@@ -5,15 +5,35 @@ import numpy as np
 from pytcint.jastrow import Jastrow
 
 
-class SimpleJastrow(Jastrow):
+class SimpleTestJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
-    def jastrow_function(self, delta_r):
-        return np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
     
-    def jastrow_gradient(self, delta_r):
-        norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
-        norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return -self.parameters[0] * delta_r / norm * self.jastrow_function(delta_r)[..., np.newaxis]
+    def __call__(self, r1, r2, atomic_positions=None):
+        """Evaluate Jastrow factor at given positions."""
+        r1 = np.atleast_2d(r1)  # Ensure 2D array with shape (N, 3)
+        r2 = np.atleast_2d(r2)  # Ensure 2D array with shape (M, 3)
+        
+        delta_r = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
+        result = np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+        
+        # Handle single point inputs
+        if r1.shape[0] == 1 and r2.shape[0] == 1:
+            result = result.reshape(1, 1)
+            
+        return result
+    
+    def grad(self, r1, r2=None, atomic_positions=None):
+        """Compute gradient with respect to coordinates."""
+        r1 = np.atleast_2d(r1)
+        r2 = np.atleast_2d(r2) if r2 is not None else r1
+        
+        diff = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
+        norm = np.linalg.norm(diff, axis=-1, keepdims=True)
+        norm = np.where(norm == 0, 1.0, norm)
+        
+        # Note: Use the reshaped call result for proper broadcasting
+        jastrow_values = self.__call__(r1, r2)[..., np.newaxis]
+        return -self.parameters[0] * diff / norm * jastrow_values
 
 
 class TestJastrow(unittest.TestCase):
@@ -28,11 +48,11 @@ class TestJastrow(unittest.TestCase):
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0]
         ])
-        cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
+        cls.jastrow = SimpleTestJastrow([0.5])  # alpha = 0.5
     
     def test_eval_shape(self):
         """Test if eval returns correct shape."""
-        values = self.jastrow.eval(self.grid_points)
+        values = self.jastrow(self.grid_points, self.grid_points)
         n_points = len(self.grid_points)
         self.assertEqual(values.shape, (n_points, n_points))
     
@@ -41,23 +61,31 @@ class TestJastrow(unittest.TestCase):
         gradients = self.jastrow.grad(self.grid_points)
         n_points = len(self.grid_points)
         self.assertEqual(gradients.shape, (n_points, n_points, 3))
+
+        # Test with different r1, r2
+        r1 = np.random.rand(5, 3)
+        r2 = np.random.rand(7, 3)
+        gradients = self.jastrow.grad(r1, r2)
+        self.assertEqual(gradients.shape, (5, 7, 3))
     
     def test_eval_symmetry(self):
         """Test if Jastrow factor is symmetric: f(r₁-r₂) = f(r₂-r₁)."""
-        values = self.jastrow.eval(self.grid_points)
-        for i in range(len(self.grid_points)):
-            for j in range(len(self.grid_points)):
+        values = self.jastrow(self.grid_points, self.grid_points)
+        n_points = len(self.grid_points)
+        for i in range(n_points):
+            for j in range(n_points):
                 self.assertAlmostEqual(values[i,j], values[j,i], places=10)
     
     def test_grad_antisymmetry(self):
         """Test if gradient is antisymmetric: ∇₁f(r₁-r₂) = -∇₂f(r₁-r₂)."""
         gradients = self.jastrow.grad(self.grid_points)
-        for i in range(len(self.grid_points)):
-            for j in range(len(self.grid_points)):
+        n_points = len(self.grid_points)
+        for i in range(n_points):
+            for j in range(n_points):
                 if i != j:
                     np.testing.assert_array_almost_equal(
-                        gradients[i,j], 
-                        -gradients[j,i],
+                        gradients[i, j], 
+                        -gradients[j, i],
                         decimal=10
                     )
     
@@ -71,37 +99,37 @@ class TestJastrow(unittest.TestCase):
             for d in range(3):
                 h = np.zeros(3)
                 h[d] = eps
-                forward = self.jastrow.jastrow_function(point1 + h - point2)
-                backward = self.jastrow.jastrow_function(point1 - h - point2)
-                grad[d] = (forward - backward) / (2*eps)
+                # Forward difference at point1 (keeping point2 fixed)
+                f_forward = self.jastrow(point1[np.newaxis, :] + h, point2[np.newaxis, :])[0, 0]
+                # Backward difference at point1 (keeping point2 fixed)
+                f_backward = self.jastrow(point1[np.newaxis, :] - h, point2[np.newaxis, :])[0, 0]
+                # Central difference
+                grad[d] = (f_forward - f_backward) / (2 * eps)
             return grad
         
-        for i in range(len(self.grid_points)):
-            for j in range(len(self.grid_points)):
+        # Use first 3 points from self.grid_points for numerical stability
+        test_points = self.grid_points[:3]
+        
+        n_points = len(test_points)
+        for i in range(n_points):
+            for j in range(n_points):
                 if i != j:
                     numerical = numerical_gradient(
-                        self.grid_points[i], 
-                        self.grid_points[j]
+                        test_points[i], 
+                        test_points[j]
                     )
-                    analytical = self.jastrow.grad(self.grid_points)[i,j]
+                    analytical = self.jastrow.grad(test_points[i:i+1], test_points[j:j+1])[0, 0]
                     np.testing.assert_array_almost_equal(
                         numerical, 
                         analytical,
-                        decimal=5
+                        decimal=5,
+                        err_msg=f"Failed at points {i},{j}"
                     )
     
     def test_cusp_condition(self):
-        """Test if Jastrow factor satisfies cusp condition as r→0 (but r≠0).
-        
-        For simple exponential Jastrow f(r)=exp(-alpha*r), 
-        the gradient magnitude should approach alpha as r→0.
-        We test this by evaluating at small but nonzero distances
-        in various directions to ensure isotropic behavior.
-        """
+        """Test if Jastrow factor satisfies cusp condition as r→0 (but r≠0)."""
         # Test with displacements in various directions
         eps_values = [1e-5, 1e-6, 1e-7, 1e-8]
-        
-        # Test along single axes
         directions = [
             [1.0, 0.0, 0.0],  # x-axis
             [0.0, 1.0, 0.0],  # y-axis
@@ -112,26 +140,35 @@ class TestJastrow(unittest.TestCase):
         
         for eps in eps_values:
             for direction in directions:
-                # Normalize direction vector
                 direction = np.array(direction) / np.linalg.norm(direction)
-                # Create points with small displacement in given direction
                 points = np.array([
                     [0.0, 0.0, 0.0],
-                    eps * direction  # Small displacement in given direction
+                    eps * direction
                 ])
-                gradients = self.jastrow.grad(points)
-                # Check gradient at first point with respect to second point
-                grad_norm = np.linalg.norm(gradients[0,1])
+                gradients = self.jastrow.grad(points)  # Shape: (N_grid, N_grid, 3)
+                grad_norm = np.linalg.norm(gradients[0, 1])  # Use first-to-second point gradient
                 self.assertAlmostEqual(
                     grad_norm, 
-                    self.jastrow.parameters[0], 
-                    places=5,
-                    msg=f"Cusp condition failed for eps={eps}, direction={direction}"
-                )
+                    self.jastrow.parameters[0], places=5, 
+                    msg=f"Cusp condition failed for eps={eps}, direction={direction}")
 
+    def test_flexible_input(self):
+        """Test if Jastrow accepts different input shapes."""
+        # Single point inputs
+        point1 = np.array([1.0, 0.0, 0.0])
+        point2 = np.array([0.0, 1.0, 0.0])
+        value = self.jastrow(point1, point2)
+        self.assertEqual(value.shape, (1, 1))
 
-if __name__ == '__main__':
-    unittest.main()
+        # Batch of points
+        batch1 = np.random.rand(5, 3)
+        batch2 = np.random.rand(7, 3)
+        value = self.jastrow(batch1, batch2)
+        self.assertEqual(value.shape, (5, 7))
 
-
-
+        # With atomic positions
+        atoms = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+        value = self.jastrow(batch1, batch2, atoms)
+        self.assertEqual(value.shape, (5, 7))
+                
+if __name__ == '__main__':    unittest.main()

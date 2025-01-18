@@ -16,13 +16,17 @@ def get_h2_sto3g():
 
 class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
-    def jastrow_function(self, delta_r):
+    def __call__(self, r1, r2, atomic_positions=None):
+        delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
         return np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
     
-    def jastrow_gradient(self, delta_r):
+    def grad(self, r1, r2=None, atomic_positions=None):
+        if r2 is None:
+            r2 = r1
+        delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
         norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return -self.parameters[0] * delta_r / norm * self.jastrow_function(delta_r)[..., np.newaxis]
+        return -self.parameters[0] * delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
 
 
 class TestKmat(unittest.TestCase):
@@ -39,17 +43,26 @@ class TestKmat(unittest.TestCase):
         grids = dft.gen_grid.Grids(cls.mol)
         grids.level = 1  # Use coarse grid for testing
         grids.build()
-        cls.grid_points = grids.coords
+        cls.grid_points = grids.coords  # Keep original shape (N_grid, 3)
         cls.weights = grids.weights
         
-        # Prepare basis functions on grid
+        # Prepare basis functions on grid with correct shapes
         ao = dft.numint.eval_ao(cls.mol, cls.grid_points, deriv=1)
-        cls.rho = np.dot(ao[0], cls.mf.mo_coeff)  # Shape: (N_grid, N_orb)
-        cls.nabla_rho = np.dot(ao[1:4].transpose(1,0,2), cls.mf.mo_coeff)  # Shape: (N_grid, 3, N_orb)
+        cls.rho = np.dot(ao[0], cls.mf.mo_coeff).T  # Shape: (N_orb, N_grid)
+        cls.nabla_rho = np.dot(ao[1:4].transpose(1,0,2), 
+                              cls.mf.mo_coeff).transpose(2,0,1)  # Shape: (N_orb, N_grid, 3)
         
         # Prepare paired indices for testing
-        cls.rho_paired = np.einsum('ni,nj->nij', cls.rho, cls.rho).reshape(cls.rho.shape[0], -1)
-        cls.nabla_rho_paired = np.einsum('ndi,nj->nijd', cls.nabla_rho, cls.rho).reshape(cls.rho.shape[0], -1, 3)
+        cls.rho_paired = np.einsum('in,jn->ijn', 
+                                  cls.rho, 
+                                  cls.rho).reshape(-1, len(cls.weights))
+        
+        cls.nabla_rho_paired = np.einsum('ind,jn->ijnd', 
+                                        cls.nabla_rho, 
+                                        cls.rho).reshape(-1, len(cls.weights), 3)
+        
+        # Pre-compute u_gradients for all tests
+        cls.u_gradients = cls.jastrow.grad(cls.grid_points)
     
     def test_k1_shape(self):
         """Test if K1 (nabla) integral has correct shape."""
@@ -57,11 +70,9 @@ class TestKmat(unittest.TestCase):
         k1 = calc_K1(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,  # Pre-computed gradients
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
         self.assertEqual(k1.shape, (self.n_orb,)*4)
     
     def test_k2_shape(self):
@@ -70,11 +81,9 @@ class TestKmat(unittest.TestCase):
         k2 = calc_K2(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,  # Pre-computed gradients
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
         self.assertEqual(k2.shape, (self.n_orb,)*4)
     
     def test_k3_shape(self):
@@ -82,11 +91,9 @@ class TestKmat(unittest.TestCase):
         from pytcint.kmat import calc_K3
         k3 = calc_K3(
             self.rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,  # Pre-computed gradients
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
         self.assertEqual(k3.shape, (self.n_orb,)*4)
     
     def test_k2_k3_symmetry(self):
@@ -96,16 +103,14 @@ class TestKmat(unittest.TestCase):
         k2 = calc_K2(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         k3 = calc_K3(
             self.rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         # Test symmetries for laplacian and square terms
@@ -134,17 +139,15 @@ class TestKmat(unittest.TestCase):
         k1 = calc_K1(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         k2 = calc_K2(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.grid_points,
-            self.weights,
-            self.jastrow
+            self.u_gradients,
+            self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         tmp = k1 + k2
@@ -155,4 +158,4 @@ class TestKmat(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main() 
+    unittest.main()
