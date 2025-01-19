@@ -37,7 +37,7 @@ def calc_L(rho_paired, v_bra, weights, v_ket=None):
         v_ket: Optional array of shape (Nb*Nb, N_grid, 3), defaults to v_bra
         
     Returns:
-        Array of shape (Nb*Nb, Nb*Nb) containing the L matrix elements
+        Array of shape (Nb*Nb, Nb*Nb, Nb*Nb) containing the L matrix elements
     """
     if v_ket is None:
         v_ket = v_bra
@@ -58,13 +58,15 @@ def calc_L_symmetric(rho_paired, v_bra, weights, v_ket=None):
         v_ket: Optional array of shape (Nb*Nb, N_grid, 3), defaults to v_bra
         
     Returns:
-        Array containing the symmetrized L matrix elements
+        l_sym: Array of shape (Nb*Nb, Nb*Nb, Nb*Nb) 
+        containing the symmetrized L matrix elements
+        
     """
     # First compute the base L matrix
     l_mat = calc_L(rho_paired, v_bra, weights, v_ket)
     
     # Reshape for permutations (assuming Nb*Nb = N²)
-    N = int(np.sqrt(rho_paired.shape[0]))
+    N = rho_paired.shape[0]
     l_mat = l_mat.reshape(N, N, N)
     
     # Add permutations

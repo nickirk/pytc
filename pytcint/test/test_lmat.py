@@ -41,37 +41,36 @@ class TestLmat(unittest.TestCase):
         cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
         
         # Set up grid points for testing
-        from pyscf.dft import gen_grid
-        grids = gen_grid.Grids(cls.mol)
+        from pyscf import dft
+        grids = dft.gen_grid.Grids(cls.mol)
         grids.level = 1  # Use coarse grid for testing
         grids.build()
-        cls.grid_points = grids.coords  # Explicitly transpose to (3, N_grid)
+        cls.grid_points = grids.coords  # Shape: (N_grid, 3)
         cls.weights = grids.weights
         
         # Prepare basis functions on grid with correct shapes
-        from pyscf.dft import numint
-        ao = numint.eval_ao(cls.mol, cls.grid_points, deriv=1)
+        ao = dft.numint.eval_ao(cls.mol, cls.grid_points, deriv=1)
+        cls.rho = np.dot(ao[0], cls.mf.mo_coeff).T  # Shape: (N_orb, N_grid)
+        cls.nabla_rho = np.dot(ao[1:4].transpose(1,0,2), 
+                              cls.mf.mo_coeff).transpose(2,0,1)  # Shape: (N_orb, N_grid, 3)
         
-        # Shape: ao[0] is (N_ao, N_grid), mo_coeff is (N_ao, N_mo)
-        # Result rho shape: (N_mo, N_grid)
-        cls.rho = np.dot(cls.mf.mo_coeff, ao[0])
+        # Prepare paired indices for testing
+        cls.rho_paired = np.einsum('in,jn->ijn', 
+                                  cls.rho, 
+                                  cls.rho).reshape(-1, len(cls.weights))
         
-        # Shape: ao[1:4] is (3, N_grid, N_ao), need to handle carefully
-        # Reshape ao gradients to (N_ao, N_grid, 3) then transform to MO basis
-        ao_gradients = ao[1:4] # Shape: (N_grid, N_ao, 3)
-        cls.nabla_rho = np.einsum('ji,njk->nik', cls.mf.mo_coeff, ao_gradients)  # Shape: (N_mo, N_grid, 3)
+        cls.nabla_rho_paired = np.einsum('ind,jn->ijnd', 
+                                        cls.nabla_rho, 
+                                        cls.rho).reshape(-1, len(cls.weights), 3)
+        
+        # Pre-compute u_gradients for all tests
+        cls.u_gradients = cls.jastrow.grad(cls.grid_points)
     
     def test_v_vector_shape(self):
         """Test if V vector computation returns correct shape."""
-        # Prepare paired indices - shape: (Nb*Nb, N_grid)
-        rho_paired = np.einsum('in,jn->ijn', self.rho, self.rho).reshape(-1, self.rho.shape[1])
-        
-        # Get Jastrow gradients - shape: (N_grid, N_grid, 3)
-        u_gradients = self.jastrow.grad(self.grid_points)
-        
         v_vector = lmat.calc_v_vector(
-            rho_paired, 
-            u_gradients,
+            self.rho_paired, 
+            self.u_gradients,
             self.weights
         )
         
@@ -80,16 +79,12 @@ class TestLmat(unittest.TestCase):
     
     def test_l_matrix_shape(self):
         """Test if L matrix computation returns correct shape."""
-        # Prepare paired indices
-        rho_paired = np.einsum('in,jn->ijn', self.rho, self.rho).reshape(-1, self.rho.shape[1])
-        
         # Get Jastrow gradients and compute V vectors
-        u_gradients = self.jastrow.grad(self.grid_points)
-        v_bra = lmat.calc_v_vector(rho_paired, u_gradients, self.weights)
+        v_bra = lmat.calc_v_vector(self.rho_paired, self.u_gradients, self.weights)
         
         # Compute L matrix
         l_mat = lmat.calc_L(
-            rho_paired,
+            self.rho_paired,
             v_bra,
             self.weights
         )
@@ -99,22 +94,18 @@ class TestLmat(unittest.TestCase):
     
     def test_l_matrix_symmetry(self):
         """Test symmetry properties of L matrix elements."""
-        # Prepare paired indices
-        rho_paired = np.einsum('in,jn->ijn', self.rho, self.rho).reshape(-1, self.rho.shape[1])
-        
         # Get Jastrow gradients and compute V vectors
-        u_gradients = self.jastrow.grad(self.grid_points)
-        v_bra = lmat.calc_v_vector(rho_paired, u_gradients, self.weights)
+        v_bra = lmat.calc_v_vector(self.rho_paired, self.u_gradients, self.weights)
         
         # Get symmetric L matrix
         l_mat = lmat.calc_L_symmetric(
-            rho_paired,
+            self.rho_paired,
             v_bra,
             self.weights
         )
         
         # Test permutation symmetry
-        l_tensor = l_mat.reshape((self.n_orb,)*3)
+        l_tensor = l_mat.reshape((self.n_orb**2,)*3)
         for p in range(self.n_orb):
             for q in range(self.n_orb):
                 for r in range(self.n_orb):
