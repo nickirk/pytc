@@ -10,7 +10,7 @@ from pytcint.jastrow import Jastrow
 
 def get_h2_sto3g():
     """Return a simple H2 molecule with STO-3G basis for testing."""
-    mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto-3g', unit='Bohr')
+    mol = gto.M(atom='H 0 0 0; H 0 0 1;', basis='sto-3g', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
@@ -19,7 +19,7 @@ class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     def __call__(self, r1, r2, atomic_positions=None):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        return np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+        return -1./self.parameters[0]*np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
     
     def grad(self, r1, r2=None, atomic_positions=None):
         if r2 is None:
@@ -27,7 +27,7 @@ class SimpleJastrow(Jastrow):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
         norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return -self.parameters[0] * delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
+        return  delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
 
 class TestXTC(unittest.TestCase):
     """Test XTranscorrelated calculations."""
@@ -37,7 +37,7 @@ class TestXTC(unittest.TestCase):
         """Set up test case using H2 molecule from test_lmat."""
         # Get mean-field data from test_lmat
         _, cls.mf = get_h2_sto3g()
-        cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
+        cls.jastrow = SimpleJastrow([1])  # alpha = 0.5
         
         # Update XTC initialization to include jastrow_factor
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
@@ -110,10 +110,8 @@ class TestXTC(unittest.TestCase):
     
     def test_get_const(self):
         """Test calculation of constant term."""
-        delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
         dm1 = self.xtc._get_mf_dm()
-        delta_h = self.xtc._calc_delta_h(delta_U, dm1)
-        const = self.xtc.get_const(dm1=dm1, delta_h=delta_h)
+        const = self.xtc.get_const(dm1=dm1)
         
         # Check that const is real
         self.assertTrue(np.isreal(const))

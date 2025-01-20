@@ -39,10 +39,11 @@ class XTC(TC):
         Returns:
             numpy.ndarray: Diagonal density matrix with 2.0 for occupied orbitals
         """
-        nelec = self.mol.nelectron
-        nocc = nelec // 2
-        dm1 = np.zeros((self.n_orb, self.n_orb))
-        np.fill_diagonal(dm1[:nocc, :nocc], 2.0)
+        #nelec = self.mol.nelectron
+        #nocc = nelec // 2
+        #dm1 = np.zeros((self.n_orb, self.n_orb))
+        #np.fill_diagonal(dm1[:nocc, :nocc], 2.0)
+        dm1 = np.diag(self.mf.mo_occ)
         return dm1
 
     def get_delta_h(self, dm1=None):
@@ -164,8 +165,8 @@ class XTC(TC):
         B = 0.5 * Wbar[None, None, :, None] * V - G  # (Nb, Nb, N_grid, 3)
         
         # Final contraction
-        term1 = np.einsum('qpi,sri->qspr', rho_weighted, A)
-        term2 = np.einsum('qpix,srix->qspr', V, B)
+        term1 = np.einsum('qpi,sri->qpsr', rho_weighted, A)
+        term2 = np.einsum('qpix,srix->qpsr', V, B)
         
         result = -(term1 + term2)
         # Add permutation P^{PQ}_{SR}

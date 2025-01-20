@@ -19,7 +19,7 @@ class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     def __call__(self, r1, r2, atomic_positions=None):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        return np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+        return -1./self.parameters[0]*np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
     
     def grad(self, r1, r2=None, atomic_positions=None):
         if r2 is None:
@@ -27,7 +27,7 @@ class SimpleJastrow(Jastrow):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
         norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return -self.parameters[0] * delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
+        return delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
 
 
 class TestTC(unittest.TestCase):
@@ -37,7 +37,7 @@ class TestTC(unittest.TestCase):
     def setUpClass(cls):
         """Set up a simple H2 molecule for all tests in this class."""
         cls.mol, cls.mf = get_h2_sto3g()
-        cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
+        cls.jastrow = SimpleJastrow([1])  # alpha = 0.5
         # Update TC initialization to include jastrow_factor
         cls.tc = TC(cls.mf, cls.jastrow, grid_lvl=1)  # Use coarse grid for testing
     

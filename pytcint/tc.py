@@ -60,8 +60,8 @@ class TC:
     
     def _eval_basis_on_grid(self):
         """Evaluate basis functions and their gradients on the grid points."""
-        if 'ao_values' in self._cache:
-            return self._cache['ao_values'], self._cache['ao_gradients']
+        if 'mo_values' in self._cache and 'mo_gradients' in self._cache:
+            return self._cache['mo_values'], self._cache['mo_gradients']
         
         # Evaluate AO values and gradients on grid
         ao = dft.numint.eval_ao(self.mol, self.grid_points, deriv=1)
@@ -74,12 +74,12 @@ class TC:
             # Shape: (N_mo, N_grid)
             mo_values = np.dot(self.mo_coeff.T, ao_values)
             # Shape: (N_mo, N_grid, 3)
-            mo_gradients = einsum('ji,jnc->inc', self.mo_coeff, ao_gradients)
+            mo_gradients = einsum('ji,jnc->inc', self.mo_coeff.T, ao_gradients)
             ao_values, ao_gradients = mo_values, mo_gradients
         
         # Cache results
-        self._cache['ao_values'] = ao_values
-        self._cache['ao_gradients'] = ao_gradients
+        self._cache['mo_values'] = ao_values
+        self._cache['mo_gradients'] = ao_gradients
         
         return ao_values, ao_gradients
 
