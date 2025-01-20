@@ -37,8 +37,9 @@ class TestTC(unittest.TestCase):
     def setUpClass(cls):
         """Set up a simple H2 molecule for all tests in this class."""
         cls.mol, cls.mf = get_h2_sto3g()
-        cls.tc = TC(cls.mf, grid_lvl=1)  # Use coarse grid for testing
         cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
+        # Update TC initialization to include jastrow_factor
+        cls.tc = TC(cls.mf, cls.jastrow, grid_lvl=1)  # Use coarse grid for testing
     
     def test_grid_initialization(self):
         """Test if grid is properly initialized."""
@@ -65,7 +66,8 @@ class TestTC(unittest.TestCase):
     
     def test_2b_shape(self):
         """Test if get_2b returns correct shape."""
-        result = self.tc.get_2b(self.jastrow)
+        # Remove jastrow argument since it's now in the TC object
+        result = self.tc.get_2b()
         self.assertEqual(result.shape, (self.mol.nao,)*4)
     
     def test_3b_shape(self):

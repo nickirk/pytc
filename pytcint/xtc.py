@@ -1,10 +1,14 @@
 import numpy as np
-from pytcint.tc import TC
+from functools import partial
 
+from pytcint.tc import TC
+from pytcint.lmat import calc_v_vector
+
+einsum = partial(np.einsum, optimize='optimal')
 class XTC(TC):
     """Extended Transcorrelated class that handles density matrices."""
     
-    def __init__(self, mf, mo_coeff=None, grid_lvl=2):
+    def __init__(self, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
         """Initialize XTC object.
         
         Args:
@@ -12,8 +16,23 @@ class XTC(TC):
             mo_coeff: Optional molecular orbital coefficients
             grid_lvl: Grid level for numerical integration
         """
-        super().__init__(mf, mo_coeff, grid_lvl)
+        super().__init__(mf, jastrow_factor, mo_coeff, grid_lvl)
+        self._delta_U = None  # Cache for delta_U
+        self._delta_h = None  # Cache for delta_h
     
+    def get_delta_U(self, dm1=None):
+        """Get or compute delta_U with caching."""
+        if self._delta_U is None:
+            if dm1 is None:
+                dm1 = self._get_mf_dm()
+            # Use cached intermediates from parent class
+            _, _, u_gradients, rho_paired = self._get_intermediates()
+            # Compute V vector
+            v_vector = calc_v_vector(rho_paired, u_gradients, self.weights)
+            # Compute and cache delta_U
+            self._delta_U = self._calc_delta_U(v_vector, rho_paired, dm1)
+        return self._delta_U
+
     def _get_mf_dm(self):
         """Get mean-field 1-body density matrix for closed shell system.
         
@@ -25,44 +44,49 @@ class XTC(TC):
         dm1 = np.zeros((self.n_orb, self.n_orb))
         np.fill_diagonal(dm1[:nocc, :nocc], 2.0)
         return dm1
-    
+
+    def get_delta_h(self, dm1=None):
+        """Get or compute delta_h with caching."""
+        if self._delta_h is None:
+            if dm1 is None:
+                dm1 = self._get_mf_dm()
+            delta_U = self.get_delta_U(dm1)
+            self._delta_h = self._calc_delta_h(delta_U, dm1)
+        return self._delta_h
+
     def get_1b(self, dm1=None, dm2=None):
-        """Compute one-body integrals.
-        
-        Args:
-            dm1: One-body density matrix. If None, uses mean-field density.
-            dm2: Two-body density matrix (not used for 1-body terms).
-            
-        Returns:
-            Float: One-body energy contribution.
-        """
+        """Get one-body operator h1e = T + V + δh."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
-        raise NotImplementedError("Implementation pending")
-    
+            
+        # Get core Hamiltonian and transform to MO basis
+        h1e = self.mf.get_hcore()
+        h1e = np.einsum('pi,pq,qj->ij', self.mo_coeff, h1e, self.mo_coeff)
+        
+        # Add delta_h using cached value
+        h1e += self.get_delta_h(dm1)
+        
+        return h1e
+
     def get_2b(self, dm1=None, dm2=None):
-        """Compute two-body integrals.
-        
-        Args:
-            dm1: One-body density matrix. If None, uses mean-field density.
-            dm2: Two-body density matrix. If None, constructs from dm1.
-            
-        Returns:
-            Float: Two-body energy contribution.
-        """
+        """Compute two-body integrals."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
-        raise NotImplementedError("Implementation pending")
+        
+        # Get TC's two-body contribution
+        result = super().get_2b()
+        
+        # Add cached delta_U
+        result += self.get_delta_U(dm1)
+        return result
+        
     
-    def get_const(self, dm1=None, dm2=None, delta_U=None, delta_h=None):
+    def get_const(self, dm1=None, dm2=None):
         """Compute constant contribution: const = -1/3 * δh^q_p * γ^p_q"""
         if dm1 is None:
             dm1 = self._get_mf_dm()
-            
-        if delta_h is None:
-            delta_h = self._calc_delta_h(delta_U, dm1)
-            
-        # Calculate const = -1/3 * δh^q_p * γ^p_q
+        
+        delta_h = self.get_delta_h(dm1)
         const = -1/3 * np.einsum('qp,pq->', delta_h, dm1)
         return const
 

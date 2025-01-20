@@ -39,8 +39,8 @@ class TestXTC(unittest.TestCase):
         _, cls.mf = get_h2_sto3g()
         cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
         
-        # Initialize XTC object
-        cls.xtc = XTC(cls.mf, grid_lvl=1)  # Use grid_lvl=1 for testing
+        # Update XTC initialization to include jastrow_factor
+        cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
         
         # Get grid points and weights from TC parent class
         cls.grid_points = cls.xtc.grid_points
@@ -55,9 +55,8 @@ class TestXTC(unittest.TestCase):
                                   cls.rho, 
                                   cls.rho).reshape(-1, len(cls.weights))
         
-        # Get test Jastrow gradients from TestLmat
-        #test_lmat = TestLmat()
-        cls.u_gradients = cls.jastrow.grad(cls.grid_points)
+        # Update to use jastrow from xtc object
+        cls.u_gradients = cls.xtc.jastrow_factor.grad(cls.grid_points)
         
         # Calculate v_vector
         cls.v_vector = calc_v_vector(cls.rho_paired, cls.u_gradients, cls.weights)
