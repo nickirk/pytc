@@ -1,5 +1,5 @@
 import numpy as np
-from functools import partial
+from functools import partial, reduce
 
 from pytcint.tc import TC
 from pytcint.lmat import calc_v_vector
@@ -62,7 +62,7 @@ class XTC(TC):
             
         # Get core Hamiltonian and transform to MO basis
         h1e = self.mf.get_hcore()
-        h1e = np.einsum('pi,pq,qj->ij', self.mo_coeff, h1e, self.mo_coeff)
+        h1e = reduce(np.dot, (self.mo_coeff.T, h1e, self.mo_coeff))
         
         # Add delta_h using cached value
         h1e += self.get_delta_h(dm1)
@@ -88,7 +88,8 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
         
         delta_h = self.get_delta_h(dm1)
-        const = -1/3 * np.einsum('qp,pq->', delta_h, dm1)
+        const = -1/3 * einsum('qp,pq->', delta_h, dm1)
+        const += self.mf.energy_nuc()
         return const
 
     def _calc_delta_h(self, delta_U=None, dm1=None):
@@ -102,8 +103,8 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
             
         # Calculate δh using einstein summation
-        term1 = np.einsum('qspr,rs->qp', delta_U, dm1)
-        term2 = np.einsum('sqpr,rs->qp', delta_U, dm1)
+        term1 = einsum('qspr,rs->qp', delta_U, dm1)
+        term2 = einsum('sqpr,rs->qp', delta_U, dm1)
         delta_h = -0.5 * (term1 - term2)
         return delta_h
 
@@ -149,27 +150,60 @@ class XTC(TC):
         # weight the rho using self.weights
         rho_weighted = rho * self.weights[None, None, :]
         # Calculate intermediates
-        W = np.einsum('tuix,ut->ix', V, dm1)  # (N_grid, 3)
-        Vbar = np.einsum('ix,srix->sri', W, V)  # (Nb, Nb, N_grid, 3)
+        W = einsum('tuix,ut->ix', V, dm1)  # (N_grid, 3)
+        Vbar = einsum('ix,srix->sri', W, V)  # (Nb, Nb, N_grid, 3)
         
-        X = np.einsum('stix,tu->suix', V, dm1)  # (Nb, N_grid, 3)
-        Zbar = np.einsum('urid,suid->sri', V, X)  # (Nb, Nb, N_grid, 3)
+        X = einsum('stix,tu->suix', V, dm1)  # (Nb, N_grid, 3)
+        Zbar = einsum('urid,suid->sri', V, X)  # (Nb, Nb, N_grid, 3)
         
-        Wbar = np.einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
-        Y = np.einsum('urix,tu->trix', V, dm1)  # (Nb, Nb, N_grid, 3)
-        G = (np.einsum('uri,suix->srix', rho_weighted, X) + 
-             np.einsum('trix,sti->srix', Y, rho_weighted))  # (Nb, Nb, N_grid, 3)
+        Wbar = einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
+        Y = einsum('urix,tu->trix', V, dm1)  # (Nb, Nb, N_grid, 3)
+        G = (einsum('uri,suix->srix', rho_weighted, X) + 
+             einsum('trix,sti->srix', Y, rho_weighted))  # (Nb, Nb, N_grid, 3)
         
         # Compute A and B using Zbar instead for A
         A = Vbar - Zbar  # (Nb, Nb, N_grid, 3)
         B = 0.5 * Wbar[None, None, :, None] * V - G  # (Nb, Nb, N_grid, 3)
         
         # Final contraction
-        term1 = np.einsum('qpi,sri->qpsr', rho_weighted, A)
-        term2 = np.einsum('qpix,srix->qpsr', V, B)
+        term1 = einsum('qpi,sri->qpsr', rho_weighted, A)
+        term2 = einsum('qpix,srix->qpsr', V, B)
         
         result = -(term1 + term2)
-        # Add permutation P^{PQ}_{SR}
+        # Add permutation of two electrons
         final = result + result.transpose(2,3,0,1)
         
         return final
+    
+    def make_eris(self):
+        from pyscf.cc import rccsd
+        mycc = rccsd.RCCSD(self.mf)
+        nocc = np.sum(self.mf.mo_occ > 0)
+        nmo = mycc.nmo
+
+        eris = rccsd._ChemistsERIs(mycc)
+        eris.e_core = self.get_const()
+        eris.fock = self.get_1b()
+        h2e = self.get_2b()
+        eris.fock += 2 * einsum('pqii->pq', h2e[:,:,:nocc,:nocc])
+        eris.fock -= einsum('piiq->pq', h2e[:,:nocc,:nocc,:])
+
+        eris.mo_energy = np.diag(eris.fock).copy()
+        
+        # Slice the full ERI tensor into required blocks
+        eris.oooo = h2e[:nocc,:nocc,:nocc,:nocc].copy()
+        eris.ovoo = h2e[:nocc,nocc:,:nocc,:nocc].copy()
+        eris.ooov = h2e[:nocc,:nocc,:nocc,nocc:].copy()
+        eris.vooo = h2e[nocc:,:nocc,:nocc,:nocc].copy()
+        eris.ovov = h2e[:nocc,nocc:,:nocc,nocc:].copy()
+        eris.vovo = h2e[nocc:,:nocc,nocc:,:nocc].copy()
+        eris.ovvo = h2e[:nocc,nocc:,nocc:,:nocc].copy()
+        eris.voov = h2e[nocc:,:nocc,:nocc,nocc:].copy()
+        eris.oovv = h2e[:nocc,:nocc,nocc:,nocc:].copy()
+        eris.ovvv = h2e[:nocc,nocc:,nocc:,nocc:].copy()
+        eris.vovv = h2e[nocc:,:nocc,nocc:,nocc:].copy()
+        eris.vvov = h2e[nocc:,nocc:,:nocc,nocc:].copy()
+        eris.vvvv = h2e[nocc:,nocc:,nocc:,nocc:].copy()
+
+        return eris
+        

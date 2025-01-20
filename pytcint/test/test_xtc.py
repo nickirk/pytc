@@ -1,7 +1,13 @@
 """Test for Exculding normal-ordered 3-body Transcorrelated (XTC) calculations."""
 
 import unittest
+import os 
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
+
 import numpy as np
+
 from pyscf import gto, scf
 
 from pytcint.xtc import XTC
@@ -10,7 +16,7 @@ from pytcint.jastrow import Jastrow
 
 def get_h2_sto3g():
     """Return a simple H2 molecule with STO-3G basis for testing."""
-    mol = gto.M(atom='H 0 0 0; H 0 0 1;', basis='sto-3g', unit='Bohr')
+    mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto6g', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
@@ -37,7 +43,7 @@ class TestXTC(unittest.TestCase):
         """Set up test case using H2 molecule from test_lmat."""
         # Get mean-field data from test_lmat
         _, cls.mf = get_h2_sto3g()
-        cls.jastrow = SimpleJastrow([1])  # alpha = 0.5
+        cls.jastrow = SimpleJastrow([1.])  # alpha = 0.5
         
         # Update XTC initialization to include jastrow_factor
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
@@ -115,6 +121,32 @@ class TestXTC(unittest.TestCase):
         
         # Check that const is real
         self.assertTrue(np.isreal(const))
+    
+    #def test_nhccsd(self):
+    #    from pyscf.cc import rccsd, CCSD
+    #    mycc = CCSD(self.mf).run()
+    #    print("E_CCSD = ", mycc.e_corr)
+
+    #    myrcc = rccsd.RCCSD(self.mf)
+    #    eris = self.xtc.make_eris()
+    #    myrcc.kernel(eris=eris)
+    #    print("E_XTC_CCSD = ", myrcc.e_corr)
+    
+    def test_scan_param(self):
+        """Test scanning over parameter space for finding optimal Jastrow factor 
+        in terms of smallest xtc-mp2 t2 norm."""
+        from pyscf import mp, cc
+        
+        # Scan over alpha values
+        for alpha in np.linspace(1.0, 1.5, 10):
+            jastrow = SimpleJastrow([alpha])
+            xtc = XTC(self.mf, jastrow, grid_lvl=1)
+            eris = xtc.make_eris()
+            #mymp2 = mp.MP2(xtc.mf)
+            mycc = cc.rccsd.RCCSD(xtc.mf)
+            e_corr, t1, t2 = mycc.kernel(eris=eris)
+            print(f"alpha = {alpha:.2f}, E_XTC_MP2 = {e_corr:.6f}, t2_norm = {np.linalg.norm(t2):.6f}")
+
 
 
 if __name__ == '__main__':

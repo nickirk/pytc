@@ -2,7 +2,7 @@
 
 import numpy as np
 from functools import partial
-from pyscf import dft
+from pyscf import dft, ao2mo
 from . import kmat
 from . import lmat
 
@@ -118,6 +118,10 @@ class TC:
         
         result = 0.5 * (k_laplacian + k_square) + k_nabla
         result += result.transpose(2, 3, 0, 1)
+
+        # add the original two-body integrals using ao2mo
+        eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff)
+        result += ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
         return result
     
     def _get_K1(self, rho_paired, nabla_rho_paired, u_gradients):
@@ -161,4 +165,4 @@ class TC:
     def get_3b(self, rho_paired, u_gradients):
         """Compute all three-body integrals involving the Jastrow factor. Use the lmat module.
         """
-        return lmat.calc_L_symmetric(self.mol, self.mo_coeff, self.grid_points, self.weights, jastrow_factor)
+        return lmat.calc_L_symmetric(self.mol, self.mo_coeff, self.grid_points, self.weights )
