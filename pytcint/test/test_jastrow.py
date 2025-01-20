@@ -171,4 +171,87 @@ class TestJastrow(unittest.TestCase):
         value = self.jastrow(batch1, batch2, atoms)
         self.assertEqual(value.shape, (5, 7))
                 
-if __name__ == '__main__':    unittest.main()
+class TestSM7(unittest.TestCase):
+    """Test SM7 Jastrow implementation."""
+    
+    @classmethod
+    def setUpClass(cls):
+        """Set up test cases and load coefficient table."""
+        from pytcint.jastrow import SM7
+        
+        # Coefficient table for different atoms
+        cls.coeff_table = {
+            'He': {(0,0,1): 0.50000, (0,0,2): 0.50516, (0,0,3): -0.19313, (0,0,4): 0.30276,
+                  (2,0,0): -0.16995, (3,0,0): -0.34505, (4,0,0): -0.54777},
+            'Li': {(0,0,1): 0.50000, (0,0,2): 0.03104, (0,0,3): 0.48928, (0,0,4): -0.62908,
+                  (2,0,0): -0.07185, (3,0,0): -0.48761, (4,0,0): 0.40450},
+            'Be': {(0,0,1): 0.50000, (0,0,2): -0.05254, (0,0,3): 0.15355, (0,0,4): -0.30549,
+                  (2,0,0): -0.11928, (3,0,0): -0.17144, (4,0,0): 0.16652},
+            'B':  {(0,0,1): 0.50000, (0,0,2): -0.13852, (0,0,3): -0.06687, (0,0,4): -0.02026,
+                  (2,0,0): -0.12573, (3,0,0): -0.05320, (4,0,0): 0.06421},
+            'C':  {(0,0,1): 0.50000, (0,0,2): -0.14368, (0,0,3): -0.34102, (0,0,4): 0.30267,
+                  (2,0,0): -0.12272, (3,0,0): -0.05622, (4,0,0): 0.08462},
+            'N':  {(0,0,1): 0.50000, (0,0,2): -0.41390, (0,0,3): 0.10406, (0,0,4): 0.06374,
+                  (2,0,0): -0.12400, (3,0,0): 0.01909, (4,0,0): -0.00383},
+            'O':  {(0,0,1): 0.50000, (0,0,2): -0.57077, (0,0,3): 0.44725, (0,0,4): -0.16075,
+                  (2,0,0): -0.11696, (3,0,0): -0.01442, (4,0,0): 0.03312},
+            'F':  {(0,0,1): 0.50000, (0,0,2): -0.73946, (0,0,3): 0.81463, (0,0,4): -0.41861,
+                  (2,0,0): -0.11872, (3,0,0): -0.01973, (4,0,0): 0.02779},
+            'Ne': {(0,0,1): 0.50000, (0,0,2): -0.79266, (0,0,3): 1.05232, (0,0,4): -0.65615,
+                  (2,0,0): -0.13312, (3,0,0): -0.00131, (4,0,0): 0.09083}
+        }
+        
+        # Set up test grid points
+        cls.grid_points = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ])
+        
+        # Create SM7 instance with He coefficients for testing
+        cls.jastrow = SM7(cls.coeff_table['He'])
+
+    def test_eval_shape(self):
+        """Test if eval returns correct shape."""
+        values = self.jastrow(self.grid_points, self.grid_points)
+        n_points = len(self.grid_points)
+        self.assertEqual(values.shape, (n_points, n_points))
+
+    def test_grad_shape(self):
+        """Test if grad returns correct shape."""
+        gradients = self.jastrow.grad(self.grid_points)
+        n_points = len(self.grid_points)
+        self.assertEqual(gradients.shape, (n_points, n_points, 3))
+
+    def test_eval_symmetry(self):
+        """Test if Jastrow factor is symmetric: f(r₁,r₂) = f(r₂,r₁)."""
+        values = self.jastrow(self.grid_points, self.grid_points)
+        n_points = len(self.grid_points)
+        for i in range(n_points):
+            for j in range(n_points):
+                self.assertAlmostEqual(values[i,j], values[j,i], places=10)
+
+    def test_numerical_gradient(self):
+        """Test gradient against numerical differentiation."""
+        eps = 1e-6
+        
+        def numerical_gradient(point1, point2):
+            grad = np.zeros(3)
+            for d in range(3):
+                h = np.zeros(3)
+                h[d] = eps
+                f_forward = self.jastrow(point1[np.newaxis, :] + h, point2[np.newaxis, :])[0, 0]
+                f_backward = self.jastrow(point1[np.newaxis, :] - h, point2[np.newaxis, :])[0, 0]
+                grad[d] = (f_forward - f_backward) / (2 * eps)
+            return grad
+        
+        # Test with a few points
+        test_points = self.grid_points[:2]  # Use first two points
+        
+        numerical = numerical_gradient(test_points[0], test_points[1])
+        analytical = self.jastrow.grad(test_points[0:1], test_points[1:2])[0, 0]
+        np.testing.assert_array_almost_equal(numerical, analytical, decimal=5)
+
+if __name__ == '__main__':
+    unittest.main()

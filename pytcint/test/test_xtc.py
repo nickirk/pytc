@@ -12,40 +12,40 @@ from pyscf import gto, scf
 
 from pytcint.xtc import XTC
 from pytcint.lmat import calc_v_vector
-from pytcint.jastrow import Jastrow
+from pytcint.jastrow import SM7
 
 def get_h2_sto3g():
     """Return a simple H2 molecule with STO-3G basis for testing."""
-    mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto6g', unit='Bohr')
+    #mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto6g', unit='Bohr')
+    mol = gto.M(atom='Be 0 0 0', basis='ccpvdz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
-
-class SimpleJastrow(Jastrow):
-    """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
-    def __call__(self, r1, r2, atomic_positions=None):
-        delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        return -1./self.parameters[0]*np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
-    
-    def grad(self, r1, r2=None, atomic_positions=None):
-        if r2 is None:
-            r2 = r1
-        delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
-        norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return  delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
 
 class TestXTC(unittest.TestCase):
     """Test XTranscorrelated calculations."""
     
     @classmethod
     def setUpClass(cls):
-        """Set up test case using H2 molecule from test_lmat."""
-        # Get mean-field data from test_lmat
+        """Set up test case using Be atom."""
+        # Get mean-field data
         _, cls.mf = get_h2_sto3g()
-        cls.jastrow = SimpleJastrow([1.])  # alpha = 0.5
         
-        # Update XTC initialization to include jastrow_factor
+        # SM7 coefficients for Be atom
+        cls.be_coefficients = {
+            (0,0,1): 0.50000, 
+            (0,0,2): -0.05254, 
+            (0,0,3): 0.15355, 
+            (0,0,4): -0.30549,
+            (2,0,0): -0.11928, 
+            (3,0,0): -0.17144, 
+            (4,0,0): 0.16652
+        }
+        
+        # Create SM7 instance with Be coefficients
+        cls.jastrow = SM7(cls.be_coefficients)
+        
+        # Initialize XTC with SM7 Jastrow
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
         
         # Get grid points and weights from TC parent class
@@ -122,30 +122,30 @@ class TestXTC(unittest.TestCase):
         # Check that const is real
         self.assertTrue(np.isreal(const))
     
-    #def test_nhccsd(self):
-    #    from pyscf.cc import rccsd, CCSD
-    #    mycc = CCSD(self.mf).run()
-    #    print("E_CCSD = ", mycc.e_corr)
+    def test_nhccsd(self):
+        from pyscf.cc import rccsd, CCSD
+        mycc = CCSD(self.mf).run()
+        print("E_CCSD = ", mycc.e_corr)
 
-    #    myrcc = rccsd.RCCSD(self.mf)
-    #    eris = self.xtc.make_eris()
-    #    myrcc.kernel(eris=eris)
-    #    print("E_XTC_CCSD = ", myrcc.e_corr)
+        myrcc = rccsd.RCCSD(self.mf)
+        eris = self.xtc.make_eris()
+        myrcc.kernel(eris=eris)
+        print("E_XTC_CCSD = ", myrcc.e_corr)
     
-    def test_scan_param(self):
-        """Test scanning over parameter space for finding optimal Jastrow factor 
-        in terms of smallest xtc-mp2 t2 norm."""
-        from pyscf import mp, cc
-        
-        # Scan over alpha values
-        for alpha in np.linspace(1.0, 1.5, 10):
-            jastrow = SimpleJastrow([alpha])
-            xtc = XTC(self.mf, jastrow, grid_lvl=1)
-            eris = xtc.make_eris()
-            #mymp2 = mp.MP2(xtc.mf)
-            mycc = cc.rccsd.RCCSD(xtc.mf)
-            e_corr, t1, t2 = mycc.kernel(eris=eris)
-            print(f"alpha = {alpha:.2f}, E_XTC_MP2 = {e_corr:.6f}, t2_norm = {np.linalg.norm(t2):.6f}")
+    #def test_scan_param(self):
+    #    """Test scanning over parameter space for finding optimal Jastrow factor 
+    #    in terms of smallest xtc-mp2 t2 norm."""
+    #    from pyscf import mp, cc
+    #    
+    #    # Scan over alpha values
+    #    for alpha in np.linspace(1.0, 1.5, 10):
+    #        jastrow = SimpleJastrow([alpha])
+    #        xtc = XTC(self.mf, jastrow, grid_lvl=1)
+    #        eris = xtc.make_eris()
+    #        #mymp2 = mp.MP2(xtc.mf)
+    #        mycc = cc.rccsd.RCCSD(xtc.mf)
+    #        e_corr, t1, t2 = mycc.kernel(eris=eris)
+    #        print(f"alpha = {alpha:.2f}, E_XTC_MP2 = {e_corr:.6f}, t2_norm = {np.linalg.norm(t2):.6f}")
 
 
 
