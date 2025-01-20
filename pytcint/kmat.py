@@ -1,5 +1,7 @@
 import numpy as np
+from functools import partial
 
+einsum = partial(np.einsum, optimize='optimal')
 
 def calc_K1(rho_paired, nabla_rho_paired, u_gradients, weights):
     """Evaluate the integral <pq|∇u·∇|rs> over grid points using broadcasting.
@@ -15,11 +17,11 @@ def calc_K1(rho_paired, nabla_rho_paired, u_gradients, weights):
     weighted_grads = u_gradients * weights[np.newaxis, :, np.newaxis]  # Shape: (N_grid, N_grid, 3)
     
     # For each r, compute dot product with nabla_rho(r') and sum over r'
-    intermediate = np.einsum('ijk,ljk->li', weighted_grads, nabla_rho_paired)  # Shape: (Nb*Nb, N_grid)
+    intermediate = einsum('ijk,ljk->li', weighted_grads, nabla_rho_paired)  # Shape: (Nb*Nb, N_grid)
     
     # Step 2: Final summation - O(N_grid * Nb^4)
     # (qs|pr) -> (pr|qs) : swap indices to follow chemists' notation for two-electron integrals
-    result = np.einsum('pi,qi,i->pq', rho_paired, intermediate, weights).swapaxes(0, 1)
+    result = einsum('pi,qi,i->pq', rho_paired, intermediate, weights).swapaxes(0, 1)
     
     return result
 
@@ -61,10 +63,10 @@ def calc_K3(rho_paired, u_gradients, weights):
     u_grad_squared = np.sum(u_gradients**2, axis=-1)  # Shape: (N_grid, N_grid)
     
     # Multiply by weights for both r and r'
-    weighted_u_squared = u_grad_squared * weights[:, np.newaxis] * weights[np.newaxis, :]
+    weighted_u_squared = u_grad_squared * weights[np.newaxis, :] * weights[:, np.newaxis]  # Shape: (N_grid, N_grid)
     
     # Compute final integral using einsum for efficiency
-    result = np.einsum('pi,ij,qj->pq', rho_paired, weighted_u_squared, rho_paired)
+    result = einsum('pi,ij,qj->pq', rho_paired, weighted_u_squared, rho_paired)
     
     return result
 

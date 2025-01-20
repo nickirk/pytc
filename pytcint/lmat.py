@@ -19,7 +19,7 @@ def calc_v_vector(rho_paired, u_gradients, weights):
         Array of shape (Nb*Nb, N_grid, 3) containing V_qt(r₁) vectors
     """
     # Multiply gradients by weights for r₂ integration
-    weighted_rho_paired = rho_paired * weights[None, :]  # Shape: (N_grid, N_grid, 3)
+    weighted_rho_paired = rho_paired * weights[None, :]  # Shape: (N_b, N_grid )
     
     # Compute V_qt(r₁) by summing over r₂
     v_vector = einsum('ijk,li->ljk', u_gradients, weighted_rho_paired)
