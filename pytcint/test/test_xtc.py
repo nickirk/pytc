@@ -2,10 +2,11 @@
 
 import unittest
 import os 
-os.environ['OMP_NUM_THREADS'] = '4'
-os.environ['MKL_NUM_THREADS'] = '4'
-os.environ['OPENBLAS_NUM_THREADS'] = '4'
-
+#os.environ['OMP_NUM_THREADS'] = '4'
+#os.environ['MKL_NUM_THREADS'] = '4'
+#os.environ['OPENBLAS_NUM_THREADS'] = '4'
+import pyscf
+print("Using PySCF from: ", pyscf.__file__)
 import numpy as np
 
 from pyscf import gto, scf
@@ -19,6 +20,7 @@ def get_be_ccpvdz():
     mol = gto.M(atom='Be 0 0 0', basis='ccpvdz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
+    
     return mol, mf
 
 class TestXTC(unittest.TestCase):
@@ -114,9 +116,11 @@ class TestXTC(unittest.TestCase):
     def test_nhccsd(self):
         from pyscf.cc import rccsd, CCSD
         mycc = CCSD(self.mf).run()
+        mycc.verbose = 5
         print("E_CCSD = ", mycc.e_corr)
 
         myrcc = rccsd.RCCSD(self.mf)
+        myrcc.verbose = 5
         eris = self.xtc.make_eris()
         myrcc.kernel(eris=eris)
         print("E_XTC_CCSD = ", myrcc.e_corr)

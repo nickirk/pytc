@@ -103,8 +103,8 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
             
         # Calculate δh using einstein summation
-        term1 = einsum('qspr,rs->qp', delta_U, dm1)
-        term2 = einsum('sqpr,rs->qp', delta_U, dm1)
+        term1 = einsum('qpsr,rs->qp', delta_U, dm1)
+        term2 = einsum('spqr,rs->qp', delta_U, dm1)
         delta_h = -0.5 * (term1 - term2)
         return delta_h
 
