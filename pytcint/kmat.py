@@ -14,10 +14,10 @@ def calc_K1(rho_paired, nabla_rho_paired, u_gradients, weights):
     """
     # Step 1: Sum over r' first at each r - O(N_grid^2 * Nb^2)
     # Multiply gradients by weights for r' integration
-    weighted_grads = u_gradients * weights[np.newaxis, :, np.newaxis]  # Shape: (N_grid, N_grid, 3)
+    #weighted_grads = u_gradients * weights[np.newaxis, :, np.newaxis]  # Shape: (N_grid, N_grid, 3)
     
     # For each r, compute dot product with nabla_rho(r') and sum over r'
-    intermediate = einsum('ijk,ljk->li', weighted_grads, nabla_rho_paired)  # Shape: (Nb*Nb, N_grid)
+    intermediate = einsum('n,inc,nmc->im', weights, nabla_rho_paired, u_gradients)  # Shape: (Nb*Nb, N_grid)
     
     # Step 2: Final summation - O(N_grid * Nb^4)
     # (qs|pr) -> (pr|qs) : swap indices to follow chemists' notation for two-electron integrals
@@ -65,7 +65,6 @@ def calc_K3(rho_paired, u_gradients, weights):
     # Multiply by weights for both r and r'
     weighted_u_squared = u_grad_squared * weights[np.newaxis, :] * weights[:, np.newaxis]  # Shape: (N_grid, N_grid)
     
-    # Compute final integral using einsum for efficiency
     result = einsum('pi,ij,qj->pq', rho_paired, weighted_u_squared, rho_paired)
     
     return result

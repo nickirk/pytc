@@ -121,7 +121,7 @@ class TC:
 
         # add the original two-body integrals using ao2mo
         eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff)
-        result += ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
+        result = ao2mo.restore(1, eri1, self.mo_coeff.shape[1]) - result
         return result
     
     def _get_K1(self, rho_paired, nabla_rho_paired, u_gradients):

@@ -22,7 +22,7 @@ def calc_v_vector(rho_paired, u_gradients, weights):
     weighted_rho_paired = rho_paired * weights[None, :]  # Shape: (N_b, N_grid )
     
     # Compute V_qt(r₁) by summing over r₂
-    v_vector = einsum('ijk,li->ljk', u_gradients, weighted_rho_paired)
+    v_vector = einsum('ijc,li->ljc', u_gradients, weighted_rho_paired)
     
     return v_vector
 

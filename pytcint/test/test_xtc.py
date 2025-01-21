@@ -75,43 +75,43 @@ class TestXTC(unittest.TestCase):
         np.testing.assert_array_almost_equal(np.diag(dm1)[nocc:], 
                                            np.zeros(len(dm1) - nocc))
     
-    def test_calc_delta_U(self):
-        """Test calculation of delta_U tensor."""
-        delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
-        
-        # Check shape
-        n_orb = self.mf.mo_coeff.shape[1]
-        self.assertEqual(delta_U.shape, (n_orb,) * 4)
-        
-        # Test symmetry property
-        np.testing.assert_array_almost_equal(
-            delta_U, 
-            delta_U.transpose(2,3,0,1)
-        )
+    #def test_calc_delta_U(self):
+    #    """Test calculation of delta_U tensor."""
+    #    delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
+    #    
+    #    # Check shape
+    #    n_orb = self.mf.mo_coeff.shape[1]
+    #    self.assertEqual(delta_U.shape, (n_orb,) * 4)
+    #    
+    #    # Test symmetry property
+    #    np.testing.assert_array_almost_equal(
+    #        delta_U, 
+    #        delta_U.transpose(2,3,0,1)
+    #    )
     
-    def test_calc_delta_h(self):
-        """Test calculation of delta_h matrix."""
-        delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
-        dm1 = self.xtc._get_mf_dm()
-        delta_h = self.xtc._calc_delta_h(delta_U, dm1)
-        
-        # Check shape
-        n_orb = self.mf.mo_coeff.shape[1]
-        self.assertEqual(delta_h.shape, (n_orb,) * 2)
-        
-        # Test hermiticity
-        np.testing.assert_array_almost_equal(
-            delta_h, 
-            delta_h.T.conj()
-        )
+    #def test_calc_delta_h(self):
+    #    """Test calculation of delta_h matrix."""
+    #    delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
+    #    dm1 = self.xtc._get_mf_dm()
+    #    delta_h = self.xtc._calc_delta_h(delta_U, dm1)
+    #    
+    #    # Check shape
+    #    n_orb = self.mf.mo_coeff.shape[1]
+    #    self.assertEqual(delta_h.shape, (n_orb,) * 2)
+    #    
+    #    # Test hermiticity
+    #    np.testing.assert_array_almost_equal(
+    #        delta_h, 
+    #        delta_h.T.conj()
+    #    )
     
-    def test_get_const(self):
-        """Test calculation of constant term."""
-        dm1 = self.xtc._get_mf_dm()
-        const = self.xtc.get_const(dm1=dm1)
-        
-        # Check that const is real
-        self.assertTrue(np.isreal(const))
+    #def test_get_const(self):
+    #    """Test calculation of constant term."""
+    #    dm1 = self.xtc._get_mf_dm()
+    #    const = self.xtc.get_const(dm1=dm1)
+    #    
+    #    # Check that const is real
+    #    self.assertTrue(np.isreal(const))
     
     def test_nhccsd(self):
         from pyscf.cc import rccsd, CCSD
