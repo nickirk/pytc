@@ -40,52 +40,34 @@ class Jastrow(ABC):
 
 
 class SimpleJastrow(Jastrow):
-    """Simple Jastrow factor of form: u(r1,r2) = a|r1-r2|/(1 + b|r1-r2|)"""
+    """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     
-    def __init__(self, params):
-        """Initialize with parameters [a, b]."""
-        super().__init__(params)
-        self.a = params[0]
-        self.b = params[1]
-
     def __call__(self, r1, r2, atomic_positions=None):
-        """Evaluate electron-electron Jastrow factor.
+        """Evaluate Jastrow factor at given positions."""
+        r1 = np.atleast_2d(r1)  # Ensure 2D array with shape (N, 3)
+        r2 = np.atleast_2d(r2)  # Ensure 2D array with shape (M, 3)
         
-        Args:
-            r1: Array of shape (..., 3) representing electron positions
-            r2: Array of shape (..., 3) representing electron positions
-            atomic_positions: Not used in this implementation
-        """
-        # Ensure inputs are arrays and expand dims for broadcasting
-        r1 = np.asarray(r1)[..., np.newaxis, :]
-        r2 = np.asarray(r2)[np.newaxis, ...]
+        delta_r = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
+        result = 0.5*1./self.params[0]*np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
         
-        diff = r1 - r2
-        dist = np.sqrt(np.sum(diff * diff, axis=-1))
-        dist = np.where(dist < 1e-10, 1e-10, dist)
-        
-        denom = 1.0 + self.b * dist
-        return self.a * dist / denom
-
+        # Handle single point inputs
+        if r1.shape[0] == 1 and r2.shape[0] == 1:
+            result = result.reshape(1, 1)
+            
+        return result
+    
     def grad(self, r1, r2=None, atomic_positions=None):
-        """Compute gradient with coordinates as last dimension.
-        
-        Args:
-            r1: Array of shape (..., 3) representing electron positions
-            r2: Optional array of shape (..., 3). If None, use r1
-            atomic_positions: Not used in this implementation
-        """
-        r1 = np.asarray(r1)
-        r2 = np.asarray(r2) if r2 is not None else r1
+        """Compute gradient with respect to coordinates."""
+        r1 = np.atleast_2d(r1)
+        r2 = np.atleast_2d(r2) if r2 is not None else r1
         
         diff = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
-        dist = np.linalg.norm(diff, axis=-1, keepdims=True)
-        dist = np.where(dist < 1e-10, 1e-10, dist)
+        norm = np.linalg.norm(diff, axis=-1, keepdims=True)
+        norm = np.where(norm == 0, 1.0, norm)
         
-        denom = 1.0 + self.b * dist
-        du_dr = self.a / (denom * denom)
-        
-        return du_dr * diff
+        # Note: Use the reshaped call result for proper broadcasting
+        jastrow_values = self.__call__(r1, r2)[..., np.newaxis]
+        return -0.5*self.params[0] * diff / norm * jastrow_values
 
 class SM7(Jastrow):
     """Schmidt-Moskowitz 7-parameter Jastrow factor."""

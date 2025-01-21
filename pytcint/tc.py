@@ -74,7 +74,7 @@ class TC:
             # Shape: (N_mo, N_grid)
             mo_values = np.dot(self.mo_coeff.T, ao_values)
             # Shape: (N_mo, N_grid, 3)
-            mo_gradients = einsum('ji,jnc->inc', self.mo_coeff.T, ao_gradients)
+            mo_gradients = einsum('ji,jnc->inc', self.mo_coeff, ao_gradients)
             ao_values, ao_gradients = mo_values, mo_gradients
         
         # Cache results
@@ -108,21 +108,23 @@ class TC:
         # Get cached intermediates
         rho, nabla_rho, u_gradients, rho_paired = self._get_intermediates()
         
-        # Update nabla_rho_paired for new array shapes
-        nabla_rho_paired = einsum('inc,jn->ijnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
+        # Update nabla_rho_paired for new array shapes, \phi_p * \nabla \phi_r
+        nabla_rho_paired = einsum('rnc,pn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
         
         # Compute integrals
         k_nabla = self._get_K1(rho_paired, nabla_rho_paired, u_gradients)
         k_laplacian = self._get_K2(rho_paired, nabla_rho_paired, u_gradients)
         k_square = self._get_K3(rho_paired, u_gradients)
         
-        result = 0.5 * (k_laplacian + k_square) + k_nabla
+        result = 0.5 * (k_laplacian + k_square)
         result += result.transpose(2, 3, 0, 1)
+        result += k_nabla + k_nabla.transpose(2, 3, 0, 1)
 
         # add the original two-body integrals using ao2mo
-        eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff)
-        result = ao2mo.restore(1, eri1, self.mo_coeff.shape[1]) - result
-        return result
+        eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
+        eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
+        
+        return eri1-result
     
     def _get_K1(self, rho_paired, nabla_rho_paired, u_gradients):
         """Compute the K1 integral <pq|∇u·∇|rs>.

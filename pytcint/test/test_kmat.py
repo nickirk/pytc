@@ -18,7 +18,7 @@ class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     def __call__(self, r1, r2, atomic_positions=None):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        return np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+        return np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
     
     def grad(self, r1, r2=None, atomic_positions=None):
         if r2 is None:
@@ -26,7 +26,7 @@ class SimpleJastrow(Jastrow):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
         norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return -self.parameters[0] * delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
+        return -self.params[0] * delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
 
 
 class TestKmat(unittest.TestCase):

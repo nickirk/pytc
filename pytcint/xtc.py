@@ -88,7 +88,7 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
         
         delta_h = self.get_delta_h(dm1)
-        const = -1/3 * einsum('qp,pq->', delta_h, dm1)
+        const = -2/3 * einsum('qp,pq->', delta_h, dm1)
         const += self.mf.energy_nuc()
         return const
 
@@ -103,7 +103,7 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
             
         # Calculate δh using einstein summation
-        term1 = einsum('qpsr,rs->qp', delta_U, dm1)
+        term1 = 2*einsum('qpsr,rs->qp', delta_U, dm1)
         term2 = einsum('spqr,rs->qp', delta_U, dm1)
         delta_h = -0.5 * (term1 - term2)
         return delta_h
@@ -150,13 +150,13 @@ class XTC(TC):
         # weight the rho using self.weights
         rho_weighted = rho * self.weights[None, None, :]
         # Calculate intermediates
-        W = einsum('tuix,ut->ix', V, dm1)  # (N_grid, 3)
+        W = 2*einsum('utix,tu->ix', V, dm1)  # (N_grid, 3)
         Vbar = einsum('ix,srix->sri', W, V)  # (Nb, Nb, N_grid, 3)
         
         X = einsum('stix,tu->suix', V, dm1)  # (Nb, N_grid, 3)
         Zbar = einsum('urid,suid->sri', V, X)  # (Nb, Nb, N_grid, 3)
         
-        Wbar = einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
+        Wbar = 2*einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
         Y = einsum('urix,tu->trix', V, dm1)  # (Nb, Nb, N_grid, 3)
         G = (einsum('uri,suix->srix', rho_weighted, X) + 
              einsum('trix,sti->srix', Y, rho_weighted))  # (Nb, Nb, N_grid, 3)
@@ -183,8 +183,8 @@ class XTC(TC):
 
         eris = rccsd._ChemistsERIs(mycc)
         eris.e_core = self.get_const()
-        eris.fock = self.get_1b()
-        h2e = self.get_2b()
+        eris.fock = self.get_1b().copy()
+        h2e = self.get_2b().transpose(1,0,3,2)
         eris.fock += 2 * einsum('pqii->pq', h2e[:,:,:nocc,:nocc])
         eris.fock -= einsum('piiq->pq', h2e[:,:nocc,:nocc,:])
 
