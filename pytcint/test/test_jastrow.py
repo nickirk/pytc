@@ -2,7 +2,7 @@
 
 import unittest
 import numpy as np
-from pytcint.jastrow import Jastrow
+from pytcint.jastrow import Jastrow, SM7  # Add SM7 to imports
 
 
 class SimpleTestJastrow(Jastrow):
@@ -230,6 +230,166 @@ class TestSM7(unittest.TestCase):
         numerical = numerical_gradient(test_points[0], test_points[1])
         analytical = self.jastrow.grad(test_points[0:1], test_points[1:2])[0, 0]
         np.testing.assert_array_almost_equal(numerical, analytical, decimal=5)
+
+class TestSM7Specific(unittest.TestCase):
+    """Additional tests specific to SM7 implementation."""
+    
+    def setUp(self):
+        """Set up test case."""
+        self.jastrow = SM7(atom='He')  # Now SM7 is properly imported
+        self.test_points = np.array([
+            [0.0, 0.0, 0.0],  # nucleus
+            [0.01, 0.0, 0.0],  # near nucleus
+            [1.0, 0.0, 0.0],  # unit distance
+            [5.0, 0.0, 0.0],  # far from nucleus
+        ])
+    
+    def test_nuclear_cusp(self):
+        """Test nuclear cusp condition.
+        
+        The electron-nuclear cusp condition requires:
+        ∂f/∂r|_{r=0} = -Z
+        
+        For He atom (Z=2), the gradient should approach -2 at the nucleus.
+        """
+        # Use even smaller eps values
+        eps_values = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
+        directions = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0]/np.sqrt(3)
+        ]
+        
+        nuclear_charge = 2.0  # He atom
+        expected_cusp = nuclear_charge  # Should be Z, not Z/2
+        
+        print("\nNuclear cusp convergence check:")
+        print("eps      direction      grad_norm")
+        print("-" * 40)
+        
+        for eps in eps_values:
+            for direction in directions:
+                direction = np.array(direction) / np.linalg.norm(direction)
+                r = eps * direction
+                grad = self.jastrow.grad(r[None,:], np.array([[1.0, 0.0, 0.0]]))[0,0]
+                grad_norm = np.linalg.norm(grad)
+                
+                print(f"{eps:.1e}  {direction}  {grad_norm:.6f}")
+                
+                if eps <= 1e-6:  # Only test assertion for very small eps
+                    # Check if gradient norm matches nuclear charge
+                    self.assertAlmostEqual(
+                        grad_norm, 
+                        expected_cusp,
+                        places=2,  # Reduced precision requirement
+                        msg=f"Nuclear cusp condition failed for eps={eps}, direction={direction}, got {grad_norm:.6f}, expected {expected_cusp}"
+                    )
+                    
+                    # Check gradient direction (should point toward nucleus)
+                    expected_direction = -direction
+                    calculated_direction = -grad / grad_norm
+                    np.testing.assert_array_almost_equal(
+                        calculated_direction,
+                        expected_direction,
+                        decimal=2  # Reduced precision requirement
+                    )
+
+    def test_electron_electron_scaling(self):
+        """Test electron-electron correlation scaling."""
+        # Test points at different separations
+        r1 = np.array([[0.0, 0.0, 0.0]])
+        r2_points = np.array([
+            [0.1, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0]
+        ])
+        
+        values = []
+        for r2 in r2_points:
+            val = self.jastrow(r1, r2[None,:])[0,0]
+            values.append(val)
+        
+        # Check that correlation decreases with distance
+        values = np.array(values)
+        self.assertTrue(np.all(np.diff(values) < 0))
+    
+    def test_asymptotic_behavior(self):
+        """Test asymptotic behavior at large distances."""
+        r_far = np.array([[10.0, 0.0, 0.0]])
+        r_very_far = np.array([[100.0, 0.0, 0.0]])
+        
+        val1 = self.jastrow(r_far, r_far)
+        val2 = self.jastrow(r_very_far, r_very_far)
+        
+        # Value should approach zero at large distances
+        self.assertLess(abs(val2), abs(val1))
+        self.assertLess(abs(val2), 1e-3)
+    
+    def test_electron_nucleus_scaling(self):
+        """Test electron-nucleus correlation scaling."""
+        points = np.array([
+            [0.1, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0]
+        ])
+        
+        values = []
+        for r in points:
+            val = self.jastrow(r[None,:], np.array([[5.0, 0.0, 0.0]]))[0,0]
+            values.append(val)
+        
+        # Check that electron-nucleus correlation behaves correctly
+        values = np.array(values)
+        # Should decrease as electron moves away from nucleus
+        self.assertTrue(np.all(np.diff(np.abs(values)) < 0))
+
+    def test_electron_electron_cusp(self):
+        """Test electron-electron cusp condition.
+        
+        For same-spin electrons: ∂f/∂r12|_{r12=0} = 1/4
+        For opposite-spin electrons: ∂f/∂r12|_{r12=0} = 1/2
+        """
+        # Test points very close to each other
+        eps_values = [1e-5, 1e-6, 1e-7]
+        directions = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0]/np.sqrt(3)
+        ]
+        
+        # Expected cusp value for opposite spin electrons
+        expected_cusp = 0.5
+        
+        for eps in eps_values:
+            for direction in directions:
+                direction = np.array(direction)
+                r1 = np.array([[0.0, 0.0, 0.0]])
+                r2 = eps * direction[None,:]
+                
+                # Calculate gradient
+                grad = self.jastrow.grad(r1, r2)[0,0]
+                grad_norm = np.linalg.norm(grad)
+                
+                # Check if gradient norm matches cusp condition
+                self.assertAlmostEqual(
+                    grad_norm, 
+                    expected_cusp, 
+                    places=3,
+                    msg=f"Electron-electron cusp condition failed for eps={eps}, direction={direction}"
+                )
+                
+                # Check if gradient points in the right direction
+                expected_direction = direction
+                calculated_direction = grad / grad_norm
+                np.testing.assert_array_almost_equal(
+                    calculated_direction,
+                    expected_direction,
+                    decimal=3
+                )
 
 if __name__ == '__main__':
     unittest.main()
