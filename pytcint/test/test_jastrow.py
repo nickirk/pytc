@@ -14,7 +14,7 @@ class SimpleTestJastrow(Jastrow):
         r2 = np.atleast_2d(r2)  # Ensure 2D array with shape (M, 3)
         
         delta_r = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
-        result = np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+        result = np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
         
         # Handle single point inputs
         if r1.shape[0] == 1 and r2.shape[0] == 1:
@@ -33,7 +33,7 @@ class SimpleTestJastrow(Jastrow):
         
         # Note: Use the reshaped call result for proper broadcasting
         jastrow_values = self.__call__(r1, r2)[..., np.newaxis]
-        return -self.parameters[0] * diff / norm * jastrow_values
+        return -self.params[0] * diff / norm * jastrow_values
 
 
 class TestJastrow(unittest.TestCase):
@@ -149,7 +149,7 @@ class TestJastrow(unittest.TestCase):
                 grad_norm = np.linalg.norm(gradients[0, 1])  # Use first-to-second point gradient
                 self.assertAlmostEqual(
                     grad_norm, 
-                    self.jastrow.parameters[0], places=5, 
+                    self.jastrow.params[0], places=5, 
                     msg=f"Cusp condition failed for eps={eps}, direction={direction}")
 
     def test_flexible_input(self):
@@ -176,30 +176,11 @@ class TestSM7(unittest.TestCase):
     
     @classmethod
     def setUpClass(cls):
-        """Set up test cases and load coefficient table."""
+        """Set up test cases."""
         from pytcint.jastrow import SM7
         
-        # Coefficient table for different atoms
-        cls.coeff_table = {
-            'He': {(0,0,1): 0.50000, (0,0,2): 0.50516, (0,0,3): -0.19313, (0,0,4): 0.30276,
-                  (2,0,0): -0.16995, (3,0,0): -0.34505, (4,0,0): -0.54777},
-            'Li': {(0,0,1): 0.50000, (0,0,2): 0.03104, (0,0,3): 0.48928, (0,0,4): -0.62908,
-                  (2,0,0): -0.07185, (3,0,0): -0.48761, (4,0,0): 0.40450},
-            'Be': {(0,0,1): 0.50000, (0,0,2): -0.05254, (0,0,3): 0.15355, (0,0,4): -0.30549,
-                  (2,0,0): -0.11928, (3,0,0): -0.17144, (4,0,0): 0.16652},
-            'B':  {(0,0,1): 0.50000, (0,0,2): -0.13852, (0,0,3): -0.06687, (0,0,4): -0.02026,
-                  (2,0,0): -0.12573, (3,0,0): -0.05320, (4,0,0): 0.06421},
-            'C':  {(0,0,1): 0.50000, (0,0,2): -0.14368, (0,0,3): -0.34102, (0,0,4): 0.30267,
-                  (2,0,0): -0.12272, (3,0,0): -0.05622, (4,0,0): 0.08462},
-            'N':  {(0,0,1): 0.50000, (0,0,2): -0.41390, (0,0,3): 0.10406, (0,0,4): 0.06374,
-                  (2,0,0): -0.12400, (3,0,0): 0.01909, (4,0,0): -0.00383},
-            'O':  {(0,0,1): 0.50000, (0,0,2): -0.57077, (0,0,3): 0.44725, (0,0,4): -0.16075,
-                  (2,0,0): -0.11696, (3,0,0): -0.01442, (4,0,0): 0.03312},
-            'F':  {(0,0,1): 0.50000, (0,0,2): -0.73946, (0,0,3): 0.81463, (0,0,4): -0.41861,
-                  (2,0,0): -0.11872, (3,0,0): -0.01973, (4,0,0): 0.02779},
-            'Ne': {(0,0,1): 0.50000, (0,0,2): -0.79266, (0,0,3): 1.05232, (0,0,4): -0.65615,
-                  (2,0,0): -0.13312, (3,0,0): -0.00131, (4,0,0): 0.09083}
-        }
+        # Create SM7 instance with He atom
+        cls.jastrow = SM7(atom='He')
         
         # Set up test grid points
         cls.grid_points = np.array([
@@ -208,9 +189,6 @@ class TestSM7(unittest.TestCase):
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0]
         ])
-        
-        # Create SM7 instance with He coefficients for testing
-        cls.jastrow = SM7(cls.coeff_table['He'])
 
     def test_eval_shape(self):
         """Test if eval returns correct shape."""

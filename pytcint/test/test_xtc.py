@@ -14,9 +14,8 @@ from pytcint.xtc import XTC
 from pytcint.lmat import calc_v_vector
 from pytcint.jastrow import SM7
 
-def get_h2_sto3g():
-    """Return a simple H2 molecule with STO-3G basis for testing."""
-    #mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto6g', unit='Bohr')
+def get_be_ccpvdz():
+    """Return a Be atom with cc-pVDZ basis for testing."""
     mol = gto.M(atom='Be 0 0 0', basis='ccpvdz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
@@ -29,21 +28,11 @@ class TestXTC(unittest.TestCase):
     def setUpClass(cls):
         """Set up test case using Be atom."""
         # Get mean-field data
-        _, cls.mf = get_h2_sto3g()
+        _, cls.mf = get_be_ccpvdz()
         
-        # SM7 coefficients for Be atom
-        cls.be_coefficients = {
-            (0,0,1): 0.50000, 
-            (0,0,2): -0.05254, 
-            (0,0,3): 0.15355, 
-            (0,0,4): -0.30549,
-            (2,0,0): -0.11928, 
-            (3,0,0): -0.17144, 
-            (4,0,0): 0.16652
-        }
         
         # Create SM7 instance with Be coefficients
-        cls.jastrow = SM7(cls.be_coefficients)
+        cls.jastrow = SM7(atom='Be')
         
         # Initialize XTC with SM7 Jastrow
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
