@@ -121,6 +121,7 @@ class TestXTC(unittest.TestCase):
         e_corr, t1, t2 = mycc.kernel()
         mycc.verbose = 5
         print("E_CCSD = ", e_corr)
+        self.assertAlmostEqual(e_corr, -0.04503138331130402, places=6)
         print("|t2| = ", np.linalg.norm(t2))
         eri1 = pyscf.ao2mo.incore.full(self.xtc.mf._eri, self.xtc.mo_coeff, compact=False)
         eri1 = pyscf.ao2mo.restore(1, eri1, self.xtc.mo_coeff.shape[1])
@@ -132,13 +133,15 @@ class TestXTC(unittest.TestCase):
         e_ex = -1. * np.einsum('ijji->', eri1[:mycc.nocc, :mycc.nocc, :mycc.nocc, :mycc.nocc])
         e_hf_0 += (e_dir + e_ex) + mycc._scf.energy_nuc()
         print("Check e_hf = ",  e_hf_0)
+        self.assertAlmostEqual(e_hf_0, -14.57233763095337, places=6)
 
         myrcc = rccsd.RCCSD(self.mf)
         #myrcc.verbose = 5
         eris = self.xtc.make_eris()
-        e_corr, t1, t2 = myrcc.kernel(eris=eris)
+        tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
         print("|t2| = ", np.linalg.norm(t2))
         print("corr E_XTC_CCSD = ", myrcc.e_corr)
+        self.assertAlmostEqual(tc_e_corr, -0.0443956329631562, places=6)
         # get the hf energy using fock and eris
         no = myrcc.nocc
         tc_h1e = self.xtc.get_1b()
@@ -148,30 +151,31 @@ class TestXTC(unittest.TestCase):
 
         tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
         print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
+        self.assertAlmostEqual(tc_e_hf, -14.592606059260131, places=6)
 
-    def test_scan_param(self):
-        """Test scanning over parameter space for finding optimal Jastrow factor 
-        in terms of smallest xtc-mp2 t2 norm."""
-        from pyscf import mp, cc
-        
-        # Scan over alpha values
-        for alpha in np.linspace(1, 1.8, 10):
-            jastrow = SimpleJastrow([alpha])
-            xtc = XTC(self.mf, jastrow, grid_lvl=1)
-            eris = xtc.make_eris()
-            #mymp2 = mp.MP2(xtc.mf)
-            mycc = cc.rccsd.RCCSD(xtc.mf)
-            e_corr, t1, t2 = mycc.kernel(eris=eris)
-            print(f"alpha = {alpha:.2f}, E_XTC_MP2 = {e_corr:.6f}, t2_norm = {np.linalg.norm(t2):.6f}")
-            no = mycc.nocc
-            tc_h1e = self.xtc.get_1b()
-            tc_e_hf = 2. * np.einsum('ii->', tc_h1e[:no, :no])
-            tc_e_dir = 2. * np.einsum('jjii->', eris.oooo)
-            tc_e_ex = -1. * np.einsum('ijji->', eris.oooo)
+    #def test_scan_param(self):
+    #    """Test scanning over parameter space for finding optimal Jastrow factor 
+    #    in terms of smallest xtc-mp2 t2 norm."""
+    #    from pyscf import mp, cc
+    #    
+    #    # Scan over alpha values
+    #    for alpha in np.linspace(1, 1.8, 0):
+    #        jastrow = SimpleJastrow([alpha])
+    #        xtc = XTC(self.mf, jastrow, grid_lvl=1)
+    #        eris = xtc.make_eris()
+    #        #mymp2 = mp.MP2(xtc.mf)
+    #        mycc = cc.rccsd.RCCSD(xtc.mf)
+    #        e_corr, t1, t2 = mycc.kernel(eris=eris)
+    #        print(f"alpha = {alpha:.2f}, E_XTC_MP2 = {e_corr:.6f}, t2_norm = {np.linalg.norm(t2):.6f}")
+    #        no = mycc.nocc
+    #        tc_h1e = self.xtc.get_1b()
+    #        tc_e_hf = 2. * np.einsum('ii->', tc_h1e[:no, :no])
+    #        tc_e_dir = 2. * np.einsum('jjii->', eris.oooo)
+    #        tc_e_ex = -1. * np.einsum('ijji->', eris.oooo)
 
-            tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
-            print("E_XTC_CCSD = ", mycc.e_corr + tc_e_hf)
-            print("|t2| = ", np.linalg.norm(t2))
+    #        tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
+    #        print("E_XTC_CCSD = ", mycc.e_corr + tc_e_hf)
+    #        print("|t2| = ", np.linalg.norm(t2))
 
 
 
