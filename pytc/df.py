@@ -42,20 +42,30 @@ def pivoted_cholesky(M, n_rank):
     return L[:, :n_rank], perm[:n_rank]
 
 def isdf_decompose_cholesky(rho, n_rank):
-    """ISDF decomposition using pivoted Cholesky.
+    """ISDF decomposition using pivoted Cholesky, generalized for tensors.
     
     Args:
-        rho: Input density matrix (N_b^2, N_grid)
+        rho: Input tensor (N_b, N_grid, *trailing_dims) or (N_b, N_grid)
         n_rank: Number of interpolation points
         
     Returns:
-        C: Selected columns from rho (N_b^2, n_rank)
+        C: Selected columns from rho (N_b, n_rank, *trailing_dims) or (N_b, n_rank)
         xi: Interpolation coefficients (n_rank, N_grid)
     """
-    N_b_sq, N_grid = rho.shape
+    # Get original shape and handle trailing dimensions
+    orig_shape = rho.shape
+    N_b, N_grid = orig_shape[:2]
     
-    # Form overlap matrix S = rho.T @ rho
-    S = rho.T @ rho
+    # Compute norm along trailing dimensions if they exist
+    if len(orig_shape) > 2:
+        # Reshape to (N_b, N_grid, -1) and take norm along last axis
+        rho_flat = rho.reshape(N_b, N_grid, -1)
+        rho_normed = np.linalg.norm(rho_flat, axis=-1)
+    else:
+        rho_normed = rho
+    
+    # Form overlap matrix S using normed tensor
+    S = rho_normed.T @ rho_normed
     
     # Add small diagonal shift for stability
     shift = 1e-12 * np.max(np.abs(np.diag(S)))
@@ -64,12 +74,31 @@ def isdf_decompose_cholesky(rho, n_rank):
     # Get interpolation points via pivoted Cholesky
     _, piv = pivoted_cholesky(S, n_rank)
     
-    # Select columns from original rho
-    C = rho[:, piv]
+    # Select columns from original tensor along grid dimension
+    if len(orig_shape) > 2:
+        # For tensor input, keep trailing dimensions
+        C = np.take(rho, piv, axis=1)
+    else:
+        # For matrix input
+        C = rho[:, piv]
     
-    # Solve least squares problem for interpolation coefficients
-    # min_xi ||rho - C @ xi||
-    xi, *_ = np.linalg.lstsq(C, rho, rcond=None)
+    # Reshape rho for least squares if needed
+    if len(orig_shape) > 2:
+        rho_2d = rho.reshape(N_b, N_grid, -1)
+        C_2d = C.reshape(N_b, len(piv), -1)
+        
+        # Solve least squares for each trailing component
+        xi_list = []
+        for i in range(rho_2d.shape[-1]):
+            xi_i, *_ = np.linalg.lstsq(C_2d[..., i], rho_2d[..., i], rcond=None)
+            xi_list.append(xi_i)
+        xi = np.stack(xi_list, axis=-1)
+        
+        # Reshape C back to original trailing dimensions
+        C = C.reshape(N_b, len(piv), *orig_shape[2:])
+    else:
+        # Standard least squares for matrix case
+        xi, *_ = np.linalg.lstsq(C, rho, rcond=None)
     
     return C, xi
 
@@ -90,8 +119,8 @@ def isdf_decompose_multi(rho1, rho2, n_rank1, n_rank2):
         piv_fused: Combined pivot indices
     """
     # Get pivots for each density separately
-    _, piv1 = pivoted_cholesky(rho1.T @ rho1, n_rank1)
-    _, piv2 = pivoted_cholesky(rho2.T @ rho2, n_rank2)
+    _, piv1 = pivoted_cholesky(rho1, n_rank1)
+    _, piv2 = pivoted_cholesky(rho2, n_rank2)
     
     # Combine and uniquify pivots
     piv_fused = np.unique(np.concatenate([piv1, piv2]))
@@ -107,8 +136,21 @@ def isdf_decompose_multi(rho1, rho2, n_rank1, n_rank2):
     return C1, xi1, C2, xi2, piv_fused
 
 def reconstruct_rho(C, xi):
-    """Reconstruct density using interpolation."""
-    return C @ xi
+    """Reconstruct tensor from decomposition.
+    
+    Args:
+        C: Selected columns (N_b, n_rank, *trailing_dims)
+        xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
+        
+    Returns:
+        Reconstructed tensor with same shape as original
+    """
+    if C.ndim > 2:
+        # For tensor case, do contraction preserving trailing dimensions
+        return np.einsum('br...,rg...->bg...', C, xi)
+    else:
+        # Matrix case
+        return C @ xi
 
 def test_accuracy(rho_orig, C, P):
     """Calculate reconstruction relative error."""
