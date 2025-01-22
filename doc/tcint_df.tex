@@ -1,0 +1,91 @@
+\documentclass[12pt]{article}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{physics}
+\usepackage{siunitx}
+\usepackage{braket}
+
+\title{Low-rank Approximations in Transcorrelated Integrals}
+\author{Ke Liao}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+The transcorrelated method combined with density-fitting approximation provides an efficient approach to electronic structure calculations.
+
+\section{Theoretical Framework}
+\subsection{Transcorrelation Theory}
+The transcorrelated Hamiltonian is a similarity transformation 
+on the original Hamiltonian in real space:
+\begin{equation}
+    \bar{H} = e^{-\hat{\hat{\tau}}} H e^{\hat{\hat{\tau}}}
+\end{equation}
+where $e^{\hat{\hat{\tau}}}$ is the so-called Jastrow factor and 
+$\hat{\tau}$ is the correlation factor operator. 
+A simple form of $\hat{\tau}$ is given by the two-body Jastrow factor:
+\begin{equation}
+    \hat{\tau} = \frac{1}{2}\sum_{ij}^N  u(r_{ij})
+\end{equation}
+where $f(r_{ij})$ is a correlation function that depends on the inter-electron distance $r_{ij}$.
+
+The TC Hamiltonian can be expanded using the Baker-Campbell-Hausdorff (BCH) formula and it terminates exactly
+at the second commutator, generating additional two-body and three-body terms:
+\begin{equation}
+    \begin{aligned}
+        \bar{H} &= \hat{H} + [\hat{\tau}, \hat{H}] + \frac{1}{2}[[\hat{\tau}, \hat{H}], \hat{\tau}]  \\
+        &= \hat{H} - \frac{1}{2}\sum_{ij}\mathcal{P}({{\bf r}_i},{{\bf r}_j})\left[\frac{1}{2}(\nabla_i^2 u({\bf r}_i,{\bf r}_j) + (\nabla_i u({\bf r}_i,{\bf r}_j))^2) + \nabla_i u({\bf r}_i,{\bf r}_j)\cdot\nabla_i\right]\\
+        & - \frac{1}{6}\sum_{ijk}\mathcal{P}({{\bf r}_i},{{\bf r}_j},{\bf r}_k)\nabla_i u({\bf r}_i,{\bf r}_j)\cdot\nabla_i u({\bf r}_i,{\bf r}_k)
+    \end{aligned}
+\end{equation}
+
+Using a set of orbitals $\{\phi_p\}$, the TC Hamiltonian can be expressed in the second quantization form:
+\begin{equation}
+    \bar{H} = \sum_{pq} h_{pq} a_p^\dagger a_q + \frac{1}{2} (V^{pq}_{rs}-K^{pq}_{rs}) a_p^\dagger a_q^\dagger a_s a_r - \frac{1}{6}L^{pqr}_{stu}a_p^\dagger a_q^\dagger a_r^\dagger a_u a_t a_s
+\end{equation}
+where we use the Einstein summation convention.
+We have the K and L tensors defined as:
+\begin{equation}
+    \begin{aligned}
+        K^{pq}_{rs} &= \hat{\mathcal{P}}_{12}\left[\braket{\phi_p({\bf r}_1)\phi_q({\bf r}_2)|\frac{1}{2}(\nabla_1^2 u({\bf r}_1,{\bf r}_2)+(\nabla_1 u({\bf r}_1,{\bf r}_2))^2)+\nabla_1 u({\bf r}_1,{\bf r}_2)\cdot\nabla_1|\phi_r({\bf r}_1)\phi_s({\bf r}_2)}\right] \\
+        L^{pqr}_{stu} &= \hat{\mathcal{P}}_{123}\braket{\phi_p({\bf r}_1)\phi_q({\bf r}_2)\phi_r({\bf r}_3)|\nabla_1 u({\bf r}_1,{\bf r}_2)\cdot\nabla_1 u({\bf r}_1,{\bf r}_3)|\phi_s({\bf r}_1)\phi_t({\bf r}_2)\phi_u({\bf r}_3)}
+    \end{aligned}
+\end{equation}
+
+
+\subsection{Interpolative Density-Fitting Approximation}
+We see that the main quantity to approximate in the K and L tensors is the three-center integrals:
+\begin{equation}
+    \begin{aligned}
+    {\bf G}({\bf r}_1,{\bf r}_2)&=\nabla_1 u({\bf r}_1,{\bf r}_2)\\
+    \rho^p_q ({\bf r})&= \phi^*_p({\bf r})\phi_q({\bf r})\\
+    {\bf W}^p_q({\bf r}) &= \phi_q({\bf r}) \nabla_1\phi^*_p({\bf r})
+    \end{aligned}
+\end{equation}
+Let's first examine if the {\bf G}({\bf r}_1,{\bf r}_2) 
+can be approximated by a low-rank tensor. 
+
+
+\section{Implementation of DF in TC Integrals}
+\subsection{Three-Center Integrals}
+The three-center integrals in the context of TC theory:
+\begin{equation}
+    (pq|\alpha) = \int \phi_p(\mathbf{r_1}) \phi_q(\mathbf{r_1}) P_\alpha(\mathbf{r_2}) 
+    \frac{1}{|\mathbf{r_1} - \mathbf{r_2}|} d\mathbf{r_1}d\mathbf{r_2}
+\end{equation}
+
+\subsection{Modified TC Integrals}
+Discussion of how density-fitting modifies the TC integrals...
+
+\section{Computational Efficiency}
+Analysis of computational scaling and memory requirements...
+
+\section{Conclusions}
+Summary of the advantages and potential applications...
+
+\bibliography{references}
+\bibliographystyle{plain}
+
+\end{document}

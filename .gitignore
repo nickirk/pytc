@@ -6,5 +6,9 @@
 *.pyz
 
 .tchint/
+doc/*
+!doc/*.tex
+!doc/*.bib
+!doc/*.pdf
 
 __pycache__/

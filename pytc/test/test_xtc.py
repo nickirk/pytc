@@ -3,11 +3,6 @@
 import unittest
 import os 
 from functools import partial, reduce
-#os.environ['OMP_NUM_THREADS'] = '4'
-#os.environ['MKL_NUM_THREADS'] = '4'
-#os.environ['OPENBLAS_NUM_THREADS'] = '4'
-import pyscf
-print("Using PySCF from: ", pyscf.__file__)
 import numpy as np
 
 from pyscf import gto, scf
@@ -152,6 +147,33 @@ class TestXTC(unittest.TestCase):
         tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
         print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
         self.assertAlmostEqual(tc_e_hf, -14.592606059260131, places=6)
+
+    def test_isdf(self):
+        """Test ISDF decomposition of paired densities."""
+        # Get decomposition with small rank for testing
+        n_rank = 50
+        result = self.xtc.isdf(n_rank=n_rank)
+        
+        # Check that all expected keys are present
+        expected_keys = ['C_rho', 'xi_rho', 'C_grad', 'xi_grad', 'pivots',
+                        'rho_paired', 'rho_grad_normed']
+        for key in expected_keys:
+            self.assertIn(key, result)
+        
+        # Check reconstruction accuracy
+        rho_recon = result['C_rho'] @ result['xi_rho']
+        grad_recon = result['C_grad'] @ result['xi_grad']
+        
+        rel_error_rho = np.linalg.norm(rho_recon - result['rho_paired']) / np.linalg.norm(result['rho_paired'])
+        rel_error_grad = np.linalg.norm(grad_recon - result['rho_grad_normed']) / np.linalg.norm(result['rho_grad_normed'])
+        
+        # Check reasonable errors
+        self.assertLess(rel_error_rho, 1e-4)
+        self.assertLess(rel_error_grad, 1e-4)
+        
+        # Check number of pivots is reasonable
+        self.assertLessEqual(len(result['pivots']), 2 * n_rank)
+        self.assertGreaterEqual(len(result['pivots']), n_rank)
 
     #def test_scan_param(self):
     #    """Test scanning over parameter space for finding optimal Jastrow factor 

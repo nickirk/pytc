@@ -5,6 +5,7 @@ from functools import partial
 from pyscf import dft, ao2mo
 from . import kmat
 from . import lmat
+from . import df
 
 # Create an optimized einsum that always uses the 'optimal' path
 einsum = partial(np.einsum, optimize='optimal')
@@ -90,6 +91,9 @@ class TC:
             self._u_gradients = self.jastrow_factor.grad(self.grid_points)
             self._rho_paired = einsum('in,jn->ijn', self._rho, self._rho).reshape(-1, self._rho.shape[1])
         return self._rho, self._nabla_rho, self._u_gradients, self._rho_paired
+
+    def isdf():
+        """Perform ISDF decomposition."""
     
     def get_2b(self):
         """Compute all two-body integrals involving the Jastrow factor.
