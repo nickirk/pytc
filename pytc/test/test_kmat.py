@@ -3,7 +3,7 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft
-from pytcint.jastrow import Jastrow
+from pytc.jastrow import Jastrow
 
 
 def get_h2_sto3g():
@@ -66,7 +66,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k1_shape(self):
         """Test if K1 (nabla) integral has correct shape."""
-        from pytcint.kmat import calc_K1
+        from pytc.kmat import calc_K1
         k1 = calc_K1(
             self.rho_paired,
             self.nabla_rho_paired,
@@ -77,7 +77,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k2_shape(self):
         """Test if K2 (laplacian) integral has correct shape."""
-        from pytcint.kmat import calc_K2
+        from pytc.kmat import calc_K2
         k2 = calc_K2(
             self.rho_paired,
             self.nabla_rho_paired,
@@ -88,7 +88,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k3_shape(self):
         """Test if K3 (square) integral has correct shape."""
-        from pytcint.kmat import calc_K3
+        from pytc.kmat import calc_K3
         k3 = calc_K3(
             self.rho_paired,
             self.u_gradients,  # Pre-computed gradients
@@ -98,7 +98,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k2_k3_symmetry(self):
         """Test symmetry properties of K2 (laplacian) and K3 (square) integrals."""
-        from pytcint.kmat import calc_K2, calc_K3
+        from pytc.kmat import calc_K2, calc_K3
         
         k2 = calc_K2(
             self.rho_paired,
@@ -134,7 +134,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k1_k2_symmetry(self):
         """Test if K1 + K2 is equal to K1 with p and r indices swapped."""
-        from pytcint.kmat import calc_K1, calc_K2
+        from pytc.kmat import calc_K1, calc_K2
         
         k1 = calc_K1(
             self.rho_paired,

@@ -1,8 +1,8 @@
 import numpy as np
 from functools import partial, reduce
 
-from pytcint.tc import TC
-from pytcint.lmat import calc_v_vector
+from pytc.tc import TC
+from pytc.lmat import calc_v_vector
 
 einsum = partial(np.einsum, optimize='optimal')
 class XTC(TC):

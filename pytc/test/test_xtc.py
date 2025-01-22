@@ -12,9 +12,9 @@ import numpy as np
 
 from pyscf import gto, scf
 
-from pytcint.xtc import XTC
-from pytcint.lmat import calc_v_vector
-from pytcint.jastrow import SM7, SimpleJastrow
+from pytc.xtc import XTC
+from pytc.lmat import calc_v_vector
+from pytc.jastrow import SM7, SimpleJastrow
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
