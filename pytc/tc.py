@@ -26,6 +26,7 @@ class TC:
         self.mol = mf.mol
         self.mo_coeff = mo_coeff if mo_coeff is not None else mf.mo_coeff
         self.n_orb = self.mo_coeff.shape[1]
+        self.verbose = mf.verbose if hasattr(mf, 'verbose') else 0  
         # Initialize grid
         self.grid_lvl = grid_lvl
         self.grid_points = None
@@ -39,7 +40,6 @@ class TC:
         self._rho = None
         self._nabla_rho = None
         self._u_gradients = None
-        self._rho_paired = None
         # Add an attribute to store ISDF results
         self._isdf_results = None
     
@@ -91,8 +91,7 @@ class TC:
         if self._rho is None:
             self._rho, self._nabla_rho = self._eval_basis_on_grid()
             self._u_gradients = self.jastrow_factor.grad(self.grid_points)
-            self._rho_paired = einsum('in,jn->ijn', self._rho, self._rho).reshape(-1, self._rho.shape[1])
-        return self._rho, self._nabla_rho, self._u_gradients, self._rho_paired
+        return self._rho, self._nabla_rho, self._u_gradients
 
     def isdf(self, n_rank=None):
         """Perform ISDF decomposition on paired densities and gradients.
@@ -109,9 +108,9 @@ class TC:
                 'pivots': Fused pivot indices
         """
     
-        # Get cached intermediates
-        rho, nabla_rho, u_gradients, rho_paired = self._get_intermediates()
-        # Update nabla_rho_paired for new array shapes, \phi_p * \nabla \phi_r
+        # Get cached intermediates and compute rho_paired
+        rho, nabla_rho, u_gradients = self._get_intermediates()
+        rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
         nabla_rho_paired = einsum('rnc,pn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
     
         # Set default rank if not provided
@@ -161,72 +160,51 @@ class TC:
             xi_grad = self._isdf_results['xi_grad']
             
             # Get cached u_gradients
-            _, _, u_gradients, _ = self._get_intermediates()
+            u_gradients = self._u_gradients
             
-            # Compute K matrices using ISDF
+            # Compute all K matrices using ISDF
             k_nabla = kmat.calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, self.weights)
-            # TODO: Implement and call calc_K2_isdf and calc_K3_isdf
+            k_laplacian = kmat.calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, self.weights)
+            k_square = kmat.calc_K3_isdf(C_rho, xi_rho, u_gradients, self.weights)
+
+            # reshape all K matrices
+            k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb) 
+            k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+            k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+            # Combine results
+            result = 0.5 * (k_laplacian + k_square)
+            result += k_nabla
+            result += result.transpose(2, 3, 0, 1)
             
-            # ...rest of the function remains the same...
+            # Add original two-body integrals
+            eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
+            eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
+            
+            return eri1-result
         else:
-            # Original logic (unchanged)
-            # Get cached intermediates
-            rho, nabla_rho, u_gradients, rho_paired = self._get_intermediates()
-            # Update nabla_rho_paired for new array shapes, \phi_p * \nabla \phi_r
+            # Original logic using direct calculation
+            rho, nabla_rho, u_gradients = self._get_intermediates()
+            rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
             nabla_rho_paired = einsum('rnc,pn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
             
-            # Compute integrals
-            k_nabla = self._get_K1(rho_paired, nabla_rho_paired, u_gradients)
-            k_laplacian = self._get_K2(rho_paired, nabla_rho_paired, u_gradients)
-            k_square = self._get_K3(rho_paired, u_gradients)
+            k_nabla = kmat.calc_K1(rho_paired, nabla_rho_paired, u_gradients, self.weights)
+            k_laplacian = kmat.calc_K2(rho_paired, nabla_rho_paired, u_gradients, self.weights)
+            k_square = kmat.calc_K3(rho_paired, u_gradients, self.weights)
+            
+            # Reshape all K matrices
+            n = self.n_orb
+            k_nabla = k_nabla.reshape(n,n,n,n)
+            k_laplacian = k_laplacian.reshape(n,n,n,n)
+            k_square = k_square.reshape(n,n,n,n)
             
             result = 0.5 * (k_laplacian + k_square)
             result += result.transpose(2, 3, 0, 1)
             result += k_nabla + k_nabla.transpose(2, 3, 0, 1)
 
-            # add the original two-body integrals using ao2mo
             eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
             eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
             
             return eri1-result
-
-    def _get_K1(self, rho_paired, nabla_rho_paired, u_gradients):
-        """Compute the K1 integral <pq|∇u·∇|rs>.
-        
-        Args:
-            rho_paired: Array of shape (N_grid, Nb*Nb) containing orbital products
-            nabla_rho_paired: Array of shape (3, N_grid, Nb*Nb) containing gradients
-            u_gradients: Array of shape (3, N_grid, N_grid) containing Jastrow gradients
-            
-        Returns:
-            Array of shape (n_orb, n_orb, n_orb, n_orb) containing reshaped K1 integrals
-        """
-        return kmat.calc_K1(rho_paired, nabla_rho_paired, u_gradients, self.weights).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-    
-    def _get_K2(self, rho_paired, nabla_rho_paired, u_gradients):
-        """Compute the K2 integral <pq|∇²₁u|rs>.
-        
-        Args:
-            rho_paired: Array of shape (N_grid, Nb*Nb) containing orbital products
-            nabla_rho_paired: Array of shape (3, N_grid, Nb*Nb) containing gradients
-            u_gradients: Array of shape (3, N_grid, N_grid) containing Jastrow gradients
-            
-        Returns:
-            Array of shape (n_orb, n_orb, n_orb, n_orb) containing reshaped K2 integrals
-        """
-        return kmat.calc_K2(rho_paired, nabla_rho_paired, u_gradients, self.weights).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-    
-    def _get_K3(self, rho_paired, u_gradients):
-        """Compute the K3 integral <pq|(∇₁u)²|rs>.
-        
-        Args:
-            rho_paired: Array of shape (N_grid, Nb*Nb) containing orbital products
-            u_gradients: Array of shape (3, N_grid, N_grid) containing Jastrow gradients
-            
-        Returns:
-            Array of shape (n_orb, n_orb, n_orb, n_orb) containing reshaped K3 integrals
-        """
-        return kmat.calc_K3(rho_paired, u_gradients, self.weights).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
 
     def get_3b(self, rho_paired, u_gradients):
         """Compute all three-body integrals involving the Jastrow factor. Use the lmat module.
