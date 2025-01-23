@@ -69,3 +69,88 @@ def calc_K3(rho_paired, u_gradients, weights):
     
     return result
 
+def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, weights):
+    """Directly evaluate <pq|∇u·∇|rs> using ISDF intermediates.
+    
+    Args:
+        C_rho: (Nb^2, n_fused) Selected columns for rho
+        xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
+        C_grad: (Nb^2, n_fused, 3) Selected columns for nabla_rho
+        xi_grad: (n_fused, N_grid, 3) Interpolation coeffs for grad
+        u_gradients: (N_grid, N_grid, 3) Jastrow gradients
+        weights: (N_grid,) Grid weights
+    
+    Returns:
+        (Nb^2, Nb^2) array in chemists' notation (pr|qs)
+    """
+    weighted_xi_grad = xi_grad * weights[None,:,None]
+    
+    # Process each spatial component using np.dot
+    G1_components = []
+    for c in range(3):
+        xi_slice = weighted_xi_grad[:,:,c]    # (n_fused, N_grid)
+        u_slice = u_gradients[:,:,c]          # (N_grid, M)
+        G1_c = np.dot(xi_slice, u_slice)      # (n_fused, M)
+        G1_components.append(G1_c)
+    
+    G1 = np.stack(G1_components, axis=-1)     # (n_fused, M, 3)
+    G1 = einsum('kmc,pkc->pm', G1, C_grad)    # (Nb^2, M)
+    
+    # Contract with xi_rho and weights
+    G2 = einsum('pm,lm,m->pl', G1, xi_rho, weights)
+    
+    # Final transformation
+    result = einsum('pl,ql->pq', G2, C_rho)
+    
+    return result
+
+def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, weights):
+    """Directly evaluate <pq|∇²₁u(r₁,r₂)|rs> using ISDF intermediates.
+    
+    Args:
+        C_rho: (Nb^2, n_fused) Selected columns for rho
+        xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
+        C_grad: (Nb^2, n_fused, 3) Selected columns for nabla_rho
+        xi_grad: (n_fused, N_grid, 3) Interpolation coeffs for grad
+        u_gradients: (N_grid, N_grid, 3) Jastrow gradients
+        weights: (N_grid,) Grid weights
+    
+    Returns:
+        (Nb^2, Nb^2) array in chemists' notation (pr|qs)
+    """
+    # Step 1: Compute the combined nabla term (∇ϕₑϕₛ + ϕₑ∇ϕₛ)
+    Nb = int(np.sqrt(C_grad.shape[0]))
+    C_grad_reshaped = C_grad.reshape(Nb, Nb, -1, 3)
+    C_grad_transposed = C_grad_reshaped.transpose(1, 0, 2, 3).reshape(-1, C_grad.shape[1], 3)
+    combined_C_grad = C_grad + C_grad_transposed
+
+    # Step 2: Reuse calc_K1_isdf with the combined gradient term
+    result = -calc_K1_isdf(C_rho, xi_rho, combined_C_grad, xi_grad, u_gradients, weights)
+
+    return result
+
+def calc_K3_isdf(C_rho, xi_rho, u_gradients, weights):
+    """Directly evaluate <pq|(∇₁u(r₁,r₂))²|rs> using ISDF intermediates.
+    
+    Args:
+        C_rho: (Nb^2, n_fused) Selected columns for rho
+        xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
+        u_gradients: (N_grid, N_grid, 3) Jastrow gradients
+        weights: (N_grid,) Grid weights
+    
+    Returns:
+        (Nb^2, Nb^2) array in chemists' notation (pr|qs)
+    """
+    # Step 1: Compute the squared magnitude of the gradient
+    u_grad_squared = np.sum(u_gradients**2, axis=-1)  # Shape: (N_grid, N_grid)
+
+    # Step 2: Multiply by weights for both r and r'
+    weighted_u_squared = u_grad_squared * weights[np.newaxis, :] * weights[:, np.newaxis]  # Shape: (N_grid, N_grid)
+
+    # Step 3: Contract xi_rho with weighted_u_squared
+    G1 = einsum('ki,ij,lj->kl', xi_rho, weighted_u_squared, xi_rho)
+
+    # Step 4: Transform to full space using C_rho
+    result = einsum('kl,pk,ql->pq', G1, C_rho, C_rho)
+
+    return result
