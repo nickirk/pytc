@@ -3,17 +3,24 @@ This module implements the density-fitting for transcorrelated integrals.
 """
 import numpy as np
 from scipy.linalg import qr
+from typing import Tuple, Union
 
-import numpy as np
-from scipy.linalg import solve_triangular
+def calculate_norm(rho: np.ndarray) -> np.ndarray:
+    """Calculate the norm of the input tensor along trailing dimensions.
+    Args:
+        rho: Input tensor (N_b, N_grid, *trailing_dims) or (N_b, N_grid)
+    Returns:
+        rho_normed: Normed tensor (N_b, N_grid)
+    """
+    if rho.ndim > 2:
+        return np.linalg.norm(rho.reshape(rho.shape[0], rho.shape[1], -1), axis=-1)
+    return rho
 
-def pivoted_cholesky(M, n_rank):
+def pivoted_cholesky(M: np.ndarray, n_rank: int) -> Tuple[np.ndarray, np.ndarray]:
     """Pivoted Cholesky decomposition with fixed rank.
-    
     Args:
         M: Input matrix to decompose (positive semi-definite)
         n_rank: Number of pivots to select
-        
     Returns:
         L: Lower triangular factor
         piv: Selected pivot indices
@@ -21,143 +28,148 @@ def pivoted_cholesky(M, n_rank):
     n = M.shape[0]
     perm = np.arange(n)
     L = np.zeros((n, n))
-    d = np.diag(M).copy()  # Diagonal elements
-    
+    d = np.diag(M).copy()
+
     for k in range(n_rank):
-        # Find maximum diagonal element
         if k > 0:
             d[perm[k:]] = np.diag(M)[perm[k:]] - np.sum(L[perm[k:], :k]**2, axis=1)
-        
-        # Select pivot
+
         pivot = k + np.argmax(d[perm[k:]])
         if pivot != k:
             perm[k], perm[pivot] = perm[pivot], perm[k]
-            
-        # Update L[:, k]
+
         L[perm[k], k] = np.sqrt(d[perm[k]])
         if k < n_rank - 1:
             row_k = M[perm[k], perm[k+1:]] - L[perm[k], :k] @ L[perm[k+1:], :k].T
             L[perm[k+1:], k] = row_k / L[perm[k], k]
-            
+
     return L[:, :n_rank], perm[:n_rank]
 
-def isdf_decompose_cholesky(rho, n_rank):
+def solve_least_squares(C: np.ndarray, rho: np.ndarray) -> np.ndarray:
+    """Solve least squares problem for interpolation coefficients.
+    Args:
+        C: Selected columns (N_b, n_rank, *trailing_dims)
+        rho: Original tensor (N_b, N_grid, *trailing_dims)
+
+    Returns:
+        xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
+    """
+    if C.ndim > 2:
+        xi_list = []
+        for i in range(rho.shape[-1]):
+            xi_i, *_ = np.linalg.lstsq(C[..., i], rho[..., i], rcond=None)
+            xi_list.append(xi_i)
+        return np.stack(xi_list, axis=-1)
+    else:
+        xi, *_ = np.linalg.lstsq(C, rho, rcond=None)
+        return xi
+
+def isdf_decompose_cholesky(rho: np.ndarray, n_rank: int) -> Tuple[np.ndarray, np.ndarray]:
     """ISDF decomposition using pivoted Cholesky, generalized for tensors.
-    
     Args:
         rho: Input tensor (N_b, N_grid, *trailing_dims) or (N_b, N_grid)
         n_rank: Number of interpolation points
-        
     Returns:
         C: Selected columns from rho (N_b, n_rank, *trailing_dims) or (N_b, n_rank)
-        xi: Interpolation coefficients (n_rank, N_grid)
+        xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims) or (n_rank, N_grid)
     """
-    # Get original shape and handle trailing dimensions
-    orig_shape = rho.shape
-    N_b, N_grid = orig_shape[:2]
-    
-    # Compute norm along trailing dimensions if they exist
-    if len(orig_shape) > 2:
-        # Reshape to (N_b, N_grid, -1) and take norm along last axis
-        rho_flat = rho.reshape(N_b, N_grid, -1)
-        rho_normed = np.linalg.norm(rho_flat, axis=-1)
-    else:
-        rho_normed = rho
-    
-    # Form overlap matrix S using normed tensor
+    rho_normed = calculate_norm(rho)
     S = rho_normed.T @ rho_normed
-    
-    # Add small diagonal shift for stability
-    shift = 1e-12 * np.max(np.abs(np.diag(S)))
-    S[np.diag_indices_from(S)] += shift
-    
-    # Get interpolation points via pivoted Cholesky
+    S[np.diag_indices_from(S)] += 1e-12 * np.max(np.abs(np.diag(S)))
+
     _, piv = pivoted_cholesky(S, n_rank)
-    
-    # Select columns from original tensor along grid dimension
-    if len(orig_shape) > 2:
-        # For tensor input, keep trailing dimensions
-        C = np.take(rho, piv, axis=1)
-    else:
-        # For matrix input
-        C = rho[:, piv]
-    
-    # Reshape rho for least squares if needed
-    if len(orig_shape) > 2:
-        rho_2d = rho.reshape(N_b, N_grid, -1)
-        C_2d = C.reshape(N_b, len(piv), -1)
-        
-        # Solve least squares for each trailing component
-        xi_list = []
-        for i in range(rho_2d.shape[-1]):
-            xi_i, *_ = np.linalg.lstsq(C_2d[..., i], rho_2d[..., i], rcond=None)
-            xi_list.append(xi_i)
-        xi = np.stack(xi_list, axis=-1)
-        
-        # Reshape C back to original trailing dimensions
-        C = C.reshape(N_b, len(piv), *orig_shape[2:])
-    else:
-        # Standard least squares for matrix case
-        xi, *_ = np.linalg.lstsq(C, rho, rcond=None)
-    
+    C = np.take(rho, piv, axis=1)
+    xi = solve_least_squares(C, rho)
+
     return C, xi
 
-def isdf_decompose_multi(rho1, rho2, n_rank1, n_rank2):
+def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank2: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """ISDF decomposition for two densities with pivot fusion.
-    
+
     Args:
-        rho1: First density matrix (N_b1^2, N_grid)
-        rho2: Second density matrix (N_b2^2, N_grid)
+        rho1: First density matrix (N_b1, N_grid, *trailing_dims)
+        rho2: Second density matrix (N_b2, N_grid, *trailing_dims)
         n_rank1: Number of interpolation points for rho1
         n_rank2: Number of interpolation points for rho2
-        
+
     Returns:
-        C1: Selected columns from rho1 using fused pivots
-        xi1: Interpolation coefficients for rho1
-        C2: Selected columns from rho2 using fused pivots
-        xi2: Interpolation coefficients for rho2
+        C1: Selected columns from rho1 using fused pivots (N_b1, n_fused, *trailing_dims)
+        xi1: Interpolation coefficients for rho1 (n_fused, N_grid, *trailing_dims)
+        C2: Selected columns from rho2 using fused pivots (N_b2, n_fused, *trailing_dims)
+        xi2: Interpolation coefficients for rho2 (n_fused, N_grid, *trailing_dims)
         piv_fused: Combined pivot indices
     """
+    # Normalize rho1 and rho2 along trailing dimensions
+    rho1_normed = calculate_norm(rho1)
+    rho2_normed = calculate_norm(rho2)
+
+    # Form overlap matrices S1 and S2
+    S1 = rho1_normed.T @ rho1_normed
+    S2 = rho2_normed.T @ rho2_normed
+
+    # Add small diagonal shift for stability
+    shift1 = 1e-12 * np.max(np.abs(np.diag(S1)))
+    shift2 = 1e-12 * np.max(np.abs(np.diag(S2)))
+    S1[np.diag_indices_from(S1)] += shift1
+    S2[np.diag_indices_from(S2)] += shift2
+
     # Get pivots for each density separately
-    _, piv1 = pivoted_cholesky(rho1, n_rank1)
-    _, piv2 = pivoted_cholesky(rho2, n_rank2)
-    
+    _, piv1 = pivoted_cholesky(S1, n_rank1)
+    _, piv2 = pivoted_cholesky(S2, n_rank2)
+
     # Combine and uniquify pivots
     piv_fused = np.unique(np.concatenate([piv1, piv2]))
-    
+
     # Select columns using fused pivots
-    C1 = rho1[:, piv_fused]
-    C2 = rho2[:, piv_fused]
-    
+    if rho1.ndim > 2:
+        C1 = np.take(rho1, piv_fused, axis=1)
+    else:
+        C1 = rho1[:, piv_fused]
+
+    if rho2.ndim > 2:
+        C2 = np.take(rho2, piv_fused, axis=1)
+    else:
+        C2 = rho2[:, piv_fused]
+
     # Solve least squares problems
-    xi1, *_ = np.linalg.lstsq(C1, rho1, rcond=None)
-    xi2, *_ = np.linalg.lstsq(C2, rho2, rcond=None)
-    
+    xi1 = solve_least_squares(C1, rho1)
+    xi2 = solve_least_squares(C2, rho2)
+
     return C1, xi1, C2, xi2, piv_fused
 
-def reconstruct_rho(C, xi):
+def reconstruct_rho(C: np.ndarray, xi: np.ndarray) -> np.ndarray:
     """Reconstruct tensor from decomposition.
-    
+
     Args:
         C: Selected columns (N_b, n_rank, *trailing_dims)
         xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
-        
+
     Returns:
         Reconstructed tensor with same shape as original
     """
     if C.ndim > 2:
-        # For tensor case, do contraction preserving trailing dimensions
         return np.einsum('br...,rg...->bg...', C, xi)
     else:
-        # Matrix case
         return C @ xi
 
-def test_accuracy(rho_orig, C, P):
-    """Calculate reconstruction relative error."""
+def test_accuracy(rho_orig: np.ndarray, C: np.ndarray, P: np.ndarray) -> Tuple[float, float]:
+    """Calculate reconstruction relative and absolute errors.
+    
+    Args:
+        rho_orig: Original tensor (N_b, N_grid, *trailing_dims)
+        C: Selected columns (N_b, n_rank, *trailing_dims)
+        P: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
+        
+    Returns:
+        rel_error: Relative error of reconstruction
+        abs_error: Absolute error of reconstruction
+    """
     rho_recon = reconstruct_rho(C, P)
-    return np.linalg.norm(rho_recon - rho_orig) 
+    abs_error = np.linalg.norm(rho_recon - rho_orig)
+    rel_error = abs_error / np.linalg.norm(rho_orig)
+    return rel_error, abs_error
 
-def test_multi_accuracy(rho1, rho2, n_rank1, n_rank2):
+def test_multi_accuracy(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank2: int) -> Tuple[float, float, float, float, int]:
     """Test reconstruction accuracy for two densities using fused pivots.
     
     Args:
@@ -165,17 +177,19 @@ def test_multi_accuracy(rho1, rho2, n_rank1, n_rank2):
         n_rank1, n_rank2: Desired ranks for each density
     
     Returns:
-        error1: Relative error for rho1 reconstruction
-        error2: Relative error for rho2 reconstruction
+        rel_error1: Relative error for rho1 reconstruction
+        abs_error1: Absolute error for rho1 reconstruction
+        rel_error2: Relative error for rho2 reconstruction
+        abs_error2: Absolute error for rho2 reconstruction
         n_fused: Number of fused pivots used
     """
     C1, xi1, C2, xi2, piv_fused = isdf_decompose_multi(rho1, rho2, n_rank1, n_rank2)
     
-    # Calculate reconstruction errors
-    error1 = np.linalg.norm(rho1 - C1 @ xi1) / np.linalg.norm(rho1)
-    error2 = np.linalg.norm(rho2 - C2 @ xi2) / np.linalg.norm(rho2)
+    # Reuse test_accuracy for both rho1 and rho2
+    rel_error1, abs_error1 = test_accuracy(rho1, C1, xi1)
+    rel_error2, abs_error2 = test_accuracy(rho2, C2, xi2)
     
-    return error1, error2, len(piv_fused)
+    return rel_error1, abs_error1, rel_error2, abs_error2, len(piv_fused)
 
 # Example usage
 if __name__ == "__main__":
@@ -186,15 +200,15 @@ if __name__ == "__main__":
     U = np.random.randn(Nb**2, rank)
     V = np.random.randn(N_grid, rank)
     rho = U @ V.T  # Construct low-rank matrix
-    
+
     # Perform Cholesky-based ISDF decomposition with fixed rank
     C, P = isdf_decompose_cholesky(rho, n_rank=rank)
-    
+
     # Test reconstruction accuracy
     error = test_accuracy(rho, C, P)
     print(f"Reconstruction relative error: {error:.2e}")
     print(f"Number of auxiliary basis: {C.shape[1]}")
-    
+
     # Test with two densities of different ranks
     rank1, rank2 = 5, 8
     U1 = np.random.randn(Nb**2, rank1)
@@ -203,7 +217,7 @@ if __name__ == "__main__":
     V2 = np.random.randn(N_grid, rank2)
     rho1 = U1 @ V1.T
     rho2 = U2 @ V2.T
-    
+
     err1, err2, n_fused = test_multi_accuracy(rho1, rho2, rank1, rank2)
     print(f"Rho1 error: {err1:.2e}")
     print(f"Rho2 error: {err2:.2e}")
