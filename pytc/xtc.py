@@ -177,76 +177,63 @@ class XTC(TC):
         return final
     
     def _calc_delta_U_isdf(self, C_rho, xi_rho, u_gradients, dm1=None):
-        """Calculate ΔU^{QS}_{PR} using ISDF intermediates.
-        
-        Args:
-            C_rho: Array of shape (Nb², N_rank) containing ISDF coefficients
-            xi_rho: Array of shape (N_rank, N_grid) containing interpolating vectors
-            u_gradients: Array of shape (N_grid, N_grid, 3) containing Jastrow gradients
-            dm1: Optional density matrix of shape (Nb, Nb)
-            
-        Returns:
-            Array of shape (Nb, Nb, Nb, Nb)
-        """
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
         Nb = int(np.sqrt(C_rho.shape[0]))
         N_rank = C_rho.shape[1]
+        C_rho = C_rho.reshape(Nb, Nb, N_rank)
         
-        # Reshape C_rho for clarity
-        C_rho_reshaped = C_rho.reshape(Nb, Nb, N_rank)
+        # Step 1: Form G(b,i,c) = weight_j * xi(b,j) * u_gradients(i,j,c)
+        G = einsum('j,bj,ijc->bic', self.weights, xi_rho, u_gradients)  # (N_rank, N_grid, 3)
         
-        # Weight the xi_rho
-        weighted_xi = xi_rho * self.weights[None, :]  # (N_rank, N_grid)
+        # Step 2: Form M(a,b,d) = weight_i * xi(a,i) * G(b,i,c) * G(d,i,c)
+        M = einsum('i,ai,bic,dic->abd', self.weights, xi_rho, G, G)  # (N_rank, N_rank, N_rank)
         
-        # Calculate intermediate contracted with u_gradients
-        # Shape: (N_rank, N_grid, 3)
-        V_intermediates = einsum('ijc,ki->kjc', u_gradients, weighted_xi)
+        # Step 3: Form G(b) = C_rho(t,u,b) * dm(t,u)
+        Gb = einsum('tub,tu->b', C_rho, dm1)  # (N_rank,)
         
-        # Calculate W using factored form
-        # First contract dm1 with C_rho
-        dm_C = einsum('tu,utk->k', dm1, C_rho_reshaped)  # (N_rank,)
-        # Then contract with V_intermediates
-        W = 2 * einsum('k,kix->ix', dm_C, V_intermediates)  # (N_grid, 3)
+        # Step 4: Form GM(a,d) = G(b) * M(a,b,d)
+        GM = einsum('b,abd->ad', Gb, M)  # (N_rank, N_rank)
         
-        # Calculate other intermediates using factored forms
-        X = einsum('stk,tu,kix->suix', C_rho_reshaped, dm1, V_intermediates)
+        # Step 5: Form T(p,q,d) = C_rho(p,q,a) * GM(a,d)
+        T = einsum('pqa,ad->pqd', C_rho, GM)  # (Nb, Nb, N_rank)
         
-        # Calculate weighted sum over grid points for Wbar
-        Wbar = 2 * einsum('k,kn,n->n', dm_C, xi_rho, self.weights)  # (N_grid,)
+        # Step 6: Final contraction for term1
+        term1 = 2 * einsum('pqd,rsd->pqrs', T, C_rho)  # (Nb, Nb, Nb, Nb)
         
-        # Fix Y intermediate using factored form - using proper index ordering
-        Y = einsum('tuk,tu,kix->trix', C_rho_reshaped, dm1, V_intermediates)
+        # Term 2: -C_rho(p,q,a)C_rho(r,u,b)C_rho(t,s,c)dm(t,u)M(a,b,c)
+        # Step 1: L(u,s,c) = dm(t,u)C_rho(t,s,c)
+        L = einsum('tu,tsc->usc', dm1, C_rho)  # (Nb, Nb, N_rank)
         
-        # Calculate G using factored forms
-        G_term1 = einsum('urk,rn,n,suix->srix', 
-                        C_rho_reshaped, xi_rho, self.weights, X)
-        G_term2 = einsum('stk,kn,n,trix->srix', 
-                        C_rho_reshaped, xi_rho, self.weights, Y)
-        G = G_term1 + G_term2
+        # Step 2: T(u,s,a,b) = M(a,b,c)L(u,s,c)
+        T = einsum('abc,usc->usab', M, L)  # (Nb, Nb, N_rank, N_rank)
         
-        # Compute A and B
-        Vbar = einsum('ix,srk,kix->sri', W, C_rho_reshaped, V_intermediates)
-        Zbar = einsum('urk,rn,n,suk,kix->sri', 
-                     C_rho_reshaped, xi_rho, self.weights, C_rho_reshaped, V_intermediates)
-        A = Vbar - Zbar
+        # Step 3: Q(r,s,a) = T(u,s,a,b)C_rho(r,u,b)
+        Q = einsum('usab,rub->rsa', T, C_rho)  # (Nb, Nb, N_rank)
         
-        # Calculate B using factored form
-        B = (0.5 * Wbar[None, None, :, None] * 
-             einsum('srk,kix->srix', C_rho_reshaped, V_intermediates)) - G
+        # Step 4: Final contraction for term2
+        term2 = -einsum('pqa,rsa->pqrs', C_rho, Q)  # (Nb, Nb, Nb, Nb)
         
-        # Final contractions
-        term1 = einsum('qpk,kn,n,sri->qpsr', 
-                      C_rho_reshaped, xi_rho, self.weights, A)
-        term2 = einsum('qpk,kix,srix->qpsr', 
-                      C_rho_reshaped, V_intermediates, B)
+        #term 3
+        # T(u,s,a,b) = M(b,a,c)L(u,s,c)
+        Mt = M + M.transpose(2,1,0)
+        T = einsum('cab,usc->usab', Mt, L)  # (Nb, Nb, N_rank, N_rank)
+        # Step 3: Q(r,s,a) = T(u,s,a,b)C_rho(r,u,b)
+        Q = einsum('usab,rub->rsa', T, C_rho)  # (Nb, Nb, N_rank)
+        term3 = -einsum('pqa,rsa->pqrs', C_rho, Q)  # (Nb, Nb, Nb, Nb)
+
+        # term 4
+        term4 = einsum('b,bac->ac', Gb, M)  # (N_rank, N_rank)
+        term4 = einsum('ac,pqa->pqc', term4, C_rho)  # (Nb, Nb, N_rank)
+        term4 = einsum('pqc,rsc->pqrs', term4, C_rho)  # (Nb, Nb, Nb, Nb
+        # Combine terms
+        result = term1 + term2 + term3 + term4
         
-        result = -(term1 + term2)
         # Add permutation of two electrons
         final = result + result.transpose(2,3,0,1)
         
-        return final
+        return -final
 
     def make_eris(self):
         from pyscf.cc import rccsd

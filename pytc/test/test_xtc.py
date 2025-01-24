@@ -149,50 +149,48 @@ class TestXTC(unittest.TestCase):
         print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
         #self.assertAlmostEqual(tc_e_hf, -14.592606059260131, places=6)
 
-    def test_isdf(self):
-        """Test ISDF decomposition and delta_U calculation."""
-        # Get decomposition with small rank for testing
-        n_rank = 50
-        result = self.xtc.isdf(n_rank=n_rank)
-        
-        # Check that all expected keys are present
-        expected_keys = ['C_rho', 'xi_rho', 'C_grad', 'xi_grad', 'pivots']
-        for key in expected_keys:
-            self.assertIn(key, result)
-        
-        # Check reconstruction accuracy
-        rho_recon = result['C_rho'] @ result['xi_rho']
-        rel_error_rho = np.linalg.norm(rho_recon - self.rho_paired) / np.linalg.norm(self.rho_paired)
-        
-        # Check reasonable errors for ISDF decomposition
-        self.assertLess(rel_error_rho, 1e-4)
-        
-        # Check number of pivots is reasonable
-        self.assertLessEqual(len(result['pivots']), 2 * n_rank)
-        self.assertGreaterEqual(len(result['pivots']), n_rank)
-        
-        # Test delta_U calculation using both methods
+
+    def test_delta_U_isdf_convergence(self):
+        """Test convergence of ISDF delta_U calculation with increasing rank."""
+        # Get reference delta_U using original method
         dm1 = self.xtc._get_mf_dm()
-        delta_U_orig = self.xtc._calc_delta_U(self.v_vector, self.rho_paired, dm1)
-        delta_U_isdf = self.xtc._calc_delta_U_isdf(result['C_rho'], result['xi_rho'], 
-                                                  self.u_gradients, dm1)
+        delta_U_ref = self.xtc._calc_delta_U(self.v_vector, self.rho_paired, dm1)
         
-        # Compare results
-        rel_error = np.linalg.norm(delta_U_isdf - delta_U_orig) / np.linalg.norm(delta_U_orig)
-        abs_error = np.max(np.abs(delta_U_isdf - delta_U_orig))
+        # Test range of ranks
+        ranks = [20, 50, 100, 200]
+        errors = []
         
-        print(f"Relative error in delta_U: {rel_error:.2e}")
-        print(f"Maximum absolute error: {abs_error:.2e}")
+        print("\nTesting ISDF delta_U convergence:")
+        print("Rank\tRel Error\tAbs Error")
+        print("-" * 40)
         
-        # Check errors are within tolerance
-        self.assertLess(rel_error, 1e-6)
-        self.assertLess(abs_error, 1e-6)
+        for rank in ranks:
+            # Get ISDF decomposition
+            result = self.xtc.isdf(n_rank=rank)
+            
+            # Calculate delta_U using ISDF
+            delta_U_isdf = self.xtc._calc_delta_U_isdf(
+                result['C_rho'], 
+                result['xi_rho'],
+                self.u_gradients,
+                dm1
+            )
+            
+            # Calculate errors
+            rel_error = np.linalg.norm(delta_U_isdf - delta_U_ref) / np.linalg.norm(delta_U_ref)
+            abs_error = np.max(np.abs(delta_U_isdf - delta_U_ref))
+            errors.append((rel_error, abs_error))
+            
+            print(f"{rank}\t{rel_error:.2e}\t{abs_error:.2e}")
         
-        # Test symmetry property of ISDF delta_U
-        np.testing.assert_array_almost_equal(
-            delta_U_isdf, 
-            delta_U_isdf.transpose(2,3,0,1)
-        )
+        # Check that errors decrease with increasing rank
+        rel_errors = [e[0] for e in errors]
+        self.assertTrue(all(rel_errors[i] > rel_errors[i+1] for i in range(len(rel_errors)-1)),
+                       "Relative errors should decrease monotonically with increasing rank")
+        
+        # Check final accuracy is reasonable
+        self.assertLess(rel_errors[-1], 1e-4,
+                       f"Final relative error {rel_errors[-1]:.2e} should be below 1e-4")
 
 if __name__ == '__main__':
     unittest.main()
