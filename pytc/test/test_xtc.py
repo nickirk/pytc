@@ -4,6 +4,7 @@ import unittest
 import os 
 from functools import partial, reduce
 import numpy as np
+import time
 
 from pyscf import gto, scf, ao2mo
 
@@ -126,7 +127,7 @@ class TestXTC(unittest.TestCase):
         e_ex = -1. * np.einsum('ijji->', eri1[:mycc.nocc, :mycc.nocc, :mycc.nocc, :mycc.nocc])
         e_hf_0 += (e_dir + e_ex) + mycc._scf.energy_nuc()
         print("Check e_hf = ",  e_hf_0)
-        #self.assertAlmostEqual(e_hf_0, -14.57233763095337, places=6)
+        self.assertAlmostEqual(e_hf_0, -14.57233763095337, places=6)
 
         myrcc = rccsd.RCCSD(self.mf)
         #myrcc.verbose = 5
@@ -136,7 +137,7 @@ class TestXTC(unittest.TestCase):
         print("|t2| = ", np.linalg.norm(t2))
         print("|t1+t2| = ", np.linalg.norm(t))
         print("corr E_XTC_CCSD = ", myrcc.e_corr)
-        #self.assertAlmostEqual(tc_e_corr, -0.0443956329631562, places=6)
+        self.assertAlmostEqual(tc_e_corr, -0.0443956329631562, places=6)
         # get the hf energy using fock and eris
         no = myrcc.nocc
         tc_h1e = self.xtc.get_1b()
@@ -146,50 +147,145 @@ class TestXTC(unittest.TestCase):
 
         tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
         print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
-        #self.assertAlmostEqual(tc_e_hf, -14.592606059260131, places=6)
+        self.assertAlmostEqual(tc_e_hf, -14.592606059260131, places=6)
 
 
-    #def test_delta_U_isdf_convergence(self):
-    #    """Test convergence of ISDF delta_U calculation with increasing rank."""
-    #    # Get reference delta_U using original method
-    #    dm1 = self.xtc._get_mf_dm()
-    #    delta_U_ref = self.xtc._calc_delta_U(self.v_vector, self.rho_paired, dm1)
-    #    
-    #    # Test range of ranks
-    #    ranks = [20, 50, 100, 200]
-    #    errors = []
-    #    
-    #    print("\nTesting ISDF delta_U convergence:")
-    #    print("Rank\tRel Error\tAbs Error")
-    #    print("-" * 40)
-    #    
-    #    for rank in ranks:
-    #        # Get ISDF decomposition
-    #        result = self.xtc.isdf(n_rank=rank)
-    #        
-    #        # Calculate delta_U using ISDF
-    #        delta_U_isdf = self.xtc._calc_delta_U_isdf(
-    #            result['C_rho'], 
-    #            result['xi_rho'],
-    #            self.u_gradients,
-    #            dm1
-    #        )
-    #        
-    #        # Calculate errors
-    #        rel_error = np.linalg.norm(delta_U_isdf - delta_U_ref) / np.linalg.norm(delta_U_ref)
-    #        abs_error = np.max(np.abs(delta_U_isdf - delta_U_ref))
-    #        errors.append((rel_error, abs_error))
-    #        
-    #        print(f"{rank}\t{rel_error:.2e}\t{abs_error:.2e}")
-    #    
-    #    # Check that errors decrease with increasing rank
-    #    rel_errors = [e[0] for e in errors]
-    #    self.assertTrue(all(rel_errors[i] > rel_errors[i+1] for i in range(len(rel_errors)-1)),
-    #                   "Relative errors should decrease monotonically with increasing rank")
-    #    
-    #    # Check final accuracy is reasonable
-    #    self.assertLess(rel_errors[-1], 1e-4,
-    #                   f"Final relative error {rel_errors[-1]:.2e} should be below 1e-4")
+    def test_delta_U_isdf_convergence(self):
+        """Test convergence of ISDF delta_U calculation with increasing rank."""
+        # Get reference delta_U using original method
+        dm1 = self.xtc._get_mf_dm()
+        
+        # Compute V vector with batched processing
+        rho, _ = self.xtc._get_intermediates()
+        rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
+        v_vector = calc_v_vector(rho_paired, self.xtc.jastrow_factor, 
+                               self.grid_points, self.weights)
+        
+        delta_U_ref = self.xtc._calc_delta_U(v_vector, rho_paired, dm1)
+         
+        # Test range of ranks
+        ranks = [20, 50, 100]
+        errors = []
+        times = []
+        
+        print("\nTesting ISDF delta_U convergence:")
+        print("Rank/Full Size\tRel Error\tTime(s)")
+        print("-" * 40)
+        
+        for rank in ranks:
+            start_time = time.time()
+            
+            # Get ISDF decomposition
+            result = self.xtc.isdf(n_rank=rank)
+            
+            fused_rank = len(result['pivots'])
+            # Calculate delta_U using ISDF
+            delta_U_isdf = self.xtc._calc_delta_U_isdf(
+                result['C_rho'], 
+                result['xi_rho'],
+                self.xtc.jastrow_factor,
+                self.grid_points,
+                self.weights,
+                dm1=dm1
+            )
+            
+            calc_time = time.time() - start_time
+            
+            # Calculate errors
+            rel_error = np.linalg.norm(delta_U_isdf - delta_U_ref) / np.linalg.norm(delta_U_ref)
+            abs_error = np.max(np.abs(delta_U_isdf - delta_U_ref))
+            errors.append((rel_error, abs_error))
+            times.append(calc_time)
+            
+            print(f"{fused_rank}/{len(self.weights)}\t{rel_error:.2e}\t{calc_time:.2f}")
+        
+        # Check that errors decrease with increasing rank
+        rel_errors = [e[0] for e in errors]
+        self.assertTrue(all(rel_errors[i] > rel_errors[i+1] for i in range(len(rel_errors)-1)),
+                       "Relative errors should decrease monotonically with increasing rank")
+        
+        # Check final accuracy is reasonable
+        self.assertLess(rel_errors[-1], 1e-4,
+                       f"Final relative error {rel_errors[-1]:.2e} should be below 1e-4")
+        
+        # Verify timing improvement
+        ref_time = time.time()
+        delta_U_ref = self.xtc._calc_delta_U(v_vector, rho_paired, dm1)
+        ref_time = time.time() - ref_time
+        print(f"\nReference calculation time: {ref_time:.2f}s")
+        
+
+    def test_isdf_ccsd_convergence(self):
+        """Test convergence of ISDF XTC-CCSD energy with increasing rank."""
+        from pyscf.cc import rccsd
+        import time
+        
+        # First get reference XTC-CCSD energy
+        myrcc = rccsd.RCCSD(self.mf)
+        eris_ref = self.xtc.make_eris()
+        e_corr_ref, t1_ref, t2_ref = myrcc.kernel(eris=eris_ref)
+        e_hf_ref = eris_ref.e_core + np.einsum('ii->', eris_ref.fock[:myrcc.nocc, :myrcc.nocc]) * 2
+        e_dir = 2. * np.einsum('jjii->', eris_ref.oooo)
+        e_ex = -1. * np.einsum('ijji->', eris_ref.oooo)
+        e_hf_ref += -(e_dir + e_ex) + myrcc._scf.energy_nuc()
+        e_ref = e_corr_ref + e_hf_ref
+        
+        # Test range of ranks
+        ranks = [20, 50, 100]
+        errors = []
+        times = []
+        
+        print("\nTesting ISDF XTC-CCSD convergence:")
+        print("Rank/Full Size\tRel Error\tTime(s)\tEnergy")
+        print("-" * 50)
+        
+        for rank in ranks:
+            start_time = time.time()
+            
+            # Get ISDF decomposition
+            result = self.xtc.isdf(n_rank=rank)
+            fused_rank = len(result['pivots'])
+            
+            # Make ERIS with ISDF
+            eris_isdf = self.xtc.make_eris()
+            
+            # Run CCSD
+            myrcc_isdf = rccsd.RCCSD(self.mf)
+            e_corr_isdf, t1, t2 = myrcc_isdf.kernel(eris=eris_isdf)
+            e_hf_isdf = eris_isdf.e_core + np.einsum('ii->', eris_isdf.fock[:myrcc_isdf.nocc, :myrcc_isdf.nocc]) * 2
+            e_dir = 2. * np.einsum('jjii->', eris_isdf.oooo)
+            e_ex = -1. * np.einsum('ijji->', eris_isdf.oooo)
+            e_hf_isdf += -(e_dir + e_ex) + myrcc._scf.energy_nuc()
+            e_isdf = e_corr_isdf + e_hf_isdf
+            
+            # Calculate timing and errors
+            calc_time = time.time() - start_time
+            rel_error = abs(e_isdf - e_ref) / abs(e_ref)
+            
+            errors.append(rel_error)
+            times.append(calc_time)
+            
+            print(f"{fused_rank}/{len(self.weights)}\t{rel_error:.2e}\t{calc_time:.2f}\t{e_isdf:.8f}")
+            
+        # Check that errors decrease with increasing rank
+        self.assertTrue(all(errors[i] > errors[i+1] for i in range(len(errors)-1)),
+                       "Errors should decrease monotonically with increasing rank")
+        
+        # Check final accuracy is reasonable
+        self.assertLess(errors[-1], 1e-4,
+                       f"Final error {errors[-1]:.2e} should be below 1e-4")
+        
+        # Verify timing improvement
+        ref_time = time.time()
+        eris_ref = self.xtc.make_eris()
+        myrcc = rccsd.RCCSD(self.mf)
+        myrcc.kernel(eris=eris_ref)
+        ref_time = time.time() - ref_time
+        
+        print(f"\nReference calculation time: {ref_time:.2f}s")
+        print(f"Reference energy: {e_ref:.8f}")
+        
+
 
 if __name__ == '__main__':
     unittest.main()

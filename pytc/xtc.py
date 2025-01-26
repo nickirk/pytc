@@ -25,14 +25,27 @@ class XTC(TC):
         if self._delta_U is None:
             if dm1 is None:
                 dm1 = self._get_mf_dm()
-            # Use cached intermediates and compute rho_paired
+            
+            # Get orbital values on grid
             rho, _ = self._get_intermediates()
             rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
-            # Compute V vector with batched processing
-            v_vector = calc_v_vector(rho_paired, self.jastrow_factor, 
-                                   self.grid_points, self.weights)
-            # Compute and cache delta_U
-            self._delta_U = self._calc_delta_U(v_vector, rho_paired, dm1)
+            
+            # Check if ISDF results are available
+            if self._isdf_results is not None:
+                # Use ISDF method
+                self._delta_U = self._calc_delta_U_isdf(
+                    self._isdf_results['C_rho'],
+                    self._isdf_results['xi_rho'],
+                    self.jastrow_factor,
+                    self.grid_points,
+                    self.weights
+                )
+            else:
+                # Use original method
+                v_vector = calc_v_vector(rho_paired, self.jastrow_factor, 
+                                       self.grid_points, self.weights)
+                self._delta_U = self._calc_delta_U(v_vector, rho_paired, dm1)
+        
         return self._delta_U
 
     def _get_mf_dm(self):
@@ -177,19 +190,50 @@ class XTC(TC):
         
         return final
     
-    def _calc_delta_U_isdf(self, C_rho, xi_rho, u_gradients, dm1=None):
+    def _calc_delta_U_isdf(self, C_rho, xi_rho, jastrow_factor, grid_points, weights, dm1=None, batch_size=None):
+        """Calculate ΔU^{QS}_{PR} using ISDF intermediates with batched processing.
+        
+        Args:
+            C_rho: (Nb^2, n_fused) Selected columns for rho
+            xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
+            jastrow_factor: Jastrow instance for computing gradients
+            grid_points: (N_grid, 3) Grid points
+            weights: (N_grid,) Grid weights
+            batch_size: Optional batch size for r2 coordinate
+        """
+        from pytc.kmat import _get_safe_batch_size
+
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
+        N_grid = len(grid_points)
         Nb = int(np.sqrt(C_rho.shape[0]))
         N_rank = C_rho.shape[1]
         C_rho = C_rho.reshape(Nb, Nb, N_rank)
         
-        # Step 1: Form G(b,i,c) = weight_j * xi(b,j) * u_gradients(i,j,c)
-        G = einsum('j,bj,ijc->bic', self.weights, xi_rho, u_gradients)  # (N_rank, N_grid, 3)
+        if batch_size is None:
+            batch_size = _get_safe_batch_size(N_grid, Nb**2)
         
-        # Step 2: Form M(a,b,d) = weight_i * xi(a,i) * G(b,i,c) * G(d,i,c)
-        M = einsum('i,ai,bic,dic->abd', self.weights, xi_rho, G, G)  # (N_rank, N_rank, N_rank)
+        # Initialize accumulator for M tensor
+        M = np.zeros((N_rank, N_rank, N_rank))
+        weighted_xi_rho = xi_rho * weights[None, :]
+        G = np.zeros((N_rank, N_grid, 3))
+        
+        # Process r2 points in batches
+        for i in range(0, N_grid, batch_size):
+            i_end = min(i + batch_size, N_grid)
+            
+            # Get Jastrow gradients for this batch
+            u_grad_batch = jastrow_factor.grad(grid_points[i:i_end], grid_points)  # (batch, N_grid,  3)
+            G[:,i:i_end,:] = einsum('j,bj,ijc->bic', weights, xi_rho, u_grad_batch)  # (Nr, N_grid, 3)
+        
+        K = einsum('bic,dic->bdi', G, G)  # (N_grid, Nr, Nr)
+        
+        # Compute weighted xi_rho for the chunk
+        weighted_xi = xi_rho * weights[None, :]  # (Nr, chunk_size)
+        
+        # Contract to get chunk contribution
+        M = einsum('ai,bdi->abd', weighted_xi, K)
         
         # Step 3: Form G(b) = C_rho(t,u,b) * dm(t,u)
         Gb = einsum('tub,tu->b', C_rho, dm1)  # (N_rank,)
@@ -223,11 +267,11 @@ class XTC(TC):
         # Step 3: Q(r,s,a) = T(u,s,a,b)C_rho(r,u,b)
         Q = einsum('usab,rub->rsa', T, C_rho)  # (Nb, Nb, N_rank)
         term3 = -einsum('pqa,rsa->pqrs', C_rho, Q)  # (Nb, Nb, Nb, Nb)
-
-        # term 4
+        # Term 4
         term4 = einsum('b,bac->ac', Gb, M)  # (N_rank, N_rank)
         term4 = einsum('ac,pqa->pqc', term4, C_rho)  # (Nb, Nb, N_rank)
-        term4 = einsum('pqc,rsc->pqrs', term4, C_rho)  # (Nb, Nb, Nb, Nb
+        term4 = einsum('pqc,rsc->pqrs', term4, C_rho)  # (Nb, Nb, Nb, Nb)
+        
         # Combine terms
         result = term1 + term2 + term3 + term4
         

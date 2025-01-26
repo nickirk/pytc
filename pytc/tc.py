@@ -108,7 +108,7 @@ class TC:
         """
     
         # Get cached intermediates and compute rho_paired
-        rho, nabla_rho, u_gradients = self._get_intermediates()
+        rho, nabla_rho = self._get_intermediates()
         rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
         nabla_rho_paired = einsum('rnc,pn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
     
@@ -151,7 +151,8 @@ class TC:
 
     def get_2b(self, dm1=None, dm2=None):
         """Calculate two-body terms K1 + K2 + K3."""
-        from pytc.kmat import calc_K1, calc_K2, calc_K3
+        from pytc.kmat import (calc_K1, calc_K2, calc_K3, 
+                             calc_K1_isdf, calc_K2_isdf, calc_K3_isdf)
         
         # Get orbital values on grid
         rho, nabla_rho = self._get_intermediates()
@@ -159,18 +160,47 @@ class TC:
         # r1 is the first index, r2 is the second index, grad on r1
         rho_nabla_rho_paired = np.einsum('pn, rnd->prnd', rho, nabla_rho).reshape(-1, len(self.weights), 3)
         
-        # Calculate K matrices using batched processing
-        k_nabla = calc_K1(rho_paired, rho_nabla_rho_paired, 
-                     self.jastrow_factor, self.grid_points, self.weights)
-        k_laplacian = calc_K2(rho_paired, rho_nabla_rho_paired,
-                     self.jastrow_factor, self.grid_points, self.weights)
-        k_square = calc_K3(rho_paired, self.jastrow_factor,
-                     self.grid_points, self.weights)
+        # Check if ISDF results are available
+        if self._isdf_results is not None:
+            # Use ISDF method
+            k_nabla = calc_K1_isdf(
+                self._isdf_results['C_rho'],
+                self._isdf_results['xi_rho'],
+                self._isdf_results['C_grad'],
+                self._isdf_results['xi_grad'],
+                self.jastrow_factor,
+                self.grid_points,
+                self.weights
+            )
+            k_laplacian = calc_K2_isdf(
+                self._isdf_results['C_rho'],
+                self._isdf_results['xi_rho'],
+                self._isdf_results['C_grad'],
+                self._isdf_results['xi_grad'],
+                self.jastrow_factor,
+                self.grid_points,
+                self.weights
+            )
+            k_square = calc_K3_isdf(
+                self._isdf_results['C_rho'],
+                self._isdf_results['xi_rho'],
+                self.jastrow_factor,
+                self.grid_points,
+                self.weights
+            )
+        else:
+            # Use original method
+            k_nabla = calc_K1(rho_paired, rho_nabla_rho_paired, 
+                         self.jastrow_factor, self.grid_points, self.weights)
+            k_laplacian = calc_K2(rho_paired, rho_nabla_rho_paired,
+                         self.jastrow_factor, self.grid_points, self.weights)
+            k_square = calc_K3(rho_paired, self.jastrow_factor,
+                         self.grid_points, self.weights)
         
         k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-                   # reshape all K matrices
+        
         # Combine results
         result = 0.5 * (k_laplacian + k_square)
         result += k_nabla

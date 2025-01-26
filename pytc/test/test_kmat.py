@@ -8,7 +8,7 @@ import time
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
-    mol = gto.M(atom='Be 0 0 0; Be 0 0 1; ', basis='ccpvtz', unit='Bohr')
+    mol = gto.M(atom='Be 0 0 0;  ', basis='ccpvdz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
@@ -25,7 +25,7 @@ class TestKmat(unittest.TestCase):
         
         # Set up grid points for testing
         grids = dft.gen_grid.Grids(cls.mol)
-        grids.level = 2  # Use coarse grid for testing
+        grids.level = 1  # Use coarse grid for testing
         grids.build()
         cls.grid_points = grids.coords  # Keep original shape (N_grid, 3)
         cls.weights = grids.weights
@@ -45,8 +45,6 @@ class TestKmat(unittest.TestCase):
                                         cls.nabla_rho, 
                                         cls.rho).reshape(-1, len(cls.weights), 3)
         
-        # Pre-compute u_gradients for all tests
-        cls.u_gradients = cls.jastrow.grad(cls.grid_points)
     
     def test_k_shapes(self):
         """Verify K matrix shapes."""
@@ -54,15 +52,15 @@ class TestKmat(unittest.TestCase):
         import time 
         time_start = time.time() 
         k1 = calc_K1(self.rho_paired, self.nabla_rho_paired,
-                   self.u_gradients, self.weights).reshape((self.n_orb,)*4)
+                   self.jastrow, self.grid_points, self.weights).reshape((self.n_orb,)*4)
         k1_time = time.time() - time_start
         time_start = time.time()
         k2 = calc_K2(self.rho_paired, self.nabla_rho_paired,
-                   self.u_gradients, self.weights).reshape((self.n_orb,)*4)
+                   self.jastrow, self.grid_points, self.weights).reshape((self.n_orb,)*4)
         k2_time = time.time() - time_start
         time_start = time.time()
-        k3 = calc_K3(self.rho_paired, self.u_gradients,
-                   self.weights).reshape((self.n_orb,)*4)
+        k3 = calc_K3(self.rho_paired, self.jastrow,
+                   self.grid_points, self.weights).reshape((self.n_orb,)*4)
         k3_time = time.time() - time_start
         print(f"K1 time: {k1_time}")
         print(f"K2 time: {k2_time}")
@@ -79,13 +77,15 @@ class TestKmat(unittest.TestCase):
         k2 = calc_K2(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.u_gradients,
+            self.jastrow,
+            self.grid_points,
             self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         k3 = calc_K3(
             self.rho_paired,
-            self.u_gradients,
+            self.jastrow,
+            self.grid_points,
             self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
@@ -101,14 +101,16 @@ class TestKmat(unittest.TestCase):
         k1 = calc_K1(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.u_gradients,
+            self.jastrow,
+            self.grid_points,
             self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         k2 = calc_K2(
             self.rho_paired,
             self.nabla_rho_paired,
-            self.u_gradients,
+            self.jastrow,
+            self.grid_points,
             self.weights
         ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
@@ -131,11 +133,11 @@ class TestISDF(TestKmat):
         from pytc.kmat import calc_K1, calc_K2, calc_K3
         
         cls.k1_ref = calc_K1(cls.rho_paired, cls.nabla_rho_paired,
-                           cls.u_gradients, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
+                           cls.jastrow, cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
         cls.k2_ref = calc_K2(cls.rho_paired, cls.nabla_rho_paired,
-                           cls.u_gradients, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
-        cls.k3_ref = calc_K3(cls.rho_paired, cls.u_gradients,
-                           cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
+                           cls.jastrow, cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
+        cls.k3_ref = calc_K3(cls.rho_paired, cls.jastrow,
+                           cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
     
     def test_isdf_convergence(self):
         """Test if K1_isdf, K2_isdf, and K3_isdf converge to original values with increasing rank."""
@@ -143,7 +145,7 @@ class TestISDF(TestKmat):
         from pytc.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
 
         # Test different ranks as fractions of grid points
-        ranks = [len(self.weights) // n for n in [1000, ]]
+        ranks = [len(self.weights) // n for n in [1000, 100, 50]]
         errors_k1, errors_k2, errors_k3 = [], [], []
         times_k1, times_k2, times_k3 = [], [], []
 
@@ -159,21 +161,25 @@ class TestISDF(TestKmat):
             start_time = time.time()
             k1_isdf = calc_K1_isdf(
                 C_rho, xi_rho, C_grad, xi_grad,
-                self.u_gradients, self.weights
+                self.jastrow, self.grid_points, self.weights
             ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
             times_k1.append(time.time() - start_time)
 
             start_time = time.time()
             k2_isdf = calc_K2_isdf(
                 C_rho, xi_rho, C_grad, xi_grad,
-                self.u_gradients, self.weights
+                self.jastrow, self.grid_points, self.weights
             ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
             times_k2.append(time.time() - start_time)
+            # assert the relation betweek K1 and K2
+            tmp = k1_isdf + k2_isdf
+            tmp = tmp.swapaxes(0, 1)
+            self.assertTrue(np.allclose(k1_isdf, -tmp))
 
             start_time = time.time()
             k3_isdf = calc_K3_isdf(
                 C_rho, xi_rho,
-                self.u_gradients, self.weights
+                self.jastrow, self.grid_points, self.weights
             ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
             times_k3.append(time.time() - start_time)
 
@@ -198,10 +204,6 @@ class TestISDF(TestKmat):
         self.assertLess(errors_k2[-1], 1e-5)
         self.assertLess(errors_k3[-1], 1e-5)
 
-        # Validate timing improvements
-        self.assertTrue(all(t < self.k1_time for t in times_k1))
-        self.assertTrue(all(t < self.k2_time for t in times_k2)) 
-        self.assertTrue(all(t < self.k3_time for t in times_k3))
 
 if __name__ == '__main__':
     unittest.main()

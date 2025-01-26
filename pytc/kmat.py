@@ -68,7 +68,7 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         
         result += np.dot(rho_paired[:,i:i_end]*weights[None,i:i_end], tmp.T)
 
-    return result
+    return result.swapaxes(0, 1)
 
 def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
     """Evaluate the integral <pq|∇²₁u(r₁,r₂)|rs> using batched processing.
@@ -124,42 +124,60 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
     
     return result
 
-def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, weights):
-    """Directly evaluate <pq|∇u·∇|rs> using ISDF intermediates.
+def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, weights, batch_size=None):
+    """Directly evaluate <pq|∇u·∇|rs> using ISDF intermediates with batched processing.
     
     Args:
         C_rho: (Nb^2, n_fused) Selected columns for rho
         xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
         C_grad: (Nb^2, n_fused, 3) Selected columns for nabla_rho
         xi_grad: (n_fused, N_grid, 3) Interpolation coeffs for grad
-        u_gradients: (N_grid, N_grid, 3) Jastrow gradients
+        jastrow_factor: Jastrow instance for computing gradients
+        grid_points: (N_grid, 3) Grid points
         weights: (N_grid,) Grid weights
+        batch_size: Optional batch size for r2 coordinate
     
     Returns:
         (Nb^2, Nb^2) array in chemists' notation (pr|qs)
     """
+    N_grid = len(grid_points)
+    Nb2 = C_rho.shape[0]
+    n_fused = xi_rho.shape[0]
+    
+    if batch_size is None:
+        batch_size = _get_safe_batch_size(N_grid, n_fused)
+        
+    result = np.zeros((Nb2, Nb2))
     weighted_xi_grad = xi_grad * weights[None,:,None]
     
-    # Process each spatial component using np.dot
-    G1_components = []
-    for c in range(3):
-        xi_slice = weighted_xi_grad[:,:,c]    # (n_fused, N_grid)
-        u_slice = u_gradients[:,:,c]          # (N_grid, M)
-        G1_c = np.dot(xi_slice, u_slice)      # (n_fused, M)
-        G1_components.append(G1_c)
-    
-    G1 = np.stack(G1_components, axis=-1)     # (n_fused, M, 3)
-    G1 = einsum('kmc,pkc->pm', G1, C_grad)    # (Nb^2, M)
-    
-    # Contract with xi_rho and weights
-    G2 = einsum('pm,lm,m->pl', G1, xi_rho, weights)
-    
-    # Final transformation
-    result = einsum('pl,ql->pq', G2, C_rho)
+    # Process r2 points in batches
+    for i in range(0, N_grid, batch_size):
+        i_end = min(i + batch_size, N_grid)
+        batch_size_i = i_end - i
+        
+        # Get Jastrow gradients for this batch
+        u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
+        
+        # Process each spatial component
+        G1_components = []
+        for c in range(3):
+            xi_slice = weighted_xi_grad[:,:,c]           # (n_fused, N_grid)
+            u_slice = u_grad_batch[:,:,c]               # (N_grid, batch)
+            G1_c = np.dot(xi_slice, u_slice)           # (n_fused, batch)
+            G1_components.append(G1_c)
+        
+        G1 = np.stack(G1_components, axis=-1)          # (n_fused, batch, 3)
+        G1 = einsum('kmc,pkc->pm', G1, C_grad)         # (Nb^2, batch)
+        
+        # Contract with xi_rho and weights for this batch
+        G2 = einsum('pm,lm,m->pl', G1, xi_rho[:,i:i_end], weights[i:i_end])
+        
+        # Accumulate result
+        result += einsum('pl,ql->pq', G2, C_rho)
     
     return result
 
-def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, weights):
+def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, weights, batch_size=None):
     """Directly evaluate <pq|∇²₁u(r₁,r₂)|rs> using ISDF intermediates.
     
     Args:
@@ -167,8 +185,10 @@ def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, weights):
         xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
         C_grad: (Nb^2, n_fused, 3) Selected columns for nabla_rho
         xi_grad: (n_fused, N_grid, 3) Interpolation coeffs for grad
-        u_gradients: (N_grid, N_grid, 3) Jastrow gradients
+        jastrow_factor: Jastrow instance for computing gradients
+        grid_points: (N_grid, 3) Grid points
         weights: (N_grid,) Grid weights
+        batch_size: Optional batch size for r2 coordinate
     
     Returns:
         (Nb^2, Nb^2) array in chemists' notation (pr|qs)
@@ -180,32 +200,51 @@ def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, weights):
     combined_C_grad = C_grad + C_grad_transposed
 
     # Step 2: Reuse calc_K1_isdf with the combined gradient term
-    result = -calc_K1_isdf(C_rho, xi_rho, combined_C_grad, xi_grad, u_gradients, weights)
+    result = -calc_K1_isdf(C_rho, xi_rho, combined_C_grad, xi_grad,
+                          jastrow_factor, grid_points, weights, batch_size)
 
     return result
 
-def calc_K3_isdf(C_rho, xi_rho, u_gradients, weights):
-    """Directly evaluate <pq|(∇₁u(r₁,r₂))²|rs> using ISDF intermediates.
+def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size=None):
+    """Directly evaluate <pq|(∇₁u(r₁,r₂))²|rs> using ISDF intermediates with batched processing.
     
     Args:
         C_rho: (Nb^2, n_fused) Selected columns for rho
         xi_rho: (n_fused, N_grid) Interpolation coeffs for rho
-        u_gradients: (N_grid, N_grid, 3) Jastrow gradients
+        jastrow_factor: Jastrow instance for computing gradients
+        grid_points: (N_grid, 3) Grid points
         weights: (N_grid,) Grid weights
+        batch_size: Optional batch size for r2 coordinate
     
     Returns:
         (Nb^2, Nb^2) array in chemists' notation (pr|qs)
     """
-    # Step 1: Compute the squared magnitude of the gradient
-    u_grad_squared = np.sum(u_gradients**2, axis=-1)  # Shape: (N_grid, N_grid)
-
-    # Step 2: Multiply by weights for both r and r'
-    weighted_u_squared = u_grad_squared * weights[np.newaxis, :] * weights[:, np.newaxis]  # Shape: (N_grid, N_grid)
-
-    # Step 3: Contract xi_rho with weighted_u_squared
-    G1 = einsum('ki,ij,lj->kl', xi_rho, weighted_u_squared, xi_rho)
-
-    # Step 4: Transform to full space using C_rho
-    result = einsum('kl,pk,ql->pq', G1, C_rho, C_rho)
-
+    N_grid = len(grid_points)
+    Nb2 = C_rho.shape[0]
+    n_fused = xi_rho.shape[0]
+    
+    if batch_size is None:
+        batch_size = _get_safe_batch_size(N_grid, n_fused)
+    
+    result = np.zeros((Nb2, Nb2))
+    
+    # Process r2 points in batches
+    for i in range(0, N_grid, batch_size):
+        i_end = min(i + batch_size, N_grid)
+        
+        # Get Jastrow gradients for this batch
+        u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
+        
+        # Compute squared magnitude of gradient
+        u_grad_squared = np.sum(u_grad_batch**2, axis=-1)  # (N_grid, batch)
+        
+        # Weight both coordinates
+        weighted_u_squared = u_grad_squared * weights[:, None] * weights[None, i:i_end]  # (N_grid, batch)
+        
+        # Contract with xi_rho for this batch
+        G1 = einsum('ki,ij,lj->kl', xi_rho, weighted_u_squared, xi_rho[:,i:i_end])
+        
+        # Accumulate result
+        result += einsum('kl,pk,ql->pq', G1, C_rho, C_rho)
+    
     return result
