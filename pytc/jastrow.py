@@ -140,7 +140,9 @@ class SM7(Jastrow):
         # Compute sum over m,n,o terms
         result = np.zeros_like(r12_dist)
         for (m,n,o), coeff in self.params.items():
-            term = coeff * (r1_scaled**m * r2_scaled**n + r2_scaled**m * r1_scaled**n) * r12_scaled**o
+            if m == n: 
+                coeff_ = 0.5 * coeff
+            term = coeff_ * (r1_scaled**m * r2_scaled**n + r2_scaled**m * r1_scaled**n) * r12_scaled**o
             result += term
             
         return result
@@ -186,22 +188,26 @@ class SM7(Jastrow):
         
         # Sum up all terms
         for (m,n,o), coeff in self.params.items():
+            if m == n: 
+                coeff_ = 0.5 * coeff
+            else:
+                coeff_ = coeff
             # First term: c_mno * r1^m * r2^n * r12^o
             if m > 0:  # Gradient of r1^m term
-                grad = coeff * m * r1_scaled**(m-1) * r2_scaled**n * r12_scaled**o * r1_scaled_grad
+                grad = coeff_ * m * r1_scaled**(m-1) * r2_scaled**n * r12_scaled**o * r1_scaled_grad
                 total_grad += grad
             
             if o > 0:  # Gradient of r12^o term
-                grad = coeff * r1_scaled**m * r2_scaled**n * o * r12_scaled**(o-1) * r12_scaled_grad
+                grad = coeff_ * r1_scaled**m * r2_scaled**n * o * r12_scaled**(o-1) * r12_scaled_grad
                 total_grad += grad
             
             # Second term (symmetric): c_mno * r2^m * r1^n * r12^o
             if n > 0:  # Gradient of r1^n term
-                grad = coeff * n * r1_scaled**(n-1) * r2_scaled**m * r12_scaled**o * r1_scaled_grad
+                grad = coeff_ * n * r1_scaled**(n-1) * r2_scaled**m * r12_scaled**o * r1_scaled_grad
                 total_grad += grad
             
             if o > 0:  # Gradient of r12^o term
-                grad = coeff * r2_scaled**m * r1_scaled**n * o * r12_scaled**(o-1) * r12_scaled_grad
+                grad = coeff_ * r2_scaled**m * r1_scaled**n * o * r12_scaled**(o-1) * r12_scaled_grad
                 total_grad += grad
         
         return total_grad
