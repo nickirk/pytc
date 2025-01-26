@@ -1,2 +1,2 @@
-# pytcint
-Pure Python numerical Transcorrelation integration
+# pytc
+*Py*thon *T*rans*C*orrelation package
