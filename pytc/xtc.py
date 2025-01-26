@@ -26,10 +26,11 @@ class XTC(TC):
             if dm1 is None:
                 dm1 = self._get_mf_dm()
             # Use cached intermediates and compute rho_paired
-            rho, _, u_gradients = self._get_intermediates()
+            rho, _ = self._get_intermediates()
             rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
-            # Compute V vector
-            v_vector = calc_v_vector(rho_paired, u_gradients, self.weights)
+            # Compute V vector with batched processing
+            v_vector = calc_v_vector(rho_paired, self.jastrow_factor, 
+                                   self.grid_points, self.weights)
             # Compute and cache delta_U
             self._delta_U = self._calc_delta_U(v_vector, rho_paired, dm1)
         return self._delta_U
@@ -244,7 +245,7 @@ class XTC(TC):
         eris = rccsd._ChemistsERIs(mycc)
         eris.e_core = self.get_const()
         eris.fock = self.get_1b().copy()
-        h2e = self.get_2b()
+        h2e = self.get_2b().transpose(1,0,3,2)
         eris.fock += 2 * einsum('pqii->pq', h2e[:,:,:nocc,:nocc])
         eris.fock -= einsum('piiq->pq', h2e[:,:nocc,:nocc,:])
 

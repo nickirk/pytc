@@ -7,24 +7,41 @@ from functools import partial
 einsum = partial(np.einsum, optimize='optimal')
 
 
-def calc_v_vector(rho_paired, u_gradients, weights):
-    """Compute the intermediate vector V_qt(r₁).
+def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
+    """Compute the intermediate vector V_qt(r₁) using batched processing.
     
     Args:
         rho_paired: Array of shape (Nb*Nb, N_grid) containing orbital products
-        u_gradients: Array of shape (N_grid, N_grid, 3) containing Jastrow gradients
-        weights: Array of shape (N_grid,) containing the weights
+        jastrow_factor: Jastrow instance for computing gradients
+        grid_points: Array of shape (N_grid, 3)
+        weights: Array of shape (N_grid,)
+        batch_size: Integer controlling batch size
         
     Returns:
         Array of shape (Nb*Nb, N_grid, 3) containing V_qt(r₁) vectors
     """
-    # Multiply gradients by weights for r₂ integration
-    weighted_rho_paired = rho_paired * weights[None, :]  # Shape: (N_b, N_grid )
+    N_grid = len(grid_points)
+    result = np.zeros((rho_paired.shape[0], N_grid, 3))
     
-    # Compute V_qt(r₁) by summing over r₂
-    v_vector = einsum('ijc,li->ljc', u_gradients, weighted_rho_paired)
+    # Weight the rho for r₂ integration once
+    weighted_rho = rho_paired * weights[None, :]  # (Nb^2, N_grid)
     
-    return v_vector
+    # Process grid points in batches
+    for i in range(0, N_grid, batch_size):
+        i_end = min(i + batch_size, N_grid)
+        batch_points = grid_points[i:i_end]
+        
+        # Get Jastrow gradients for this batch
+        u_grad_batch = jastrow_factor.grad(batch_points, grid_points)  # (batch, N_grid, 3)
+        
+        # Process each spatial component separately using np.dot
+        for c in range(3):
+            # Extract the c-th component: (batch, N_grid)
+            u_grad_c = u_grad_batch[..., c]
+            # Compute v_vector for this component: (Nb^2, batch)
+            result[:, i:i_end, c] = np.dot(weighted_rho, u_grad_c.T)
+    
+    return result
 
 
 def calc_L(rho_paired, v_bra, weights, v_ket=None):

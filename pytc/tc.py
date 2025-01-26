@@ -87,11 +87,10 @@ class TC:
         return ao_values, ao_gradients
 
     def _get_intermediates(self):
-        """Get or compute intermediate quantities with caching."""
+        """Get or compute intermediate quantities."""
         if self._rho is None:
             self._rho, self._nabla_rho = self._eval_basis_on_grid()
-            self._u_gradients = self.jastrow_factor.grad(self.grid_points)
-        return self._rho, self._nabla_rho, self._u_gradients
+        return self._rho, self._nabla_rho
 
     def isdf(self, n_rank=None):
         """Perform ISDF decomposition on paired densities and gradients.
@@ -150,61 +149,38 @@ class TC:
         self._isdf_results = result
         return result
 
-    def get_2b(self, use_isdf: bool = True):
-        """Compute all two-body integrals."""
-        if use_isdf and self._isdf_results is not None:
-            # Use ISDF intermediates
-            C_rho = self._isdf_results['C_rho']
-            xi_rho = self._isdf_results['xi_rho']
-            C_grad = self._isdf_results['C_grad']
-            xi_grad = self._isdf_results['xi_grad']
-            
-            # Get cached u_gradients
-            u_gradients = self._u_gradients
-            
-            # Compute all K matrices using ISDF
-            k_nabla = kmat.calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, self.weights)
-            k_laplacian = kmat.calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, u_gradients, self.weights)
-            k_square = kmat.calc_K3_isdf(C_rho, xi_rho, u_gradients, self.weights)
-
-            # reshape all K matrices
-            k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb) 
-            k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-            k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-            # Combine results
-            result = 0.5 * (k_laplacian + k_square)
-            result += k_nabla
-            result += result.transpose(2, 3, 0, 1)
-            
-            # Add original two-body integrals
-            eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
-            eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
-            
-            return eri1-result
-        else:
-            # Original logic using direct calculation
-            rho, nabla_rho, u_gradients = self._get_intermediates()
-            rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
-            nabla_rho_paired = einsum('rnc,pn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
-            
-            k_nabla = kmat.calc_K1(rho_paired, nabla_rho_paired, u_gradients, self.weights)
-            k_laplacian = kmat.calc_K2(rho_paired, nabla_rho_paired, u_gradients, self.weights)
-            k_square = kmat.calc_K3(rho_paired, u_gradients, self.weights)
-            
-            # Reshape all K matrices
-            n = self.n_orb
-            k_nabla = k_nabla.reshape(n,n,n,n)
-            k_laplacian = k_laplacian.reshape(n,n,n,n)
-            k_square = k_square.reshape(n,n,n,n)
-            
-            result = 0.5 * (k_laplacian + k_square)
-            result += result.transpose(2, 3, 0, 1)
-            result += k_nabla + k_nabla.transpose(2, 3, 0, 1)
-
-            eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
-            eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
-            
-            return eri1-result
+    def get_2b(self, dm1=None, dm2=None):
+        """Calculate two-body terms K1 + K2 + K3."""
+        from pytc.kmat import calc_K1, calc_K2, calc_K3
+        
+        # Get orbital values on grid
+        rho, nabla_rho = self._get_intermediates()
+        rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
+        # r1 is the first index, r2 is the second index, grad on r1
+        rho_nabla_rho_paired = np.einsum('pn, rnd->prnd', rho, nabla_rho).reshape(-1, len(self.weights), 3)
+        
+        # Calculate K matrices using batched processing
+        k_nabla = calc_K1(rho_paired, rho_nabla_rho_paired, 
+                     self.jastrow_factor, self.grid_points, self.weights)
+        k_laplacian = calc_K2(rho_paired, rho_nabla_rho_paired,
+                     self.jastrow_factor, self.grid_points, self.weights)
+        k_square = calc_K3(rho_paired, self.jastrow_factor,
+                     self.grid_points, self.weights)
+        
+        k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+                   # reshape all K matrices
+        # Combine results
+        result = 0.5 * (k_laplacian + k_square)
+        result += k_nabla
+        result += result.transpose(2, 3, 0, 1)
+        
+        # Add original two-body integrals
+        eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
+        eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
+        
+        return eri1-result
 
     def get_3b(self, rho_paired, u_gradients):
         """Compute all three-body integrals involving the Jastrow factor. Use the lmat module.

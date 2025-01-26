@@ -64,18 +64,30 @@ class TestTC(unittest.TestCase):
         np.testing.assert_array_equal(rho, rho2)
         np.testing.assert_array_equal(nabla_rho, nabla_rho2)
     
-    def test_2b_shape(self):
-        """Test if get_2b returns correct shape."""
-        # Remove jastrow argument since it's now in the TC object
-        result = self.tc.get_2b()
-        self.assertEqual(result.shape, (self.mol.nao,)*4)
+    def test_two_body_terms(self):
+        """Test calculation of two-body terms."""
+        from pytc.kmat import calc_K1, calc_K2, calc_K3
+        
+        # Get orbital values on grid
+        rho, nabla_rho = self.tc._get_intermediates()
+        rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.tc.weights))
+        nabla_rho_paired = np.einsum('ind,jn->ijnd', nabla_rho, rho).reshape(-1, len(self.tc.weights), 3)
+        
+        # Calculate terms individually
+        k1 = calc_K1(rho_paired, nabla_rho_paired, 
+                     self.tc.jastrow_factor, self.tc.grid_points, self.tc.weights)
+        k2 = calc_K2(rho_paired, nabla_rho_paired,
+                     self.tc.jastrow_factor, self.tc.grid_points, self.tc.weights)
+        k3 = calc_K3(rho_paired, self.tc.jastrow_factor,
+                     self.tc.grid_points, self.tc.weights)
+        
+        # Get combined result from TC class
+        combined = self.tc.get_2b()
+        
+        # Compare results
+        k_sum = k1.reshape(combined.shape) + k2.reshape(combined.shape) + k3.reshape(combined.shape)
+        np.testing.assert_array_almost_equal(combined, k_sum)
     
-    def test_3b_shape(self):
-        """Test if get_3b returns correct shape."""
-        pass
-        #result = self.tc.get_3b(self.jastrow)
-        #self.assertEqual(result.shape, (self.mol.nao,)*6)
-
 
 if __name__ == '__main__':
     unittest.main()
