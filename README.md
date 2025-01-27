@@ -11,6 +11,7 @@
 - Calculates the transcorrelated 2-body integrals: K1, K2, K3
 - Calculates the xTC approximated 3-body integrals
 - Implements the Interpolative Separable Density Fitting (ISDF) approximation for the all the aforementioned integrals
+- Seamless integration with PySCF rccsd solver, and more to come...
 
 ## Usage
 See the test directory for examples of how to use the package.
