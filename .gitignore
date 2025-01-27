@@ -4,7 +4,9 @@
 *.pyd
 *.pyw
 *.pyz
-
+*.ipynb
+*.png
+.pytc 
 .tchint/
 doc/*
 !doc/*.tex
