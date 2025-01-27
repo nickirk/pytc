@@ -2,8 +2,8 @@
 This module implements the density-fitting for transcorrelated integrals.
 """
 import numpy as np
-from scipy.linalg import qr
-from typing import Tuple, Union
+from typing import Tuple 
+import time  
 
 def calculate_norm(rho: np.ndarray) -> np.ndarray:
     """Calculate the norm of the input tensor along trailing dimensions.
@@ -28,6 +28,7 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
         L: Lower triangular factor
         piv: Selected pivot indices
     """
+    start_time = time.time()
     n = M.shape[0]
     
     perm = np.arange(n)
@@ -52,6 +53,8 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
         # Check for numerical stability
         if max_val < tol:
             print(f"Warning: Small pivot encountered at step {k}: {max_val:.2e}")
+            end_time = time.time()
+            print(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
             return L[:, :k], perm[:k]
         
         pivot = k + np.argmax(d[perm[k:]])
@@ -74,8 +77,12 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
         # Early termination if accuracy is reached
         if rel_err < tol:
             print(f"Converged at step {k} with relative error {rel_err:.2e}")
+            end_time = time.time()
+            print(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
             return L[:, :k+1], perm[:k+1]
     
+    end_time = time.time()
+    print(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
     return L[:, :n_rank], perm[:n_rank]
 
 def solve_least_squares(C: np.ndarray, rho: np.ndarray) -> np.ndarray:
@@ -106,6 +113,7 @@ def isdf_decompose_cholesky(rho: np.ndarray, n_rank: int) -> Tuple[np.ndarray, n
         C: Selected columns from rho (N_b, n_rank, *trailing_dims) or (N_b, n_rank)
         xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims) or (n_rank, N_grid)
     """
+    start_time = time.time()
     rho_normed = calculate_norm(rho)
     S = rho_normed.T @ rho_normed
     S[np.diag_indices_from(S)] += 1e-12 * np.max(np.abs(np.diag(S)))
@@ -114,6 +122,8 @@ def isdf_decompose_cholesky(rho: np.ndarray, n_rank: int) -> Tuple[np.ndarray, n
     C = np.take(rho, piv, axis=1)
     xi = solve_least_squares(C, rho)
 
+    end_time = time.time()
+    print(f"ISDF decomposition took {end_time - start_time:.2f} seconds")
     return C, xi
 
 def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank2: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

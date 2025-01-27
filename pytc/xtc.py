@@ -1,5 +1,6 @@
 import numpy as np
 from functools import partial, reduce
+import time  # Add this import at the top
 
 from pytc.tc import TC
 from pytc.lmat import calc_v_vector
@@ -154,6 +155,7 @@ class XTC(TC):
         Returns:
             Array of shape (Nb, Nb, Nb, Nb)
         """
+        start_time = time.time()
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -188,6 +190,8 @@ class XTC(TC):
         # Add permutation of two electrons
         final = result + result.transpose(2,3,0,1)
         
+        end_time = time.time()
+        print(f"Delta U calculation took {end_time - start_time:.2f} seconds")
         return final
     
     def _calc_delta_U_isdf(self, C_rho, xi_rho, jastrow_factor, grid_points, weights, dm1=None, batch_size=None):

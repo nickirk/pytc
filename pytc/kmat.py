@@ -2,6 +2,7 @@ import numpy as np
 from functools import partial, reduce
 import psutil
 import logging
+import time  # Add this import at the top
 
 einsum = partial(np.einsum, optimize='optimal')
 
@@ -39,6 +40,8 @@ def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
 
 def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
     """Evaluate the integral <pq|∇u·∇|rs> over grid points using batched processing."""
+    start_time = time.perf_counter()
+    
     N_grid = len(grid_points)
     Nb2 = rho_paired.shape[0]
     
@@ -68,7 +71,10 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         
         result += np.dot(rho_paired[:,i:i_end]*weights[None,i:i_end], tmp.T)
 
-    return result.swapaxes(0, 1)
+    result = result.swapaxes(0, 1)
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"calc_K1 completed in {elapsed_time:.2f} seconds")
+    return result
 
 def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
     """Evaluate the integral <pq|∇²₁u(r₁,r₂)|rs> using batched processing.
@@ -81,6 +87,8 @@ def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         weights: Array of shape (N_grid,)
         batch_size: Integer for controlling batch size
     """
+    start_time = time.perf_counter()
+    
     # Get the transposed term
     Nb = int(np.sqrt(nabla_rho_paired.shape[0]))
     nabla_rho_reshaped = nabla_rho_paired.reshape(Nb, Nb, -1, 3)
@@ -89,7 +97,10 @@ def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     
     # Sum the two terms and compute K1 with combined gradient
     combined_nabla = nabla_rho_paired + nabla_rho_transposed
-    return -calc_K1(rho_paired, combined_nabla, jastrow_factor, grid_points, weights, batch_size)
+    result = -calc_K1(rho_paired, combined_nabla, jastrow_factor, grid_points, weights, batch_size)
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"calc_K2 completed in {elapsed_time:.2f} seconds")
+    return result
 
 def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
     """Evaluate the integral <pq|(∇₁u(r₁,r₂))²|rs> using batched processing.
@@ -101,6 +112,8 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
         weights: Array of shape (N_grid,)
         batch_size: Integer for controlling batch size
     """
+    start_time = time.perf_counter()
+    
     N_grid = len(grid_points)
     result = np.zeros((rho_paired.shape[0],) * 2)
     # Process grid points in batches
@@ -122,6 +135,9 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
         
         result += reduce(np.dot, (rho_paired[:,i:i_end], weighted_u_squared, rho_paired.T))
     
+    result = result
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"calc_K3 completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, weights, batch_size=None):
@@ -140,6 +156,8 @@ def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
     Returns:
         (Nb^2, Nb^2) array in chemists' notation (pr|qs)
     """
+    start_time = time.perf_counter()
+    
     N_grid = len(grid_points)
     Nb2 = C_rho.shape[0]
     n_fused = xi_rho.shape[0]
@@ -175,6 +193,8 @@ def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
         # Accumulate result
         result += einsum('pl,ql->pq', G2, C_rho)
     
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"calc_K1_isdf completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, weights, batch_size=None):
@@ -193,6 +213,8 @@ def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
     Returns:
         (Nb^2, Nb^2) array in chemists' notation (pr|qs)
     """
+    start_time = time.perf_counter()
+    
     # Step 1: Compute the combined nabla term (∇ϕₑϕₛ + ϕₑ∇ϕₛ)
     Nb = int(np.sqrt(C_grad.shape[0]))
     C_grad_reshaped = C_grad.reshape(Nb, Nb, -1, 3)
@@ -203,6 +225,8 @@ def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
     result = -calc_K1_isdf(C_rho, xi_rho, combined_C_grad, xi_grad,
                           jastrow_factor, grid_points, weights, batch_size)
 
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"calc_K2_isdf completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size=None):
@@ -219,6 +243,8 @@ def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size
     Returns:
         (Nb^2, Nb^2) array in chemists' notation (pr|qs)
     """
+    start_time = time.perf_counter()
+    
     N_grid = len(grid_points)
     Nb2 = C_rho.shape[0]
     n_fused = xi_rho.shape[0]
@@ -247,4 +273,6 @@ def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size
         # Accumulate result
         result += einsum('kl,pk,ql->pq', G1, C_rho, C_rho)
     
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"calc_K3_isdf completed in {elapsed_time:.2f} seconds")
     return result
