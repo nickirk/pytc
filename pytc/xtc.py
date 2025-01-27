@@ -216,8 +216,8 @@ class XTC(TC):
         
         # Initialize accumulator for M tensor
         M = np.zeros((N_rank, N_rank, N_rank))
-        weighted_xi_rho = xi_rho * weights[None, :]
-        G = np.zeros((N_rank, N_grid, 3))
+        #weighted_xi_rho = xi_rho * weights[None, :]
+        #G = np.zeros((N_rank, N_grid, 3))
         
         # Process r2 points in batches
         for i in range(0, N_grid, batch_size):
@@ -225,15 +225,15 @@ class XTC(TC):
             
             # Get Jastrow gradients for this batch
             u_grad_batch = jastrow_factor.grad(grid_points[i:i_end], grid_points)  # (batch, N_grid,  3)
-            G[:,i:i_end,:] = einsum('j,bj,ijc->bic', weights, xi_rho, u_grad_batch)  # (Nr, N_grid, 3)
+            G = einsum('j,bj,ijc->bic', weights, xi_rho, u_grad_batch)  # (Nr, N_grid, 3)
         
-        K = einsum('bic,dic->bdi', G, G)  # (N_grid, Nr, Nr)
+            K = einsum('bic,dic->bdi', G, G)  # (N_grid, Nr, Nr)
         
-        # Compute weighted xi_rho for the chunk
-        weighted_xi = xi_rho * weights[None, :]  # (Nr, chunk_size)
+            # Compute weighted xi_rho for the chunk
+            weighted_xi = xi_rho[:,i:i_end] * weights[None, i:i_end]  # (Nr, chunk_size)
         
-        # Contract to get chunk contribution
-        M = einsum('ai,bdi->abd', weighted_xi, K)
+            # Contract to get chunk contribution
+            M += einsum('ai,bdi->abd', weighted_xi, K)
         
         # Step 3: Form G(b) = C_rho(t,u,b) * dm(t,u)
         Gb = einsum('tub,tu->b', C_rho, dm1)  # (N_rank,)
@@ -289,7 +289,7 @@ class XTC(TC):
         eris = rccsd._ChemistsERIs(mycc)
         eris.e_core = self.get_const()
         eris.fock = self.get_1b().copy()
-        h2e = self.get_2b().transpose(1,0,3,2)
+        h2e = self.get_2b()
         eris.fock += 2 * einsum('pqii->pq', h2e[:,:,:nocc,:nocc])
         eris.fock -= einsum('piiq->pq', h2e[:,:nocc,:nocc,:])
 

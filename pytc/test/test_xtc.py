@@ -11,7 +11,6 @@ from pyscf import gto, scf, ao2mo
 from pytc.xtc import XTC
 from pytc.lmat import calc_v_vector
 from pytc.jastrow import SM7, SimpleJastrow
-from pytc.df import isdf_decompose_cholesky 
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
@@ -165,6 +164,7 @@ class TestXTC(unittest.TestCase):
          
         # Test range of ranks
         ranks = [20, 50, 100]
+        #ranks = [300, 400]
         errors = []
         times = []
         
@@ -227,7 +227,7 @@ class TestXTC(unittest.TestCase):
         e_hf_ref = eris_ref.e_core + np.einsum('ii->', eris_ref.fock[:myrcc.nocc, :myrcc.nocc]) * 2
         e_dir = 2. * np.einsum('jjii->', eris_ref.oooo)
         e_ex = -1. * np.einsum('ijji->', eris_ref.oooo)
-        e_hf_ref += -(e_dir + e_ex) + myrcc._scf.energy_nuc()
+        e_hf_ref += -(e_dir + e_ex)
         e_ref = e_corr_ref + e_hf_ref
         
         # Test range of ranks
@@ -255,7 +255,7 @@ class TestXTC(unittest.TestCase):
             e_hf_isdf = eris_isdf.e_core + np.einsum('ii->', eris_isdf.fock[:myrcc_isdf.nocc, :myrcc_isdf.nocc]) * 2
             e_dir = 2. * np.einsum('jjii->', eris_isdf.oooo)
             e_ex = -1. * np.einsum('ijji->', eris_isdf.oooo)
-            e_hf_isdf += -(e_dir + e_ex) + myrcc._scf.energy_nuc()
+            e_hf_isdf += -(e_dir + e_ex)
             e_isdf = e_corr_isdf + e_hf_isdf
             
             # Calculate timing and errors

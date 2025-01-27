@@ -16,40 +16,73 @@ def calculate_norm(rho: np.ndarray) -> np.ndarray:
         return np.linalg.norm(rho.reshape(rho.shape[0], rho.shape[1], -1), axis=-1)
     return rho
 
-def pivoted_cholesky(M: np.ndarray, n_rank: int) -> Tuple[np.ndarray, np.ndarray]:
+def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
     """Pivoted Cholesky decomposition with fixed rank.
+    
     Args:
         M: Input matrix to decompose (positive semi-definite)
         n_rank: Number of pivots to select
+        tol: Tolerance for early termination and numerical stability
+    
     Returns:
         L: Lower triangular factor
         piv: Selected pivot indices
     """
     n = M.shape[0]
+    
     perm = np.arange(n)
     L = np.zeros((n, n))
     d = np.diag(M).copy()
-
-    for k in range(n_rank):
+    
+    # Initial error is the trace
+    initial_err = np.sum(d)
+    current_err = initial_err
+    
+    if initial_err < 0:
+        raise ValueError("Input matrix must be positive semi-definite")
+    
+    for k in range(min(n_rank, n)):
         if k > 0:
+            # Update diagonal elements
             d[perm[k:]] = np.diag(M)[perm[k:]] - np.sum(L[perm[k:], :k]**2, axis=1)
-
+        
+        # Find maximum diagonal element
+        max_val = np.max(d[perm[k:]])
+        
+        # Check for numerical stability
+        if max_val < tol:
+            print(f"Warning: Small pivot encountered at step {k}: {max_val:.2e}")
+            return L[:, :k], perm[:k]
+        
         pivot = k + np.argmax(d[perm[k:]])
+        
+        # Swap pivot if needed
         if pivot != k:
             perm[k], perm[pivot] = perm[pivot], perm[k]
-
+        
         L[perm[k], k] = np.sqrt(d[perm[k]])
+        
         if k < n_rank - 1:
             row_k = M[perm[k], perm[k+1:]] - L[perm[k], :k] @ L[perm[k+1:], :k].T
             L[perm[k+1:], k] = row_k / L[perm[k], k]
-
+        
+        # Calculate error
+        current_err = np.sum(d[perm[k+1:]])
+        rel_err = current_err / initial_err
+        #print(f"Step {k}: Relative error = {rel_err:.2e}")
+        
+        # Early termination if accuracy is reached
+        if rel_err < tol:
+            print(f"Converged at step {k} with relative error {rel_err:.2e}")
+            return L[:, :k+1], perm[:k+1]
+    
     return L[:, :n_rank], perm[:n_rank]
 
 def solve_least_squares(C: np.ndarray, rho: np.ndarray) -> np.ndarray:
     """Solve least squares problem for interpolation coefficients.
     Args:
-        C: Selected columns (N_b, n_rank, *trailing_dims)
-        rho: Original tensor (N_b, N_grid, *trailing_dims)
+        C: Selected columns (N_b*N_b, n_rank, *trailing_dims)
+        rho: Original tensor (N_b*N_b, N_grid, *trailing_dims)
 
     Returns:
         xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
@@ -87,15 +120,15 @@ def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_ran
     """ISDF decomposition for two densities with pivot fusion.
 
     Args:
-        rho1: First density matrix (N_b1, N_grid, *trailing_dims)
-        rho2: Second density matrix (N_b2, N_grid, *trailing_dims)
+        rho1: First overlap density (N_b*N_b, N_grid, *trailing_dims)
+        rho2: Second overlap density (N_b*N_b, N_grid, *trailing_dims)
         n_rank1: Number of interpolation points for rho1
         n_rank2: Number of interpolation points for rho2
 
     Returns:
-        C1: Selected columns from rho1 using fused pivots (N_b1, n_fused, *trailing_dims)
+        C1: Selected columns from rho1 using fused pivots (N_b*N_b, n_fused, *trailing_dims)
         xi1: Interpolation coefficients for rho1 (n_fused, N_grid, *trailing_dims)
-        C2: Selected columns from rho2 using fused pivots (N_b2, n_fused, *trailing_dims)
+        C2: Selected columns from rho2 using fused pivots (N_b*N_b, n_fused, *trailing_dims)
         xi2: Interpolation coefficients for rho2 (n_fused, N_grid, *trailing_dims)
         piv_fused: Combined pivot indices
     """

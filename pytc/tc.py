@@ -110,7 +110,7 @@ class TC:
         # Get cached intermediates and compute rho_paired
         rho, nabla_rho = self._get_intermediates()
         rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
-        nabla_rho_paired = einsum('rnc,pn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
+        nabla_rho_paired = einsum('pnc,rn->prnc', nabla_rho, rho).reshape(-1, rho.shape[1], 3)
     
         # Set default rank if not provided
         if n_rank is None:
@@ -154,11 +154,6 @@ class TC:
         from pytc.kmat import (calc_K1, calc_K2, calc_K3, 
                              calc_K1_isdf, calc_K2_isdf, calc_K3_isdf)
         
-        # Get orbital values on grid
-        rho, nabla_rho = self._get_intermediates()
-        rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
-        # r1 is the first index, r2 is the second index, grad on r1
-        rho_nabla_rho_paired = np.einsum('pn, rnd->prnd', rho, nabla_rho).reshape(-1, len(self.weights), 3)
         
         # Check if ISDF results are available
         if self._isdf_results is not None:
@@ -190,6 +185,11 @@ class TC:
             )
         else:
             # Use original method
+            # Get orbital values on grid
+            rho, nabla_rho = self._get_intermediates()
+            rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
+            # r1 is the first index, r2 is the second index, grad on r1
+            rho_nabla_rho_paired = np.einsum('pnd, rn ->prnd',nabla_rho,rho).reshape(-1, len(self.weights), 3)
             k_nabla = calc_K1(rho_paired, rho_nabla_rho_paired, 
                          self.jastrow_factor, self.grid_points, self.weights)
             k_laplacian = calc_K2(rho_paired, rho_nabla_rho_paired,
