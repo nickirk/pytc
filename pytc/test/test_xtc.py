@@ -10,7 +10,7 @@ from pyscf import gto, scf, ao2mo
 
 from pytc.xtc import XTC
 from pytc.lmat import calc_v_vector
-from pytc.jastrow import SM7, SimpleJastrow
+from pytc.jastrow import SM7, SM17, SimpleJastrow
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
@@ -31,8 +31,8 @@ class TestXTC(unittest.TestCase):
         
         
         # Create SM7 instance with Be coefficients
-        #cls.jastrow = SM7(atom='He')
-        cls.jastrow = SimpleJastrow([1.4])
+        cls.jastrow = SM7(atom='Be')
+        #cls.jastrow = SimpleJastrow([1.4])
         
         # Initialize XTC with SM7 Jastrow
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
