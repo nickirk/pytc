@@ -32,6 +32,7 @@ def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=1
         batch_points = grid_points[i:i_end]
         
         # Get Jastrow gradients for this batch
+        # TODO: This step is not using multiple threads.
         u_grad_batch = jastrow_factor.grad(batch_points, grid_points)  # (batch, N_grid, 3)
         
         # Process each spatial component separately using np.dot

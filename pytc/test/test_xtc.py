@@ -31,8 +31,8 @@ class TestXTC(unittest.TestCase):
         
         
         # Create SM7 instance with Be coefficients
-        cls.jastrow = SM7(atom='Be')
-        #cls.jastrow = SimpleJastrow([1.4])
+        #cls.jastrow = SM7(atom='Be')
+        cls.jastrow = SimpleJastrow([1.4])
         
         # Initialize XTC with SM7 Jastrow
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
