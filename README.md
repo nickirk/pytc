@@ -1,5 +1,5 @@
 # pytc
-*Py*thon *T*rans*C*orrelation package
+**Py**thon **T**rans**C**orrelation package
 
 ## Dependencies
 - numpy
@@ -20,7 +20,7 @@ See the test directory for examples of how to use the package.
 - [ ] Jastrow optimization VMC
 
 - [ ] Further efficiency improvements: 
-    - [ ] Identify the most time-consuming parts of the code
+    - [x] Identify the most time-consuming parts of the code. ~~_calc_delta_U~~
     - [ ] all eisums need careful inspection to see if they can be optimized by matrix multiplication.
 
 - [ ] GPU acceleration
