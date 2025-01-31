@@ -1,6 +1,6 @@
 import numpy as np
 from functools import partial, reduce
-import time  # Add this import at the top
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from pytc.tc import TC
@@ -165,20 +165,33 @@ class XTC(TC):
             
         # Reshape inputs
         V, rho = self._validate_and_reshape(v_vector, rho_paired)
+        nb = V.shape[0]
+        n_grid = V.shape[2]
+
         # weight the rho using self.weights
         rho_weighted = rho * self.weights[None, None, :]
         # Calculate intermediates
         W = 2*einsum('utix,tu->ix', V, dm1)  # (N_grid, 3)
-        Vbar = einsum('ix,srix->sri', W, V)  # (Nb, Nb, N_grid, 3)
+        Vbar = einsum('ix,srix->sri', W, V)  # (nb, Nb, N_grid, 3)
         
         X = einsum('stix,tu->suix', V, dm1)  # (Nb, N_grid, 3)
-        Zbar = einsum('urid,suid->sri', V, X)  # (Nb, Nb, N_grid, 3)
+        
+        # Compute Zbar using parallel processing
+        Zbar = _parallel_over_i(
+            lambda i: _process_Zbar_i(i, V, X),
+            output_shape=(nb, nb, n_grid),
+            n_i=n_grid
+        )
         
         Wbar = 2*einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
         Y = einsum('urix,tu->trix', V, dm1)  # (Nb, Nb, N_grid, 3)
 
-        # Compute G using parallel implementation
-        G = _parallel_compute_G(rho_weighted, X, Y)
+        # Compute G using parallel processing
+        G = _parallel_over_i(
+            lambda i: _process_G_i(i, rho_weighted, X, Y),
+            output_shape=(nb, nb, n_grid, 3),
+            n_i=n_grid
+        )
 
         #G = (einsum('uri,suix->srix', rho_weighted, X) + 
         #     einsum('trix,sti->srix', Y, rho_weighted))  # (Nb, Nb, N_grid, 3)
@@ -360,3 +373,50 @@ def _parallel_compute_G(rho_weighted, X, Y):
             G[:, :, i, :] = result
     
     return G
+
+def _parallel_over_i(process_i_func, output_shape, n_i):
+    """Generic parallel processor for i-index contractions.
+    
+    Args:
+        process_i_func: Function that takes i and returns (i, result)
+        output_shape: Shape of output tensor
+        n_i: Number of i indices to process
+        
+    Returns:
+        Tensor with results assembled
+    """
+    result = np.zeros(output_shape)
+    
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for i in range(n_i):
+            futures.append(executor.submit(process_i_func, i))
+            
+        for future in futures:
+            i, slice_result = future.result()
+            if len(output_shape) == 3:
+                result[..., i] = slice_result
+            elif len(output_shape) == 4:
+                result[..., i, :] = slice_result
+            else:
+                raise ValueError("Invalid output shape")
+    return result
+
+def _process_G_i(i, rho_weighted, X, Y):
+    """Process i-th slice for G tensor."""
+    X_slice = X[:, :, i, :]  # (S, U, X)
+    Y_slice = Y[:, :, i, :]  # (T, R, X)
+    rho_slice = rho_weighted[:, :, i]  # (U, R) and (S, T)
+    
+    term1 = np.einsum('ur,sux->srx', rho_slice, X_slice)
+    term2 = np.einsum('trx,st->srx', Y_slice, rho_slice)
+    
+    return i, term1 + term2
+
+def _process_Zbar_i(i, V, X):
+    """Process i-th slice for Zbar tensor."""
+    V_slice = V[:, :, i, :]  # (U, R, X)
+    X_slice = X[:, :, i, :]  # (S, U, X)
+    
+    result = np.einsum('urx,sux->sr', V_slice, X_slice)
+    return i, result
