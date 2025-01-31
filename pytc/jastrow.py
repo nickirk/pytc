@@ -2,9 +2,10 @@
 
 import numpy as np
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 
 class Jastrow(ABC):
-    """Base class for Jastrow factors."""
+    """Base class for Jastrow factors with built-in parallel gradient computation."""
 
     def __init__(self, params=None):
         """Initialize the Jastrow factor with parameters."""
@@ -25,19 +26,43 @@ class Jastrow(ABC):
         pass
 
     @abstractmethod
-    def grad(self, r1, r2=None, atomic_positions=None):
-        """Compute gradient with coordinates as last dimension.
+    def _process_grad_batch(self, r1_batch, r2):
+        """Process a batch of r1 points for gradient computation.
         
         Args:
-            r1: Array of shape (..., 3) representing electron positions
-            r2: Optional array of shape (..., 3). If None, use r1
-            atomic_positions: Optional array of shape (N_atoms, 3) for nuclear coordinates
+            r1_batch: Array of shape (batch_size, 3)
+            r2: Array of shape (N2, 3)
             
         Returns:
-            Array of shape (N1, N2, 3) containing gradients
+            Array of shape (batch_size, N2, 3) containing gradients
         """
         pass
-
+    
+    def _get_batch_size(self, n_points):
+        """Determine batch size based on available threads."""
+        with ThreadPoolExecutor() as executor:
+            n_workers = executor._max_workers
+        return max(1, n_points // (4 * n_workers))
+    
+    def grad(self, r1, r2=None, atomic_positions=None):
+        """Compute gradient using parallel processing over batches."""
+        r2 = r2 if r2 is not None else r1
+        r1 = np.atleast_2d(r1)
+        r2 = np.atleast_2d(r2)
+        
+        n_points = len(r1)
+        batch_size = self._get_batch_size(n_points)
+        
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for i in range(0, n_points, batch_size):
+                batch = r1[i:i+batch_size]
+                futures.append(
+                    executor.submit(self._process_grad_batch, batch, r2)
+                )
+            results = [f.result() for f in futures]
+        
+        return np.concatenate(results, axis=0)
 
 class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
@@ -56,17 +81,21 @@ class SimpleJastrow(Jastrow):
             
         return result
     
-    def grad(self, r1, r2=None, atomic_positions=None):
-        """Compute gradient with respect to coordinates."""
-        r1 = np.atleast_2d(r1)
-        r2 = np.atleast_2d(r2) if r2 is not None else r1
+    def _process_grad_batch(self, r1_batch, r2):
+        """Process a batch of r1 points efficiently using vectorized operations."""
+        # Reshape for broadcasting
+        r1_batch = np.asarray(r1_batch)[:, None, :]  # (batch, 1, 3)
+        r2 = np.asarray(r2)[None, :, :]             # (1, N2, 3)
         
-        diff = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
-        norm = np.linalg.norm(diff, axis=-1, keepdims=True)
+        # Vectorized operations for the batch
+        diff = r1_batch - r2                         # (batch, N2, 3)
+        norm = np.linalg.norm(diff, axis=-1)[..., None]  # (batch, N2, 1)
         norm = np.where(norm == 0, 1.0, norm)
         
-        # Note: Use the reshaped call result for proper broadcasting
-        jastrow_values = self.__call__(r1, r2)[..., np.newaxis]
+        # Compute jastrow values efficiently for the batch
+        r = norm.squeeze(-1)  # Remove last dimension for jastrow calculation
+        jastrow_values = 0.5/self.params[0] * np.exp(-self.params[0] * r)[..., None]
+        
         return -0.5*self.params[0] * diff / norm * jastrow_values
 
 class SM7(Jastrow):
@@ -147,66 +176,48 @@ class SM7(Jastrow):
             
         return result
 
-    def grad(self, r1, r2=None, atomic_positions=None):
-        """Compute gradient of SM7 Jastrow factor with respect to r1.
+    def _process_grad_batch(self, r1_batch, r2):
+        """Process a batch of r1 points efficiently using vectorized operations."""
+        r1_batch = np.asarray(r1_batch)
+        r2 = np.asarray(r2)
         
-        Args:
-            r1: Array of shape (..., 3) representing electron positions
-            r2: Array of shape (..., 3) representing electron positions
-            atomic_positions: Ignored (assumes nucleus at origin)
-            
-        Returns:
-            Array of shape (N1, N2, 3) containing gradients
-        """
-        r1 = np.asarray(r1)
-        r2 = np.asarray(r2) if r2 is not None else r1
-        
-        # Reshape for broadcasting
-        r1_expanded = r1[:, np.newaxis, :]
+        r1_expanded = r1_batch[:, np.newaxis, :]
         r2_expanded = r2[np.newaxis, :, :]
         
-        # Calculate electron-nucleus distances and their directional gradients
         r1_dist = np.sqrt(np.sum(r1_expanded * r1_expanded, axis=-1, keepdims=True))
         r1_grad_dir = r1_expanded / np.where(r1_dist < 1e-10, 1e-10, r1_dist)
         
-        # Calculate electron-electron distances and their directional gradients
         diff = r1_expanded - r2_expanded
         r12_dist = np.sqrt(np.sum(diff * diff, axis=-1, keepdims=True))
         r12_grad_dir = diff / np.where(r12_dist < 1e-10, 1e-10, r12_dist)
         
-        # Calculate scaled distances
         r1_scaled = self._scaled_r(r1_dist)
         r2_scaled = self._scaled_r(np.sqrt(np.sum(r2_expanded * r2_expanded, axis=-1, keepdims=True)))
         r12_scaled = self._scaled_r(r12_dist)
         
-        # Calculate gradients of scaled distances
         r1_scaled_grad = self._scaled_r_grad(r1_dist) * r1_grad_dir
         r12_scaled_grad = self._scaled_r_grad(r12_dist) * r12_grad_dir
         
-        # Initialize total gradient
         total_grad = np.zeros_like(diff)
         
-        # Sum up all terms
         for (m,n,o), coeff in self.params.items():
             if m == n: 
                 coeff_ = 0.5 * coeff
             else:
                 coeff_ = coeff
-            # First term: c_mno * r1^m * r2^n * r12^o
-            if m > 0:  # Gradient of r1^m term
+            if m > 0:
                 grad = coeff_ * m * r1_scaled**(m-1) * r2_scaled**n * r12_scaled**o * r1_scaled_grad
                 total_grad += grad
             
-            if o > 0:  # Gradient of r12^o term
+            if o > 0:
                 grad = coeff_ * r1_scaled**m * r2_scaled**n * o * r12_scaled**(o-1) * r12_scaled_grad
                 total_grad += grad
             
-            # Second term (symmetric): c_mno * r2^m * r1^n * r12^o
-            if n > 0:  # Gradient of r1^n term
+            if n > 0:
                 grad = coeff_ * n * r1_scaled**(n-1) * r2_scaled**m * r12_scaled**o * r1_scaled_grad
                 total_grad += grad
             
-            if o > 0:  # Gradient of r12^o term
+            if o > 0:
                 grad = coeff_ * r2_scaled**m * r1_scaled**n * o * r12_scaled**(o-1) * r12_scaled_grad
                 total_grad += grad
         
