@@ -1,7 +1,8 @@
 import numpy as np
 from functools import partial, reduce
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 from pytc.tc import TC
 from pytc.lmat import calc_v_vector
@@ -176,21 +177,23 @@ class XTC(TC):
         
         X = einsum('stix,tu->suix', V, dm1)  # (Nb, N_grid, 3)
         
-        # Compute Zbar using parallel processing
+        # Compute Zbar using parallel processing with progress tracking
         Zbar = _parallel_over_i(
             lambda i: _process_Zbar_i(i, V, X),
             output_shape=(nb, nb, n_grid),
-            n_i=n_grid
+            n_i=n_grid,
+            desc="Computing Zbar"
         )
         
         Wbar = 2*einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
         Y = einsum('urix,tu->trix', V, dm1)  # (Nb, Nb, N_grid, 3)
 
-        # Compute G using parallel processing
+        # Compute G using parallel processing with progress tracking
         G = _parallel_over_i(
             lambda i: _process_G_i(i, rho_weighted, X, Y),
             output_shape=(nb, nb, n_grid, 3),
-            n_i=n_grid
+            n_i=n_grid,
+            desc="Computing G tensor"
         )
 
         #G = (einsum('uri,suix->srix', rho_weighted, X) + 
@@ -374,13 +377,14 @@ def _parallel_compute_G(rho_weighted, X, Y):
     
     return G
 
-def _parallel_over_i(process_i_func, output_shape, n_i):
-    """Generic parallel processor for i-index contractions.
+def _parallel_over_i(process_i_func, output_shape, n_i, desc=None):
+    """Generic parallel processor for i-index contractions with progress tracking.
     
     Args:
         process_i_func: Function that takes i and returns (i, result)
         output_shape: Shape of output tensor
         n_i: Number of i indices to process
+        desc: Optional description for progress bar
         
     Returns:
         Tensor with results assembled
@@ -388,18 +392,24 @@ def _parallel_over_i(process_i_func, output_shape, n_i):
     result = np.zeros(output_shape)
     
     with ThreadPoolExecutor() as executor:
-        futures = []
-        for i in range(n_i):
-            futures.append(executor.submit(process_i_func, i))
-            
-        for future in futures:
-            i, slice_result = future.result()
-            if len(output_shape) == 3:
-                result[..., i] = slice_result
-            elif len(output_shape) == 4:
-                result[..., i, :] = slice_result
-            else:
-                raise ValueError("Invalid output shape")
+        # Submit all tasks
+        futures = {
+            executor.submit(process_i_func, i): i 
+            for i in range(n_i)
+        }
+        
+        # Process results as they complete with progress bar
+        with tqdm(total=n_i, desc=desc or "Processing") as pbar:
+            for future in as_completed(futures):
+                i, slice_result = future.result()
+                if len(output_shape) == 3:
+                    result[..., i] = slice_result
+                elif len(output_shape) == 4:
+                    result[..., i, :] = slice_result
+                else:
+                    raise ValueError("Invalid output shape")
+                pbar.update(1)
+    
     return result
 
 def _process_G_i(i, rho_weighted, X, Y):

@@ -16,7 +16,7 @@ def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
     """
     bytes_per_elem = np.dtype(dtype).itemsize
     mem = psutil.virtual_memory()
-    available_bytes = mem.available * 0.5  # Use 70% of available memory
+    available_bytes = mem.available * 0.5  # Use 50% of available memory
     
     # Calculate memory for main arrays
     def calc_mem_for_batch(batch_size):
