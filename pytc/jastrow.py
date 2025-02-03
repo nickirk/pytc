@@ -12,13 +12,13 @@ class Jastrow(ABC):
         self.params = params
 
     @abstractmethod
-    def __call__(self, r1, r2, atomic_positions=None):
+    def __call__(self, r1, r2, r_nuc=None):
         """Evaluate Jastrow factor at given positions.
         
         Args:
             r1: Array of shape (..., 3) representing electron positions
             r2: Array of shape (..., 3) representing electron positions
-            atomic_positions: Optional array of shape (N_atoms, 3) for nuclear coordinates
+            r_nuc: Optional array of shape (N_atoms, 3) for nuclear coordinates
         
         Returns:
             Array of shape (N1, N2) where N1, N2 are the batch dimensions of r1, r2
@@ -44,7 +44,7 @@ class Jastrow(ABC):
             n_workers = executor._max_workers
         return max(1, n_points // (4 * n_workers))
     
-    def grad(self, r1, r2=None, atomic_positions=None):
+    def grad(self, r1, r2=None, r_nuc=None):
         """Compute gradient using parallel processing over batches."""
         r2 = r2 if r2 is not None else r1
         r1 = np.atleast_2d(r1)
@@ -67,7 +67,7 @@ class Jastrow(ABC):
 class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     
-    def __call__(self, r1, r2, atomic_positions=None):
+    def __call__(self, r1, r2, r_nuc=None):
         """Evaluate Jastrow factor at given positions."""
         r1 = np.atleast_2d(r1)  # Ensure 2D array with shape (N, 3)
         r2 = np.atleast_2d(r2)  # Ensure 2D array with shape (M, 3)
@@ -141,13 +141,13 @@ class SM7(Jastrow):
         """Gradient of scaled distance with respect to r."""
         return 1.0 / (1.0 + r)**2
     
-    def __call__(self, r1, r2, atomic_positions=None):
+    def __call__(self, r1, r2, r_nuc=None):
         """Evaluate SM7 Jastrow factor.
         
         Args:
             r1: Array of shape (..., 3) representing electron positions
             r2: Array of shape (..., 3) representing electron positions
-            atomic_positions: Ignored (assumes nucleus at origin)
+            r_nuc: Ignored (assumes nucleus at origin)
         """
         r1 = np.asarray(r1)[..., np.newaxis, :]
         r2 = np.asarray(r2)[np.newaxis, ...]
@@ -274,3 +274,247 @@ class SM17(SM7):
                (4,2,2): -4.62167, (6,0,2): -1.32220, (4,0,4): 5.22850, (2,2,4): -4.17394,
                (2,0,6): -1.64963}
     }
+
+class CASINO(Jastrow):
+    """Jastrow factor based on CASINO format parameters."""
+    def __call__(self, r1, r2, r_nuc=None):
+        total = 0.0
+        for term in self.params:
+            if term['rank'] == [2, 0]:
+                total += self.compute_term_2e0n(term, r1, r2)
+            elif term['rank'] == [1, 1]:
+                total += self.compute_term_1e1n(term, r1, r_nuc)
+            elif term['rank'] == [2, 1]:
+                total += self.compute_term_2e1n(term, r1, r2, r_nuc)
+            elif term['rank'] == [1, 2]:
+                total += self.compute_term_1e2n(term, r1, r_nuc)
+        return total
+
+    def compute_term_2e0n(self, term, r1, r2):
+        """Compute electron-electron terms using vectorized operations.
+        
+        Args:
+            term: dict containing basis parameters and coefficients
+            r1: ndarray of shape (n_grid, 3)
+            r2: ndarray of shape (n_grid, 3)
+            
+        Returns:
+            ndarray: correlation values for each electron pair
+        """
+        # Compute all pairwise distances using broadcasting
+        # r1[:, np.newaxis] has shape (n_grid, 1, 3)
+        # r2[np.newaxis, :] has shape (1, n_grid, 3)
+        diff = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]  # shape: (n_grid, n_grid, 3)
+        r_ij = np.sqrt(np.sum(diff * diff, axis=-1))  # shape: (n_grid, n_grid)
+        
+        # Create mask for cutoff
+        L = term['cutoff']['L']
+        C = term['cutoff']['C']
+        mask = r_ij < L
+        
+        # Initialize result array
+        result = np.zeros_like(r_ij)
+        
+        # Compute cutoff function where mask is True
+        cutoff = np.where(mask, (1 - r_ij/L)**C, 0.0)
+        
+        # Compute power series terms
+        order = term['basis']['order']
+        for nu in range(2, order + 1):
+            param = term['channels']['1-2'][f'c_{nu}']
+            # Only compute powers where mask is True
+            power_term = np.where(mask, r_ij**nu, 0.0)
+            result += param * power_term * cutoff
+            
+        return result
+
+    def compute_term_1e1n(self, term, r1, r_nuc):
+        total = 0.0
+        L = term['cutoff']['L']
+        C = term['cutoff']['C']
+        order = term['basis']['order']
+        for i in range(len(electrons)):
+            for k in range(len(r_nuc)):
+                n_type = self.nucleus_types[k]
+                if n_type not in term['channels']:
+                    continue  # Skip if nucleus type not in term's channels
+                r_ik = distance(electrons[i], r_nuc[k])
+                if r_ik >= L:
+                    continue
+                cutoff = (1 - r_ik / L) ** C
+                for mu in range(2, order + 1):
+                    param = term['channels'][n_type][f'c_{mu}']
+                    basis = r_ik ** mu
+                    total += param * basis * cutoff
+        return total
+
+    def compute_term_2e1n(self, term, electrons, r_nuc):
+        total = 0.0
+        L = term['cutoff']['L']
+        C = term['cutoff']['C']
+        order_ee = term['basis_e-e']['order']
+        order_en = term['basis_e-n']['order']
+        for i, j in itertools.combinations(range(len(electrons)), 2):
+            r_ij = distance(electrons[i], electrons[j])
+            basis_ee = [r_ij ** nu for nu in range(1, order_ee + 1)]
+            for k in range(len(r_nuc)):
+                n_type = self.nucleus_types[k]
+                channel = f"1-2-{n_type}"
+                if channel not in term['channels']:
+                    continue
+                r_ik = distance(electrons[i], r_nuc[k])
+                r_jk = distance(electrons[j], r_nuc[k])
+                if r_ik >= L or r_jk >= L:
+                    continue
+                cutoff_ik = (1 - r_ik / L) ** C
+                cutoff_jk = (1 - r_jk / L) ** C
+                basis_en_i = [r_ik ** mu for mu in range(1, order_en + 1)]
+                basis_en_j = [r_jk ** mu for mu in range(1, order_en + 1)]
+                for nu in range(1, order_ee + 1):
+                    for mu1 in range(1, order_en + 1):
+                        for mu2 in range(1, order_en + 1):
+                            param_key = f"c_{nu},{mu1},{mu2}"
+                            if param_key in term['channels'][channel]:
+                                param = term['channels'][channel][param_key]
+                                contrib = param * basis_ee[nu-1] * basis_en_i[mu1-1] * basis_en_j[mu2-1] * cutoff_ik * cutoff_jk
+                                total += contrib
+        return total
+
+    def compute_term_1e2n(self, term, electrons, r_nuc):
+        total = 0.0
+        L = term['cutoff']['L']
+        C = term['cutoff']['C']
+        order = term['basis']['order']
+        for i in range(len(electrons)):
+            for k, l in itertools.combinations(range(len(r_nuc)), 2):
+                n_type_k = self.nucleus_types[k]
+                n_type_l = self.nucleus_types[l]
+                channel = None
+                if {n_type_k, n_type_l} == {'n1', 'n2'}:
+                    channel = '1-n1-n2'
+                elif {n_type_k, n_type_l} == {'n2', 'n3'}:
+                    channel = '1-n2-n3'
+                else:
+                    continue
+                if channel not in term['channels']:
+                    continue
+                r_ik = distance(electrons[i], r_nuc[k])
+                r_il = distance(electrons[i], r_nuc[l])
+                if r_ik >= L or r_il >= L:
+                    continue
+                cutoff_ik = (1 - r_ik / L) ** C
+                cutoff_il = (1 - r_il / L) ** C
+                for mu1 in range(2, order + 1):
+                    for mu2 in range(2, order + 1):
+                        param_key = f"c_{mu1},{mu2}"
+                        if param_key in term['channels'][channel]:
+                            param = term['channels'][channel][param_key]
+                            basis_ik = r_ik ** mu1
+                            basis_il = r_il ** mu2
+                            contrib = param * basis_ik * basis_il * cutoff_ik * cutoff_il
+                            total += contrib
+        return total
+
+def main():
+    # Example usage setup (hypothetical data)
+    params = [
+        # Term 1: 2e-0n
+        {
+            'rank': [2, 0],
+            'basis': {'type': 'natural_power', 'order': 9},
+            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 4.5},
+            'rules': ['1=2'],
+            'channels': {
+                '1-2': {
+                    'c_2': 0.17116191470246386,
+                    'c_3': -0.32746596009857848,
+                    'c_4': 0.55850739348156975,
+                    'c_5': -0.48872917684252443,
+                    'c_6': 0.22932203915330066,
+                    'c_7': -5.8347255319090852e-2,
+                    'c_8': 7.5581655776572323e-3,
+                    'c_9': -4.0154385008477826e-4,
+                }
+            }
+        },
+        # Term 2: 1e-1n
+        {
+            'rank': [1, 1],
+            'basis': {'type': 'natural_power', 'order': 9},
+            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 4.0},
+            'rules': ['1=2', 'Z'],
+            'channels': {
+                '1-n1': {
+                    'c_2': 10.665093365434497,
+                    'c_3': -43.468216235575234,
+                    'c_4': 34.854942972961524,
+                    'c_5': -13.417577330711682,
+                    'c_6': 4.6310964477366312,
+                    'c_7': -1.6638796125111699,
+                    'c_8': 0.37409693251810372,
+                    'c_9': -3.3920208930857530e-2,
+                },
+                '1-n2': {
+                    'c_2': -2.4129347722542174,
+                    'c_3': 12.315524399833910,
+                    'c_4': -7.2496314229269379,
+                    'c_5': 0.47107735618282570,
+                    'c_6': 0.27433532501303559,
+                    'c_7': 0.12348115518349240,
+                    'c_8': -7.2679544780244631e-2,
+                    'c_9': 8.6405312400579699e-3,
+                }
+            }
+        },
+        # Term 3: 2e-1n (example structure; parameters may need adjustment)
+        {
+            'rank': [2, 1],
+            'basis_e-e': {'type': 'natural_power', 'order': 4},
+            'basis_e-n': {'type': 'natural_power', 'order': 4},
+            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 4.0},
+            'rules': ['1=2', 'Z'],
+            'channels': {
+                '1-2-n2': {
+                    'c_1,2,2': -8.2592025742978161e-3,
+                    # ... other parameters for this channel
+                },
+                '1-2-n1': {
+                    'c_1,2,2': -5.5947693452814744e-2,
+                    # ... other parameters for this channel
+                }
+            }
+        },
+        # Term 4: 1e-2n (example structure)
+        {
+            'rank': [1, 2],
+            'basis': {'type': 'natural_power', 'order': 6},
+            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 5.0},
+            'rules': ['1=2', 'Z'],
+            'channels': {
+                '1-n1-n2': {
+                    'c_2,2': -0.30065820052318637,
+                    # ... other parameters
+                },
+                '1-n2-n3': {
+                    'c_2,2': 0.53438787789588926,
+                    # ... other parameters
+                }
+            }
+        }
+    ]
+
+    # Hypothetical particle positions and types
+    electrons = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]  # Example coordinates
+    r_nuc = [(0.5, 0.5, 0.5), (1.5, 1.5, 1.5)]      # Example coordinates
+    electron_types = ['1', '2']                       # Spin types for electrons
+    nucleus_types = ['n1', 'n2']                      # Types for r_nuc
+
+    # Initialize calculator
+    calculator = CASINO(params, electron_types, nucleus_types)
+
+    # Calculate Jastrow factor
+    jastrow_value = calculator.calculate_jastrow(electrons, r_nuc)
+    print(f"Jastrow factor value: {jastrow_value}")
+
+if __name__ == '__main__':
+    main()
