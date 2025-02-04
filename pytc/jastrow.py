@@ -377,7 +377,7 @@ class CASINO(Jastrow):
     def compute_term_2e0n(self, term, r1, r2):
         """Compute electron-electron terms using vectorized operations."""
         # Check for spin-dependent terms
-        if '1=2' not in term['rules']:
+        if '1=2' not in term['Rules']:
             raise NotImplementedError("Spin-dependent terms not yet implemented")
             
         # Get cutoff parameters
@@ -428,19 +428,89 @@ class CASINO(Jastrow):
         diff = r1 - r_nuc  # (N_e, N_nuc, 3)
         return np.sqrt(np.sum(diff * diff, axis=-1))  # (N_e, N_nuc)
 
+    def compute_orbital_cusp_correction(self, r, term):
+        """Compute orbital cusp correction term.
+        
+        Args:
+            r: Distance from nucleus (float or array)
+            term: Dictionary containing orbital cusp parameters
+        
+        Returns:
+            Cusp correction value at r
+        """
+        if '1=2' not in term['Rules']:
+            raise NotImplementedError("Spin-dependent terms not yet implemented")
+        constants = term['e-n cutoff']['Constants']
+        ngrid = constants['ngrid']
+        L_grid = constants['L_grid']
+        rc = ngrid * L_grid
+        
+        # Get tabulated orbital values (note: 1000 points from 0 to 999)
+        phi_grid = []
+        for i in range(ngrid + 1):  # +1 because we have phi_0 to phi_999
+            key = f'phi_{i}'
+            if key in constants['Orbital 1']:
+                phi_grid.append(constants['Orbital 1'][key])
+            else:
+                break
+        
+        # Convert to numpy array for interpolation
+        phi_grid = np.array(phi_grid)
+        # Generate grid points (1000 points from 0 to rc)
+        r_grid = np.linspace(0, rc, len(phi_grid))
+        
+        # Verify grid spacing
+        dr = r_grid[1] - r_grid[0]
+        if not np.isclose(dr, L_grid, rtol=1e-10):
+            raise ValueError(f"Grid spacing mismatch: {dr} != {L_grid}")
+        
+        # Use cubic spline interpolation
+        from scipy.interpolate import CubicSpline
+        spline = CubicSpline(r_grid, np.log(phi_grid))
+        
+        # Interpolate ln(phi) at r using spline
+        r = np.asarray(r)
+        ln_phi = spline(r)
+        
+        # Compute cusp-corrected orbital
+        alpha_0 = term.get('alpha_0', 0.0)  # Default to 0 if not specified
+        ln_phi_tilde = alpha_0 * r + constants.get('C', 0.0)
+        
+        # Apply theta function (1 inside rc, 0 outside)
+        mask = r < rc
+        
+        return (ln_phi_tilde - ln_phi) * mask
+
     def compute_term_1e1n(self, term, r1, r_nuc, nuc_groups):
         """Compute electron-nuclear correlation term using vectorized operations."""
-        # Check for spin-dependent terms
-        if '1=2' not in term['rules']:
+        if '1=2' not in term['Rules']:
             raise NotImplementedError("Spin-dependent terms not yet implemented")
-            
+        # Get nuclear charge from term
+        Z = term['e-n cutoff']['Constants'].get('Z', None)
+        
+        # Parse rules
+        rules = term['Rules']
+        use_Z = 'Z' in rules
+        # Get all exclusions (!N1, !N2, etc)
+        excluded_groups = []
+        for rule in rules:
+            if rule.startswith('!N'):
+                excluded_groups.append(rule[2:])  # Remove '!N' prefix
+        
+        # Get cutoff parameters
+        if 'e-n basis' in term and term['e-n basis']['Type'] != 'none':
+            order = term['e-n basis']['order']
+        else:
+            order = 0  # For orbital cusp terms
+        
         # Get cutoff parameters
         C = term['e-n cutoff']['Constants']['C']
-        order = term['e-n basis']['order']
         
         # Get cutoff radii for different nuclear types
         cutoff_L = {}
         for group_key in nuc_groups.keys():
+            if group_key in excluded_groups:
+                continue
             channel = f'Channel 1-{group_key}'
             if channel in term['e-n cutoff']['Parameters']:
                 cutoff_L[group_key] = term['e-n cutoff']['Parameters'][channel]['L'][0]
@@ -451,8 +521,23 @@ class CASINO(Jastrow):
         # Initialize result
         total = 0.0
         
+        # Add orbital cusp correction if present
+        if term['e-n cutoff']['Type'] == 'orbital cusp':
+            total += self.compute_orbital_cusp_correction(r_en, term)
+            
         # Process each nuclear group
         for group_key, group_nuclei in nuc_groups.items():
+            # Skip excluded groups
+            if group_key in excluded_groups:
+                continue
+                
+            # If using Z-based grouping, check Z matches
+            if use_Z and Z is not None:
+                nuc_index = int(group_nuclei[0][1:]) - 1
+                if abs(self.mol.atom_charges()[nuc_index] - Z) > 1e-6:
+                    continue
+                
+            # Rest of the computation remains the same
             # Get channel parameters for this group
             channel = f'Channel 1-{group_key}'
             if channel not in term['Linear parameters']:
@@ -488,7 +573,7 @@ class CASINO(Jastrow):
     def compute_term_2e1n(self, term, r1, r2, r_nuc, nuc_groups):
         """Compute electron-nuclear-electron correlation terms using vectorized operations."""
         # Check for spin-dependent terms
-        if '1=2' not in term['rules']:
+        if '1=2' not in term['Rules']:
             raise NotImplementedError("Spin-dependent terms not yet implemented")
             
         # Get cutoff parameters
@@ -555,7 +640,7 @@ class CASINO(Jastrow):
     def compute_term_1e2n(self, term, r1, r_nuc, nuc_groups):
         """Compute electron-two-nuclear correlation term using vectorized operations."""
         # Check for spin-dependent terms
-        if '1=2' not in term['rules']:
+        if '1=2' not in term['Rules']:
             raise NotImplementedError("Spin-dependent terms not yet implemented")
             
         # Get cutoff parameters
