@@ -7,8 +7,17 @@ from concurrent.futures import ThreadPoolExecutor
 class Jastrow(ABC):
     """Base class for Jastrow factors with built-in parallel gradient computation."""
 
-    def __init__(self, params=None):
-        """Initialize the Jastrow factor with parameters."""
+    def __init__(self, params, mol=None):
+        """Initialize the Jastrow factor with parameters.
+        
+        Args:
+            mf: Mean-field object (e.g., pyscf SCF object)
+            mo_coeff: Molecular orbital coefficients
+            params: Dictionary of Jastrow parameters (or any other format, as long as
+                the __call__ and _process_grad_batch methods can interpret it)
+            mol: Molecule object (e.g., pyscf Mole object)
+        """
+        self.mol = mol
         self.params = params
 
     @abstractmethod
@@ -67,7 +76,7 @@ class Jastrow(ABC):
 class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     
-    def __call__(self, r1, r2, r_nuc=None):
+    def __call__(self, r1, r2):
         """Evaluate Jastrow factor at given positions."""
         r1 = np.atleast_2d(r1)  # Ensure 2D array with shape (N, 3)
         r2 = np.atleast_2d(r2)  # Ensure 2D array with shape (M, 3)
@@ -277,39 +286,110 @@ class SM17(SM7):
 
 class CASINO(Jastrow):
     """Jastrow factor based on CASINO format parameters."""
-    def __call__(self, r1, r2, r_nuc=None):
+    
+    def _get_nuc_groups(self, is_symm=False):
+        """Generate nucleus labels and groups based on atomic charges.
+        
+        Args:
+            is_symm: Whether to use symmetry-based grouping
+
+        Returns:
+            nuc_groups: dict of nucleus label groups, e.g. {'n1': ['n1', 'n2'], 'n3': ['n3']}
+            
+        """
+        if self.nuc_groups is not None:
+            return self.nuc_groups, self.nuc_coords
+        
+        if self.mol is None:
+            raise ValueError("mol object must be set to use nuclear coordinates")
+            
+        charges = self.mol.atom_charges()
+        
+        if is_symm:
+            coords = self._get_nuc_coords()
+            raise NotImplementedError("Symmetry-based grouping not implemented yet!")
+
+        
+        # Track unique charges we've seen
+        charge_to_label = {}
+        current_label_num = 1
+        
+        # First pass: assign labels
+        nucleus_labels = []
+        for charge in charges:
+            label = f'n{current_label_num}'
+            charge_to_label[charge] = label
+            current_label_num += 1
+            nucleus_labels.append(charge_to_label[charge])
+            
+        # Second pass: create groups
+        nuc_groups = {}
+        for label in nucleus_labels:
+            # Extract numeric part from label (e.g. 'n1' -> 1)
+            num = int(label[1:])
+            # Find lowest numeric label in each group
+            group_key = min(n for n in nucleus_labels if int(n[1:]) <= num)
+            # Initialize group if needed
+            if group_key not in nuc_groups:
+                nuc_groups[group_key] = []
+            # Add current label to appropriate group
+            nuc_groups[group_key].append(label)
+        
+        self.nuc_groups = nuc_groups
+            
+        return self.nuc_groups 
+    
+    def _get_nuc_coords(self):
+        """Get nuclear coordinates from molecule object."""
+        if self.mol is None:
+            raise ValueError("mol object must be set to use nuclear coordinates")
+        self.nuc_coords =self.mol.atom_coords() 
+        return self.nuc_coords
+    
+    def __call__(self, r1, r2, r_nuc=None, nuc_groups=None):
+        """Evaluate CASINO Jastrow factor.
+        
+        Args:
+            r1: Array of shape (..., 3) representing electron positions
+            r2: Array of shape (..., 3) representing electron positions
+            r_nuc: Array of shape (N_atoms, 3) for nuclear coordinates
+            nuc_groups: Dict of nucleus labels for grouping, e.g., {'n1': ['n1', 'n2'], 'n3': ['n3']}
+        """
+        if r_nuc is None:
+            r_nuc = self._get_nuc_coords()
+        
+        if nuc_groups is None:
+            nuc_groups = self._get_nuc_groups()
+
+        
         total = 0.0
         for term in self.params:
             if term['rank'] == [2, 0]:
                 total += self.compute_term_2e0n(term, r1, r2)
             elif term['rank'] == [1, 1]:
-                total += self.compute_term_1e1n(term, r1, r_nuc)
+                total += self.compute_term_1e1n(term, r1, r_nuc, nuc_groups)
             elif term['rank'] == [2, 1]:
-                total += self.compute_term_2e1n(term, r1, r2, r_nuc)
+                total += self.compute_term_2e1n(term, r1, r2, r_nuc, nuc_groups)
             elif term['rank'] == [1, 2]:
-                total += self.compute_term_1e2n(term, r1, r_nuc)
+                total += self.compute_term_1e2n(term, r1, r_nuc, nuc_groups)
         return total
 
     def compute_term_2e0n(self, term, r1, r2):
-        """Compute electron-electron terms using vectorized operations.
-        
-        Args:
-            term: dict containing basis parameters and coefficients
-            r1: ndarray of shape (n_grid, 3)
-            r2: ndarray of shape (n_grid, 3)
+        """Compute electron-electron terms using vectorized operations."""
+        # Check for spin-dependent terms
+        if '1=2' not in term['rules']:
+            raise NotImplementedError("Spin-dependent terms not yet implemented")
             
-        Returns:
-            ndarray: correlation values for each electron pair
-        """
-        # Compute all pairwise distances using broadcasting
-        # r1[:, np.newaxis] has shape (n_grid, 1, 3)
-        # r2[np.newaxis, :] has shape (1, n_grid, 3)
+        # Get cutoff parameters
+        L = term['e-e cutoff']['Parameters']['Channel 1-2']['L'][0]
+        C = term['e-e cutoff']['Constants']['C']
+        order = term['e-e basis']['order']
+        
+        # Compute all distances
         diff = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]  # shape: (n_grid, n_grid, 3)
         r_ij = np.sqrt(np.sum(diff * diff, axis=-1))  # shape: (n_grid, n_grid)
         
         # Create mask for cutoff
-        L = term['cutoff']['L']
-        C = term['cutoff']['C']
         mask = r_ij < L
         
         # Initialize result array
@@ -318,203 +398,228 @@ class CASINO(Jastrow):
         # Compute cutoff function where mask is True
         cutoff = np.where(mask, (1 - r_ij/L)**C, 0.0)
         
+        # Get parameters for this channel
+        channel_params = term['Linear parameters']['Channel 1-2']
+        
         # Compute power series terms
-        order = term['basis']['order']
         for nu in range(2, order + 1):
-            param = term['channels']['1-2'][f'c_{nu}']
-            # Only compute powers where mask is True
-            power_term = np.where(mask, r_ij**nu, 0.0)
-            result += param * power_term * cutoff
+            param_key = f'c_{nu}'
+            if param_key in channel_params:
+                param = channel_params[param_key][0]  # Get parameter value
+                # Only compute powers where mask is True
+                power_term = np.where(mask, r_ij**nu, 0.0)
+                result += param * power_term * cutoff
             
         return result
 
-    def compute_term_1e1n(self, term, r1, r_nuc):
+    def _compute_e_n_distances(self, r1, r_nuc):
+        """Compute electron-nuclear distances efficiently.
+        
+        Args:
+            r1: Array of shape (N_e, 3) for electron positions
+            r_nuc: Array of shape (N_nuc, 3) for nuclear positions
+            
+        Returns:
+            Array of shape (N_e, N_nuc) containing e-n distances
+        """
+        r1 = np.atleast_2d(r1)[:, np.newaxis, :]  # (N_e, 1, 3)
+        r_nuc = np.atleast_2d(r_nuc)[np.newaxis, :, :]  # (1, N_nuc, 3)
+        
+        diff = r1 - r_nuc  # (N_e, N_nuc, 3)
+        return np.sqrt(np.sum(diff * diff, axis=-1))  # (N_e, N_nuc)
+
+    def compute_term_1e1n(self, term, r1, r_nuc, nuc_groups):
+        """Compute electron-nuclear correlation term using vectorized operations."""
+        # Check for spin-dependent terms
+        if '1=2' not in term['rules']:
+            raise NotImplementedError("Spin-dependent terms not yet implemented")
+            
+        # Get cutoff parameters
+        C = term['e-n cutoff']['Constants']['C']
+        order = term['e-n basis']['order']
+        
+        # Get cutoff radii for different nuclear types
+        cutoff_L = {}
+        for group_key in nuc_groups.keys():
+            channel = f'Channel 1-{group_key}'
+            if channel in term['e-n cutoff']['Parameters']:
+                cutoff_L[group_key] = term['e-n cutoff']['Parameters'][channel]['L'][0]
+        
+        # Compute all e-n distances at once
+        r_en = self._compute_e_n_distances(r1, r_nuc)  # (N_e, N_nuc)
+        
+        # Initialize result
         total = 0.0
-        L = term['cutoff']['L']
-        C = term['cutoff']['C']
-        order = term['basis']['order']
-        for i in range(len(electrons)):
-            for k in range(len(r_nuc)):
-                n_type = self.nucleus_types[k]
-                if n_type not in term['channels']:
-                    continue  # Skip if nucleus type not in term's channels
-                r_ik = distance(electrons[i], r_nuc[k])
-                if r_ik >= L:
-                    continue
-                cutoff = (1 - r_ik / L) ** C
-                for mu in range(2, order + 1):
-                    param = term['channels'][n_type][f'c_{mu}']
-                    basis = r_ik ** mu
-                    total += param * basis * cutoff
+        
+        # Process each nuclear group
+        for group_key, group_nuclei in nuc_groups.items():
+            # Get channel parameters for this group
+            channel = f'Channel 1-{group_key}'
+            if channel not in term['Linear parameters']:
+                continue
+                
+            channel_params = term['Linear parameters'][channel]
+            L = cutoff_L[group_key]
+            
+            # Get indices for nuclei in this group
+            nuc_indices = [int(n[1:])-1 for n in group_nuclei]
+            
+            # Extract relevant distances
+            group_r_en = r_en[:, nuc_indices]  # (N_e, N_group)
+            
+            # Apply cutoff conditions
+            mask = group_r_en < L
+            cutoff = np.where(mask, (1 - group_r_en/L)**C, 0.0)
+            
+            # Process each power term
+            for mu in range(2, order + 1):
+                param_key = f'c_{mu}'
+                if param_key in channel_params:
+                    param = channel_params[param_key][0]  # Get parameter value
+                    
+                    # Compute basis functions and apply cutoff
+                    basis = np.where(mask, group_r_en**mu, 0.0)
+                    
+                    # Sum contributions for this group
+                    total += param * np.sum(basis * cutoff)
+                    
         return total
 
-    def compute_term_2e1n(self, term, electrons, r_nuc):
+    def compute_term_2e1n(self, term, r1, r2, r_nuc, nuc_groups):
+        """Compute electron-nuclear-electron correlation terms using vectorized operations."""
+        # Check for spin-dependent terms
+        if '1=2' not in term['rules']:
+            raise NotImplementedError("Spin-dependent terms not yet implemented")
+            
+        # Get cutoff parameters
+        L = term['e-n cutoff']['Constants']['C']
+        C = term['e-n cutoff']['Constants']['C']
+        order_ee = term['e-e basis']['order']
+        order_en = term['e-n basis']['order']
+        
+        # Compute all required distances at once
+        r12 = np.sqrt(np.sum((r1[:, np.newaxis] - r2[np.newaxis])**2, axis=-1))  # (N1, N2)
+        
+        # Initialize result
         total = 0.0
-        L = term['cutoff']['L']
-        C = term['cutoff']['C']
-        order_ee = term['basis_e-e']['order']
-        order_en = term['basis_e-n']['order']
-        for i, j in itertools.combinations(range(len(electrons)), 2):
-            r_ij = distance(electrons[i], electrons[j])
-            basis_ee = [r_ij ** nu for nu in range(1, order_ee + 1)]
-            for k in range(len(r_nuc)):
-                n_type = self.nucleus_types[k]
-                channel = f"1-2-{n_type}"
-                if channel not in term['channels']:
-                    continue
-                r_ik = distance(electrons[i], r_nuc[k])
-                r_jk = distance(electrons[j], r_nuc[k])
-                if r_ik >= L or r_jk >= L:
-                    continue
-                cutoff_ik = (1 - r_ik / L) ** C
-                cutoff_jk = (1 - r_jk / L) ** C
-                basis_en_i = [r_ik ** mu for mu in range(1, order_en + 1)]
-                basis_en_j = [r_jk ** mu for mu in range(1, order_en + 1)]
-                for nu in range(1, order_ee + 1):
-                    for mu1 in range(1, order_en + 1):
-                        for mu2 in range(1, order_en + 1):
-                            param_key = f"c_{nu},{mu1},{mu2}"
-                            if param_key in term['channels'][channel]:
-                                param = term['channels'][channel][param_key]
-                                contrib = param * basis_ee[nu-1] * basis_en_i[mu1-1] * basis_en_j[mu2-1] * cutoff_ik * cutoff_jk
-                                total += contrib
+        
+        # Process each nuclear group
+        for group_key, group_nuclei in nuc_groups.items():
+            # Get channel name for this nuclear group
+            channel_name = f'Channel 1-2-{group_key}'
+            if channel_name not in term['Linear parameters']:
+                continue
+                
+            channel_params = term['Linear parameters'][channel_name]
+            
+            # Get L parameter for this nuclear group
+            L = term['e-n cutoff']['Parameters'][f'Channel 1-{group_key}']['L'][0]
+            
+            # Get indices for nuclei in this group
+            nuc_indices = [int(n[1:])-1 for n in group_nuclei]
+            
+            for k in nuc_indices:
+                # Compute e-n distances for both electrons
+                r1_nuc = np.sqrt(np.sum((r1 - r_nuc[k])**2, axis=-1))  # (N1,)
+                r2_nuc = np.sqrt(np.sum((r2 - r_nuc[k])**2, axis=-1))  # (N2,)
+                
+                # Apply cutoff conditions
+                mask1 = r1_nuc < L  # (N1,)
+                mask2 = r2_nuc < L  # (N2,)
+                cutoff1 = np.where(mask1, (1 - r1_nuc/L)**C, 0.0)  # (N1,)
+                cutoff2 = np.where(mask2, (1 - r2_nuc/L)**C, 0.0)  # (N2,)
+                
+                # For each parameter in the channel
+                for param_key, param_info in channel_params.items():
+                    if not param_key.startswith('c_'):
+                        continue
+                        
+                    # Extract indices from parameter key (e.g., 'c_1,2,2' -> n=1, l=2, m=2)
+                    n, l, m = map(int, param_key[2:].split(','))
+                    param_value = param_info[0]  # Get the parameter value
+                    
+                    # Compute basis functions
+                    basis_i = np.where(mask1, r1_nuc**l, 0.0)  # (N1,)
+                    basis_j = np.where(mask2, r2_nuc**m, 0.0)  # (N2,)
+                    basis_ij = r12**n  # (N1, N2)
+                    
+                    # Combine all terms
+                    contrib = param_value * basis_ij * \
+                             (basis_i[:, None] * cutoff1[:, None]) * \
+                             (basis_j[None, :] * cutoff2[None, :])
+                    
+                    total += np.sum(contrib)
+        
         return total
 
-    def compute_term_1e2n(self, term, electrons, r_nuc):
+    def compute_term_1e2n(self, term, r1, r_nuc, nuc_groups):
+        """Compute electron-two-nuclear correlation term using vectorized operations."""
+        # Check for spin-dependent terms
+        if '1=2' not in term['rules']:
+            raise NotImplementedError("Spin-dependent terms not yet implemented")
+            
+        # Get cutoff parameters
+        C = term['e-n cutoff']['Constants']['C']
+        
+        # Get all cutoff radii for different nuclear types
+        cutoff_L = {}
+        for group_key in nuc_groups.keys():
+            channel = f'Channel 1-{group_key}'
+            if channel in term['e-n cutoff']['Parameters']:
+                cutoff_L[group_key] = term['e-n cutoff']['Parameters'][channel]['L'][0]
+        
+        # Compute all e-n distances at once
+        r_en = self._compute_e_n_distances(r1, r_nuc)  # (N_e, N_nuc)
+        
+        # Initialize result
         total = 0.0
-        L = term['cutoff']['L']
-        C = term['cutoff']['C']
-        order = term['basis']['order']
-        for i in range(len(electrons)):
-            for k, l in itertools.combinations(range(len(r_nuc)), 2):
-                n_type_k = self.nucleus_types[k]
-                n_type_l = self.nucleus_types[l]
-                channel = None
-                if {n_type_k, n_type_l} == {'n1', 'n2'}:
-                    channel = '1-n1-n2'
-                elif {n_type_k, n_type_l} == {'n2', 'n3'}:
-                    channel = '1-n2-n3'
-                else:
+        
+        # Process each nuclear group pair
+        for group1, nuclei1 in nuc_groups.items():
+            for group2, nuclei2 in nuc_groups.items():
+                if group1 >= group2:  # Skip duplicate pairs and same group
                     continue
-                if channel not in term['channels']:
+                    
+                # Get channel parameters for this group pair
+                channel = f'Channel 1-{group1}-{group2}'
+                if channel not in term['Linear parameters']:
                     continue
-                r_ik = distance(electrons[i], r_nuc[k])
-                r_il = distance(electrons[i], r_nuc[l])
-                if r_ik >= L or r_il >= L:
-                    continue
-                cutoff_ik = (1 - r_ik / L) ** C
-                cutoff_il = (1 - r_il / L) ** C
-                for mu1 in range(2, order + 1):
-                    for mu2 in range(2, order + 1):
-                        param_key = f"c_{mu1},{mu2}"
-                        if param_key in term['channels'][channel]:
-                            param = term['channels'][channel][param_key]
-                            basis_ik = r_ik ** mu1
-                            basis_il = r_il ** mu2
-                            contrib = param * basis_ik * basis_il * cutoff_ik * cutoff_il
-                            total += contrib
+                    
+                # Get indices for each nuclear group
+                indices1 = [int(n[1:])-1 for n in nuclei1]  # Convert 'n1' to 0, etc.
+                indices2 = [int(n[1:])-1 for n in nuclei2]  # Convert 'n2' to 1, etc.
+                
+                L1 = cutoff_L[group1]
+                L2 = cutoff_L[group2]
+                
+                # Extract relevant distances
+                r_e1 = r_en[:, indices1]  # (N_e, N_group1)
+                r_e2 = r_en[:, indices2]  # (N_e, N_group2)
+                
+                # Apply cutoff conditions
+                mask1 = r_e1 < L1
+                mask2 = r_e2 < L2
+                cutoff1 = np.where(mask1, (1 - r_e1/L1)**C, 0.0)
+                cutoff2 = np.where(mask2, (1 - r_e2/L2)**C, 0.0)
+                
+                # Loop over all parameter combinations
+                channel_params = term['Linear parameters'][channel]
+                for param_key, param_info in channel_params.items():
+                    if not param_key.startswith('c_'):
+                        continue
+                    
+                    # Extract power indices (e.g., 'c_2,3' -> l=2, m=3)
+                    l, m = map(int, param_key[2:].split(','))
+                    param_value = param_info[0]  # Get parameter value
+                    
+                    # Compute basis functions
+                    basis1 = np.where(mask1, r_e1**l, 0.0)  # (N_e, N_group1)
+                    basis2 = np.where(mask2, r_e2**m, 0.0)  # (N_e, N_group2)
+                    
+                    # Sum over all nucleus pairs between the groups
+                    total += param_value * np.sum(
+                        (basis1 * cutoff1)[:, :, None] * 
+                        (basis2 * cutoff2)[:, None, :]
+                    )
+        
         return total
-
-def main():
-    # Example usage setup (hypothetical data)
-    params = [
-        # Term 1: 2e-0n
-        {
-            'rank': [2, 0],
-            'basis': {'type': 'natural_power', 'order': 9},
-            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 4.5},
-            'rules': ['1=2'],
-            'channels': {
-                '1-2': {
-                    'c_2': 0.17116191470246386,
-                    'c_3': -0.32746596009857848,
-                    'c_4': 0.55850739348156975,
-                    'c_5': -0.48872917684252443,
-                    'c_6': 0.22932203915330066,
-                    'c_7': -5.8347255319090852e-2,
-                    'c_8': 7.5581655776572323e-3,
-                    'c_9': -4.0154385008477826e-4,
-                }
-            }
-        },
-        # Term 2: 1e-1n
-        {
-            'rank': [1, 1],
-            'basis': {'type': 'natural_power', 'order': 9},
-            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 4.0},
-            'rules': ['1=2', 'Z'],
-            'channels': {
-                '1-n1': {
-                    'c_2': 10.665093365434497,
-                    'c_3': -43.468216235575234,
-                    'c_4': 34.854942972961524,
-                    'c_5': -13.417577330711682,
-                    'c_6': 4.6310964477366312,
-                    'c_7': -1.6638796125111699,
-                    'c_8': 0.37409693251810372,
-                    'c_9': -3.3920208930857530e-2,
-                },
-                '1-n2': {
-                    'c_2': -2.4129347722542174,
-                    'c_3': 12.315524399833910,
-                    'c_4': -7.2496314229269379,
-                    'c_5': 0.47107735618282570,
-                    'c_6': 0.27433532501303559,
-                    'c_7': 0.12348115518349240,
-                    'c_8': -7.2679544780244631e-2,
-                    'c_9': 8.6405312400579699e-3,
-                }
-            }
-        },
-        # Term 3: 2e-1n (example structure; parameters may need adjustment)
-        {
-            'rank': [2, 1],
-            'basis_e-e': {'type': 'natural_power', 'order': 4},
-            'basis_e-n': {'type': 'natural_power', 'order': 4},
-            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 4.0},
-            'rules': ['1=2', 'Z'],
-            'channels': {
-                '1-2-n2': {
-                    'c_1,2,2': -8.2592025742978161e-3,
-                    # ... other parameters for this channel
-                },
-                '1-2-n1': {
-                    'c_1,2,2': -5.5947693452814744e-2,
-                    # ... other parameters for this channel
-                }
-            }
-        },
-        # Term 4: 1e-2n (example structure)
-        {
-            'rank': [1, 2],
-            'basis': {'type': 'natural_power', 'order': 6},
-            'cutoff': {'type': 'polynomial', 'C': 3, 'L': 5.0},
-            'rules': ['1=2', 'Z'],
-            'channels': {
-                '1-n1-n2': {
-                    'c_2,2': -0.30065820052318637,
-                    # ... other parameters
-                },
-                '1-n2-n3': {
-                    'c_2,2': 0.53438787789588926,
-                    # ... other parameters
-                }
-            }
-        }
-    ]
-
-    # Hypothetical particle positions and types
-    electrons = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]  # Example coordinates
-    r_nuc = [(0.5, 0.5, 0.5), (1.5, 1.5, 1.5)]      # Example coordinates
-    electron_types = ['1', '2']                       # Spin types for electrons
-    nucleus_types = ['n1', 'n2']                      # Types for r_nuc
-
-    # Initialize calculator
-    calculator = CASINO(params, electron_types, nucleus_types)
-
-    # Calculate Jastrow factor
-    jastrow_value = calculator.calculate_jastrow(electrons, r_nuc)
-    print(f"Jastrow factor value: {jastrow_value}")
-
-if __name__ == '__main__':
-    main()
