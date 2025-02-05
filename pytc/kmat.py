@@ -3,6 +3,7 @@ from functools import partial, reduce
 import psutil
 import logging
 import time  # Add this import at the top
+from tqdm import tqdm
 
 einsum = partial(np.einsum, optimize='optimal')
 
@@ -33,7 +34,7 @@ def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
         else:
             right = mid - 1
     
-    batch_size = max(1, min(left, 2000))  # Cap at 1000 for practical purposes
+    batch_size = max(1, min(left, 5000))  
     #batch_size = max(1, left)
     logging.info(f"Selected batch_size: {batch_size} based on available memory: {mem.available / 1e9:.2f} GB")
     return batch_size
@@ -46,14 +47,15 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     Nb2 = rho_paired.shape[0]
     
     result = np.zeros((rho_paired.shape[0],) * 2)
-    # Automatically determine batch size if not provided
     if batch_size is None:
         batch_size = _get_safe_batch_size(N_grid, Nb2)
-     
-     
-    # Process r2 points in batches
-    for i in range(0, N_grid, batch_size):
+    
+    logging.info(f"Starting K1 calculation with {N_grid} grid points in batches of {batch_size}")
+    pbar = tqdm(range(0, N_grid, batch_size), desc="Computing K1")
+    for i in pbar:
         i_end = min(i + batch_size, N_grid)
+        progress = (i + batch_size) / N_grid * 100
+        logging.info(f"K1 progress: {progress:.1f}% (points {i} to {i_end})")
         
         # Get Jastrow gradients for this batch against all r1
         u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
@@ -76,7 +78,7 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     logging.info(f"calc_K1 completed in {elapsed_time:.2f} seconds")
     return result
 
-def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
+def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
     """Evaluate the integral <pq|∇²₁u(r₁,r₂)|rs> using batched processing.
     
     Args:
@@ -102,7 +104,7 @@ def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     logging.info(f"calc_K2 completed in {elapsed_time:.2f} seconds")
     return result
 
-def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
+def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
     """Evaluate the integral <pq|(∇₁u(r₁,r₂))²|rs> using batched processing.
     
     Args:
@@ -120,8 +122,13 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
     # Automatically determine batch size if not provided
     if batch_size is None:
         batch_size = _get_safe_batch_size(N_grid, rho_paired.shape[0])
-    for i in range(0, N_grid, batch_size):
+    
+    logging.info(f"Starting K3 calculation with {N_grid} grid points in batches of {batch_size}")
+    pbar = tqdm(range(0, N_grid, batch_size), desc="Computing K3")
+    for i in pbar:
         i_end = min(i + batch_size, N_grid)
+        progress = (i + batch_size) / N_grid * 100
+        logging.info(f"K3 progress: {progress:.1f}% (points {i} to {i_end})")
         batch_points = grid_points[i:i_end]
         
         # Get Jastrow gradients for this batch

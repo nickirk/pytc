@@ -5,7 +5,7 @@ from pyscf import gto, scf, cc, lib
 from pytc import xtc, jastrow                                                   
                                                                                 
 lib.num_threads(10)                                                             
-mol = gto.M(atom='C 0 0 0; O 0 0 -5.63; O 0 0 5.63', basis='ccpvtz', unit='Bohr')
+mol = gto.M(atom='C 0 0 0; O 0 0 -5.63; O 0 0 5.63', basis='ccpvdz', unit='Bohr')
 mf = scf.RHF(mol)                                                               
 mf.kernel()                                                                     
                                                                                 
