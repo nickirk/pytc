@@ -18,8 +18,8 @@ See the test directory for examples of how to use the package.
 
 ## TODO
 - [ ] VMC, based on Jax, for Jastrow optimization
-      - [x] det.py is completed. Need tests.
-      - [ ] Jax autodiff for new jastrows, sampling and optimization.
+    - [x] det.py is completed. Need tests.
+    - [ ] Jax autodiff for new jastrows, sampling and optimization.
 
 - [ ] Further efficiency improvements: 
     - [x] Identify the most time-consuming parts of the code. ~~_calc_delta_U~~
