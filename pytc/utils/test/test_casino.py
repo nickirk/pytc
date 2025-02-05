@@ -6,7 +6,7 @@ class TestCasinoParameters(unittest.TestCase):
         self.param_file = os.path.join(os.path.dirname(__file__), 'parameters.casl')
     
     def test_parse_casl(self):
-        from pytc.utils.casino import parse_casl
+        from pytc.utils.parser import parse_casl
         params = parse_casl(self.param_file)
         
         # Test basic structure
@@ -24,13 +24,13 @@ class TestCasinoParameters(unittest.TestCase):
         self.assertEqual(term1["Linear parameters"]["Channel 1-2"]["c_2"][1], "optimizable")
 
     def test_parse_casl_invalid_file(self):
-        from pytc.utils.casino import parse_casl
+        from pytc.utils.parser import parse_casl
         
         with self.assertRaises(FileNotFoundError):
             parse_casl("nonexistent.casl")
 
     def test_parse_casl_term5(self):
-        from pytc.utils.casino import parse_casl
+        from pytc.utils.parser import parse_casl
         params = parse_casl(self.param_file)
         
         term5 = params["JASTROW"]["TERM 5"]
@@ -56,7 +56,7 @@ class TestCasinoParameters(unittest.TestCase):
         self.assertEqual(orbital["phi_999"], 1.8105994855870560)
 
     def test_parse_casl_term6(self):
-        from pytc.utils.casino import parse_casl
+        from pytc.utils.parser import parse_casl
         params = parse_casl(self.param_file)
         
         term6 = params["JASTROW"]["TERM 6"]
