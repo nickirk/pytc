@@ -186,7 +186,6 @@ class CASINO(Jastrow):
             raise ValueError(f"Grid spacing mismatch: {dr} != {L_grid}")
         
         # Use cubic spline interpolation
-        from scipy.interpolate import CubicSpline
         spline = CubicSpline(r_grid, np.log(phi_grid))
         
         # Interpolate ln(phi) at r using spline
@@ -429,3 +428,6 @@ class CASINO(Jastrow):
                     )
         
         return total
+    
+    def _process_grad_batch(self, r1_batch, r2):
+        pass
