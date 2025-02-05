@@ -28,5 +28,6 @@ See the test directory for examples of how to use the package.
     - [ ] K1 and K2 mats are related by a simple indices transpose. No need to calculate K2. Just use K1 to construct
           K1+K2
     - [ ] ISDF needs similar efficiency checks, aiming at scaling to large molecules and solids, when combined with efficient 2nd quantized methods, should be competitive to real space VMC and DMC.
+    - [ ] Needs more careful memory management, by improving slicing of the grid points or even the number of orbitals.
 
 - [ ] GPU acceleration
