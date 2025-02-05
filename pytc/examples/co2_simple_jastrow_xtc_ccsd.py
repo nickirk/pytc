@@ -4,8 +4,8 @@ from pyscf import gto, scf, cc, lib
                                                                                 
 from pytc import xtc, jastrow                                                   
                                                                                 
-lib.num_threads(10)                                                             
-mol = gto.M(atom='C 0 0 0; O 0 0 -5.63; O 0 0 5.63', basis='ccpvdz', unit='Bohr')
+lib.num_threads(1)                                                             
+mol = gto.M(atom='C 0 0 0; O 0 0 -5.63; O 0 0 5.63', basis='aug-ccpvtz', unit='Bohr')
 mf = scf.RHF(mol)                                                               
 mf.kernel()                                                                     
                                                                                 
@@ -18,7 +18,7 @@ eris = my_xtc.make_eris()
 print("Running CCSD")                                                           
 # Use modified rccsd from https://github.com/nickirk/pyscf/tree/tc-ccsd    
 # Which can handle non-hermitian integrals   
-lib.num_threads(10)                                                             
+lib.num_threads(1)                                                             
 mycc = cc.rccsd.RCCSD(mf)                                                       
 tc_e_corr, t1, t2 = mycc.kernel(eris=eris)                                      
                                                                                 
