@@ -27,13 +27,27 @@ class TC:
         self.verbose = mf.verbose if hasattr(mf, 'verbose') else 0
         self.jastrow_factor = jastrow_factor
         
-        # Initialize grid
-        self._init_grid(grid_lvl)
-        
         # Cache for evaluated quantities
         self._rho = None
         self._nabla_rho = None
         self._eri1 = None
+        
+        # Initialize grid
+        self._init_grid(grid_lvl)
+        self._eval_basis_on_grid()
+        
+    def update_jastrow_params(self, new_params):
+        """Update Jastrow parameters for the TC class.
+        
+        Args:
+            new_params: New parameters for the Jastrow factor
+        """
+        self.jastrow_factor = self.jastrow_factor.update(new_params)
+        # Reset cached values
+        #self._rho = None
+        #self._nabla_rho = None
+        #self._eri1 = None
+        return self
     
     def _init_grid(self, grid_lvl=2):
         """Initialize numerical integration grid using PySCF."""

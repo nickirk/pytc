@@ -37,10 +37,11 @@ class SimpleJastrow(Jastrow):
         """Compute gradient with respect to r1 for single positions."""
         diff = r1 - r2
         r12_sq = jnp.sum(diff**2, axis=-1)
-        r12 = jnp.sqrt(r12_sq)
-        return jnp.where(r12_sq > 1e-10,
-                        params[0] * diff / r12,
-                        jnp.zeros_like(diff))
+        r12 = jnp.sqrt(r12_sq + 1e-10)  # Add small epsilon to prevent division by zero
+        
+        # Smooth cutoff near r=0 using sigmoid
+        cutoff = jax.nn.sigmoid((r12 - 1e-5) * 1e6)
+        return params[0] * diff * cutoff / r12
     
     def __call__(self, r1, r2):
         """Evaluate Jastrow factor for batched positions.

@@ -73,29 +73,29 @@ class TestXTC(unittest.TestCase):
             rtol=1e-5, atol=1e-5
         )
 
-    #def test_v_vector(self):
-    #    """Test v_vector calculation."""
-    #    # Get orbital values on grid
-    #    mo_values_jax, _ = self.xtc_jax._eval_basis_on_grid()
-    #    mo_values_numpy, _ = self.xtc_numpy._eval_basis_on_grid()
-    #    
-    #    # Prepare paired indices
-    #    rho_paired_jax = jnp.einsum('in,jn->ijn', 
-    #                               mo_values_jax, 
-    #                               mo_values_jax).reshape(-1, len(self.xtc_jax.weights))
-    #    rho_paired_numpy = np.einsum('in,jn->ijn', 
-    #                                mo_values_numpy, 
-    #                                mo_values_numpy).reshape(-1, len(self.xtc_numpy.weights))
-    #    
-    #    # Calculate v_vector
-    #    v_vector_jax = self.xtc_jax.calc_v_vector(rho_paired_jax)
-    #    v_vector_numpy = self.xtc_numpy._calc_v_vector(rho_paired_numpy)
-    #    
-    #    np.testing.assert_allclose(
-    #        np.asarray(v_vector_jax),
-    #        v_vector_numpy,
-    #        rtol=1e-5, atol=1e-5
-    #    )
+    def test_v_vector(self):
+        """Test v_vector calculation."""
+        # Get orbital values on grid
+        mo_values_jax, _ = self.xtc_jax._eval_basis_on_grid()
+        mo_values_numpy, _ = self.xtc_numpy._eval_basis_on_grid()
+        
+        # Prepare paired indices
+        rho_paired_jax = jnp.einsum('in,jn->ijn', 
+                                   mo_values_jax, 
+                                   mo_values_jax).reshape(-1, len(self.xtc_jax.weights))
+        rho_paired_numpy = np.einsum('in,jn->ijn', 
+                                    mo_values_numpy, 
+                                    mo_values_numpy).reshape(-1, len(self.xtc_numpy.weights))
+        
+        # Calculate v_vector
+        v_vector_jax = self.xtc_jax.calc_v_vector(rho_paired_jax)
+        v_vector_numpy = self.xtc_numpy._calc_v_vector(rho_paired_numpy)
+        
+        np.testing.assert_allclose(
+            np.asarray(v_vector_jax),
+            v_vector_numpy,
+            rtol=1e-5, atol=1e-5
+        )
 
     def test_delta_U(self):
         """Test delta_U calculation."""

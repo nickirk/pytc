@@ -17,7 +17,7 @@ class XTC(TC):
             grid_points: Array of shape (N_grid, 3)
             weights: Array of shape (N_grid,)
         """
-        self.jastrow_factor = jastrow_factor
+        # Remove redundant jastrow_factor assignment since parent handles it
         super().__init__(mf, jastrow_factor, mo_coeff, grid_lvl)
         self._delta_U = None  # Cache for delta_U
         self._delta_h = None  # Cache for delta_h
@@ -165,8 +165,8 @@ class XTC(TC):
         """Get delta_U matrix."""
         if self._delta_U is None:
             # Convert numpy arrays to jax arrays explicitly
+            n_orb = self._rho.shape[0]  # Get shape information before JIT
             rho = jnp.asarray(self._rho)
-            n_orb = rho.shape[0]  # Get shape information before JIT
             rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape((n_orb * n_orb, -1))
             v_vector = self.calc_v_vector(rho_paired)
             self._delta_U = self.calc_delta_U(v_vector, rho_paired, dm1)
@@ -201,3 +201,12 @@ class XTC(TC):
     def get_3b(self):
         """Get three-body extended correlation."""
         raise NotImplementedError("JAX implementation pending")
+    
+    def update_jastrow_params(self, new_params):
+        """Update Jastrow parameters and reset XTC-specific caches."""
+        # Call parent class's update method
+        super().update_jastrow_params(new_params)
+        # Reset XTC-specific caches
+        self._delta_U = None
+        self._delta_h = None
+        return self
