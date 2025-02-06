@@ -27,7 +27,7 @@ class SimpleJastrow(Jastrow):
             r1: Array of shape (3,) for first electron position
             r2: Array of shape (3,) for second electron position
         """
-        r12_sq = jnp.sum((r1 - r2)**2)
+        r12_sq = jnp.sum((r1 - r2)**2, axis=-1)
         r12 = jnp.sqrt(r12_sq)
         return jnp.where(r12_sq > 1e-10, 
                         jnp.sum(params * r12),
@@ -36,7 +36,7 @@ class SimpleJastrow(Jastrow):
     def _compute_grad_r(self, params, r1, r2):
         """Compute gradient with respect to r1 for single positions."""
         diff = r1 - r2
-        r12_sq = jnp.sum(diff**2)
+        r12_sq = jnp.sum(diff**2, axis=-1)
         r12 = jnp.sqrt(r12_sq)
         return jnp.where(r12_sq > 1e-10,
                         params[0] * diff / r12,

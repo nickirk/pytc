@@ -47,17 +47,28 @@ class XTC(TC):
         padded_weighted_rho = jnp.pad(weighted_rho, ((0, 0), (0, padded_size - N_grid)))
         batched_grid = padded_grid.reshape(-1, batch_size, 3)
 
+        # Create a mask for valid grid points
+        grid_mask = jnp.arange(padded_size) < N_grid
+
         def scan_body(carry, batch_grid):
+            batch_start = carry
+            batch_end = batch_start + batch_size
+            #batch_mask = grid_mask[batch_start:batch_end]
+
             @partial(jax.vmap, in_axes=(None, 0))
             def grad_fn(r1, r2):
                 return self.jastrow_factor.grad_r(r1, r2)
         
             grads = jax.vmap(grad_fn, in_axes=(0, None))(batch_grid, padded_grid)
+            # Mask out gradients for padded points
+            grads = grads * grid_mask[None, :, None]
             contribution = jnp.einsum('nj,ijk->nik', padded_weighted_rho, grads)
-            return carry, contribution
+            return batch_end, contribution
         
-        _, results = jax.lax.scan(scan_body, None, batched_grid)
-        return results.reshape(rho_paired.shape[0], -1, 3)[:,:N_grid,:]
+        _, results = jax.lax.scan(scan_body, 0, batched_grid)
+        # tranpose first before reshaping and slicing due to some jax memory layout.
+        # Otherwise the result is wrong.
+        return  results.transpose(1,0,2,3).reshape(Nb2, padded_size, 3)[:, :N_grid, :]
 
     @partial(jax.jit, static_argnums=(0,))  # Only self should be static
     def _calc_delta_h(self, delta_U=None, dm1=None):
@@ -78,54 +89,49 @@ class XTC(TC):
     
     @partial(jax.jit, static_argnums=(0,))  # Only self should be static
     def calc_delta_U(self, v_vector, rho_paired, dm1):
-        """Calculate delta_U matrix.
+        """Calculate delta_U matrix."""
+        # Replace int(jnp.sqrt()) with static shape information
+        nb = dm1.shape[1]  # This computes during tracing
+        #nb = jnp.sqrt(v_vector.shape[0]).astype(int)
         
-        Args:
-            v_vector: Array from calc_v_vector
-            rho_paired: Array of shape (Nb*Nb, N_grid)
-            dm1: One-particle density matrix
-        
-        Returns:
-            Array of shape (Nb, Nb, Nb, Nb)
-        """
-        nb = int(np.sqrt(v_vector.shape[0]))
-        V = v_vector.reshape(nb, nb, -1, 3)
-
-        rho = rho_paired.reshape(nb, nb, -1)
+        V = jnp.reshape(v_vector, (nb, nb, -1, 3))  # Use reshape instead of .reshape
+        rho = jnp.reshape(rho_paired, (nb, nb, -1))
         rho_weighted = rho * self.weights[None, None, :]
         
-        # Use existing vectorized computations
+        # Fix W computation to keep spatial dimension last
         compute_W = jax.vmap(lambda V, dm: 2 * jnp.einsum('utx,tu->x', V, dm), 
-                            in_axes=(2, None), out_axes=1)
-        W = compute_W(V, dm1)
+                            in_axes=(2, None), out_axes=0)
+        W = compute_W(V, dm1)  # shape: (N_grid, 3)
         
-        # ... rest of the delta_U calculation remains the same ...
-        compute_Vbar = jax.vmap(lambda W, V: jnp.einsum('x,srx->sr', W, V), 
+        # Fix Vbar computation to match dimensions
+        compute_Vbar = jax.vmap(lambda W, V: jnp.einsum('d,srd->sr', W, V), 
                                in_axes=(0, 2))
-        Vbar = compute_Vbar(W, V)
+        Vbar = compute_Vbar(W, V)  # shape: (nb, nb, N_grid)
         
+        # Rest of the computations remain the same but with clearer axis specifications
         compute_X = jax.vmap(lambda V, dm: jnp.einsum('stx,tu->sux', V, dm), 
-                            in_axes=2, out_axes=2)
+                            in_axes=(2, None), out_axes=0)
         X = compute_X(V, dm1)
         
         compute_Zbar = jax.vmap(lambda V, X: jnp.einsum('urx,sux->sr', V, X), 
-                               in_axes=2)
+                               in_axes=(2, 0))
         Zbar = compute_Zbar(V, X)
         
         Wbar = 2 * jnp.einsum('uti,tu->i', rho_weighted, dm1)
         
         compute_Y = jax.vmap(lambda V, dm: jnp.einsum('urx,tu->trx', V, dm), 
-                            in_axes=2, out_axes=2)
+                            in_axes=(2, None), out_axes=0)
         Y = compute_Y(V, dm1)
         
         compute_G = jax.vmap(lambda rho, X, Y: 
                             jnp.einsum('ur,sux->srx', rho, X) + 
                             jnp.einsum('trx,st->srx', Y, rho),
-                            in_axes=(2, 2, 2))
+                            in_axes=(2, 0, 0))
         G = compute_G(rho_weighted, X, Y)
+
         
-        A = Vbar - Zbar
-        B = 0.5 * Wbar[None, None, :, None] * V - G
+        A = (Vbar - Zbar).transpose(1,2,0)
+        B = 0.5 * Wbar[None, None, :, None] * V - jnp.transpose(G, (1, 2, 0, 3))
         
         term1 = jnp.einsum('qpi,sri->qpsr', rho_weighted, A)
         term2 = jnp.einsum('qpix,srix->qpsr', V, B)
@@ -160,7 +166,8 @@ class XTC(TC):
         if self._delta_U is None:
             # Convert numpy arrays to jax arrays explicitly
             rho = jnp.asarray(self._rho)
-            rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
+            n_orb = rho.shape[0]  # Get shape information before JIT
+            rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape((n_orb * n_orb, -1))
             v_vector = self.calc_v_vector(rho_paired)
             self._delta_U = self.calc_delta_U(v_vector, rho_paired, dm1)
         return self._delta_U
