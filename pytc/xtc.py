@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 from pytc.tc import TC
-from pytc.lmat import calc_v_vector
 
 einsum = partial(np.einsum, optimize='optimal')
 class XTC(TC):
@@ -45,8 +44,7 @@ class XTC(TC):
                 )
             else:
                 # Use original method
-                v_vector = calc_v_vector(rho_paired, self.jastrow_factor, 
-                                       self.grid_points, self.weights)
+                v_vector = self._calc_v_vector(rho_paired)
                 self._delta_U = self._calc_delta_U(v_vector, rho_paired, dm1)
         
         return self._delta_U
@@ -162,7 +160,14 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
             
         if v_vector is None or rho_paired is None:
-            raise NotImplementedError("Auto-calculation of v_vector not yet implemented")
+            # Get orbital values on grid
+            rho, _ = self._get_intermediates()
+            
+            # Prepare paired indices
+            rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
+            
+            # Compute V vector with batched processing
+            v_vector = self._calc_v_vector(rho_paired)
             
         # Reshape inputs
         V, rho = self._validate_and_reshape(v_vector, rho_paired)
@@ -336,6 +341,37 @@ class XTC(TC):
         eris.vvvv = h2e[nocc:,nocc:,nocc:,nocc:].copy()
 
         return eris
+
+    def _calc_v_vector(self, rho_paired, batch_size=3000):
+        """Compute the intermediate vector V_qt(r₁) using batched processing.
+        
+        Args:
+            rho_paired: Array of shape (Nb*Nb, N_grid) containing orbital products
+            batch_size: Integer controlling batch size
+            
+        Returns:
+            Array of shape (Nb*Nb, N_grid, 3) containing V_qt(r₁) vectors
+        """
+        N_grid = len(self.grid_points)
+        result = np.zeros((rho_paired.shape[0], N_grid, 3))
+        
+        # Weight the rho for r₂ integration once
+        weighted_rho = rho_paired * self.weights[None, :]  # (Nb^2, N_grid)
+        
+        # Process grid points in batches
+        for i in range(0, N_grid, batch_size):
+            i_end = min(i + batch_size, N_grid)
+            batch_points = self.grid_points[i:i_end]
+            
+            # Get Jastrow gradients for this batch
+            u_grad_batch = self.jastrow_factor.grad(batch_points, self.grid_points)
+            
+            # Process each spatial component separately using np.dot
+            for c in range(3):
+                u_grad_c = u_grad_batch[..., c]
+                result[:, i:i_end, c] = np.dot(weighted_rho, u_grad_c.T)
+        
+        return result
 
 
 def _parallel_compute_G(rho_weighted, X, Y):

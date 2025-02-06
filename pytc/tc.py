@@ -3,7 +3,6 @@
 import numpy as np
 from functools import partial
 from pyscf import dft, ao2mo
-from pytc import kmat
 from pytc import lmat
 from pytc.df import isdf_decompose_multi, test_accuracy
 
@@ -198,7 +197,7 @@ class TC:
                          self.grid_points, self.weights)
         
         k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        k_laplacian = - (k_nabla + k_nabla.swapaxes(0, 1))
         k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         # Combine results
