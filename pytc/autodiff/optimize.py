@@ -78,18 +78,23 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
         # Update parameters using optimizer
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        
+
+        grad_norm = jnp.linalg.norm(grads)
+        # Print progress 
         if step % 1 == 0:
             print(f"Step {step}, Loss: {loss_val:.6f}, "
-                  f"Grad norm: {jnp.linalg.norm(grads):.6f}, "
+                  f"Grad norm: {grad_norm:.6f}, "
                   f"Params: {params}")
+        if grad_norm < 1e-6:
+            print(f"Converged at step {step}")
+            break
 
     return params
 
 
 def create_test_system():
     """Create a test Be atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='Be 0 0 0', basis='sto6g', unit='Bohr')
+    mol = gto.M(atom='Be 0 0 0', basis='ccpvdz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
@@ -108,7 +113,7 @@ def main():
     
     # Try different optimizers
     optimizers_to_try = {
-        'rmsprop': 1e-2
+        'rmsprop': 5e-2
     }
     
     for opt_name, lr in optimizers_to_try.items():
