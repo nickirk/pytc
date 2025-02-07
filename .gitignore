@@ -13,5 +13,8 @@ doc/*
 !doc/*.bib
 !doc/*.pdf
 
+*egg-info/
+build/
+
 *.log
 __pycache__/

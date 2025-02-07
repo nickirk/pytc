@@ -4,7 +4,11 @@
 ## Dependencies
 - numpy
 - scipy
-- pyscf (modified version)
+- unittest
+- jax (autodiff and GPU acceleration)
+- optax (machine learning optimizers)
+- tqdm (visual progress tracking)
+- pyscf (![modified version](https://github.com/nickirk/pyscf/tree/tc-ccsd) for tc-ccsd only. Otherwise, official pyscf also works)
 
 ## Features
 - Takes in user defined Jastrow factors
