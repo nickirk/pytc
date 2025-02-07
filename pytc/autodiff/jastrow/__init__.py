@@ -17,7 +17,39 @@ class Jastrow(ABC):
         """
         self.params = jnp.asarray(params, dtype=jnp.float64)
         self.atomic_coords = None if atomic_coords is None else jnp.asarray(atomic_coords, dtype=jnp.float64)
+        
+        # Redefine gradient functions to handle batching correctly
+        def grad_r(r1, r2, params):
+            # Handle batched inputs more carefully
+            def scalar_out(x):
+                val = self._compute(x, r2, params)
+                # Ensure scalar output by summing only if batched
+                return val.sum() if val.ndim > 0 else val
+            return jax.grad(scalar_out)(r1)
+            
+        def grad_params(r1, r2, params):
+            def scalar_out(p):
+                val = self._compute(r1, r2, p)
+                return val.sum() if val.ndim > 0 else val
+            return jax.grad(scalar_out)(params)
+            
+        self._grad_r_fn = grad_r
+        self._grad_params_fn = grad_params
     
+    @abstractmethod
+    def _compute(self, r1, r2, params):
+        """Core computation of Jastrow factor.
+        
+        Args:
+            r1: Array of shape (..., 3) for first electron positions
+            r2: Array of shape (..., 3) for second electron positions
+            params: Jastrow parameters
+            
+        Returns:
+            Jastrow factor value
+        """
+        pass
+
     @abstractmethod
     def __call__(self, r1, r2):
         """Evaluate Jastrow factor.
@@ -31,9 +63,8 @@ class Jastrow(ABC):
         """
         pass
     
-    @abstractmethod
     def grad_params(self, r1, r2):
-        """Compute gradient with respect to parameters.
+        """Compute gradient with respect to parameters using JAX autodiff.
         
         Args:
             r1: Array of shape (..., 3) for first electron positions
@@ -42,11 +73,10 @@ class Jastrow(ABC):
         Returns:
             Gradient with respect to parameters
         """
-        pass
+        return self._grad_params_fn(r1, r2, self.params)
     
-    @abstractmethod
     def grad_r(self, r1, r2):
-        """Compute gradient with respect to r1 positions.
+        """Compute gradient with respect to r1 positions using JAX autodiff.
         
         Args:
             r1: Array of shape (..., 3) for first electron positions
@@ -55,7 +85,7 @@ class Jastrow(ABC):
         Returns:
             Gradient with respect to r1 positions
         """
-        pass
+        return self._grad_r_fn(r1, r2, self.params)
     
     def update(self, new_params):
         """Update parameters and return a new instance.

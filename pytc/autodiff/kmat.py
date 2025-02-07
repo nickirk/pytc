@@ -18,7 +18,8 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         # Define gradient computation for a single r2 point, vectorized over r1
         @partial(jax.vmap, in_axes=(0, None))
         def get_grads(r1, r2):
-            return jastrow_factor.grad_r(r1[None], r2[None])[0]
+            # Remove extra params argument - it's handled internally
+            return jastrow_factor.grad_r(r1, r2)
         
         # For each r2 in batch, compute gradients for all r1
         u_grad_batch = jax.vmap(get_grads, in_axes=(None, 0))(grid_points, batch_points)  # (batch, N_grid, 3)
@@ -42,13 +43,6 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     
     return result.T
 
-def get_2b():
-    """JAX version of two-body kinetic energy computation."""
-    raise NotImplementedError("JAX implementation pending")
-
-def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points):
-    """JAX implementation of K2 term."""
-    raise NotImplementedError("JAX implementation pending")
 
 def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
     """JAX implementation of K3 term with memory-efficient batching.
@@ -76,7 +70,8 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
         # Define gradient computation for a single r2 point, vectorized over r1
         @partial(jax.vmap, in_axes=(0, None))
         def get_grads(r1, r2):
-            return jastrow_factor.grad_r(r1[None], r2[None])[0]
+            # Remove extra params argument - it's handled internally
+            return jastrow_factor.grad_r(r1, r2)
         
         # For each r2 in batch, compute gradients for all r1
         u_grad_batch = jax.vmap(get_grads, in_axes=(None, 0))(grid_points, batch_points)

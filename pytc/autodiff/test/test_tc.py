@@ -28,15 +28,25 @@ class TestTC(unittest.TestCase):
         
         # Create numpy version of same jastrow for comparison
         class SimpleJastrowNumpy:
+            """Numpy version of SimpleJastrow for comparison."""
+            def __init__(self, params):
+                self.params = params
+
+            def __call__(self, r1, r2):
+                r12 = np.sqrt(np.sum((r1 - r2)**2, axis=-1))
+                return self.params[0] * r12
+
             def grad(self, r1, r2):
+                """Combined gradient calculation for comparison."""
                 diff = r1[:, None, :] - r2[None, :, :]
-                r12 = np.sqrt(np.sum(diff * diff, axis=-1))
-                mask = r12 > 1e-10
-                grad = np.where(mask[..., None], 
-                              diff / np.maximum(r12[..., None], 1e-10),
-                              np.zeros_like(diff))
+                r12_sq = np.sum(diff * diff, axis=-1)
+                r12 = np.sqrt(r12_sq + 1e-10)  # Add epsilon for stability
+                cutoff = 1.0 / (1.0 + np.exp(-(r12 - 1e-5) * 1e6))  # Sigmoid cutoff
+                grad = np.where(r12_sq[..., None] > 1e-10,
+                               diff * self.params[0] * cutoff[..., None] / r12[..., None],
+                               np.zeros_like(diff))
                 return grad
-        self.jastrow_numpy = SimpleJastrowNumpy()
+        self.jastrow_numpy = SimpleJastrowNumpy(self.params)
         
         # Create TC objects
         self.tc_jax = TC_jax(self.mf, self.jastrow_jax)
@@ -94,6 +104,20 @@ class TestTC(unittest.TestCase):
             np.asarray(result_jax), result_numpy,
             rtol=1e-5, atol=1e-5,
             err_msg="Results don't match with explicit mo_coeff"
+        )
+
+    def test_two_body_terms(self):
+        """Test two-body term calculation."""
+        r1 = np.array([[0.0, 0.0, 0.0]])
+        r2 = np.array([[0.0, 0.0, 1.0]])
+        # Add necessary reshape to match dimensions
+        grad_jax = self.tc_jax.jastrow_factor.grad_r(r1, r2)[:, None, :]  # Add middle dimension
+        grad_numpy = self.jastrow_numpy.grad(r1, r2)
+        
+        np.testing.assert_allclose(
+            grad_jax, grad_numpy,
+            rtol=1e-5, atol=1e-5,
+            err_msg="Gradients don't match"
         )
 
 if __name__ == '__main__':

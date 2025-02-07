@@ -57,7 +57,8 @@ class XTC(TC):
 
             @partial(jax.vmap, in_axes=(None, 0))
             def grad_fn(r1, r2):
-                return self.jastrow_factor.grad_r(r1, r2)
+                # Replace old gradient calculation with new method
+                return self.jastrow_factor.grad_r(r1[None], r2[None])[0]
         
             grads = jax.vmap(grad_fn, in_axes=(0, None))(batch_grid, padded_grid)
             # Mask out gradients for padded points

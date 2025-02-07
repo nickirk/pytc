@@ -2,6 +2,7 @@
 
 import unittest
 import numpy as np
+from functools import partial
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
@@ -96,9 +97,15 @@ class TestXTC(unittest.TestCase):
             v_vector_numpy,
             rtol=1e-5, atol=1e-5
         )
+        
+        # Update gradient usage to match new interface
+        @partial(jax.vmap, in_axes=(0, None))
+        def get_grads(r1, r2):
+            return self.xtc.jastrow_factor.grad_r(r1[None], r2[None])[0]
 
     def test_delta_U(self):
         """Test delta_U calculation."""
+        # First test delta_U matrices
         dm1_jax = self.xtc_jax._get_mf_dm()
         dm1_numpy = self.xtc_numpy._get_mf_dm()
         
@@ -116,6 +123,20 @@ class TestXTC(unittest.TestCase):
             np.asarray(delta_U_jax),
             np.asarray(delta_U_jax.transpose(2,3,0,1)),
             rtol=1e-7, atol=1e-7
+        )
+        
+        # Test gradient calculations with defined points
+        test_r1 = np.array([[0.0, 0.0, 0.0]])
+        test_r2 = np.array([[0.0, 0.0, 1.0]])
+        
+        grad_jax = self.xtc_jax.jastrow_factor.grad_r(test_r1, test_r2)
+        grad_numpy = self.jastrow_numpy.grad(test_r1, test_r2)
+        
+        np.testing.assert_allclose(
+            np.asarray(grad_jax[:, None, :]),  # Add middle dimension to match numpy shape
+            grad_numpy,
+            rtol=1e-5, atol=1e-5,
+            err_msg="Gradients don't match"
         )
 
     def test_delta_h(self):
