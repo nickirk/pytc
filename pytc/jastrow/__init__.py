@@ -59,7 +59,7 @@ class Jastrow(ABC):
         r1 = np.atleast_2d(r1)
         r2 = np.atleast_2d(r2)
         
-        n_points = len(r2)
+        n_points = len(r1)
         batch_size = self._get_batch_size(n_points)
         
         with ThreadPoolExecutor() as executor:

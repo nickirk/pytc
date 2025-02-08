@@ -25,15 +25,24 @@ class SimpleJastrow(Jastrow):
         Args:
             r1: Array of shape (3,) for first electron position
             r2: Array of shape (3,) for second electron position
-            params: Jastrow parameters
+            params: Jastrow parameters (contains a_i in first half, c_i in second half)
         """
         diff = r1 - r2
-        r12_sq = jnp.sum(diff**2, axis=-1)
-        # Add small epsilon to prevent division by zero
-        r12 = jnp.sqrt(r12_sq + 1e-10)
-        # Smooth cutoff using sigmoid
-        cutoff = jax.nn.sigmoid((r12 - 1e-5) * 1e6)
-        return jnp.sum(params * r12 * cutoff)
+        r12 = jnp.sqrt(jnp.sum(diff**2, axis=-1) + 1e-10)
+        
+        # Split params into a_i and c_i coefficients
+        n_terms = len(params)
+        #a_params = params[:n_terms]
+        c_params = params[:]
+        
+        # Calculate rescaled distance for each a_i
+        r_rescaled = r12 / (1+ r12)
+        
+        # Compute powers of r_rescaled and multiply by c_i
+        powers = jnp.arange(1, n_terms + 1)
+        terms = c_params * r_rescaled**powers
+        
+        return jnp.sum(terms) 
     
     def __call__(self, r1, r2):
         """Evaluate Jastrow factor for batched positions.

@@ -1,3 +1,4 @@
+import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)  # Enable float64 support
 import jax.numpy as jnp
@@ -8,32 +9,34 @@ from pytc.autodiff import xtc
 from pyscf import gto, scf
 
 def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learning_rate=1e-3):
-    """Optimize Jastrow parameters using advanced optimizers.
-    
-    Args:
-        xtc: XTC instance
-        init_params: Initial parameters
-        n_steps: Number of optimization steps
-        optimizer_name: One of ['adam', 'adamw', 'adagrad', 'rmsprop', 'sgd']
-        learning_rate: Learning rate for optimizer
-    """
-    # Convert initial parameters to float64
+    """Optimize Jastrow parameters using advanced optimizers with adaptive learning rate."""
     params = jnp.asarray(init_params, dtype=jnp.float64)
     
-    # Select optimizer
-    if optimizer_name == 'adam':
-        optimizer = optax.adam(learning_rate)
-    elif optimizer_name == 'adamw':
-        optimizer = optax.adamw(learning_rate)
-    elif optimizer_name == 'adagrad':
-        optimizer = optax.adagrad(learning_rate)
-    elif optimizer_name == 'rmsprop':
-        optimizer = optax.rmsprop(learning_rate)
-    else:
-        optimizer = optax.sgd(learning_rate)
+    # Add learning rate schedule parameters
+    current_lr = learning_rate
+    lr_decay_factor = 0.5  # How much to reduce learning rate
+    lr_min = 1e-6  # Minimum learning rate
+    patience = 3  # How many steps to wait before reducing lr
     
-    # Initialize optimizer state
+    # Create optimizer with current learning rate
+    def create_optimizer(lr):
+        if optimizer_name == 'adam':
+            return optax.adam(lr)
+        elif optimizer_name == 'adamw':
+            return optax.adamw(lr)
+        elif optimizer_name == 'adagrad':
+            return optax.adagrad(lr)
+        elif optimizer_name == 'rmsprop':
+            return optax.rmsprop(lr)
+        else:
+            return optax.sgd(lr)
+    
+    optimizer = create_optimizer(current_lr)
     opt_state = optimizer.init(params)
+    
+    # Track gradient history for adaptive learning rate
+    prev_grad_norm = None
+    increasing_count = 0
     
     @jax.jit
     def loss_fn(params):
@@ -66,35 +69,64 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
         
         return loss
 
-    # Optimization loop with advanced optimizer
+    steps = []
+    losses = []
+    grad_norms = []
+    params_bag = []
+    
     for step in range(n_steps):
         loss_val, grads = jax.value_and_grad(loss_fn)(params)
+        grad_norm = jnp.linalg.norm(grads)
         
         # Check for NaN gradients
         if jnp.any(jnp.isnan(grads)):
             print(f"Warning: NaN gradients at step {step}")
             break
+            
+        # Adaptive learning rate logic
+        if prev_grad_norm is not None:
+            if grad_norm > prev_grad_norm:
+                increasing_count += 1
+                if increasing_count >= patience and current_lr > lr_min:
+                    # Reduce learning rate
+                    current_lr = max(current_lr * lr_decay_factor, lr_min)
+                    print(f"\nReducing learning rate to {current_lr}")
+                    # Reinitialize optimizer with new learning rate
+                    optimizer = create_optimizer(current_lr)
+                    opt_state = optimizer.init(params)
+                    increasing_count = 0
+            else:
+                increasing_count = 0
+        
+        prev_grad_norm = grad_norm
         
         # Update parameters using optimizer
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
 
-        grad_norm = jnp.linalg.norm(grads)
-        # Print progress 
         if step % 1 == 0:
             print(f"Step {step}, Loss: {loss_val:.6f}, "
                   f"Grad norm: {grad_norm:.6f}, "
+                  f"LR: {current_lr:.6f}, "
                   f"Params: {params}")
+                  
         if grad_norm < 1e-6:
             print(f"Converged at step {step}")
             break
+            
+        steps.append(step)
+        losses.append(loss_val)
+        grad_norms.append(grad_norm)
+        params_bag.append(params)
+        np.savez('Mg_opt_data2.npz', steps=steps, losses=losses, 
+                 grad_norms=grad_norms, params_bag=params_bag)
 
     return params
 
 
 def create_test_system():
     """Create a test Be atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='Be 0 0 0', basis='ccpvdz', unit='Bohr')
+    mol = gto.M(atom='Mg 0 0 0', basis='ccpvdz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
@@ -105,7 +137,10 @@ def main():
     mol, mf = create_test_system()
     
     # Initialize Jastrow with smaller parameters
-    init_params = jnp.array([0.5], dtype=jnp.float64)  # Start with smaller initial value
+    init_params = jnp.array([0.5, 0.1, -0.1, 0.2], dtype=jnp.float64)
+    init_params = jnp.array([1.30442946,  0.55080467, -0.20307955, -0.22240826])
+    #init_params = jnp.array([ 3.30571992,  0.52066121,  0.3091659,   1.56504699, -0.17847568, -0.0455195 ], dtype=jnp.float64)
+    #init_params = jnp.array([3.30992979,  0.57100468,  0.31507011,  1.53111045, -0.22547859, -0.0537576], dtype=jnp.float64)
     my_jastrow = jastrow.SimpleJastrow(init_params)
     
     # Run optimization with smaller learning rate
@@ -121,7 +156,7 @@ def main():
         optimized_params = optimize_jastrow(myxtc, init_params,
                                           optimizer_name=opt_name,
                                           learning_rate=lr,
-                                          n_steps=100)
+                                          n_steps=500)
         print(f"{opt_name} optimized parameters:", optimized_params)
 
 if __name__ == "__main__":

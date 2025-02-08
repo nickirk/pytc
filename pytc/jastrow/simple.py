@@ -12,7 +12,7 @@ class SimpleJastrow(Jastrow):
         r2 = np.atleast_2d(r2)  # Ensure 2D array with shape (M, 3)
         
         delta_r = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
-        result = 0.5*1./self.params[0]*np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
+        result = 0.5*1./self.params[0]*np.exp(self.params[0] * np.linalg.norm(delta_r, axis=-1))
         
         # Handle single point inputs
         if r1.shape[0] == 1 and r2.shape[0] == 1:
