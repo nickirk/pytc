@@ -3,7 +3,6 @@
 import numpy as np
 from functools import partial
 from pyscf import dft, ao2mo
-from pytc import kmat
 from pytc import lmat
 from pytc.df import isdf_decompose_multi, test_accuracy
 
@@ -192,13 +191,14 @@ class TC:
             rho_nabla_rho_paired = np.einsum('pnd, rn ->prnd',nabla_rho,rho).reshape(-1, len(self.weights), 3)
             k_nabla = calc_K1(rho_paired, rho_nabla_rho_paired, 
                          self.jastrow_factor, self.grid_points, self.weights)
-            k_laplacian = calc_K2(rho_paired, rho_nabla_rho_paired,
-                         self.jastrow_factor, self.grid_points, self.weights)
+            #k_laplacian = calc_K2(rho_paired, rho_nabla_rho_paired,
+            #             self.jastrow_factor, self.grid_points, self.weights)
             k_square = calc_K3(rho_paired, self.jastrow_factor,
                          self.grid_points, self.weights)
         
         k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        #k_laplacian = k_laplacian.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        k_laplacian = - (k_nabla + k_nabla.swapaxes(0, 1))
         k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         # Combine results

@@ -2,33 +2,42 @@
 
 import numpy as np
 from functools import partial
+import logging
+import time
+from tqdm import tqdm
+import warnings
 
 # Create an optimized einsum that always uses the 'optimal' path
 einsum = partial(np.einsum, optimize='optimal')
 
 
-def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=1000):
-    """Compute the intermediate vector V_qt(r₁) using batched processing.
+def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=3000):
+    """DEPRECATED: Use XTC._calc_v_vector instead.
     
-    Args:
-        rho_paired: Array of shape (Nb*Nb, N_grid) containing orbital products
-        jastrow_factor: Jastrow instance for computing gradients
-        grid_points: Array of shape (N_grid, 3)
-        weights: Array of shape (N_grid,)
-        batch_size: Integer controlling batch size
-        
-    Returns:
-        Array of shape (Nb*Nb, N_grid, 3) containing V_qt(r₁) vectors
+    This standalone function is deprecated and will be removed in a future version.
+    Please use the method XTC._calc_v_vector which is now part of the XTC class.
     """
+    warnings.warn(
+        "calc_v_vector in lmat.py is deprecated. Use XTC._calc_v_vector instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    start_time = time.perf_counter()
+    
     N_grid = len(grid_points)
     result = np.zeros((rho_paired.shape[0], N_grid, 3))
     
     # Weight the rho for r₂ integration once
     weighted_rho = rho_paired * weights[None, :]  # (Nb^2, N_grid)
     
-    # Process grid points in batches
-    for i in range(0, N_grid, batch_size):
+    logging.info(f"Starting v_vector calculation with {N_grid} grid points in batches of {batch_size}")
+    # Process grid points in batches with progress bar
+    pbar = tqdm(range(0, N_grid, batch_size), desc="Computing v_vector")
+    for i in pbar:
         i_end = min(i + batch_size, N_grid)
+        progress = (i + batch_size) / N_grid * 100
+        logging.info(f"v_vector progress: {progress:.1f}% (points {i} to {i_end})")
+        
         batch_points = grid_points[i:i_end]
         
         # Get Jastrow gradients for this batch
@@ -42,6 +51,8 @@ def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=1
             # Compute v_vector for this component: (Nb^2, batch)
             result[:, i:i_end, c] = np.dot(weighted_rho, u_grad_c.T)
     
+    elapsed_time = time.perf_counter() - start_time
+    logging.info(f"v_vector calculation completed in {elapsed_time:.2f} seconds")
     return result
 
 
