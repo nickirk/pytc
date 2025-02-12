@@ -71,6 +71,16 @@ class XTC(TC):
         # Otherwise the result is wrong.
         return  results.transpose(1,0,2,3).reshape(Nb2, padded_size, 3)[:, :N_grid, :]
 
+    def get_const(self, dm1=None, dm2=None):
+        """Compute constant contribution: const = -1/3 * δh^q_p * γ^p_q"""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+        
+        delta_h = self.get_delta_h(dm1)
+        const = -2/3 * jnp.einsum('qp,pq->', delta_h, dm1)
+        const += self.mf.energy_nuc()
+        return const
+    
     @partial(jax.jit, static_argnums=(0,))  # Only self should be static
     def _calc_delta_h(self, delta_U=None, dm1=None):
         """Calculate δh using δU and density matrix.
