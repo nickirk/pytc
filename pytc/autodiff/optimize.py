@@ -47,7 +47,6 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
 
         # Get number of occupied and virtual orbitals
         nocc = int(sum(xtc.mf.mo_occ == 2))  # Number of occupied orbitals
-        nvir = len(xtc.mf.mo_occ) - nocc     # Number of virtual orbitals
 
         # Slice the tensors for occupied and virtual spaces
         V_iajb = two_body[:nocc,nocc:,:nocc,nocc:]
@@ -125,6 +124,7 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
 def create_test_system(basis):
     """Create a test Be atom system with cc-pVDZ basis."""
     mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
+    mol.incore_anyway = True
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
@@ -146,21 +146,39 @@ class REXP(jastrow.Jastrow):
     def __call__(self, r1, r2):
         return super().__call__(r1, r2)
 
+def do_ccsd(params, basis):
+    # Create new system with cc-pVTZ basis
+    mol, mf = create_test_system('ccpvtz')
+    
+    my_jastrow = jastrow.simple.SimpleJastrow(params)
+    myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
+    eris = myxtc.make_eris()
+    from pyscf.cc import rccsd
+    mycc = rccsd.RCCSD(mf)
+    mycc.kernel(eris=eris)
+    nocc = int(sum(mf.mo_occ == 2))
+    e_hf = 2*np.einsum("ii->", eris.fock[:nocc,:nocc])
+    e_hf -= 2*np.einsum("iijj->", eris.oooo) - np.einsum("ijji->", eris.oooo)
+    print("HF energy:", e_hf)
+    print("CCSD correlation energy:", mycc.e_corr)
+    print("Total CCSD energy:", e_hf + mycc.e_corr)
 
 def main():
     """Example usage with Be atom."""
     # Create test system
     mol, mf = create_test_system('ccpvtz')
+
     
-    init_params = jnp.array([0.39839], dtype=jnp.float64)
-    my_jastrow = REXP(init_params)
+    init_params = jnp.array([0.724243576], dtype=jnp.float64)
+    #my_jastrow = REXP(init_params)
+    my_jastrow = jastrow.simple.SimpleJastrow(init_params)
     
     # Run optimization with smaller learning rate
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
     
     # Try different optimizers
     optimizers_to_try = {
-        'rmsprop': 5e-2
+        'rmsprop': 1e-2
     }
     
     for opt_name, lr in optimizers_to_try.items():
@@ -168,23 +186,12 @@ def main():
         optimized_params = optimize_jastrow(myxtc, init_params,
                                           optimizer_name=opt_name,
                                           learning_rate=lr,
-                                          n_steps=0)
+                                          n_steps=10)
         print(f"{opt_name} optimized parameters:", optimized_params)
+    
+    do_ccsd(optimized_params, 'ccpvtz')
 
-    #mol, mf = create_test_system('ccpvtz') 
-    #my_jastrow = REXP(optimized_params)
-    #myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
 
-    #eris = myxtc.make_eris()
-    #from pyscf.cc import rccsd
-    #mycc = rccsd.RCCSD(mf)
-    #mycc.kernel(eris=eris)
-    #nocc = int(sum(mf.mo_occ == 2))
-    #e_hf = 2*np.einsum("ii->", eris.fock[:nocc,:nocc])
-    #e_hf -= 2*np.einsum("iijj->", eris.oooo) - np.einsum("ijji->", eris.oooo)
-    #print("HF energy:", e_hf)
-    #print("CCSD correlation energy:", mycc.e_corr)
-    #print("Total CCSD energy:", e_hf + mycc.e_corr)
 
 if __name__ == "__main__":
     main()
