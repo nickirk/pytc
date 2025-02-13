@@ -16,7 +16,7 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     current_lr = learning_rate
     lr_decay_factor = 0.5  # How much to reduce learning rate
     lr_min = 1e-6  # Minimum learning rate
-    patience = 3  # How many steps to wait before reducing lr
+    patience = 10  # How many steps to wait before reducing lr
     
     # Create optimizer with current learning rate
     def create_optimizer(lr):
@@ -50,23 +50,21 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
         nvir = len(xtc.mf.mo_occ) - nocc     # Number of virtual orbitals
 
         # Slice the tensors for occupied and virtual spaces
-        V_ijab = two_body[:nocc,:nocc,nocc:,nocc:]
-        V_ijab_anti = 2*V_ijab - V_ijab.transpose(0,1,3,2)
-        V_abij = two_body[nocc:,nocc:,:nocc,:nocc]
-        V_abij_anti = 2*V_abij - V_abij.transpose(0,1,3,2)
+        V_iajb = two_body[:nocc,nocc:,:nocc,nocc:]
+        V_iajb_anti = 2*V_iajb - V_iajb.transpose(0,3,2,1)
+        #V_abij = two_body[nocc:,nocc:,:nocc,:nocc]
+        #V_abij_anti = 2*V_abij - V_abij.transpose(0,1,3,2)
 
         # Build Fock matrix elements
         f_ia = one_body[:nocc,nocc:]
         f_ia = f_ia + 2.*jnp.einsum('iajj->ia', two_body[:nocc,nocc:,:nocc,:nocc])
         f_ia = f_ia - jnp.einsum('ijja->ia', two_body[:nocc,:nocc,:nocc,nocc:])
 
-        f_ai = one_body[nocc:,:nocc]
-        f_ai = f_ai + 2.*jnp.einsum('aijj->ai', two_body[nocc:,:nocc,:nocc,:nocc])
-        f_ai = f_ai - jnp.einsum('jiaj->ai', two_body[:nocc,:nocc,nocc:,:nocc])
+        #f_ai = one_body[nocc:,:nocc]
+        #f_ai = f_ai + 2.*jnp.einsum('aijj->ai', two_body[nocc:,:nocc,:nocc,:nocc])
+        #f_ai = f_ai - jnp.einsum('jiaj->ai', two_body[:nocc,:nocc,nocc:,:nocc])
 
-        loss = jnp.asarray(jnp.einsum('ia,ai->', f_ia, f_ai), dtype=jnp.float64)
-        loss = loss + jnp.asarray(jnp.einsum('ijab,abij->', V_ijab_anti, V_abij_anti), dtype=jnp.float64)
-        
+        loss = jnp.sum(f_ia*f_ia) + jnp.sum(V_iajb_anti*V_iajb_anti)
         return loss
 
     steps = []
@@ -124,27 +122,41 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     return params
 
 
-def create_test_system():
+def create_test_system(basis):
     """Create a test Be atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='Mg 0 0 0', basis='ccpvdz', unit='Bohr')
+    mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
 
+class REXP(jastrow.Jastrow):
+    def __init__(self, params, epsilon=1e-12):
+        super().__init__(params)
+        self.epsilon = epsilon
+        
+    def _safe_norm(self, x):
+        """Compute norm with a small epsilon to prevent division by zero."""
+        return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
+    
+    def _compute(self, r1, r2, params):
+        r12 = r1-r2
+        r12_norm = self._safe_norm(r12)
+        return 0.5*jnp.exp(-params[0] * r12_norm) * r12_norm
+
+    def __call__(self, r1, r2):
+        return super().__call__(r1, r2)
+
+
 def main():
     """Example usage with Be atom."""
     # Create test system
-    mol, mf = create_test_system()
+    mol, mf = create_test_system('ccpvtz')
     
-    # Initialize Jastrow with smaller parameters
-    init_params = jnp.array([0.5, 0.1, -0.1, 0.2], dtype=jnp.float64)
-    init_params = jnp.array([1.30442946,  0.55080467, -0.20307955, -0.22240826])
-    #init_params = jnp.array([ 3.30571992,  0.52066121,  0.3091659,   1.56504699, -0.17847568, -0.0455195 ], dtype=jnp.float64)
-    #init_params = jnp.array([3.30992979,  0.57100468,  0.31507011,  1.53111045, -0.22547859, -0.0537576], dtype=jnp.float64)
-    my_jastrow = jastrow.SimpleJastrow(init_params)
+    init_params = jnp.array([0.39839], dtype=jnp.float64)
+    my_jastrow = REXP(init_params)
     
     # Run optimization with smaller learning rate
-    myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=1)
+    myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
     
     # Try different optimizers
     optimizers_to_try = {
@@ -156,8 +168,23 @@ def main():
         optimized_params = optimize_jastrow(myxtc, init_params,
                                           optimizer_name=opt_name,
                                           learning_rate=lr,
-                                          n_steps=500)
+                                          n_steps=0)
         print(f"{opt_name} optimized parameters:", optimized_params)
+
+    #mol, mf = create_test_system('ccpvtz') 
+    #my_jastrow = REXP(optimized_params)
+    #myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
+
+    #eris = myxtc.make_eris()
+    #from pyscf.cc import rccsd
+    #mycc = rccsd.RCCSD(mf)
+    #mycc.kernel(eris=eris)
+    #nocc = int(sum(mf.mo_occ == 2))
+    #e_hf = 2*np.einsum("ii->", eris.fock[:nocc,:nocc])
+    #e_hf -= 2*np.einsum("iijj->", eris.oooo) - np.einsum("ijji->", eris.oooo)
+    #print("HF energy:", e_hf)
+    #print("CCSD correlation energy:", mycc.e_corr)
+    #print("Total CCSD energy:", e_hf + mycc.e_corr)
 
 if __name__ == "__main__":
     main()

@@ -8,11 +8,11 @@
 *.png
 .pytc 
 .tchint/
+.venv/
 doc/*
 !doc/*.tex
 !doc/*.bib
 !doc/*.pdf
-
 *egg-info/
 build/
 

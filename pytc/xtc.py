@@ -374,45 +374,6 @@ class XTC(TC):
         return result
 
 
-def _parallel_compute_G(rho_weighted, X, Y):
-    """Compute G tensor using parallel thread processing.
-    
-    Computes: G[s,r,i,x] = rho[u,r,i] * X[s,u,i,x] + Y[t,r,i,x] * rho[s,t,i]
-    """
-    # Get dimensions
-    S, U_X, I, X_dim = X.shape
-    U_rho, R, I_rho = rho_weighted.shape
-    assert U_X == U_rho and I == I_rho, "Dimension mismatch"
-    
-    # Initialize output
-    G = np.zeros((S, R, I, X_dim))
-    
-    def process_i(i):
-        # Get views for this i
-        X_slice = X[:, :, i, :]  # (S, U, X)
-        Y_slice = Y[:, :, i, :]  # (T, R, X)
-        rho_slice = rho_weighted[:, :, i]  # (U, R) and (S, T)
-        
-        # First term: rho[u,r,i] * X[s,u,i,x]
-        term1 = np.einsum('ur,sux->srx', rho_slice, X_slice)
-        
-        # Second term: Y[t,r,i,x] * rho[s,t,i]
-        term2 = np.einsum('trx,st->srx', Y_slice, rho_slice)
-        
-        return i, term1 + term2
-    
-    # Parallelize over i using threads
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for i in range(I):
-            futures.append(executor.submit(process_i, i))
-        
-        for future in futures:
-            i, result = future.result()
-            G[:, :, i, :] = result
-    
-    return G
-
 def _parallel_over_i(process_i_func, output_shape, n_i, desc=None):
     """Generic parallel processor for i-index contractions with progress tracking.
     

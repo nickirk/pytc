@@ -212,7 +212,57 @@ class XTC(TC):
     def get_3b(self):
         """Get three-body extended correlation."""
         raise NotImplementedError("JAX implementation pending")
+        
+    def make_eris(self):
+        """Create ChemistsERIs object for CCSD calculation.
+        
+        This method constructs the electron repulsion integrals (ERIs) needed for CCSD
+        calculations. It properly handles the conversion from JAX arrays to NumPy arrays
+        and organizes the two-electron integrals into various required blocks (oooo,
+        ovov, etc.).
+        
+        Returns:
+            _ChemistsERIs: An object containing all the required integrals for CCSD:
+                - e_core: Core energy including nuclear repulsion
+                - fock: Fock matrix in MO basis
+                - mo_energy: Diagonal elements of the Fock matrix
+                - Various blocks of two-electron integrals (oooo, ovov, etc.)
+        """
+        from pyscf.cc import rccsd
+        mycc = rccsd.RCCSD(self.mf)
+        nocc = np.sum(self.mf.mo_occ > 0)
+        nmo = mycc.nmo
+
+        eris = rccsd._ChemistsERIs(mycc)
+        # Convert JAX arrays to NumPy arrays and ensure they're writable
+        eris.e_core = np.float64(self.get_const())
+        eris.fock = np.asarray(self.get_1b()).copy()  # Make writable copy
+        h2e = np.asarray(self.get_2b()).copy()  # Make writable copy
+        
+        # Modify fock matrix
+        fock_modification = (2 * np.einsum('pqii->pq', h2e[:,:,:nocc,:nocc]) - 
+                           np.einsum('piiq->pq', h2e[:,:nocc,:nocc,:]))
+        eris.fock += fock_modification
+
+        eris.mo_energy = np.diag(eris.fock).copy()
+        
+        eris.oooo = h2e[:nocc,:nocc,:nocc,:nocc].copy()
+        eris.ovoo = h2e[:nocc,nocc:,:nocc,:nocc].copy()
+        eris.ooov = h2e[:nocc,:nocc,:nocc,nocc:].copy()
+        eris.vooo = h2e[nocc:,:nocc,:nocc,:nocc].copy()
+        eris.ovov = h2e[:nocc,nocc:,:nocc,nocc:].copy()
+        eris.vovo = h2e[nocc:,:nocc,nocc:,:nocc].copy()
+        eris.ovvo = h2e[:nocc,nocc:,nocc:,:nocc].copy()
+        eris.voov = h2e[nocc:,:nocc,:nocc,nocc:].copy()
+        eris.oovv = h2e[:nocc,:nocc,nocc:,nocc:].copy()
+        eris.ovvv = h2e[:nocc,nocc:,nocc:,nocc:].copy()
+        eris.vovv = h2e[nocc:,:nocc,nocc:,nocc:].copy()
+        eris.vvov = h2e[nocc:,nocc:,:nocc,nocc:].copy()
+        eris.vvvv = h2e[nocc:,nocc:,nocc:,nocc:].copy()
+
+        return eris
     
+
     def update_jastrow_params(self, new_params):
         """Update Jastrow parameters and reset XTC-specific caches."""
         # Call parent class's update method
