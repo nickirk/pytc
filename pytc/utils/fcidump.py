@@ -24,8 +24,12 @@ def write_fcidump(filename, h1e, h2e, ecore, n_orb, n_elec):
             for j in range(n_orb):
                 for k in range(n_orb):
                     for l in range(n_orb):
+                        # Only write if (i,j) is not greater than (k,l) to avoid duplicates.
+                        if (i, j) > (k, l):
+                            continue
                         if abs(h2e[i, j, k, l]) > 1e-15:
-                            f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(h2e[i, j, k, l], i + 1, j + 1, k + 1, l + 1))
+                            f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(
+                            h2e[i, j, k, l], i + 1, j + 1, k + 1, l + 1))
 
         # Write 1-body integrals
         for i in range(n_orb):
@@ -90,7 +94,7 @@ def read_fcidump(filename):
 
             else:
                 g2e[i, j, k, l] = float(a)
-                # g2e[k, l, i, j] = float(a)
+                g2e[k, l, i, j] = float(a)
 
 
     # print('h1e norm = ', np.linalg.norm(h1e))

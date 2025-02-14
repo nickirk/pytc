@@ -9,7 +9,7 @@ from pytc.jastrow import SimpleJastrow
 class TestFCIDump(unittest.TestCase):
     def setUp(self):
         self.mol = gto.M(atom='He 0 0 0', basis='ccpvdz')
-        self.filename = 'test_fcidump.txt'
+        self.filename = 'pytc/utils/test/test_fcidump.txt'
 
     def tearDown(self):
         if os.path.exists(self.filename):
