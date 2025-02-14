@@ -23,3 +23,7 @@ tmp*
 __pycache__/
 
 calcs
+
+*.vscode/
+*.venv/
+
