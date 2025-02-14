@@ -1,35 +1,22 @@
 import numpy as np
-from pyscf import gto, scf, ao2mo
-from pytc.xtc import XTC
 
-def write_fcidump(filename, mol):
+def write_fcidump(filename, h1e, h2e, ecore, n_orb, n_elec):
     """
     Write integrals in FCI dump format.
 
     Parameters:
     filename (str): The name of the output file.
-    mol (Mole): The PySCF molecule object.
+    h1e (ndarray): 1-body integrals.
+    h2e (ndarray): 2-body integrals.
+    ecore (float): Core energy.
+    n_orb (int): Number of orbitals.
+    n_elec (int): Number of electrons.
     """
-    # Perform SCF calculation
-    mf = scf.RHF(mol)
-    mf.kernel()
-
-    # Create XTC object
-    my_xtc = XTC(mf, None, grid_lvl=2)
-
-    # Extract 1body and 2body integrals and ecore from the XTC object
-    h1e = my_xtc.get_1b()
-    h2e = my_xtc.get_2b()
-    ecore = my_xtc.get_const()
-
-    # Get the number of orbitals
-    n_orb = h1e.shape[0]
-
     with open(filename, 'w') as f:
         # Write header
         f.write('&FCI\n')
         f.write('NORB= {}\n'.format(n_orb))
-        f.write('NELEC= {}\n'.format(mol.nelectron))
+        f.write('NELEC= {}\n'.format(n_elec))
         f.write('MS2= 0\n')
         f.write('ORBSYM= {}\n'.format('1 ' * n_orb))
         f.write('ISYM= 1\n')
