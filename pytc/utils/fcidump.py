@@ -1,6 +1,6 @@
 import numpy as np
 
-def write_fcidump(filename, h1e, h2e, ecore, n_orb, n_elec):
+def write(filename, h1e, h2e, ecore, n_orb, n_elec):
     """
     Write integrals in FCI dump format.
 
@@ -42,7 +42,7 @@ def write_fcidump(filename, h1e, h2e, ecore, n_orb, n_elec):
         f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(ecore, 0, 0, 0, 0))
 
 
-def read_fcidump(filename):
+def read(filename):
     """
     Reads a FCIDUMP file and extracts electronic structure parameters, one-electron integrals,
     two-electron integrals, and the core energy.
@@ -95,9 +95,5 @@ def read_fcidump(filename):
             else:
                 g2e[i, j, k, l] = float(a)
                 g2e[k, l, i, j] = float(a)
-
-
-    # print('h1e norm = ', np.linalg.norm(h1e))
-    # print('g2e norm = ', np.linalg.norm(g2e))
 
     return n_sites, n_elec, ecore, h1e, g2e
