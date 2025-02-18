@@ -15,7 +15,7 @@
 - Uses JAX autodiff to compute gradient of Jastrow on r and on parameters
 - Support simple Jastrow optimization by deterministic/second quantized optimization algorithm
 - Real-space VMC Jastrow optimization (coming soon)
-- Supports GPU acceleration via JAX (CUDA-backend currently implemented)
+- Supports GPU acceleration via JAX (CUDA-backend currently not implemented)
 - Calculates the transcorrelated 2-body integrals: K1, K2, K3
 - Calculates the xTC approximated 3-body integrals
 - Implements the Interpolative Separable Density Fitting (ISDF) approximation for the all the aforementioned integrals
