@@ -90,5 +90,91 @@ class TestAnsatzH2(unittest.TestCase):
         # Values should be equal and opposite
         np.testing.assert_allclose(value1, -value2)
 
+    def test_jastrow_terms(self):
+        """Test computation of Jastrow gradient and laplacian terms."""
+        grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos)
+        
+        # Check shapes
+        self.assertEqual(grad_J.shape, (2, 3))  # (n_electrons, xyz)
+        self.assertEqual(lap_J.shape, (2,))     # (n_electrons,)
+        
+        # Gradients should be opposite for electrons near equilibrium
+        np.testing.assert_allclose(grad_J[0], -grad_J[1], rtol=1e-5)
+
+    def test_kinetic_matrix(self):
+        """Test computation of kinetic energy matrix."""
+        grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos)
+        inv_up, inv_down, B_kin_up, B_kin_down = self.ansatz._compute_kinetic_matrix(
+            self.test_pos, grad_J, lap_J)
+        
+        # Check shapes
+        n_up = self.det.n_alpha
+        n_down = self.det.n_beta
+        self.assertEqual(B_kin_up.shape, (n_up, n_up))
+        self.assertEqual(B_kin_down.shape, (n_down, n_down))
+        
+        # Kinetic energy should be real
+        self.assertTrue(np.allclose(B_kin_up.imag, 0))
+        self.assertTrue(np.allclose(B_kin_down.imag, 0))
+        
+        # Inverse matrices should be correct
+        slater_up, slater_down = self.det.matrix(self.test_pos)
+        np.testing.assert_allclose(inv_up @ slater_up, np.eye(n_up), rtol=1e-5)
+
+    def test_potential_matrix(self):
+        """Test computation of potential energy matrix."""
+        slater_up, slater_down = self.det.matrix(self.test_pos)
+        B_pot_up, B_pot_down = self.ansatz._compute_potential_matrix(
+            self.test_pos, slater_up, slater_down)
+        
+        # Check shapes
+        self.assertEqual(B_pot_up.shape, slater_up.shape)
+        self.assertEqual(B_pot_down.shape, slater_down.shape)
+        
+        # Potential energy should be real
+        self.assertTrue(np.allclose(B_pot_up.imag, 0))
+        self.assertTrue(np.allclose(B_pot_down.imag, 0))
+        
+        # Test that potential increases as electrons move apart
+        far_pos = jnp.array([
+            [0.0, 0.0, -5.0],
+            [0.0, 0.0, 5.0],
+        ])
+        far_slater_up, far_slater_down = self.det.matrix(far_pos)
+        far_B_pot_up, far_B_pot_down = self.ansatz._compute_potential_matrix(
+            far_pos, far_slater_up, far_slater_down)
+        
+        # Energy should be higher for separated electrons
+        self.assertGreater(
+            float(jnp.abs(far_B_pot_up).mean()), 
+            float(jnp.abs(B_pot_up).mean())
+        )
+
+    def test_local_energy(self):
+        """Test local energy computation."""
+        energy = self.ansatz.local_energy(self.test_pos)
+        
+        # Energy should be real
+        self.assertTrue(np.isreal(energy))
+        
+        # Energy should be finite
+        self.assertTrue(np.isfinite(energy))
+        
+        # Test virial theorem: <T> ≈ -<V> for ground state
+        # This requires computing T and V separately
+        grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos)
+        inv_up, inv_down, B_kin_up, B_kin_down = self.ansatz._compute_kinetic_matrix(
+            self.test_pos, grad_J, lap_J)
+        
+        slater_up, slater_down = self.det.matrix(self.test_pos)
+        B_pot_up, B_pot_down = self.ansatz._compute_potential_matrix(
+            self.test_pos, slater_up, slater_down)
+        
+        T = float(jnp.trace(inv_up @ B_kin_up) + jnp.trace(inv_down @ B_kin_down))
+        V = float(jnp.trace(inv_up @ B_pot_up) + jnp.trace(inv_down @ B_pot_down))
+        
+        # Check if T ≈ -V (allow for some deviation due to non-optimal wavefunction)
+        self.assertLess(abs(T + V), abs(T))  # |T + V| should be smaller than |T|
+
 if __name__ == '__main__':
     unittest.main()

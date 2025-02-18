@@ -9,7 +9,7 @@ class Poly(Jastrow):
     
     def __init__(self, params, atomic_coords=None):
         """Initialize with parameters."""
-        super().__init__(params, atomic_coords)
+        super().__init__(params)
         # Create JIT-compiled versions of core functions
         self._compute_jit = jax.jit(self._compute)
         # Fix the vectorization to handle proper batch dimensions
