@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from pytc.autodiff.jastrow import Jastrow
 
-class SimpleJastrow(Jastrow):
+class Poly(Jastrow):
     """Simple Jastrow factor implemented in JAX."""
     
     def __init__(self, params, atomic_coords=None):
@@ -35,12 +35,10 @@ class SimpleJastrow(Jastrow):
         #a_params = params[:n_terms]
         c_params = params[:]
         
-        # Calculate rescaled distance for each a_i
-        r_rescaled = r12 / (1+ r12)
         
         # Compute powers of r_rescaled and multiply by c_i
         powers = jnp.arange(1, n_terms + 1)
-        terms = c_params * r_rescaled**powers
+        terms = c_params * r12**powers
         
         return jnp.sum(terms) 
     

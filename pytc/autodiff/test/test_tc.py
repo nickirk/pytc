@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from pyscf import gto, scf
 from pytc.tc import TC as TC_numpy
 from pytc.autodiff.tc import TC as TC_jax
-from pytc.autodiff.jastrow import SimpleJastrow
+from pytc.autodiff.jastrow import Poly
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -24,11 +24,11 @@ class TestTC(unittest.TestCase):
         
         # Create simple Jastrow factors for both implementations
         self.params = jnp.array([1.0])
-        self.jastrow_jax = SimpleJastrow(self.params)
+        self.jastrow_jax = Poly(self.params)
         
         # Create numpy version of same jastrow for comparison
-        class SimpleJastrowNumpy:
-            """Numpy version of SimpleJastrow for comparison."""
+        class PolyNumpy:
+            """Numpy version of Poly for comparison."""
             def __init__(self, params):
                 self.params = params
 
@@ -46,7 +46,7 @@ class TestTC(unittest.TestCase):
                                diff * self.params[0] * cutoff[..., None] / r12[..., None],
                                np.zeros_like(diff))
                 return grad
-        self.jastrow_numpy = SimpleJastrowNumpy(self.params)
+        self.jastrow_numpy = PolyNumpy(self.params)
         
         # Create TC objects
         self.tc_jax = TC_jax(self.mf, self.jastrow_jax)

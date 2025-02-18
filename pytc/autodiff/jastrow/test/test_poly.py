@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 import jax
 import jax.numpy as jnp
-from pytc.autodiff.jastrow import SimpleJastrow
+from pytc.autodiff.jastrow import Poly
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -19,8 +19,8 @@ def numerical_gradient_params(jastrow, r1, r2, eps=1e-4):
         params_plus = params.at[i].add(eps)
         params_minus = params.at[i].add(-eps)
         
-        j_plus = SimpleJastrow(params_plus)._compute(r1, r2, params_plus)
-        j_minus = SimpleJastrow(params_minus)._compute(r1, r2, params_minus)
+        j_plus = Poly(params_plus)._compute(r1, r2, params_plus)
+        j_minus = Poly(params_minus)._compute(r1, r2, params_minus)
         
         # Central difference - no normalization needed
         grad = grad.at[i].set((j_plus - j_minus) / (2 * eps))
@@ -49,7 +49,7 @@ class TestSimpleJastrowJAX(unittest.TestCase):
     
     def setUp(self):
         self.params = jnp.array([1.0])
-        self.jastrow = SimpleJastrow(self.params)
+        self.jastrow = Poly(self.params)
     
     def test_single_point_evaluation(self):
         """Test single point Jastrow evaluation."""
@@ -58,7 +58,8 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         
         value = self.jastrow._compute(r1, r2, self.params)
         self.assertTrue(jnp.isfinite(value))
-        self.assertEqual(value, 1.0)  # Should be param * |r1-r2| = 1.0 * 1.0
+        # Fix: Use np.testing.assert_allclose instead of assertEqual
+        np.testing.assert_allclose(float(value), 1.0, rtol=1e-10)
     
     def test_batch_evaluation(self):
         """Test batched Jastrow evaluation."""

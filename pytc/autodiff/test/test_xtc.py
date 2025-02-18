@@ -9,7 +9,7 @@ from pyscf import gto, scf
 
 from pytc.xtc import XTC as XTC_numpy
 from pytc.autodiff.xtc import XTC as XTC_jax
-from pytc.autodiff.jastrow import SimpleJastrow
+from pytc.autodiff.jastrow import Poly
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -32,10 +32,10 @@ class TestXTC(unittest.TestCase):
         
         # Create simple Jastrow factors for both implementations
         cls.params = jnp.array([1.4])
-        cls.jastrow_jax = SimpleJastrow(cls.params)
+        cls.jastrow_jax = Poly(cls.params)
         
         # Create numpy version of same jastrow
-        class SimpleJastrowNumpy:
+        class PolyNumpy:
             def grad(self, r1, r2):
                 diff = r1[:, None, :] - r2[None, :, :]
                 r12 = np.sqrt(np.sum(diff * diff, axis=-1))
@@ -44,7 +44,7 @@ class TestXTC(unittest.TestCase):
                               cls.params[0]*diff / np.maximum(r12[..., None], 1e-10),
                               np.zeros_like(diff))
                 return grad
-        cls.jastrow_numpy = SimpleJastrowNumpy()
+        cls.jastrow_numpy = PolyNumpy()
         
         # Initialize XTC calculators with low grid level for testing
         cls.xtc_jax = XTC_jax(cls.mf, cls.jastrow_jax, grid_lvl=1)

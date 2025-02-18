@@ -1,7 +1,7 @@
 import numpy as np
 from pyscf.dft import numint
 
-class SlaterDeterminant:
+class SlaterDet:
     def __init__(self, mol, mo_coeff=None, nelec=None):
         """
         Args:

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from pytc.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
 from pytc.autodiff.kmat import calc_K1, calc_K3
-from pytc.autodiff.jastrow import SimpleJastrow
+from pytc.autodiff.jastrow import Poly
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -38,9 +38,9 @@ class TestKmat(unittest.TestCase):
         
         # Create Jastrow factors
         self.params = jnp.array([1.0])
-        self.jastrow_jax = SimpleJastrow(self.params)
+        self.jastrow_jax = Poly(self.params)
         
-        class SimpleJastrowNumpy:
+        class PolyNumpy:
             def grad(self, r1, r2):
                 diff = r1[:, None, :] - r2[None, :, :]
                 r12 = np.sqrt(np.sum(diff * diff, axis=-1))
@@ -49,7 +49,7 @@ class TestKmat(unittest.TestCase):
                               diff / np.maximum(r12[..., None], 1e-10),
                               np.zeros_like(diff))
                 return grad
-        self.jastrow_numpy = SimpleJastrowNumpy()
+        self.jastrow_numpy = PolyNumpy()
     
     def test_K1_shapes(self):
         """Test K1 output shapes for different input sizes."""
