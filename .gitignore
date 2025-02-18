@@ -6,6 +6,11 @@
 *.pyz
 *.ipynb
 *.png
+*.npz
+*.xml
+tmp/*
+
+.coverage
 .pytc 
 .tchint/
 doc/*
