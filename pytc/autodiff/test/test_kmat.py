@@ -12,7 +12,7 @@ from pytc.autodiff.jastrow import Poly
 jax.config.update("jax_enable_x64", True)
 
 class TestKmat(unittest.TestCase):
-    """Test JAX implementation of kinetic matrix elements."""
+    """Test JAX implementation of K matrix elements."""
     
     def setUp(self):
         """Set up test fixtures."""
