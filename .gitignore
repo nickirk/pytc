@@ -4,8 +4,11 @@
 *.pyd
 *.pyw
 *.pyz
+*.npz
 *.ipynb
 *.png
+.coverage
+*.xml
 .pytc 
 .tchint/
 .venv/
@@ -15,6 +18,6 @@ doc/*
 !doc/*.pdf
 *egg-info/
 build/
-
+tmp*
 *.log
 __pycache__/
