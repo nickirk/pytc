@@ -42,28 +42,18 @@ class Jastrow(ABC):
         return jnp.exp(self._compute(r1, r2, self.params))
     
     def grad_r(self, r1, r2):
-        """Compute gradient of u w.r.t r1 coordinates.
-        
-        Args:
-            r1: Array of shape (3,) for first electron position
-            r2: Array of shape (3,) for second electron position
-            
-        Returns:
-            Gradient array of shape (3,)
-        """
-        return jax.grad(lambda x: self._compute(x, r2, self.params))(r1)
+        """Compute gradient of u w.r.t r1 coordinates."""
+        def scalar_fn(x):
+            # Ensure scalar output by selecting the single value
+            return self._compute(x, r2, self.params).reshape(-1)[0]
+        return jax.grad(scalar_fn)(r1)
     
     def laplacian_r(self, r1, r2):
-        """Compute Laplacian of u w.r.t r1 coordinates.
-        
-        Args:
-            r1: Array of shape (3,) for first electron position
-            r2: Array of shape (3,) for second electron position
-            
-        Returns:
-            Laplacian (scalar)
-        """
-        return jnp.trace(jax.hessian(lambda x: self._compute(x, r2, self.params))(r1))
+        """Compute Laplacian of u w.r.t r1 coordinates."""
+        def scalar_fn(x):
+            # Ensure scalar output by selecting the single value
+            return self._compute(x, r2, self.params).reshape(-1)[0]
+        return jnp.trace(jax.hessian(scalar_fn)(r1))
     
     def grad_params(self, r1, r2):
         """Compute gradient of u w.r.t parameters.

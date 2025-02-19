@@ -158,7 +158,7 @@ def do_ccsd(params, basis):
     assert np.isclose(e_hf + mycc.e_corr, -2.903476659618479, atol=1e-7)
 
 def main():
-    """Example usage with Be atom."""
+    """Example usage with He atom."""
     # Create test system
     mol, mf = create_test_system('ccpvtz')
 
