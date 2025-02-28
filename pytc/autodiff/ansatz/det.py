@@ -93,26 +93,20 @@ class SlaterDet:
         return grad_up, grad_down
     
     def laplacian(self, coords):
-        """Compute the Laplacian of the Slater determinant.
-        TODO: determine how the repetitive computation of values,
-        grad, laplacian affects performance and if it is worth it to 
-        avoid it in matrix, grad, laplacian functions. 
-        Args:
-            coords: (n_up + n_down, 3) electron positions
-            
-        Returns:
-            laplacian_up, laplacian_down: tuple ((n_up, n_up), (n_down, n_down))
-                Each element (i,j) represents ∇²ᵢϕⱼ(rᵢ)
-        """
+        """Compute the Laplacian of the Slater determinant."""
         # Get AO values, gradients, and laplacians using numint
-        ao_lapls = numint.eval_ao(self.mol, coords, deriv=2)[4:].transpose(1, 2, 0)
+        ao_vals = numint.eval_ao(self.mol, coords, deriv=2)
+        
+        # PySCF returns a list where ao_vals[4:] contains the laplacian components
+        # Need to reshape and combine the xx, yy, zz components
+        ao_lapls = ao_vals[4:].sum(axis=0)  # Sum the diagonal terms
         
         # Split laplacians into up and down electron parts
-        # Note: PySCF returns laplacian as sum of second derivatives
         ao_lapls_up = ao_lapls[:self.n_alpha]      # shape (n_up, nAOs)
         ao_lapls_down = ao_lapls[self.n_alpha:]    # shape (n_down, nAOs)
         
         # Contract with MO coefficients to get laplacians of molecular orbitals
+        # Only use coefficients up to number of electrons
         lapl_up = ao_lapls_up @ self.mo_coeff_alpha[:, :self.n_alpha]    # shape (n_up, n_up)
         lapl_down = ao_lapls_down @ self.mo_coeff_beta[:, :self.n_beta]  # shape (n_down, n_down)
             

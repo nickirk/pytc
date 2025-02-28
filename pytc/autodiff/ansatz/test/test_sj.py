@@ -33,7 +33,7 @@ class TestAnsatzH2(unittest.TestCase):
         
         # Create ansatz with single determinant
         self.coeffs = jnp.array([1.0])
-        self.ansatz = SlaterJastrow(self.jastrow, [self.det], self.coeffs)
+        self.ansatz = SlaterJastrow(self.mol, self.jastrow, [self.det], self.coeffs)
         
         # Test positions: two electrons slightly offset from nuclei
         self.test_pos = jnp.array([
@@ -119,7 +119,7 @@ class TestAnsatzH2(unittest.TestCase):
         
         # Inverse matrices should be correct
         slater_up, slater_down = self.det.matrix(self.test_pos)
-        np.testing.assert_allclose(inv_up @ slater_up, np.eye(n_up), rtol=1e-5)
+        np.testing.assert_allclose(inv_up @ slater_up, np.eye(n_up), atol=1e-7)
 
     def test_potential_matrix(self):
         """Test computation of potential energy matrix."""

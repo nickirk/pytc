@@ -41,16 +41,9 @@ class SlaterJastrow:
         return jastrow_val * linear_combo
 
     def update_jastrow(self, new_jastrow_params):
-        """Update Jastrow parameters.
-        
-        Args:
-            new_jastrow_params: New parameters for Jastrow factor
-            
-        Returns:
-            New Ansatz instance with updated Jastrow
-        """
+        """Update Jastrow parameters."""
         new_jastrow = self.jastrow.update(new_jastrow_params)
-        return SlaterJastrow(new_jastrow, self.dets, self.linear_coeffs)
+        return SlaterJastrow(self.mol, new_jastrow, self.dets, self.linear_coeffs)
     
     def update_coefficients(self, new_coefficients):
         """Update linear coefficients.
@@ -67,32 +60,28 @@ class SlaterJastrow:
         """Compute ∇J/J and ∇²J/J for all electrons using vmap."""
         n_electrons = elec_coords.shape[0]
         
-        # Vectorize gradient and laplacian computation
-        vmap_grads = jax.vmap(self.jastrow.get_log_grads, in_axes=(None, 0))
-        vmap_all_grads = jax.vmap(vmap_grads, in_axes=(0, None))
+        # Vectorize gradient and laplacian computation over all pairs
+        # First vmap over r1, keeping r2 fixed
+        vmap_grads = jax.vmap(self.jastrow.get_log_grads, in_axes=(0, None))
+        # Then vmap over r2, broadcasting r1
+        vmap_all_grads = jax.vmap(vmap_grads, in_axes=(None, 0))
         
-        # Compute all pairs once
-        # TODO: could be optimized to compute only upper triangle
-        all_grads, all_laps = vmap_all_grads(elec_coords, elec_coords)  # (n,n,3), (n,n)
+        # Compute all pairs at once - shape will be (n_elec, n_elec, 3) for grads
+        # and (n_elec, n_elec) for laps
+        all_grads, all_laps = vmap_all_grads(elec_coords, elec_coords)
         
-        # Use transpose for opposite ordering
-        # For gradients: need to negate when swapping i,j due to chain rule
-        all_grads_T = jnp.transpose(all_grads, (1, 0, 2))  
+        # Create mask for upper triangle (j > i)
+        triu_mask = jnp.triu(jnp.ones((n_electrons, n_electrons)), k=1)
+        triu_mask_3d = triu_mask[..., None]  # Add dimension for xyz coordinates
         
-        # Create mask for upper and lower triangles
-        upper_mask = jnp.triu(jnp.ones((n_electrons, n_electrons)), k=1)[..., None]  # for j>i
-        lower_mask = jnp.tril(jnp.ones((n_electrons, n_electrons)), k=-1)[..., None]  # for j<i
+        # For gradients: need both i->j and j->i contributions with opposite signs
+        grad_J_over_J = (
+            jnp.sum(all_grads * triu_mask_3d, axis=1) -      # Sum over j (positive)
+            jnp.sum((all_grads * triu_mask_3d).transpose(1, 0, 2), axis=1)  # Sum over i (negative)
+        )
         
-        # Sum contributions properly respecting order
-        grad_J_over_J = (jnp.sum(all_grads * upper_mask, axis=1) + 
-                        jnp.sum(all_grads_T * lower_mask, axis=1))
-        
-        # Laplacian contributions (symmetric part)
-        lap_J_over_J = (jnp.sum(all_laps * upper_mask[..., 0], axis=1) + 
-                       jnp.sum(all_laps * lower_mask[..., 0], axis=1))
-        
-        # Add (∇u)² term
-        lap_J_over_J = lap_J_over_J + jnp.sum(grad_J_over_J**2, axis=1)
+        # For laplacian: contributions are symmetric
+        lap_J_over_J = 2 * jnp.sum(all_laps * triu_mask, axis=1)  # Sum over j and multiply by 2
         
         return grad_J_over_J, lap_J_over_J
 
@@ -115,16 +104,18 @@ class SlaterJastrow:
         inv_up = jnp.linalg.inv(slater_up)
         inv_down = jnp.linalg.inv(slater_down)
         
-        # Compute kinetic terms using vmap
-        def compute_row(grad_J, lap_J, orb_vals, grad_orb, lap_orb):
-            """Compute single row of kinetic matrix."""
-            return -0.5 * (lap_orb + 
-                          2 * jnp.sum(grad_J[:, None, :] * grad_orb, axis=-1) +
-                          lap_J[:, None] * orb_vals)
+        # Compute kinetic terms directly without vmap
+        B_up = -0.5 * (
+            lap_up +  # (n_up, n_up)
+            2 * jnp.einsum('ik,ijk->ij', grad_J_up, grad_up) +  # sum over spatial dimensions
+            jnp.multiply(lap_J_up[:, None], slater_up)  # broadcast laplacian
+        )
         
-        # Vectorize over electrons
-        B_up = jax.vmap(compute_row)(grad_J_up, lap_J_up, slater_up, grad_up, lap_up)
-        B_down = jax.vmap(compute_row)(grad_J_down, lap_J_down, slater_down, grad_down, lap_up)
+        B_down = -0.5 * (
+            lap_down +  # (n_down, n_down)
+            2 * jnp.einsum('ik,ijk->ij', grad_J_down, grad_down) +  # sum over spatial dimensions
+            jnp.multiply(lap_J_down[:, None], slater_down)  # broadcast laplacian
+        )
         
         return inv_up, inv_down, B_up, B_down
 
@@ -136,31 +127,33 @@ class SlaterJastrow:
         atom_coords = self.mol.atom_coords()
         atom_charges = self.mol.atom_charges()
         
-        # Vectorize e-n potential computation
         def e_n_potential(r):
             """Compute electron-nuclear potential for one electron."""
             dists = jnp.linalg.norm(r - atom_coords, axis=1)
-            return jnp.sum(-atom_charges / dists)
+            return -jnp.sum(atom_charges / dists)
             
-        V_en_up = jax.vmap(e_n_potential)(elec_coords[:n_up])
-        V_en_down = jax.vmap(e_n_potential)(elec_coords[n_up:])
+        V_en_up = jax.vmap(e_n_potential)(elec_coords[:n_up])[:, None]
+        V_en_down = jax.vmap(e_n_potential)(elec_coords[n_up:])[:, None]
         
         # Electron-electron potential
         def e_e_potential(r, other_coords):
             """Compute e-e potential for one electron with all others."""
             dists = jnp.linalg.norm(r - other_coords, axis=1)
-            mask = jnp.ones_like(dists)  # Mask to exclude self-interaction
-            return jnp.sum(mask / (dists + 1e-10))  # Add small constant for stability
+            mask = jnp.ones_like(dists)
+            same_idx = jnp.arange(len(dists)) == jnp.arange(len(dists))[:, None]
+            mask = jnp.where(same_idx, 0.0, 1.0)
+            return jnp.sum(mask / (dists + 1e-10))
             
-        # Vectorize e-e potential computation
+        # Compute e-e potential for up and down electrons
         V_ee_up = jax.vmap(e_e_potential, in_axes=(0, None))(
-            elec_coords[:n_up], elec_coords[:n_up])
+            elec_coords[:n_up], elec_coords)[:, None]
         V_ee_down = jax.vmap(e_e_potential, in_axes=(0, None))(
-            elec_coords[n_up:], elec_coords[n_up:])
+            elec_coords[n_up:], elec_coords)[:, None]
         
         # Combine potentials with orbital values
-        B_up = (V_en_up[:, None] + V_ee_up[:, None]) * slater_up
-        B_down = (V_en_down[:, None] + V_ee_down[:, None]) * slater_down
+        # Note: e-e potential is already properly counted, no need for 0.5
+        B_up = (V_en_up + V_ee_up) * slater_up
+        B_down = (V_en_down + V_ee_down) * slater_down
         
         return B_up, B_down
 
