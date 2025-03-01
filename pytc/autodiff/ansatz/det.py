@@ -2,7 +2,7 @@ import numpy as np
 from pyscf.dft import numint
 
 class SlaterDet:
-    def __init__(self, mol, mo_coeff=None, nelec=None):
+    def __init__(self, mol, mo_coeff=None, nelec=None, excitations=None):
         """
         Args:
         mol: A PySCF mol object (provides integrals, eval_gto, etc.)
@@ -10,6 +10,11 @@ class SlaterDet:
         or a tuple/list [mo_coeff_alpha, mo_coeff_beta] each of
         shape (nAOs, nMOs) for UHF.
         nelec: Number of electrons as a tuple (n_alpha, n_beta).
+        excitations: Tuple of (alpha_excitations, beta_excitations) where each is a tuple of
+                    (from_indices, to_indices) specifying which orbitals to remove and add.
+                    Example: (([0,1], [5,6]), ([], [])) means:
+                    - For alpha: remove electrons from orbitals 0,1 and add to orbitals 5,6
+                    - For beta: no excitations (regular HF reference)
         """
         self.mol = mol
         if nelec is None:
@@ -28,6 +33,52 @@ class SlaterDet:
             self.mo_coeff_alpha = mo_coeff
             self.mo_coeff_beta = mo_coeff  # identical for spin up/down
             self.unrestricted = False
+    
+        # Default occupied orbitals (HF reference)
+        self.alpha_occ = list(range(self.n_alpha)) 
+        self.beta_occ = list(range(self.n_beta))  
+
+        # Apply excitations if specified
+        if excitations is not None:
+            alpha_exc, beta_exc = excitations
+            
+            # Handle alpha excitations
+            if alpha_exc and len(alpha_exc) == 2:
+                from_idx, to_idx = alpha_exc
+                # Validate excitation indices
+                if len(from_idx) != len(to_idx):
+                    raise ValueError("Number of occupied and virtual orbitals must match for alpha excitations")
+                
+                # Apply excitations
+                for i, a in zip(from_idx, to_idx):
+                    if i not in self.alpha_occ:
+                        raise ValueError(f"Cannot remove electron from unoccupied alpha orbital {i}")
+                    if a in self.alpha_occ:
+                        raise ValueError(f"Cannot add electron to already occupied alpha orbital {a}")
+                    self.alpha_occ.remove(i)  
+                    self.alpha_occ.append(a)  
+                self.alpha_occ.sort()  # Keep indices sorted
+                
+            # Handle beta excitations
+            if beta_exc and len(beta_exc) == 2:
+                from_idx, to_idx = beta_exc
+                # Validate excitation indices
+                if len(from_idx) != len(to_idx):
+                    raise ValueError("Number of occupied and virtual orbitals must match for beta excitations")
+                
+                # Apply excitations
+                for i, a in zip(from_idx, to_idx):
+                    if i not in self.beta_occ:
+                        raise ValueError(f"Cannot remove electron from unoccupied beta orbital {i}")
+                    if a in self.beta_occ:
+                        raise ValueError(f"Cannot add electron to already occupied beta orbital {a}")
+                    self.beta_occ.remove(i)  
+                    self.beta_occ.append(a)  
+                self.beta_occ.sort()  # Keep indices sorted
+
+        # Store the occupied MO coefficients
+        self.mo_coeff_alpha_occ = self.mo_coeff_alpha[:, self.alpha_occ]
+        self.mo_coeff_beta_occ = self.mo_coeff_beta[:, self.beta_occ]
     
         # Internal placeholders for (inverse) Slater matrices
         self.inv_up = None
@@ -81,14 +132,14 @@ class SlaterDet:
         ao_grads_down = ao_grads[self.n_alpha:]    # shape (n_down, nAOs, 3)
         
         # Contract with MO coefficients to get gradients of molecular orbitals
-        # For each spatial direction, multiply ao_grad by mo_coeff
+        # For each spatial direction, multiply ao_grad by mo_coeff_occ
         grad_up = np.zeros((self.n_alpha, self.n_alpha, 3))
         grad_down = np.zeros((self.n_beta, self.n_beta, 3))
         
         # Handle each spatial direction
         for d in range(3):
-            grad_up[..., d] = ao_grads_up[..., d] @ self.mo_coeff_alpha[:, :self.n_alpha]
-            grad_down[..., d] = ao_grads_down[..., d] @ self.mo_coeff_beta[:, :self.n_beta]
+            grad_up[..., d] = ao_grads_up[..., d] @ self.mo_coeff_alpha_occ
+            grad_down[..., d] = ao_grads_down[..., d] @ self.mo_coeff_beta_occ
             
         return grad_up, grad_down
     
@@ -106,9 +157,8 @@ class SlaterDet:
         ao_lapls_down = ao_lapls[self.n_alpha:]    # shape (n_down, nAOs)
         
         # Contract with MO coefficients to get laplacians of molecular orbitals
-        # Only use coefficients up to number of electrons
-        lapl_up = ao_lapls_up @ self.mo_coeff_alpha[:, :self.n_alpha]    # shape (n_up, n_up)
-        lapl_down = ao_lapls_down @ self.mo_coeff_beta[:, :self.n_beta]  # shape (n_down, n_down)
+        lapl_up = ao_lapls_up @ self.mo_coeff_alpha_occ    # shape (n_up, n_up)
+        lapl_down = ao_lapls_down @ self.mo_coeff_beta_occ  # shape (n_down, n_beta)
             
         return lapl_up, lapl_down
     
@@ -130,13 +180,9 @@ class SlaterDet:
         ao_up = ao_vals_all[:self.n_alpha]      # shape (n_up, nAOs)
         ao_down = ao_vals_all[self.n_alpha:]    # shape (n_down, nAOs)
     
-        # Multiply AO by mo_coeff
-        mat_up = ao_up @ self.mo_coeff_alpha     # shape (n_up, nMOs_alpha)
-        mat_down = ao_down @ self.mo_coeff_beta  # shape (n_down, nMOs_beta)
-    
-        # Select only the orbitals up to number of electrons for each spin
-        slater_up = mat_up[:, :self.n_alpha]        # shape (n_up, n_up)
-        slater_down = mat_down[:, :self.n_beta]  # shape (n_down, n_down)
+        # Multiply AO by pre-selected occupied mo_coeff
+        slater_up = ao_up @ self.mo_coeff_alpha_occ     # shape (n_up, n_up)
+        slater_down = ao_down @ self.mo_coeff_beta_occ  # shape (n_down, n_beta)
     
         return slater_up, slater_down
     
@@ -189,13 +235,11 @@ class SlaterDet:
         # Evaluate AO for the new position
         ao_new = numint.eval_ao(self.mol, new_pos.reshape(1, 3)).squeeze(axis=0)
     
-        # Build new row. If alpha spin, use mo_coeff_alpha, else mo_coeff_beta
-        mo_coeff_spin = self.mo_coeff_alpha if is_alpha else self.mo_coeff_beta
-        n_spin = self.n_alpha if is_alpha else self.n_beta
+        # Build new row using pre-computed occupied MO coefficients
+        mo_coeff_spin_occ = self.mo_coeff_alpha_occ if is_alpha else self.mo_coeff_beta_occ
     
         # Build the row (shape (n_spin,))
-        new_row = ao_new @ mo_coeff_spin
-        new_row = new_row[:n_spin]
+        new_row = ao_new @ mo_coeff_spin_occ
     
         # local index within that spin
         local_idx = e_idx if is_alpha else e_idx - self.n_alpha
@@ -206,7 +250,7 @@ class SlaterDet:
         # Sherman-Morrison update for inverse
         c = spin_inv @ new_row
         factor = 1.0 / c[local_idx]  # same as 1.0 / ratio
-        for j in range(n_spin):
+        for j in range(n_spin := (self.n_alpha if is_alpha else self.n_beta)):
             spin_inv[:, j] -= c * factor * spin_inv[local_idx, j]
     
         # Update the stored determinant
