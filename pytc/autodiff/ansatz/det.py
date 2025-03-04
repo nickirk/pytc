@@ -1,4 +1,5 @@
 import numpy as np
+
 from pyscf.dft import numint
 
 class SlaterDet:
@@ -99,6 +100,11 @@ class SlaterDet:
             float: The product of alpha and beta determinants
         """
         return self.value(coords)
+    
+    @property
+    def n_electrons(self):
+        """Return the total number of electrons."""
+        return self.n_alpha + self.n_beta
 
     def value_and_grad(self, coords):
         """Compute both value and gradient of Slater determinant.
@@ -124,7 +130,7 @@ class SlaterDet:
             grad_up, grad_down: tuple ((n_up, n_up, 3), (n_down, n_down, 3))
                 Each element (i,j,k) represents ∇ᵢϕⱼ(rᵢ) in direction k
         """
-        # Get AO values and gradients using numint (returns tuple (value, grad))
+        # Get AO values and gradients using eval_ao_safe (returns tuple (value, grad))
         ao_grads = numint.eval_ao(self.mol, coords, deriv=1)[1:].transpose(1, 2, 0)
         
         # Split into up and down electron parts
@@ -145,7 +151,7 @@ class SlaterDet:
     
     def laplacian(self, coords):
         """Compute the Laplacian of the Slater determinant."""
-        # Get AO values, gradients, and laplacians using numint
+        # Get AO values, gradients, and laplacians using eval_ao
         ao_vals = numint.eval_ao(self.mol, coords, deriv=2)
         
         # PySCF returns a list where ao_vals[4:] contains the laplacian components
@@ -173,7 +179,7 @@ class SlaterDet:
         Returns:
             slater_up, slater_down: the Slater matrices for alpha and beta spins
         """
-        # Get AO values using numint
+        # Get AO values using eval_ao_safe
         ao_vals_all = numint.eval_ao(self.mol, coords, deriv=0)
     
         # Partition the AO values by spin

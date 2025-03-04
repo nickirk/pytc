@@ -4,6 +4,27 @@ import jax
 import jax.numpy as jnp
 from typing import List, Any
 
+# Add these imports 
+import numpy as np
+import jax
+import jax.numpy as jnp
+from typing import List, Any, Tuple
+from functools import partial
+
+# Remove JIT decoration - make these pure Python functions
+def _evaluate_single_determinant(det, elec_coords_np):
+    """Evaluate a single determinant without JAX tracing."""
+    # Make sure we're working with NumPy arrays
+    elec_coords_np = np.asarray(elec_coords_np)
+    return det.value(elec_coords_np)
+
+def _evaluate_determinants(dets, elec_coords_np):
+    """Evaluate all determinants by calling the single version."""
+    # Make sure we're working with NumPy arrays
+    elec_coords_np = np.asarray(elec_coords_np)
+    # Use NumPy array instead of JAX array to avoid tracing
+    return np.array([_evaluate_single_determinant(det, elec_coords_np) for det in dets])
+
 class SlaterJastrow:
     """Quantum many-body wavefunction ansatz combining Jastrow factor with Slater determinants."""
     
@@ -22,7 +43,23 @@ class SlaterJastrow:
         
     def __call__(self, elec_coords):
         """Evaluate wavefunction at given electron positions."""
+        # Handle Jastrow part with JAX arrays
+        jastrow_val = self._compute_jastrow_value(elec_coords)
         
+        # Handle determinant part with NumPy conversion - ensure we use numpy throughout
+        elec_coords_np = np.array(elec_coords)
+        
+        # Get determinant values through our pure Python functions
+        det_vals_np = _evaluate_determinants(self.dets, elec_coords_np)
+        
+        # Convert back to JAX array only at the end
+        det_vals = jnp.array(det_vals_np)
+        linear_combo = jnp.sum(self.linear_coeffs * det_vals)
+        
+        return jastrow_val * linear_combo
+
+    def _compute_jastrow_value(self, elec_coords):
+        """Compute Jastrow factor value."""
         # Vectorize Jastrow computation over all pairs
         vmap_single = jax.vmap(self.jastrow._compute, in_axes=(None, 0, None))
         vmap_all = jax.vmap(vmap_single, in_axes=(0, None, None))
@@ -35,14 +72,13 @@ class SlaterJastrow:
         diag_mask = 1.0 - jnp.eye(n_electrons)
         
         # Use redundant summation form (multiply by 1/2)
-        jastrow_val = jnp.exp(0.5 * jnp.sum(all_pairs * diag_mask))
+        return jnp.exp(0.5 * jnp.sum(all_pairs * diag_mask))
+    
+    @property
+    def n_electrons(self):
+        """Return the number of electrons."""
+        return self.dets[0].n_electrons
         
-        # Evaluate determinants (already vectorized internally)
-        det_vals = jnp.array([det.value(elec_coords) for det in self.dets])
-        linear_combo = jnp.sum(self.linear_coeffs * det_vals)
-        
-        return jastrow_val * linear_combo
-
     def update_jastrow(self, new_jastrow_params):
         """Update Jastrow parameters."""
         new_jastrow = self.jastrow.update(new_jastrow_params)
@@ -103,9 +139,9 @@ class SlaterJastrow:
     def _compute_kinetic_matrix(self, elec_coords, grad_J_over_J, lap_J_over_J):
         """Compute kinetic energy part of B matrix."""
         # Get Slater matrices and their gradients/laplacians
-        slater_up, slater_down = self.dets[0].matrix(elec_coords)
-        grad_up, grad_down = self.dets[0].grad(elec_coords)  # shape: (n_up/down, n_up/down, 3)
-        lap_up, lap_down = self.dets[0].laplacian(elec_coords)
+        slater_up, slater_down = self._get_matrices(elec_coords)
+        grad_up, grad_down = self._get_gradients(elec_coords)  # shape: (n_up/down, n_up/down, 3)
+        lap_up, lap_down = self._get_laplacians(elec_coords)
         
         n_up = self.dets[0].n_alpha
         
@@ -201,20 +237,57 @@ class SlaterJastrow:
         
         return B_up, B_down
 
+    # Create wrappers for matrix, grad, laplacian that use NumPy conversion
+    def _get_matrices(self, elec_coords):
+        """Get Slater matrices with NumPy conversion."""
+        elec_coords_np = np.array(elec_coords)
+        slater_up, slater_down = self.dets[0].matrix(elec_coords_np)
+        return jnp.array(slater_up), jnp.array(slater_down)
+        
+    def _get_gradients(self, elec_coords):
+        """Get gradients of Slater matrices with NumPy conversion."""
+        elec_coords_np = np.array(elec_coords)
+        grad_up, grad_down = self.dets[0].grad(elec_coords_np)
+        return jnp.array(grad_up), jnp.array(grad_down)
+        
+    def _get_laplacians(self, elec_coords):
+        """Get laplacians of Slater matrices with NumPy conversion."""
+        elec_coords_np = np.array(elec_coords)
+        lap_up, lap_down = self.dets[0].laplacian(elec_coords_np)
+        return jnp.array(lap_up), jnp.array(lap_down)
+
+    @property
+    def n_up(self):
+        """Number of up-spin electrons."""
+        return self.dets[0].n_alpha if self.dets else 0
+
+    @property
+    def n_down(self):
+        """Number of down-spin electrons."""
+        return self.n_electrons - self.n_up
+
     def local_energy(self, elec_coords):
         """Compute local energy E_L = ℋΨ/Ψ. 
         See "Simple formalism for eﬃcient derivatives and multi-determinant expansions
             in quantum Monte Carlo" for details.
         """
-        # Get Jastrow contributions
+        # Convert to NumPy for determinant calculations
+        elec_coords_np = np.array(elec_coords)
+        
+        # Get Jastrow contributions (using JAX arrays)
         grad_J_over_J, lap_J_over_J = self._compute_jastrow_terms(elec_coords)
+        
+        # Get determinant quantities using static helpers
+        slater_up, slater_down = self._get_matrices(elec_coords_np)
+        grad_up, grad_down = self._get_gradients(elec_coords_np)
+        lap_up, lap_down = self._get_laplacians(elec_coords_np)
         
         # Compute kinetic energy matrices
         inv_up, inv_down, B_kin_up, B_kin_down = self._compute_kinetic_matrix(
             elec_coords, grad_J_over_J, lap_J_over_J)
         
         # Get Slater matrices for potential energy
-        slater_up, slater_down = self.dets[0].matrix(elec_coords)
+        slater_up, slater_down = self._get_matrices(elec_coords_np)
         
         # Compute potential energy matrices
         B_pot_up, B_pot_down = self._compute_potential_matrix(
