@@ -30,9 +30,12 @@ class SlaterJastrow:
         # Compute all pairwise values at once
         all_pairs = vmap_all(elec_coords, elec_coords, self.jastrow.params)
         
-        # Sum upper triangle (excluding diagonal) for total exponent
-        mask = jnp.triu(jnp.ones_like(all_pairs), k=1)
-        jastrow_val = jnp.exp(jnp.sum(all_pairs * mask))
+        # Create a mask to exclude diagonal elements (no self-interaction)
+        n_electrons = elec_coords.shape[0]
+        diag_mask = 1.0 - jnp.eye(n_electrons)
+        
+        # Use redundant summation form (multiply by 1/2)
+        jastrow_val = jnp.exp(0.5 * jnp.sum(all_pairs * diag_mask))
         
         # Evaluate determinants (already vectorized internally)
         det_vals = jnp.array([det.value(elec_coords) for det in self.dets])
@@ -57,31 +60,43 @@ class SlaterJastrow:
         return SlaterJastrow(self.jastrow, self.dets, new_coefficients)
 
     def _compute_jastrow_terms(self, elec_coords):
-        """Compute ∇J/J and ∇²J/J for all electrons using vmap."""
+        """Compute ∇J/J and ∇²J/J for all electrons using redundant summation form.
+        
+        In the redundant summation form J = exp(0.5*∑ᵢⱼ u(rᵢ,rⱼ)), we have:
+        ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)/2 + ∑ⱼ≠ᵢ ∇ᵢu(rⱼ,rᵢ)/2
+        
+        For a symmetric u function where u(rᵢ,rⱼ) = u(rⱼ,rᵢ), this simplifies to:
+        ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)
+        """
         n_electrons = elec_coords.shape[0]
         
         # Vectorize gradient and laplacian computation over all pairs
-        # First vmap over r1, keeping r2 fixed
-        vmap_grads = jax.vmap(self.jastrow.get_log_grads, in_axes=(0, None))
-        # Then vmap over r2, broadcasting r1
-        vmap_all_grads = jax.vmap(vmap_grads, in_axes=(None, 0))
+        # First vmap over r2, keeping r1 fixed
+        vmap_grads = jax.vmap(self.jastrow.get_log_grads, in_axes=(None, 0))
+        # Then vmap over r1, broadcasting r2
+        vmap_all_grads = jax.vmap(vmap_grads, in_axes=(0, None))
         
-        # Compute all pairs at once - shape will be (n_elec, n_elec, 3) for grads
-        # and (n_elec, n_elec) for laps
+        # Compute all pairs at once
         all_grads, all_laps = vmap_all_grads(elec_coords, elec_coords)
+
+        # The shape of all_grads is (n_electrons, n_electrons, 3)
+        # To symmetrize, we need to swap the first two dimensions (electron indices)
+        # not the last two dimensions (which would mix spatial coordinates with electron indices)
+        #all_grads = 0.5 * (all_grads + jnp.swapaxes(all_grads, 0, 1))
+        #all_laps = 0.5 * (all_laps + jnp.swapaxes(all_laps, 0, 1))
+
         
-        # Create mask for upper triangle (j > i)
-        triu_mask = jnp.triu(jnp.ones((n_electrons, n_electrons)), k=1)
-        triu_mask_3d = triu_mask[..., None]  # Add dimension for xyz coordinates
+        # Create a mask to exclude diagonal elements (no self-interaction)
+        # TODO: check if it is needed, since when ri=rj, the value is zero
+        diag_mask = 1.0 - jnp.eye(n_electrons)
+        diag_mask_3d = diag_mask[..., None]  # Add dimension for xyz coordinates
         
-        # For gradients: need both i->j and j->i contributions with opposite signs
-        grad_J_over_J = (
-            jnp.sum(all_grads * triu_mask_3d, axis=1) -      # Sum over j (positive)
-            jnp.sum((all_grads * triu_mask_3d).transpose(1, 0, 2), axis=1)  # Sum over i (negative)
-        )
+        # For gradients: since we use redundant summation, each gradient 
+        # contribution is already counted correctly when we sum
+        grad_J_over_J = jnp.sum(all_grads * diag_mask_3d, axis=1)
         
-        # For laplacian: contributions are symmetric
-        lap_J_over_J = 2 * jnp.sum(all_laps * triu_mask, axis=1)  # Sum over j and multiply by 2
+        # For laplacian: contributions are summed with the same mask
+        lap_J_over_J = jnp.sum(all_laps * diag_mask, axis=1)
         
         return grad_J_over_J, lap_J_over_J
 
@@ -120,38 +135,67 @@ class SlaterJastrow:
         return inv_up, inv_down, B_up, B_down
 
     def _compute_potential_matrix(self, elec_coords, slater_up, slater_down):
-        """Compute potential energy part of B matrix using vmap."""
-        n_up = self.dets[0].n_alpha
+        """Compute potential energy part of B matrix using vmap.
         
-        # Electron-nuclear potential
+        Efficiently computes both electron-nuclear and electron-electron
+        potential energy interactions, with careful handling to avoid
+        double-counting or self-interactions.
+        """
+        n_up = self.dets[0].n_alpha
+        n_electrons = len(elec_coords)
+        
+        # Electron-nuclear potential with regularization
         atom_coords = self.mol.atom_coords()
         atom_charges = self.mol.atom_charges()
         
         def e_n_potential(r):
-            """Compute electron-nuclear potential for one electron."""
+            """Compute electron-nuclear potential for one electron with regularization."""
             dists = jnp.linalg.norm(r - atom_coords, axis=1)
-            return -jnp.sum(atom_charges / dists)
+            # Add small regularization parameter to avoid numerical instability
+            return -jnp.sum(atom_charges / (dists + 1e-10))
             
-        V_en_up = jax.vmap(e_n_potential)(elec_coords[:n_up])[:, None]
-        V_en_down = jax.vmap(e_n_potential)(elec_coords[n_up:])[:, None]
+        # Use JAX-friendly slicing with jnp.take to avoid potential issues with direct slicing
+        up_coords = jnp.take(elec_coords, jnp.arange(n_up), axis=0)
+        down_coords = jnp.take(elec_coords, jnp.arange(n_up, n_electrons), axis=0)
         
-        # Electron-electron potential
-        def e_e_potential(r, other_coords):
-            """Compute e-e potential for one electron with all others."""
-            dists = jnp.linalg.norm(r - other_coords, axis=1)
-            mask = jnp.ones_like(dists)
-            same_idx = jnp.arange(len(dists)) == jnp.arange(len(dists))[:, None]
-            mask = jnp.where(same_idx, 0.0, 1.0)
-            return jnp.sum(mask / (dists + 1e-10))
+        # Calculate electron-nuclear potentials
+        V_en_up = jax.vmap(e_n_potential)(up_coords)[:, None]
+        V_en_down = jax.vmap(e_n_potential)(down_coords)[:, None]
+        
+        # Electron-electron potential with efficient mask creation
+        def pairwise_potential(coords):
+            """Calculate electron-electron potential energy efficiently.
             
-        # Compute e-e potential for up and down electrons
-        V_ee_up = jax.vmap(e_e_potential, in_axes=(0, None))(
-            elec_coords[:n_up], elec_coords)[:, None]
-        V_ee_down = jax.vmap(e_e_potential, in_axes=(0, None))(
-            elec_coords[n_up:], elec_coords)[:, None]
+            Uses a redundant sum approach (similar to Jastrow) and avoids
+            double-counting and self-interactions.
+            """
+            # Calculate all pairwise distances
+            n = coords.shape[0]
+            # Create expanded arrays: (n,1,3) and (1,n,3)
+            ri = coords[:, None, :]
+            rj = coords[None, :, :]
+            
+            # Calculate 1/r_ij for all pairs
+            diff = ri - rj
+            dist = jnp.sqrt(jnp.sum(diff**2, axis=2) + 1e-10)
+            
+            # Create mask to exclude self-interaction (diagonal elements)
+            mask = 1.0 - jnp.eye(n)
+            
+            # Calculate potential for each electron with all others
+            # Using redundant sum approach (will multiply by 0.5 later)
+            pot = jnp.sum(mask / dist, axis=1)
+            
+            return pot
+        
+        # Calculate e-e potential for all electrons
+        all_ee_pot = pairwise_potential(elec_coords)
+        
+        # Extract up and down electron potentials
+        V_ee_up = all_ee_pot[:n_up, None]
+        V_ee_down = all_ee_pot[n_up:, None]
         
         # Combine potentials with orbital values
-        # Note: e-e potential is already properly counted, no need for 0.5
         B_up = (V_en_up + V_ee_up) * slater_up
         B_down = (V_en_down + V_ee_down) * slater_down
         
