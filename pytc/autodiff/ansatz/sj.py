@@ -1,29 +1,11 @@
 """Implementation of the quantum many-body wavefunction ansatz."""
 
-import jax
-import jax.numpy as jnp
-from typing import List, Any
-
-# Add these imports 
 import numpy as np
 import jax
 import jax.numpy as jnp
-from typing import List, Any, Tuple
+from typing import List, Any
 from functools import partial
 
-# Remove JIT decoration - make these pure Python functions
-def _evaluate_single_determinant(det, elec_coords_np):
-    """Evaluate a single determinant without JAX tracing."""
-    # Make sure we're working with NumPy arrays
-    elec_coords_np = np.asarray(elec_coords_np)
-    return det.value(elec_coords_np)
-
-def _evaluate_determinants(dets, elec_coords_np):
-    """Evaluate all determinants by calling the single version."""
-    # Make sure we're working with NumPy arrays
-    elec_coords_np = np.asarray(elec_coords_np)
-    # Use NumPy array instead of JAX array to avoid tracing
-    return np.array([_evaluate_single_determinant(det, elec_coords_np) for det in dets])
 
 class SlaterJastrow:
     """Quantum many-body wavefunction ansatz combining Jastrow factor with Slater determinants."""
@@ -41,23 +23,53 @@ class SlaterJastrow:
         self.dets = dets
         self.linear_coeffs = jnp.asarray(linear_coeffs, dtype=jnp.float64)
         
-    def __call__(self, elec_coords):
-        """Evaluate wavefunction at given electron positions."""
-        # Handle Jastrow part with JAX arrays
-        jastrow_val = self._compute_jastrow_value(elec_coords)
+    def __call__(self, elec_coords_batch):
+        """Evaluate wavefunction for a batch of electron configurations.
         
-        # Handle determinant part with NumPy conversion - ensure we use numpy throughout
-        elec_coords_np = np.array(elec_coords)
+        Args:
+            elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
+                           or (n_electrons, 3) for a single walker
+                           
+        Returns:
+            Array of wavefunction values with shape (n_walkers,)
+            or a single value for a single walker
+        """
+        # Handle single walker case by adding a batch dimension
+        single_walker = False
+        if len(elec_coords_batch.shape) == 2:  # (n_electrons, 3)
+            elec_coords_batch = elec_coords_batch[None, ...]  # Add batch dimension
+            single_walker = True
         
-        # Get determinant values through our pure Python functions
-        det_vals_np = _evaluate_determinants(self.dets, elec_coords_np)
+        # Vectorize Jastrow calculation over batch dimension
+        jastrow_vals = jax.vmap(self._compute_jastrow_value)(elec_coords_batch)
         
-        # Convert back to JAX array only at the end
-        det_vals = jnp.array(det_vals_np)
-        linear_combo = jnp.sum(self.linear_coeffs * det_vals)
+        # Convert to NumPy for determinant calculations
+        elec_coords_batch_np = np.array(elec_coords_batch)
         
-        return jastrow_val * linear_combo
+        # Use new batched determinant evaluation
+        det_vals = []
+        for det in self.dets:
+            det_batch_vals = det.value(elec_coords_batch_np)  # Now returns values for all walkers at once
+            det_vals.append(det_batch_vals)
+            
+        # Combine determinant values using linear coefficients
+        det_vals_array = np.array(det_vals).transpose()  # Shape (n_walkers, n_dets)
+        linear_combo = np.sum(np.array(self.linear_coeffs) * det_vals_array, axis=1)
+        
+        # Convert to JAX array
+        det_linear_combos = jnp.array(linear_combo)
+        
+        # Multiply Jastrow and determinant parts
+        psi_vals = jastrow_vals * det_linear_combos
+        
+        # Return single value if input was a single walker
+        if single_walker:
+            return psi_vals[0]
+        else:
+            return psi_vals
 
+    # Use partial with static_argnums to specify that 'self' is static
+    @partial(jax.jit, static_argnums=(0,))
     def _compute_jastrow_value(self, elec_coords):
         """Compute Jastrow factor value."""
         # Vectorize Jastrow computation over all pairs
@@ -95,6 +107,7 @@ class SlaterJastrow:
         """
         return SlaterJastrow(self.jastrow, self.dets, new_coefficients)
 
+    @partial(jax.jit, static_argnums=(0,))
     def _compute_jastrow_terms(self, elec_coords):
         """Compute ∇J/J and ∇²J/J for all electrons using redundant summation form.
         
@@ -170,6 +183,7 @@ class SlaterJastrow:
         
         return inv_up, inv_down, B_up, B_down
 
+    @partial(jax.jit, static_argnums=(0,))
     def _compute_potential_matrix(self, elec_coords, slater_up, slater_down):
         """Compute potential energy part of B matrix using vmap.
         
@@ -198,38 +212,30 @@ class SlaterJastrow:
         V_en_up = jax.vmap(e_n_potential)(up_coords)[:, None]
         V_en_down = jax.vmap(e_n_potential)(down_coords)[:, None]
         
-        # Electron-electron potential with efficient mask creation
-        def pairwise_potential(coords):
-            """Calculate electron-electron potential energy efficiently.
-            
-            Uses a redundant sum approach (similar to Jastrow) and avoids
-            double-counting and self-interactions.
-            """
-            # Calculate all pairwise distances
-            n = coords.shape[0]
-            # Create expanded arrays: (n,1,3) and (1,n,3)
-            ri = coords[:, None, :]
-            rj = coords[None, :, :]
-            
-            # Calculate 1/r_ij for all pairs
-            diff = ri - rj
-            dist = jnp.sqrt(jnp.sum(diff**2, axis=2) + 1e-10)
-            
-            # Create mask to exclude self-interaction (diagonal elements)
-            mask = 1.0 - jnp.eye(n)
-            
-            # Calculate potential for each electron with all others
-            # Using redundant sum approach (will multiply by 0.5 later)
-            pot = jnp.sum(mask / dist, axis=1)
-            
-            return pot
+        # More efficient electron-electron potential using vmap
+        def pairwise_distance(r_i, r_j):
+            """Compute 1/|r_i - r_j| with regularization."""
+            diff = r_i - r_j
+            dist = jnp.sqrt(jnp.sum(diff**2) + 1e-10)
+            return 1.0 / dist
         
-        # Calculate e-e potential for all electrons
-        all_ee_pot = pairwise_potential(elec_coords)
+        # Map over all electron pairs
+        ee_vmap_inner = jax.vmap(pairwise_distance, in_axes=(None, 0))
+        ee_vmap_outer = jax.vmap(ee_vmap_inner, in_axes=(0, None))
+        
+        # Compute all pairwise interactions at once
+        all_e_e_pot = ee_vmap_outer(elec_coords, elec_coords)
+        
+        # Remove self-interactions
+        mask = 1.0 - jnp.eye(n_electrons)
+        all_e_e_pot = all_e_e_pot * mask
+        
+        # Sum interactions for each electron
+        e_e_pot = jnp.sum(all_e_e_pot, axis=1)
         
         # Extract up and down electron potentials
-        V_ee_up = all_ee_pot[:n_up, None]
-        V_ee_down = all_ee_pot[n_up:, None]
+        V_ee_up = e_e_pot[:n_up, None]
+        V_ee_down = e_e_pot[n_up:, None]
         
         # Combine potentials with orbital values
         B_up = (V_en_up + V_ee_up) * slater_up
@@ -238,23 +244,95 @@ class SlaterJastrow:
         return B_up, B_down
 
     # Create wrappers for matrix, grad, laplacian that use NumPy conversion
-    def _get_matrices(self, elec_coords):
-        """Get Slater matrices with NumPy conversion."""
-        elec_coords_np = np.array(elec_coords)
-        slater_up, slater_down = self.dets[0].matrix(elec_coords_np)
-        return jnp.array(slater_up), jnp.array(slater_down)
+    def _get_matrices(self, elec_coords_batch):
+        """Get Slater matrices with NumPy conversion.
         
-    def _get_gradients(self, elec_coords):
-        """Get gradients of Slater matrices with NumPy conversion."""
-        elec_coords_np = np.array(elec_coords)
-        grad_up, grad_down = self.dets[0].grad(elec_coords_np)
-        return jnp.array(grad_up), jnp.array(grad_down)
+        Args:
+            elec_coords_batch: Array of shape (n_walkers, n_electrons, 3)
+                              or (n_electrons, 3) for a single walker
         
-    def _get_laplacians(self, elec_coords):
-        """Get laplacians of Slater matrices with NumPy conversion."""
-        elec_coords_np = np.array(elec_coords)
-        lap_up, lap_down = self.dets[0].laplacian(elec_coords_np)
-        return jnp.array(lap_up), jnp.array(lap_down)
+        Returns:
+            tuple: (slater_up, slater_down) with appropriate batch dimensions
+        """
+        # Ensure batch dimension
+        single_walker = False
+        if len(elec_coords_batch.shape) == 2:
+            elec_coords_batch = elec_coords_batch[None, ...]
+            single_walker = True
+            
+        # Convert to NumPy
+        elec_coords_batch_np = np.array(elec_coords_batch)
+        
+        # Use batched matrix calculation
+        slater_up, slater_down = self.dets[0].matrix(elec_coords_batch_np)
+        
+        # Convert to JAX arrays
+        slater_up_jax = jnp.array(slater_up)
+        slater_down_jax = jnp.array(slater_down)
+        
+        # Return appropriately based on input shape
+        if single_walker:
+            return slater_up_jax, slater_down_jax
+        else:
+            return slater_up_jax, slater_down_jax
+        
+    def _get_gradients(self, elec_coords_batch):
+        """Get gradients of Slater matrices with NumPy conversion.
+        
+        Args:
+            elec_coords_batch: Array of shape (n_walkers, n_electrons, 3)
+                              or (n_electrons, 3) for a single walker
+        """
+        # Ensure batch dimension
+        single_walker = False
+        if len(elec_coords_batch.shape) == 2:
+            elec_coords_batch = elec_coords_batch[None, ...]
+            single_walker = True
+            
+        # Convert to NumPy
+        elec_coords_batch_np = np.array(elec_coords_batch)
+        
+        # Use batched gradient calculation
+        grad_up, grad_down = self.dets[0].grad(elec_coords_batch_np)
+        
+        # Convert to JAX arrays
+        grad_up_jax = jnp.array(grad_up)
+        grad_down_jax = jnp.array(grad_down)
+        
+        # Return appropriately based on input shape
+        if single_walker:
+            return grad_up_jax, grad_down_jax
+        else:
+            return grad_up_jax, grad_down_jax
+        
+    def _get_laplacians(self, elec_coords_batch):
+        """Get laplacians of Slater matrices with NumPy conversion.
+        
+        Args:
+            elec_coords_batch: Array of shape (n_walkers, n_electrons, 3)
+                              or (n_electrons, 3) for a single walker
+        """
+        # Ensure batch dimension
+        single_walker = False
+        if len(elec_coords_batch.shape) == 2:
+            elec_coords_batch = elec_coords_batch[None, ...]
+            single_walker = True
+            
+        # Convert to NumPy
+        elec_coords_batch_np = np.array(elec_coords_batch)
+        
+        # Use batched laplacian calculation
+        lap_up, lap_down = self.dets[0].laplacian(elec_coords_batch_np)
+        
+        # Convert to JAX arrays
+        lap_up_jax = jnp.array(lap_up)
+        lap_down_jax = jnp.array(lap_down)
+        
+        # Return appropriately based on input shape
+        if single_walker:
+            return lap_up_jax, lap_down_jax
+        else:
+            return lap_up_jax, lap_down_jax
 
     @property
     def n_up(self):
@@ -266,35 +344,86 @@ class SlaterJastrow:
         """Number of down-spin electrons."""
         return self.n_electrons - self.n_up
 
-    def local_energy(self, elec_coords):
-        """Compute local energy E_L = ℋΨ/Ψ. 
-        See "Simple formalism for eﬃcient derivatives and multi-determinant expansions
-            in quantum Monte Carlo" for details.
+    def local_energy(self, elec_coords_batch):
+        """Compute local energy for a batch of electron configurations.
+        
+        Args:
+            elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
+                            or (n_electrons, 3) for a single walker
+                            
+        Returns:
+            Array of local energy values with shape (n_walkers,)
+            or a single value for a single walker
         """
-        # Convert to NumPy for determinant calculations
-        elec_coords_np = np.array(elec_coords)
+        # Handle single walker case by adding a batch dimension
+        single_walker = False
+        if len(elec_coords_batch.shape) == 2:  # (n_electrons, 3)
+            elec_coords_batch = elec_coords_batch[None, ...]  # Add batch dimension
+            single_walker = True
         
-        # Get Jastrow contributions (using JAX arrays)
-        grad_J_over_J, lap_J_over_J = self._compute_jastrow_terms(elec_coords)
+        # Use vmap to compute Jastrow terms for all walkers
+        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(self._compute_jastrow_terms)(elec_coords_batch)
         
-        # Get determinant quantities using static helpers
-        slater_up, slater_down = self._get_matrices(elec_coords_np)
-        grad_up, grad_down = self._get_gradients(elec_coords_np)
-        lap_up, lap_down = self._get_laplacians(elec_coords_np)
+        # Get batched matrices, gradients, and laplacians directly
+        slater_up_batch, slater_down_batch = self._get_matrices(elec_coords_batch)
+        grad_up_batch, grad_down_batch = self._get_gradients(elec_coords_batch)
+        lap_up_batch, lap_down_batch = self._get_laplacians(elec_coords_batch)
         
-        # Compute kinetic energy matrices
-        inv_up, inv_down, B_kin_up, B_kin_down = self._compute_kinetic_matrix(
-            elec_coords, grad_J_over_J, lap_J_over_J)
+        # Now we'll use vmap to process all walkers at once
+        energies = jax.vmap(self._compute_single_walker_energy)(
+            elec_coords_batch,
+            grad_J_over_J_batch,
+            lap_J_over_J_batch,
+            slater_up_batch, 
+            slater_down_batch,
+            grad_up_batch,
+            grad_down_batch,
+            lap_up_batch,
+            lap_down_batch
+        )
         
-        # Get Slater matrices for potential energy
-        slater_up, slater_down = self._get_matrices(elec_coords_np)
+        # Return single value if input was a single walker
+        if single_walker:
+            return energies[0]
+        else:
+            return energies
+            
+    @partial(jax.jit, static_argnums=(0,))
+    def _compute_single_walker_energy(self, coords, grad_J_over_J, lap_J_over_J,
+                                     slater_up, slater_down, grad_up, grad_down,
+                                     lap_up, lap_down):
+        """Compute energy for a single walker with pre-computed quantities."""
+        n_up = self.dets[0].n_alpha
+        
+        # Slice gradients and laplacians for up/down electrons
+        grad_J_up = grad_J_over_J[:n_up]      # shape: (n_up, 3)
+        grad_J_down = grad_J_over_J[n_up:]    # shape: (n_down, 3)
+        lap_J_up = lap_J_over_J[:n_up]        # shape: (n_up,)
+        lap_J_down = lap_J_over_J[n_up:]      # shape: (n_down,)
+        
+        # Build inverses
+        inv_up = jnp.linalg.inv(slater_up)
+        inv_down = jnp.linalg.inv(slater_down)
+        
+        # Compute kinetic terms
+        B_kin_up = -0.5 * (
+            lap_up +
+            2 * jnp.einsum('ik,ijk->ij', grad_J_up, grad_up) +
+            jnp.multiply(lap_J_up[:, None], slater_up)
+        )
+        
+        B_kin_down = -0.5 * (
+            lap_down + 
+            2 * jnp.einsum('ik,ijk->ij', grad_J_down, grad_down) +
+            jnp.multiply(lap_J_down[:, None], slater_down)
+        )
         
         # Compute potential energy matrices
         B_pot_up, B_pot_down = self._compute_potential_matrix(
-            elec_coords, slater_up, slater_down)
+            coords, slater_up, slater_down)
         
         # Combine kinetic and potential terms
         E_L = (jnp.trace(inv_up @ (B_kin_up + B_pot_up)) + 
-               jnp.trace(inv_down @ (B_kin_down + B_pot_down)))
+              jnp.trace(inv_down @ (B_kin_down + B_pot_down)))
         
         return jnp.real(E_L)  # Ensure real value

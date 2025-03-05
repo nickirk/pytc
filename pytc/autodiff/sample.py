@@ -9,6 +9,8 @@ from jax import random
 import time
 from functools import partial
 from typing import Tuple, Dict, Any, Optional
+import concurrent.futures
+import os
 
 def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key):
     """Initialize electron configurations based on atomic positions.
@@ -80,14 +82,6 @@ def _adjust_electron_counts(electron_counts, n_electrons, atom_charges):
     # Convert back to JAX array
     return jnp.array(ec)
 
-def _compute_wf_batch(ansatz, walker_batch):
-    """Compute wavefunction values for a batch of walkers without tracing through ansatz object."""
-    # First convert walker_batch to a list of individual walker arrays
-    walker_list = [walker_batch[i] for i in range(walker_batch.shape[0])]
-    
-    # Evaluate each walker individually
-    return jnp.array([ansatz(walker) for walker in walker_list])
-
 def metropolis_hastings(
     ansatz, 
     n_walkers: int, 
@@ -131,8 +125,8 @@ def metropolis_hastings(
     else:
         walkers = initial_walkers
     
-    # Compute initial wavefunction values
-    psi_values = _compute_wf_batch(ansatz, walkers)
+    # Compute initial wavefunction values - use batch capability
+    psi_values = ansatz(walkers)
     
     # Separate step sizes for up and down electrons can improve sampling
     step_size_up = step_size 
@@ -153,8 +147,8 @@ def metropolis_hastings(
         # Create combined walkers with proposed up-spin positions
         proposals = walkers.at[:, :ansatz.n_up, :].set(up_proposals)
         
-        # Compute acceptance probabilities
-        new_psi_values = _compute_wf_batch(ansatz, proposals)
+        # Compute acceptance probabilities directly using batch capability
+        new_psi_values = ansatz(proposals)
         acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
         
         # Accept or reject
@@ -173,7 +167,7 @@ def metropolis_hastings(
         
         proposals = walkers.at[:, ansatz.n_up:, :].set(down_proposals)
         
-        new_psi_values = _compute_wf_batch(ansatz, proposals)
+        new_psi_values = ansatz(proposals)
         acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
         
         key, subkey = random.split(key)
@@ -213,7 +207,7 @@ def metropolis_hastings(
         proposals = walkers.at[:, :ansatz.n_up, :].set(up_proposals)
         
         # Compute acceptance probabilities
-        new_psi_values = _compute_wf_batch(ansatz, proposals)
+        new_psi_values = ansatz(proposals)
         acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
         
         # Accept or reject
@@ -233,7 +227,7 @@ def metropolis_hastings(
         
         proposals = walkers.at[:, ansatz.n_up:, :].set(down_proposals)
         
-        new_psi_values = _compute_wf_batch(ansatz, proposals)
+        new_psi_values = ansatz(proposals)
         acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
         
         key, subkey = random.split(key)
@@ -250,8 +244,8 @@ def metropolis_hastings(
         
         # Store samples at thinning interval
         if step % thinning == 0:
-            # Calculate local energies for each configuration separately to avoid tracing through ansatz
-            energies = jnp.array([ansatz.local_energy(walkers[i]) for i in range(walkers.shape[0])])
+            # Use the new batch capability to compute local energies for all walkers at once
+            energies = ansatz.local_energy(walkers)
             
             # Store samples and energies
             collected_samples.append(walkers)
