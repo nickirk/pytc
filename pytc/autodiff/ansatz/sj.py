@@ -203,14 +203,15 @@ class SlaterJastrow:
             dists = jnp.linalg.norm(r - atom_coords, axis=1)
             # Add small regularization parameter to avoid numerical instability
             return -jnp.sum(atom_charges / (dists + 1e-10))
-            
+        
         # Use JAX-friendly slicing with jnp.take to avoid potential issues with direct slicing
         up_coords = jnp.take(elec_coords, jnp.arange(n_up), axis=0)
         down_coords = jnp.take(elec_coords, jnp.arange(n_up, n_electrons), axis=0)
         
-        # Calculate electron-nuclear potentials
-        V_en_up = jax.vmap(e_n_potential)(up_coords)[:, None]
-        V_en_down = jax.vmap(e_n_potential)(down_coords)[:, None]
+        # Calculate electron-nuclear potentials directly without using vmap
+        # Since _compute_potential_matrix is already called inside a vmapped function in local_energy
+        V_en_up = e_n_potential(up_coords)
+        V_en_down = e_n_potential(down_coords)
         
         # More efficient electron-electron potential using vmap
         def pairwise_distance(r_i, r_j):
@@ -231,7 +232,7 @@ class SlaterJastrow:
         all_e_e_pot = all_e_e_pot * mask
         
         # Sum interactions for each electron
-        e_e_pot = jnp.sum(all_e_e_pot, axis=1)
+        e_e_pot = 0.5 * jnp.sum(all_e_e_pot, axis=1)
         
         # Extract up and down electron potentials
         V_ee_up = e_e_pot[:n_up, None]
@@ -272,10 +273,10 @@ class SlaterJastrow:
         
         # Return appropriately based on input shape
         if single_walker:
-            return slater_up_jax, slater_down_jax
+            return slater_up_jax[0], slater_down_jax[0]  # Extract single walker data
         else:
             return slater_up_jax, slater_down_jax
-        
+    
     def _get_gradients(self, elec_coords_batch):
         """Get gradients of Slater matrices with NumPy conversion.
         
@@ -301,10 +302,10 @@ class SlaterJastrow:
         
         # Return appropriately based on input shape
         if single_walker:
-            return grad_up_jax, grad_down_jax
+            return grad_up_jax[0], grad_down_jax[0]  # Extract single walker data
         else:
             return grad_up_jax, grad_down_jax
-        
+    
     def _get_laplacians(self, elec_coords_batch):
         """Get laplacians of Slater matrices with NumPy conversion.
         
@@ -330,7 +331,7 @@ class SlaterJastrow:
         
         # Return appropriately based on input shape
         if single_walker:
-            return lap_up_jax, lap_down_jax
+            return lap_up_jax[0], lap_down_jax[0]  # Extract single walker data
         else:
             return lap_up_jax, lap_down_jax
 

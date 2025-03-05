@@ -80,7 +80,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Create molecule
         mol = gto.Mole()
         mol.atom = molecule_spec
-        mol.basis = 'ccpvtz'
+        mol.basis = 'ccpvdz'
         mol.build()
         
         # Run PySCF calculation for reference energy
@@ -103,8 +103,8 @@ class TestHartreeFockEnergy(unittest.TestCase):
         
         # Use small settings for test speed
         # For production, use larger values
-        n_walkers = 10000
-        n_steps = 100
+        n_walkers = 1000
+        n_steps = 10000
         step_size = 0.1
         burn_in = 100
         thinning = 2
@@ -160,12 +160,12 @@ class TestHartreeFockEnergy(unittest.TestCase):
     
     #def test_h2_molecule(self):
     #    """Test HF energy sampling for H2 molecule."""
-    #    results = self.run_hf_energy_test("H 0 0 0; H 0 0 0.74")
+    #    results = self.run_hf_energy_test("H 0 0 0; H 0 0 0.1")
     #    # Additional H2-specific assertions could be added here
     
     def test_he_atom(self):
         """Test HF energy sampling for He atom."""
-        results = self.run_hf_energy_test("H 0 0 0; H 0 0 1;")
+        results = self.run_hf_energy_test("He 0 0 0")
         # Additional He-specific assertions could be added here
 
 

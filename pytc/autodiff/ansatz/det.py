@@ -187,8 +187,11 @@ class SlaterDet:
         flat_coords = coords_batch.reshape(-1, 3)
         
         # Call eval_ao once for all walkers/electrons
+        # deriv=2 returns (10, N, nAOs) array with ao values, first, second derivatives
+        # val, x, y, z, xx, xy, xz, yy, yz, zz
         ao_vals_deriv = numint.eval_ao(self.mol, flat_coords, deriv=2)
-        ao_lapls = ao_vals_deriv[4:].sum(axis=0)  # Sum the diagonal terms
+        
+        ao_lapls = ao_vals_deriv[[4, 7, 9]].sum(axis=0)  # Sum only diagonal terms for Laplacian
         
         # Reshape back to batch form
         ao_lapls = ao_lapls.reshape(n_walkers, n_electrons, -1)

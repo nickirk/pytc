@@ -86,7 +86,7 @@ def metropolis_hastings(
     ansatz, 
     n_walkers: int, 
     n_steps: int, 
-    step_size: float = 0.1, 
+    step_size: float = 1, 
     burn_in: int = 1000,
     thinning: int = 10,
     n_samples: Optional[int] = None,
