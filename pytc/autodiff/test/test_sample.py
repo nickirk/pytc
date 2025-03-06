@@ -81,6 +81,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         mol = gto.Mole()
         mol.atom = molecule_spec
         mol.basis = 'ccpvdz'
+        mol.unit = 'bohr'
         mol.build()
         
         # Run PySCF calculation for reference energy
@@ -103,11 +104,11 @@ class TestHartreeFockEnergy(unittest.TestCase):
         
         # Use small settings for test speed
         # For production, use larger values
-        n_walkers = 1000
-        n_steps = 10000
-        step_size = 0.1
-        burn_in = 100
-        thinning = 2
+        n_walkers = 2000
+        n_steps = 8000
+        step_size = 0.2
+        burn_in = 8000
+        thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
         # Run sampling
@@ -143,12 +144,12 @@ class TestHartreeFockEnergy(unittest.TestCase):
         
         # We use a 5% tolerance because MC sampling has statistical fluctuations
         # and we're using a small number of steps for test speed
-        #self.assertLess(rel_error, 1.05, 
-        #               f"Sampled energy {energy_mean:.6f} too far from reference {hf_energy_reference:.6f}")
+        self.assertLess(rel_error, 1.05, 
+                       f"Sampled energy {energy_mean:.6f} too far from reference {hf_energy_reference:.6f}")
         
-        ## Also check if the reference energy is within the statistical error bars
-        #self.assertLessEqual(abs(energy_mean - hf_energy_reference), 3 * energy_error,
-        #                    "Reference energy outside 3-sigma error bars of sampled energy")
+        # Also check if the reference energy is within the statistical error bars
+        self.assertLessEqual(abs(energy_mean - hf_energy_reference), 3 * energy_error,
+                            "Reference energy outside 3-sigma error bars of sampled energy")
         
         # Return values to be used in other tests if needed
         return {
@@ -158,16 +159,20 @@ class TestHartreeFockEnergy(unittest.TestCase):
             "sampling_results": sampling_results
         }
     
-    #def test_h2_molecule(self):
-    #    """Test HF energy sampling for H2 molecule."""
-    #    results = self.run_hf_energy_test("H 0 0 0; H 0 0 0.1")
-    #    # Additional H2-specific assertions could be added here
+    def test_h4_molecule(self):
+        """Test HF energy sampling for H2 molecule."""
+        results = self.run_hf_energy_test("H 0 0 0; H 0 0 2; H 0 0 4; H 0 0 6")
+        # Additional H2-specific assertions could be added here
     
     def test_he_atom(self):
-        """Test HF energy sampling for He atom."""
-        results = self.run_hf_energy_test("He 0 0 0")
+        """Test HF energy sampling for He He molecule."""
+        results = self.run_hf_energy_test("He 0 0 0; He 0 0 1")
         # Additional He-specific assertions could be added here
 
+    def test_lih(self):
+        """Test HF energy sampling for LiH molecule."""
+        results = self.run_hf_energy_test("Li 0 0 0; H 0 0 1.6")
+        # Additional He-specific assertions could be added here
 
 if __name__ == "__main__":
     unittest.main()

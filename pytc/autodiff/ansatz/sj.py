@@ -23,6 +23,38 @@ class SlaterJastrow:
         self.dets = dets
         self.linear_coeffs = jnp.asarray(linear_coeffs, dtype=jnp.float64)
         
+        # Calculate and store ion-ion repulsion energy (constant for fixed geometry)
+        self._ion_ion_potential = self._compute_ion_ion_potential()
+        
+    def _compute_ion_ion_potential(self):
+        """Calculate the ion-ion repulsion energy (nuclear-nuclear Coulomb interaction).
+        
+        This is a constant term that depends only on the molecular geometry.
+        
+        Returns:
+            float: The ion-ion potential energy
+        """
+        atom_coords = self.mol.atom_coords()
+        atom_charges = self.mol.atom_charges()
+        n_atoms = len(atom_charges)
+        
+        # Calculate ion-ion potential energy
+        v_ion_ion = 0.0
+        
+        R_diff = atom_coords[:, None, :] - atom_coords[None, :, :]
+        R_dist = jnp.linalg.norm(R_diff, axis=-1)
+        charge_products = jnp.outer(atom_charges, atom_charges)
+
+        mask = 1-jnp.eye(n_atoms)
+        v_ion_ion = jnp.sum(charge_products * mask / (R_dist+1e-10)) / 2.0
+        
+        return v_ion_ion
+    
+    @property
+    def ion_ion_potential(self):
+        """Return the ion-ion potential energy (nuclear-nuclear repulsion)."""
+        return self._ion_ion_potential
+        
     def __call__(self, elec_coords_batch):
         """Evaluate wavefunction for a batch of electron configurations.
         
@@ -200,16 +232,22 @@ class SlaterJastrow:
         
         def e_n_potential(r):
             """Compute electron-nuclear potential for one electron with regularization."""
-            dists = jnp.linalg.norm(r - atom_coords, axis=1)
-            # Add small regularization parameter to avoid numerical instability
-            return -jnp.sum(atom_charges / (dists + 1e-10))
+            # Fix broadcasting issue by using proper reshaping
+            # Reshape r to (n_electrons, 1, 3) and atom_coords to (1, n_atoms, 3)
+            # for proper broadcasting
+            r_reshaped = r[:, jnp.newaxis, :]  # Shape: (n_elec, 1, 3)
+            diff = r_reshaped - atom_coords[jnp.newaxis, :, :]  # Shape: (n_elec, n_atoms, 3)
+            dists = jnp.linalg.norm(diff, axis=2)  # Shape: (n_elec, n_atoms)
+            # Compute Coulomb potentials with small regularization
+            potentials = -atom_charges[jnp.newaxis, :] / (dists + 1e-10)  # Shape: (n_elec, n_atoms)
+            # Sum over all atoms for each electron
+            return jnp.sum(potentials, axis=1)  # Shape: (n_elec,)
         
         # Use JAX-friendly slicing with jnp.take to avoid potential issues with direct slicing
         up_coords = jnp.take(elec_coords, jnp.arange(n_up), axis=0)
         down_coords = jnp.take(elec_coords, jnp.arange(n_up, n_electrons), axis=0)
         
         # Calculate electron-nuclear potentials directly without using vmap
-        # Since _compute_potential_matrix is already called inside a vmapped function in local_energy
         V_en_up = e_n_potential(up_coords)
         V_en_down = e_n_potential(down_coords)
         
@@ -426,5 +464,8 @@ class SlaterJastrow:
         # Combine kinetic and potential terms
         E_L = (jnp.trace(inv_up @ (B_kin_up + B_pot_up)) + 
               jnp.trace(inv_down @ (B_kin_down + B_pot_down)))
+        
+        # Add ion-ion potential energy (constant term)
+        E_L = E_L + self._ion_ion_potential
         
         return jnp.real(E_L)  # Ensure real value

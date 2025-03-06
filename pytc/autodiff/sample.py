@@ -3,17 +3,13 @@ Metropolis-Hastings sampling
 '''
 
 import numpy as np
-import jax
 import jax.numpy as jnp
 from jax import random
 import time
-from functools import partial
-from typing import Tuple, Dict, Any, Optional
-import concurrent.futures
-import os
+from typing import Dict, Any, Optional
 
-def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key):
-    """Initialize electron configurations based on atomic positions.
+def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key, n_up=None):
+    """Initialize electron configurations based on atomic positions with proper spin ordering.
     
     Args:
         atom_coords: Array of atom coordinates with shape (n_atoms, 3)
@@ -21,66 +17,154 @@ def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key
         n_electrons: Total number of electrons in the system
         n_walkers: Number of walker configurations to generate
         key: PRNG key for random initialization
+        n_up: Number of up-spin electrons (if None, defaults to n_electrons//2)
         
     Returns:
         Array of shape (n_walkers, n_electrons, 3) with initial positions
+        where the first n_up positions are up-spin electrons
     """
     # Initialize electrons near atoms proportional to nuclear charge
     n_atoms = len(atom_charges)
     
-    # Calculate electron allocation per atom based on charge
-    electron_counts = jnp.round(atom_charges / jnp.sum(atom_charges) * n_electrons).astype(jnp.int32)
+    # Set default n_up if not specified
+    if n_up is None:
+        n_up = n_electrons // 2
+        
+    n_down = n_electrons - n_up
     
-    # Adjust to ensure correct total
-    electron_counts = _adjust_electron_counts(electron_counts, n_electrons, atom_charges)
-            
-    # Generate positions with randomness around atoms
-    positions = []
+    # Use the pairing-based electron distribution algorithm
+    up_counts, down_counts = _distribute_electrons_by_pairing(atom_charges, n_up, n_down)
     
-    # Place electrons around each atom with distance ~ 1.0 bohr
+    print(f"Electron distribution by atom:")
+    for i in range(len(up_counts)):
+        print(f"  Atom {i}: {up_counts[i]} up, {down_counts[i]} down")
+    
+    # Generate positions for up-spin electrons around each atom
+    up_positions = []
     for i in range(n_atoms):
-        n_elec_at_atom = electron_counts[i]
-        if n_elec_at_atom > 0:
+        n_up_at_atom = up_counts[i]
+        if n_up_at_atom > 0:
             # Generate random directions
             key, subkey = random.split(key)
-            directions = random.normal(subkey, (n_walkers, n_elec_at_atom, 3))
+            directions = random.normal(subkey, (n_walkers, n_up_at_atom, 3))
             directions = directions / jnp.linalg.norm(directions, axis=2, keepdims=True)
             
-            # Generate distances (peaked around 1.0 bohr)
+            # Generate distances (peaked around 0.5 bohr)
             key, subkey = random.split(key)
-            distances = 1.0 + 0.1 * random.normal(subkey, (n_walkers, n_elec_at_atom, 1))
+            distances = 0.5 + 0.1 * random.normal(subkey, (n_walkers, n_up_at_atom, 1))
             
             # Calculate positions
             atom_pos = atom_coords[i]
             new_positions = atom_pos + directions * distances
-            positions.append(new_positions)
+            up_positions.append(new_positions)
     
-    # Concatenate positions for all atoms
-    all_positions = jnp.concatenate(positions, axis=1)
+    # Generate positions for down-spin electrons around each atom
+    down_positions = []
+    for i in range(n_atoms):
+        n_down_at_atom = down_counts[i]
+        if n_down_at_atom > 0:
+            # Generate random directions
+            key, subkey = random.split(key)
+            directions = random.normal(subkey, (n_walkers, n_down_at_atom, 3))
+            directions = directions / jnp.linalg.norm(directions, axis=2, keepdims=True)
+            
+            # Generate distances (peaked around 0.5 bohr)
+            key, subkey = random.split(key)
+            distances = 1 + 0.3 * random.normal(subkey, (n_walkers, n_down_at_atom, 1))
+            
+            # Calculate positions
+            atom_pos = atom_coords[i]
+            new_positions = atom_pos + directions * distances
+            down_positions.append(new_positions)
     
-    # Ensure we have exactly n_electrons (in case of rounding issues)
-    all_positions = all_positions[:, :n_electrons, :]
+    # Concatenate all up positions and all down positions
+    all_up_positions = jnp.concatenate(up_positions, axis=1) if up_positions else jnp.empty((n_walkers, 0, 3))
+    all_down_positions = jnp.concatenate(down_positions, axis=1) if down_positions else jnp.empty((n_walkers, 0, 3))
+    
+    # Ensure we have exactly the right number of electrons
+    all_up_positions = all_up_positions[:, :n_up, :]
+    all_down_positions = all_down_positions[:, :n_down, :]
+    
+    # Combine up and down positions in correct order
+    all_positions = jnp.concatenate([all_up_positions, all_down_positions], axis=1)
+    
+    print(f"Initialized {n_up} up-spin and {n_down} down-spin electrons around {n_atoms} atoms")
     
     return all_positions
 
-# Remove the JIT decorator - this function isn't a performance bottleneck
-def _adjust_electron_counts(electron_counts, n_electrons, atom_charges):
-    """Helper function to adjust electron counts to match total."""
-    # Convert to numpy for easier manipulation
-    ec = np.array(electron_counts)
-    ac = np.array(atom_charges)
+def _distribute_electrons_by_pairing(atom_charges, n_up, n_down):
+    """Distribute electrons across atoms following physical pairing patterns.
     
-    # Calculate current deficit
-    deficit = int(n_electrons - np.sum(ec))
+    This algorithm follows the typical pattern of filling atomic orbitals:
+    first up, then down, alternating until the atom is filled or we run out
+    of electrons.
     
-    # Add electrons one by one to atoms with highest remaining charge-to-electron ratio
-    for _ in range(deficit):
-        # Find atom with highest remaining charge-to-electron ratio
-        idx = np.argmax(ac - ec)
-        ec[idx] += 1
+    Args:
+        atom_charges: Array of atomic charges
+        n_up: Total number of up-spin electrons to distribute
+        n_down: Total number of down-spin electrons to distribute
+        
+    Returns:
+        Tuple of (up_counts, down_counts) arrays showing distribution by atom
+    """
+    n_atoms = len(atom_charges)
+    up_counts = np.zeros(n_atoms, dtype=np.int32)
+    down_counts = np.zeros(n_atoms, dtype=np.int32)
     
-    # Convert back to JAX array
-    return jnp.array(ec)
+    remaining_up = n_up
+    remaining_down = n_down
+    
+    # First pass: distribute electrons following alternating up/down pattern
+    for i in range(n_atoms):
+        atom_charge = int(atom_charges[i])
+        atom_electrons = 0
+        
+        # Fill atom with alternating up/down until reaching charge limit
+        while atom_electrons < atom_charge:
+            # Try to add an up electron if we're at an even position
+            if atom_electrons % 2 == 0 and remaining_up > 0:
+                up_counts[i] += 1
+                remaining_up -= 1
+                atom_electrons += 1
+            # Then try to add a down electron
+            elif atom_electrons % 2 == 1 and remaining_down > 0:
+                down_counts[i] += 1
+                remaining_down -= 1
+                atom_electrons += 1
+            else:
+                # No more electrons of needed type or atom is full
+                break
+    
+    # Second pass: handle any remaining electrons by assigned to highest charge atoms
+    # (should be rare, but we need to handle it)
+    atoms_by_charge = np.argsort(-atom_charges)  # Sort by descending charge
+    
+    # Distribute remaining up electrons
+    for i in atoms_by_charge:
+        while (up_counts[i] + down_counts[i] < atom_charges[i]) and remaining_up > 0:
+            up_counts[i] += 1
+            remaining_up -= 1
+    
+    # Distribute remaining down electrons
+    for i in atoms_by_charge:
+        while (up_counts[i] + down_counts[i] < atom_charges[i]) and remaining_down > 0:
+            down_counts[i] += 1
+            remaining_down -= 1
+    
+    # If we still have electrons left, add them to the highest charge atoms
+    # This could happen if total electrons > sum of charges
+    for i in atoms_by_charge:
+        while remaining_up > 0:
+            up_counts[i] += 1
+            remaining_up -= 1
+    
+    for i in atoms_by_charge:
+        while remaining_down > 0:
+            down_counts[i] += 1
+            remaining_down -= 1
+            
+    return jnp.array(up_counts), jnp.array(down_counts)
+
 
 def metropolis_hastings(
     ansatz, 
@@ -119,9 +203,10 @@ def metropolis_hastings(
         atom_coords = ansatz.mol.atom_coords()
         atom_charges = ansatz.mol.atom_charges()
         n_electrons = ansatz.n_electrons
+        n_up = ansatz.n_up  # Use n_up from the ansatz
         
-        # Initialize electron positions based on nuclear positions
-        walkers = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey)
+        # Initialize electron positions based on nuclear positions and spin counts
+        walkers = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey, n_up=n_up)
     else:
         walkers = initial_walkers
     
@@ -259,6 +344,9 @@ def metropolis_hastings(
             avg_acceptance = jnp.mean(jnp.array(acceptance_history[-100:]))
             avg_time = jnp.mean(jnp.array(step_times[-100:]))
             print(f"Step {step}/{n_steps}, Acceptance: {avg_acceptance:.4f}, Time/step: {avg_time*1000:.2f}ms")
+            # print the current average energy
+            energies = jnp.array(collected_energies)
+            print(f"  Current energy: {jnp.mean(energies):.6f}")
     
     # Stack collected samples and energies
     all_samples = jnp.stack(collected_samples) if collected_samples else None
