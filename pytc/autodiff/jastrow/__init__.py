@@ -2,4 +2,5 @@
 
 from .jastrow import Jastrow
 from .poly import Poly
-__all__ = ['Jastrow', 'Poly']
+from .rexp import REXP
+__all__ = ['Jastrow', 'Poly', 'REXP']
