@@ -21,3 +21,5 @@ build/
 tmp*
 *.log
 __pycache__/
+
+calcs
