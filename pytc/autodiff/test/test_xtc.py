@@ -8,8 +8,9 @@ import jax.numpy as jnp
 from pyscf import gto, scf
 
 from pytc.xtc import XTC as XTC_numpy
+from pytc.jastrow import REXP as REXP_np
 from pytc.autodiff.xtc import XTC as XTC_jax
-from pytc.autodiff.jastrow import Poly
+from pytc.autodiff.jastrow import REXP as REXP_jax
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -31,24 +32,16 @@ class TestXTC(unittest.TestCase):
         _, cls.mf = get_be_ccpvdz()
         
         # Create simple Jastrow factors for both implementations
-        cls.params = jnp.array([1.4])
-        cls.jastrow_jax = Poly(cls.params)
+        cls.params = jnp.array([1])
+        cls.jastrow_jax = REXP_jax(cls.params)
         
         # Create numpy version of same jastrow
-        class PolyNumpy:
-            def grad(self, r1, r2):
-                diff = r1[:, None, :] - r2[None, :, :]
-                r12 = np.sqrt(np.sum(diff * diff, axis=-1))
-                mask = r12 > 1e-10
-                grad = np.where(mask[..., None], 
-                              cls.params[0]*diff / np.maximum(r12[..., None], 1e-10),
-                              np.zeros_like(diff))
-                return grad
-        cls.jastrow_numpy = PolyNumpy()
+
+        cls.jastrow_numpy = REXP_np(np.asarray(cls.params))
         
         # Initialize XTC calculators with low grid level for testing
-        cls.xtc_jax = XTC_jax(cls.mf, cls.jastrow_jax, grid_lvl=1)
-        cls.xtc_numpy = XTC_numpy(cls.mf, cls.jastrow_numpy, grid_lvl=1)
+        cls.xtc_jax = XTC_jax(cls.mf, cls.jastrow_jax, grid_lvl=2)
+        cls.xtc_numpy = XTC_numpy(cls.mf, cls.jastrow_numpy, grid_lvl=2)
         
     def test_grid_initialization(self):
         """Test grid initialization and conversion to JAX arrays."""
@@ -178,6 +171,53 @@ class TestXTC(unittest.TestCase):
             v2e_numpy,
             rtol=1e-5, atol=1e-5
         )
+
+    def test_nhccsd(self):
+        from pyscf.cc import rccsd, CCSD
+        from pyscf import ao2mo
+        import numpy as np
+        from functools import reduce
+
+        mycc = CCSD(self.mf)
+        e_corr, t1, t2 = mycc.kernel()
+        mycc.verbose = 5
+        print("E_CCSD = ", e_corr)
+        #self.assertAlmostEqual(e_corr, -0.04503138331130402, places=6)
+        t = mycc.amplitudes_to_vector(t1, t2)
+        print("|t2| = ", np.linalg.norm(t2))
+        print("|t1+t2| = ", np.linalg.norm(t))
+        eri1 = ao2mo.incore.full(self.xtc_jax.mf._eri, self.xtc_jax.mo_coeff, compact=False)
+        eri1 = ao2mo.restore(1, eri1, self.xtc_jax.mo_coeff.shape[1])
+        h1e = mycc._scf.get_hcore()
+        h1e = reduce(np.dot, (self.xtc_jax.mo_coeff.T, h1e, self.xtc_jax.mo_coeff))
+        
+        e_hf_0 = 2. * np.einsum('ii->', h1e[:mycc.nocc, :mycc.nocc])
+        e_dir = 2. * np.einsum('jjii->', eri1[:mycc.nocc, :mycc.nocc, :mycc.nocc, :mycc.nocc])
+        e_ex = -1. * np.einsum('ijji->', eri1[:mycc.nocc, :mycc.nocc, :mycc.nocc, :mycc.nocc])
+        e_hf_0 += (e_dir + e_ex) + mycc._scf.energy_nuc()
+        print("Check e_hf = ",  e_hf_0)
+        self.assertAlmostEqual(e_hf_0, -14.57233763095337, places=6)
+
+        myrcc = rccsd.RCCSD(self.mf)
+        #myrcc.verbose = 5
+        eris = self.xtc_jax.make_eris()
+        tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
+        t = myrcc.amplitudes_to_vector(t1, t2)
+        print("|t2| = ", np.linalg.norm(t2))
+        print("|t1+t2| = ", np.linalg.norm(t))
+        print("corr E_XTC_CCSD = ", myrcc.e_corr)
+        self.assertAlmostEqual(tc_e_corr, -0.03272155333587409, places=6)
+        # get the hf energy using fock and eris
+        no = myrcc.nocc
+        tc_h1e = self.xtc_jax.get_1b()
+        tc_e_hf = 2. * np.einsum('ii->', tc_h1e[:no, :no])
+        tc_e_dir = 2. * np.einsum('jjii->', eris.oooo)
+        tc_e_ex = -1. * np.einsum('ijji->', eris.oooo)
+
+        tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
+        print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
+        self.assertAlmostEqual(tc_e_hf + tc_e_corr, -14.656373992235194, places=6)
+
 
 if __name__ == '__main__':
     unittest.main()

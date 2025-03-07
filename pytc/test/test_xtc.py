@@ -9,8 +9,7 @@ import time
 from pyscf import gto, scf, ao2mo
 
 from pytc.xtc import XTC
-from pytc.lmat import calc_v_vector
-from pytc.jastrow import SM7, SM17, SimpleJastrow
+from pytc.jastrow import REXP
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
@@ -30,12 +29,10 @@ class TestXTC(unittest.TestCase):
         _, cls.mf = get_be_ccpvdz()
         
         
-        # Create SM7 instance with Be coefficients
-        #cls.jastrow = SM7(atom='Be')
-        cls.jastrow = SimpleJastrow([1.4])
+        cls.jastrow = REXP([1.])
         
-        # Initialize XTC with SM7 Jastrow
-        cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)  # Use grid_lvl=1 for testing
+        # Initialize XTC with REXP Jastrow
+        cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=2)  
         
         # Get grid points and weights from TC parent class
         cls.grid_points = cls.xtc.grid_points
@@ -53,7 +50,7 @@ class TestXTC(unittest.TestCase):
     
     def test_get_mf_dm(self):
         """Test mean-field density matrix generation."""
-        dm1 = self.xtc._get_mf_dm()
+        dm1 = self.xtc._get_mf_dm() * 2
         
         # Check shape
         self.assertEqual(dm1.shape, (self.mf.mo_coeff.shape[1],) * 2)
@@ -68,43 +65,6 @@ class TestXTC(unittest.TestCase):
         np.testing.assert_array_almost_equal(np.diag(dm1)[nocc:], 
                                            np.zeros(len(dm1) - nocc))
     
-    #def test_calc_delta_U(self):
-    #    """Test calculation of delta_U tensor."""
-    #    delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
-    #    
-    #    # Check shape
-    #    n_orb = self.mf.mo_coeff.shape[1]
-    #    self.assertEqual(delta_U.shape, (n_orb,) * 4)
-    #    
-    #    # Test symmetry property
-    #    np.testing.assert_array_almost_equal(
-    #        delta_U, 
-    #        delta_U.transpose(2,3,0,1)
-    #    )
-    
-    #def test_calc_delta_h(self):
-    #    """Test calculation of delta_h matrix."""
-    #    delta_U = self.xtc._calc_delta_U(self.v_vector, self.rho_paired)
-    #    dm1 = self.xtc._get_mf_dm()
-    #    delta_h = self.xtc._calc_delta_h(delta_U, dm1)
-    #    
-    #    # Check shape
-    #    n_orb = self.mf.mo_coeff.shape[1]
-    #    self.assertEqual(delta_h.shape, (n_orb,) * 2)
-    #    
-    #    # Test hermiticity
-    #    np.testing.assert_array_almost_equal(
-    #        delta_h, 
-    #        delta_h.T.conj()
-    #    )
-    
-    #def test_get_const(self):
-    #    """Test calculation of constant term."""
-    #    dm1 = self.xtc._get_mf_dm()
-    #    const = self.xtc.get_const(dm1=dm1)
-    #    
-    #    # Check that const is real
-    #    self.assertTrue(np.isreal(const))
     
     def test_nhccsd(self):
         from pyscf.cc import rccsd, CCSD
@@ -136,7 +96,7 @@ class TestXTC(unittest.TestCase):
         print("|t2| = ", np.linalg.norm(t2))
         print("|t1+t2| = ", np.linalg.norm(t))
         print("corr E_XTC_CCSD = ", myrcc.e_corr)
-        self.assertAlmostEqual(tc_e_corr, -0.0443956329631562, places=6)
+        self.assertAlmostEqual(tc_e_corr, -0.03272155333587409, places=6)
         # get the hf energy using fock and eris
         no = myrcc.nocc
         tc_h1e = self.xtc.get_1b()
@@ -146,7 +106,7 @@ class TestXTC(unittest.TestCase):
 
         tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
         print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
-        self.assertAlmostEqual(tc_e_hf, -14.592606059260131, places=6)
+        self.assertAlmostEqual(tc_e_hf + tc_e_corr, -14.656373992235194, places=6)
 
 
     def test_delta_U_isdf_convergence(self):
@@ -157,8 +117,7 @@ class TestXTC(unittest.TestCase):
         # Compute V vector with batched processing
         rho, _ = self.xtc._get_intermediates()
         rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
-        v_vector = calc_v_vector(rho_paired, self.xtc.jastrow_factor, 
-                               self.grid_points, self.weights)
+        v_vector = self.xtc._calc_v_vector(rho_paired)
         
         delta_U_ref = self.xtc._calc_delta_U(v_vector, rho_paired, dm1)
          

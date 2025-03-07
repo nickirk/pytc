@@ -26,15 +26,7 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         
         tmp = jnp.zeros((Nb2, i_end - i))
         
-        # Loop over spatial components
-        for c in range(3):
-            nabla_c = nabla_rho_paired[..., c]  # (Nb2, N_grid)
-            u_grad_c = u_grad_batch[..., c]     # (batch, N_grid)
-            
-            # First: scale nabla by weights and compute dot product
-            # Note: No transpose needed since u_grad_c is already in correct shape
-            tmp += jnp.dot(nabla_c * weights[None, :], u_grad_c.T)
-        
+        tmp = jnp.einsum('ijc,j,kjc->ik', nabla_rho_paired, weights, u_grad_batch)
         # Final multiplication including weights for batch points
         result += jnp.dot(
             rho_paired[:, i:i_end] * weights[None, i:i_end],
