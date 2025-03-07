@@ -1,6 +1,9 @@
 import numpy as np
+from functools import partial
 
 from pyscf.dft import numint
+
+einsum = partial(np.einsum, optimize=True)
 
 class SlaterDet:
     def __init__(self, mol, mo_coeff=None, nelec=None, excitations=None):
@@ -143,24 +146,40 @@ class SlaterDet:
         ao_vals = ao_vals_deriv[0]
         ao_grads = ao_vals_deriv[1:].transpose(1, 2, 0)  # Reshape to (n_walkers*n_electrons, nAOs, 3)
         
-        # Reshape back to batch form
-        ao_vals = ao_vals.reshape(n_walkers, n_electrons, -1)
-        ao_grads = ao_grads.reshape(n_walkers, n_electrons, -1, 3)
         
-        # Split by spin
-        ao_grads_up = ao_grads[:, :self.n_alpha]      # shape (n_walkers, n_up, nAOs, 3)
-        ao_grads_down = ao_grads[:, self.n_alpha:]    # shape (n_walkers, n_down, nAOs, 3)
+        if not self.unrestricted:
+            grad_batch = np.zeros((n_walkers, self.n_electrons, self.mo_coeff_alpha_occ.shape[-1], 3))
+
+            # Vectorized computation for gradients in each direction
+            for d in range(3):
+                # Batch matrix multiplication using einsum
+                # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
+                grad_batch[..., d] = np.dot(ao_grads[..., d], self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_electrons, -1)
+            
+            grad_up_batch = grad_batch[:, :self.n_alpha]
+            grad_down_batch = grad_batch[:, self.n_alpha:]
+            
+        else:
+            # Reshape back to batch form
+            ao_vals = ao_vals.reshape(n_walkers, n_electrons, -1)
+            ao_grads = ao_grads.reshape(n_walkers, n_electrons, -1, 3)
+            # Split by spin
+            ao_grads_up = ao_grads[:, :self.n_alpha]      # shape (n_walkers, n_up, nAOs, 3)
+            ao_grads_down = ao_grads[:, self.n_alpha:]    # shape (n_walkers, n_down, nAOs, 3)
         
-        # Initialize output arrays
-        grad_up_batch = np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3))
-        grad_down_batch = np.zeros((n_walkers, self.n_beta, self.n_beta, 3))
+            # Initialize output arrays
+            grad_up_batch = np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3))
+            grad_down_batch = np.zeros((n_walkers, self.n_beta, self.n_beta, 3))
         
-        # Vectorized computation for gradients in each direction
-        for d in range(3):
-            # Batch matrix multiplication using einsum
-            # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
-            grad_up_batch[..., d] = np.einsum('wij,jk->wik', ao_grads_up[..., d], self.mo_coeff_alpha_occ)
-            grad_down_batch[..., d] = np.einsum('wij,jk->wik', ao_grads_down[..., d], self.mo_coeff_beta_occ)
+            # Vectorized computation for gradients in each direction
+            for d in range(3):
+                # Batch matrix multiplication using einsum
+                # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
+                grad_up_batch[..., d] = einsum('wij,jk->wik', ao_grads_up[..., d], self.mo_coeff_alpha_occ)
+                grad_down_batch[..., d] = einsum('wij,jk->wik', ao_grads_down[..., d], self.mo_coeff_beta_occ)
+        
+        #grad_up_batch = einsum('wijc,jk->wikc', ao_grads_up, self.mo_coeff_alpha_occ)
+        #grad_down_batch = einsum('wijc,jk->wikc', ao_grads_down, self.mo_coeff_beta_occ)
                 
         # Return single matrices if input was single walker
         if is_single:
@@ -197,13 +216,15 @@ class SlaterDet:
         ao_lapls = ao_lapls.reshape(n_walkers, n_electrons, -1)
         
         # Split by spin
-        ao_lapls_up = ao_lapls[:, :self.n_alpha]      # shape (n_walkers, n_up, nAOs)
-        ao_lapls_down = ao_lapls[:, self.n_alpha:]    # shape (n_walkers, n_down, nAOs)
+        ao_lapls_up = ao_lapls[:, :self.n_alpha].reshape(-1, ao_lapls.shape[-1])      # shape (n_walkers * n_up, nAOs)
+        ao_lapls_down = ao_lapls[:, self.n_alpha:].reshape(-1, ao_lapls.shape[-1])    # shape (n_walkers * n_down, nAOs)
         
         # Vectorized matrix multiplication for all walkers
         # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
-        lap_up_batch = np.einsum('wij,jk->wik', ao_lapls_up, self.mo_coeff_alpha_occ)
-        lap_down_batch = np.einsum('wij,jk->wik', ao_lapls_down, self.mo_coeff_beta_occ)
+        #lap_up_batch = einsum('wij,jk->wik', ao_lapls_up, self.mo_coeff_alpha_occ)
+        #lap_down_batch = einsum('wij,jk->wik', ao_lapls_down, self.mo_coeff_beta_occ)
+        lap_up_batch = np.dot(ao_lapls_up, self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_alpha, self.n_alpha)
+        lap_down_batch = np.dot(ao_lapls_down, self.mo_coeff_beta_occ).reshape(n_walkers, self.n_beta, self.n_beta)
                 
         # Return single matrices if input was single walker
         if is_single:
@@ -234,17 +255,25 @@ class SlaterDet:
         ao_vals_all = numint.eval_ao(self.mol, flat_coords, deriv=0)
         
         # Reshape back to (n_walkers, n_electrons, n_aos)
-        ao_vals_all = ao_vals_all.reshape(n_walkers, n_electrons, -1)
+        #ao_vals_all = ao_vals_all.reshape(n_walkers, n_electrons, -1)
         
-        # Split AO values by spin - shape: (n_walkers, n_up, nAOs) and (n_walkers, n_down, nAOs)
-        ao_up = ao_vals_all[:, :self.n_alpha]
-        ao_down = ao_vals_all[:, self.n_alpha:]
         
         # Vectorized matrix multiplication for all walkers at once
-        # We need to use np.einsum for batch matrix multiplication
+        # We need to use einsum for batch matrix multiplication
         # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
-        slater_up_batch = np.einsum('wij,jk->wik', ao_up, self.mo_coeff_alpha_occ)
-        slater_down_batch = np.einsum('wij,jk->wik', ao_down, self.mo_coeff_beta_occ)
+        if not self.unrestricted:
+            slater_batch = np.dot(ao_vals_all, self.mo_coeff_alpha_occ).reshape(n_walkers, n_electrons, -1)
+
+            slater_up_batch = slater_batch[:,:self.n_alpha]
+            slater_down_batch = slater_batch[:, self.n_alpha:]
+
+        else:
+            # Split AO values by spin - shape: (n_walkers, n_up, nAOs) and (n_walkers, n_down, nAOs)
+            ao_vals_all = ao_vals_all.reshape(n_walkers, n_electrons, -1)
+            ao_up = ao_vals_all[:, :self.n_alpha].reshape(-1, ao_vals_all.shape[-1])
+            ao_down = ao_vals_all[:, self.n_alpha:].reshape(-1, ao_vals_all.shape[-1])
+            slater_up_batch = np.dot(ao_up, self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_alpha, self.n_alpha)
+            slater_down_batch = np.dot(ao_down, self.mo_coeff_beta_occ).reshape(n_walkers, self.n_beta, self.n_beta)
         
         # Return single matrices if input was single walker
         if is_single:
