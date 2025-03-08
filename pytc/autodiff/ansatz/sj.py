@@ -54,7 +54,7 @@ class SlaterJastrow:
     def ion_ion_potential(self):
         """Return the ion-ion potential energy (nuclear-nuclear repulsion)."""
         return self._ion_ion_potential
-        
+   
     def __call__(self, elec_coords_batch):
         """Evaluate wavefunction for a batch of electron configurations.
         
@@ -73,7 +73,7 @@ class SlaterJastrow:
             single_walker = True
         
         # Vectorize Jastrow calculation over batch dimension
-        jastrow_vals = jax.vmap(self._compute_jastrow_value)(elec_coords_batch)
+        jastrow_vals = jax.jit(jax.vmap(self._compute_jastrow_value))(elec_coords_batch)
         
         # Convert to NumPy for determinant calculations
         elec_coords_batch_np = np.array(elec_coords_batch)
