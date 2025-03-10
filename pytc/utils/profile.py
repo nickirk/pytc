@@ -1,8 +1,8 @@
 from line_profiler import LineProfiler
 import unittest
 import io
-from pytc.autodiff.test.test_sample import TestHartreeFockEnergy
-from pytc.autodiff.sample import metropolis_hastings
+from pytc.autodiff.test.test_mcmc import TestHartreeFockEnergy
+from pytc.autodiff.mcmc import metropolis_hastings
 from pytc.autodiff.ansatz.det import SlaterDet
 from pytc.autodiff.ansatz.sj import SlaterJastrow
 from pyscf.dft import numint  # Import numint to profile AO evaluations

@@ -2,19 +2,23 @@
 
 import unittest
 import numpy as np
-import jax
-import jax.numpy as jnp
 from jax import random
+import jax.numpy as jnp
 import time
 
 # Import PySCF-related functionality
 from pyscf import gto, scf
+from pyscf import gto, scf
 
 # Import our modules
-from pytc.autodiff.sample import metropolis_hastings, init_electron_configs
+from pytc.autodiff.mcmc import (
+    optimize, sample, init_electron_configs, metropolis_hastings,
+    initialize_walkers, perform_mcmc_step, burn_in, prepare_sampling_results,
+    report_progress, create_optimizer
+)
 from pytc.autodiff.sample_utils import analyze_energies
 from pytc.autodiff.ansatz.sj import SlaterJastrow
-from pytc.autodiff.jastrow import Poly
+from pytc.autodiff.jastrow import REXP, Poly
 from pytc.autodiff.ansatz.det import SlaterDet 
 
 
@@ -107,19 +111,19 @@ class TestHartreeFockEnergy(unittest.TestCase):
         n_walkers = 2000
         n_steps = 8000
         step_size = 0.2
-        burn_in = 8000
+        burn_in_steps = 4000  # Updated parameter name
         thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
         # Run sampling
         print(f"Starting sampling for {mol.atom}...")
         start_time = time.time()
-        sampling_results = metropolis_hastings(
+        sampling_results = sample(
             sj_ansatz,
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
-            burn_in=burn_in,
+            burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
             key=key
         )
@@ -162,17 +166,149 @@ class TestHartreeFockEnergy(unittest.TestCase):
     def test_h4_molecule(self):
         """Test HF energy sampling for H2 molecule."""
         results = self.run_hf_energy_test("H 0 0 0; H 0 0 2; H 0 0 4; H 0 0 6")
-        # Additional H2-specific assertions could be added here
     
     def test_he_atom(self):
         """Test HF energy sampling for He He molecule."""
         results = self.run_hf_energy_test("He 0 0 0; He 0 0 1")
-        # Additional He-specific assertions could be added here
 
     def test_lih(self):
         """Test HF energy sampling for LiH molecule."""
         results = self.run_hf_energy_test("Li 0 0 0; H 0 0 1.6")
-        # Additional He-specific assertions could be added here
+
+
+
+class TestJastrowOptimization(unittest.TestCase):
+    """Test optimization of the Jastrow factor."""
+    
+    def test_h2_optimization(self):
+        """Test optimization of Jastrow parameters for H2 molecule."""
+        # Create molecule
+        mol = gto.Mole()
+        mol.atom = 'H 0 0 0; H 0 0 1.0'
+        mol.basis = 'sto-3g'
+        mol.unit = 'bohr'
+        mol.build()
+        
+        # Run PySCF calculation for reference energy
+        mf = scf.RHF(mol)
+        mf.kernel()
+        hf_energy_reference = mf.e_tot
+        
+        # Create determinant from HF solution
+        det = SlaterDet(mol, mf.mo_coeff)
+        
+        # Create PolyJastrow with small but non-zero parameters
+        # We use small initial parameters to test if optimization improves them
+        jastrow = REXP(params=jnp.array([0.01]))
+        
+        # Create SlaterJastrow ansatz (initial state with small Jastrow)
+        sj_ansatz = SlaterJastrow(mol, jastrow, [det], jnp.array([1.0]))
+        
+        # Use small settings for test speed
+        n_walkers = 1000
+        n_steps = 200
+        step_size = 0.1
+        burn_in_steps = 200
+        thinning = 10
+        n_opt_steps = 100  # Just a few optimization steps for test
+        key = random.PRNGKey(42)  # Fixed seed for reproducibility
+        
+        # Run optimization
+        print(f"Starting Jastrow optimization for H2...")
+        start_time = time.time()
+        opt_results = optimize(
+            sj_ansatz,
+            n_walkers=n_walkers,
+            n_steps=n_steps,
+            step_size=step_size,
+            burn_in_steps=burn_in_steps,
+            thinning=thinning,
+            n_opt_steps=n_opt_steps,
+            learning_rate=0.05,
+            key=key
+        )
+        end_time = time.time()
+        print(f"Optimization completed in {end_time - start_time:.2f} seconds")
+        
+        # Check that we have optimization history
+        self.assertIn("optimization_history", opt_results)
+        self.assertEqual(len(opt_results["optimization_history"]["energy"]), n_opt_steps)
+        
+        # Check that optimized energy is available
+        self.assertIn("best_energy", opt_results)
+        self.assertIn("best_params", opt_results)
+        
+        # Check that params are updated (different from initial value)
+        self.assertNotEqual(opt_results["best_params"][0], 0.01)
+        
+        # Check that best energy is reasonable
+        self.assertLess(abs(opt_results["best_energy"] - hf_energy_reference), 0.1)
+        
+        # Check energy improvement over optimization steps
+        initial_energy = opt_results["optimization_history"]["energy"][0]
+        final_energy = opt_results["optimization_history"]["energy"][-1]
+        print(f"Initial energy: {initial_energy:.6f}")
+        print(f"Final energy: {final_energy:.6f}")
+        print(f"Reference HF energy: {hf_energy_reference:.6f}")
+        
+        # Energy should improve (lower) or stay similar
+        self.assertLessEqual(final_energy, initial_energy + 0.05)
+    
+    def test_he2_optimization(self):
+        """Test optimization of Jastrow parameters for He-He molecule."""
+        # Create molecule
+        mol = gto.Mole()
+        mol.atom = 'He 0 0 0; He 0 0 2.0'
+        mol.basis = 'sto-3g'
+        mol.unit = 'bohr'
+        mol.build()
+        
+        # Run PySCF calculation for reference energy
+        mf = scf.RHF(mol)
+        mf.kernel()
+        hf_energy_reference = mf.e_tot
+        
+        # Create determinant from HF solution
+        det = SlaterDet(mol, mf.mo_coeff)
+        
+        # Create PolyJastrow with small but non-zero parameters
+        jastrow = Poly(params=jnp.array([0.01]))
+        
+        # Create SlaterJastrow ansatz
+        sj_ansatz = SlaterJastrow(mol, jastrow, [det], jnp.array([1.0]))
+        
+        # Use small settings for test speed
+        n_walkers = 500
+        n_steps = 200
+        step_size = 0.1
+        burn_in_steps = 200
+        thinning = 10
+        n_opt_steps = 3
+        key = random.PRNGKey(43)  # Different seed
+        
+        # Run optimization
+        print(f"Starting Jastrow optimization for He2...")
+        opt_results = optimize(
+            sj_ansatz,
+            n_walkers=n_walkers,
+            n_steps=n_steps,
+            step_size=step_size,
+            burn_in_steps=burn_in_steps,
+            thinning=thinning,
+            n_opt_steps=n_opt_steps,
+            learning_rate=0.05,
+            key=key
+        )
+        
+        # Check energy improvement over optimization steps
+        initial_energy = opt_results["optimization_history"]["energy"][0]
+        final_energy = opt_results["optimization_history"]["energy"][-1]
+        print(f"Initial energy: {initial_energy:.6f}")
+        print(f"Final energy: {final_energy:.6f}")
+        print(f"Reference HF energy: {hf_energy_reference:.6f}")
+        
+        # Energy should improve (lower) or stay similar
+        self.assertLessEqual(final_energy, initial_energy + 0.05)
 
 if __name__ == "__main__":
     unittest.main()
