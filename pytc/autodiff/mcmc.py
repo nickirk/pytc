@@ -5,6 +5,7 @@ Metropolis-Hastings sampling
 import numpy as np
 import jax.numpy as jnp
 from jax import random, grad, value_and_grad
+import jax
 import optax
 import time
 from typing import Dict, Any, Optional, Callable, Tuple
@@ -538,16 +539,15 @@ def optimize(
     print(f"Starting optimization with {n_opt_steps} steps...")
     for opt_step in range(n_opt_steps):
         start_time = time.time()
-        
         # Compute loss and gradients
-        (loss, energies), grads = value_and_grad(loss_fn, has_aux=True)(jastrow_params)
-        
+        (loss, energies), grads = jax.jit(value_and_grad(loss_fn, has_aux=True))(jastrow_params)
         # Compute energy statistics
         energy_mean = jnp.mean(energies).item()
         energy_std = jnp.std(energies).item() / jnp.sqrt(len(energies))
         
         # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state)
+        print(f"Loss: {loss}, Gradients: {grads}, Updates: {updates}")
         jastrow_params = optax.apply_updates(jastrow_params, updates)
         
         # Update ansatz with new parameters
@@ -567,7 +567,7 @@ def optimize(
         
         # Print progress
         step_time = time.time() - start_time
-        print(f"Opt step {opt_step}/{n_opt_steps}, Energy: {energy_mean:.6f} ± {energy_std:.6f}, Time: {step_time*1000:.2f}ms")
+        print(f"Opt step {opt_step}/{n_opt_steps}, Energy: {energy_mean:.6f} ± {energy_std:.6f}, Params: {jastrow_params}, Time: {step_time*1000:.2f}ms")
         
         # Resample configurations for next iteration (except for last step)
         if opt_step < n_opt_steps - 1:

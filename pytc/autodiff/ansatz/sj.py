@@ -116,7 +116,7 @@ class SlaterJastrow:
         diag_mask = 1.0 - jnp.eye(n_electrons)
         
         # Use redundant summation form (multiply by 1/2)
-        return jnp.exp(0.5 * jnp.sum(all_pairs * diag_mask))
+        return jnp.exp(0.5*jnp.sum(all_pairs * diag_mask))
     
     @property
     def n_electrons(self):
@@ -146,7 +146,7 @@ class SlaterJastrow:
         In the redundant summation form J = exp(0.5*∑ᵢⱼ u(rᵢ,rⱼ)), we have:
         ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)/2 + ∑ⱼ≠ᵢ ∇ᵢu(rⱼ,rᵢ)/2
         
-        For a symmetric u function where u(rᵢ,rⱼ) = u(rⱼ,rᵢ), this simplifies to:
+        For a symmetric u function where u(rᵢ,rⱼ) = -u(rⱼ,rᵢ), this simplifies to:
         ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)
         """
         n_electrons = elec_coords.shape[0]
@@ -163,8 +163,7 @@ class SlaterJastrow:
         # The shape of all_grads is (n_electrons, n_electrons, 3)
         # To symmetrize, we need to swap the first two dimensions (electron indices)
         # not the last two dimensions (which would mix spatial coordinates with electron indices)
-        #all_grads = 0.5 * (all_grads + jnp.swapaxes(all_grads, 0, 1))
-        #all_laps = 0.5 * (all_laps + jnp.swapaxes(all_laps, 0, 1))
+        #all_grads =  0.5 * (all_grads - jnp.swapaxes(all_grads, 0, 1))
 
         
         # Create a mask to exclude diagonal elements (no self-interaction)
@@ -176,45 +175,18 @@ class SlaterJastrow:
         # contribution is already counted correctly when we sum
         grad_J_over_J = jnp.sum(all_grads * diag_mask_3d, axis=1)
         
-        # For laplacian: contributions are summed with the same mask
-        lap_J_over_J = jnp.sum(all_laps * diag_mask, axis=1)
+        # For laplacian: first sum the laplacian terms
+        lap_sum = jnp.sum(all_laps * diag_mask, axis=1) 
+        
+        # Then add the squared gradient term (∇u)²
+        # Square the gradients and sum over spatial dimensions for each electron
+        grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
+        
+        # Complete Laplacian expression: ∇²J/J = ∇²u + (∇u)²
+        lap_J_over_J = lap_sum + grad_squared
         
         return grad_J_over_J, lap_J_over_J
-
-    def _compute_kinetic_matrix(self, elec_coords, grad_J_over_J, lap_J_over_J):
-        """Compute kinetic energy part of B matrix."""
-        # Get Slater matrices and their gradients/laplacians
-        slater_up, slater_down = self._get_matrices(elec_coords)
-        grad_up, grad_down = self._get_gradients(elec_coords)  # shape: (n_up/down, n_up/down, 3)
-        lap_up, lap_down = self._get_laplacians(elec_coords)
-        
-        n_up = self.dets[0].n_alpha
-        
-        # Slice gradients and laplacians for up/down electrons
-        grad_J_up = grad_J_over_J[:n_up]      # shape: (n_up, 3)
-        grad_J_down = grad_J_over_J[n_up:]    # shape: (n_down, 3)
-        lap_J_up = lap_J_over_J[:n_up]        # shape: (n_up,)
-        lap_J_down = lap_J_over_J[n_up:]      # shape: (n_down,)
-        
-        # Build inverses
-        inv_up = jnp.linalg.inv(slater_up)
-        inv_down = jnp.linalg.inv(slater_down)
-        
-        # Compute kinetic terms directly without vmap
-        B_up = -0.5 * (
-            lap_up +  # (n_up, n_up)
-            2 * jnp.einsum('ik,ijk->ij', grad_J_up, grad_up) +  # sum over spatial dimensions
-            jnp.multiply(lap_J_up[:, None], slater_up)  # broadcast laplacian
-        )
-        
-        B_down = -0.5 * (
-            lap_down +  # (n_down, n_down)
-            2 * jnp.einsum('ik,ijk->ij', grad_J_down, grad_down) +  # sum over spatial dimensions
-            jnp.multiply(lap_J_down[:, None], slater_down)  # broadcast laplacian
-        )
-        
-        return inv_up, inv_down, B_up, B_down
-
+    
     @partial(jax.jit, static_argnums=(0,))
     def _compute_potential_matrix(self, elec_coords, slater_up, slater_down):
         """Compute potential energy part of B matrix using vmap.
@@ -263,7 +235,7 @@ class SlaterJastrow:
         ee_vmap_outer = jax.vmap(ee_vmap_inner, in_axes=(0, None))
         
         # Compute all pairwise interactions at once
-        all_e_e_pot = ee_vmap_outer(elec_coords, elec_coords)
+        all_e_e_pot = jax.jit(ee_vmap_outer)(elec_coords, elec_coords)
         
         # Remove self-interactions
         mask = 1.0 - jnp.eye(n_electrons)
