@@ -659,22 +659,25 @@ def optimize(
         "steps": []
     }
     
-    # Define loss function that computes average energy
-    def loss_fn(params):
+    # Define loss function that computes energy
+    def loss_fn(params, walkers_batch):
         # Update ansatz with new parameters
         new_ansatz = ansatz.update_jastrow(params)
         
         # Compute energies for all walkers
-        energies = new_ansatz.local_energy(walkers)
+        energies = new_ansatz.local_energy(walkers_batch)
 
         # clip energies to avoid numerical instability
-        energies = jnp.clip(energies, -50., 50.)
+        #energies = jnp.clip(energies, -50., 50.)
         
         # Compute cost (default: mean energy)
         cost = cost_fn(energies)
         
         # Also return energies for statistics
         return cost, energies
+    
+    # Vectorized gradient function
+    value_and_grad_fn = jax.jit(value_and_grad(loss_fn, has_aux=True))
     
     # Optimization loop
     best_energy = float('inf')
@@ -684,15 +687,46 @@ def optimize(
     print(f"Starting optimization with {n_opt_steps} steps...")
     for opt_step in range(n_opt_steps):
         start_time = time.time()
-        # Compute loss and gradients
-        (loss, energies), grads = jax.jit(value_and_grad(loss_fn, has_aux=True))(jastrow_params)
-        # Compute energy statistics
-        energy_mean = jnp.mean(energies).item()
-        energy_std = jnp.std(energies).item() / jnp.sqrt(len(energies))
         
-        # Update parameters
-        updates, opt_state = optimizer.update(grads, opt_state)
-        print(f"Loss: {loss}, Gradients: {grads}, Updates: {updates}")
+        # Initialize numpy-based accumulator for gradients (mutable)
+        accumulated_grads = None
+        all_energies = []
+        acceptance_temp = []
+        
+        # Perform n_steps MCMC steps, accumulating gradients
+        # for mcmc_step in range(n_steps):
+        if opt_step % n_steps == 0:
+            # Update walker positions using MCMC
+            if use_importance_sampling:
+                walkers, acceptance, key = perform_mcmc_step_with_importance(
+                    ansatz, walkers, step_size, key)
+            else:
+                walkers, acceptance, key = perform_mcmc_step(
+                    ansatz, walkers, step_size, key)
+            acceptance_temp.append(acceptance)
+            
+            # Compute loss and gradients for current walker configurations
+        (loss, energies), grads = value_and_grad_fn(jastrow_params, walkers)
+        all_energies.append(energies)
+            
+        # Accumulate gradients, creating the structure only once
+        #if accumulated_grads is None:
+        #    accumulated_grads = grads
+        #else:
+        #    accumulated_grads = jax.tree_util.tree_map(
+        #        lambda acc, g: acc + g,
+        #        accumulated_grads, grads)
+        accumulated_grads = -grads
+        
+        
+        # Flatten energy arrays for statistics
+        all_energies = jnp.concatenate(all_energies)
+        energy_mean = jnp.mean(all_energies).item()
+        energy_std = jnp.std(all_energies).item() / jnp.sqrt(len(all_energies))
+        
+        # Update parameters using accumulated gradients
+        updates, opt_state = optimizer.update(accumulated_grads, opt_state)
+        print(f"Loss: {loss}, Accumulated Gradients: {accumulated_grads}, Updates: {updates}")
         jastrow_params = optax.apply_updates(jastrow_params, updates)
         
         # Update ansatz with new parameters
@@ -707,8 +741,11 @@ def optimize(
         opt_history["energy"].append(energy_mean)
         opt_history["energy_std"].append(energy_std)
         opt_history["params"].append(jastrow_params)
-        opt_history["gradients"].append(grads)
+        opt_history["gradients"].append(accumulated_grads)
         opt_history["steps"].append(opt_step)
+        
+        # Add acceptances to history
+        acceptance_history.extend(acceptance_temp)
         
         # Print progress
         step_time = time.time() - start_time
@@ -717,25 +754,8 @@ def optimize(
         print(f"Opt step {opt_step}/{n_opt_steps}, Inst Energy: {energy_mean:.6f} ± {energy_std:.6f}, ") 
         print(f"Mean Energy: {jnp.mean(hist_energies):.6f} ± {jnp.std(hist_energies)/jnp.sqrt(len(hist_energies))},")
         print(f"Params: {jastrow_params}, Time: {step_time*1000:.2f}ms")
-        
-        # Resample configurations for next iteration (except for last step)
-        if opt_step < n_opt_steps - 1:
-            # Perform MCMC steps to get new samples
-            acceptance_temp = []
-            for mcmc_step in range(n_steps):
-                if use_importance_sampling:
-                    walkers, acceptance, key = perform_mcmc_step_with_importance(
-                        ansatz, walkers, step_size, key)
-                else:
-                    walkers, acceptance, key = perform_mcmc_step(
-                        ansatz, walkers, step_size, key)
-                acceptance_temp.append(acceptance)
-            
-            # Add acceptances to history
-            acceptance_history.extend(acceptance_temp)
     
     print(f"Optimization complete. Best energy: {best_energy:.6f}")
-    
     
     # Combine optimization results with final sampling results
     results = {

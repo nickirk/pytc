@@ -146,7 +146,7 @@ class SlaterJastrow:
         In the redundant summation form J = exp(0.5*∑ᵢⱼ u(rᵢ,rⱼ)), we have:
         ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)/2 + ∑ⱼ≠ᵢ ∇ᵢu(rⱼ,rᵢ)/2
         
-        For a symmetric u function where u(rᵢ,rⱼ) = -u(rⱼ,rᵢ), this simplifies to:
+        For a symmetric u function where u(rᵢ,rⱼ) = -u(rⱼ,rⱼ), this simplifies to:
         ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)
         """
         n_electrons = elec_coords.shape[0]
@@ -345,6 +345,81 @@ class SlaterJastrow:
         else:
             return lap_up_jax, lap_down_jax
 
+    def _get_matrices_pure(self, elec_coords_batch):
+        """Wrapper for _get_matrices using pure_callback for JIT compatibility."""
+        # Determine output shapes based on input
+        batch_size = elec_coords_batch.shape[0] if len(elec_coords_batch.shape) > 2 else 1
+        n_up = self.dets[0].n_alpha
+        n_down = self.n_electrons - n_up
+        
+        # Define shapes and dtypes for the expected outputs
+        up_shape = (batch_size, n_up, n_up) if batch_size > 1 else (n_up, n_up)
+        down_shape = (batch_size, n_down, n_down) if batch_size > 1 else (n_down, n_down)
+        
+        # Define the function to pass to pure_callback
+        def get_matrices_callback(coords):
+            return self._get_matrices(coords)
+        
+        # Use pure_callback to isolate the non-traceable computation
+        slater_up, slater_down = jax.pure_callback(
+            get_matrices_callback,
+            (jax.ShapeDtypeStruct(up_shape, jnp.float64), 
+             jax.ShapeDtypeStruct(down_shape, jnp.float64)),
+            elec_coords_batch
+        )
+        
+        return slater_up, slater_down
+    
+    def _get_gradients_pure(self, elec_coords_batch):
+        """Wrapper for _get_gradients using pure_callback for JIT compatibility."""
+        # Determine output shapes based on input
+        batch_size = elec_coords_batch.shape[0] if len(elec_coords_batch.shape) > 2 else 1
+        n_up = self.dets[0].n_alpha
+        n_down = self.n_electrons - n_up
+        
+        # Define shapes and dtypes for the expected outputs
+        up_shape = (batch_size, n_up, n_up, 3) if batch_size > 1 else (n_up, n_up, 3)
+        down_shape = (batch_size, n_down, n_down, 3) if batch_size > 1 else (n_down, n_down, 3)
+        
+        # Define the function to pass to pure_callback
+        def get_gradients_callback(coords):
+            return self._get_gradients(coords)
+        
+        # Use pure_callback to isolate the non-traceable computation
+        grad_up, grad_down = jax.pure_callback(
+            get_gradients_callback,
+            (jax.ShapeDtypeStruct(up_shape, jnp.float64), 
+             jax.ShapeDtypeStruct(down_shape, jnp.float64)),
+            elec_coords_batch
+        )
+        
+        return grad_up, grad_down
+    
+    def _get_laplacians_pure(self, elec_coords_batch):
+        """Wrapper for _get_laplacians using pure_callback for JIT compatibility."""
+        # Determine output shapes based on input
+        batch_size = elec_coords_batch.shape[0] if len(elec_coords_batch.shape) > 2 else 1
+        n_up = self.dets[0].n_alpha
+        n_down = self.n_electrons - n_up
+        
+        # Define shapes and dtypes for the expected outputs
+        up_shape = (batch_size, n_up, n_up) if batch_size > 1 else (n_up, n_up)
+        down_shape = (batch_size, n_down, n_down) if batch_size > 1 else (n_down, n_down)
+        
+        # Define the function to pass to pure_callback
+        def get_laplacians_callback(coords):
+            return self._get_laplacians(coords)
+        
+        # Use pure_callback to isolate the non-traceable computation
+        lap_up, lap_down = jax.pure_callback(
+            get_laplacians_callback,
+            (jax.ShapeDtypeStruct(up_shape, jnp.float64), 
+             jax.ShapeDtypeStruct(down_shape, jnp.float64)),
+            elec_coords_batch
+        )
+        
+        return lap_up, lap_down
+
     @property
     def n_up(self):
         """Number of up-spin electrons."""
@@ -354,7 +429,7 @@ class SlaterJastrow:
     def n_down(self):
         """Number of down-spin electrons."""
         return self.n_electrons - self.n_up
-
+    @partial(jax.jit, static_argnums=(0,))
     def local_energy(self, elec_coords_batch):
         """Compute local energy for a batch of electron configurations.
         
@@ -375,10 +450,10 @@ class SlaterJastrow:
         # Use vmap to compute Jastrow terms for all walkers
         grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(self._compute_jastrow_terms)(elec_coords_batch)
         
-        # Get batched matrices, gradients, and laplacians directly
-        slater_up_batch, slater_down_batch = self._get_matrices(elec_coords_batch)
-        grad_up_batch, grad_down_batch = self._get_gradients(elec_coords_batch)
-        lap_up_batch, lap_down_batch = self._get_laplacians(elec_coords_batch)
+        # Get batched matrices, gradients, and laplacians using pure_callback wrappers
+        slater_up_batch, slater_down_batch = self._get_matrices_pure(elec_coords_batch)
+        grad_up_batch, grad_down_batch = self._get_gradients_pure(elec_coords_batch)
+        lap_up_batch, lap_down_batch = self._get_laplacians_pure(elec_coords_batch)
         
         # Now we'll use vmap to process all walkers at once
         energies = jax.vmap(self._compute_single_walker_energy)(
