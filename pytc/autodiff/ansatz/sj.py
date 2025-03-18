@@ -116,7 +116,7 @@ class SlaterJastrow:
         diag_mask = 1.0 - jnp.eye(n_electrons)
         
         # Use redundant summation form (multiply by 1/2)
-        return jnp.exp(0.5*jnp.sum(all_pairs * diag_mask))
+        return jnp.exp(1./2. * jnp.sum(all_pairs * diag_mask))
     
     @property
     def n_electrons(self):
@@ -441,3 +441,82 @@ class SlaterJastrow:
         E_L = E_L + self._ion_ion_potential
         
         return jnp.real(E_L)  # Ensure real value
+
+    def quantum_force(self, elec_coords_batch, cutoff=1.0):
+        """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
+        
+        Args:
+            elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
+                           or (n_electrons, 3) for a single walker
+            cutoff: Maximum allowed magnitude for quantum forces
+                           
+        Returns:
+            Array of quantum forces with shape (n_walkers, n_electrons, 3)
+            or shape (n_electrons, 3) for a single walker
+        """
+        # Handle single walker case by adding a batch dimension
+        single_walker = False
+        if len(elec_coords_batch.shape) == 2:  # (n_electrons, 3)
+            elec_coords_batch = elec_coords_batch[None, ...]  # Add batch dimension
+            single_walker = True
+        
+        # Compute Jastrow gradient contributions
+        grad_J_over_J_batch = jax.jit(jax.vmap(lambda coords: self._compute_jastrow_terms(coords)[0]))(elec_coords_batch)
+        
+        # Get determinant gradient contributions
+        slater_up_batch, slater_down_batch = self._get_matrices(elec_coords_batch)
+        grad_up_batch, grad_down_batch = self._get_gradients(elec_coords_batch)
+        
+        # Build quantum forces with vmap
+        forces = jax.jit(jax.vmap(self._compute_quantum_force))(
+            elec_coords_batch, 
+            grad_J_over_J_batch,
+            slater_up_batch,
+            slater_down_batch,
+            grad_up_batch,
+            grad_down_batch
+        )
+
+        # Apply cutoff to quantum forces while maintaining direction
+        # Calculate force magnitudes (shape: batch, n_electrons)
+        force_magnitudes = jnp.linalg.norm(forces, axis=-1)
+        
+        # Create scaling factors: min(1.0, cutoff/magnitude)
+        # This preserves direction while limiting magnitude
+        scaling_factors = jnp.minimum(1.0, cutoff / (force_magnitudes + 1e-10))
+        
+        # Reshape for broadcasting (add dimension for x,y,z components)
+        scaling_factors = scaling_factors[..., jnp.newaxis]
+        
+        # Apply scaling to forces
+        clipped_forces = forces * scaling_factors
+        
+        # Return single value if input was a single walker
+        if single_walker:
+            return clipped_forces[0]
+        else:
+            return clipped_forces
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _compute_quantum_force(self, coords, grad_J_over_J, slater_up, slater_down, grad_up, grad_down):
+        """Compute quantum force for a single configuration."""
+        n_up = self.n_up
+        
+        # Slice gradient contributions for up/down electrons
+        grad_J_up = grad_J_over_J[:n_up]      # shape: (n_up, 3)
+        grad_J_down = grad_J_over_J[n_up:]    # shape: (n_down, 3)
+        
+        # Build inverses
+        inv_up = jnp.linalg.inv(slater_up)
+        inv_down = jnp.linalg.inv(slater_down)
+        
+        # Compute gradient of log determinant part: ∇ln|D|/D
+        grad_logD_up = jnp.einsum('ij,ijk->ik', inv_up, grad_up)
+        grad_logD_down = jnp.einsum('ij,ijk->ik', inv_down, grad_down)
+        
+        # Combine gradient contributions: 2∇ψ/ψ = 2(∇J/J + ∇D/D)
+        quantum_force_up = 2.0 * (grad_J_up + grad_logD_up)
+        quantum_force_down = 2.0 * (grad_J_down + grad_logD_down)
+        
+        # Combine and return
+        return jnp.concatenate([quantum_force_up, quantum_force_down], axis=0)

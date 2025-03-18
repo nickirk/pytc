@@ -236,14 +236,13 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     
     return walkers
 
-def perform_mcmc_step(ansatz, walkers, step_size_up, step_size_down, key):
+def perform_mcmc_step(ansatz, walkers, step_size, key):
     """Perform one full MCMC step for both up and down electrons.
     
     Args:
         ansatz: Wavefunction object
         walkers: Current walker configurations
-        step_size_up: Step size for up-spin electrons
-        step_size_down: Step size for down-spin electrons
+        step_size: Step size, std dev of Gaussian proposal
         key: PRNG key
     
     Returns:
@@ -251,26 +250,25 @@ def perform_mcmc_step(ansatz, walkers, step_size_up, step_size_down, key):
     """
     # Move up-spin electrons with metropolis_hastings
     key, subkey = random.split(key)
-    walkers, up_acceptance = metropolis_hastings(ansatz, walkers, step_size_up, subkey)
+    walkers, up_acceptance = metropolis_hastings(ansatz, walkers, step_size, subkey)
     
     # Move down-spin electrons with metropolis_hastings
     key, subkey = random.split(key)
-    walkers, down_acceptance = metropolis_hastings(ansatz, walkers, step_size_down, subkey)
+    walkers, down_acceptance = metropolis_hastings(ansatz, walkers, step_size, subkey)
     
     # Average the acceptance rates from up and down moves
     avg_acceptance = (up_acceptance + down_acceptance) / 2
     
     return walkers, avg_acceptance, key
 
-def burn_in(ansatz, walkers, n_steps, step_size_up, step_size_down, key, report_interval=100):
+def burn_in(ansatz, walkers, n_steps, step_size, key, report_interval=100):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
         ansatz: Wavefunction object
         walkers: Initial walker configurations
         n_steps: Number of burn-in steps
-        step_size_up: Step size for up-spin electrons
-        step_size_down: Step size for down-spin electrons
+        step_size: Step size for MCMC proposals, std dev of Gaussian
         key: PRNG key
         report_interval: How often to print progress
     
@@ -285,7 +283,7 @@ def burn_in(ansatz, walkers, n_steps, step_size_up, step_size_down, key, report_
     print(f"Starting burn-in with {n_steps} steps...")
     for step in range(n_steps):
         walkers, acceptance, key = perform_mcmc_step(
-            ansatz, walkers, step_size_up, step_size_down, key)
+            ansatz, walkers, step_size, key)
         acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
@@ -358,12 +356,146 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
         opt_kwargs = {}
         
     if optimizer_type.lower() == "adam":
-        return optax.adam(learning_rate=learning_rate, **opt_kwargs)
+        return optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=learning_rate, **opt_kwargs))
     elif optimizer_type.lower() == "sgd":
         return optax.sgd(learning_rate=learning_rate, **opt_kwargs)
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
+def _compute_green_function(r_target, r_source, quantum_force, time_step):
+    """Compute transition probability density for drift-diffusion.
+    
+    G(R→R') = exp(-(R'-R-D*F(R)*τ)²/(2*τ))
+    
+    Args:
+        r_target: Target position array
+        r_source: Source position array
+        quantum_force: Quantum force at source
+        time_step: Time step
+        
+    Returns:
+        Green's function values for transitions
+    """
+    # Calculate the expected drift
+    drift = 0.5 * quantum_force * time_step
+    
+    # Calculate the difference between actual and drift-guided movement
+    diff = r_target - r_source - drift
+    
+    # Calculate the exponent of the Green's function
+    exponent = -jnp.sum(diff**2, axis=(-2, -1)) / (2.0 * time_step)
+    
+    # Return the Green's function values
+    return jnp.exp(exponent)
+
+def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key):
+    """Perform one step of Metropolis-Hastings with importance sampling (drift).
+    
+    Args:
+        ansatz: Wavefunction object with __call__ method that returns ψ(R)
+               Should also have a quantum_force method
+        walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
+        time_step: Time step for the drift-diffusion process
+        key: PRNG key
+    
+    Returns:
+        Tuple containing:
+        - new_walkers: New walker configurations after one sampling step
+        - acceptance_rate: Fraction of proposals that were accepted
+    """
+    # Compute initial wavefunction values and quantum forces
+    psi_values = ansatz(walkers)
+    
+    # Compute quantum force: F = 2∇ψ/ψ (gradient of log wavefunction)
+    quantum_forces = ansatz.quantum_force(walkers)
+    
+    # Generate drift-diffusion proposals:
+    # R' = R + D*F(R)*τ + √(2D*τ)*χ (D=0.5 in atomic units)
+    drift_term = 0.5 * quantum_forces * time_step
+    diffusion_coef = jnp.sqrt(time_step)
+    
+    key, subkey = random.split(key)
+    random_term = diffusion_coef * random.normal(subkey, walkers.shape)
+    
+    # Combine drift and diffusion terms
+    proposals = walkers + drift_term + random_term
+    
+    # Compute new wavefunction values and quantum forces at proposed positions
+    new_psi_values = ansatz(proposals)
+    new_quantum_forces = ansatz.quantum_force(proposals)
+    
+    # Modified acceptance probability for importance sampling
+    # G(R→R') = exp(-(R'-R-D*F(R)*τ)²/(2*τ))
+    forward_density = _compute_green_function(proposals, walkers, quantum_forces, time_step)
+    backward_density = _compute_green_function(walkers, proposals, new_quantum_forces, time_step)
+    
+    # Compute acceptance probabilities with Green's function ratio
+    acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2 * (backward_density / forward_density)
+    
+    # Accept or reject
+    key, subkey = random.split(key)
+    accept_mask = random.uniform(subkey, shape=(walkers.shape[0],)) < acceptance_prob
+    accept_count = jnp.sum(accept_mask)
+    
+    # Create new walkers without modifying input
+    accept_mask_3d = accept_mask[:, jnp.newaxis, jnp.newaxis]
+    new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
+    
+    # Calculate acceptance rate
+    acceptance_rate = float(accept_count) / walkers.shape[0]
+    
+    return new_walkers, acceptance_rate
+
+def perform_mcmc_step_with_importance(ansatz, walkers, time_step, key):
+    """Perform one full MCMC step with importance sampling.
+    
+    Args:
+        ansatz: Wavefunction object
+        walkers: Current walker configurations
+        time_step: Time step for the drift-diffusion process
+        key: PRNG key
+    
+    Returns:
+        Tuple of (new_walkers, acceptance_rate, new_key)
+    """
+    # Move all electrons at once with importance sampling
+    key, subkey = random.split(key)
+    walkers, acceptance = metropolis_hastings_importance_sampling(ansatz, walkers, time_step, subkey)
+    
+    return walkers, acceptance, key
+
+def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, report_interval=100):
+    """Perform burn-in steps for MCMC sampling with importance sampling.
+    
+    Args:
+        ansatz: Wavefunction object
+        walkers: Initial walker configurations
+        n_steps: Number of burn-in steps
+        time_step: Time step for the drift-diffusion process
+        key: PRNG key
+        report_interval: How often to print progress
+    
+    Returns:
+        Tuple of (equilibrated_walkers, acceptance_history, new_key)
+    """
+    acceptance_history = []
+    
+    if n_steps <= 0:
+        return walkers, acceptance_history, key
+        
+    print(f"Starting burn-in with {n_steps} steps using importance sampling...")
+    for step in range(n_steps):
+        walkers, acceptance, key = perform_mcmc_step_with_importance(
+            ansatz, walkers, time_step, key)
+        acceptance_history.append(acceptance)
+        
+        if step % report_interval == 0:
+            print(f"Burn-in step {step}/{n_steps}")
+    
+    print("Burn-in complete.")
+    return walkers, acceptance_history, key
+
+# Modified sample function to support importance sampling
 def sample(
     ansatz, 
     n_walkers: int = 100, 
@@ -372,6 +504,7 @@ def sample(
     thinning: int = 10,
     burn_in_steps: int = 1000,
     initial_walkers=None,
+    use_importance_sampling: bool = False,  # New parameter to toggle importance sampling
     key=None
 ) -> Dict[str, Any]:
     """Perform MCMC sampling for quantum wavefunction.
@@ -380,10 +513,12 @@ def sample(
         ansatz: Wavefunction object with __call__ method that returns ψ(R)
         n_walkers: Number of parallel walkers
         n_steps: Number of MCMC steps for each walker
-        step_size: Standard deviation of Gaussian proposal for MCMC
+        step_size: Standard deviation of Gaussian proposal for regular MCMC
+                  or time step for importance sampling (typically 0.01-0.05)
         thinning: Keep only every `thinning` steps to reduce autocorrelation
         burn_in_steps: Number of initial MCMC steps to discard (equilibration)
         initial_walkers: Optional initial positions, otherwise initialized near nuclei
+        use_importance_sampling: Whether to use importance sampling with drift
         key: PRNG key
     
     Returns:
@@ -395,13 +530,14 @@ def sample(
     # Initialize walkers
     walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
-    # Separate step sizes for up and down electrons can improve sampling
-    step_size_up = step_size 
-    step_size_down = step_size
+    # Perform burn-in with appropriate method
+    if use_importance_sampling:
+        walkers, acceptance_history, key = burn_in_with_importance(
+            ansatz, walkers, burn_in_steps, step_size, key)
+    else:
+        walkers, acceptance_history, key = burn_in(
+            ansatz, walkers, burn_in_steps, step_size, key)
     
-    # Perform burn-in
-    walkers, acceptance_history, key = burn_in(
-        ansatz, walkers, burn_in_steps, step_size_up, step_size_down, key)
     
     if burn_in_steps > 0:
         print("Starting production sampling...")
@@ -416,8 +552,12 @@ def sample(
         start_time = time.time()
         
         # Perform one MCMC step (moves both up and down electrons)
-        walkers, acceptance, key = perform_mcmc_step(
-            ansatz, walkers, step_size_up, step_size_down, key)
+        if use_importance_sampling:
+            walkers, acceptance, key = perform_mcmc_step_with_importance(
+                ansatz, walkers, step_size, key)
+        else:
+            walkers, acceptance, key = perform_mcmc_step(
+                ansatz, walkers, step_size, key)
         acceptance_history.append(acceptance)
         
         # Store samples at thinning interval
@@ -448,6 +588,7 @@ def optimize(
     n_steps: int = 1000, 
     step_size: float = 1.0, 
     burn_in_steps: int = 1000,
+    use_importance_sampling: bool = True,
     thinning: int = 10,
     n_samples: Optional[int] = None,
     initial_walkers=None,
@@ -467,6 +608,7 @@ def optimize(
         n_steps: Number of MCMC steps for each walker in each opt iteration
         step_size: Standard deviation of Gaussian proposal for MCMC
         burn_in_steps: Number of initial MCMC steps to discard (equilibration)
+        use_importance_sampling: Whether to use importance sampling with drift
         thinning: Keep only every `thinning` steps to reduce autocorrelation
         n_samples: If provided, collect this many uncorrelated samples
         initial_walkers: Optional initial positions, otherwise initialized near nuclei
@@ -494,13 +636,12 @@ def optimize(
     # Initialize walkers
     walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
-    # Separate step sizes for up and down electrons can improve sampling
-    step_size_up = step_size 
-    step_size_down = step_size
-    
-    # Perform burn-in
-    walkers, acceptance_history, key = burn_in(
-        ansatz, walkers, burn_in_steps, step_size_up, step_size_down, key)
+    if use_importance_sampling:
+        walkers, acceptance_history, key = burn_in_with_importance(
+            ansatz, walkers, burn_in_steps, step_size, key)
+    else:
+        walkers, acceptance_history, key = burn_in(
+            ansatz, walkers, burn_in_steps, step_size, key)
     
     print("Starting optimization...")
     
@@ -525,6 +666,9 @@ def optimize(
         
         # Compute energies for all walkers
         energies = new_ansatz.local_energy(walkers)
+
+        # clip energies to avoid numerical instability
+        energies = jnp.clip(energies, -50., 50.)
         
         # Compute cost (default: mean energy)
         cost = cost_fn(energies)
@@ -535,6 +679,7 @@ def optimize(
     # Optimization loop
     best_energy = float('inf')
     best_params = None
+    step_times = []
     
     print(f"Starting optimization with {n_opt_steps} steps...")
     for opt_step in range(n_opt_steps):
@@ -567,15 +712,23 @@ def optimize(
         
         # Print progress
         step_time = time.time() - start_time
-        print(f"Opt step {opt_step}/{n_opt_steps}, Energy: {energy_mean:.6f} ± {energy_std:.6f}, Params: {jastrow_params}, Time: {step_time*1000:.2f}ms")
+        step_times.append(step_time)
+        hist_energies = jnp.array(opt_history["energy"])[-200:]
+        print(f"Opt step {opt_step}/{n_opt_steps}, Inst Energy: {energy_mean:.6f} ± {energy_std:.6f}, ") 
+        print(f"Mean Energy: {jnp.mean(hist_energies):.6f} ± {jnp.std(hist_energies)/jnp.sqrt(len(hist_energies))},")
+        print(f"Params: {jastrow_params}, Time: {step_time*1000:.2f}ms")
         
         # Resample configurations for next iteration (except for last step)
         if opt_step < n_opt_steps - 1:
             # Perform MCMC steps to get new samples
             acceptance_temp = []
             for mcmc_step in range(n_steps):
-                walkers, acceptance, key = perform_mcmc_step(
-                    ansatz, walkers, step_size_up, step_size_down, key)
+                if use_importance_sampling:
+                    walkers, acceptance, key = perform_mcmc_step_with_importance(
+                        ansatz, walkers, step_size, key)
+                else:
+                    walkers, acceptance, key = perform_mcmc_step(
+                        ansatz, walkers, step_size, key)
                 acceptance_temp.append(acceptance)
             
             # Add acceptances to history

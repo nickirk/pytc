@@ -156,8 +156,8 @@ class SlaterDet:
                 # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
                 grad_batch[..., d] = np.dot(ao_grads[..., d], self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_electrons, -1)
             
-            grad_up_batch = grad_batch[:, :self.n_alpha]
-            grad_down_batch = grad_batch[:, self.n_alpha:]
+            grad_up_batch = grad_batch[:, :self.n_alpha, :self.n_alpha]
+            grad_down_batch = grad_batch[:, self.n_alpha:, self.n_alpha:]
             
         else:
             # Reshape back to batch form
@@ -264,8 +264,8 @@ class SlaterDet:
         if not self.unrestricted:
             slater_batch = np.dot(ao_vals_all, self.mo_coeff_alpha_occ).reshape(n_walkers, n_electrons, -1)
 
-            slater_up_batch = slater_batch[:,:self.n_alpha]
-            slater_down_batch = slater_batch[:, self.n_alpha:]
+            slater_up_batch = slater_batch[:,:self.n_alpha, :self.n_alpha]
+            slater_down_batch = slater_batch[:, self.n_alpha:, self.n_alpha:]
 
         else:
             # Split AO values by spin - shape: (n_walkers, n_up, nAOs) and (n_walkers, n_down, nAOs)
