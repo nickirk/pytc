@@ -10,7 +10,7 @@ import optax
 import time
 from typing import Dict, Any, Optional, Callable, Tuple
 
-def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key, n_up=None):
+def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key, n_alpha=None):
     """Initialize electron configurations based on atomic positions with proper spin ordering.
     
     Args:
@@ -19,82 +19,82 @@ def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key
         n_electrons: Total number of electrons in the system
         n_walkers: Number of walker configurations to generate
         key: PRNG key for random initialization
-        n_up: Number of up-spin electrons (if None, defaults to n_electrons//2)
+        n_alpha: Number of up-spin electrons (if None, defaults to n_electrons//2)
         
     Returns:
         Array of shape (n_walkers, n_electrons, 3) with initial positions
-        where the first n_up positions are up-spin electrons
+        where the first n_alpha positions are up-spin electrons
     """
     # Initialize electrons near atoms proportional to nuclear charge
     n_atoms = len(atom_charges)
     
-    # Set default n_up if not specified
-    if n_up is None:
-        n_up = n_electrons // 2
+    # Set default n_alpha if not specified
+    if n_alpha is None:
+        n_alpha = n_electrons // 2
         
-    n_down = n_electrons - n_up
+    n_beta = n_electrons - n_alpha
     
     # Use the pairing-based electron distribution algorithm
-    up_counts, down_counts = _distribute_electrons_by_pairing(atom_charges, n_up, n_down)
+    alpha_counts, beta_counts = _distribute_electrons_by_pairing(atom_charges, n_alpha, n_beta)
     
     print(f"Electron distribution by atom:")
-    for i in range(len(up_counts)):
-        print(f"  Atom {i}: {up_counts[i]} up, {down_counts[i]} down")
+    for i in range(len(alpha_counts)):
+        print(f"  Atom {i}: {alpha_counts[i]} up, {beta_counts[i]} down")
     
     # Generate positions for up-spin electrons around each atom
-    up_positions = []
+    alpha_positions = []
     for i in range(n_atoms):
-        n_up_at_atom = up_counts[i]
-        if n_up_at_atom > 0:
+        n_alpha_at_atom = alpha_counts[i]
+        if n_alpha_at_atom > 0:
             # Generate random directions
             key, subkey = random.split(key)
-            directions = random.normal(subkey, (n_walkers, n_up_at_atom, 3))
+            directions = random.normal(subkey, (n_walkers, n_alpha_at_atom, 3))
             directions = directions / jnp.linalg.norm(directions, axis=2, keepdims=True)
             
             # Generate distances (peaked around 0.5 bohr)
             key, subkey = random.split(key)
-            distances = 0.5 + 0.1 * random.normal(subkey, (n_walkers, n_up_at_atom, 1))
+            distances = 0.5 + 0.1 * random.normal(subkey, (n_walkers, n_alpha_at_atom, 1))
             
             # Calculate positions
             atom_pos = atom_coords[i]
             new_positions = atom_pos + directions * distances
-            up_positions.append(new_positions)
+            alpha_positions.append(new_positions)
     
     # Generate positions for down-spin electrons around each atom
-    down_positions = []
+    beta_positions = []
     for i in range(n_atoms):
-        n_down_at_atom = down_counts[i]
-        if n_down_at_atom > 0:
+        n_beta_at_atom = beta_counts[i]
+        if n_beta_at_atom > 0:
             # Generate random directions
             key, subkey = random.split(key)
-            directions = random.normal(subkey, (n_walkers, n_down_at_atom, 3))
+            directions = random.normal(subkey, (n_walkers, n_beta_at_atom, 3))
             directions = directions / jnp.linalg.norm(directions, axis=2, keepdims=True)
             
             # Generate distances (peaked around 0.5 bohr)
             key, subkey = random.split(key)
-            distances = 1 + 0.3 * random.normal(subkey, (n_walkers, n_down_at_atom, 1))
+            distances = 1 + 0.3 * random.normal(subkey, (n_walkers, n_beta_at_atom, 1))
             
             # Calculate positions
             atom_pos = atom_coords[i]
             new_positions = atom_pos + directions * distances
-            down_positions.append(new_positions)
+            beta_positions.append(new_positions)
     
     # Concatenate all up positions and all down positions
-    all_up_positions = jnp.concatenate(up_positions, axis=1) if up_positions else jnp.empty((n_walkers, 0, 3))
-    all_down_positions = jnp.concatenate(down_positions, axis=1) if down_positions else jnp.empty((n_walkers, 0, 3))
+    all_alpha_positions = jnp.concatenate(alpha_positions, axis=1) if alpha_positions else jnp.empty((n_walkers, 0, 3))
+    all_beta_positions = jnp.concatenate(beta_positions, axis=1) if beta_positions else jnp.empty((n_walkers, 0, 3))
     
     # Ensure we have exactly the right number of electrons
-    all_up_positions = all_up_positions[:, :n_up, :]
-    all_down_positions = all_down_positions[:, :n_down, :]
+    all_alpha_positions = all_alpha_positions[:, :n_alpha, :]
+    all_beta_positions = all_beta_positions[:, :n_beta, :]
     
     # Combine up and down positions in correct order
-    all_positions = jnp.concatenate([all_up_positions, all_down_positions], axis=1)
+    all_positions = jnp.concatenate([all_alpha_positions, all_beta_positions], axis=1)
     
-    print(f"Initialized {n_up} up-spin and {n_down} down-spin electrons around {n_atoms} atoms")
+    print(f"Initialized {n_alpha} up-spin and {n_beta} down-spin electrons around {n_atoms} atoms")
     
     return all_positions
 
-def _distribute_electrons_by_pairing(atom_charges, n_up, n_down):
+def _distribute_electrons_by_pairing(atom_charges, n_alpha, n_beta):
     """Distribute electrons across atoms following physical pairing patterns.
     
     This algorithm follows the typical pattern of filling atomic orbitals:
@@ -103,18 +103,18 @@ def _distribute_electrons_by_pairing(atom_charges, n_up, n_down):
     
     Args:
         atom_charges: Array of atomic charges
-        n_up: Total number of up-spin electrons to distribute
-        n_down: Total number of down-spin electrons to distribute
+        n_alpha: Total number of up-spin electrons to distribute
+        n_beta: Total number of down-spin electrons to distribute
         
     Returns:
-        Tuple of (up_counts, down_counts) arrays showing distribution by atom
+        Tuple of (alpha_counts, beta_counts) arrays showing distribution by atom
     """
     n_atoms = len(atom_charges)
-    up_counts = np.zeros(n_atoms, dtype=np.int32)
-    down_counts = np.zeros(n_atoms, dtype=np.int32)
+    alpha_counts = np.zeros(n_atoms, dtype=np.int32)
+    beta_counts = np.zeros(n_atoms, dtype=np.int32)
     
-    remaining_up = n_up
-    remaining_down = n_down
+    remaining_alpha = n_alpha
+    remaining_beta = n_beta
     
     # First pass: distribute electrons following alternating up/down pattern
     for i in range(n_atoms):
@@ -124,14 +124,14 @@ def _distribute_electrons_by_pairing(atom_charges, n_up, n_down):
         # Fill atom with alternating up/down until reaching charge limit
         while atom_electrons < atom_charge:
             # Try to add an up electron if we're at an even position
-            if atom_electrons % 2 == 0 and remaining_up > 0:
-                up_counts[i] += 1
-                remaining_up -= 1
+            if atom_electrons % 2 == 0 and remaining_alpha > 0:
+                alpha_counts[i] += 1
+                remaining_alpha -= 1
                 atom_electrons += 1
             # Then try to add a down electron
-            elif atom_electrons % 2 == 1 and remaining_down > 0:
-                down_counts[i] += 1
-                remaining_down -= 1
+            elif atom_electrons % 2 == 1 and remaining_beta > 0:
+                beta_counts[i] += 1
+                remaining_beta -= 1
                 atom_electrons += 1
             else:
                 # No more electrons of needed type or atom is full
@@ -143,29 +143,29 @@ def _distribute_electrons_by_pairing(atom_charges, n_up, n_down):
     
     # Distribute remaining up electrons
     for i in atoms_by_charge:
-        while (up_counts[i] + down_counts[i] < atom_charges[i]) and remaining_up > 0:
-            up_counts[i] += 1
-            remaining_up -= 1
+        while (alpha_counts[i] + beta_counts[i] < atom_charges[i]) and remaining_alpha > 0:
+            alpha_counts[i] += 1
+            remaining_alpha -= 1
     
     # Distribute remaining down electrons
     for i in atoms_by_charge:
-        while (up_counts[i] + down_counts[i] < atom_charges[i]) and remaining_down > 0:
-            down_counts[i] += 1
-            remaining_down -= 1
+        while (alpha_counts[i] + beta_counts[i] < atom_charges[i]) and remaining_beta > 0:
+            beta_counts[i] += 1
+            remaining_beta -= 1
     
     # If we still have electrons left, add them to the highest charge atoms
     # This could happen if total electrons > sum of charges
     for i in atoms_by_charge:
-        while remaining_up > 0:
-            up_counts[i] += 1
-            remaining_up -= 1
+        while remaining_alpha > 0:
+            alpha_counts[i] += 1
+            remaining_alpha -= 1
     
     for i in atoms_by_charge:
-        while remaining_down > 0:
-            down_counts[i] += 1
-            remaining_down -= 1
+        while remaining_beta > 0:
+            beta_counts[i] += 1
+            remaining_beta -= 1
             
-    return jnp.array(up_counts), jnp.array(down_counts)
+    return jnp.array(alpha_counts), jnp.array(beta_counts)
 
 def metropolis_hastings(ansatz, walkers, step_size, key):
     """Perform one step of Metropolis-Hastings sampling for quantum wavefunction.
@@ -228,11 +228,11 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     atom_coords = ansatz.mol.atom_coords()
     atom_charges = ansatz.mol.atom_charges()
     n_electrons = ansatz.n_electrons
-    n_up = ansatz.n_up
+    n_alpha = ansatz.n_alpha
     
     # Initialize electron positions based on nuclear positions and spin counts
     key, subkey = random.split(key)
-    walkers = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey, n_up=n_up)
+    walkers = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey, n_alpha=n_alpha)
     
     return walkers
 
@@ -250,14 +250,14 @@ def perform_mcmc_step(ansatz, walkers, step_size, key):
     """
     # Move up-spin electrons with metropolis_hastings
     key, subkey = random.split(key)
-    walkers, up_acceptance = metropolis_hastings(ansatz, walkers, step_size, subkey)
+    walkers, alpha_acceptance = metropolis_hastings(ansatz, walkers, step_size, subkey)
     
     # Move down-spin electrons with metropolis_hastings
     key, subkey = random.split(key)
-    walkers, down_acceptance = metropolis_hastings(ansatz, walkers, step_size, subkey)
+    walkers, beta_acceptance = metropolis_hastings(ansatz, walkers, step_size, subkey)
     
     # Average the acceptance rates from up and down moves
-    avg_acceptance = (up_acceptance + down_acceptance) / 2
+    avg_acceptance = (alpha_acceptance + beta_acceptance) / 2
     
     return walkers, avg_acceptance, key
 

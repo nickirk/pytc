@@ -1,9 +1,92 @@
 import numpy as np
 from functools import partial
+import jax
+import jax.numpy as jnp
+from jax import tree_util
 
 from pyscf.dft import numint
 
 einsum = partial(np.einsum, optimize=True)
+
+def value(det, coords):
+    """JAX-compatible wrapper for SlaterDet.value()
+    
+    Args:
+        det: SlaterDet object (static)
+        coords: JAX array of shape (n_walkers, n_electrons, 3)
+        
+    Returns:
+        JAX array of shape (n_walkers,)
+    """
+    def value_callback(coords_np):
+        # Convert to numpy array and call SlaterDet method
+        return np.asarray(det.value(np.array(coords_np)))
+    
+    result_shape = jax.ShapeDtypeStruct((coords.shape[0],), jnp.float64)
+    return jax.pure_callback(value_callback, result_shape, coords)
+
+def grad(det, coords):
+    """JAX-compatible wrapper for SlaterDet.grad()
+    
+    Args:
+        det: SlaterDet object (static)
+        coords: JAX array of shape (n_walkers, n_electrons, 3)
+        
+    Returns:
+        Tuple of JAX arrays for (grad_up, grad_down) with shapes:
+        ((n_walkers, n_alpha, n_alpha, 3), (n_walkers, n_beta, n_beta, 3))
+    """
+    def grad_callback(coords_np):
+        # Call SlaterDet method directly - it handles batching
+        grad_up, grad_down = det.grad(np.array(coords_np))
+        return (np.asarray(grad_up), np.asarray(grad_down))
+    
+    up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha, 3), jnp.float64)
+    down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta, 3), jnp.float64)
+    
+    return jax.pure_callback(grad_callback, (up_shape, down_shape), coords)
+
+def laplacian(det, coords):
+    """JAX-compatible wrapper for SlaterDet.laplacian()
+    
+    Args:
+        det: SlaterDet object (static)
+        coords: JAX array of shape (n_walkers, n_electrons, 3)
+        
+    Returns:
+        Tuple of JAX arrays for (lap_up, lap_down) with shapes:
+        ((n_walkers, n_alpha, n_alpha), (n_walkers, n_beta, n_beta))
+    """
+    def laplacian_callback(coords_np):
+        # Call SlaterDet method directly - it handles batching
+        lap_up, lap_down = det.laplacian(np.array(coords_np))
+        return (np.asarray(lap_up), np.asarray(lap_down))
+    
+    up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
+    down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
+    
+    return jax.pure_callback(laplacian_callback, (up_shape, down_shape), coords)
+
+def matrix(det, coords):
+    """JAX-compatible wrapper for SlaterDet.matrix()
+    
+    Args:
+        det: SlaterDet object (static)
+        coords: JAX array of shape (n_walkers, n_electrons, 3)
+        
+    Returns:
+        Tuple of JAX arrays for (slater_up, slater_down) with shapes:
+        ((n_walkers, n_alpha, n_alpha), (n_walkers, n_beta, n_beta))
+    """
+    def matrix_callback(coords_np):
+        # Call SlaterDet method directly - it handles batching
+        slater_up, slater_down = det.matrix(np.array(coords_np))
+        return (np.asarray(slater_up), np.asarray(slater_down))
+    
+    up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
+    down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
+    
+    return jax.pure_callback(matrix_callback, (up_shape, down_shape), coords)
 
 class SlaterDet:
     def __init__(self, mol, mo_coeff=None, nelec=None, excitations=None):
@@ -428,3 +511,47 @@ class SlaterDet:
             return coords, False
         else:
             return coords[np.newaxis, :, :], True
+    
+    def tree_flatten(self):
+        """Flatten the SlaterDet for JAX PyTree handling."""
+        # Dynamic values that can be transformed by JAX
+        dynamic_values = (
+            jnp.array(self.mo_coeff_alpha), 
+            jnp.array(self.mo_coeff_beta),
+            jnp.array(self.mo_coeff_alpha_occ),
+            jnp.array(self.mo_coeff_beta_occ),
+            # Convert Python lists to JAX arrays
+            jnp.array(self.alpha_occ),
+            jnp.array(self.beta_occ)
+        )
+        
+        # Static values that won't be transformed (including PySCF objects)
+        static_dict = {
+            'mol': self.mol,
+            'n_alpha': self.n_alpha,
+            'n_beta': self.n_beta,
+            'unrestricted': self.unrestricted
+        }
+        
+        return (dynamic_values, static_dict)
+    
+    @classmethod
+    def tree_unflatten(cls, static_dict, dynamic_values):
+        """Reconstruct a SlaterDet from flattened data."""
+        mo_coeff_alpha, mo_coeff_beta, mo_coeff_alpha_occ, mo_coeff_beta_occ, alpha_occ, beta_occ = dynamic_values
+        
+        # Create a new instance with required parameters
+        instance = cls(static_dict['mol'], 
+                       [mo_coeff_alpha, mo_coeff_beta] if static_dict['unrestricted'] else mo_coeff_alpha,
+                       (static_dict['n_alpha'], static_dict['n_beta']))
+        
+        # Override the computed attributes with provided values
+        instance.mo_coeff_alpha_occ = mo_coeff_alpha_occ
+        instance.mo_coeff_beta_occ = mo_coeff_beta_occ
+        instance.alpha_occ = alpha_occ.tolist()
+        instance.beta_occ = beta_occ.tolist()
+        
+        return instance
+
+# Register SlaterDet as a custom PyTree node
+tree_util.register_pytree_node_class(SlaterDet)

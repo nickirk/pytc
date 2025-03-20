@@ -423,6 +423,76 @@ class TestAnsatzH2(unittest.TestCase):
             # check the total potential
             if i < len(potentials):
                 self.assertAlmostEqual(potentials[i], expected_total, delta=1e-6)
+    
+    def test_param_gradient(self):
+        """Test parameter gradient calculation."""
+        # For our current setup:
+        # - Jastrow with parameter a=0.5: exp(0.5*a*r_ij)
+        # - Single determinant
+        # - Test positions at [0.0, 0.1, 0.0] and [0.0, 0.1, 0.742]
+        
+        # Compute the distance between electrons
+        electron_dist = jnp.linalg.norm(self.test_pos[0] - self.test_pos[1])
+        self.assertAlmostEqual(electron_dist, 0.742, places=3)
+        
+        # Create a function to get the wavefunction value for a given Jastrow parameter
+        def wf_value(param):
+            # Create Jastrow with this parameter
+            temp_jastrow = Poly(jnp.array([param]))
+            # Create ansatz 
+            temp_ansatz = SlaterJastrow(self.mol, temp_jastrow, [self.det], self.coeffs)
+            # Return wavefunction value
+            return temp_ansatz(self.test_pos)
+        
+        # Use JAX's automatic differentiation to compute gradient
+        param_grad = jax.grad(wf_value)(0.5)
+        
+        # Calculate expected gradient analytically:
+        # For Poly Jastrow with a single parameter a, the implementation is:
+        # J = exp(0.5 * sum_ij param * |r_i - r_j|)
+        # 
+        # For two electrons:
+        # J = exp(0.5 * param * |r_1 - r_2|)
+        # dJ/dparam = J * 0.5 * |r_1 - r_2|
+        # dψ/dparam = ψ * (dJ/dparam) = ψ * 0.5 * |r_1 - r_2|
+        
+        # Get current wavefunction value
+        current_wf = self.ansatz(self.test_pos)
+        
+        # Calculate dJ/da for this electron configuration
+        # For two electrons, there's one term: 0.5 * |r_1 - r_2|
+        dj_da = electron_dist  # The full electron distance 
+        
+        # Expected gradient: ψ × dJ/da = ψ × 0.5 × |r_1 - r_2|
+        expected_grad = float(current_wf * dj_da)
+        
+        # Compare with JAX's gradient
+        self.assertAlmostEqual(float(param_grad), expected_grad, places=8)
+        
+        # Also test with a different parameter value
+        different_param = 1.0
+        # Create Jastrow with different parameter
+        different_jastrow = Poly(jnp.array([different_param]))
+        # Create ansatz
+        different_ansatz = SlaterJastrow(self.mol, different_jastrow, [self.det], self.coeffs)
+        
+        # Get wavefunction value with different parameter
+        different_wf = different_ansatz(self.test_pos)
+        
+        # The dJ/da is the same (electron_dist), but the wavefunction value is different
+        different_expected_grad = float(different_wf * dj_da)
+        
+        # Use JAX's automatic differentiation to compute gradient at the different parameter
+        different_param_grad = jax.grad(wf_value)(different_param)
+        
+        # Compare with JAX's gradient
+        self.assertAlmostEqual(float(different_param_grad), different_expected_grad, places=8)
+        
+        # Test that gradient is in correct direction
+        self.assertGreater(different_param, 0.5)  # Parameter increased
+        ratio = different_wf / current_wf
+        self.assertGreater(ratio, 1.0)  # Wavefunction increased
+        
 
 if __name__ == '__main__':
     unittest.main()

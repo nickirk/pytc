@@ -6,6 +6,8 @@ import jax.numpy as jnp
 from typing import List, Any
 from functools import partial
 
+from pytc.autodiff.ansatz.det import value, grad, laplacian, matrix
+
 
 class SlaterJastrow:
     """Quantum many-body wavefunction ansatz combining Jastrow factor with Slater determinants."""
@@ -66,39 +68,28 @@ class SlaterJastrow:
             Array of wavefunction values with shape (n_walkers,)
             or a single value for a single walker
         """
-        # Handle single walker case by adding a batch dimension
-        single_walker = False
-        if len(elec_coords_batch.shape) == 2:  # (n_electrons, 3)
-            elec_coords_batch = elec_coords_batch[None, ...]  # Add batch dimension
-            single_walker = True
         
         # Vectorize Jastrow calculation over batch dimension
         jastrow_vals = jax.jit(jax.vmap(self._compute_jastrow_value))(elec_coords_batch)
         
-        # Convert to NumPy for determinant calculations
-        elec_coords_batch_np = np.array(elec_coords_batch)
-        
-        # Use new batched determinant evaluation
+        # Use JAX wrapper for determinant values
         det_vals = []
         for det in self.dets:
-            det_batch_vals = det.value(elec_coords_batch_np)  # Now returns values for all walkers at once
+            # Convert to JAX array if needed
+            coords_jax = jnp.asarray(elec_coords_batch)
+            # Use the JAX-compatible value function
+            det_batch_vals = value(det, coords_jax)
             det_vals.append(det_batch_vals)
             
         # Combine determinant values using linear coefficients
-        det_vals_array = np.array(det_vals).transpose()  # Shape (n_walkers, n_dets)
-        linear_combo = np.sum(np.array(self.linear_coeffs) * det_vals_array, axis=1)
-        
-        # Convert to JAX array
-        det_linear_combos = jnp.array(linear_combo)
+        det_vals_array = jnp.array(det_vals).transpose()  # Shape (n_walkers, n_dets)
+        linear_combo = jnp.sum(self.linear_coeffs * det_vals_array, axis=1)
         
         # Multiply Jastrow and determinant parts
-        psi_vals = jastrow_vals * det_linear_combos
+        psi_vals = jastrow_vals * linear_combo
         
         # Return single value if input was a single walker
-        if single_walker:
-            return psi_vals[0]
-        else:
-            return psi_vals
+        return psi_vals
 
     # Use partial with static_argnums to specify that 'self' is static
     @partial(jax.jit, static_argnums=(0,))
@@ -144,7 +135,7 @@ class SlaterJastrow:
         """Compute ∇J/J and ∇²J/J for all electrons using redundant summation form.
         
         In the redundant summation form J = exp(0.5*∑ᵢⱼ u(rᵢ,rⱼ)), we have:
-        ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)/2 + ∑ⱼ≠ᵢ ∇ᵢu(rⱼ,rᵢ)/2
+        ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)/2 + ∑ⱼ≠ᵢ ∇ᵢu(rⱼ,rⱼ)/2
         
         For a symmetric u function where u(rᵢ,rⱼ) = -u(rⱼ,rⱼ), this simplifies to:
         ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)
@@ -160,13 +151,7 @@ class SlaterJastrow:
         # Compute all pairs at once
         all_grads, all_laps = vmap_all_grads(elec_coords, elec_coords)
 
-        # The shape of all_grads is (n_electrons, n_electrons, 3)
-        # To symmetrize, we need to swap the first two dimensions (electron indices)
-        # not the last two dimensions (which would mix spatial coordinates with electron indices)
-        #all_grads =  0.5 * (all_grads - jnp.swapaxes(all_grads, 0, 1))
-
         
-        # Create a mask to exclude diagonal elements (no self-interaction)
         # TODO: check if it is needed, since when ri=rj, the value is zero
         diag_mask = 1.0 - jnp.eye(n_electrons)
         diag_mask_3d = diag_mask[..., None]  # Add dimension for xyz coordinates
@@ -188,14 +173,14 @@ class SlaterJastrow:
         return grad_J_over_J, lap_J_over_J
     
     @partial(jax.jit, static_argnums=(0,))
-    def _compute_potential_matrix(self, elec_coords, slater_up, slater_down):
+    def _compute_potential_matrix(self, elec_coords, slater_alpha, slater_beta):
         """Compute potential energy part of B matrix using vmap.
         
         Efficiently computes both electron-nuclear and electron-electron
         potential energy interactions, with careful handling to avoid
         double-counting or self-interactions.
         """
-        n_up = self.dets[0].n_alpha
+        n_alpha = self.dets[0].n_alpha
         n_electrons = len(elec_coords)
         
         # Electron-nuclear potential with regularization
@@ -216,12 +201,12 @@ class SlaterJastrow:
             return jnp.sum(potentials, axis=1)  # Shape: (n_elec,)
         
         # Use JAX-friendly slicing with jnp.take to avoid potential issues with direct slicing
-        up_coords = jnp.take(elec_coords, jnp.arange(n_up), axis=0)
-        down_coords = jnp.take(elec_coords, jnp.arange(n_up, n_electrons), axis=0)
+        alpha_coords = jnp.take(elec_coords, jnp.arange(n_alpha), axis=0)
+        beta_coords = jnp.take(elec_coords, jnp.arange(n_alpha, n_electrons), axis=0)
         
         # Calculate electron-nuclear potentials directly without using vmap
-        V_en_up = e_n_potential(up_coords)
-        V_en_down = e_n_potential(down_coords)
+        V_en_alpha = e_n_potential(alpha_coords)
+        V_en_beta = e_n_potential(beta_coords)
         
         # More efficient electron-electron potential using vmap
         def pairwise_distance(r_i, r_j):
@@ -244,191 +229,27 @@ class SlaterJastrow:
         # Sum interactions for each electron
         e_e_pot = 0.5 * jnp.sum(all_e_e_pot, axis=1)
         
-        # Extract up and down electron potentials
-        V_ee_up = e_e_pot[:n_up, None]
-        V_ee_down = e_e_pot[n_up:, None]
+        # Extract alpha and beta electron potentials
+        V_ee_alpha = e_e_pot[:n_alpha, None]
+        V_ee_beta = e_e_pot[n_alpha:, None]
         
         # Combine potentials with orbital values
-        B_up = (V_en_up + V_ee_up) * slater_up
-        B_down = (V_en_down + V_ee_down) * slater_down
+        B_alpha = (V_en_alpha + V_ee_alpha) * slater_alpha
+        B_beta = (V_en_beta + V_ee_beta) * slater_beta
         
-        return B_up, B_down
+        return B_alpha, B_beta
 
-    # Create wrappers for matrix, grad, laplacian that use NumPy conversion
-    def _get_matrices(self, elec_coords_batch):
-        """Get Slater matrices with NumPy conversion.
-        
-        Args:
-            elec_coords_batch: Array of shape (n_walkers, n_electrons, 3)
-                              or (n_electrons, 3) for a single walker
-        
-        Returns:
-            tuple: (slater_up, slater_down) with appropriate batch dimensions
-        """
-        # Ensure batch dimension
-        single_walker = False
-        if len(elec_coords_batch.shape) == 2:
-            elec_coords_batch = elec_coords_batch[None, ...]
-            single_walker = True
-            
-        # Convert to NumPy
-        elec_coords_batch_np = np.array(elec_coords_batch)
-        
-        # Use batched matrix calculation
-        slater_up, slater_down = self.dets[0].matrix(elec_coords_batch_np)
-        
-        # Convert to JAX arrays
-        slater_up_jax = jnp.array(slater_up)
-        slater_down_jax = jnp.array(slater_down)
-        
-        # Return appropriately based on input shape
-        if single_walker:
-            return slater_up_jax[0], slater_down_jax[0]  # Extract single walker data
-        else:
-            return slater_up_jax, slater_down_jax
-    
-    def _get_gradients(self, elec_coords_batch):
-        """Get gradients of Slater matrices with NumPy conversion.
-        
-        Args:
-            elec_coords_batch: Array of shape (n_walkers, n_electrons, 3)
-                              or (n_electrons, 3) for a single walker
-        """
-        # Ensure batch dimension
-        single_walker = False
-        if len(elec_coords_batch.shape) == 2:
-            elec_coords_batch = elec_coords_batch[None, ...]
-            single_walker = True
-            
-        # Convert to NumPy
-        elec_coords_batch_np = np.array(elec_coords_batch)
-        
-        # Use batched gradient calculation
-        grad_up, grad_down = self.dets[0].grad(elec_coords_batch_np)
-        
-        # Convert to JAX arrays
-        grad_up_jax = jnp.array(grad_up)
-        grad_down_jax = jnp.array(grad_down)
-        
-        # Return appropriately based on input shape
-        if single_walker:
-            return grad_up_jax[0], grad_down_jax[0]  # Extract single walker data
-        else:
-            return grad_up_jax, grad_down_jax
-    
-    def _get_laplacians(self, elec_coords_batch):
-        """Get laplacians of Slater matrices with NumPy conversion.
-        
-        Args:
-            elec_coords_batch: Array of shape (n_walkers, n_electrons, 3)
-                              or (n_electrons, 3) for a single walker
-        """
-        # Ensure batch dimension
-        single_walker = False
-        if len(elec_coords_batch.shape) == 2:
-            elec_coords_batch = elec_coords_batch[None, ...]
-            single_walker = True
-            
-        # Convert to NumPy
-        elec_coords_batch_np = np.array(elec_coords_batch)
-        
-        # Use batched laplacian calculation
-        lap_up, lap_down = self.dets[0].laplacian(elec_coords_batch_np)
-        
-        # Convert to JAX arrays
-        lap_up_jax = jnp.array(lap_up)
-        lap_down_jax = jnp.array(lap_down)
-        
-        # Return appropriately based on input shape
-        if single_walker:
-            return lap_up_jax[0], lap_down_jax[0]  # Extract single walker data
-        else:
-            return lap_up_jax, lap_down_jax
-
-    def _get_matrices_pure(self, elec_coords_batch):
-        """Wrapper for _get_matrices using pure_callback for JIT compatibility."""
-        # Determine output shapes based on input
-        batch_size = elec_coords_batch.shape[0] if len(elec_coords_batch.shape) > 2 else 1
-        n_up = self.dets[0].n_alpha
-        n_down = self.n_electrons - n_up
-        
-        # Define shapes and dtypes for the expected outputs
-        up_shape = (batch_size, n_up, n_up) if batch_size > 1 else (n_up, n_up)
-        down_shape = (batch_size, n_down, n_down) if batch_size > 1 else (n_down, n_down)
-        
-        # Define the function to pass to pure_callback
-        def get_matrices_callback(coords):
-            return self._get_matrices(coords)
-        
-        # Use pure_callback to isolate the non-traceable computation
-        slater_up, slater_down = jax.pure_callback(
-            get_matrices_callback,
-            (jax.ShapeDtypeStruct(up_shape, jnp.float64), 
-             jax.ShapeDtypeStruct(down_shape, jnp.float64)),
-            elec_coords_batch
-        )
-        
-        return slater_up, slater_down
-    
-    def _get_gradients_pure(self, elec_coords_batch):
-        """Wrapper for _get_gradients using pure_callback for JIT compatibility."""
-        # Determine output shapes based on input
-        batch_size = elec_coords_batch.shape[0] if len(elec_coords_batch.shape) > 2 else 1
-        n_up = self.dets[0].n_alpha
-        n_down = self.n_electrons - n_up
-        
-        # Define shapes and dtypes for the expected outputs
-        up_shape = (batch_size, n_up, n_up, 3) if batch_size > 1 else (n_up, n_up, 3)
-        down_shape = (batch_size, n_down, n_down, 3) if batch_size > 1 else (n_down, n_down, 3)
-        
-        # Define the function to pass to pure_callback
-        def get_gradients_callback(coords):
-            return self._get_gradients(coords)
-        
-        # Use pure_callback to isolate the non-traceable computation
-        grad_up, grad_down = jax.pure_callback(
-            get_gradients_callback,
-            (jax.ShapeDtypeStruct(up_shape, jnp.float64), 
-             jax.ShapeDtypeStruct(down_shape, jnp.float64)),
-            elec_coords_batch
-        )
-        
-        return grad_up, grad_down
-    
-    def _get_laplacians_pure(self, elec_coords_batch):
-        """Wrapper for _get_laplacians using pure_callback for JIT compatibility."""
-        # Determine output shapes based on input
-        batch_size = elec_coords_batch.shape[0] if len(elec_coords_batch.shape) > 2 else 1
-        n_up = self.dets[0].n_alpha
-        n_down = self.n_electrons - n_up
-        
-        # Define shapes and dtypes for the expected outputs
-        up_shape = (batch_size, n_up, n_up) if batch_size > 1 else (n_up, n_up)
-        down_shape = (batch_size, n_down, n_down) if batch_size > 1 else (n_down, n_down)
-        
-        # Define the function to pass to pure_callback
-        def get_laplacians_callback(coords):
-            return self._get_laplacians(coords)
-        
-        # Use pure_callback to isolate the non-traceable computation
-        lap_up, lap_down = jax.pure_callback(
-            get_laplacians_callback,
-            (jax.ShapeDtypeStruct(up_shape, jnp.float64), 
-             jax.ShapeDtypeStruct(down_shape, jnp.float64)),
-            elec_coords_batch
-        )
-        
-        return lap_up, lap_down
 
     @property
-    def n_up(self):
-        """Number of up-spin electrons."""
+    def n_alpha(self):
+        """Number of alpha-spin electrons."""
         return self.dets[0].n_alpha if self.dets else 0
 
     @property
-    def n_down(self):
-        """Number of down-spin electrons."""
-        return self.n_electrons - self.n_up
+    def n_beta(self):
+        """Number of beta-spin electrons."""
+        return self.n_electrons - self.n_alpha
+    
     @partial(jax.jit, static_argnums=(0,))
     def local_energy(self, elec_coords_batch):
         """Compute local energy for a batch of electron configurations.
@@ -441,82 +262,94 @@ class SlaterJastrow:
             Array of local energy values with shape (n_walkers,)
             or a single value for a single walker
         """
-        # Handle single walker case by adding a batch dimension
-        single_walker = False
-        if len(elec_coords_batch.shape) == 2:  # (n_electrons, 3)
-            elec_coords_batch = elec_coords_batch[None, ...]  # Add batch dimension
-            single_walker = True
+        
+        # Ensure we have JAX arrays
+        elec_coords_jax = jnp.asarray(elec_coords_batch)
         
         # Use vmap to compute Jastrow terms for all walkers
-        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(self._compute_jastrow_terms)(elec_coords_batch)
+        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(self._compute_jastrow_terms)(elec_coords_jax)
         
-        # Get batched matrices, gradients, and laplacians using pure_callback wrappers
-        slater_up_batch, slater_down_batch = self._get_matrices_pure(elec_coords_batch)
-        grad_up_batch, grad_down_batch = self._get_gradients_pure(elec_coords_batch)
-        lap_up_batch, lap_down_batch = self._get_laplacians_pure(elec_coords_batch)
+        # Get batched matrices, gradients, and laplacians using JAX wrappers
+        det = self.dets[0]  # Using the first determinant (assuming single-determinant for now)
+        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords_jax)
+        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_jax)
+        lap_alpha_batch, lap_beta_batch = laplacian(det, elec_coords_jax)
         
-        # Now we'll use vmap to process all walkers at once
-        energies = jax.vmap(self._compute_single_walker_energy)(
-            elec_coords_batch,
-            grad_J_over_J_batch,
-            lap_J_over_J_batch,
-            slater_up_batch, 
-            slater_down_batch,
-            grad_up_batch,
-            grad_down_batch,
-            lap_up_batch,
-            lap_down_batch
+        # Use scan instead of vmap to process walkers sequentially, reducing memory usage
+        batch_size = elec_coords_jax.shape[0]
+        
+        def scan_fn(_, idx):
+            # Get single walker inputs
+            coords = elec_coords_jax[idx]
+            grad_J = grad_J_over_J_batch[idx]
+            lap_J = lap_J_over_J_batch[idx]
+            s_alpha = slater_alpha_batch[idx]
+            s_beta = slater_beta_batch[idx]
+            g_alpha = grad_alpha_batch[idx]
+            g_beta = grad_beta_batch[idx]
+            l_alpha = lap_alpha_batch[idx]
+            l_beta = lap_beta_batch[idx]
+            
+            # Compute energy for this walker
+            energy = self._compute_single_walker_energy(
+                coords, grad_J, lap_J, s_alpha, s_beta, g_alpha, g_beta, l_alpha, l_beta)
+            
+            return None, energy
+            
+        # Run scan over all indices
+        _, energies = jax.lax.scan(
+            scan_fn,
+            None,  # No carry needed
+            jnp.arange(batch_size)
         )
         
         # Return single value if input was a single walker
-        if single_walker:
-            return energies[0]
-        else:
-            return energies
+        return energies
             
     @partial(jax.jit, static_argnums=(0,))
     def _compute_single_walker_energy(self, coords, grad_J_over_J, lap_J_over_J,
-                                     slater_up, slater_down, grad_up, grad_down,
-                                     lap_up, lap_down):
+                                     slater_alpha, slater_beta, grad_alpha, grad_beta,
+                                     lap_alpha, lap_beta):
         """Compute energy for a single walker with pre-computed quantities."""
-        n_up = self.dets[0].n_alpha
+        n_alpha = self.dets[0].n_alpha
         
-        # Slice gradients and laplacians for up/down electrons
-        grad_J_up = grad_J_over_J[:n_up]      # shape: (n_up, 3)
-        grad_J_down = grad_J_over_J[n_up:]    # shape: (n_down, 3)
-        lap_J_up = lap_J_over_J[:n_up]        # shape: (n_up,)
-        lap_J_down = lap_J_over_J[n_up:]      # shape: (n_down,)
+        # Slice gradients and laplacians for alpha/beta electrons
+        grad_J_alpha = grad_J_over_J[:n_alpha]      # shape: (n_alpha, 3)
+        grad_J_beta = grad_J_over_J[n_alpha:]    # shape: (n_beta, 3)
+        lap_J_alpha = lap_J_over_J[:n_alpha]        # shape: (n_alpha,)
+        lap_J_beta = lap_J_over_J[n_alpha:]      # shape: (n_beta,)
         
         # Build inverses
-        inv_up = jnp.linalg.inv(slater_up)
-        inv_down = jnp.linalg.inv(slater_down)
+        inv_alpha = jnp.linalg.inv(slater_alpha)
+        inv_beta = jnp.linalg.inv(slater_beta)
         
         # Compute kinetic terms
-        B_kin_up = -0.5 * (
-            lap_up +
-            2 * jnp.einsum('ik,ijk->ij', grad_J_up, grad_up) +
-            jnp.multiply(lap_J_up[:, None], slater_up)
+        B_kin_alpha = -0.5 * (
+            lap_alpha +
+            2 * jnp.einsum('ik,ijk->ij', grad_J_alpha, grad_alpha) +
+            jnp.multiply(lap_J_alpha[:, None], slater_alpha)
         )
         
-        B_kin_down = -0.5 * (
-            lap_down + 
-            2 * jnp.einsum('ik,ijk->ij', grad_J_down, grad_down) +
-            jnp.multiply(lap_J_down[:, None], slater_down)
+        B_kin_beta = -0.5 * (
+            lap_beta + 
+            2 * jnp.einsum('ik,ijk->ij', grad_J_beta, grad_beta) +
+            jnp.multiply(lap_J_beta[:, None], slater_beta)
         )
         
         # Compute potential energy matrices
-        B_pot_up, B_pot_down = self._compute_potential_matrix(
-            coords, slater_up, slater_down)
+        B_pot_alpha, B_pot_beta = self._compute_potential_matrix(
+            coords, slater_alpha, slater_beta)
         
         # Combine kinetic and potential terms
-        E_L = (jnp.trace(inv_up @ (B_kin_up + B_pot_up)) + 
-              jnp.trace(inv_down @ (B_kin_down + B_pot_down)))
+        E_L = (jnp.trace(inv_alpha @ (B_kin_alpha + B_pot_alpha)) + 
+              jnp.trace(inv_beta @ (B_kin_beta + B_pot_beta)))
         
         # Add ion-ion potential energy (constant term)
         E_L = E_L + self._ion_ion_potential
         
         return jnp.real(E_L)  # Ensure real value
 
+    @partial(jax.jit, static_argnums=(0,))
     def quantum_force(self, elec_coords_batch, cutoff=1.0):
         """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
         
@@ -530,26 +363,25 @@ class SlaterJastrow:
             or shape (n_electrons, 3) for a single walker
         """
         # Handle single walker case by adding a batch dimension
-        single_walker = False
-        if len(elec_coords_batch.shape) == 2:  # (n_electrons, 3)
-            elec_coords_batch = elec_coords_batch[None, ...]  # Add batch dimension
-            single_walker = True
+        
+        # Ensure we have JAX arrays
+        elec_coords_jax = jnp.asarray(elec_coords_batch)
         
         # Compute Jastrow gradient contributions
-        grad_J_over_J_batch = jax.jit(jax.vmap(lambda coords: self._compute_jastrow_terms(coords)[0]))(elec_coords_batch)
+        grad_J_over_J_batch = jax.jit(jax.vmap(lambda coords: self._compute_jastrow_terms(coords)[0]))(elec_coords_jax)
         
-        # Get determinant gradient contributions
-        slater_up_batch, slater_down_batch = self._get_matrices(elec_coords_batch)
-        grad_up_batch, grad_down_batch = self._get_gradients(elec_coords_batch)
+        # Get determinant gradient contributions using JAX wrappers
+        det = self.dets[0]  # Using the first determinant
+        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords_jax)
+        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_jax)
         
         # Build quantum forces with vmap
         forces = jax.jit(jax.vmap(self._compute_quantum_force))(
-            elec_coords_batch, 
             grad_J_over_J_batch,
-            slater_up_batch,
-            slater_down_batch,
-            grad_up_batch,
-            grad_down_batch
+            slater_alpha_batch,
+            slater_beta_batch,
+            grad_alpha_batch,
+            grad_beta_batch
         )
 
         # Apply cutoff to quantum forces while maintaining direction
@@ -567,31 +399,28 @@ class SlaterJastrow:
         clipped_forces = forces * scaling_factors
         
         # Return single value if input was a single walker
-        if single_walker:
-            return clipped_forces[0]
-        else:
-            return clipped_forces
+        return clipped_forces
     
     @partial(jax.jit, static_argnums=(0,))
-    def _compute_quantum_force(self, coords, grad_J_over_J, slater_up, slater_down, grad_up, grad_down):
+    def _compute_quantum_force(self, grad_J_over_J, slater_alpha, slater_beta, grad_alpha, grad_beta):
         """Compute quantum force for a single configuration."""
-        n_up = self.n_up
+        n_alpha = self.n_alpha
         
-        # Slice gradient contributions for up/down electrons
-        grad_J_up = grad_J_over_J[:n_up]      # shape: (n_up, 3)
-        grad_J_down = grad_J_over_J[n_up:]    # shape: (n_down, 3)
+        # Slice gradient contributions for alpha/beta electrons
+        grad_J_alpha = grad_J_over_J[:n_alpha]      # shape: (n_alpha, 3)
+        grad_J_beta = grad_J_over_J[n_alpha:]    # shape: (n_beta, 3)
         
         # Build inverses
-        inv_up = jnp.linalg.inv(slater_up)
-        inv_down = jnp.linalg.inv(slater_down)
+        inv_alpha = jnp.linalg.inv(slater_alpha)
+        inv_beta = jnp.linalg.inv(slater_beta)
         
         # Compute gradient of log determinant part: ∇ln|D|/D
-        grad_logD_up = jnp.einsum('ij,ijk->ik', inv_up, grad_up)
-        grad_logD_down = jnp.einsum('ij,ijk->ik', inv_down, grad_down)
+        grad_logD_alpha = jnp.einsum('ij,ijk->ik', inv_alpha, grad_alpha)
+        grad_logD_beta = jnp.einsum('ij,ijk->ik', inv_beta, grad_beta)
         
         # Combine gradient contributions: 2∇ψ/ψ = 2(∇J/J + ∇D/D)
-        quantum_force_up = 2.0 * (grad_J_up + grad_logD_up)
-        quantum_force_down = 2.0 * (grad_J_down + grad_logD_down)
+        quantum_force_alpha = 2.0 * (grad_J_alpha + grad_logD_alpha)
+        quantum_force_beta = 2.0 * (grad_J_beta + grad_logD_beta)
         
         # Combine and return
-        return jnp.concatenate([quantum_force_up, quantum_force_down], axis=0)
+        return jnp.concatenate([quantum_force_alpha, quantum_force_beta], axis=0)
