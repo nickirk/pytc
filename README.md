@@ -24,19 +24,4 @@
 ## Usage
 See the test directory for examples of how to use the package.
 
-## TODO
-- [x] JAX autodiff is now completed and tested for simple Jastrow.
-    - [x] ~~det.py is completed. Need tests.~~ Related to VMC, not relevant here. 
-    - [x] Jax autodiff for new jastrows and optimization.
 
-- [ ] Further efficiency improvements: 
-    - [x] Identify the most time-consuming parts of the code. ~~_calc_delta_U~~
-    - [ ] all eisums need careful inspection to see if they can be optimized by matrix multiplication.
-        - Some of most time consuming ones are checked and optimized. But extensive tests are needed to identify more.
-    - [x] K1 and K2 mats are related by a simple indices transpose. No need to calculate K2. Just use K1 to construct
-          K1+K2
-    - [ ] ISDF needs similar efficiency checks, aiming at scaling to large molecules and solids, when combined with efficient 2nd quantized methods, should be competitive to real space VMC and DMC.
-    - [ ] Needs more careful memory management, by improving slicing of the grid points or even the number of orbitals.
-
-- [x] GPU acceleration
-    - [ ] In principle, now can use JAX's GPU support to accelerate integral computations (NEED MORE TESTS ON REAL GPU!)
