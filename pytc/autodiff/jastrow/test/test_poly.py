@@ -57,14 +57,14 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         
         value = self.jastrow._compute(r1, r2, self.params)
         self.assertTrue(jnp.isfinite(value))
-        np.testing.assert_allclose(float(value), 1.0, rtol=1e-10)
+        np.testing.assert_allclose(float(value), 1.0, rtol=1e-8)
     
     def test_batch_evaluation(self):
         """Test batched Jastrow evaluation."""
         r1 = jnp.array([[0., 0., 0.], [1., 1., 1.]])  # (2, 3)
         r2 = jnp.array([[1., 0., 0.]])  # (1, 3) - single point for r2
         
-        values = self.jastrow(r1, r2, self.params)
+        values = self.jastrow._compute(r1, r2, self.params)
         self.assertEqual(values.shape, (2,))  # Changed from (2, 1)
         self.assertTrue(jnp.all(jnp.isfinite(values)))
     

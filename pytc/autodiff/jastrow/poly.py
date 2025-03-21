@@ -22,5 +22,5 @@ class Poly(Jastrow):
             Jastrow exponent value u with shape (...)
         """
         diff = r1 - r2
-        r = jnp.sqrt(jnp.sum(diff * diff) + 1e-10)  # Add epsilon for stability
+        r = jnp.sqrt(jnp.sum(diff*diff, axis=-1) + 1e-10)  # Add epsilon for stability
         return params[0] * r  # Simple linear form for testing
