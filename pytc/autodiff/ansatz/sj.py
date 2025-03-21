@@ -222,27 +222,12 @@ class SlaterJastrow:
         grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_batch)
         lap_alpha_batch, lap_beta_batch = laplacian(det, elec_coords_batch)
 
-        n_walkers = elec_coords_batch.shape[0]
-        # generate random slater matrices
-        # memory_usage = psutil.Process().memory_info().rss / 1024**2
-        # print(f"Memory usage before generating random slater matrices: {memory_usage} MB") 
-        # key, subkey = jax.random.split(jax.random.PRNGKey(0))
-        # slater_alpha_batch = jax.random.normal(subkey, (n_walkers, self.n_alpha, self.n_alpha))
-        # slater_beta_batch = jax.random.normal(subkey, (n_walkers, self.n_beta, self.n_beta))
-        # grad_alpha_batch = jax.random.normal(subkey, (n_walkers, self.n_alpha, self.n_alpha, 3))
-        # grad_beta_batch = jax.random.normal(subkey, (n_walkers, self.n_beta, self.n_beta, 3))
-        # lap_alpha_batch = jax.random.normal(subkey, (n_walkers, self.n_alpha,))
-        # lap_beta_batch = jax.random.normal(subkey, (n_walkers, self.n_beta,))
-        # memory_usage = psutil.Process().memory_info().rss / 1024**2
-        # print(f"Memory usage after generating random slater matrices: {memory_usage} MB") 
-        
         energies = jax.vmap(self._compute_single_walker_energy)(
             elec_coords_batch, grad_J_over_J_batch, lap_J_over_J_batch,
             slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch,
             lap_alpha_batch, lap_beta_batch
         )
-        #del slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch, lap_alpha_batch, lap_beta_batch
-        # Return single value if input was a single walker
+
         return energies
             
     @partial(jax.jit, static_argnums=(0,))
