@@ -78,6 +78,7 @@ from .simple import SimpleJastrow
 from .sm7 import SM7
 from .sm17 import SM17
 from .casino import CASINO
+from .rexp import REXP
 
 # Make classes available at package level
-__all__ = ['SimpleJastrow', 'SM7', 'SM17', 'CASINO']
+__all__ = ['SimpleJastrow', 'SM7', 'SM17', 'CASINO', 'REXP']

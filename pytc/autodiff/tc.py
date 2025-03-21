@@ -15,13 +15,12 @@ class TC:
         
         Args:
             mf: PySCF mean-field object
-            jastrow_factor: JAX Jastrow factor instance
+            jastrow_factor: JAX Jastrow factor instance without parameters
             mo_coeff: Optional molecular orbital coefficients
             grid_lvl: Grid level for numerical integration
         """
         self.mf = mf
         self.mol = mf.mol
-        # Store mo_coeff as numpy array
         self.mo_coeff = mo_coeff if mo_coeff is not None else mf.mo_coeff
         self.n_orb = self.mo_coeff.shape[1]
         self.verbose = mf.verbose if hasattr(mf, 'verbose') else 0
@@ -35,19 +34,6 @@ class TC:
         # Initialize grid
         self._init_grid(grid_lvl)
         self._eval_basis_on_grid()
-        
-    def update_jastrow_params(self, new_params):
-        """Update Jastrow parameters for the TC class.
-        
-        Args:
-            new_params: New parameters for the Jastrow factor
-        """
-        self.jastrow_factor = self.jastrow_factor.update(new_params)
-        # Reset cached values
-        #self._rho = None
-        #self._nabla_rho = None
-        #self._eri1 = None
-        return self
     
     def _init_grid(self, grid_lvl=2):
         """Initialize numerical integration grid using PySCF."""
@@ -82,8 +68,14 @@ class TC:
         return self._rho, self._nabla_rho
     
     @partial(jax.jit, static_argnums=(0,))
-    def get_2b(self, dm1=None, dm2=None):
-        """Calculate two-body terms K1 + K2 + K3."""
+    def get_2b(self, jastrow_params, dm1=None, dm2=None):
+        """Calculate two-body terms K1 + K2 + K3.
+        
+        Args:
+            jastrow_params: Parameters for the Jastrow factor
+            dm1: Optional one-body density matrix
+            dm2: Optional two-body density matrix
+        """
         # Get orbital values on grid
         rho, nabla_rho = self._eval_basis_on_grid()
         
@@ -91,11 +83,17 @@ class TC:
         rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
         rho_nabla_rho_paired = jnp.einsum('pnd,rn->prnd', nabla_rho, rho).reshape(-1, len(self.weights), 3)
         
-        # Compute K terms
-        k_nabla = kmat_jax.calc_K1(rho_paired, rho_nabla_rho_paired, 
-                                  self.jastrow_factor, self.grid_points, self.weights)
-        k_square = kmat_jax.calc_K3(rho_paired, self.jastrow_factor,
-                                   self.grid_points, self.weights)
+        # Compute K terms with explicit parameter passing
+        k_nabla = kmat_jax.calc_K1(
+            rho_paired, rho_nabla_rho_paired,
+            self.jastrow_factor, jastrow_params,
+            self.grid_points, self.weights
+        )
+        
+        k_square = kmat_jax.calc_K3(
+            rho_paired, self.jastrow_factor, jastrow_params,
+            self.grid_points, self.weights
+        )
         
         # Reshape results
         k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)

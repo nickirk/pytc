@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from pyscf import gto, scf
 from pytc.tc import TC as TC_numpy
 from pytc.autodiff.tc import TC as TC_jax
-from pytc.autodiff.jastrow import SimpleJastrow
+from pytc.autodiff.jastrow import Poly
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -24,11 +24,11 @@ class TestTC(unittest.TestCase):
         
         # Create simple Jastrow factors for both implementations
         self.params = jnp.array([1.0])
-        self.jastrow_jax = SimpleJastrow(self.params)
+        self.jastrow_jax = Poly()  # No params in constructor
         
         # Create numpy version of same jastrow for comparison
-        class SimpleJastrowNumpy:
-            """Numpy version of SimpleJastrow for comparison."""
+        class PolyNumpy:
+            """Numpy version of Poly for comparison."""
             def __init__(self, params):
                 self.params = params
 
@@ -46,10 +46,10 @@ class TestTC(unittest.TestCase):
                                diff * self.params[0] * cutoff[..., None] / r12[..., None],
                                np.zeros_like(diff))
                 return grad
-        self.jastrow_numpy = SimpleJastrowNumpy(self.params)
+        self.jastrow_numpy = PolyNumpy(self.params)
         
         # Create TC objects
-        self.tc_jax = TC_jax(self.mf, self.jastrow_jax)
+        self.tc_jax = TC_jax(self.mf, self.jastrow_jax)  # No params in constructor
         self.tc_numpy = TC_numpy(self.mf, self.jastrow_numpy)
         
     def test_grid_initialization(self):
@@ -77,8 +77,8 @@ class TestTC(unittest.TestCase):
         
     def test_get_2b_against_numpy(self):
         """Test two-body term calculation against numpy version."""
-        # Compute two-body terms
-        result_jax = self.tc_jax.get_2b()
+        # Compute two-body terms with explicit parameter passing
+        result_jax = self.tc_jax.get_2b(self.params)
         result_numpy = self.tc_numpy.get_2b()
         
         # Convert JAX array to numpy for comparison
@@ -97,7 +97,7 @@ class TestTC(unittest.TestCase):
         tc_jax_new = TC_jax(self.mf, self.jastrow_jax, mo_coeff=new_mo)
         tc_numpy_new = TC_numpy(self.mf, self.jastrow_numpy, mo_coeff=new_mo)
         
-        result_jax = tc_jax_new.get_2b()
+        result_jax = tc_jax_new.get_2b(self.params)
         result_numpy = tc_numpy_new.get_2b()
         
         np.testing.assert_allclose(
@@ -110,8 +110,7 @@ class TestTC(unittest.TestCase):
         """Test two-body term calculation."""
         r1 = np.array([[0.0, 0.0, 0.0]])
         r2 = np.array([[0.0, 0.0, 1.0]])
-        # Add necessary reshape to match dimensions
-        grad_jax = self.tc_jax.jastrow_factor.grad_r(r1, r2)[:, None, :]  # Add middle dimension
+        grad_jax = self.jastrow_jax.grad_r(r1, r2, self.params)[:, None, :]
         grad_numpy = self.jastrow_numpy.grad(r1, r2)
         
         np.testing.assert_allclose(

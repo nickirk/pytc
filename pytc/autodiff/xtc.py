@@ -13,26 +13,27 @@ class XTC(TC):
         """Initialize the XTC calculator.
         
         Args:
-            jastrow_factor: JAX Jastrow instance
-            grid_points: Array of shape (N_grid, 3)
-            weights: Array of shape (N_grid,)
+            mf: PySCF mean-field object
+            jastrow_factor: JAX Jastrow instance without parameters
+            mo_coeff: Optional molecular orbital coefficients
+            grid_lvl: Grid level for numerical integration
         """
-        # Remove redundant jastrow_factor assignment since parent handles it
         super().__init__(mf, jastrow_factor, mo_coeff, grid_lvl)
-        self._delta_U = None  # Cache for delta_U
-        self._delta_h = None  # Cache for delta_h
+        self._delta_U = None
+        self._delta_h = None
     
     @property
     def n_grid(self):
         """Number of grid points."""
         return len(self.grid_points)
     
-    @partial(jax.jit, static_argnums=(0,2))  # Only self and batch_size should be static
-    def calc_v_vector(self, rho_paired, batch_size=1000):
+    @partial(jax.jit, static_argnums=(0,))  # Only self should be static
+    def calc_v_vector(self, rho_paired, jastrow_params, batch_size=1000):
         """Calculate V_qt(r₁) vector.
         
         Args:
             rho_paired: Array of shape (Nb*Nb, N_grid)
+            jastrow_params: Parameters for the Jastrow factor
             batch_size: Number of grid points to process at once
         
         Returns:
@@ -57,8 +58,7 @@ class XTC(TC):
 
             @partial(jax.vmap, in_axes=(None, 0))
             def grad_fn(r1, r2):
-                # Replace old gradient calculation with new method
-                return self.jastrow_factor.grad_r(r1[None], r2[None])[0]
+                return self.jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]
         
             grads = jax.vmap(grad_fn, in_axes=(0, None))(batch_grid, padded_grid)
             # Mask out gradients for padded points
@@ -71,6 +71,17 @@ class XTC(TC):
         # Otherwise the result is wrong.
         return  results.transpose(1,0,2,3).reshape(Nb2, padded_size, 3)[:, :N_grid, :]
 
+    @partial(jax.jit, static_argnums=(0,))  # Only self should be static
+    def get_const(self, jastrow_params, dm1=None, dm2=None):
+        """Compute constant contribution with explicit jastrow parameters."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+        
+        delta_h = self.get_delta_h(jastrow_params, dm1)
+        const = -2/3 * jnp.einsum('qp,pq->', delta_h, dm1)
+        const += self.mf.energy_nuc()
+        return const
+    
     @partial(jax.jit, static_argnums=(0,))  # Only self should be static
     def _calc_delta_h(self, delta_U=None, dm1=None):
         """Calculate δh using δU and density matrix.
@@ -142,39 +153,37 @@ class XTC(TC):
 
     def _get_mf_dm(self):
         """Get mean-field 1-body density matrix for closed shell system.
+        !!! Note: This DM is specific to closed shell systems and the XTC calcs!!!
+        It is different from spin-integrated DMs used in other contexts.
+        For mean-field calculations, the diagonal DM is used to represent the
+        which orbitals are occupied by the number 1. While the spin factor of 2 
+        is explicitly used in the xtc equations.
+        !!! This might not be ideal. And should be revisited in the future.!!!
         
         Returns:
             numpy.ndarray: Diagonal density matrix with 2.0 for occupied orbitals
         """
-        #nelec = self.mol.nelectron
-        #nocc = nelec // 2
-        #dm1 = np.zeros((self.n_orb, self.n_orb))
-        #np.fill_diagonal(dm1[:nocc, :nocc], 2.0)
-        dm1 = jnp.diag(self.mf.mo_occ)
+        dm1 = jnp.diag(self.mf.mo_occ)/2
         return dm1
 
-    def get_delta_h(self, dm1=None):
-        """Get or compute delta_h with caching."""
-        if self._delta_h is None:
-            if dm1 is None:
-                dm1 = self._get_mf_dm()
-            delta_U = self.get_delta_U(dm1)
-            self._delta_h = self._calc_delta_h(delta_U, dm1)
-        return self._delta_h
+    def get_delta_h(self, jastrow_params, dm1=None):
+        """Get or compute delta_h with explicit parameter passing."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+        delta_U = self.get_delta_U(jastrow_params, dm1)
+        return self._calc_delta_h(delta_U, dm1)
     
-    def get_delta_U(self, dm1):
-        """Get delta_U matrix."""
-        if self._delta_U is None:
-            # Convert numpy arrays to jax arrays explicitly
-            n_orb = self._rho.shape[0]  # Get shape information before JIT
-            rho = jnp.asarray(self._rho)
-            rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape((n_orb * n_orb, -1))
-            v_vector = self.calc_v_vector(rho_paired)
-            self._delta_U = self.calc_delta_U(v_vector, rho_paired, dm1)
-        return self._delta_U
+    def get_delta_U(self, jastrow_params, dm1):
+        """Get delta_U matrix with explicit parameter passing."""
+        n_orb = self._rho.shape[0]
+        rho = jnp.asarray(self._rho)
+        rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape((n_orb * n_orb, -1))
+        v_vector = self.calc_v_vector(rho_paired, jastrow_params)
+        return self.calc_delta_U(v_vector, rho_paired, dm1)
 
-    def get_1b(self, dm1=None, dm2=None):
-        """Get one-body operator h1e = T + V + δh."""
+    @partial(jax.jit, static_argnums=(0,))
+    def get_1b(self, jastrow_params, dm1=None, dm2=None):
+        """Get one-body operator with explicit parameter passing."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -183,26 +192,68 @@ class XTC(TC):
         h1e = jnp.asarray(reduce(np.dot, (self.mo_coeff.T, h1e, self.mo_coeff)))
         
         # Add delta_h using cached value
-        h1e += self.get_delta_h(dm1)
+        h1e += self.get_delta_h(jastrow_params, dm1)
         
         return h1e
 
-    def get_2b(self, dm1=None):
-        """Compute two-body integrals."""
+    @partial(jax.jit, static_argnums=(0,))
+    def get_2b(self, jastrow_params, dm1=None):
+        """Compute two-body integrals with explicit parameter passing."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
         
         # Get TC's two-body contribution
-        result = super().get_2b()
+        result = super().get_2b(jastrow_params)
         
         # Add cached delta_U
-        result += self.get_delta_U(dm1)
+        result += self.get_delta_U(jastrow_params, dm1)
         return result
 
     def get_3b(self):
         """Get three-body extended correlation."""
         raise NotImplementedError("JAX implementation pending")
+        
+    def make_eris(self, jastrow_params):
+        """Create ChemistsERIs object for CCSD calculation."""
+        from pyscf.cc import rccsd
+        mycc = rccsd.RCCSD(self.mf)
+        nocc = np.sum(self.mf.mo_occ > 0)
+        nmo = mycc.nmo
+
+        eris = rccsd._ChemistsERIs(mycc)
+        # Force concrete value computation with jax.device_get()
+        const = np.asarray(self.get_const(jastrow_params))
+        h1e = np.asarray(self.get_1b(jastrow_params))
+        h2e = np.asarray(self.get_2b(jastrow_params))
+        
+        # Now use the concrete NumPy arrays
+        eris.e_core = np.float64(const)
+        eris.fock = h1e.copy()
+        
+        # Modify fock matrix with concrete arrays
+        fock_modification = (2 * np.einsum('pqii->pq', h2e[:,:,:nocc,:nocc]) - 
+                           np.einsum('piiq->pq', h2e[:,:nocc,:nocc,:]))
+        eris.fock += fock_modification
+        eris.mo_energy = np.diag(eris.fock).copy()
+        
+        # Store ERI blocks using concrete h2e array
+        eris.oooo = h2e[:nocc,:nocc,:nocc,:nocc].copy()
+        eris.ovoo = h2e[:nocc,nocc:,:nocc,:nocc].copy()
+        eris.ooov = h2e[:nocc,:nocc,:nocc,nocc:].copy()
+        eris.vooo = h2e[nocc:,:nocc,:nocc,:nocc].copy()
+        eris.ovov = h2e[:nocc,nocc:,:nocc,nocc:].copy()
+        eris.vovo = h2e[nocc:,:nocc,nocc:,:nocc].copy()
+        eris.ovvo = h2e[:nocc,nocc:,nocc:,:nocc].copy()
+        eris.voov = h2e[nocc:,:nocc,:nocc,nocc:].copy()
+        eris.oovv = h2e[:nocc,:nocc,nocc:,nocc:].copy()
+        eris.ovvv = h2e[:nocc,nocc:,nocc:,nocc:].copy()
+        eris.vovv = h2e[nocc:,:nocc,nocc:,nocc:].copy()
+        eris.vvov = h2e[nocc:,nocc:,:nocc,nocc:].copy()
+        eris.vvvv = h2e[nocc:,nocc:,nocc:,nocc:].copy()
+
+        return eris
     
+
     def update_jastrow_params(self, new_params):
         """Update Jastrow parameters and reset XTC-specific caches."""
         # Call parent class's update method

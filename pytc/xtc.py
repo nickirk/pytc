@@ -51,15 +51,19 @@ class XTC(TC):
 
     def _get_mf_dm(self):
         """Get mean-field 1-body density matrix for closed shell system.
+
+        !!! Note: This DM is specific to closed shell systems and the XTC calcs!!!
+        It is different from spin-integrated DMs used in other contexts.
+        For mean-field calculations, the diagonal DM is used to represent the
+        which orbitals are occupied by the number 1. While the spin factor of 2 
+        is explicitly used in the xtc equations.
+        !!! This might not be ideal. And should be revisited in the future.!!!
         
         Returns:
             numpy.ndarray: Diagonal density matrix with 2.0 for occupied orbitals
         """
-        #nelec = self.mol.nelectron
-        #nocc = nelec // 2
-        #dm1 = np.zeros((self.n_orb, self.n_orb))
-        #np.fill_diagonal(dm1[:nocc, :nocc], 2.0)
-        dm1 = np.diag(self.mf.mo_occ)
+        
+        dm1 = np.diag(self.mf.mo_occ)/2
         return dm1
 
     def get_delta_h(self, dm1=None):
@@ -99,7 +103,7 @@ class XTC(TC):
         
     
     def get_const(self, dm1=None, dm2=None):
-        """Compute constant contribution: const = -1/3 * δh^q_p * γ^p_q"""
+        """Compute constant contribution: const = -2/3 * δh^q_p * γ^p_q"""
         if dm1 is None:
             dm1 = self._get_mf_dm()
         
@@ -178,9 +182,9 @@ class XTC(TC):
         rho_weighted = rho * self.weights[None, None, :]
         # Calculate intermediates
         W = 2*einsum('utix,tu->ix', V, dm1)  # (N_grid, 3)
-        Vbar = einsum('ix,srix->sri', W, V)  # (nb, Nb, N_grid, 3)
+        Vbar = einsum('ix,srix->sri', W, V)  # (nb, nb, N_grid)
         
-        X = einsum('stix,tu->suix', V, dm1)  # (Nb, N_grid, 3)
+        X = einsum('stix,tu->suix', V, dm1)  # (nb, nb, N_grid, 3)
         
         # Compute Zbar using parallel processing with progress tracking
         Zbar = _parallel_over_i(
@@ -191,7 +195,7 @@ class XTC(TC):
         )
         
         Wbar = 2*einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
-        Y = einsum('urix,tu->trix', V, dm1)  # (Nb, Nb, N_grid, 3)
+        Y = einsum('urix,tu->trix', V, dm1)  # (nb, nb, N_grid, 3)
 
         # Compute G using parallel processing with progress tracking
         G = _parallel_over_i(
@@ -374,45 +378,6 @@ class XTC(TC):
         return result
 
 
-def _parallel_compute_G(rho_weighted, X, Y):
-    """Compute G tensor using parallel thread processing.
-    
-    Computes: G[s,r,i,x] = rho[u,r,i] * X[s,u,i,x] + Y[t,r,i,x] * rho[s,t,i]
-    """
-    # Get dimensions
-    S, U_X, I, X_dim = X.shape
-    U_rho, R, I_rho = rho_weighted.shape
-    assert U_X == U_rho and I == I_rho, "Dimension mismatch"
-    
-    # Initialize output
-    G = np.zeros((S, R, I, X_dim))
-    
-    def process_i(i):
-        # Get views for this i
-        X_slice = X[:, :, i, :]  # (S, U, X)
-        Y_slice = Y[:, :, i, :]  # (T, R, X)
-        rho_slice = rho_weighted[:, :, i]  # (U, R) and (S, T)
-        
-        # First term: rho[u,r,i] * X[s,u,i,x]
-        term1 = np.einsum('ur,sux->srx', rho_slice, X_slice)
-        
-        # Second term: Y[t,r,i,x] * rho[s,t,i]
-        term2 = np.einsum('trx,st->srx', Y_slice, rho_slice)
-        
-        return i, term1 + term2
-    
-    # Parallelize over i using threads
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for i in range(I):
-            futures.append(executor.submit(process_i, i))
-        
-        for future in futures:
-            i, result = future.result()
-            G[:, :, i, :] = result
-    
-    return G
-
 def _parallel_over_i(process_i_func, output_shape, n_i, desc=None):
     """Generic parallel processor for i-index contractions with progress tracking.
     
@@ -464,5 +429,5 @@ def _process_Zbar_i(i, V, X):
     V_slice = V[:, :, i, :]  # (U, R, X)
     X_slice = X[:, :, i, :]  # (S, U, X)
     
-    result = np.einsum('urx,sux->sr', V_slice, X_slice)
+    result = einsum('urx,sux->sr', V_slice, X_slice)
     return i, result

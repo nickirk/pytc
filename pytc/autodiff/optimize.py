@@ -8,7 +8,7 @@ from pytc.autodiff import jastrow
 from pytc.autodiff import xtc
 from pyscf import gto, scf
 
-def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learning_rate=1e-3):
+def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learning_rate=1e-3, opt_file='opt_data.npz'):
     """Optimize Jastrow parameters using advanced optimizers with adaptive learning rate."""
     params = jnp.asarray(init_params, dtype=jnp.float64)
     
@@ -16,17 +16,17 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     current_lr = learning_rate
     lr_decay_factor = 0.5  # How much to reduce learning rate
     lr_min = 1e-6  # Minimum learning rate
-    patience = 3  # How many steps to wait before reducing lr
+    patience = 10  # How many steps to wait before reducing lr
     
     # Create optimizer with current learning rate
     def create_optimizer(lr):
-        if optimizer_name == 'adam':
+        if (optimizer_name == 'adam'):
             return optax.adam(lr)
-        elif optimizer_name == 'adamw':
+        elif (optimizer_name == 'adamw'):
             return optax.adamw(lr)
-        elif optimizer_name == 'adagrad':
+        elif (optimizer_name == 'adagrad'):
             return optax.adagrad(lr)
-        elif optimizer_name == 'rmsprop':
+        elif (optimizer_name == 'rmsprop'):
             return optax.rmsprop(lr)
         else:
             return optax.sgd(lr)
@@ -40,33 +40,19 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     
     @jax.jit
     def loss_fn(params):
-        # Update the Jastrow parameters in a way that maintains JAX gradients
-        xtc.update_jastrow_params(params)  # We need to add this method to XTC class
-        one_body = xtc.get_1b()
-        two_body = xtc.get_2b()
+        one_body = xtc.get_1b(params)
+        two_body = xtc.get_2b(params)
 
-        # Get number of occupied and virtual orbitals
-        nocc = int(sum(xtc.mf.mo_occ == 2))  # Number of occupied orbitals
-        nvir = len(xtc.mf.mo_occ) - nocc     # Number of virtual orbitals
-
-        # Slice the tensors for occupied and virtual spaces
-        V_ijab = two_body[:nocc,:nocc,nocc:,nocc:]
-        V_ijab_anti = 2*V_ijab - V_ijab.transpose(0,1,3,2)
-        V_abij = two_body[nocc:,nocc:,:nocc,:nocc]
-        V_abij_anti = 2*V_abij - V_abij.transpose(0,1,3,2)
+        nocc = int(sum(xtc.mf.mo_occ == 2))  
+        V_iajb = two_body[:nocc,nocc:,:nocc,nocc:]
+        V_iajb_anti = 2*V_iajb - V_iajb.transpose(0,3,2,1)
 
         # Build Fock matrix elements
         f_ia = one_body[:nocc,nocc:]
         f_ia = f_ia + 2.*jnp.einsum('iajj->ia', two_body[:nocc,nocc:,:nocc,:nocc])
         f_ia = f_ia - jnp.einsum('ijja->ia', two_body[:nocc,:nocc,:nocc,nocc:])
 
-        f_ai = one_body[nocc:,:nocc]
-        f_ai = f_ai + 2.*jnp.einsum('aijj->ai', two_body[nocc:,:nocc,:nocc,:nocc])
-        f_ai = f_ai - jnp.einsum('jiaj->ai', two_body[:nocc,:nocc,nocc:,:nocc])
-
-        loss = jnp.asarray(jnp.einsum('ia,ai->', f_ia, f_ai), dtype=jnp.float64)
-        loss = loss + jnp.asarray(jnp.einsum('ijab,abij->', V_ijab_anti, V_abij_anti), dtype=jnp.float64)
-        
+        loss = jnp.sum(f_ia*f_ia) + jnp.sum(V_iajb_anti*V_iajb_anti)
         return loss
 
     steps = []
@@ -118,37 +104,72 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
         losses.append(loss_val)
         grad_norms.append(grad_norm)
         params_bag.append(params)
-        np.savez('Mg_opt_data2.npz', steps=steps, losses=losses, 
+        np.savez(opt_file, steps=steps, losses=losses, 
                  grad_norms=grad_norms, params_bag=params_bag)
 
     return params
 
 
-def create_test_system():
+def create_test_system(basis):
     """Create a test Be atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='Mg 0 0 0', basis='ccpvdz', unit='Bohr')
+    mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
+    mol.incore_anyway = True
     mf = scf.RHF(mol)
     mf.kernel()
     return mol, mf
 
-def main():
-    """Example usage with Be atom."""
-    # Create test system
-    mol, mf = create_test_system()
+class REXP(jastrow.Jastrow):
+    def __init__(self, epsilon=1e-12):
+        super().__init__()
+        self.epsilon = epsilon
+        
+    def _safe_norm(self, x):
+        """Compute norm with a small epsilon to prevent division by zero."""
+        return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
     
-    # Initialize Jastrow with smaller parameters
-    init_params = jnp.array([0.5, 0.1, -0.1, 0.2], dtype=jnp.float64)
-    init_params = jnp.array([1.30442946,  0.55080467, -0.20307955, -0.22240826])
-    #init_params = jnp.array([ 3.30571992,  0.52066121,  0.3091659,   1.56504699, -0.17847568, -0.0455195 ], dtype=jnp.float64)
-    #init_params = jnp.array([3.30992979,  0.57100468,  0.31507011,  1.53111045, -0.22547859, -0.0537576], dtype=jnp.float64)
-    my_jastrow = jastrow.SimpleJastrow(init_params)
+    def _compute(self, r1, r2, params):
+        r12 = r1-r2
+        r12_norm = self._safe_norm(r12)
+        return 0.5*jnp.exp(-params[0] * r12_norm) * r12_norm
+
+    def __call__(self, r1, r2):
+        return super().__call__(r1, r2)
+
+def do_ccsd(params, basis):
+    # Create new system with cc-pVTZ basis
+    mol, mf = create_test_system('ccpvtz')
+    
+    my_jastrow = REXP()  # Remove params from constructor
+    myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
+    eris = myxtc.make_eris(params)  # Pass params explicitly
+    from pyscf.cc import rccsd
+    mycc = rccsd.RCCSD(mf)
+    mycc.kernel(eris=eris)
+    nocc = int(sum(mf.mo_occ == 2))
+    e_hf = 2*np.einsum("ii->", eris.fock[:nocc,:nocc])
+    e_hf -= 2*np.einsum("iijj->", eris.oooo) - np.einsum("ijji->", eris.oooo)
+    print("HF energy:", e_hf)
+    print("CCSD correlation energy:", mycc.e_corr)
+    print("Total CCSD energy:", e_hf + mycc.e_corr)
+    assert np.isclose(e_hf, -2.8986313304138127, atol=1e-7)
+    assert np.isclose(mycc.e_corr, -0.004918838638616493, atol=1e-7)
+    assert np.isclose(e_hf + mycc.e_corr, -2.903550169052428, atol=1e-7)
+
+def main():
+    """Example usage with He atom."""
+    # Create test system
+    mol, mf = create_test_system('ccpvtz')
+
+    
+    init_params = jnp.array([0.5], dtype=jnp.float64)
+    my_jastrow = REXP()  # Remove params from constructor
     
     # Run optimization with smaller learning rate
-    myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=1)
+    myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
     
     # Try different optimizers
     optimizers_to_try = {
-        'rmsprop': 5e-2
+        'rmsprop': 1e-2
     }
     
     for opt_name, lr in optimizers_to_try.items():
@@ -156,8 +177,14 @@ def main():
         optimized_params = optimize_jastrow(myxtc, init_params,
                                           optimizer_name=opt_name,
                                           learning_rate=lr,
-                                          n_steps=500)
+                                          n_steps=20)
         print(f"{opt_name} optimized parameters:", optimized_params)
+    
+    assert np.isclose(optimized_params, 0.39839909, atol=1e-5)
+    
+    do_ccsd(optimized_params, 'ccpvtz')
+
+
 
 if __name__ == "__main__":
     main()
