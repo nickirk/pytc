@@ -31,71 +31,70 @@ class TestAnsatzH2(unittest.TestCase):
         # Create determinant with RHF orbitals
         self.det = SlaterDet(self.mol, self.mf.mo_coeff)
         
-        # Simple Jastrow with one parameter
-        self.jastrow = Poly(jnp.array([0.5]))
+        # Create simple Jastrow without parameters and store params separately
+        self.jastrow_params = jnp.array([0.5])
+        self.jastrow = Poly()  # No params in constructor
         
-        # Create ansatz with single determinant
-        self.coeffs = jnp.array([1.0])
-        self.ansatz = SlaterJastrow(self.mol, self.jastrow, [self.det], self.coeffs)
+        # Store linear coefficients separately
+        self.linear_coeffs = jnp.array([1.0])
+        
+        # Create ansatz without coefficients
+        self.ansatz = SlaterJastrow(self.mol, self.jastrow, [self.det])
         
         # Test positions: two electrons slightly offset from nuclei
-        self.test_pos = jnp.array([
+        self.test_pos = jnp.array([[
             [0.0, 0.1, 0.0],    # electron 1 near first H
             [0.0, 0.1, 0.742],  # electron 2 near second H
-        ])
+        ]])  # Shape: (1, 2, 3)
 
     def test_wavefunction_evaluation(self):
         """Test full wavefunction evaluation for H2."""
-        value = self.ansatz(self.test_pos)
-        
-        # Value should be real for ground state
-        self.assertTrue(np.isreal(value))
-        
-        # Value should be non-zero
-        self.assertNotEqual(float(value), 0.0)
+        value = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)
+        self.assertTrue(np.isreal(value[0]))  # Index into batch dimension
+        self.assertNotEqual(float(value[0]), 0.0)  # Index into batch dimension
         
         # Test that moving electrons far apart gives smaller value
-        far_pos = jnp.array([
+        far_pos = jnp.array([[
             [0.0, 0.0, -5.0],
             [0.0, 0.0, 5.0],
-        ])
-        far_value = self.ansatz(far_pos)
-        self.assertLess(abs(far_value), abs(value))
+        ]])  # Shape: (1, 2, 3)
+        far_value = self.ansatz(far_pos, self.jastrow_params, self.linear_coeffs)
+        self.assertLess(abs(float(far_value[0])), abs(float(value[0])))
 
     def test_jastrow_parameter_sensitivity(self):
         """Test sensitivity to Jastrow parameter changes."""
-        value_original = self.ansatz(self.test_pos)
+        value_original = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)
         
         # Change Jastrow parameter more significantly
-        new_ansatz = self.ansatz.update_jastrow(jnp.array([2.0]))  # Bigger change
-        value_new = new_ansatz(self.test_pos)
+        new_params = jnp.array([2.0])  # Bigger change
+        value_new = self.ansatz(self.test_pos, new_params, self.linear_coeffs)
         
         # Values should be different
-        self.assertNotAlmostEqual(float(value_original), float(value_new))
+        self.assertNotAlmostEqual(float(value_original[0]), float(value_new[0]))
 
     def test_antisymmetry(self):
         """Test that wavefunction is antisymmetric under electron exchange."""
-        value1 = self.ansatz(self.test_pos)
+        value1 = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)
         
         # Swap electrons and check sign change
         # Note: For H2 in RHF, we need to swap within same spin block to see antisymmetry
         # First electron is spin-up, second is spin-down, so swapping won't show antisymmetry
         # Let's modify the test to use two spin-up electrons
-        spin_up_pos = jnp.array([
+        spin_up_pos = jnp.array([[
             [0.0, 0.1, 0.0],    # first spin-up electron
             [0.0, 0.1, 1.0],    # second spin-up electron
-        ])
+        ]])  # Shape: (1, 2, 3)
         
-        value1 = self.ansatz(spin_up_pos)
-        swapped_pos = spin_up_pos[::-1]
-        value2 = self.ansatz(swapped_pos)
+        value1 = self.ansatz(spin_up_pos, self.jastrow_params, self.linear_coeffs)
+        swapped_pos = spin_up_pos[:, ::-1, :]  # Swap along electron dimension
+        value2 = self.ansatz(swapped_pos, self.jastrow_params, self.linear_coeffs)
         
         # Values should be equal and opposite
-        np.testing.assert_allclose(value1, -value2)
+        np.testing.assert_allclose(value1[0], -value2[0])
 
     def test_jastrow_terms(self):
         """Test computation of Jastrow gradient and laplacian terms."""
-        grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos)
+        grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos[0], self.jastrow_params)
         
         # Check shapes
         self.assertEqual(grad_J.shape, (2, 3))  # (n_electrons, xyz)
@@ -104,126 +103,6 @@ class TestAnsatzH2(unittest.TestCase):
         # Gradients should be opposite for electrons near equilibrium
         np.testing.assert_allclose(grad_J[0], -grad_J[1], rtol=1e-5)
 
-    #def test_kinetic_matrix(self):
-    #    """Test computation of kinetic energy matrix."""
-    #    grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos)
-    #    inv_up, inv_down, B_kin_up, B_kin_down = self.ansatz._compute_kinetic_matrix(
-    #        self.test_pos, grad_J, lap_J)
-    #    
-    #    # Check shapes
-    #    n_up = self.det.n_alpha
-    #    n_down = self.det.n_beta
-    #    self.assertEqual(B_kin_up.shape, (n_up, n_up))
-    #    self.assertEqual(B_kin_down.shape, (n_down, n_down))
-    #    
-    #    # Kinetic energy should be real
-    #    self.assertTrue(np.allclose(B_kin_up.imag, 0))
-    #    self.assertTrue(np.allclose(B_kin_down.imag, 0))
-    #    
-    #    # Inverse matrices should be correct
-    #    slater_up, slater_down = self.det.matrix(self.test_pos)
-    #    np.testing.assert_allclose(inv_up @ slater_up, np.eye(n_up), atol=1e-7)
-
-    #def test_local_energy(self):
-    #    """Test local energy computation."""
-    #    energy = self.ansatz.local_energy(self.test_pos)
-    #    
-    #    # Energy should be real
-    #    self.assertTrue(np.isreal(energy))
-    #    
-    #    # Energy should be finite
-    #    self.assertTrue(np.isfinite(energy))
-    #    
-    #    # Test virial theorem: <T> ≈ -<V> for ground state
-    #    # This requires computing T and V separately
-    #    grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos)
-    #    inv_up, inv_down, B_kin_up, B_kin_down = self.ansatz._compute_kinetic_matrix(
-    #        self.test_pos, grad_J, lap_J)
-    #    
-    #    slater_up, slater_down = self.det.matrix(self.test_pos)
-    #    B_pot_up, B_pot_down = self.ansatz._compute_potential_matrix(
-    #        self.test_pos, slater_up, slater_down)
-    #    
-    #    T = float(jnp.trace(inv_up @ B_kin_up) + jnp.trace(inv_down @ B_kin_down))
-    #    V = float(jnp.trace(inv_up @ B_pot_up) + jnp.trace(inv_down @ B_pot_down))
-    #    
-    #    # Check if T ≈ -V (allow for some deviation due to non-optimal wavefunction)
-    #    self.assertLess(abs(T + V), abs(T))  # |T + V| should be smaller than |T|
-    #    
-    #    # Calculate total energy manually and verify consistency with local_energy method
-    #    total_E = T + V
-    #    self.assertAlmostEqual(energy, total_E, places=10)
-    #    
-    #    # Test energy stability across similar geometries
-    #    # Small perturbations to electron positions shouldn't cause large energy changes
-    #    perturbed_pos = self.test_pos + jnp.array([[0.01, -0.01, 0.005], [-0.005, 0.007, -0.01]])
-    #    perturbed_energy = self.ansatz.local_energy(perturbed_pos)
-    #    
-    #    # Energy should change slightly but not dramatically
-    #    energy_diff = abs(perturbed_energy - energy)
-    #    self.assertLess(energy_diff / abs(energy), 0.1)  # Less than 10% change
-    #    
-    #    # Test energy with different Jastrow parameters
-    #    improved_jastrow = Poly(jnp.array([-0.5]))  # Negative parameter for electron-electron repulsion
-    #    improved_ansatz = SlaterJastrow(self.mol, improved_jastrow, [self.det], self.coeffs)
-    #    improved_energy = improved_ansatz.local_energy(self.test_pos)
-    #    
-    #    # Test energy with different electron configurations
-    #    # Electrons very close together should have high energy (repulsion)
-    #    close_pos = jnp.array([
-    #        [0.1, 0.1, 0.1],
-    #        [0.1, 0.1, 0.1 + 1e-3]  # Very close to first electron
-    #    ])
-    #    close_energy = self.ansatz.local_energy(close_pos)
-    #    
-    #    # Electrons far apart should have higher energy (mostly kinetic)
-    #    far_pos = jnp.array([
-    #        [0.0, 0.0, -5.0],
-    #        [0.0, 0.0, 5.0]
-    #    ])
-    #    far_energy = self.ansatz.local_energy(far_pos)
-    #    
-    #    # Energy should be higher when electrons are very close or very far
-    #    self.assertGreater(close_energy, energy)
-    #    self.assertGreater(far_energy, energy)
-
-    #def test_local_energy_reference_values(self):
-    #    """Test local energy against reference calculations."""
-    #    # For H2 near equilibrium, we have reference values
-    #    # Create a better ansatz with optimized Jastrow
-    #    opt_jastrow = Poly(jnp.array([-0.25]))  # Example optimized parameter
-    #    opt_ansatz = SlaterJastrow(self.mol, opt_jastrow, [self.det], self.coeffs)
-    #    
-    #    # Sample multiple points to approximate the true expectation value
-    #    n_samples = 10
-    #    energies = []
-    #    
-    #    # Generate sample positions around equilibrium
-    #    for i in range(n_samples):
-    #        # Random positions centered around nuclei with small perturbations
-    #        # Fix: Convert Python lists to JAX arrays before adding
-    #        pos = jnp.array([
-    #            jnp.array([0.0, 0.0, 0.0]) + 0.1 * jnp.array([np.random.normal(), np.random.normal(), np.random.normal()]),
-    #            jnp.array([0.0, 0.0, 0.742]) + 0.1 * jnp.array([np.random.normal(), np.random.normal(), np.random.normal()])
-    #        ])
-    #        energy = opt_ansatz.local_energy(pos)
-    #        energies.append(float(energy))
-    #    
-    #    # Calculate mean and variance
-    #    mean_energy = np.mean(energies)
-    #    energy_variance = np.var(energies)
-    #    
-    #    # The ground state energy of H2 (in atomic units) at bond length 0.742 bohr
-    #    # should be approximately -1.1 to -1.2 Hartree with a minimal basis
-    #    # Note: Exact value depends on the basis set quality
-    #    self.assertTrue(-1.3 < mean_energy < -0.9,
-    #                    f"Mean energy {mean_energy} outside expected range")
-    #    
-    #    # A good wavefunction should have low variance in local energy
-    #    # This is not a strict test but checks for reasonable variance
-    #    self.assertLess(energy_variance, 0.1,
-    #                   f"Energy variance {energy_variance} is too high")
-
     def test_jastrow_terms_analytical(self):
         """Test Jastrow gradient and laplacian against analytical values.
         
@@ -231,8 +110,9 @@ class TestAnsatzH2(unittest.TestCase):
         we can derive the analytical expressions for gradient and laplacian.
         """
         # Use a simple Jastrow with u(r_ij) = 0.5*r_ij
-        simple_jastrow = Poly(jnp.array([0.5]))  # Single parameter a=0.5
-        simple_ansatz = SlaterJastrow(self.mol, simple_jastrow, [self.det], jnp.array([1.0]))
+        simple_jastrow = Poly()  # Single parameter a=0.5
+        simple_ansatz = SlaterJastrow(self.mol, simple_jastrow, [self.det])
+        simple_jastrow_params = jnp.array([0.5])
         
         # Use simple positions for easier analytical calculation
         # Two electrons along the x-axis at positions 0 and 1
@@ -250,7 +130,7 @@ class TestAnsatzH2(unittest.TestCase):
         # ∇_2 u(r_21) = 0.5 * ([1,0,0] - [0,0,0])/1 = [0.5, 0, 0]
         
         # Calculate the actual values from our implementation
-        grad_J_over_J, lap_J_over_J = simple_ansatz._compute_jastrow_terms(positions)
+        grad_J_over_J, lap_J_over_J = simple_ansatz._compute_jastrow_terms(positions, simple_jastrow_params)
         
         # Expected values based on our implementation
         expected_grad = jnp.array([
@@ -267,11 +147,11 @@ class TestAnsatzH2(unittest.TestCase):
         np.testing.assert_allclose(lap_J_over_J, expected_lap, rtol=1e-5)
         
         # Test with a different parameter
-        different_jastrow = Poly(jnp.array([2.0]))  # Parameter a=2.0
-        different_ansatz = SlaterJastrow(self.mol, different_jastrow, [self.det], jnp.array([1.0]))
+        different_jastrow_params = jnp.array([2.0])  # Parameter a=2.0
+        different_ansatz = SlaterJastrow(self.mol, simple_jastrow, [self.det])
         
         # Recalculate with different parameter
-        grad_J_over_J_2, lap_J_over_J_2 = different_ansatz._compute_jastrow_terms(positions)
+        grad_J_over_J_2, lap_J_over_J_2 = different_ansatz._compute_jastrow_terms(positions, different_jastrow_params)
         
         # For a=2.0, all gradients and laplacians should scale by 4
         np.testing.assert_allclose(grad_J_over_J_2, 4.0 * expected_grad, rtol=1e-5)
@@ -285,7 +165,7 @@ class TestAnsatzH2(unittest.TestCase):
         ])
         
         # Calculate for three electrons
-        grad_J_over_J_3, lap_J_over_J_3 = simple_ansatz._compute_jastrow_terms(three_electron_pos)
+        grad_J_over_J_3, lap_J_over_J_3 = simple_ansatz._compute_jastrow_terms(three_electron_pos, simple_jastrow_params)
         
         # For three electrons with u(r) = 0.5*r, analytical results:
         # ∇_1 J/J = 0.5*([1,0,0] + [0,1,0]) = [0.5, 0.5, 0]
@@ -366,7 +246,21 @@ class TestAnsatzH2(unittest.TestCase):
         slater_up, slater_down = self.det.matrix(self.test_pos)
         
         # Compute potential matrices
-        B_pot_up, B_pot_down = self.ansatz._compute_potential_matrix(self.test_pos, slater_up, slater_down)
+        # internal functions with _ are not batched since they are vmapped.
+        B_pot_up, B_pot_down = self.ansatz._compute_potential_matrix(
+            self.test_pos[0],  # Remove batch dimension for potential calculation
+            slater_up[0],      # Remove batch dimension
+            slater_down[0]     # Remove batch dimension
+        )
+        
+        # Extract values safely from batched outputs
+        slater_up = slater_up[0]  # Remove batch dimension
+        slater_down = slater_down[0]
+        B_pot_up = B_pot_up  # Remove batch dimension
+        B_pot_down = B_pot_down
+        
+        # Test positions are now batched [1, n_elec, 3], need to use [0] to get actual positions
+        test_positions = self.test_pos[0]
         
         # Check if we have both alpha and beta electrons
         n_alpha = self.det.n_alpha
@@ -376,11 +270,11 @@ class TestAnsatzH2(unittest.TestCase):
         potentials = []
         
         if n_alpha > 0:  # If we have alpha electrons
-            pot_e1 = float(B_pot_up[0, 0] / slater_up[0, 0])  # Divide by slater value to get raw potential
+            pot_e1 = float(jnp.asarray(B_pot_up[0, 0] / slater_up[0, 0]))  # Convert to scalar
             potentials.append(pot_e1)
         
         if n_beta > 0:  # If we have beta electrons
-            pot_e2 = float(B_pot_down[0, 0] / slater_down[0, 0])
+            pot_e2 = float(jnp.asarray(B_pot_down[0, 0] / slater_down[0, 0]))
             potentials.append(pot_e2)
         
         # Also verify that we have at least one potential to check
@@ -397,16 +291,17 @@ class TestAnsatzH2(unittest.TestCase):
             return -jnp.sum(atom_charges / (dists + 1e-10))
         
         # Calculate potentials for the available electrons
-        n_electrons = len(self.test_pos)
+        positions = self.test_pos[0]  # Remove batch dimension
+        n_electrons = len(positions)
         for i in range(n_electrons):
-            e_n = compute_nuclear_pot(self.test_pos[i])
+            e_n = compute_nuclear_pot(positions[i])
             
             # Calculate electron-electron potential 
             # (sum of interactions with all other electrons)
             e_e_sum = 0.0
             for j in range(n_electrons):
                 if i != j:  # Skip self-interaction
-                    e_e_dist = jnp.linalg.norm(self.test_pos[i] - self.test_pos[j])
+                    e_e_dist = jnp.linalg.norm(positions[i] - positions[j])
                     e_e_sum += 1.0 / (e_e_dist + 1e-10)
             
             # Expected values calculated analytically
@@ -431,18 +326,13 @@ class TestAnsatzH2(unittest.TestCase):
         # - Single determinant
         # - Test positions at [0.0, 0.1, 0.0] and [0.0, 0.1, 0.742]
         
-        # Compute the distance between electrons
-        electron_dist = jnp.linalg.norm(self.test_pos[0] - self.test_pos[1])
-        self.assertAlmostEqual(electron_dist, 0.742, places=3)
+        # Fix electron distance calculation for batched coordinates
+        electron_dist = jnp.linalg.norm(self.test_pos[0, 0] - self.test_pos[0, 1])
+        self.assertAlmostEqual(float(electron_dist), 0.742, places=3)
         
         # Create a function to get the wavefunction value for a given Jastrow parameter
         def wf_value(param):
-            # Create Jastrow with this parameter
-            temp_jastrow = Poly(jnp.array([param]))
-            # Create ansatz 
-            temp_ansatz = SlaterJastrow(self.mol, temp_jastrow, [self.det], self.coeffs)
-            # Return wavefunction value
-            return temp_ansatz(self.test_pos)
+            return self.ansatz(self.test_pos, jnp.array([param]), self.linear_coeffs)[0]
         
         # Use JAX's automatic differentiation to compute gradient
         param_grad = jax.grad(wf_value)(0.5)
@@ -457,7 +347,7 @@ class TestAnsatzH2(unittest.TestCase):
         # dψ/dparam = ψ * (dJ/dparam) = ψ * 0.5 * |r_1 - r_2|
         
         # Get current wavefunction value
-        current_wf = self.ansatz(self.test_pos)
+        current_wf = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)[0]
         
         # Calculate dJ/da for this electron configuration
         # For two electrons, there's one term: 0.5 * |r_1 - r_2|
@@ -472,12 +362,10 @@ class TestAnsatzH2(unittest.TestCase):
         # Also test with a different parameter value
         different_param = 1.0
         # Create Jastrow with different parameter
-        different_jastrow = Poly(jnp.array([different_param]))
-        # Create ansatz
-        different_ansatz = SlaterJastrow(self.mol, different_jastrow, [self.det], self.coeffs)
+        different_jastrow_params = jnp.array([different_param])
         
         # Get wavefunction value with different parameter
-        different_wf = different_ansatz(self.test_pos)
+        different_wf = self.ansatz(self.test_pos, different_jastrow_params, self.linear_coeffs)[0]
         
         # The dJ/da is the same (electron_dist), but the wavefunction value is different
         different_expected_grad = float(different_wf * dj_da)

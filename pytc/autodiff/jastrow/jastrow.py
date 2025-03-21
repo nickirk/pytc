@@ -5,15 +5,16 @@ import jax
 import jax.numpy as jnp
 
 class Jastrow(ABC):
-    """Abstract base class for JAX-based Jastrow factors."""
+    """Abstract base class for JAX-based Jastrow factors.
     
-    def __init__(self, params):
-        """Initialize Jastrow factor.
-        
-        Args:
-            params: Parameters for the Jastrow factor
-        """
-        self.params = params
+    This class defines the interface for Jastrow factors. Unlike the previous implementation,
+    parameters are not stored in the instance but passed directly to methods that need them.
+    This aligns better with JAX's philosophy for parameter handling and computational graph tracing.
+    """
+    
+    def __init__(self):
+        """Initialize Jastrow factor structure."""
+        pass
     
     @abstractmethod
     def _compute(self, r1, r2, params):
@@ -29,67 +30,75 @@ class Jastrow(ABC):
         """
         pass
 
-    def __call__(self, r1, r2):
+    def __call__(self, r1, r2, params):
         """Evaluate Jastrow factor J = exp(u) for a single pair.
         
         Args:
             r1: Array of shape (3,) for first electron position
             r2: Array of shape (3,) for second electron position
+            params: Jastrow parameters
             
         Returns:
             Jastrow factor value J = exp(u)
         """
-        return jnp.exp(self._compute(r1, r2, self.params))
+        return jnp.exp(self._compute(r1, r2, params))
     
-    def grad_r(self, r1, r2):
-        """Compute gradient of u w.r.t r1 coordinates."""
+    def grad_r(self, r1, r2, params):
+        """Compute gradient of u w.r.t r1 coordinates.
+        
+        Args:
+            r1: Array of shape (3,) for first electron position
+            r2: Array of shape (3,) for second electron position
+            params: Jastrow parameters
+            
+        Returns:
+            Gradient array of shape (3,)
+        """
         def scalar_fn(x):
-            # Ensure scalar output by selecting the single value
-            return self._compute(x, r2, self.params).reshape(-1)[0]
+            return self._compute(x, r2, params).reshape(-1)[0]
         return jax.grad(scalar_fn)(r1)
     
-    def laplacian_r(self, r1, r2):
-        """Compute Laplacian of u w.r.t r1 coordinates."""
+    def laplacian_r(self, r1, r2, params):
+        """Compute Laplacian of u w.r.t r1 coordinates.
+        
+        Args:
+            r1: Array of shape (3,) for first electron position
+            r2: Array of shape (3,) for second electron position
+            params: Jastrow parameters
+            
+        Returns:
+            Laplacian value (scalar)
+        """
         def scalar_fn(x):
-            # Ensure scalar output by selecting the single value
-            return self._compute(x, r2, self.params).reshape(-1)[0]
+            return self._compute(x, r2, params).reshape(-1)[0]
         return jnp.trace(jax.hessian(scalar_fn)(r1))
     
-    def grad_params(self, r1, r2):
+    def grad_params(self, r1, r2, params):
         """Compute gradient of u w.r.t parameters.
         
         Args:
             r1: Array of shape (3,) for first electron position
             r2: Array of shape (3,) for second electron position
+            params: Jastrow parameters
             
         Returns:
             Gradient array with same shape as params
         """
-        return jax.grad(lambda p: self._compute(r1, r2, p))(self.params)
+        return jax.grad(lambda p: self._compute(r1, r2, p))(params)
     
-    def get_log_grads(self, r1, r2):
+    def get_log_grads(self, r1, r2, params):
         """Compute both ∇u and ∇²u for the Jastrow exponent.
         
         Args:
             r1: Array of shape (3,) for first electron position
             r2: Array of shape (3,) for second electron position
+            params: Jastrow parameters
             
         Returns:
             tuple (grad_u, lapl_u) containing:
                 grad_u: gradient of u, shape (3,)
                 lapl_u: laplacian of u (scalar)
         """
-        grad_u = self.grad_r(r1, r2)
-        lapl_u = self.laplacian_r(r1, r2)
+        grad_u = self.grad_r(r1, r2, params)
+        lapl_u = self.laplacian_r(r1, r2, params)
         return grad_u, lapl_u
-    
-    def update(self, new_params):
-        """Return new instance with updated parameters.
-        
-        Args:
-            new_params: New parameters for the Jastrow factor
-            
-        Returns:
-            New Jastrow instance
-        """
-        return self.__class__(new_params)

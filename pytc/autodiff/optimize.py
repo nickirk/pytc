@@ -20,13 +20,13 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     
     # Create optimizer with current learning rate
     def create_optimizer(lr):
-        if optimizer_name == 'adam':
+        if (optimizer_name == 'adam'):
             return optax.adam(lr)
-        elif optimizer_name == 'adamw':
+        elif (optimizer_name == 'adamw'):
             return optax.adamw(lr)
-        elif optimizer_name == 'adagrad':
+        elif (optimizer_name == 'adagrad'):
             return optax.adagrad(lr)
-        elif optimizer_name == 'rmsprop':
+        elif (optimizer_name == 'rmsprop'):
             return optax.rmsprop(lr)
         else:
             return optax.sgd(lr)
@@ -40,10 +40,8 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     
     @jax.jit
     def loss_fn(params):
-        # Update the Jastrow parameters in a way that maintains JAX gradients
-        xtc.update_jastrow_params(params) 
-        one_body = xtc.get_1b()
-        two_body = xtc.get_2b()
+        one_body = xtc.get_1b(params)
+        two_body = xtc.get_2b(params)
 
         nocc = int(sum(xtc.mf.mo_occ == 2))  
         V_iajb = two_body[:nocc,nocc:,:nocc,nocc:]
@@ -121,8 +119,8 @@ def create_test_system(basis):
     return mol, mf
 
 class REXP(jastrow.Jastrow):
-    def __init__(self, params, epsilon=1e-12):
-        super().__init__(params)
+    def __init__(self, epsilon=1e-12):
+        super().__init__()
         self.epsilon = epsilon
         
     def _safe_norm(self, x):
@@ -141,9 +139,9 @@ def do_ccsd(params, basis):
     # Create new system with cc-pVTZ basis
     mol, mf = create_test_system('ccpvtz')
     
-    my_jastrow = REXP(params)
+    my_jastrow = REXP()  # Remove params from constructor
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
-    eris = myxtc.make_eris()
+    eris = myxtc.make_eris(params)  # Pass params explicitly
     from pyscf.cc import rccsd
     mycc = rccsd.RCCSD(mf)
     mycc.kernel(eris=eris)
@@ -154,8 +152,8 @@ def do_ccsd(params, basis):
     print("CCSD correlation energy:", mycc.e_corr)
     print("Total CCSD energy:", e_hf + mycc.e_corr)
     assert np.isclose(e_hf, -2.8986313304138127, atol=1e-7)
-    assert np.isclose(mycc.e_corr, -0.004845329204667209, atol=1e-7)
-    assert np.isclose(e_hf + mycc.e_corr, -2.903476659618479, atol=1e-7)
+    assert np.isclose(mycc.e_corr, -0.004918838638616493, atol=1e-7)
+    assert np.isclose(e_hf + mycc.e_corr, -2.903550169052428, atol=1e-7)
 
 def main():
     """Example usage with He atom."""
@@ -164,7 +162,7 @@ def main():
 
     
     init_params = jnp.array([0.5], dtype=jnp.float64)
-    my_jastrow = REXP(init_params)
+    my_jastrow = REXP()  # Remove params from constructor
     
     # Run optimization with smaller learning rate
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)

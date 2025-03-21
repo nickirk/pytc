@@ -2,8 +2,8 @@ from pytc.autodiff import jastrow
 import jax.numpy as jnp
 
 class REXP(jastrow.Jastrow):
-    def __init__(self, params, epsilon=1e-12):
-        super().__init__(params)
+    def __init__(self, epsilon=1e-12):
+        super().__init__()
         self.epsilon = epsilon
         
     def _safe_norm(self, x):
@@ -15,5 +15,5 @@ class REXP(jastrow.Jastrow):
         r12_norm = self._safe_norm(r12)
         return 0.5*jnp.exp(-params[0] * r12_norm) * r12_norm
 
-    def __call__(self, r1, r2):
-        return super().__call__(r1, r2)
+    def __call__(self, r1, r2, params):
+        return super().__call__(r1, r2, params)

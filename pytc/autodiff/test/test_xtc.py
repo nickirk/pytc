@@ -33,11 +33,8 @@ class TestXTC(unittest.TestCase):
         
         # Create simple Jastrow factors for both implementations
         cls.params = jnp.array([1])
-        cls.jastrow_jax = REXP_jax(cls.params)
-        
-        # Create numpy version of same jastrow
-
-        cls.jastrow_numpy = REXP_np(np.asarray(cls.params))
+        cls.jastrow_jax = REXP_jax()  # Remove params from constructor
+        cls.jastrow_numpy = REXP_np(np.asarray(cls.params))  # Keep numpy version unchanged
         
         # Initialize XTC calculators with low grid level for testing
         cls.xtc_jax = XTC_jax(cls.mf, cls.jastrow_jax, grid_lvl=2)
@@ -82,7 +79,7 @@ class TestXTC(unittest.TestCase):
                                     mo_values_numpy).reshape(-1, len(self.xtc_numpy.weights))
         
         # Calculate v_vector
-        v_vector_jax = self.xtc_jax.calc_v_vector(rho_paired_jax)
+        v_vector_jax = self.xtc_jax.calc_v_vector(rho_paired_jax, self.params)  # Add params
         v_vector_numpy = self.xtc_numpy._calc_v_vector(rho_paired_numpy)
         
         np.testing.assert_allclose(
@@ -102,7 +99,7 @@ class TestXTC(unittest.TestCase):
         dm1_jax = self.xtc_jax._get_mf_dm()
         dm1_numpy = self.xtc_numpy._get_mf_dm()
         
-        delta_U_jax = self.xtc_jax.get_delta_U(dm1_jax)
+        delta_U_jax = self.xtc_jax.get_delta_U(self.params, dm1_jax)  # Add params
         delta_U_numpy = self.xtc_numpy._calc_delta_U()
         
         np.testing.assert_allclose(
@@ -122,7 +119,7 @@ class TestXTC(unittest.TestCase):
         test_r1 = np.array([[0.0, 0.0, 0.0]])
         test_r2 = np.array([[0.0, 0.0, 1.0]])
         
-        grad_jax = self.xtc_jax.jastrow_factor.grad_r(test_r1, test_r2)
+        grad_jax = self.xtc_jax.jastrow_factor.grad_r(test_r1, test_r2, self.params)
         grad_numpy = self.jastrow_numpy.grad(test_r1, test_r2)
         
         np.testing.assert_allclose(
@@ -134,7 +131,7 @@ class TestXTC(unittest.TestCase):
 
     def test_delta_h(self):
         """Test delta_h calculation."""
-        delta_h_jax = self.xtc_jax.get_delta_h()
+        delta_h_jax = self.xtc_jax.get_delta_h(self.params)  # Add params
         delta_h_numpy = self.xtc_numpy._calc_delta_h()
         
         np.testing.assert_allclose(
@@ -152,7 +149,7 @@ class TestXTC(unittest.TestCase):
 
     def test_one_body(self):
         """Test one-body operator calculation."""
-        h1e_jax = self.xtc_jax.get_1b()
+        h1e_jax = self.xtc_jax.get_1b(self.params)  # Add params
         h1e_numpy = self.xtc_numpy.get_1b()
         
         np.testing.assert_allclose(
@@ -163,7 +160,7 @@ class TestXTC(unittest.TestCase):
 
     def test_two_body(self):
         """Test two-body term calculation."""
-        v2e_jax = self.xtc_jax.get_2b()
+        v2e_jax = self.xtc_jax.get_2b(self.params)  # Add params
         v2e_numpy = self.xtc_numpy.get_2b()
         
         np.testing.assert_allclose(
@@ -200,7 +197,7 @@ class TestXTC(unittest.TestCase):
 
         myrcc = rccsd.RCCSD(self.mf)
         #myrcc.verbose = 5
-        eris = self.xtc_jax.make_eris()
+        eris = self.xtc_jax.make_eris(self.params)  # Add params
         tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
         t = myrcc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))
@@ -209,7 +206,7 @@ class TestXTC(unittest.TestCase):
         self.assertAlmostEqual(tc_e_corr, -0.03272155333587409, places=6)
         # get the hf energy using fock and eris
         no = myrcc.nocc
-        tc_h1e = self.xtc_jax.get_1b()
+        tc_h1e = self.xtc_jax.get_1b(self.params)  # Add params
         tc_e_hf = 2. * np.einsum('ii->', tc_h1e[:no, :no])
         tc_e_dir = 2. * np.einsum('jjii->', eris.oooo)
         tc_e_ex = -1. * np.einsum('ijji->', eris.oooo)

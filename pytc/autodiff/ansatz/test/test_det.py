@@ -117,7 +117,7 @@ class TestSlaterDet(unittest.TestCase):
     def test_determinant_value(self):
         """Test basic determinant evaluation."""
         det = SlaterDet(self.mol, self.mo_coeff)
-        value = det.value(self.test_coords)
+        value = det.value(self.test_coords)[0]
         self.assertIsInstance(value, float)
         self.assertNotEqual(value, 0.0)
         
@@ -155,7 +155,7 @@ class TestSlaterDet(unittest.TestCase):
         # Check ratio against direct calculation
         new_coords = self.test_coords.copy()
         new_coords[0] = new_pos
-        direct_value = det.value(new_coords)
+        direct_value = det.value(new_coords)[0]
         
         self.assertAlmostEqual(ratio * init_value, direct_value, places=10)
         
@@ -165,7 +165,7 @@ class TestSlaterDet(unittest.TestCase):
         
         # Check against direct calculation
         new_coords[1] = new_pos2
-        direct_value2 = det.value(new_coords)
+        direct_value2 = det.value(new_coords)[0]
         
         self.assertAlmostEqual(ratio2 * ratio * init_value, direct_value2, places=10)
 

@@ -9,9 +9,8 @@ from pytc.autodiff.jastrow import Poly
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
 
-def numerical_gradient_params(jastrow, r1, r2, eps=1e-4):
+def numerical_gradient_params(jastrow, r1, r2, params, eps=1e-4):
     """Compute numerical gradient with respect to parameters for single points."""
-    params = jastrow.params
     grad = jnp.zeros_like(params)
     
     for i in range(len(params)):
@@ -19,15 +18,15 @@ def numerical_gradient_params(jastrow, r1, r2, eps=1e-4):
         params_plus = params.at[i].add(eps)
         params_minus = params.at[i].add(-eps)
         
-        j_plus = Poly(params_plus)._compute(r1, r2, params_plus)
-        j_minus = Poly(params_minus)._compute(r1, r2, params_minus)
+        j_plus = jastrow._compute(r1, r2, params_plus)
+        j_minus = jastrow._compute(r1, r2, params_minus)
         
-        # Central difference - no normalization needed
+        # Central difference
         grad = grad.at[i].set((j_plus - j_minus) / (2 * eps))
     
     return grad
 
-def numerical_gradient_r1(jastrow, r1, r2, eps=1e-7):
+def numerical_gradient_r1(jastrow, r1, r2, params, eps=1e-7):
     """Compute numerical gradient with respect to r1 for single points."""
     grad = jnp.zeros_like(r1)
     
@@ -36,8 +35,8 @@ def numerical_gradient_r1(jastrow, r1, r2, eps=1e-7):
         r1_plus = r1.at[j].add(eps)
         r1_minus = r1.at[j].add(-eps)
         
-        j_plus = jastrow._compute(r1_plus, r2, jastrow.params)
-        j_minus = jastrow._compute(r1_minus, r2, jastrow.params)
+        j_plus = jastrow._compute(r1_plus, r2, params)
+        j_minus = jastrow._compute(r1_minus, r2, params)
         
         # Central difference
         grad = grad.at[j].set((j_plus - j_minus) / (2 * eps))
@@ -49,7 +48,7 @@ class TestSimpleJastrowJAX(unittest.TestCase):
     
     def setUp(self):
         self.params = jnp.array([1.0])
-        self.jastrow = Poly(self.params)
+        self.jastrow = Poly()  # No params in constructor
     
     def test_single_point_evaluation(self):
         """Test single point Jastrow evaluation."""
@@ -58,7 +57,6 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         
         value = self.jastrow._compute(r1, r2, self.params)
         self.assertTrue(jnp.isfinite(value))
-        # Fix: Use np.testing.assert_allclose instead of assertEqual
         np.testing.assert_allclose(float(value), 1.0, rtol=1e-10)
     
     def test_batch_evaluation(self):
@@ -66,9 +64,8 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         r1 = jnp.array([[0., 0., 0.], [1., 1., 1.]])  # (2, 3)
         r2 = jnp.array([[1., 0., 0.]])  # (1, 3) - single point for r2
         
-        values = self.jastrow(r1, r2)
-        # Should broadcast to (2, 1)
-        self.assertEqual(values.shape, (2, 1))
+        values = self.jastrow(r1, r2, self.params)
+        self.assertEqual(values.shape, (2,))  # Changed from (2, 1)
         self.assertTrue(jnp.all(jnp.isfinite(values)))
     
     def test_param_gradient(self):
@@ -76,9 +73,8 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         r1 = jnp.array([0., 0., 0.])
         r2 = jnp.array([1., 0., 0.])
         
-        # Use raw gradients for comparison
-        grad_analytical = self.jastrow.grad_params(r1, r2)
-        grad_numerical = numerical_gradient_params(self.jastrow, r1, r2)
+        grad_analytical = self.jastrow.grad_params(r1, r2, self.params)
+        grad_numerical = numerical_gradient_params(self.jastrow, r1, r2, self.params)
         
         np.testing.assert_allclose(
             grad_analytical, grad_numerical,
@@ -91,9 +87,8 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         r1 = jnp.array([0., 0., 0.])
         r2 = jnp.array([1., 0., 0.])
         
-        # Use new method name _compute_grad_r instead of _grad_r1_single
-        grad_analytical = self.jastrow.grad_r(r1, r2)
-        grad_numerical = numerical_gradient_r1(self.jastrow, r1, r2)
+        grad_analytical = self.jastrow.grad_r(r1, r2, self.params)
+        grad_numerical = numerical_gradient_r1(self.jastrow, r1, r2, self.params)
         
         np.testing.assert_allclose(
             grad_analytical, grad_numerical,
@@ -108,13 +103,22 @@ class TestSimpleJastrowJAX(unittest.TestCase):
         r1_batch = jnp.array([[0., 0., 0.]])
         r2_batch = jnp.array([[1., 0., 0.]])
         
-        single_value = self.jastrow._compute(r1_single, r2_single, self.params)
-        batch_value = self.jastrow(r1_batch, r2_batch)
-        
+        # Compare raw _compute values
+        single_u = self.jastrow._compute(r1_single, r2_single, self.params)
+        batch_u = self.jastrow._compute(r1_batch[0], r2_batch[0], self.params)
         np.testing.assert_allclose(
-            single_value, batch_value[0, 0],
+            single_u, batch_u,
             rtol=1e-10, atol=1e-10,
-            err_msg="Batch and single point results don't match"
+            err_msg="Batch and single point u values don't match"
+        )
+        
+        # Compare exp(u) values from __call__
+        single_J = self.jastrow(r1_single, r2_single, self.params)
+        batch_J = self.jastrow(r1_batch, r2_batch, self.params)
+        np.testing.assert_allclose(
+            single_J, batch_J[0],
+            rtol=1e-10, atol=1e-10,
+            err_msg="Batch and single point J values don't match"
         )
 
 if __name__ == '__main__':

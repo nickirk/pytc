@@ -4,6 +4,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pyscf import gto, scf
+import psutil
+import gc
 
 from pytc.autodiff.ansatz.det import SlaterDet, value, grad, laplacian, matrix
 
@@ -13,7 +15,7 @@ class TestDetJax(unittest.TestCase):
     def setUp(self):
         """Create a simple H2 molecule with a SlaterDet for testing"""
         # Create a simple H2 molecule
-        self.mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='sto-3g', unit='angstrom')
+        self.mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='ccpvdz', unit='angstrom')
         
         # Get RHF orbitals
         mf = scf.RHF(self.mol)
@@ -155,6 +157,87 @@ class TestDetJax(unittest.TestCase):
         # Just check that we got some output
         self.assertIsNotNone(value_result)
         self.assertEqual(value_result.shape, (1,))
+    
+    def test_memory_leak(self):
+        """Test that repeated calls to JAX wrappers don't cause memory leaks"""
+        process = psutil.Process()
+        
+        # Force garbage collection
+        gc.collect()
+        initial_memory = process.memory_info().rss / 1024 / 1024  # in MB
+        
+        # Number of iterations for repeated function calls
+        n_iterations = 100
+        n_walkers = 10000
+        
+        # Test all wrapper functions
+        for _ in range(n_iterations):
+            # Generate new coordinates each time
+            coords_np = np.random.rand(n_walkers, self.det.n_electrons, 3)
+            coords_jax = jnp.array(coords_np)
+            
+            # Call all wrapper functions
+            value(self.det, coords_jax)
+            grad(self.det, coords_jax)
+            laplacian(self.det, coords_jax)
+            matrix(self.det, coords_jax)
+            final_memory = process.memory_info().rss / 1024 / 1024  # in MB
+            print(f"Iter: {_}, Memory usage during iteration: {final_memory:.2f}MB")
+        
+        # Force garbage collection again
+        gc.collect()
+        final_memory = process.memory_info().rss / 1024 / 1024  # in MB
+        
+        # Check memory growth
+        memory_growth = final_memory - initial_memory
+        print(f"Memory usage: initial={initial_memory:.2f}MB, final={final_memory:.2f}MB, growth={memory_growth:.2f}MB")
+        
+        # Allow some reasonable growth, but not excessive
+        self.assertLess(memory_growth, 50.0, "Excessive memory growth detected, possible memory leak")
+    
+    def test_memory_leak_jit(self):
+        """Test that repeated calls to JIT-compiled JAX wrappers don't cause memory leaks"""
+        # Create JIT versions of all functions
+        
+        process = psutil.Process()
+        
+        # Force garbage collection
+        gc.collect()
+        initial_memory = process.memory_info().rss / 1024 / 1024  # in MB
+        
+        # Number of iterations for repeated function calls
+        n_iterations = 100
+        n_walkers = 500000
+        
+        # Test all wrapper functions
+        for _ in range(n_iterations):
+            # Generate new coordinates each time
+            coords_np = np.random.rand(n_walkers, self.det.n_electrons, 3)
+            coords_jax = jnp.array(coords_np)
+            value_jit = jax.jit(value, static_argnums=0)
+            grad_jit = jax.jit(grad, static_argnums=0)
+            laplacian_jit = jax.jit(laplacian, static_argnums=0)
+            matrix_jit = jax.jit(matrix, static_argnums=0)
+            
+            # Call all JIT-compiled wrapper functions
+            value_jit(self.det, coords_jax)
+            grad_jit(self.det, coords_jax)
+            laplacian_jit(self.det, coords_jax)
+            matrix_jit(self.det, coords_jax)
+            final_memory = process.memory_info().rss / 1024 / 1024  # in MB
+            print(f"value = {value_jit(self.det, coords_jax)}")
+            print(f"Iter: {_}, Memory usage during iteration: {final_memory:.2f}MB")
+        
+        # Force garbage collection again
+        gc.collect()
+        final_memory = process.memory_info().rss / 1024 / 1024  # in MB
+        
+        # Check memory growth
+        memory_growth = final_memory - initial_memory
+        print(f"JIT Memory usage: initial={initial_memory:.2f}MB, final={final_memory:.2f}MB, growth={memory_growth:.2f}MB")
+        
+        # Allow some reasonable growth, but not excessive
+        self.assertLess(memory_growth, 50.0, "Excessive memory growth detected in JIT functions, possible memory leak")
 
 if __name__ == '__main__':
     unittest.main()

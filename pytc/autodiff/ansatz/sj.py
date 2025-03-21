@@ -12,22 +12,13 @@ from pytc.autodiff.ansatz.det import value, grad, laplacian, matrix
 class SlaterJastrow:
     """Quantum many-body wavefunction ansatz combining Jastrow factor with Slater determinants."""
     
-    def __init__(self, mol, jastrow, dets: List[Any], linear_coeffs: jnp.ndarray):
-        """Initialize the ansatz.
-        
-        Args:
-            jastrow: Jastrow factor object
-            determinants: List of Slater determinant objects
-            coefficients: Array of linear coefficients for determinants
-        """
+    def __init__(self, mol, jastrow, dets: List[Any]):
+        """Initialize the ansatz without storing optimizable parameters."""
         self.mol = mol
         self.jastrow = jastrow
         self.dets = dets
-        self.linear_coeffs = jnp.asarray(linear_coeffs, dtype=jnp.float64)
-        
-        # Calculate and store ion-ion repulsion energy (constant for fixed geometry)
         self._ion_ion_potential = self._compute_ion_ion_potential()
-        
+
     def _compute_ion_ion_potential(self):
         """Calculate the ion-ion repulsion energy (nuclear-nuclear Coulomb interaction).
         
@@ -57,56 +48,31 @@ class SlaterJastrow:
         """Return the ion-ion potential energy (nuclear-nuclear repulsion)."""
         return self._ion_ion_potential
    
-    def __call__(self, elec_coords_batch):
-        """Evaluate wavefunction for a batch of electron configurations.
+    def __call__(self, elec_coords_batch, jastrow_params, linear_coeffs):
+        """Evaluate wavefunction with explicit parameters."""
+        jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(elec_coords_batch)
         
-        Args:
-            elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
-                           or (n_electrons, 3) for a single walker
-                           
-        Returns:
-            Array of wavefunction values with shape (n_walkers,)
-            or a single value for a single walker
-        """
-        
-        # Vectorize Jastrow calculation over batch dimension
-        jastrow_vals = jax.jit(jax.vmap(self._compute_jastrow_value))(elec_coords_batch)
-        
-        # Use JAX wrapper for determinant values
         det_vals = []
         for det in self.dets:
-            # Convert to JAX array if needed
-            coords_jax = jnp.asarray(elec_coords_batch)
-            # Use the JAX-compatible value function
-            det_batch_vals = value(det, coords_jax)
+            det_batch_vals = value(det, elec_coords_batch)
             det_vals.append(det_batch_vals)
-            
-        # Combine determinant values using linear coefficients
-        det_vals_array = jnp.array(det_vals).transpose()  # Shape (n_walkers, n_dets)
-        linear_combo = jnp.sum(self.linear_coeffs * det_vals_array, axis=1)
         
-        # Multiply Jastrow and determinant parts
-        psi_vals = jastrow_vals * linear_combo
+        det_vals_array = jnp.array(det_vals).transpose()
+        linear_combo = jnp.sum(linear_coeffs * det_vals_array, axis=1)
         
-        # Return single value if input was a single walker
-        return psi_vals
+        return jastrow_vals * linear_combo
 
-    # Use partial with static_argnums to specify that 'self' is static
     @partial(jax.jit, static_argnums=(0,))
-    def _compute_jastrow_value(self, elec_coords):
-        """Compute Jastrow factor value."""
-        # Vectorize Jastrow computation over all pairs
+    def _compute_jastrow_value(self, elec_coords, jastrow_params):
+        """Compute Jastrow factor value with explicit parameters."""
         vmap_single = jax.vmap(self.jastrow._compute, in_axes=(None, 0, None))
         vmap_all = jax.vmap(vmap_single, in_axes=(0, None, None))
         
-        # Compute all pairwise values at once
-        all_pairs = vmap_all(elec_coords, elec_coords, self.jastrow.params)
+        all_pairs = vmap_all(elec_coords, elec_coords, jastrow_params)
         
-        # Create a mask to exclude diagonal elements (no self-interaction)
         n_electrons = elec_coords.shape[0]
         diag_mask = 1.0 - jnp.eye(n_electrons)
         
-        # Use redundant summation form (multiply by 1/2)
         return jnp.exp(1./2. * jnp.sum(all_pairs * diag_mask))
     
     @property
@@ -117,7 +83,7 @@ class SlaterJastrow:
     def update_jastrow(self, new_jastrow_params):
         """Update Jastrow parameters."""
         new_jastrow = self.jastrow.update(new_jastrow_params)
-        return SlaterJastrow(self.mol, new_jastrow, self.dets, self.linear_coeffs)
+        return SlaterJastrow(self.mol, new_jastrow, self.dets)
     
     def update_coefficients(self, new_coefficients):
         """Update linear coefficients.
@@ -128,46 +94,27 @@ class SlaterJastrow:
         Returns:
             New Ansatz instance with updated coefficients
         """
-        return SlaterJastrow(self.jastrow, self.dets, new_coefficients)
+        return SlaterJastrow(self.jastrow, self.dets)
 
     @partial(jax.jit, static_argnums=(0,))
-    def _compute_jastrow_terms(self, elec_coords):
-        """Compute ∇J/J and ∇²J/J for all electrons using redundant summation form.
-        
-        In the redundant summation form J = exp(0.5*∑ᵢⱼ u(rᵢ,rⱼ)), we have:
-        ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)/2 + ∑ⱼ≠ᵢ ∇ᵢu(rⱼ,rⱼ)/2
-        
-        For a symmetric u function where u(rᵢ,rⱼ) = -u(rⱼ,rⱼ), this simplifies to:
-        ∇ᵢJ/J = ∑ⱼ≠ᵢ ∇ᵢu(rᵢ,rⱼ)
-        """
+    def _compute_jastrow_terms(self, elec_coords, jastrow_params):
+        """Compute ∇J/J and ∇²J/J with explicit parameters."""
         n_electrons = elec_coords.shape[0]
         
-        # Vectorize gradient and laplacian computation over all pairs
-        # First vmap over r2, keeping r1 fixed
-        vmap_grads = jax.vmap(self.jastrow.get_log_grads, in_axes=(None, 0))
-        # Then vmap over r1, broadcasting r2
+        vmap_grads = jax.vmap(
+            lambda r1, r2: self.jastrow.get_log_grads(r1, r2, jastrow_params),
+            in_axes=(None, 0)
+        )
         vmap_all_grads = jax.vmap(vmap_grads, in_axes=(0, None))
         
-        # Compute all pairs at once
         all_grads, all_laps = vmap_all_grads(elec_coords, elec_coords)
-
         
-        # TODO: check if it is needed, since when ri=rj, the value is zero
         diag_mask = 1.0 - jnp.eye(n_electrons)
-        diag_mask_3d = diag_mask[..., None]  # Add dimension for xyz coordinates
+        diag_mask_3d = diag_mask[..., None]
         
-        # For gradients: since we use redundant summation, each gradient 
-        # contribution is already counted correctly when we sum
         grad_J_over_J = jnp.sum(all_grads * diag_mask_3d, axis=1)
-        
-        # For laplacian: first sum the laplacian terms
-        lap_sum = jnp.sum(all_laps * diag_mask, axis=1) 
-        
-        # Then add the squared gradient term (∇u)²
-        # Square the gradients and sum over spatial dimensions for each electron
+        lap_sum = jnp.sum(all_laps * diag_mask, axis=1)
         grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
-        
-        # Complete Laplacian expression: ∇²J/J = ∇²u + (∇u)²
         lap_J_over_J = lap_sum + grad_squared
         
         return grad_J_over_J, lap_J_over_J
@@ -250,59 +197,51 @@ class SlaterJastrow:
         """Number of beta-spin electrons."""
         return self.n_electrons - self.n_alpha
     
-    @partial(jax.jit, static_argnums=(0,))
-    def local_energy(self, elec_coords_batch):
+    def local_energy(self, elec_coords_batch, jastrow_params, linear_coeffs):
         """Compute local energy for a batch of electron configurations.
         
         Args:
             elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
                             or (n_electrons, 3) for a single walker
+            jastrow_params: Jastrow parameters
+            linear_coeffs: Linear coefficients for determinants
                             
         Returns:
             Array of local energy values with shape (n_walkers,)
             or a single value for a single walker
         """
+        import psutil
         
-        # Ensure we have JAX arrays
-        elec_coords_jax = jnp.asarray(elec_coords_batch)
         
         # Use vmap to compute Jastrow terms for all walkers
-        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(self._compute_jastrow_terms)(elec_coords_jax)
+        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(lambda x: self._compute_jastrow_terms(x, jastrow_params))(elec_coords_batch)
         
         # Get batched matrices, gradients, and laplacians using JAX wrappers
         det = self.dets[0]  # Using the first determinant (assuming single-determinant for now)
-        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords_jax)
-        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_jax)
-        lap_alpha_batch, lap_beta_batch = laplacian(det, elec_coords_jax)
+        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords_batch)
+        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_batch)
+        lap_alpha_batch, lap_beta_batch = laplacian(det, elec_coords_batch)
+
+        n_walkers = elec_coords_batch.shape[0]
+        # generate random slater matrices
+        # memory_usage = psutil.Process().memory_info().rss / 1024**2
+        # print(f"Memory usage before generating random slater matrices: {memory_usage} MB") 
+        # key, subkey = jax.random.split(jax.random.PRNGKey(0))
+        # slater_alpha_batch = jax.random.normal(subkey, (n_walkers, self.n_alpha, self.n_alpha))
+        # slater_beta_batch = jax.random.normal(subkey, (n_walkers, self.n_beta, self.n_beta))
+        # grad_alpha_batch = jax.random.normal(subkey, (n_walkers, self.n_alpha, self.n_alpha, 3))
+        # grad_beta_batch = jax.random.normal(subkey, (n_walkers, self.n_beta, self.n_beta, 3))
+        # lap_alpha_batch = jax.random.normal(subkey, (n_walkers, self.n_alpha,))
+        # lap_beta_batch = jax.random.normal(subkey, (n_walkers, self.n_beta,))
+        # memory_usage = psutil.Process().memory_info().rss / 1024**2
+        # print(f"Memory usage after generating random slater matrices: {memory_usage} MB") 
         
-        # Use scan instead of vmap to process walkers sequentially, reducing memory usage
-        batch_size = elec_coords_jax.shape[0]
-        
-        def scan_fn(_, idx):
-            # Get single walker inputs
-            coords = elec_coords_jax[idx]
-            grad_J = grad_J_over_J_batch[idx]
-            lap_J = lap_J_over_J_batch[idx]
-            s_alpha = slater_alpha_batch[idx]
-            s_beta = slater_beta_batch[idx]
-            g_alpha = grad_alpha_batch[idx]
-            g_beta = grad_beta_batch[idx]
-            l_alpha = lap_alpha_batch[idx]
-            l_beta = lap_beta_batch[idx]
-            
-            # Compute energy for this walker
-            energy = self._compute_single_walker_energy(
-                coords, grad_J, lap_J, s_alpha, s_beta, g_alpha, g_beta, l_alpha, l_beta)
-            
-            return None, energy
-            
-        # Run scan over all indices
-        _, energies = jax.lax.scan(
-            scan_fn,
-            None,  # No carry needed
-            jnp.arange(batch_size)
+        energies = jax.vmap(self._compute_single_walker_energy)(
+            elec_coords_batch, grad_J_over_J_batch, lap_J_over_J_batch,
+            slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch,
+            lap_alpha_batch, lap_beta_batch
         )
-        
+        #del slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch, lap_alpha_batch, lap_beta_batch
         # Return single value if input was a single walker
         return energies
             
@@ -349,13 +288,14 @@ class SlaterJastrow:
         
         return jnp.real(E_L)  # Ensure real value
 
-    @partial(jax.jit, static_argnums=(0,))
-    def quantum_force(self, elec_coords_batch, cutoff=1.0):
+    def quantum_force(self, elec_coords, jastrow_params, linear_coeffs, cutoff=1.0):
         """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
         
         Args:
             elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
                            or (n_electrons, 3) for a single walker
+            jastrow_params: Jastrow parameters
+            linear_coeffs: Linear coefficients for determinants
             cutoff: Maximum allowed magnitude for quantum forces
                            
         Returns:
@@ -364,19 +304,17 @@ class SlaterJastrow:
         """
         # Handle single walker case by adding a batch dimension
         
-        # Ensure we have JAX arrays
-        elec_coords_jax = jnp.asarray(elec_coords_batch)
         
         # Compute Jastrow gradient contributions
-        grad_J_over_J_batch = jax.jit(jax.vmap(lambda coords: self._compute_jastrow_terms(coords)[0]))(elec_coords_jax)
+        grad_J_over_J_batch = jax.vmap(lambda coords: self._compute_jastrow_terms(coords, jastrow_params)[0])(elec_coords)
         
         # Get determinant gradient contributions using JAX wrappers
         det = self.dets[0]  # Using the first determinant
-        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords_jax)
-        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_jax)
+        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords)
+        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords)
         
         # Build quantum forces with vmap
-        forces = jax.jit(jax.vmap(self._compute_quantum_force))(
+        forces = jax.vmap(self._compute_quantum_force)(
             grad_J_over_J_batch,
             slater_alpha_batch,
             slater_beta_batch,
