@@ -420,9 +420,9 @@ def optimize(
     # Track optimization progress
     opt_history = {
         "energy": [],
-        "energy_std": [],
         "params": [],
         "gradients": [],
+        'acceptance': [],
         "steps": []
     }
     
@@ -445,10 +445,12 @@ def optimize(
     
     # Optimization loop
     best_energy = float('inf')
-    best_params = None
     step_times = []
     accumulated_grads = []
     losses = []
+    params = []
+    opt_steps = []
+    acceptances = []
 
 
     print(f"Starting optimization with {n_opt_steps} steps...")
@@ -468,31 +470,20 @@ def optimize(
         else:
             walkers, acceptance = metropolis_hastings(
                 ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
-        acceptance_temp.append(acceptance)
             
         if opt_step % n_steps == 0:
             # Compute loss and gradients for current walker configurations
             (loss, (energies, var_e)), grads = value_and_grad_fn(jastrow_params, walkers)
-            # Add norm-based gradient clipping
-            # grads = clip_by_global_norm(grads, max_norm=5.0)  # Adjust max_norm as needed
-
-            losses.append(energies) 
-            accumulated_grads.append(grads)
-        
-        
-            # Update parameters using accumulated gradients
             updates, opt_state = optimizer.update(grads, opt_state, jastrow_params)
             jastrow_params = optax.apply_updates(jastrow_params, updates)
         
-            # Store optimization history
-            opt_history["energy"].append(energies)
-            opt_history["params"].append(jastrow_params)
-            opt_history["gradients"].append(accumulated_grads)
-            opt_history["steps"].append(opt_step)
+            losses.append(energies) 
+            accumulated_grads.append(grads)
+            params.append(jastrow_params)
+            opt_steps.append(opt_step)
+            acceptances.append(acceptance)
             # Convert arrays to scalars for printing
             loss_val = float(loss)
-            if len(accumulated_grads) > 0:
-                grad_mean = float(jnp.mean(jnp.asarray(accumulated_grads)[-1:]))
         
             # Print progress with proper scalar conversions
             step_time = time.time() - start_time
@@ -501,22 +492,21 @@ def optimize(
             print(f"Step: {opt_step}, Loss: {loss_val:.6f}, "
                   f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
                   f"Var loss: {var_e:.6f}, "
-                  f"Acceptance: {jnp.mean(jnp.asarray(acceptance_temp)):.3f}, "
+                  f"Acceptance: {acceptance:.3f}, "
                   f"Params: {jastrow_params[0]:.6f}, "
                   f"Time: {step_time*1000:.2f}ms")
         
         # Add acceptances to history
         acceptance_history.extend(acceptance_temp)
-        
-        
-    
+
+        # Store optimization history
+        opt_history["energies"] = jnp.asarray(losses)
+        opt_history["params"] = jnp.asarray(params)
+        opt_history["gradients"] = jnp.asarray(accumulated_grads)
+        opt_history["acceptance"] = jnp.asarray(acceptances)
+        opt_history["steps"] = jnp.asarray(opt_steps)
+
     print(f"Optimization complete. Best energy: {best_energy:.6f}")
     
-    # Combine optimization results with final sampling results
-    results = {
-        "optimization_history": opt_history,
-        "best_params": best_params,
-        "best_energy": best_energy
-    }
     
-    return results
+    return opt_history 
