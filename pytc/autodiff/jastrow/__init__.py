@@ -3,4 +3,5 @@
 from .jastrow import Jastrow
 from .poly import Poly
 from .rexp import REXP
-__all__ = ['Jastrow', 'Poly', 'REXP']
+from .nn import NeuralJastrow
+__all__ = ['Jastrow', 'Poly', 'REXP', 'NeuralJastrow']
