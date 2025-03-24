@@ -166,22 +166,34 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
     """Create an optimizer based on specified type and parameters."""
     if opt_kwargs is None:
         opt_kwargs = {}
-        
+    
+    base_kwargs = {}
+    # Update with user-provided kwargs
+    merged_kwargs = {**base_kwargs, **opt_kwargs}
     def schedule_lr(step):
-        return jnp.maximum(0.0001, learning_rate / (1 + step/100))
-        
+        return learning_rate / (1.0 + step/100)
+    
     if optimizer_type.lower() == "adam":
+        #return optax.adamw(learning_rate=schedule_lr)
         return optax.chain(
-            optax.scale_by_adam(**opt_kwargs),
-            optax.scale_by_schedule(schedule_lr),
+            optax.scale_by_adam(),
+            optax.scale_by_learning_rate(schedule_lr),
             optax.scale(-1.0)  # Minimize energy
         )
     elif optimizer_type.lower() == "sgd":
         return optax.chain(
-            optax.sgd(**opt_kwargs),
-            optax.scale(learning_rate),
+            optax.sgd(learning_rate=learning_rate),
+            optax.scale_by_learning_rate(schedule_lr),
             optax.scale(-1.0)  # Minimize energy
         )
+    elif optimizer_type.lower() == "rmsprop":
+        return optax.chain(
+            optax.scale_by_rms(decay=merged_kwargs.get("decay", 0.9), eps=merged_kwargs.get("eps", 1e-8)),
+            optax.scale_by_learning_rate(schedule_lr),
+            optax.scale(-1.0)  # Minimize energy
+        )
+    elif optimizer_type.lower() == "lion":
+        return optax.lion(learning_rate=learning_rate, b1=merged_kwargs.get("b1", 0.9), b2=merged_kwargs.get("b2", 0.99))
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 

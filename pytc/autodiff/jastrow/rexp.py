@@ -2,7 +2,7 @@ from pytc.autodiff import jastrow
 import jax.numpy as jnp
 
 class REXP(jastrow.Jastrow):
-    def __init__(self, epsilon=1e-12):
+    def __init__(self, epsilon=1e-8):
         super().__init__()
         self.epsilon = epsilon
         

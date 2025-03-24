@@ -1,4 +1,5 @@
 import numpy as np
+import scipy
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -8,6 +9,7 @@ from pyscf.dft import numint
 
 einsum = partial(np.einsum, optimize=True)
 
+@partial(jax.jit, static_argnums=(0,))
 def value(det, coords):
     """JAX-compatible wrapper for SlaterDet.value()
     
@@ -25,6 +27,7 @@ def value(det, coords):
     result_shape = jax.ShapeDtypeStruct((coords.shape[0],), jnp.float64)
     return jax.pure_callback(value_callback, result_shape, coords)
 
+@partial(jax.jit, static_argnums=(0,))
 def grad(det, coords):
     """JAX-compatible wrapper for SlaterDet.grad()
     
@@ -46,6 +49,7 @@ def grad(det, coords):
     
     return jax.pure_callback(grad_callback, (up_shape, down_shape), coords)
 
+@partial(jax.jit, static_argnums=(0,))
 def laplacian(det, coords):
     """JAX-compatible wrapper for SlaterDet.laplacian()
     
@@ -67,6 +71,7 @@ def laplacian(det, coords):
     
     return jax.pure_callback(laplacian_callback, (up_shape, down_shape), coords)
 
+@partial(jax.jit, static_argnums=(0,))
 def matrix(det, coords):
     """JAX-compatible wrapper for SlaterDet.matrix()
     
@@ -383,18 +388,15 @@ class SlaterDet:
         
         # Compute determinants
         if is_single:
-            det_up = np.linalg.det(slater_up_batch)
-            det_down = np.linalg.det(slater_down_batch)
+            det_up = scipy.linalg.det(slater_up_batch)
+            det_down = scipy.linalg.det(slater_down_batch)
             return det_up * det_down
         else:
-            # Compute determinants for each walker
-            n_walkers = coords_batch.shape[0]
-            
             # NumPy can compute determinants of batched matrices using a list comprehension
             # but we'll avoid loops by using built-in vectorization
             # Use optimized batched determinant calculation
-            det_up_batch = np.linalg.det(slater_up_batch)
-            det_down_batch = np.linalg.det(slater_down_batch)
+            det_up_batch = scipy.linalg.det(slater_up_batch)
+            det_down_batch = scipy.linalg.det(slater_down_batch)
             
             # Multiply the determinants
             values = det_up_batch * det_down_batch

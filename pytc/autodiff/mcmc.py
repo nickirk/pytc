@@ -243,7 +243,7 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, jastrow_pa
         acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}")
+            print(f"Burn-in step {step}/{n_steps}, Acceptance: {acceptance}")
     
     print("Burn-in complete.")
     return walkers, acceptance_history, key
@@ -315,12 +315,8 @@ def sample(
                 ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
         else:
             # Do both up and down spin moves
-            walkers, alpha_acceptance = metropolis_hastings(
+            walkers, acceptance = metropolis_hastings(
                 ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
-            key, subkey = random.split(key)
-            walkers, beta_acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
-            acceptance = (alpha_acceptance + beta_acceptance) / 2
             
         acceptance_history.append(acceptance)
         
@@ -435,10 +431,14 @@ def optimize(
         # Compute energies for all walkers with current parameters
         energies = ansatz.local_energy(walkers_batch, params, linear_coeffs)
         
+        # clip energies around the mean energy to avoid numerical instability
+        mean_energy = jnp.mean(energies)
+        var_e = jnp.mean(jnp.abs(energies - mean_energy))
+        energies = jnp.clip(energies, mean_energy-20.*var_e, mean_energy+20.*var_e)
         # Compute cost (default: mean energy)
         cost = cost_fn(energies)
         
-        return cost, energies
+        return cost, (mean_energy, var_e)
     
     # Vectorized gradient function
     value_and_grad_fn = jax.jit(value_and_grad(loss_fn, has_aux=True))
@@ -449,7 +449,8 @@ def optimize(
     step_times = []
     accumulated_grads = []
     losses = []
-    
+
+
     print(f"Starting optimization with {n_opt_steps} steps...")
     for opt_step in range(n_opt_steps):
         start_time = time.time()
@@ -465,42 +466,42 @@ def optimize(
             walkers, acceptance = metropolis_hastings_importance_sampling(
                 ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
         else:
-            walkers, alpha_acceptance = metropolis_hastings(
+            walkers, acceptance = metropolis_hastings(
                 ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
-            key, subkey = random.split(key)
-            walkers, beta_acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
-            acceptance = (alpha_acceptance + beta_acceptance) / 2
         acceptance_temp.append(acceptance)
             
         if opt_step % n_steps == 0:
             # Compute loss and gradients for current walker configurations
-            (loss, energies), grads = value_and_grad_fn(jastrow_params, walkers)
-            losses.append(loss) 
+            (loss, (energies, var_e)), grads = value_and_grad_fn(jastrow_params, walkers)
+            # Add norm-based gradient clipping
+            # grads = clip_by_global_norm(grads, max_norm=5.0)  # Adjust max_norm as needed
+
+            losses.append(energies) 
             accumulated_grads.append(grads)
         
         
             # Update parameters using accumulated gradients
-            updates, opt_state = optimizer.update(grads, opt_state)
+            updates, opt_state = optimizer.update(grads, opt_state, jastrow_params)
             jastrow_params = optax.apply_updates(jastrow_params, updates)
         
             # Store optimization history
-            opt_history["energy"].append(loss)
+            opt_history["energy"].append(energies)
             opt_history["params"].append(jastrow_params)
             opt_history["gradients"].append(accumulated_grads)
             opt_history["steps"].append(opt_step)
             # Convert arrays to scalars for printing
             loss_val = float(loss)
             if len(accumulated_grads) > 0:
-                grad_mean = float(jnp.mean(jnp.asarray(accumulated_grads)))
+                grad_mean = float(jnp.mean(jnp.asarray(accumulated_grads)[-1:]))
         
             # Print progress with proper scalar conversions
             step_time = time.time() - start_time
             step_times.append(step_time)
 
             print(f"Step: {opt_step}, Loss: {loss_val:.6f}, "
-                  f"Mean loss: {jnp.mean(jnp.asarray(losses[-500:])):.6f}, "
-                  f"Ave Gradients: {grad_mean:.6f}, "
+                  f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
+                  f"Var loss: {var_e:.6f}, "
+                  f"Acceptance: {jnp.mean(jnp.asarray(acceptance_temp)):.3f}, "
                   f"Params: {jastrow_params[0]:.6f}, "
                   f"Time: {step_time*1000:.2f}ms")
         
