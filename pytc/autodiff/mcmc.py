@@ -430,9 +430,10 @@ def optimize(
         energies = ansatz.local_energy(walkers_batch, params, linear_coeffs)
         
         # clip energies around the mean energy to avoid numerical instability
+        median_energy = jnp.median(energies)
         mean_energy = jnp.mean(energies)
-        var_e = jnp.mean(jnp.abs(energies - mean_energy))
-        energies = jnp.clip(energies, mean_energy-20.*var_e, mean_energy+20.*var_e)
+        var_e = jnp.mean(jnp.abs(energies - median_energy))
+        energies = jnp.clip(energies, median_energy-10.*var_e, median_energy+10.*var_e)
         # Compute cost (default: mean energy)
         cost = cost_fn(energies)
         

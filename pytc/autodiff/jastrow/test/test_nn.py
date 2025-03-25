@@ -37,82 +37,55 @@ class TestNeuralJastrow(unittest.TestCase):
     """Test cases for NeuralJastrow class."""
     
     def setUp(self):
-        # Set up H2 molecule
-        mol_h2 = get_h2_molecule()
-        self.nuclear_pos_h2 = mol_h2.atom_coords()
-        self.nuclear_charges_h2 = mol_h2.atom_charges()
+        # Test systems
+        h2_pos = jnp.array([[0., 0., -0.7], [0., 0., 0.7]])
+        h2_charges = jnp.array([1., 1.])
+        h2o_pos = jnp.array([[0., 0., 0.], [0., 1.43233673, -0.96104039],
+                            [0., -1.43233673, -0.96104039]])
+        h2o_charges = jnp.array([8., 1., 1.])
         
-        # Set up H2O molecule
-        mol_h2o = get_h2o_molecule()
-        self.nuclear_pos_h2o = mol_h2o.atom_coords()
-        self.nuclear_charges_h2o = mol_h2o.atom_charges()
+        key1 = random.PRNGKey(0)
+        # Initialize networks with smaller width for testing
+        self.jastrow_h2 = NeuralJastrow(h2_pos, h2_charges, 
+                                       layer_widths=[4, 4])
+        self.jastrow_h2o = NeuralJastrow(h2o_pos, h2o_charges, 
+                                        layer_widths=[4, 4])
         
-        # Initialize jastrows with fixed random seed for reproducibility
-        key = random.PRNGKey(42)
-        key1, key2 = random.split(key)
-        
-        # Use smaller networks for testing
-        self.jastrow_h2 = NeuralJastrow(
-            self.nuclear_pos_h2,
-            self.nuclear_charges_h2,
-            layer_widths=[4, 4],
-            key=key1
-        )
-        self.jastrow_h2o = NeuralJastrow(
-            self.nuclear_pos_h2o,
-            self.nuclear_charges_h2o,
-            layer_widths=[8, 8],
-            key=key2
-        )
-        
-        # Initialize parameters
-        self.params_h2 = self.jastrow_h2.init_params(key1)
-        self.params_h2o = self.jastrow_h2o.init_params(key2)
+        # Split the key for three networks
+        key1, key2, key3 = random.split(key1, 3)
+        self.params_h2 = self.jastrow_h2.init_params(key1, key2, key3)
+        key1, key2, key3 = random.split(key1, 3)
+        self.params_h2o = self.jastrow_h2o.init_params(key1, key2, key3)
     
     def test_params_shape(self):
         """Test parameter count and shapes."""
-        # Test H2
+        n_nuclei_h2 = 2
         expected_params_h2 = (
-            (1 + 2*len(self.nuclear_charges_h2)) * 4  # First layer weights
-            + 4  # First layer bias
-            + 4 * 4  # Second layer weights
-            + 4  # Second layer bias
-            + 4 * 1  # Output layer weights
-            + 1  # Output layer bias
+            self.jastrow_h2.get_param_count_single(2 * n_nuclei_h2) +  # en network
+            self.jastrow_h2.get_param_count_single(1) +                # ee network
+            self.jastrow_h2.get_param_count_single(1 + 2 * n_nuclei_h2)  # een network
         )
-        self.assertEqual(len(self.params_h2), expected_params_h2)
+        self.assertEqual(self.params_h2.size, expected_params_h2)
         
-        # Test H2O
+        n_nuclei_h2o = 3
         expected_params_h2o = (
-            (1 + 2*len(self.nuclear_charges_h2o)) * 8  # First layer weights
-            + 8  # First layer bias
-            + 8 * 8  # Second layer weights
-            + 8  # Second layer bias
-            + 8 * 1  # Output layer weights
-            + 1  # Output layer bias
+            self.jastrow_h2o.get_param_count_single(2 * n_nuclei_h2o) +  # en network
+            self.jastrow_h2o.get_param_count_single(1) +                 # ee network
+            self.jastrow_h2o.get_param_count_single(1 + 2 * n_nuclei_h2o)  # een network
         )
-        self.assertEqual(len(self.params_h2o), expected_params_h2o)
+        self.assertEqual(self.params_h2o.size, expected_params_h2o)
     
     def test_feature_construction(self):
         """Test feature vector construction."""
         r1 = jnp.array([0., 0., 0.])
         r2 = jnp.array([1., 0., 0.])
         
-        net_features_h2, cusp_features_h2 = self.jastrow_h2._construct_features(r1, r2)
-        net_features_h2o, cusp_features_h2o = self.jastrow_h2o._construct_features(r1, r2)
+        en_features, ee_features, een_features = self.jastrow_h2._construct_features(r1, r2)
         
-        # Check network feature dimensions (1 e-e + 2N nuclear distances)
-        expected_dim_h2 = 1 + 2*len(self.nuclear_charges_h2)
-        expected_dim_h2o = 1 + 2*len(self.nuclear_charges_h2o)
-        
-        self.assertEqual(net_features_h2.shape, (1, expected_dim_h2))
-        self.assertEqual(net_features_h2o.shape, (1, expected_dim_h2o))
-        
-        # Check cusp features structure
-        cusp_r12_h2, cusp_r1n_h2, cusp_r2n_h2 = cusp_features_h2
-        self.assertEqual(cusp_r12_h2.shape, ())  # scalar
-        self.assertEqual(cusp_r1n_h2.shape, (len(self.nuclear_charges_h2),))
-        self.assertEqual(cusp_r2n_h2.shape, (len(self.nuclear_charges_h2),))
+        # Check shapes
+        self.assertEqual(en_features.shape, (1, 4))  # 2 nuclei * 2 electrons
+        self.assertEqual(ee_features.shape, (1, 1))  # 1 e-e distance
+        self.assertEqual(een_features.shape, (1, 5))  # 1 e-e + 2*2 e-n distances
     
     def test_compute_basics(self):
         """Test basic compute functionality."""
@@ -169,6 +142,19 @@ class TestNeuralJastrow(unittest.TestCase):
         grad_r1 = jax.grad(lambda x: self.jastrow_h2._compute(x, r2, self.params_h2))(r1)
         self.assertEqual(grad_r1.shape, (3,))
         self.assertTrue(jnp.all(jnp.isfinite(grad_r1)))
+
+    def test_gradient_symmetry(self):
+        """Test that grad_r1 = -grad_r2 for the Jastrow factor."""
+        r1 = jnp.array([0.2, 0.3, 0.1])
+        r2 = jnp.array([0.5, -0.1, 0.4])
+        
+        # Compute gradients with respect to both electron positions
+        grad_r1 = jax.grad(lambda x: self.jastrow_h2._compute(x, r2, self.params_h2))(r1)
+        grad_r2 = jax.grad(lambda x: self.jastrow_h2._compute(r1, x, self.params_h2))(r2)
+        
+        # Check that grad_r1 = -grad_r2
+        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7, 
+                                 err_msg="Gradient symmetry violated: grad_r1 ≠ -grad_r2")
 
 if __name__ == '__main__':
     unittest.main()
