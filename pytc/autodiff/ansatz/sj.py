@@ -47,7 +47,8 @@ class SlaterJastrow:
     def ion_ion_potential(self):
         """Return the ion-ion potential energy (nuclear-nuclear repulsion)."""
         return self._ion_ion_potential
-   
+    
+    @partial(jax.jit, static_argnums=(0,))
     def __call__(self, elec_coords_batch, jastrow_params, linear_coeffs):
         """Evaluate wavefunction with explicit parameters."""
         jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(elec_coords_batch)
@@ -273,6 +274,7 @@ class SlaterJastrow:
         
         return jnp.real(E_L)  # Ensure real value
 
+    @partial(jax.jit, static_argnums=(0,))
     def quantum_force(self, elec_coords, jastrow_params, linear_coeffs, cutoff=1.0):
         """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
         

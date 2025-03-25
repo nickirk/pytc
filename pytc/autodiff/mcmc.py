@@ -1,14 +1,12 @@
 '''
 Metropolis-Hastings sampling
 '''
-import gc
-import numpy as np
 import jax.numpy as jnp
 from jax import random, grad, value_and_grad
 import jax
 import optax
 import time
-from typing import Dict, Any, Optional, Callable, Tuple
+from typing import Dict, Any, Optional
 
 from pytc.autodiff.mcmc_utils import (
     prepare_sampling_results, report_progress, create_optimizer,
