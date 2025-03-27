@@ -144,17 +144,37 @@ class TestNeuralJastrow(unittest.TestCase):
         self.assertTrue(jnp.all(jnp.isfinite(grad_r1)))
 
     def test_gradient_symmetry(self):
-        """Test that grad_r1 = -grad_r2 for the Jastrow factor."""
-        r1 = jnp.array([0.2, 0.3, 0.1])
-        r2 = jnp.array([0.5, -0.1, 0.4])
+        """Test that grad_r1 = -grad_r2 for the Jastrow factor across all electron pairs."""
+        # Create a walker with multiple electron positions
+        nelec = 2
+        key = random.PRNGKey(42)
+        walker = random.normal(key, shape=(nelec, 3))  # Random positions for testing
         
-        # Compute gradients with respect to both electron positions
-        grad_r1 = jax.grad(lambda x: self.jastrow_h2._compute(x, r2, self.params_h2))(r1)
-        grad_r2 = jax.grad(lambda x: self.jastrow_h2._compute(r1, x, self.params_h2))(r2)
+        # Create vmapped functions to compute gradients for all pairs
+        # First vmap over r2 (second argument), then over r1 (first argument)
+        grad_r1_fn = jax.vmap(jax.vmap(
+            jax.grad(lambda x, y: self.jastrow_h2._compute(x, y, self.params_h2)), 
+            in_axes=(None, 0)), in_axes=(0, None))
         
-        # Check that grad_r1 = -grad_r2
-        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7, 
+        grad_r2_fn = jax.vmap(jax.vmap(
+            jax.grad(lambda x, y: self.jastrow_h2._compute(x, y, self.params_h2), 1), 
+            in_axes=(None, 0)), in_axes=(0, None))
+        
+        # Compute gradients for all pairs
+        grad_r1 = grad_r1_fn(walker, walker)  # Shape: (nelec, nelec, 3)
+        grad_r2 = grad_r2_fn(walker, walker)  # Shape: (nelec, nelec, 3)
+        
+        # Check shapes
+        self.assertEqual(grad_r1.shape, (nelec, nelec, 3))
+        self.assertEqual(grad_r2.shape, (nelec, nelec, 3))
+        
+        # Check that grad_r1 = -grad_r2 for all pairs
+        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7,
                                  err_msg="Gradient symmetry violated: grad_r1 ≠ -grad_r2")
+        
+        # Test finiteness of gradients
+        self.assertTrue(jnp.all(jnp.isfinite(grad_r1)))
+        self.assertTrue(jnp.all(jnp.isfinite(grad_r2)))
 
 if __name__ == '__main__':
     unittest.main()

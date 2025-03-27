@@ -117,13 +117,13 @@ class TestSlaterDet(unittest.TestCase):
     def test_determinant_value(self):
         """Test basic determinant evaluation."""
         det = SlaterDet(self.mol, self.mo_coeff)
-        value = det.value(self.test_coords)[0]
-        self.assertIsInstance(value, float)
+        value = det.value(self.test_coords)
+        self.assertIsInstance(value, (float, np.ndarray))
         self.assertNotEqual(value, 0.0)
         
         # Test __call__ convenience method
         call_value = det(self.test_coords)
-        self.assertEqual(value, call_value)
+        np.testing.assert_allclose(value, call_value)
 
     def test_matrix_shape(self):
         """Test shape of Slater matrices."""
@@ -180,7 +180,11 @@ class TestSlaterDet(unittest.TestCase):
         val2 = det.value(coords2)
         
         # Determinant should change sign when two rows are swapped
-        self.assertAlmostEqual(val1, -val2, places=10)
+        # Handle both scalar and array outputs
+        if isinstance(val1, np.ndarray):
+            np.testing.assert_allclose(val1, -val2)
+        else:
+            self.assertAlmostEqual(val1, -val2, places=10)
 
     def test_boundary_conditions(self):
         """Test behavior at large distances."""
@@ -191,6 +195,7 @@ class TestSlaterDet(unittest.TestCase):
         ])
         value = det.value(far_coords)
         # Determinant should decay to zero far from molecule
+        value = value[0] if isinstance(value, np.ndarray) else value
         self.assertLess(abs(value), 1e-3)
 
     def test_numerical_gradient(self):
@@ -199,12 +204,15 @@ class TestSlaterDet(unittest.TestCase):
         eps = 1e-5
         coords = self.test_coords
         
+        # Get analytical gradient and matrix
+        (matrix_up, matrix_down), (grad_up, grad_down) = det.grad(coords)
+        
         # Compute numerical gradient for first electron, x direction
         d = 0  # x-direction
         e_idx = 0  # first electron
         
-        # Get the Slater matrix at the original position
-        slater_up_orig, _ = det.matrix(coords)
+        # Get the Slater matrix at the original position - already computed above
+        slater_up_orig = matrix_up
         
         # Compute numerical derivative using central difference
         h = np.zeros(3)
@@ -219,9 +227,6 @@ class TestSlaterDet(unittest.TestCase):
         
         numeric_grad = (slater_up_plus - slater_up_minus) / (2 * eps)
         
-        # Get analytical gradient
-        grad_up, _ = det.grad(coords)
-        
         # Compare numerical vs analytical for this specific element
         self.assertAlmostEqual(
             grad_up[e_idx, 0, d],  # [electron, orbital, direction]
@@ -233,12 +238,27 @@ class TestSlaterDet(unittest.TestCase):
         """Test Laplacian calculation."""
         det = SlaterDet(self.mol, self.mo_coeff)
         
-        # We can at least verify it returns the expected shape
-        lapl_up, lapl_down = det.laplacian(self.test_coords)
+        # Get all derivatives at once
+        (matrix_up, matrix_down), (grad_up, grad_down), (lapl_up, lapl_down) = det.laplacian(self.test_coords)
+        
+        # Check shapes
+        self.assertEqual(matrix_up.shape, (1, 1))
+        self.assertEqual(matrix_down.shape, (1, 1))
+        self.assertEqual(grad_up.shape, (1, 1, 3))
+        self.assertEqual(grad_down.shape, (1, 1, 3))
         self.assertEqual(lapl_up.shape, (1, 1))
         self.assertEqual(lapl_down.shape, (1, 1))
         
-        # Testing against numerical Laplacian would require more complex code
+        # Verify consistency with individual calls
+        matrix_only_up, matrix_only_down = det.matrix(self.test_coords)
+        np.testing.assert_allclose(matrix_up, matrix_only_up)
+        np.testing.assert_allclose(matrix_down, matrix_only_down)
+        
+        (matrix_grad_up, matrix_grad_down), (grad_only_up, grad_only_down) = det.grad(self.test_coords)
+        np.testing.assert_allclose(matrix_up, matrix_grad_up)
+        np.testing.assert_allclose(matrix_down, matrix_grad_down)
+        np.testing.assert_allclose(grad_up, grad_only_up)
+        np.testing.assert_allclose(grad_down, grad_only_down)
 
     def test_excitation_det_value(self):
         """Test determinant value with excitation."""
@@ -252,9 +272,7 @@ class TestSlaterDet(unittest.TestCase):
         # Values should be different
         val_normal = det_normal.value(self.water_coords)
         val_excited = det_excited.value(self.water_coords)
-        
-        self.assertNotEqual(val_normal, val_excited)
-        
+        self.assertNotEqual(val_normal, val_excited)        
 
 
 if __name__ == '__main__':
