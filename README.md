@@ -6,16 +6,17 @@
 - scipy
 - unittest
 - jax (autodiff and GPU acceleration)
+- flax (neural network)
 - optax (machine learning optimizers)
 - tqdm (visual progress tracking)
 - pyscf (![modified version](https://github.com/nickirk/pyscf/tree/tc-ccsd) for tc-ccsd only. Otherwise, official pyscf also works)
 
 ## Features
-- Takes in user defined Jastrow factors
+- Takes in user defined Jastrow factors (Neural Jastrow under test)
 - Uses JAX autodiff to compute gradient of Jastrow on r and on parameters
-- Support simple Jastrow optimization by deterministic/second quantized optimization algorithm
-- Real-space VMC Jastrow optimization (coming soon)
-- Supports GPU acceleration via JAX (CUDA-backend currently not implemented)
+- Supports simple Jastrow optimization by deterministic/second quantized optimization algorithm
+- Real-space VMC Jastrow optimization
+- Supports GPU acceleration via JAX (needs careful memory management)
 - Calculates the transcorrelated 2-body integrals: K1, K2, K3
 - Calculates the xTC approximated 3-body integrals
 - Implements the Interpolative Separable Density Fitting (ISDF) approximation for the all the aforementioned integrals
