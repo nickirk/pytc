@@ -79,22 +79,7 @@ class SlaterJastrow:
     def n_electrons(self):
         """Return the number of electrons."""
         return self.dets[0].n_electrons
-        
-    def update_jastrow(self, new_jastrow_params):
-        """Update Jastrow parameters."""
-        new_jastrow = self.jastrow.update(new_jastrow_params)
-        return SlaterJastrow(self.mol, new_jastrow, self.dets)
-    
-    def update_coefficients(self, new_coefficients):
-        """Update linear coefficients.
-        
-        Args:
-            new_coefficients: New linear coefficients for determinants
-            
-        Returns:
-            New Ansatz instance with updated coefficients
-        """
-        return SlaterJastrow(self.jastrow, self.dets)
+
 
     @partial(jax.jit, static_argnums=(0,))
     def _compute_jastrow_terms(self, elec_coords, jastrow_params):
