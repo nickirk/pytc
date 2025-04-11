@@ -11,8 +11,10 @@ setup(
     install_requires=[
         "numpy",
         "scipy",
+        "unittest",
         "jax",
         "optax",
+        "flax",
         "tqdm",
         "pyscf",
     ],
