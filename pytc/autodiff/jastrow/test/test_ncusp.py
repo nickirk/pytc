@@ -8,26 +8,33 @@ class TestNuclearCuspJastrow(unittest.TestCase):
     
     def setUp(self):
         """Set up H2 molecule and compute RHF."""
-        self.mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='cc-pvdz')
+        self.mol = gto.M(atom='H 0 0 1.4; O 0 0 0; H 0 0 -1.4', basis='cc-pvdz')
         self.mf = scf.RHF(self.mol)
         self.mf.kernel()
         
         # Initialize and setup NuclearCuspJastrow
-        self.ncusp = NuclearCuspJastrow(n_radial=100)
+        self.ncusp = NuclearCuspJastrow(n_radial=1000)
         self.ncusp.setup_for_molecule(self.mol, self.mf.mo_coeff)
         
     def test_mo_values_symmetry(self):
-        """Test that MO values are symmetric for H2."""
+        """Test that MO values follow expected symmetry for H2O.
+        The two H atoms should have similar magnitude but potentially opposite signs
+        due to the molecular orbital symmetry."""
         # Test points
-        distances = [0.1, 0.5, 1.0, 2.0]
+        distances = np.linspace(0.1, 2.0, 1000)
         
-        for d in distances:
-            val1 = self.ncusp.eval_mo_at_r(0, d)
-            val2 = self.ncusp.eval_mo_at_r(1, d)
-            # For H2, absolute values should be similar due to symmetry
-            np.testing.assert_allclose(abs(val1), abs(val2), rtol=1e-5,
-                                     err_msg=f"MO values not symmetric at r={d}")
-    
+        # Get values for both H atoms
+        val1 = self.ncusp.eval_mo_at_r(0, distances)  # First H
+        val2 = self.ncusp.eval_mo_at_r(2, distances)  # Second H
+        
+        # Test that magnitudes are similar
+        np.testing.assert_allclose(abs(val1), abs(val2), rtol=1e-5,
+                                 err_msg=f"MO value magnitudes not symmetric for H atoms")
+        
+        # Test that they have opposite signs (due to molecular orbital symmetry)
+        np.testing.assert_allclose(val1, -val2, rtol=1e-5,
+                                 err_msg=f"MO values don't show expected antisymmetry for H atoms")
+
     def test_mo_sums_debug(self):
         """Debug MO sums calculation."""
         # Print debug information
@@ -41,6 +48,7 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             
             # Test MO values
             s_ao_vals = self.ncusp.ao_values[i][0]
+            print("mo_coeff:", self.mf.mo_coeff[self.ncusp.s_indices_per_atom[i], :nocc])
             mo_vals = np.dot(s_ao_vals, self.mf.mo_coeff[self.ncusp.s_indices_per_atom[i], :nocc])
             print(f"MO values at nucleus {i}:", mo_vals)
             

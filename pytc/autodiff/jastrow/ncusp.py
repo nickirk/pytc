@@ -6,7 +6,7 @@ from pyscf import gto
 from .jastrow import Jastrow
 
 class NuclearCuspJastrow(Jastrow):
-    def __init__(self, n_radial=100):
+    def __init__(self, n_radial=1000):
         """Initialize nuclear cusp correction.
         
         Args:
@@ -84,12 +84,13 @@ class NuclearCuspJastrow(Jastrow):
             ao_values.append(ao_values_r)
         
         self.r_grids = jnp.array(r_grids)
-        self.ao_values = jnp.array(ao_values)
+        # Store as list instead of JAX array since shapes may differ
+        self.ao_values = ao_values  # Changed from jnp.array(ao_values)
         
         # Transform AO values to MO values and sum them for each nucleus
         mo_sums = []
         for atom_id in range(self.n_nuclei):
-            s_ao_vals = self.ao_values[atom_id]  # (n_radial, n_s_orbs)
+            s_ao_vals = jnp.array(self.ao_values[atom_id])  # Convert individual arrays to JAX
             # Only take occupied orbitals
             n_occ = mol.nelec[0]  # number of occupied orbitals (RHF)
             mo_vals = jnp.dot(s_ao_vals, mo_coeff[self.s_indices_per_atom[atom_id], :n_occ])
@@ -173,7 +174,7 @@ class NuclearCuspJastrow(Jastrow):
             
             # Combine using cutoff
             cutoff = self._cutoff_function(r, rc)
-            contrib = jnp.log(phi_cusp) - jnp.log(phi_s) * cutoff
+            contrib = jnp.log(phi_cusp/phi_s) * cutoff
             
             total = total + contrib
             
