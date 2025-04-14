@@ -87,32 +87,58 @@ class NuclearCuspJastrow(Jastrow):
         # Store as list instead of JAX array since shapes may differ
         self.ao_values = ao_values  # Changed from jnp.array(ao_values)
         
-        # Transform AO values to MO values and sum them for each nucleus
-        mo_sums = []
+        # Instead of MO transformation, just use 1s orbital values
+        sao_sums = []
         for atom_id in range(self.n_nuclei):
-            s_ao_vals = jnp.array(self.ao_values[atom_id])  # Convert individual arrays to JAX
-            # Only take occupied orbitals
-            n_occ = mol.nelec[0]  # number of occupied orbitals (RHF)
-            mo_vals = jnp.dot(s_ao_vals, mo_coeff[self.s_indices_per_atom[atom_id], :n_occ])
-            mo_sum = jnp.sum(mo_vals, axis=1)  # sum over occupied MOs
-            mo_sums.append(mo_sum)
+            s_ao_vals = jnp.array(self.ao_values[atom_id])  # (n_radial, n_s_orbs)
+            # For now, just take the first s-orbital (1s) contribution
+            # Assuming first s-orbital in the basis set is 1s
+            sao_sum = s_ao_vals[:, 0]  # Only use 1s orbital
+            sao_sums.append(sao_sum)
         
-        # Setup cubic spline interpolators for summed MO values at each nucleus
+        # Setup cubic spline interpolators for s-orbital values at each nucleus
         self.splines = []
         for i in range(self.n_nuclei):
-            # Convert to numpy for scipy interpolation
             x = np.array(self.r_grids[i])
-            y = np.array(mo_sums[i])
+            y = np.array(sao_sums[i])
             spline = CubicSpline(x, y, bc_type='natural')
             self.splines.append(spline)
             
     def init_params(self):
-        """Initialize parameter dictionary structure with validation."""
+        """Initialize parameter dictionary structure."""
+        # Initialize parameters for each unique nuclear type
         params = {
-            'rc': jnp.ones(self.n_types),  # cutoff radius per nucleus type
-            'poly_coeff': jnp.zeros((self.n_types, 5)),  # coefficients per type
-            'C': jnp.ones(self.n_types)  # scaling factor per type
+            'rc': jnp.array([1.0/float(Z) for Z in self.Z_to_idx.keys()]),  # rc = 1/Z for each type
+            'poly_coeff': jnp.zeros((self.n_types, 5)),
+            'C': jnp.zeros(self.n_types)  # Changed from ones to zeros
         }
+        
+        # Initialize α coefficients for each nucleus type
+        for Z_type, Z_idx in self.Z_to_idx.items():
+            Z = float(Z_type)
+            rc = params['rc'][Z_idx]
+            
+            # Find first nucleus of this type
+            for i in range(self.n_nuclei):
+                if self.charges[i] == Z:
+                    nucleus_idx = i
+                    break
+                    
+            phi_rc_vals = self._get_phi_s_derivatives(nucleus_idx, rc)
+            phi_0 = self.eval_mo_at_r(nucleus_idx, 1e-8)
+            
+            # Set up X values
+            X = jnp.zeros(5)
+            X = X.at[0].set(jnp.log(abs(phi_rc_vals[0])))  # X₁ = ln|φ(rc)|
+            X = X.at[1].set(phi_rc_vals[1]/phi_rc_vals[0])  # X₂ = φ'(rc)/φ(rc)
+            X = X.at[2].set(phi_rc_vals[2]/phi_rc_vals[0])  # X₃ = φ''(rc)/φ(rc)
+            X = X.at[3].set(-Z)  # X₄ = -Z (cusp condition)
+            X = X.at[4].set(jnp.log(abs(phi_0)))  # X₅ = ln|φ(0)|
+            
+            # Compute α coefficients
+            alpha = self._compute_alpha_coeffs(Z, rc, X)
+            params['poly_coeff'] = params['poly_coeff'].at[Z_idx].set(alpha)
+            
         self._validate_params(params)
         return params
     
@@ -147,7 +173,7 @@ class NuclearCuspJastrow(Jastrow):
             params: Dictionary containing cusp parameters
         
         Returns:
-            ln(φ_cusp(r)) - ln(φ_s(r))Θ(r-rc) for each nucleus, summed
+            (ln(φ_cusp(r)) - ln(φ_s(r)))Θ(r-rc) for each nucleus, summed
         """
         total = 0.0
         
@@ -194,3 +220,52 @@ class NuclearCuspJastrow(Jastrow):
         r_np = np.array(r)
         result = self.splines[nucleus_idx](r_np)
         return jnp.array(result)
+    
+    def _get_phi_s_derivatives(self, nucleus_idx, r):
+        """Compute φ_s and its derivatives at given r.
+        
+        Args:
+            nucleus_idx: Index of nucleus
+            r: Distance from nucleus
+            
+        Returns:
+            tuple (φ_s, φ_s', φ_s'') at r
+        """
+        # Use spline object to get derivatives
+        r_np = np.array(r)
+        phi = self.splines[nucleus_idx](r_np)
+        phi_d1 = self.splines[nucleus_idx].derivative(1)(r_np)
+        phi_d2 = self.splines[nucleus_idx].derivative(2)(r_np)
+        return jnp.array([phi, phi_d1, phi_d2])
+
+    def _compute_alpha_coeffs(self, Z, rc, X_vals):
+        """Compute α coefficients from X values and rc.
+        
+        Args:
+            Z: Nuclear charge
+            rc: Cutoff radius
+            X_vals: Array of X1-X5 values
+            
+        Returns:
+            Array of α coefficients [α₀, α₁, α₂, α₃, α₄]
+        """
+        X1, X2, X3, X4, X5 = X_vals
+        
+        alpha = jnp.zeros(5)
+        # α₀ = X₅
+        alpha = alpha.at[0].set(X5)
+        # α₁ = X₄
+        alpha = alpha.at[1].set(X4)
+        # α₂ = 6X₁/rc² - 3X₂/rc + X₃/2 - 3X₄/rc - 6X₅/rc² - X₂²/2
+        alpha = alpha.at[2].set(
+            6*X1/rc**2 - 3*X2/rc + X3/2 - 3*X4/rc - 6*X5/rc**2 - X2**2/2
+        )
+        # α₃ = -8X₁/rc³ + 5X₂/rc² - X₃/rc + 3X₄/rc² + 8X₅/rc³ + X₂²/rc
+        alpha = alpha.at[3].set(
+            -8*X1/rc**3 + 5*X2/rc**2 - X3/rc + 3*X4/rc**2 + 8*X5/rc**3 + X2**2/rc
+        )
+        # α₄ = 3X₁/rc⁴ - 2X₂/rc³ + X₃/(2rc²) - X₄/rc³ - 3X₅/rc⁴ - X₂²/(2rc²)
+        alpha = alpha.at[4].set(
+            3*X1/rc**4 - 2*X2/rc**3 + X3/(2*rc**2) - X4/rc**3 - 3*X5/rc**4 - X2**2/(2*rc**2)
+        )
+        return alpha
