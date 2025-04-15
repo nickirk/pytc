@@ -38,7 +38,7 @@ class NuclearCuspJastrow(Jastrow):
         self.s_indices_per_atom = []
         
         for atom_id in range(self.n_nuclei):
-            r_grid = jnp.linspace(1e-8, 5.0, self.n_radial)
+            r_grid = jnp.linspace(1e-8, 1.5, self.n_radial)
             coords = jnp.zeros((self.n_radial, 3))
             coords = coords.at[:,0].set(r_grid)
             coords = coords + self.coords[atom_id]
