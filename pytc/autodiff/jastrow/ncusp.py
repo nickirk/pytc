@@ -1,12 +1,12 @@
-import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import CubicSpline
-from pyscf import gto
 from .jastrow import Jastrow
+from functools import partial
+import jax
 
 class NuclearCuspJastrow(Jastrow):
-    def __init__(self, n_radial=1000):
+    def __init__(self, mol, n_radial=1000):
         """Initialize nuclear cusp correction.
         
         Args:
@@ -14,8 +14,10 @@ class NuclearCuspJastrow(Jastrow):
         """
         super().__init__()
         self.n_radial = n_radial
+        self.setup_for_molecule(mol)
         
-    def setup_for_molecule(self, mol, mo_coeff):
+        
+    def setup_for_molecule(self, mol, mo_coeff=None):
         """Setup orbital evaluators for given molecule.
         This is separate from __init__ to avoid storing large arrays.
         
@@ -23,15 +25,23 @@ class NuclearCuspJastrow(Jastrow):
             mol: PySCF Mole object
             mo_coeff: Molecular orbital coefficients
         """
-        self.coords = mol.atom_coords()
-        self.charges = mol.atom_charges()
+        # Convert coordinates and charges to JAX arrays
+        self.coords = jnp.array(mol.atom_coords())
+        self.charges = jnp.array(mol.atom_charges())
         self.n_nuclei = len(self.charges)
         
-        # Group nuclei by atomic number
-        unique_Z = jnp.unique(self.charges)
-        self.Z_to_idx = {int(Z): i for i, Z in enumerate(unique_Z)}
+        # Convert atomic charges to indices using array ops
+        unique_Z = jnp.sort(jnp.unique(self.charges))
+        self.unique_Z = unique_Z
+        # Create reverse mapping array: Z -> idx
+        max_Z = int(jnp.max(unique_Z))
+        Z_to_idx = -jnp.ones(max_Z + 1, dtype=jnp.int32)
+        # Use dynamic_update_slice or scatter to set values
+        for i, Z in enumerate(unique_Z):
+            Z_to_idx = Z_to_idx.at[int(Z)].set(i)
+        self.Z_to_idx = Z_to_idx  # Now an array instead of dict
         self.n_types = len(unique_Z)
-        
+
         # Create radial grids for each nucleus
         r_grids = []
         ao_values = []
@@ -96,36 +106,38 @@ class NuclearCuspJastrow(Jastrow):
             sao_sum = s_ao_vals[:, 0]  # Only use 1s orbital
             sao_sums.append(sao_sum)
         
-        # Setup cubic spline interpolators for s-orbital values at each nucleus
-        self.splines = []
+        # Instead of storing CubicSpline objects, store their coefficients
+        self.spline_coeffs = []
+        self.spline_xs = []
         for i in range(self.n_nuclei):
             x = np.array(self.r_grids[i])
             y = np.array(sao_sums[i])
             spline = CubicSpline(x, y, bc_type='natural')
-            self.splines.append(spline)
+            dx = np.diff(x)
+            # Convert coefficients to segment form for each interval
+            # SciPy stores coefficients in descending power order: [a3, a2, a1, a0]
+            # where p(x) = a3*(x-x0)^3 + a2*(x-x0)^2 + a1*(x-x0) + a0
+            self.spline_xs.append(jnp.array(x))
+            self.spline_coeffs.append(jnp.array(spline.c))
             
     def init_params(self):
         """Initialize parameter dictionary structure."""
         # Initialize parameters for each unique nuclear type
         params = {
-            'rc': jnp.array([1.0/float(Z) for Z in self.Z_to_idx.keys()]),  # rc = 1/Z for each type
+            'rc': jnp.array([1.0/float(Z) for Z in self.unique_Z]),  # Use unique_Z array
             'poly_coeff': jnp.zeros((self.n_types, 5)),
-            'C': jnp.zeros(self.n_types)  # Changed from ones to zeros
+            'C': jnp.zeros(self.n_types)
         }
         
         # Initialize α coefficients for each nucleus type
-        for Z_type, Z_idx in self.Z_to_idx.items():
-            Z = float(Z_type)
+        for Z_idx, Z in enumerate(self.unique_Z):
             rc = params['rc'][Z_idx]
             
             # Find first nucleus of this type
-            for i in range(self.n_nuclei):
-                if self.charges[i] == Z:
-                    nucleus_idx = i
-                    break
-                    
+            nucleus_idx = jnp.where(self.charges == Z)[0][0]
+            
             phi_rc_vals = self._get_phi_s_derivatives(nucleus_idx, rc)
-            phi_0 = self.eval_mo_at_r(nucleus_idx, 1e-8)
+            phi_0 = self.eval_mo_at_r(nucleus_idx, 0.0)
             
             # Set up X values
             X = jnp.zeros(5)
@@ -164,78 +176,149 @@ class NuclearCuspJastrow(Jastrow):
         powers = jnp.arange(len(coeffs))
         return jnp.sum(coeffs * (r**powers))
     
+    #@partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
-        """Compute nuclear cusp Jastrow correction.
+        """Compute nuclear cusp correction for a single electron.
         
         Args:
-            r1: Position of electron (3,)
-            r2: Not used, kept for interface consistency
-            params: Dictionary containing cusp parameters
-        
+            r1: Single electron position of shape (3,)
+            r2: Dummy argument for interface compatibility
+            params: Dictionary of parameters
+            
         Returns:
-            (ln(φ_cusp(r)) - ln(φ_s(r)))Θ(r-rc) for each nucleus, summed
+            Jastrow contribution for this electron as scalar
         """
-        total = 0.0
-        
-        for nucleus_idx in range(self.n_nuclei):
-            # Get distance from electron to nucleus
+        def scan_nuclei(carry, nucleus_idx):
+            total = carry
+            # Get distance from electron to this nucleus
             dr = r1 - self.coords[nucleus_idx]
             r = jnp.sqrt(jnp.sum(dr**2))
             
-            # Get nucleus type index for parameter lookup
+            # Use array indexing instead of dictionary lookup
             Z = self.charges[nucleus_idx]
-            Z_idx = self.Z_to_idx[int(Z)]
-            
-            # Get parameters for this nucleus type
+            Z_idx = self.Z_to_idx[Z.astype(jnp.int32)]
             rc = params['rc'][Z_idx]
-            poly_coeffs = params['poly_coeff'][Z_idx]
-            C = params['C'][Z_idx]
             
-            # Compute φ_cusp = exp(poly(r)) + C
-            poly_val = self._eval_poly(r, poly_coeffs)
-            phi_cusp = jnp.exp(poly_val) + C
+            # Use where to conditionally evaluate only when r <= rc
+            def evaluate_contribution(r):
+                poly_coeffs = params['poly_coeff'][Z_idx]
+                C = params['C'][Z_idx]
+                
+                # Compute φ_cusp = exp(poly(r)) + C
+                poly_val = jnp.where(r<=rc, self._eval_poly(r, poly_coeffs), 0.0)
+                phi_cusp = jnp.exp(poly_val) + C
+                
+                # Get φ_s value with numerical safeguard
+                phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
+                
+                # Add small constants to prevent division by zero or log(0)
+                eps = 1e-8
+                ratio = (phi_cusp + eps)/(phi_s + eps)
+                # Use log1p for better numerical stability when ratio is close to 1
+                log_term = jnp.log(ratio)
+                
+                # Combine using cutoff
+                cutoff = self._cutoff_function(r, rc)
+                return log_term * cutoff
             
-            # Get φ_s from spline interpolation
-            phi_s = self.eval_mo_at_r(nucleus_idx, r)
+            # Only evaluate when r <= rc, otherwise return 0
+            contrib = jnp.where(r <= rc, 
+                              evaluate_contribution(r),
+                              0.0)
             
-            # Combine using cutoff
-            cutoff = self._cutoff_function(r, rc)
-            contrib = jnp.log(phi_cusp/phi_s) * cutoff
-            
-            total = total + contrib
-            
-        return total
-    
-    def eval_mo_at_r(self, nucleus_idx, r):
-        """Evaluate sum of MO values at distance r from nucleus using spline interpolation.
+            return total + contrib, None
         
-        Args:
-            nucleus_idx: Index of nucleus
-            r: Distance from nucleus
+        # Sum over all nuclei
+        total, _ = jax.lax.scan(scan_nuclei, 0.0, jnp.arange(self.n_nuclei))
+        
+        return total
+
+    def eval_mo_at_r(self, nucleus_idx, r):
+        """JAX-compatible cubic spline evaluation."""
+        # Handle scalar vs array inputs differently
+        r_is_array = hasattr(r, 'shape') and r.ndim > 0
+        
+        # Stack all spline data for vectorized operations
+        xs = jnp.stack(self.spline_xs)
+        coeffs = jnp.stack(self.spline_coeffs)
+        
+        # Select data for this nucleus
+        mask = jnp.arange(self.n_nuclei) == nucleus_idx
+        x = jnp.sum(xs * mask[:, None], axis=0)
+        c = jnp.sum(coeffs * mask[:, None, None], axis=0)
+        
+        # Process differently based on input type
+        if r_is_array:
+            # Vectorized processing for array inputs
+            dx = x[1] - x[0]
             
-        Returns:
-            Interpolated sum of MO values
-        """
-        # Convert input to numpy, evaluate, then convert back to jax array
-        r_np = np.array(r)
-        result = self.splines[nucleus_idx](r_np)
-        return jnp.array(result)
+            # Compute all indices and t values at once (JAX-traceable)
+            indices = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
+            indices_int = jnp.floor(indices).astype(jnp.int32)
+            
+            # Calculate local coordinates relative to left endpoint
+            x_i = jnp.take(x, indices_int)
+            t = r - x_i
+            
+            # Use vmap to apply the spline evaluation to each element
+            def eval_spline_at_idx(idx, t):
+                # Get coefficients for this interval - use JAX-friendly indexing
+                # SciPy's coefficients are stored in descending power order:
+                # c[0,idx] is coefficient of (x-x_i)³
+                # c[1,idx] is coefficient of (x-x_i)²
+                # c[2,idx] is coefficient of (x-x_i)
+                # c[3,idx] is constant term
+                return c[3,idx] + t*(c[2,idx] + t*(c[1,idx] + t*c[0,idx]))
+            
+            # Use vmap instead of fori_loop for better traceability
+            values = jax.vmap(eval_spline_at_idx)(indices_int, t)
+            return values
+        else:
+            # Scalar processing - use same logic as array processing
+            dx = x[1] - x[0]
+            # Compute index and t value same as array case
+            index = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
+            indices_int = jnp.floor(index).astype(jnp.int32)
+            # Calculate local coordinate
+            x_i = jnp.take(x, indices_int)
+            t = r - x_i
+            # Use same coefficient order as array case
+            return c[3,indices_int] + t*(c[2,indices_int] + t*(c[1,indices_int] + t*c[0,indices_int]))
     
     def _get_phi_s_derivatives(self, nucleus_idx, r):
-        """Compute φ_s and its derivatives at given r.
+        """JAX-compatible derivatives computation."""
+        # Convert inputs to arrays and combine spline data
+        xs = jnp.stack(self.spline_xs)
+        coeffs = jnp.stack(self.spline_coeffs)
         
-        Args:
-            nucleus_idx: Index of nucleus
-            r: Distance from nucleus
-            
-        Returns:
-            tuple (φ_s, φ_s', φ_s'') at r
-        """
-        # Use spline object to get derivatives
-        r_np = np.array(r)
-        phi = self.splines[nucleus_idx](r_np)
-        phi_d1 = self.splines[nucleus_idx].derivative(1)(r_np)
-        phi_d2 = self.splines[nucleus_idx].derivative(2)(r_np)
+        # Select data for this nucleus using where/multiply
+        mask = jnp.arange(self.n_nuclei) == nucleus_idx
+        x = jnp.sum(xs * mask[:, None], axis=0)
+        c = jnp.sum(coeffs * mask[:, None, None], axis=0)
+        
+        # Find interval using safe integer operations
+        dx = x[1] - x[0]
+        index = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
+        index_int = jnp.floor(index).astype(jnp.int32)
+        
+        # Get local coordinate
+        t = r - x[index_int]  # Note: not normalized by dx here
+        
+        # Get coefficients for this interval
+        c0 = jnp.sum(c[0] * (jnp.arange(len(c[0])) == index_int))  # cubic term
+        c1 = jnp.sum(c[1] * (jnp.arange(len(c[1])) == index_int))  # quadratic term
+        c2 = jnp.sum(c[2] * (jnp.arange(len(c[2])) == index_int))  # linear term
+        c3 = jnp.sum(c[3] * (jnp.arange(len(c[3])) == index_int))  # constant term
+        
+        # Value: p(t) = c0*t³ + c1*t² + c2*t + c3
+        phi = c3 + t*(c2 + t*(c1 + t*c0))
+        
+        # First derivative: p'(t) = 3c0*t² + 2c1*t + c2
+        phi_d1 = c2 + t*(2*c1 + t*3*c0)
+        
+        # Second derivative: p''(t) = 6c0*t + 2c1
+        phi_d2 = 2*c1 + t*6*c0
+        
         return jnp.array([phi, phi_d1, phi_d2])
 
     def _compute_alpha_coeffs(self, Z, rc, X_vals):
