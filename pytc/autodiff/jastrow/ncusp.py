@@ -14,6 +14,7 @@ class NuclearCuspJastrow(Jastrow):
         """
         super().__init__()
         self.n_radial = n_radial
+        self.nelectron = mol.nelectron
         self.setup_for_molecule(mol)
         
         
@@ -145,7 +146,7 @@ class NuclearCuspJastrow(Jastrow):
             X = X.at[1].set(phi_rc_vals[1]/phi_rc_vals[0])  # X₂ = φ'(rc)/φ(rc)
             X = X.at[2].set(phi_rc_vals[2]/phi_rc_vals[0])  # X₃ = φ''(rc)/φ(rc)
             X = X.at[3].set(-Z)  # X₄ = -Z (cusp condition)
-            X = X.at[4].set(jnp.log(abs(phi_0)))  # X₅ = ln|φ(0)|
+            X = X.at[4].set(jnp.log(abs(phi_0))+0.08)  # X₅ = ln|φ(0)|
             
             # Compute α coefficients
             alpha = self._compute_alpha_coeffs(Z, rc, X)
@@ -212,7 +213,7 @@ class NuclearCuspJastrow(Jastrow):
                 phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
                 
                 # Add small constants to prevent division by zero or log(0)
-                eps = 1e-8
+                eps = 0.0
                 ratio = (phi_cusp + eps)/(phi_s + eps)
                 # Use log1p for better numerical stability when ratio is close to 1
                 log_term = jnp.log(ratio)
@@ -232,6 +233,15 @@ class NuclearCuspJastrow(Jastrow):
         total, _ = jax.lax.scan(scan_nuclei, 0.0, jnp.arange(self.n_nuclei))
         
         return total
+    
+    # overwrite get_log_grads_r2 to give the same value as get_log_grads_r1 from
+    # parent class
+    def get_log_grads_r1(self, r1, r2, params):
+        grad_u, lap_u = super().get_log_grads_r1(r1, r2, params)
+        return grad_u/self.nelectron, lap_u/self.nelectron
+
+    def get_log_grads_r2(self, r1, r2, params):
+        return self.get_log_grads_r1(r2, r1, params)
 
     def eval_mo_at_r(self, nucleus_idx, r):
         """JAX-compatible cubic spline evaluation."""
