@@ -1,9 +1,17 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf
-from pytc.autodiff.jastrow.ncusp import NuclearCusp
 import jax 
 jax.config.update("jax_enable_x64", True)
+from jax import random
+import jax.numpy as jnp
+
+from pytc.autodiff.jastrow.ncusp import NuclearCusp
+from pytc.autodiff.mcmc import sample
+from pytc.autodiff.ansatz.sj import SlaterJastrow
+from pytc.autodiff.ansatz.det import SlaterDet
+from pytc.autodiff.mcmc_utils import analyze_energies
+
 class TestNuclearCuspJastrow(unittest.TestCase):
     """Test cases for NuclearCuspJastrow class."""
     
@@ -355,6 +363,98 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         print("-" * 50)
         for x, E, u in zip(x_points, energies, jastrow_vals):
             print(f"{x:10.4f}  {E:15.6f}  {u:15.6f}")
+
+class TestHartreeFockCBS(unittest.TestCase):
+    """Test cases for Hartree-Fock basis set convergence with nuclear cusp correction."""
+    
+    def setUp(self):
+        """Set up common test parameters."""
+        # Common sampling parameters
+        self.n_walkers = 5000
+        self.n_steps = 8000
+        self.step_size = 0.05
+        self.burn_in_steps = 1000
+        self.thinning = 10
+        self.key = random.PRNGKey(42)
+        
+        # Test molecule (using H2O as example)
+        self.atom_str = 'H 0 0 1.4; O 0 0 0; H 0 0 -1.4'
+        self.basis_sets = ['sto6g', 'cc-pvdz', 'cc-pvtz']
+        
+    def sample_hf_energy(self, mol, mf, use_ncusp=False):
+        """Helper function to sample HF energy with or without nuclear cusp."""
+        # Create determinant from HF solution
+        det = SlaterDet(mol, mf.mo_coeff)
+        
+        # Create Jastrow (either nuclear cusp or identity)
+        jastrow = NuclearCusp(mol, n_radial=1000)
+            
+        # Initialize parameters
+        jastrow_params = jastrow.init_params()
+        linear_coeffs = jnp.ones(1)  # Single determinant
+        
+        # Create SlaterJastrow ansatz
+        sj_ansatz = SlaterJastrow(mol, jastrow, [det])
+        
+        # Run sampling
+        sampling_results = sample(
+            sj_ansatz,
+            n_walkers=self.n_walkers,
+            n_steps=self.n_steps,
+            step_size=self.step_size,
+            use_importance_sampling=False,
+            burn_in_steps=self.burn_in_steps,
+            thinning=self.thinning,
+            jastrow_params=jastrow_params,
+            linear_coeffs=linear_coeffs,
+            key=self.key
+        )
+        
+        # Analyze results
+        energy_stats = analyze_energies(sampling_results)
+        return float(energy_stats["mean"]), float(energy_stats["error"])
+    
+    def test_basis_set_convergence(self):
+        """Test convergence of HF energy with and without nuclear cusp correction."""
+        results = []
+        
+        for basis in self.basis_sets:
+            # Create molecule with current basis
+            mol = gto.M(atom=self.atom_str, basis=basis, unit='bohr')
+            
+            # Run PySCF calculation
+            mf = scf.RHF(mol)
+            hf_energy_reference = float(mf.kernel())
+            
+            # Sample with nuclear cusp
+            cusp_energy, cusp_error = self.sample_hf_energy(mol, mf, use_ncusp=True)
+            
+            results.append({
+                'basis': basis,
+                'reference': hf_energy_reference,
+                'with_cusp': (cusp_energy, cusp_error)
+            })
+            
+            # Print current results
+            print(f"\nResults for {basis}:")
+            print(f"Reference HF: {hf_energy_reference:.6f}")
+            print(f"With cusp:   {cusp_energy:.6f} ± {cusp_error:.6f}")
+        
+        # Analyze convergence
+        for i in range(len(results)-1):
+            basis1, basis2 = results[i], results[i+1]
+            
+            # Energy differences between consecutive basis sets
+            diff_no_cusp = abs(basis1['no_cusp'][0] - basis2['no_cusp'][0])
+            diff_cusp = abs(basis1['with_cusp'][0] - basis2['with_cusp'][0])
+            
+            print(f"\nConvergence from {basis1['basis']} to {basis2['basis']}:")
+            print(f"Energy difference without cusp: {diff_no_cusp:.6f}")
+            print(f"Energy difference with cusp:    {diff_cusp:.6f}")
+            
+            # Test that cusp correction improves convergence
+            self.assertLess(diff_cusp, diff_no_cusp, 
+                          "Nuclear cusp correction should improve basis set convergence")
 
 if __name__ == '__main__':
     unittest.main()
