@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf
-from pytc.autodiff.jastrow.ncusp import NuclearCuspJastrow
+from pytc.autodiff.jastrow.ncusp import NuclearCusp
 import jax 
 jax.config.update("jax_enable_x64", True)
 class TestNuclearCuspJastrow(unittest.TestCase):
@@ -14,7 +14,7 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         self.mf.kernel()
         
         # Initialize and setup NuclearCuspJastrow
-        self.ncusp = NuclearCuspJastrow(self.mol, n_radial=1000)
+        self.ncusp = NuclearCusp(self.mol, n_radial=1000)
         
     def test_mo_values_symmetry(self):
         """Test that MO values follow expected symmetry for H2O.

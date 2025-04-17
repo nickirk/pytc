@@ -5,7 +5,7 @@ from .jastrow import Jastrow
 from functools import partial
 import jax
 
-class NuclearCuspJastrow(Jastrow):
+class NuclearCusp(Jastrow):
     def __init__(self, mol, n_radial=1000):
         """Initialize nuclear cusp correction.
         
@@ -177,7 +177,7 @@ class NuclearCuspJastrow(Jastrow):
         powers = jnp.arange(len(coeffs))
         return jnp.sum(coeffs * (r**powers))
     
-    #@partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
         """Compute nuclear cusp correction for a single electron.
         
