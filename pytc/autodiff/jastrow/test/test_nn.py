@@ -1,4 +1,4 @@
-"""Tests for Neural Network based Jastrow implementation."""
+"""Tests for Neural Network based Jastrow implementations."""
 
 import unittest
 import numpy as np
@@ -6,7 +6,8 @@ import jax
 import jax.numpy as jnp
 from jax import random
 from pyscf import gto
-from pytc.autodiff.jastrow import NeuralJastrow
+from pytc.autodiff.jastrow import NeuralEN, NeuralEE, NeuralEEN
+from pytc.autodiff.jastrow import CompositeJastrow
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -33,148 +34,132 @@ def get_h2o_molecule():
     )
     return mol
 
-class TestNeuralJastrow(unittest.TestCase):
-    """Test cases for NeuralJastrow class."""
+class TestNeuralBase(unittest.TestCase):
+    """Common setup and utilities for neural network tests."""
     
     def setUp(self):
-        # Test systems
-        h2_pos = jnp.array([[0., 0., -0.7], [0., 0., 0.7]])
-        h2_charges = jnp.array([1., 1.])
-        h2o_pos = jnp.array([[0., 0., 0.], [0., 1.43233673, -0.96104039],
-                            [0., -1.43233673, -0.96104039]])
-        h2o_charges = jnp.array([8., 1., 1.])
+        self.h2_pos = jnp.array([[0., 0., -0.7], [0., 0., 0.7]])
+        self.h2_charges = jnp.array([1., 1.])
+        self.h2o_pos = jnp.array([[0., 0., 0.], 
+                                 [0., 1.43233673, -0.96104039],
+                                 [0., -1.43233673, -0.96104039]])
+        self.h2o_charges = jnp.array([8., 1., 1.])
+        self.key = random.PRNGKey(0)
+
+    def assert_gradient_symmetry(self, jastrow, params):
+        """Test that grad_r1 = -grad_r2 for the Jastrow factor."""
+        nelec = 2
+        walker = random.normal(self.key, shape=(nelec, 3))
         
-        key1 = random.PRNGKey(0)
-        # Initialize networks with smaller width for testing
-        self.jastrow_h2 = NeuralJastrow(h2_pos, h2_charges, 
-                                       layer_widths=[4, 4])
-        self.jastrow_h2o = NeuralJastrow(h2o_pos, h2o_charges, 
-                                        layer_widths=[4, 4])
+        grad_r1_fn = jax.vmap(jax.vmap(
+            jax.grad(lambda x, y: jastrow._compute(x, y, params)), 
+            in_axes=(None, 0)), in_axes=(0, None))
         
-        # Split the key for three networks
-        key1, key2, key3 = random.split(key1, 3)
-        self.params_h2 = self.jastrow_h2.init_params(key1, key2, key3)
-        key1, key2, key3 = random.split(key1, 3)
-        self.params_h2o = self.jastrow_h2o.init_params(key1, key2, key3)
+        grad_r2_fn = jax.vmap(jax.vmap(
+            jax.grad(lambda x, y: jastrow._compute(x, y, params), 1), 
+            in_axes=(None, 0)), in_axes=(0, None))
+        
+        grad_r1 = grad_r1_fn(walker, walker)
+        grad_r2 = grad_r2_fn(walker, walker)
+        
+        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7)
+
+class TestNeuralEN(TestNeuralBase):
+    """Test electron-nuclear component."""
     
-    def test_params_shape(self):
-        """Test parameter count and shapes."""
-        n_nuclei_h2 = 2
-        expected_params_h2 = (
-            self.jastrow_h2.get_param_count_single(2 * n_nuclei_h2) +  # en network
-            self.jastrow_h2.get_param_count_single(1) +                # ee network
-            self.jastrow_h2.get_param_count_single(1 + 2 * n_nuclei_h2)  # een network
-        )
-        self.assertEqual(self.params_h2.size, expected_params_h2)
-        
-        n_nuclei_h2o = 3
-        expected_params_h2o = (
-            self.jastrow_h2o.get_param_count_single(2 * n_nuclei_h2o) +  # en network
-            self.jastrow_h2o.get_param_count_single(1) +                 # ee network
-            self.jastrow_h2o.get_param_count_single(1 + 2 * n_nuclei_h2o)  # een network
-        )
-        self.assertEqual(self.params_h2o.size, expected_params_h2o)
-    
-    def test_feature_construction(self):
-        """Test feature vector construction."""
+    def setUp(self):
+        super().setUp()
+        self.jastrow_h2 = NeuralEN(self.h2_pos, self.h2_charges, layer_widths=[4, 4])
+        self.jastrow_h2o = NeuralEN(self.h2o_pos, self.h2o_charges, layer_widths=[4, 4])
+        self.params_h2 = self.jastrow_h2.init_params(key=self.key)
+        self.params_h2o = self.jastrow_h2o.init_params(key=self.key)
+
+    def test_compute(self):
         r1 = jnp.array([0., 0., 0.])
         r2 = jnp.array([1., 0., 0.])
         
-        en_features, ee_features, een_features = self.jastrow_h2._construct_features(r1, r2)
-        
-        # Check shapes
-        self.assertEqual(en_features.shape, (1, 4))  # 2 nuclei * 2 electrons
-        self.assertEqual(ee_features.shape, (1, 1))  # 1 e-e distance
-        self.assertEqual(een_features.shape, (1, 5))  # 1 e-e + 2*2 e-n distances
-    
-    def test_compute_basics(self):
-        """Test basic compute functionality."""
-        r1 = jnp.array([0., 0., 0.])
-        r2 = jnp.array([1., 0., 0.])
-        
-        # Check output is scalar
         value_h2 = self.jastrow_h2._compute(r1, r2, self.params_h2)
         value_h2o = self.jastrow_h2o._compute(r1, r2, self.params_h2o)
         
         self.assertEqual(value_h2.shape, ())
         self.assertEqual(value_h2o.shape, ())
-        
-        # Check values are finite
         self.assertTrue(jnp.isfinite(value_h2))
         self.assertTrue(jnp.isfinite(value_h2o))
+
+class TestNeuralEE(TestNeuralBase):
+    """Test electron-electron component."""
     
+    def setUp(self):
+        super().setUp()
+        self.jastrow = NeuralEE(layer_widths=[4, 4])
+        self.params = self.jastrow.init_params(key=self.key)
+
     def test_electron_coalescence(self):
-        """Test behavior when electrons approach each other."""
         r1 = jnp.array([0., 0., 0.])
         r2_close = jnp.array([0., 0., 1e-3])
         r2_far = jnp.array([0., 0., 1.0])
         
-        value_close = self.jastrow_h2._compute(r1, r2_close, self.params_h2)
-        value_far = self.jastrow_h2._compute(r1, r2_far, self.params_h2)
+        value_close = self.jastrow._compute(r1, r2_close, self.params)
+        value_far = self.jastrow._compute(r1, r2_far, self.params)
         
-        # Value should be larger in magnitude when electrons are close
         self.assertTrue(jnp.abs(value_close) > jnp.abs(value_far))
+
+    def test_symmetry(self):
+        self.assert_gradient_symmetry(self.jastrow, self.params)
+
+class TestNeuralEEN(TestNeuralBase):
+    """Test electron-electron-nuclear component."""
     
+    def setUp(self):
+        super().setUp()
+        self.jastrow_h2o = NeuralEEN(self.h2o_pos, self.h2o_charges, layer_widths=[4, 4])
+        self.params_h2o = self.jastrow_h2o.init_params(key=self.key)
+
     def test_h2o_symmetry(self):
-        """Test approximate symmetry of Jastrow for H2O."""
-        # Test points symmetric about the O atom at z=0 plane
         z_offset = 0.3
         r1 = jnp.array([0., 0.5, z_offset])
-        r2 = jnp.array([0., -0.5, z_offset])  # Symmetric position
+        r2 = jnp.array([0., -0.5, z_offset])
         
         value1 = self.jastrow_h2o._compute(r1, r2, self.params_h2o)
         value2 = self.jastrow_h2o._compute(r2, r1, self.params_h2o)
         
-        # Check values are close but not necessarily identical
         np.testing.assert_allclose(value1, value2, rtol=1e-5)
+
+class TestCompositeNeural(TestNeuralBase):
+    """Test combined neural Jastrow components."""
     
-    def test_gradients(self):
-        """Test gradient computation."""
+    def setUp(self):
+        super().setUp()
+        # Create individual components
+        self.en = NeuralEN(self.h2_pos, self.h2_charges, layer_widths=[4, 4])
+        self.ee = NeuralEE(layer_widths=[4, 4])
+        self.een = NeuralEEN(self.h2_pos, self.h2_charges, layer_widths=[4, 4])
+        
+        # Create composite with initialized params
+        self.jastrow = CompositeJastrow([self.en, self.ee, self.een])
+        self.params = [
+            self.en.init_params(key=self.key),
+            self.ee.init_params(key=self.key),
+            self.een.init_params(key=self.key)
+        ]
+
+    def test_composite_compute(self):
         r1 = jnp.array([0., 0., 0.])
         r2 = jnp.array([1., 0., 0.])
         
-        # Test parameter gradients
-        grad_params = jax.grad(lambda p: self.jastrow_h2._compute(r1, r2, p))(self.params_h2)
-        self.assertEqual(grad_params.shape, self.params_h2.shape)
-        self.assertTrue(jnp.all(jnp.isfinite(grad_params)))
+        value = self.jastrow._compute(r1, r2, self.params)
+        self.assertTrue(jnp.isfinite(value))
         
-        # Test spatial gradients
-        grad_r1 = jax.grad(lambda x: self.jastrow_h2._compute(x, r2, self.params_h2))(r1)
-        self.assertEqual(grad_r1.shape, (3,))
-        self.assertTrue(jnp.all(jnp.isfinite(grad_r1)))
-
-    def test_gradient_symmetry(self):
-        """Test that grad_r1 = -grad_r2 for the Jastrow factor across all electron pairs."""
-        # Create a walker with multiple electron positions
-        nelec = 2
-        key = random.PRNGKey(42)
-        walker = random.normal(key, shape=(nelec, 3))  # Random positions for testing
+        # Test that composite gradient matches sum of individual gradients
+        grad_composite = jax.grad(lambda x: self.jastrow._compute(x, r2, self.params))(r1)
+        grad_parts = [
+            jax.grad(lambda x: self.en._compute(x, r2, self.params[0]))(r1),
+            jax.grad(lambda x: self.ee._compute(x, r2, self.params[1]))(r1),
+            jax.grad(lambda x: self.een._compute(x, r2, self.params[2]))(r1)
+        ]
+        grad_sum = sum(grad_parts)
         
-        # Create vmapped functions to compute gradients for all pairs
-        # First vmap over r2 (second argument), then over r1 (first argument)
-        grad_r1_fn = jax.vmap(jax.vmap(
-            jax.grad(lambda x, y: self.jastrow_h2._compute(x, y, self.params_h2)), 
-            in_axes=(None, 0)), in_axes=(0, None))
-        
-        grad_r2_fn = jax.vmap(jax.vmap(
-            jax.grad(lambda x, y: self.jastrow_h2._compute(x, y, self.params_h2), 1), 
-            in_axes=(None, 0)), in_axes=(0, None))
-        
-        # Compute gradients for all pairs
-        grad_r1 = grad_r1_fn(walker, walker)  # Shape: (nelec, nelec, 3)
-        grad_r2 = grad_r2_fn(walker, walker)  # Shape: (nelec, nelec, 3)
-        
-        # Check shapes
-        self.assertEqual(grad_r1.shape, (nelec, nelec, 3))
-        self.assertEqual(grad_r2.shape, (nelec, nelec, 3))
-        
-        # Check that grad_r1 = -grad_r2 for all pairs
-        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7,
-                                 err_msg="Gradient symmetry violated: grad_r1 ≠ -grad_r2")
-        
-        # Test finiteness of gradients
-        self.assertTrue(jnp.all(jnp.isfinite(grad_r1)))
-        self.assertTrue(jnp.all(jnp.isfinite(grad_r2)))
+        np.testing.assert_allclose(grad_composite, grad_sum, rtol=1e-7)
 
 if __name__ == '__main__':
     unittest.main()

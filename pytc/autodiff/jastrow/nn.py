@@ -1,9 +1,9 @@
-from pytc.autodiff import jastrow
 import jax.numpy as jnp
 from jax import random
 import flax.linen as nn
-from functools import partial
 from typing import Sequence
+
+from pytc.autodiff.jastrow import Jastrow 
 
 class MLP(nn.Module):
     """Multi-layer perceptron network using Flax with residual connections."""
@@ -28,43 +28,20 @@ class MLP(nn.Module):
         x = nn.Dense(self.features[-1])(x)
         return x
 
-class NeuralJastrow(jastrow.Jastrow):
-    def __init__(self, nuclear_pos, nuclear_charges, layer_widths=[16, 16], 
-                 epsilon=1e-8, key=random.PRNGKey(0)):
+
+class NeuralBase(Jastrow):
+    """Base class for neural network-based Jastrow factors."""
+    def __init__(self, layer_widths=[16, 16], epsilon=1e-8, **kwargs):
         super().__init__()
-        self.nuclear_pos = jnp.array(nuclear_pos)
-        self.nuclear_charges = jnp.array(nuclear_charges)
-        self.epsilon = epsilon
-
-        # Configure separate MLPs with same architecture
-        n_nuclei = len(nuclear_charges)
         self.features = [*layer_widths, 1]
-        
-        # Initialize three networks
-        key1, key2, key3 = random.split(key, 3)
-        self.net_en = MLP(features=self.features)   # Input: 2*n_nuclei distances
-        self.net_ee = MLP(features=self.features)   # Input: 1 distance
-        self.net_een = MLP(features=self.features)  # Input: 1 + 2*n_nuclei distances
-        
-        self.params = self.init_params(key1, key2, key3)
+        self.epsilon = epsilon
+        self.net = MLP(features=self.features)
+        key = kwargs.get('key', random.PRNGKey(0))
+        self.params = self.init_params(key=key)
 
-    def init_params(self, key1, key2, key3):
-        """Initialize network parameters using Flax."""
-        # Create dummy inputs for initialization
-        dummy_x_en = jnp.zeros((1, len(self.nuclear_charges) * 2))
-        dummy_x_ee = jnp.zeros((1, 1))
-        dummy_x_een = jnp.zeros((1, 1 + 2*len(self.nuclear_charges)))
-        
-        variables_en = self.net_en.init(key1, dummy_x_en)
-        variables_ee = self.net_ee.init(key2, dummy_x_ee)
-        variables_een = self.net_een.init(key3, dummy_x_een)
-        
-        # Flatten parameters for compatibility with existing interface
-        flat_params_en = self._flatten_params(variables_en['params'])
-        flat_params_ee = self._flatten_params(variables_ee['params'])
-        flat_params_een = self._flatten_params(variables_een['params'])
-        
-        return jnp.concatenate([flat_params_en, flat_params_ee, flat_params_een]) * 0.01
+    def _safe_norm(self, x):
+        """Compute norm with a small epsilon to prevent division by zero."""
+        return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
 
     def _flatten_params(self, nested_params):
         """Flatten nested parameter dictionary into 1D array."""
@@ -95,54 +72,8 @@ class NeuralJastrow(jastrow.Jastrow):
             prev_width = width
             
         return {'params': params}
-        
-    def _safe_norm(self, x):
-        """Compute norm with a small epsilon to prevent division by zero."""
-        return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
-    
-    def _construct_features(self, r1, r2):
-        """Construct separate feature sets for each network"""
-        # Basic distances using broadcasting
-        r12 = self._safe_norm(r1 - r2)
-        r1n = self._safe_norm(r1[None, :] - self.nuclear_pos)  # (n_nuclei,)
-        r2n = self._safe_norm(r2[None, :] - self.nuclear_pos)  # (n_nuclei,)
-        
-        # Separate features for each network
-        en_features = jnp.concatenate([r1n, r2n]).reshape(1, -1)  # e-n distances
-        ee_features = r12.reshape(1, -1)                          # e-e distance
-        een_features = jnp.concatenate([                          # all distances
-            jnp.array([r12]),
-            r1n,
-            r2n,
-        ]).reshape(1, -1)
-        
-        return en_features, ee_features, een_features
 
-    def _compute(self, r1, r2, params):
-        """Combine outputs from three networks"""
-        # Get features
-        en_features, ee_features, een_features = self._construct_features(r1, r2)
-        
-        # Split parameters for each network
-        n_params_en = self.get_param_count_single(2 * len(self.nuclear_charges))
-        n_params_ee = self.get_param_count_single(1)
-        
-        params_en = params[:n_params_en]
-        params_ee = params[n_params_en:n_params_en + n_params_ee]
-        params_een = params[n_params_en + n_params_ee:]
-        
-        # Apply each network
-        vars_en = self._unflatten_params(params_en, 2 * len(self.nuclear_charges))
-        vars_ee = self._unflatten_params(params_ee, 1)
-        vars_een = self._unflatten_params(params_een, 1 + 2 * len(self.nuclear_charges))
-        
-        en_out = self.net_en.apply(vars_en, en_features)[0, 0]
-        ee_out = self.net_ee.apply(vars_ee, ee_features)[0, 0]
-        een_out = self.net_een.apply(vars_een, een_features)[0, 0]
-        
-        return (en_out + ee_out + een_out)
-
-    def get_param_count_single(self, input_size):
+    def get_param_count(self, input_size):
         """Return parameter count for a single network"""
         total = 0
         prev_width = input_size
@@ -151,9 +82,66 @@ class NeuralJastrow(jastrow.Jastrow):
             prev_width = width
         return total
 
-    def get_param_count(self):
-        """Return total number of parameters needed for all networks"""
-        n_nuclei = len(self.nuclear_charges)
-        return (self.get_param_count_single(2 * n_nuclei) +  # en network
-                self.get_param_count_single(1) +             # ee network
-                self.get_param_count_single(1 + 2 * n_nuclei))  # een network
+
+class NeuralEN(NeuralBase):
+    """Neural network for electron-nuclear correlations."""
+    def __init__(self, nuclear_pos, nuclear_charges, **kwargs):
+        self.nuclear_pos = jnp.array(nuclear_pos)
+        self.nuclear_charges = jnp.array(nuclear_charges)
+        super().__init__(**kwargs)
+
+    def init_params(self, **kwargs):
+        key = kwargs.get('key', random.PRNGKey(0))
+        dummy_x = jnp.zeros((1, len(self.nuclear_charges)))
+        variables = self.net.init(key, dummy_x)
+        return self._flatten_params(variables['params']) * 0.01
+
+    def _compute(self, r1, r2, params):
+        r1n = self._safe_norm(r1[None, :] - self.nuclear_pos)
+        features = r1n.reshape(1, -1)
+        vars_dict = self._unflatten_params(params, len(self.nuclear_charges))
+        return self.net.apply(vars_dict, features)[0, 0]
+
+
+class NeuralEE(NeuralBase):
+    """Neural network for electron-electron correlations."""
+    def init_params(self, **kwargs):
+        key = kwargs.get('key', random.PRNGKey(0))
+        dummy_x = jnp.zeros((1, 1))
+        variables = self.net.init(key, dummy_x)
+        return self._flatten_params(variables['params']) * 0.01
+
+    def _compute(self, r1, r2, params):
+        r12 = self._safe_norm(r1 - r2)
+        features = r12.reshape(1, -1)
+        vars_dict = self._unflatten_params(params, 1)
+        return self.net.apply(vars_dict, features)[0, 0]
+
+
+class NeuralEEN(NeuralBase):
+    """Neural network for electron-electron-nuclear correlations."""
+    def __init__(self, nuclear_pos, nuclear_charges, **kwargs):
+        self.nuclear_pos = jnp.array(nuclear_pos)
+        self.nuclear_charges = jnp.array(nuclear_charges)
+        super().__init__(**kwargs)
+
+    def init_params(self, **kwargs):
+        key = kwargs.get('key', random.PRNGKey(0))
+        input_size = 1 + 2 * len(self.nuclear_charges)
+        dummy_x = jnp.zeros((1, input_size))
+        variables = self.net.init(key, dummy_x)
+        return self._flatten_params(variables['params']) * 0.01
+
+    def _compute(self, r1, r2, params):
+        r12 = self._safe_norm(r1 - r2)
+        r1n = self._safe_norm(r1[None, :] - self.nuclear_pos)
+        r2n = self._safe_norm(r2[None, :] - self.nuclear_pos)
+        
+        features = jnp.concatenate([
+            jnp.array([r12]),
+            r1n,
+            r2n,
+        ]).reshape(1, -1)
+        
+        vars_dict = self._unflatten_params(params, 1 + 2 * len(self.nuclear_charges))
+        return self.net.apply(vars_dict, features)[0, 0]

@@ -124,3 +124,8 @@ class Jastrow(ABC):
         grad_u = jax.grad(scalar_fn)(r2)
         lapl_u = jnp.trace(jax.hessian(scalar_fn)(r2))
         return grad_u, lapl_u
+    
+    @abstractmethod
+    def init_params(self, **kwargs):
+        """Initialize parameters. Subclasses should implement this."""
+        pass
