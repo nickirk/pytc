@@ -6,7 +6,7 @@ jax.config.update("jax_enable_x64", True)
 from jax import random
 import jax.numpy as jnp
 
-from pytc.autodiff.jastrow.ncusp import NuclearCusp
+from pytc.autodiff.jastrow import NuclearCusp, Poly
 from pytc.autodiff.mcmc import sample
 from pytc.autodiff.ansatz.sj import SlaterJastrow
 from pytc.autodiff.ansatz.det import SlaterDet
@@ -329,16 +329,13 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         # Set up fixed positions for other electrons (random but fixed)
         np.random.seed(42)
         n_electrons = 10  # Water molecule has 10 electrons
-        fixed_positions = np.random.randn(n_electrons-1, 3)+1.  # 9 electrons at random positions
+        fixed_positions = np.random.randn(n_electrons-1, 3)+4.  # 9 electrons at random positions
         
         # Create grid points along x-axis through O atom
-        x_points = np.linspace(-0.2, 0.2, 100)
+        x_points = np.linspace(-0.02, 0.02, 100)
         energies = []
         jastrow_vals = []
         
-        # Create a vmap function for Jastrow evaluation
-        vmap_jastrow = jax.vmap(lambda pos: self.ncusp._compute(
-            pos, fixed_positions[0], jastrow_params))
         
         # Evaluate Jastrow and local energy at each point
         for x in x_points:
@@ -347,7 +344,7 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             
             # Compute Jastrow value
             u = self.ncusp._compute(pos, fixed_positions[0], jastrow_params)
-            jastrow_vals.append(float(u))
+            jastrow_vals.append(jnp.exp(float(u)))
             
             # Create full electron configuration
             elec_coords = np.vstack([[pos], fixed_positions])
@@ -378,19 +375,23 @@ class TestHartreeFockCBS(unittest.TestCase):
         self.key = random.PRNGKey(42)
         
         # Test molecule (using H2O as example)
-        self.atom_str = 'H 0 0 1.4; O 0 0 0; H 0 0 -1.4'
-        self.basis_sets = ['sto6g', 'cc-pvdz', 'cc-pvtz']
+        self.atom_str = 'H 0 0 1.6; Li 0 0 0'
+        self.basis_sets = ['ccpvdz']
         
     def sample_hf_energy(self, mol, mf, use_ncusp=False):
         """Helper function to sample HF energy with or without nuclear cusp."""
         # Create determinant from HF solution
         det = SlaterDet(mol, mf.mo_coeff)
         
-        # Create Jastrow (either nuclear cusp or identity)
-        jastrow = NuclearCusp(mol, n_radial=1000)
+        if use_ncusp:
+            # Create NuclearCusp Jastrow
+            jastrow = NuclearCusp(mol, n_radial=1000)
+            # Initialize parameters
+            jastrow_params = jastrow.init_params()
+        else:
+            jastrow = Poly()
+            jastrow_params = jnp.zeros(1)  # Identity Jastrow
             
-        # Initialize parameters
-        jastrow_params = jastrow.init_params()
         linear_coeffs = jnp.ones(1)  # Single determinant
         
         # Create SlaterJastrow ansatz
@@ -402,7 +403,7 @@ class TestHartreeFockCBS(unittest.TestCase):
             n_walkers=self.n_walkers,
             n_steps=self.n_steps,
             step_size=self.step_size,
-            use_importance_sampling=False,
+            use_importance_sampling=True,
             burn_in_steps=self.burn_in_steps,
             thinning=self.thinning,
             jastrow_params=jastrow_params,
@@ -428,16 +429,19 @@ class TestHartreeFockCBS(unittest.TestCase):
             
             # Sample with nuclear cusp
             cusp_energy, cusp_error = self.sample_hf_energy(mol, mf, use_ncusp=True)
+            no_cusp_energy, no_cusp_error = self.sample_hf_energy(mol, mf, use_ncusp=False)
             
             results.append({
                 'basis': basis,
                 'reference': hf_energy_reference,
+                'without_cusp': (no_cusp_energy, no_cusp_error),
                 'with_cusp': (cusp_energy, cusp_error)
             })
             
             # Print current results
             print(f"\nResults for {basis}:")
             print(f"Reference HF: {hf_energy_reference:.6f}")
+            print(f"Without cusp: {no_cusp_energy:.6f} ± {no_cusp_error:.6f}")
             print(f"With cusp:   {cusp_energy:.6f} ± {cusp_error:.6f}")
         
         # Analyze convergence

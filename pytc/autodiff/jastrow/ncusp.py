@@ -206,11 +206,11 @@ class NuclearCusp(Jastrow):
                 C = params['C'][Z_idx]
                 
                 # Compute φ_cusp = exp(poly(r)) + C
-                poly_val = jnp.where(r<=rc, self._eval_poly(r, poly_coeffs), 0.0)
+                poly_val = jnp.where(r<=rc*1.5, self._eval_poly(r, poly_coeffs), 0.0)
                 phi_cusp = jnp.exp(poly_val) + C
                 
                 # Get φ_s value with numerical safeguard
-                phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
+                phi_s = jnp.where(r<=rc*1.5, self.eval_mo_at_r(nucleus_idx, r), 1.0)
                 
                 # Add small constants to prevent division by zero or log(0)
                 eps = 0.0
