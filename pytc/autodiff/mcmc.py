@@ -7,6 +7,7 @@ import jax
 import optax
 import time
 from typing import Dict, Any, Optional
+from jax.tree_util import tree_map # Use tree_map directly for clarity
 
 from pytc.autodiff.mcmc_utils import (
     prepare_sampling_results, report_progress, create_optimizer,
@@ -354,8 +355,9 @@ def optimize(
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
     opt_kwargs: Optional[Dict[str, Any]] = None,
-    jastrow_params=None,  # Added parameter
-    linear_coeffs=None    # Added parameter
+    jastrow_params=None,
+    linear_coeffs=None,
+    frozen_params=None  # Parameter freezing identifiers
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -405,13 +407,46 @@ def optimize(
     
     print("Starting optimization...")
     
-    # Initialize optimizer with provided or default parameters
+    # Initialize parameters if not provided
     if jastrow_params is None:
-        jastrow_params = ansatz.jastrow.params
+        # Assuming ansatz.jastrow.init_params() exists and works
+        jastrow_params = ansatz.jastrow.init_params() 
     
     if linear_coeffs is None:
-        linear_coeffs = jnp.ones(len(ansatz.dets))  # Default to equal weights
+        linear_coeffs = jnp.ones(len(ansatz.dets))
         
+    # --- Manual Gradient Masking Setup ---
+    mask = None
+    if frozen_params:
+        print(f"Manual gradient masking enabled for: {frozen_params}")
+        jastrows = ansatz.jastrow.jastrows
+        if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
+             raise TypeError(f"Params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
+
+        final_mask_list = []
+        for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
+            should_update = True  # Python boolean
+            for fp in frozen_params:
+                if isinstance(fp, int) and fp == i:
+                    should_update = False; break
+                elif isinstance(fp, str):
+                    if fp == jastrow.__class__.__name__ or fp == getattr(jastrow, 'name', None):
+                        should_update = False; break
+            
+            # Create mask pytree with Python booleans for this jastrow
+            mask_pytree_for_jastrow = tree_map(lambda _: should_update, param_pytree)
+            final_mask_list.append(mask_pytree_for_jastrow)
+            print(f"  Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}, update={should_update}")
+        
+        mask = final_mask_list # This is the boolean mask PyTree
+        
+        # Define function to apply mask to gradients
+        def apply_gradient_mask(grads, mask):
+            # Multiply gradient leaf by boolean mask leaf (True=1, False=0)
+            return tree_map(lambda g, m: g * m, grads, mask)
+    # --- End Manual Gradient Masking Setup ---
+
+    # Use the base optimizer directly
     optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
     opt_state = optimizer.init(jastrow_params)
     
@@ -433,7 +468,7 @@ def optimize(
         median_energy = jnp.median(energies)
         mean_energy = jnp.mean(energies)
         var_e = jnp.mean(jnp.abs(energies - median_energy))
-        energies = jnp.clip(energies, median_energy-10.*var_e, median_energy+10.*var_e)
+        energies = jnp.clip(energies, median_energy-5.*var_e, median_energy+5.*var_e)
         # Compute cost (default: mean energy)
         cost = cost_fn(energies)
         
@@ -453,6 +488,8 @@ def optimize(
 
 
     print(f"Starting optimization with {n_opt_steps} steps...")
+    # ncusp_params = jastrow_params[0] # Keep for reference if needed
+    
     for opt_step in range(n_opt_steps):
         start_time = time.time()
         
@@ -473,39 +510,51 @@ def optimize(
         if opt_step % n_steps == 0:
             # Compute loss and gradients for current walker configurations
             (loss, (energies, var_e)), grads = value_and_grad_fn(jastrow_params, walkers)
+            
+            # --- Apply manual gradient mask if enabled ---
+            if mask is not None:
+                grads = apply_gradient_mask(grads, mask)
+            # --- End Apply manual gradient mask ---
+
+            # Update parameters using base optimizer and potentially masked grads
             updates, opt_state = optimizer.update(grads, opt_state, jastrow_params)
             jastrow_params = optax.apply_updates(jastrow_params, updates)
-        
-            losses.append(energies) 
-            accumulated_grads.append(grads)
             params.append(jastrow_params)
-            opt_steps.append(opt_step)
+            # Store loss and acceptance
+            losses.append(energies)
             acceptances.append(acceptance)
-            # Convert arrays to scalars for printing
-            loss_val = float(loss)
         
-            # Print progress with proper scalar conversions
+            # ... (logging, history appending) ...
             step_time = time.time() - start_time
-            step_times.append(step_time)
-
-            print(f"Step: {opt_step}, Loss: {loss_val:.6f}, "
-                  f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
-                  f"Var loss: {var_e:.6f}, "
-                  f"Acceptance: {acceptance:.3f}, "
-                  f"Params: {jastrow_params[0]:.6f}, "
-                  f"Time: {step_time*1000:.2f}ms")
+            if len(jastrow_params) > 1:
+                rexp = jastrow_params[1]
+                print(f"Step: {opt_step}, Loss: {float(loss):.6f}, "
+                      f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
+                      f"Var loss: {var_e:.6f}, "
+                      f"Acceptance: {acceptance:.3f}, "
+                      f"Nuclear Cusp: rc={jastrow_params[0]['rc'][0]:.3f}, X4={jastrow_params[0]['X4'][0]:.3f}, "
+                      f"Time: {step_time*1000:.2f}ms")
+            else:
+                print(f"Step: {opt_step}, Loss: {float(loss):.6f}, "
+                      f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
+                      f"Var loss: {var_e:.6f}, "
+                      f"Acceptance: {acceptance:.3f}, "
+                      f"Nuclear Cusp: rc={jastrow_params[0]['rc'][0]:.3f}, X4={jastrow_params[0]['X4'][0]:.3f}, "
+                      f"Time: {step_time*1000:.2f}ms")
+            #print(f"NCusp Params: {jastrow_params[0]['rc']}")
+            #print(f"REXP Params: {jastrow_params[2]}")
         
         # Add acceptances to history
         acceptance_history.extend(acceptance_temp)
 
         # Store optimization history
         opt_history["energies"] = jnp.asarray(losses)
-        opt_history["params"] = jnp.asarray(params)
-        opt_history["gradients"] = jnp.asarray(accumulated_grads)
+        opt_history["params"] = params
+        #opt_history["gradients"] = jnp.asarray(accumulated_grads)
         opt_history["acceptance"] = jnp.asarray(acceptances)
         opt_history["steps"] = jnp.asarray(opt_steps)
 
-    print(f"Optimization complete. Best energy: {best_energy:.6f}")
+    print(f"Optimization complete.")
     
     
-    return opt_history 
+    return opt_history

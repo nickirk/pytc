@@ -6,13 +6,13 @@ from functools import partial
 import jax
 
 class NuclearCusp(Jastrow):
-    def __init__(self, mol, n_radial=1000):
+    def __init__(self, mol, name=None, n_radial=1000):
         """Initialize nuclear cusp correction.
         
         Args:
             n_radial: Number of radial grid points for orbital evaluation
         """
-        super().__init__()
+        super().__init__(name=name)
         self.n_radial = n_radial
         self.nelectron = mol.nelectron
         self.setup_for_molecule(mol)
@@ -120,48 +120,71 @@ class NuclearCusp(Jastrow):
             # where p(x) = a3*(x-x0)^3 + a2*(x-x0)^2 + a1*(x-x0) + a0
             self.spline_xs.append(jnp.array(x))
             self.spline_coeffs.append(jnp.array(spline.c))
-            
+        
+        # Add mapping from Z_idx to first nucleus of that type
+        self.Z_idx_to_nucleus = []
+        for Z_idx, Z in enumerate(self.unique_Z):
+            nucleus_idx = int(np.where(self.charges == Z)[0][0])
+            self.Z_idx_to_nucleus.append(nucleus_idx)
+        self.Z_idx_to_nucleus = jnp.array(self.Z_idx_to_nucleus)
+        
     def init_params(self):
         """Initialize parameter dictionary structure."""
         # Initialize parameters for each unique nuclear type
         params = {
             'rc': jnp.array([1.0/float(Z) for Z in self.unique_Z]),  # Use unique_Z array
-            'poly_coeff': jnp.zeros((self.n_types, 5)),
-            'C': jnp.zeros(self.n_types)
+            'X4': jnp.zeros(self.n_types),  # Only store X4 (phi_0) values
         }
         
-        # Initialize α coefficients for each nucleus type
+        # Initialize X4 and compute alpha coefficients for each nucleus type
         for Z_idx, Z in enumerate(self.unique_Z):
-            rc = params['rc'][Z_idx]
-            
             # Find first nucleus of this type
             nucleus_idx = jnp.where(self.charges == Z)[0][0]
-            
-            phi_rc_vals = self._get_phi_s_derivatives(nucleus_idx, rc)
             phi_0 = self.eval_mo_at_r(nucleus_idx, 0.0)
-            
-            # Set up X values
-            X = jnp.zeros(5)
-            X = X.at[0].set(jnp.log(abs(phi_rc_vals[0])))  # X₁ = ln|φ(rc)|
-            X = X.at[1].set(phi_rc_vals[1]/phi_rc_vals[0])  # X₂ = φ'(rc)/φ(rc)
-            X = X.at[2].set(phi_rc_vals[2]/phi_rc_vals[0])  # X₃ = φ''(rc)/φ(rc)
-            X = X.at[3].set(-Z)  # X₄ = -Z (cusp condition)
-            X = X.at[4].set(jnp.log(abs(phi_0)))  # X₅ = ln|φ(0)|
-            
-            # Compute α coefficients
-            alpha = self._compute_alpha_coeffs(Z, rc, X)
-            params['poly_coeff'] = params['poly_coeff'].at[Z_idx].set(alpha)
-            
+            params['X4'] = params['X4'].at[Z_idx].set(jnp.log(abs(phi_0)*1.4))
+        
+        # Update all alpha coefficients
+        #self._update_alpha_coeffs(params)
         self._validate_params(params)
         return params
     
     def _validate_params(self, params):
         """Validate parameter shapes."""
         assert params['rc'].shape == (self.n_types,), f"rc shape {params['rc'].shape} != {(self.n_types,)}"
-        assert params['poly_coeff'].shape == (self.n_types, 5), \
-            f"poly_coeff shape {params['poly_coeff'].shape} != {(self.n_types, 5)}"
-        assert params['C'].shape == (self.n_types,), f"C shape {params['C'].shape} != {(self.n_types,)}"
-    
+        assert params['X4'].shape == (self.n_types,), f"X4 shape {params['X4'].shape} != {(self.n_types,)}"
+
+    def _compute_X_values(self, Z_idx, rc, X4):
+        """Compute all X values given rc and X4."""
+        Z = self.unique_Z[Z_idx]
+        # Use pre-computed mapping instead of jnp.where
+        nucleus_idx = self.Z_idx_to_nucleus[Z_idx]
+        
+        phi_rc_vals = self._get_phi_s_derivatives(nucleus_idx, rc)
+        
+        X = jnp.zeros(5)
+        X = X.at[0].set(jnp.log(abs(phi_rc_vals[0])))  # X₁ = ln|φ(rc)|
+        X = X.at[1].set(phi_rc_vals[1]/phi_rc_vals[0])  # X₂ = φ'(rc)/φ(rc)
+        X = X.at[2].set(phi_rc_vals[2]/phi_rc_vals[0])  # X₃ = φ''(rc)/φ(rc)
+        X = X.at[3].set(-Z)  # X₄ = -Z (cusp condition)
+        X = X.at[4].set(X4)  # X₅ = ln|φ(0)|
+        
+        return X
+
+    def _update_alpha_coeffs(self, params):
+        """Compute but don't store polynomial coefficients."""
+        poly_coeffs = jnp.zeros((self.n_types, 5))
+        
+        for Z_idx, Z in enumerate(self.unique_Z):
+            rc = params['rc'][Z_idx]
+            X4 = params['X4'][Z_idx]
+            
+            # Compute X values and alpha coefficients
+            X = self._compute_X_values(Z_idx, rc, X4)
+            alpha = self._compute_alpha_coeffs(Z, rc, X)
+            poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
+        
+        return poly_coeffs  # Just return without storing in params
+
     def _cutoff_function(self, r, rc):
         """Smooth cutoff function using inverse polynomial.
         
@@ -179,16 +202,16 @@ class NuclearCusp(Jastrow):
     
     @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
-        """Compute nuclear cusp correction for a single electron.
-        
-        Args:
-            r1: Single electron position of shape (3,)
-            r2: Dummy argument for interface compatibility
-            params: Dictionary of parameters
-            
-        Returns:
-            Jastrow contribution for this electron as scalar
-        """
+        """Compute nuclear cusp correction for a single electron."""
+        # Compute polynomial coefficients from current params
+        poly_coeffs = jnp.zeros((self.n_types, 5))
+        for Z_idx, Z in enumerate(self.unique_Z):
+            rc = params['rc'][Z_idx]
+            X4 = params['X4'][Z_idx]
+            X = self._compute_X_values(Z_idx, rc, X4)
+            alpha = self._compute_alpha_coeffs(Z, rc, X)
+            poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
+
         def scan_nuclei(carry, nucleus_idx):
             total = carry
             # Get distance from electron to this nucleus
@@ -202,15 +225,15 @@ class NuclearCusp(Jastrow):
             
             # Use where to conditionally evaluate only when r <= rc
             def evaluate_contribution(r):
-                poly_coeffs = params['poly_coeff'][Z_idx]
-                C = params['C'][Z_idx]
+                # Use computed poly_coeffs instead of params
+                coeffs = poly_coeffs[Z_idx]
                 
-                # Compute φ_cusp = exp(poly(r)) + C
-                poly_val = jnp.where(r<=rc*1.5, self._eval_poly(r, poly_coeffs), 0.0)
-                phi_cusp = jnp.exp(poly_val) + C
+                # Compute φ_cusp = exp(poly(r))
+                poly_val = jnp.where(r<=rc, self._eval_poly(r, coeffs), 0.0)
+                phi_cusp = jnp.exp(poly_val)
                 
                 # Get φ_s value with numerical safeguard
-                phi_s = jnp.where(r<=rc*1.5, self.eval_mo_at_r(nucleus_idx, r), 1.0)
+                phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
                 
                 # Add small constants to prevent division by zero or log(0)
                 eps = 0.0

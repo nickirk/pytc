@@ -12,9 +12,18 @@ class Jastrow(ABC):
     This aligns better with JAX's philosophy for parameter handling and computational graph tracing.
     """
     
-    def __init__(self):
-        """Initialize Jastrow factor structure."""
-        pass
+    def __init__(self, name=None):
+        """Initialize Jastrow factor.
+        
+        Args:
+            name: Optional name for parameter filtering
+        """
+        self.name = name
+        
+    def set_name(self, name):
+        """Set instance name for parameter filtering."""
+        self.name = name
+        return self
     
     @abstractmethod
     def _compute(self, r1, r2, params):

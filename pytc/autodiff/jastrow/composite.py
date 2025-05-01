@@ -13,6 +13,9 @@ class CompositeJastrow(Jastrow):
         """
         super().__init__()
         self.jastrows = jastrows
+        # Track jastrow identifiers for filtering
+        self.jastrow_types = [j.__class__.__name__ for j in jastrows]
+        self.jastrow_names = [j.name for j in jastrows]
         
     def _compute(self, r1, r2, params):
         """Compute sum of Jastrow exponents.
