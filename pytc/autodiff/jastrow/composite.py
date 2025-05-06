@@ -85,39 +85,31 @@ class CompositeJastrow(Jastrow):
         return [j.init_params() for j in self.jastrows]
 
     def save_params(self, params, filename='jastrow_params.hdf5'):
-        """Save parameters for all Jastrow factors into an HDF5 file.
-
-        Args:
-            params: List of parameter PyTrees, one per Jastrow factor.
-            filename: Name of the HDF5 file to save to.
-        """
+        """Save parameters for all Jastrow factors into an HDF5 file."""
         if not filename.endswith('.hdf5'):
             filename += '.hdf5'
 
         print(f"Saving composite Jastrow parameters to {filename}...")
         with h5py.File(filename, 'w') as f:
             f.attrs['num_jastrows'] = len(self.jastrows)
-            for i, param_pytree in enumerate(params):
+            
+            # Save each jastrow's parameters while preserving dict structure
+            for i, param_dict in enumerate(params):
                 group = f.create_group(f'jastrow_{i}')
-                leaves, treedef = tree_util.tree_flatten(param_pytree)
-                # Store the treedef serialization as a byte string attribute
-                group.attrs['treedef'] = np.void(pickle.dumps(treedef))
-                group.attrs['num_leaves'] = len(leaves)
-                # Store each leaf array as a dataset
-                for j, leaf in enumerate(leaves):
-                    group.create_dataset(f'leaf_{j}', data=np.asarray(leaf))
-        print("Save complete.")
+                for key, value in param_dict.items():
+                    # For nested structures like net_vars, use tree_flatten
+                    if isinstance(value, dict):
+                        nested_group = group.create_group(key)
+                        leaves, treedef = tree_util.tree_flatten(value)
+                        nested_group.attrs['treedef'] = np.void(pickle.dumps(treedef))
+                        nested_group.attrs['num_leaves'] = len(leaves)
+                        for j, leaf in enumerate(leaves):
+                            nested_group.create_dataset(f'leaf_{j}', data=np.asarray(leaf))
+                    else:  # Direct parameters like rc_raw
+                        group.create_dataset(key, data=np.asarray(value))
 
     def read_params(self, filename='jastrow_params.hdf5'):
-        """Read parameters for all Jastrow factors from an HDF5 file.
-
-        Args:
-            filename: Name of the HDF5 file to read from.
-
-        Returns:
-            List of parameter PyTrees, matching the structure expected by the composite Jastrow.
-            Returns None if the file does not exist.
-        """
+        """Read parameters for all Jastrow factors from an HDF5 file."""
         if not filename.endswith('.hdf5'):
             filename += '.hdf5'
 
@@ -128,50 +120,24 @@ class CompositeJastrow(Jastrow):
         print(f"Reading composite Jastrow parameters from {filename}...")
         loaded_params = []
         with h5py.File(filename, 'r') as f:
-            num_jastrows_expected = len(self.jastrows)
-            num_jastrows_file = f.attrs.get('num_jastrows', -1)
-
-            if num_jastrows_file != num_jastrows_expected:
-                print(f"Warning: Mismatch in number of Jastrow factors. Expected {num_jastrows_expected}, found {num_jastrows_file} in file.")
-                # Decide how to handle mismatch, here we proceed but only load up to expected number
-                num_to_load = min(num_jastrows_expected, num_jastrows_file)
-            else:
-                num_to_load = num_jastrows_expected
-
-            for i in range(num_to_load):
-                group_name = f'jastrow_{i}'
-                if group_name not in f:
-                    raise IOError(f"Group {group_name} not found in {filename}.")
-                group = f[group_name]
-
-                # Load the treedef from the attribute
-                treedef_bytes = group.attrs.get('treedef')
-                if treedef_bytes is None:
-                     raise IOError(f"'treedef' attribute not found in group {group_name} in {filename}.")
-                treedef = pickle.loads(treedef_bytes.tobytes())
-
-                # Load the leaves
-                num_leaves = group.attrs.get('num_leaves', -1)
-                if num_leaves == -1:
-                     raise IOError(f"'num_leaves' attribute not found in group {group_name} in {filename}.")
-
-                leaves = []
-                for j in range(num_leaves):
-                    dataset_name = f'leaf_{j}'
-                    if dataset_name not in group:
-                        raise IOError(f"Dataset {dataset_name} not found in group {group_name} in {filename}.")
-                    # Load dataset and convert back to jnp array
-                    leaves.append(jnp.array(group[dataset_name][()]))
-
-                # Reconstruct the PyTree
-                param_pytree = tree_util.tree_unflatten(treedef, leaves)
-                loaded_params.append(param_pytree)
-
-            # If file had fewer jastrows than expected, potentially initialize remaining ones
-            if num_to_load < num_jastrows_expected:
-                 print(f"Initializing default parameters for remaining {num_jastrows_expected - num_to_load} Jastrow factors.")
-                 for i in range(num_to_load, num_jastrows_expected):
-                      loaded_params.append(self.jastrows[i].init_params())
+            num_jastrows = f.attrs['num_jastrows']
+            for i in range(num_jastrows):
+                group = f[f'jastrow_{i}']
+                param_dict = {}
+                
+                # Load each parameter from the group
+                for key in group.keys():
+                    if isinstance(group[key], h5py.Group):  # Nested structure (e.g., net_vars)
+                        nested_group = group[key]
+                        treedef = pickle.loads(nested_group.attrs['treedef'].tobytes())
+                        leaves = []
+                        for j in range(nested_group.attrs['num_leaves']):
+                            leaves.append(jnp.array(nested_group[f'leaf_{j}'][()]))
+                        param_dict[key] = tree_util.tree_unflatten(treedef, leaves)
+                    else:  # Direct parameter
+                        param_dict[key] = jnp.array(group[key][()])
+                
+                loaded_params.append(param_dict)
 
         print("Read complete.")
         return loaded_params

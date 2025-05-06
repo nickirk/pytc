@@ -36,11 +36,12 @@ class BoysHandy(Jastrow):
                 BHTerm(0, 0, 1, d_cusp),  # e-e cusp term with c = 1/(2d)
                 BHTerm(0, 0, 2, 0.01),  
                 BHTerm(0, 0, 3, 0.001),  
-                BHTerm(0, 0, 4, 0.001),  
-                #BHTerm(2, 0, 0, 0.001),  # e-n term
-                #BHTerm(2, 0, 2, 0.1),
-                #BHTerm(3, 0, 0, 0.0001),
-                #BHTerm(4, 0, 0, 0.0001)   # higher order term
+                BHTerm(0, 0, 4, -0.001),  
+                BHTerm(2, 0, 0, 0.001),  # e-n term
+                BHTerm(2, 2, 0, -0.001),    # e-n term
+                BHTerm(2, 0, 2, 0.1),
+                BHTerm(3, 0, 0, 0.0001),
+                BHTerm(4, 0, 0, 0.0001)   # higher order term
             ]
             # Create a list of default terms for each nucleus
             self.terms_per_nucleus = [default_terms_for_one_nucleus for _ in range(self.natom)]
@@ -114,10 +115,15 @@ class BoysHandy(Jastrow):
 
                 # Sum over terms for this nucleus
                 for k, term in enumerate(self.terms_per_nucleus[I]):
-                    factor = self._delta(term.m, term.n) * c[I, k]
-                    # Symmetric combination of r1I and r2I terms
-                    u_term = (r1I**term.m * r2I**term.n +
-                             r2I**term.m * r1I**term.n) * r12**term.o
+                    if term.m == 0 and term.n == 0 and term.o == 1:
+                        # Cusp term
+                        factor = self._delta(term.m, term.n) * 0.5
+                        u_term = r12**term.o
+                    else:
+                        factor = self._delta(term.m, term.n) * c[I, k]
+                        # Symmetric combination of r1I and r2I terms
+                        u_term = (r1I**term.m * r2I**term.n +
+                                 r2I**term.m * r1I**term.n) * r12**term.o
                     u_total += factor * u_term
 
             return u_total
