@@ -11,11 +11,11 @@ from jax.tree_util import tree_map # Use tree_map directly for clarity
 
 from pytc.autodiff.mcmc_utils import (
     prepare_sampling_results, report_progress, create_optimizer,
-    init_electron_configs
+    init_electron_configs, create_gradient_mask, apply_gradient_mask
 )
 
 
-def metropolis_hastings(ansatz, walkers, step_size, key, jastrow_params, linear_coeffs):
+def metropolis_hastings(ansatz, walkers, step_size, key, params):
     """Perform one step of Metropolis-Hastings sampling for quantum wavefunction.
     
     Args:
@@ -23,8 +23,7 @@ def metropolis_hastings(ansatz, walkers, step_size, key, jastrow_params, linear_
         walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
-        jastrow_params: Jastrow parameters
-        linear_coeffs: Linear coefficients
+        params: contians jastrow_params and linear_coeffs
     
     Returns:
         Tuple containing:
@@ -32,14 +31,14 @@ def metropolis_hastings(ansatz, walkers, step_size, key, jastrow_params, linear_
         - acceptance_rate: Fraction of proposals that were accepted
     """
     # Compute initial wavefunction values with parameters
-    psi_values = ansatz(walkers, jastrow_params, linear_coeffs)
+    psi_values = ansatz(walkers, params)
     
     # Generate proposals (one step)
     key, subkey = random.split(key)
     proposals = walkers + random.normal(subkey, walkers.shape) * step_size
     
     # Compute acceptance probabilities with parameters
-    new_psi_values = ansatz(proposals, jastrow_params, linear_coeffs)
+    new_psi_values = ansatz(proposals, params)
     acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
     
     # Accept or reject
@@ -86,7 +85,7 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     
     return walkers
 
-def burn_in(ansatz, walkers, n_steps, step_size, key, jastrow_params, linear_coeffs, report_interval=100):
+def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=100):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -95,8 +94,7 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, jastrow_params, linear_coe
         n_steps: Number of burn-in steps
         step_size: Step size for MCMC proposals, std dev of Gaussian
         key: PRNG key
-        jastrow_params: Jastrow parameters
-        linear_coeffs: Linear coefficients
+        params: Parameters for the ansatz, including jastrow and linear coefficients
         report_interval: How often to print progress
     
     Returns:
@@ -111,19 +109,20 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, jastrow_params, linear_coe
     for step in range(n_steps):
         key, subkey = random.split(key)
         walkers, alpha_acceptance = metropolis_hastings(
-            ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
+            ansatz, walkers, step_size, subkey, params)
         
         key, subkey = random.split(key)
         walkers, beta_acceptance = metropolis_hastings(
-            ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
+            ansatz, walkers, step_size, subkey, params)
         
         acceptance_history.append((alpha_acceptance + beta_acceptance) / 2)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}")
+            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}")
+            step_size *= acceptance_history[-1]/0.5
     
     print("Burn-in complete.")
-    return walkers, acceptance_history, key
+    return walkers, acceptance_history, key, step_size
 
 
 @jax.jit
@@ -153,7 +152,7 @@ def _compute_green_function(r_target, r_source, quantum_force, time_step):
     # Return the Green's function values
     return jnp.exp(exponent)
 
-def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, jastrow_params, linear_coeffs):
+def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, params):
     """Perform one step of Metropolis-Hastings with importance sampling (drift).
     
     Args:
@@ -162,8 +161,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, jas
         walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
         time_step: Time step for the drift-diffusion process
         key: PRNG key
-        jastrow_params: Jastrow parameters
-        linear_coeffs: Linear coefficients
+        params: Parameters for the ansatz, including jastrow and linear coefficients
     
     Returns:
         Tuple containing:
@@ -171,10 +169,10 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, jas
         - acceptance_rate: Fraction of proposals that were accepted
     """
     # Compute initial wavefunction values and quantum forces with parameters
-    psi_values = ansatz(walkers, jastrow_params, linear_coeffs)
+    psi_values = ansatz(walkers, params)
     
     # Compute quantum force: F = 2∇ψ/ψ (gradient of log wavefunction)
-    quantum_forces = ansatz.quantum_force(walkers, jastrow_params, linear_coeffs)
+    quantum_forces = ansatz.quantum_force(walkers, params)
     
     # Generate drift-diffusion proposals:
     # R' = R + D*F(R)*τ + √(2D*τ)*χ (D=0.5 in atomic units)
@@ -188,8 +186,8 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, jas
     proposals = walkers + drift_term + random_term
     
     # Compute new wavefunction values and quantum forces at proposed positions
-    new_psi_values = ansatz(proposals, jastrow_params, linear_coeffs)
-    new_quantum_forces = ansatz.quantum_force(proposals, jastrow_params, linear_coeffs)
+    new_psi_values = ansatz(proposals, params)
+    new_quantum_forces = ansatz.quantum_force(proposals, params)
     
     # Modified acceptance probability for importance sampling
     # G(R→R') = exp(-(R'-R-D*F(R)*τ)²/(2*τ))
@@ -213,7 +211,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, jas
     
     return new_walkers, acceptance_rate
 
-def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, jastrow_params, linear_coeffs, report_interval=100):
+def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, report_interval=100):
     """Perform burn-in steps for MCMC sampling with importance sampling.
     
     Args:
@@ -222,15 +220,13 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, jastrow_pa
         n_steps: Number of burn-in steps
         time_step: Time step for the drift-diffusion process
         key: PRNG key
-        jastrow_params: Jastrow parameters
-        linear_coeffs: Linear coefficients
+        params: Parameters for the ansatz, including jastrow and linear coefficients
         report_interval: How often to print progress
     
     Returns:
         Tuple of (equilibrated_walkers, acceptance_history, new_key)
     """
     acceptance_history = []
-    
     if n_steps <= 0:
         return walkers, acceptance_history, key
         
@@ -238,14 +234,15 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, jastrow_pa
     for step in range(n_steps):
         key, subkey = random.split(key)
         walkers, acceptance = metropolis_hastings_importance_sampling(
-            ansatz, walkers, time_step, subkey, jastrow_params, linear_coeffs)
+            ansatz, walkers, time_step, subkey, params)
         acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}, Acceptance: {acceptance}")
+            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}")
+            time_step *= acceptance_history[-1]/0.5
     
     print("Burn-in complete.")
-    return walkers, acceptance_history, key
+    return walkers, acceptance_history, key, time_step
 
 # Modified sample function to support importance sampling
 def sample(
@@ -257,8 +254,7 @@ def sample(
     burn_in_steps: int = 1000,
     initial_walkers=None,
     use_importance_sampling: bool = False,  # New parameter to toggle importance sampling
-    jastrow_params=None,  # New parameter
-    linear_coeffs=None,  # New parameter
+    params=None,
     key=None
 ) -> Dict[str, Any]:
     """Perform MCMC sampling for quantum wavefunction.
@@ -273,8 +269,7 @@ def sample(
         burn_in_steps: Number of initial MCMC steps to discard (equilibration)
         initial_walkers: Optional initial positions, otherwise initialized near nuclei
         use_importance_sampling: Whether to use importance sampling with drift
-        jastrow_params: Jastrow parameters
-        linear_coeffs: Linear coefficients
+        params: Parameters for the ansatz, including jastrow and linear coefficients
         key: PRNG key
     
     Returns:
@@ -288,11 +283,11 @@ def sample(
     
     # Perform burn-in with appropriate method
     if use_importance_sampling:
-        walkers, acceptance_history, key = burn_in_with_importance(
-            ansatz, walkers, burn_in_steps, step_size, key, jastrow_params, linear_coeffs)
+        walkers, acceptance_history, key, step_size = burn_in_with_importance(
+            ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
-        walkers, acceptance_history, key = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, jastrow_params, linear_coeffs)
+        walkers, acceptance_history, key, step_size = burn_in(
+            ansatz, walkers, burn_in_steps, step_size, key, params)
     
     
     if burn_in_steps > 0:
@@ -311,18 +306,18 @@ def sample(
         key, subkey = random.split(key)
         if use_importance_sampling:
             walkers, acceptance = metropolis_hastings_importance_sampling(
-                ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
+                ansatz, walkers, step_size, subkey, params)
         else:
             # Do both up and down spin moves
             walkers, acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
+                ansatz, walkers, step_size, subkey, params)
             
         acceptance_history.append(acceptance)
         
         # Store samples at thinning interval
         if step % thinning == 0:
             # Compute local energies with parameters
-            energies = ansatz.local_energy(walkers, jastrow_params, linear_coeffs)
+            energies = ansatz.local_energy(walkers, params)
             
             # Store samples and energies
             collected_samples.append(walkers)
@@ -341,11 +336,11 @@ def sample(
         collected_samples, collected_energies, acceptance_history, walkers, step_times)
 
 def optimize(
-    ansatz, 
+    ansatz,
     cost_fn=None,
-    n_walkers: int = 100, 
-    n_steps: int = 1000, 
-    step_size: float = 1.0, 
+    n_walkers: int = 100,
+    n_steps: int = 1000,
+    step_size: float = 1.0,
     burn_in_steps: int = 1000,
     use_importance_sampling: bool = True,
     initial_walkers=None,
@@ -355,9 +350,8 @@ def optimize(
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
     opt_kwargs: Optional[Dict[str, Any]] = None,
-    jastrow_params=None,
-    linear_coeffs=None,
-    frozen_params=None  # Parameter freezing identifiers
+    params=None, # Combined params: [jastrow_params, linear_coeffs]
+    frozen_params=None  # Parameter freezing identifiers for Jastrow part
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -399,56 +393,26 @@ def optimize(
     walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
     if use_importance_sampling:
-        walkers, acceptance_history, key = burn_in_with_importance(
-            ansatz, walkers, burn_in_steps, step_size, key, jastrow_params, linear_coeffs)
+        walkers, acceptance_history, key, step_size = burn_in_with_importance(
+            ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
-        walkers, acceptance_history, key = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, jastrow_params, linear_coeffs)
+        walkers, acceptance_history, key, step_size = burn_in(
+            ansatz, walkers, burn_in_steps, step_size, key, params)
     
     print("Starting optimization...")
     
     # Initialize parameters if not provided
-    if jastrow_params is None:
-        # Assuming ansatz.jastrow.init_params() exists and works
-        jastrow_params = ansatz.jastrow.init_params() 
-    
-    if linear_coeffs is None:
+    if params is None:
+        jastrow_params = ansatz.jastrow.init_params()
         linear_coeffs = jnp.ones(len(ansatz.dets))
-        
-    # --- Manual Gradient Masking Setup ---
-    mask = None
-    if frozen_params:
-        print(f"Manual gradient masking enabled for: {frozen_params}")
-        jastrows = ansatz.jastrow.jastrows
-        if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
-             raise TypeError(f"Params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
+        params = [jastrow_params, linear_coeffs]
+    else:
+        if not isinstance(params, (list, tuple)) or len(params) != 2:
+             raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
 
-        final_mask_list = []
-        for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
-            should_update = True  # Python boolean
-            for fp in frozen_params:
-                if isinstance(fp, int) and fp == i:
-                    should_update = False; break
-                elif isinstance(fp, str):
-                    if fp == jastrow.__class__.__name__ or fp == getattr(jastrow, 'name', None):
-                        should_update = False; break
-            
-            # Create mask pytree with Python booleans for this jastrow
-            mask_pytree_for_jastrow = tree_map(lambda _: should_update, param_pytree)
-            final_mask_list.append(mask_pytree_for_jastrow)
-            print(f"  Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}, update={should_update}")
-        
-        mask = final_mask_list # This is the boolean mask PyTree
-        
-        # Define function to apply mask to gradients
-        def apply_gradient_mask(grads, mask):
-            # Multiply gradient leaf by boolean mask leaf (True=1, False=0)
-            return tree_map(lambda g, m: g * m, grads, mask)
-    # --- End Manual Gradient Masking Setup ---
-
-    # Use the base optimizer directly
+    # --- Initialize Optimizer for combined params ---
     optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
-    opt_state = optimizer.init(jastrow_params)
+    opt_state = optimizer.init(params)
     
     # Track optimization progress
     opt_history = {
@@ -460,101 +424,218 @@ def optimize(
     }
     
     # Define loss function that computes energy with explicit parameters
-    def loss_fn(params, walkers_batch):
+    def loss_fn(current_params, walkers_batch):
         # Compute energies for all walkers with current parameters
-        energies = ansatz.local_energy(walkers_batch, params, linear_coeffs)
+        energies = ansatz.local_energy(walkers_batch, current_params)
         
         # clip energies around the mean energy to avoid numerical instability
         median_energy = jnp.median(energies)
         mean_energy = jnp.mean(energies)
         var_e = jnp.mean(jnp.abs(energies - median_energy))
-        energies = jnp.clip(energies, median_energy-5.*var_e, median_energy+5.*var_e)
+        # Use a configurable multiplier for clipping range to ensure numerical stability
+        clip_multiplier = 5  # Default value, can be adjusted as needed
+        energies = jnp.clip(energies, median_energy - clip_multiplier * var_e, median_energy + clip_multiplier * var_e)
         # Compute cost (default: mean energy)
         cost = cost_fn(energies)
         
         return cost, (mean_energy, var_e)
     
     # Vectorized gradient function
-    value_and_grad_fn = jax.jit(value_and_grad(loss_fn, has_aux=True))
+    value_and_grad_fn = jax.jit(value_and_grad(loss_fn, argnums=0, has_aux=True))
     
-    # Optimization loop
-    best_energy = float('inf')
-    step_times = []
-    accumulated_grads = []
     losses = []
-    params = []
-    opt_steps = []
+    params_history = []
     acceptances = []
 
-
     print(f"Starting optimization with {n_opt_steps} steps...")
-    # ncusp_params = jastrow_params[0] # Keep for reference if needed
-    
+
     for opt_step in range(n_opt_steps):
         start_time = time.time()
         
-        # Initialize numpy-based accumulator for gradients (mutable)
-        acceptance_temp = []
-        
-        # Perform n_steps MCMC steps, accumulating gradients
-        # for mcmc_step in range(n_steps):
-        # Update walker positions using MCMC directly
+        # Perform MCMC step to update walkers
         key, subkey = random.split(key)
         if use_importance_sampling:
             walkers, acceptance = metropolis_hastings_importance_sampling(
-                ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
+                ansatz, walkers, step_size, subkey, params)
         else:
             walkers, acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, jastrow_params, linear_coeffs)
+                ansatz, walkers, step_size, subkey, params)
             
-        if opt_step % n_steps == 0:
-            # Compute loss and gradients for current walker configurations
-            (loss, (energies, var_e)), grads = value_and_grad_fn(jastrow_params, walkers)
-            
-            # --- Apply manual gradient mask if enabled ---
-            if mask is not None:
-                grads = apply_gradient_mask(grads, mask)
-            # --- End Apply manual gradient mask ---
-
-            # Update parameters using base optimizer and potentially masked grads
-            updates, opt_state = optimizer.update(grads, opt_state, jastrow_params)
-            jastrow_params = optax.apply_updates(jastrow_params, updates)
-            params.append(jastrow_params)
-            # Store loss and acceptance
-            losses.append(energies)
-            acceptances.append(acceptance)
+        # Compute loss and gradients for current walker configurations
+        (loss, (mean_energy_val, var_e)), grads = value_and_grad_fn(params, walkers)
         
-            # ... (logging, history appending) ...
-            step_time = time.time() - start_time
-            if len(jastrow_params) > 1:
-                rexp = jastrow_params[1]
-                print(f"Step: {opt_step}, Loss: {float(loss):.6f}, "
-                      f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
-                      f"Var loss: {var_e:.6f}, "
-                      f"Acceptance: {acceptance:.3f}, "
-                      f"Nuclear Cusp: rc={jastrow_params[0]['rc'][0]:.3f}, X4={jastrow_params[0]['X4'][0]:.3f}, "
-                      f"Time: {step_time*1000:.2f}ms")
-            else:
-                print(f"Step: {opt_step}, Loss: {float(loss):.6f}, "
-                      f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
-                      f"Var loss: {var_e:.6f}, "
-                      f"Acceptance: {acceptance:.3f}, "
-                      f"Nuclear Cusp: rc={jastrow_params[0]['rc'][0]:.3f}, X4={jastrow_params[0]['X4'][0]:.3f}, "
-                      f"Time: {step_time*1000:.2f}ms")
-            #print(f"NCusp Params: {jastrow_params[0]['rc']}")
-            #print(f"REXP Params: {jastrow_params[2]}")
-        
-        # Add acceptances to history
-        acceptance_history.extend(acceptance_temp)
+        # --- Create and Apply Gradient Mask ---
+        mask = create_gradient_mask(ansatz, params, frozen_params)
+        if mask is not None:
+            grads = apply_gradient_mask(grads, mask)
+        # --- End Apply Gradient Mask ---
 
-        # Store optimization history
-        opt_history["energies"] = jnp.asarray(losses)
-        opt_history["params"] = params
-        #opt_history["gradients"] = jnp.asarray(accumulated_grads)
-        opt_history["acceptance"] = jnp.asarray(acceptances)
-        opt_history["steps"] = jnp.asarray(opt_steps)
+        # Update parameters using base optimizer and potentially masked grads
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        params_history.append(params)
+        losses.append(mean_energy_val)
+        acceptances.append(acceptance)
+        
+        step_time = time.time() - start_time
+        print(f"Step: {opt_step}, Loss: {float(loss):.6f}, "
+              f"Mean loss: {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
+              f"Var loss: {var_e:.6f}, "
+              f"Acceptance: {acceptance:.3f}, "
+              f"Time: {step_time*1000:.2f}ms")
+        
+    opt_history["energies"] = jnp.asarray(losses)
+    opt_history["params"] = params_history
+    opt_history["acceptance"] = jnp.asarray(acceptances)
+    opt_history["steps"] = jnp.arange(n_opt_steps)
 
     print(f"Optimization complete.")
     
-    
+    return opt_history
+
+def optimize_ref_var(
+    ansatz,
+    cost_fn=None,
+    n_walkers: int = 100,
+    n_steps: int = 1000,
+    step_size: float = 1.0,
+    burn_in_steps: int = 1000,
+    initial_walkers=None,
+    key=None,
+    # Optimization parameters
+    n_opt_steps: int = 100,
+    learning_rate: float = 0.01,
+    optimizer_type: str = "adam",
+    opt_kwargs: Optional[Dict[str, Any]] = None,
+    params=None, # Combined params: [jastrow_params, linear_coeffs]
+    frozen_params=None  # Parameter freezing identifiers for Jastrow part
+):
+    """Perform reference variance optimization using MCMC sampling.
+
+    Args:
+        ansatz: Wavefunction object with __call__ method that returns ψ(R)
+        cost_fn: Cost function (defaults to reference variance if None).
+                 Should accept (params, walkers_batch) and return (cost, aux_data).
+        n_walkers: Number of parallel walkers
+        n_steps: Number of MCMC steps per optimization step (used for walker updates)
+        step_size: Standard deviation of Gaussian proposal for MCMC
+        burn_in_steps: Number of initial MCMC steps to discard (equilibration)
+        initial_walkers: Optional initial positions, otherwise initialized near nuclei
+        key: PRNG key
+        n_opt_steps: Number of optimization steps
+        learning_rate: Learning rate for optimizer
+        optimizer_type: Type of optimizer ("adam", "sgd", etc.)
+        opt_kwargs: Additional optimizer parameters
+        params: Initial combined parameters [jastrow_params, linear_coeffs].
+        frozen_params: List of identifiers (int index or str name/type) for Jastrow factors to freeze.
+
+    Returns:
+        Dictionary with optimization results and statistics
+    """
+    if key is None:
+        key = random.PRNGKey(int(time.time()))
+
+    if opt_kwargs is None:
+        opt_kwargs = {}
+
+    # Initialize parameters if not provided
+    if params is None:
+        jastrow_params = ansatz.jastrow.init_params()
+        linear_coeffs = jnp.ones(len(ansatz.dets))
+        params = [jastrow_params, linear_coeffs]
+    else:
+        if not isinstance(params, (list, tuple)) or len(params) != 2:
+             raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
+
+    # Default cost function (ref variance) if needed
+    if cost_fn is None:
+        def ref_var_cost_fn(current_params, walkers_batch):
+            energies = ansatz.local_energy(walkers_batch, current_params)
+            #clip_multiplier = 10  # Default value, can be adjusted as needed
+            #var_e = jnp.mean(jnp.abs(energies - jnp.median(energies)))
+            #median_energy = jnp.median(energies)
+            #clipped_energies = jnp.clip(energies, median_energy - clip_multiplier * var_e, median_energy + clip_multiplier * var_e)
+            #clipped_e_ref = jnp.mean(clipped_energies)
+            e_ref = jnp.mean(energies)
+            e_std = jnp.std(energies)
+            #var_ref = jnp.sum((clipped_energies - clipped_e_ref)**2) / (clipped_energies.shape[0] - 1) if energies.shape[0] > 1 else 0.0
+            var_ref = jnp.sum((energies - e_ref)**2) / (energies.shape[0] - 1) if energies.shape[0] > 1 else 0.0
+            return var_ref, (e_ref, e_std)
+        cost_fn = ref_var_cost_fn
+
+    # Initialize walkers using the reference determinant's info
+    ref_det = ansatz.dets[0]
+    walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
+
+    # Burn-in walkers using the initial combined parameters
+    walkers, acceptance_history, key, step_size = burn_in(
+        ref_det, walkers, burn_in_steps, step_size, key, params)
+
+    print("Starting optimization...")
+
+    # --- Initialize Optimizer for combined params ---
+    optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
+    opt_state = optimizer.init(params)
+
+    # Track optimization progress
+    opt_history = {
+        "cost": [],
+        "energies": [],
+        "params": [],
+        'acceptance': [],
+        "steps": []
+    }
+
+    # Gradient function for the combined parameters
+    value_and_grad_fn = jax.jit(value_and_grad(cost_fn, argnums=0, has_aux=True))
+
+    losses = []
+    energies = []
+    params_history = []
+    acceptances = []
+
+    # --- Create and Apply Gradient Mask ---
+    mask = create_gradient_mask(ansatz, params, frozen_params)
+    print(f"Starting optimization with {n_opt_steps} steps...")
+
+    for opt_step in range(n_opt_steps):
+        start_time = time.time()
+
+
+        # Compute loss (variance) and gradients
+        (loss, (ref_e, std_e)), grads = value_and_grad_fn(params, walkers)
+
+        if mask is not None:
+            grads = apply_gradient_mask(grads, mask)
+        # --- End Apply Gradient Mask ---
+
+        # Update combined parameters
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+
+        # Store history
+        params_history.append(params)
+        losses.append(loss)
+        energies.append(ref_e)
+
+        if opt_step % n_steps == 0:
+            # Perform MCMC step to update walkers
+            key, subkey = random.split(key)
+            walkers, acceptance = metropolis_hastings(
+                ref_det, walkers, step_size, subkey, params)
+            acceptances.append(acceptance)
+
+            step_time = time.time() - start_time
+            print(f"Step: {opt_step}, Var: {float(loss):.6f}, E_mean: {float(ref_e):.6f}+\-{float(std_e):.6f}, "
+                  f"Acceptance: {acceptance:.3f}, Time: {step_time*1000/n_steps:.2f}ms/step "
+                  f"rc: {float(params[0][0]['rc'][0]):.6f}, X4: {float(params[0][0]['X4'][0]):.6f}")
+
+    opt_history["cost"] = jnp.asarray(losses)
+    opt_history["energies"] = jnp.asarray(energies)
+    opt_history["params"] = params_history
+    opt_history["acceptance"] = jnp.asarray(acceptances)
+    opt_history["steps"] = jnp.arange(n_opt_steps)
+
+    print(f"Optimization complete.")
+
     return opt_history

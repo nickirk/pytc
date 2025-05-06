@@ -159,7 +159,7 @@ class NeuralEE(NeuralBase):
         r12_dist = self._safe_norm(r1 - r2)
         # Apply decay parameter
         # r12_feat = r12_dist * jnp.exp(-0.5 * r12_dist)
-        r12_feat = r12_dist / (1 + r12_dist) # Normalize to [0, 1]
+        r12_feat = r12_dist  # Normalize to [0, 1]
 
         features = r12_feat.reshape(1, -1)
         # Reconstruct network variables dictionary from flattened weights
@@ -201,9 +201,9 @@ class NeuralEEN(NeuralBase):
         r2n_dist = self._safe_norm(r2[None, :] - self.nuclear_pos)
 
         # Apply decay parameters
-        r12_feat = r12_dist  / (1+r12_dist) 
-        r1n_feat = r1n_dist  / (1+r1n_dist) 
-        r2n_feat = r2n_dist  / (1+r2n_dist) 
+        r12_feat = r12_dist
+        r1n_feat = r1n_dist
+        r2n_feat = r2n_dist
         #feat = r12_feat * r1n_feat * r2n_feat * jnp.exp(-0.5 * r1n_dist) * jnp.exp(-0.5 * r2n_dist) * jnp.exp(-0.5 * r12_dist)
 
         features = jnp.concatenate([

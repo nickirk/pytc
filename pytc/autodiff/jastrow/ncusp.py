@@ -141,7 +141,7 @@ class NuclearCusp(Jastrow):
             # Find first nucleus of this type
             nucleus_idx = jnp.where(self.charges == Z)[0][0]
             phi_0 = self.eval_mo_at_r(nucleus_idx, 0.0)
-            params['X4'] = params['X4'].at[Z_idx].set(jnp.log(abs(phi_0)*1.4))
+            params['X4'] = params['X4'].at[Z_idx].set(jnp.log(abs(phi_0))*1.1)
         
         # Update all alpha coefficients
         #self._update_alpha_coeffs(params)

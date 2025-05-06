@@ -49,8 +49,9 @@ class SlaterJastrow:
         return self._ion_ion_potential
     
     @partial(jax.jit, static_argnums=(0,))
-    def __call__(self, elec_coords_batch, jastrow_params, linear_coeffs):
+    def __call__(self, elec_coords_batch, params):
         """Evaluate wavefunction with explicit parameters."""
+        jastrow_params, linear_coeffs = params
         jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(elec_coords_batch)
         
         det_vals = []
@@ -195,20 +196,19 @@ class SlaterJastrow:
         return self.n_electrons - self.n_alpha
     
     @partial(jax.jit, static_argnums=(0,))
-    def local_energy(self, elec_coords_batch, jastrow_params, linear_coeffs):
+    def local_energy(self, elec_coords_batch, params):
         """Compute local energy for a batch of electron configurations.
         
         Args:
             elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
                             or (n_electrons, 3) for a single walker
-            jastrow_params: Jastrow parameters
-            linear_coeffs: Linear coefficients for determinants
+            params: Tuple of parameters (jastrow_params, linear_coeffs)
                             
         Returns:
             Array of local energy values with shape (n_walkers,)
             or a single value for a single walker
         """
-        
+        jastrow_params, linear_coeffs = params
         # Use vmap to compute Jastrow terms for all walkers
         grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(lambda x: self._compute_jastrow_terms(x, jastrow_params))(elec_coords_batch)
         
@@ -272,21 +272,20 @@ class SlaterJastrow:
         return jnp.real(E_L)  # Ensure real value
 
     @partial(jax.jit, static_argnums=(0,))
-    def quantum_force(self, elec_coords, jastrow_params, linear_coeffs, cutoff=1.0):
+    def quantum_force(self, elec_coords, params, cutoff=1.0):
         """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
         
         Args:
             elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
                            or (n_electrons, 3) for a single walker
-            jastrow_params: Jastrow parameters
-            linear_coeffs: Linear coefficients for determinants
+            params: Tuple of parameters (jastrow_params, linear_coeffs)
             cutoff: Maximum allowed magnitude for quantum forces
                            
         Returns:
             Array of quantum forces with shape (n_walkers, n_electrons, 3)
             or shape (n_electrons, 3) for a single walker
         """
-        
+        jastrow_params, linear_coeffs = params 
         # Compute Jastrow gradient contributions
         grad_J_over_J_batch = jax.vmap(lambda coords: self._compute_jastrow_terms(coords, jastrow_params)[0])(elec_coords)
         

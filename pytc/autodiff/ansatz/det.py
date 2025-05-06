@@ -195,7 +195,7 @@ class SlaterDet:
         self.det_down = None
         self.last_positions = None
     
-    def __call__(self, coords):
+    def __call__(self, coords, params=None):
         """
         Convenience method to call value on a set of coordinates.
     
