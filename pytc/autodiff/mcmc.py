@@ -103,9 +103,10 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=10
     acceptance_history = []
     
     if n_steps <= 0:
-        return walkers, acceptance_history, key
+        return walkers, acceptance_history, key, step_size
         
     print(f"Starting burn-in with {n_steps} steps...")
+    start_time = time.time()
     for step in range(n_steps):
         key, subkey = random.split(key)
         walkers, alpha_acceptance = metropolis_hastings(
@@ -118,8 +119,9 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=10
         acceptance_history.append((alpha_acceptance + beta_acceptance) / 2)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}")
+            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]:.3f}, time: {time.time() - start_time:.2f}s")
             step_size *= acceptance_history[-1]/0.5
+            start_time = time.time()
     
     print("Burn-in complete.")
     return walkers, acceptance_history, key, step_size
@@ -231,6 +233,7 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
         return walkers, acceptance_history, key
         
     print(f"Starting burn-in with {n_steps} steps using importance sampling...")
+    time_start = time.time()
     for step in range(n_steps):
         key, subkey = random.split(key)
         walkers, acceptance = metropolis_hastings_importance_sampling(
@@ -238,8 +241,9 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
         acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}")
+            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}, time: {time.time() - time_start:.2f}s")
             time_step *= acceptance_history[-1]/0.5
+            time_start = time.time()
     
     print("Burn-in complete.")
     return walkers, acceptance_history, key, time_step
@@ -299,8 +303,8 @@ def sample(
     step_times = []
     
     # Main sampling loop
+    start_time = time.time()
     for step in range(n_steps):
-        start_time = time.time()
         
         key, subkey = random.split(key)
         if use_importance_sampling:
@@ -319,13 +323,14 @@ def sample(
             collected_samples.append(walkers)
             collected_energies.append(energies)
         
-        step_time = time.time() - start_time
-        step_times.append(step_time)
         
         # Print progress occasionally
         if step % 100 == 0 or step == n_steps - 1:
+            step_time = time.time() - start_time
+            step_times.append(step_time)
             report_progress(step, n_steps, acceptance_history, step_times, 
                            collected_energies if collected_energies else None)
+            start_time = time.time()
     
     # Prepare and return results
     return prepare_sampling_results(
@@ -476,8 +481,8 @@ def optimize(
 
     print(f"Starting optimization with {n_opt_steps} steps...")
 
+    start_time = time.time()
     for opt_step in range(n_opt_steps):
-        start_time = time.time()
         
         # Perform MCMC step to update walkers
         key, subkey = random.split(key)
@@ -521,7 +526,7 @@ def optimize(
               f"Mean E (hist): {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
               f"Batch Var E: {current_batch_energy_variance:.6f}, "
               f"Acceptance: {acceptance:.3f}, "
-              f"Time: {step_time*1000:.2f}ms")
+              f"Time: {step_time:.2f}s")
         
     opt_history["energies"] = jnp.asarray(losses)
     opt_history["params"] = params_history
@@ -657,8 +662,8 @@ def optimize_ref_var(
 
     print(f"Starting optimization with {n_opt_steps} steps...")
 
+    start_time = time.time()
     for opt_step in range(n_opt_steps):
-        start_time = time.time()
 
         current_batch_cost = None
         current_batch_ref_e = None
@@ -708,8 +713,10 @@ def optimize_ref_var(
 
             step_time_val = time.time() - start_time # Corrected variable name
             print(f"Step: {opt_step}, Var: {float(current_batch_cost):.6f}, E_mean: {float(current_batch_ref_e):.6f}+\-{float(current_batch_std_e):.6f}, "
-                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val*1000/n_steps:.2f}ms/step "
+                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s, "
                   f"rc: {float(params[0][0]['rc'][0]):.6f}, X4: {float(params[0][0]['X4'][0]):.6f}")
+
+            start_time = time.time()
 
     opt_history["cost"] = jnp.asarray(losses)
     opt_history["energies"] = jnp.asarray(energies)

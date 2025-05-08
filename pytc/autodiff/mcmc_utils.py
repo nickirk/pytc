@@ -158,7 +158,7 @@ def report_progress(step, total_steps, acceptance_history, step_times, energies=
     """
     recent_acceptance = jnp.mean(jnp.array(acceptance_history[-100:]))
     recent_time = jnp.mean(jnp.array(step_times[-100:]))
-    print(f"Step {step}/{total_steps}, Acceptance: {recent_acceptance:.4f}, Time/step: {recent_time*1000:.2f}ms")
+    print(f"Step {step}/{total_steps}, Acceptance: {recent_acceptance:.4f}, Time/step: {recent_time:.2f}s")
     
     if energies:
         recent_energy = jnp.mean(jnp.concatenate(energies))

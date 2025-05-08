@@ -195,6 +195,56 @@ class SlaterDet:
         self.det_down = None
         self.last_positions = None
     
+        # Add cache attributes
+        self._cached_hash = None
+        self._cached_matrix = None
+        self._cached_grad = None
+        self._cached_laplacian = None
+        self._cached_value = None
+
+    def _hash_coords(self, coords):
+        """Hash coordinates for cache comparison.
+        
+        Args:
+            coords: Array of shape (n_electrons, 3) or (n_walkers, n_electrons, 3)
+            
+        Returns:
+            int: Hash of the coordinates
+        """
+        return hash(np.asarray(coords).tobytes())
+        #return np.sum(np.asarray(coords))
+
+    def _check_cache(self, coords, cache_type):
+        """Check if cache needs to be updated.
+        
+        Args:
+            coords: Array of coordinates
+            cache_type: String indicating which cache to check ('matrix', 'grad', 'laplacian', 'value')
+            
+        Returns:
+            bool: True if cache needs to be updated
+        """
+        coords_hash = self._hash_coords(coords)
+        needs_update = (coords_hash != self._cached_hash)
+        
+        if needs_update:
+            # Clear all caches if coords change
+            self._cached_hash = coords_hash
+            self._cached_matrix = None
+            self._cached_grad = None
+            self._cached_laplacian = None
+            self._cached_value = None
+        
+        # Also return True if requested cache is empty
+        if cache_type == 'matrix':
+            return needs_update or self._cached_matrix is None
+        elif cache_type == 'grad':
+            return needs_update or self._cached_grad is None
+        elif cache_type == 'laplacian':
+            return needs_update or self._cached_laplacian is None
+        else:  # value
+            return needs_update or self._cached_value is None
+
     def __call__(self, coords, params=None):
         """
         Convenience method to call value on a set of coordinates.
@@ -260,6 +310,9 @@ class SlaterDet:
                                   If input is batched, returns arrays of shape:
                                   (n_walkers, n_up, n_up), (n_walkers, n_down, n_down)
         """
+        if not self._check_cache(coords, 'matrix'):
+            return self._cached_matrix
+            
         coords_batch, is_single = self._ensure_batch(coords)
         n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
         
@@ -290,6 +343,8 @@ class SlaterDet:
             slater_up_batch = np.dot(ao_up, self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_alpha, self.n_alpha)
             slater_down_batch = np.dot(ao_down, self.mo_coeff_beta_occ).reshape(n_walkers, self.n_beta, self.n_beta)
         
+        # Cache result before returning
+        self._cached_matrix = (slater_up_batch, slater_down_batch)
         # Return single matrices if input was single walker
         if is_single:
             return slater_up_batch[0], slater_down_batch[0]
@@ -309,6 +364,9 @@ class SlaterDet:
                  matrix_up/down: (n_walkers, n_up/down, n_up/down)
                  grad_up/down: (n_walkers, n_up/down, n_up/down, 3)
         """
+        if not self._check_cache(coords, 'grad'):
+            return self._cached_grad
+            
         coords_batch, is_single = self._ensure_batch(coords)
         n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
         
@@ -334,11 +392,13 @@ class SlaterDet:
             grad_up_batch[..., d] = grad_up
             grad_down_batch[..., d] = grad_down
         
+        # Cache result before returning
+        result = ((matrix_up, matrix_down), (grad_up_batch, grad_down_batch))
+        self._cached_grad = result
         if is_single:
             return ((matrix_up[0], matrix_down[0]), 
                     (grad_up_batch[0], grad_down_batch[0]))
-        return ((matrix_up, matrix_down), 
-                (grad_up_batch, grad_down_batch))
+        return result
 
     def laplacian(self, coords):
         """Compute laplacian, gradient and matrix of the Slater determinant.
@@ -352,6 +412,9 @@ class SlaterDet:
                     (grad_up, grad_down),
                     (lap_up, lap_down))
         """
+        if not self._check_cache(coords, 'laplacian'):
+            return self._cached_laplacian
+            
         coords_batch, is_single = self._ensure_batch(coords)
         n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
         
@@ -384,15 +447,15 @@ class SlaterDet:
                                     self.mo_coeff_beta_occ,
                                     n_walkers, n_electrons)
         
+        # Cache result before returning
+        result = ((matrix_up, matrix_down), (grad_up_batch, grad_down_batch), (lap_up, lap_down))
+        self._cached_laplacian = result
         if is_single:
             return ((matrix_up[0], matrix_down[0]),
                     (grad_up_batch[0], grad_down_batch[0]),
                     (lap_up[0], lap_down[0]))
-        return ((matrix_up, matrix_down),
-                (grad_up_batch, grad_down_batch),
-                (lap_up, lap_down))
+        return result
 
-    
     def value(self, coords):
         """
         Full evaluation of the Slater determinant for the entire electron configuration.
@@ -405,6 +468,9 @@ class SlaterDet:
             float or array: determinant product(s)
                           If input is batched, returns array of shape (n_walkers,)
         """
+        if not self._check_cache(coords, 'value'):
+            return self._cached_value
+            
         coords_batch, is_single = self._ensure_batch(coords)
         
         # Get Slater matrices for all walkers
@@ -424,8 +490,10 @@ class SlaterDet:
             
             # Multiply the determinants
             values = det_up_batch * det_down_batch
-            return values
-    
+            # Cache result before returning
+            self._cached_value = values
+            return values if not is_single else (det_up * det_down)
+
     def init_inverse(self, coords):
         """
         Compute and store the inverse Slater matrices for the current coords,
