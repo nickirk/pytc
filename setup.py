@@ -13,6 +13,8 @@ setup(
         "scipy",
         "jax",
         "optax",
+        "kfac_jax",
+        "flax",
         "tqdm",
         "pyscf",
     ],

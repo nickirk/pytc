@@ -177,12 +177,11 @@ class NeuralEEN(NeuralBase):
         r12_feat = r12_dist
         r1n_feat = r1n_dist
         r2n_feat = r2n_dist
-
         features = jnp.concatenate([
             jnp.asarray([r12_feat]), # Ensure it's an array
             r1n_feat,
             r2n_feat,
-        ]).reshape(1, -1)
+        ], axis=-1).reshape(1, -1)
         
         # Use the standard Flax variable structure directly
         return self.net.apply(net_vars, features)[0, 0]

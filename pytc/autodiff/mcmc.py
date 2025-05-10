@@ -1,13 +1,15 @@
-'''
-Metropolis-Hastings sampling
-'''
-import jax.numpy as jnp
-from jax import random, grad, value_and_grad
+"""Metropolis-Hastings sampling
+"""
+
+import numpy as np
 import jax
+import jax.numpy as jnp
 import optax
 import kfac_jax
 import time
-from typing import Dict, Any, Optional
+from jax import random, value_and_grad
+from jax.lax import stop_gradient
+from typing import Dict, Optional
 
 from pytc.autodiff.mcmc_utils import (
     prepare_sampling_results, report_progress, create_optimizer,
@@ -450,23 +452,18 @@ def optimize(
     params_history = []
     acceptances = []
     opt_history = {}
-    # This mask is for Optax-style optimizers.
-    # KFAC requires its own parameter freezing mechanisms if needed.
-    gradient_mask_for_optax = create_gradient_mask(ansatz, params, frozen_params)
+    # Create mask for parameter freezing
+    gradient_mask = create_gradient_mask(ansatz, params, frozen_params)
 
     # --- Initialize Optimizer for combined params ---
     if optimizer_type.lower() == "kfac":
         # KFAC specific setup
         opt_kwargs["value_and_grad_func"] = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
-        opt_kwargs["value_func_has_aux"] = True # Crucial for KFAC
+        opt_kwargs["value_func_has_aux"] = True
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         key, subkey_init = random.split(key)
-
-        # Temporarily remove prepare_kfac_params logic for freezing
-        # params_for_init = params
-        # if frozen_params:
-        #     params_for_init = prepare_kfac_params(ansatz, params, frozen_params)
         
+        # For KFAC, the mask does not work yet.
         opt_state = optimizer.init(params, subkey_init, (walkers, None)) # Use original params
         # If params were wrapped for init, ensure the main 'params' var reflects this structure
         # if frozen_params:
@@ -497,10 +494,10 @@ def optimize(
         if optimizer_type.lower() == "kfac":
             key, subkey_step = random.split(key)
             # KFAC's step function computes gradients internally and updates params
-            new_params, opt_state, stats = optimizer.step(
+            params, opt_state, stats = optimizer.step(
                 params, opt_state, subkey_step, batch=(walkers, None), global_step_int=opt_step
             )
-            params = new_params
+            
             current_batch_cost = stats['loss']
             current_batch_mean_energy, current_batch_energy_variance = stats['aux']
         else:
@@ -509,12 +506,14 @@ def optimize(
             current_batch_mean_energy = mean_energy_val
             current_batch_energy_variance = var_e_val
             
-            if gradient_mask_for_optax is not None:
-                grads = apply_gradient_mask(grads, gradient_mask_for_optax)
+            if gradient_mask is not None:
+                # Zero out gradients for frozen parameters
+                grads = jax.tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
+                                   grads, gradient_mask)
             
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
-
+            
         # Create materialized copies of parameters for history storage
         params_copy = jax.tree_map(lambda x: jax.device_get(x), params)
         params_history.append(params_copy)
@@ -637,28 +636,20 @@ def optimize_ref_var(
     # --- Initialize Optimizer for combined params ---
     if optimizer_type.lower() == "kfac":
         opt_kwargs["value_and_grad_func"] = jax.value_and_grad(user_or_default_cost_fn, argnums=0, has_aux=True)
-        opt_kwargs["value_func_has_aux"] = True # Crucial for KFAC
+        opt_kwargs["value_func_has_aux"] = True
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         key, subkey_init = random.split(key)
-
-        # Temporarily remove prepare_kfac_params logic for freezing
-        # params_for_init = params # Start with the original params
-        # if frozen_params: # If there are params to freeze
-        #     params_for_init = prepare_kfac_params(ansatz, params, frozen_params)
-
-        opt_state = optimizer.init(params, subkey_init, (walkers, None)) # Use original params
-        # After KFAC init, if params were wrapped (for freezing), 
-        # the 'params' variable in the optimization loop must be this wrapped version.
-        # if frozen_params:
-        #     params = params_for_init
+        
+        opt_state = optimizer.init(params, subkey_init, (walkers, None))
     else:
         value_and_grad_fn = jax.jit(value_and_grad(user_or_default_cost_fn, argnums=0, has_aux=True))
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
+        
+        # Apply gradient masking to initial parameters
+        if frozen_params:
+            params = create_gradient_mask(ansatz, params, frozen_params)
+            
         opt_state = optimizer.init(params)
-
-    # For Optax-style optimizers. KFAC handles gradients internally.
-    # The original optimize_ref_var created the mask inside the loop.
-    # We will keep this behavior for non-KFAC optimizers.
 
     print(f"Starting optimization with {n_opt_steps} steps...")
 
@@ -671,13 +662,15 @@ def optimize_ref_var(
 
         if optimizer_type.lower() == "kfac":
             key, subkey_step = random.split(key)
+            
+            # KFAC's step function computes gradients internally and updates params
             params, opt_state, stats = optimizer.step(
                 params, opt_state, subkey_step, batch=(walkers, None), global_step_int=opt_step
             )
-            current_batch_cost = stats['loss'] # This is var_ref from ref_var_cost_fn
+            
+            current_batch_cost = stats['loss']
             current_batch_ref_e, current_batch_std_e = stats['aux']
-            # Note: frozen_params with apply_gradient_mask is not applied here for KFAC.
-        else: # Optax-style
+        else:  # Optax-style
             # For Optax, value_and_grad_fn is called with (params, walkers)
             # So, user_or_default_cost_fn will receive `walkers` directly as batch_data_for_loss
             (cost_val, (ref_e_val, std_e_val)), grads = value_and_grad_fn(params, walkers)
@@ -685,10 +678,6 @@ def optimize_ref_var(
             current_batch_ref_e = ref_e_val
             current_batch_std_e = std_e_val
             
-            # Create mask inside the loop for non-KFAC, as per original structure
-            mask = create_gradient_mask(ansatz, params, frozen_params)
-            if mask is not None:
-                grads = apply_gradient_mask(grads, mask)
             
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
@@ -696,20 +685,25 @@ def optimize_ref_var(
 
         if opt_step % n_steps == 0:
             # Perform MCMC step to update walkers
-            key, subkey_mcmc = random.split(key) # Ensure key is split for MCMC
-            current_acceptance_rate = 0.0 # Default if not run
-            # The metropolis_hastings in the original code for optimize_ref_var uses ref_det and params
-            # It seems params here should be the updated params for the MCMC step
+            key, subkey_mcmc = random.split(key)
+            current_acceptance_rate = 0.0
             walkers, current_acceptance_rate = metropolis_hastings(
-                ref_det, walkers, step_size, subkey_mcmc, params) # Pass current (potentially updated) params
+                ref_det, walkers, step_size, subkey_mcmc, params)
             acceptances.append(current_acceptance_rate)
 
-
             # Create materialized copies of parameters for history storage
-            params_copy = jax.tree_map(lambda x: jax.device_get(x), params)
+            # First materialize all parameters by copying them to ensure they don't get deleted
+            def materialize_and_get(x):
+                # Explicitly copy array and move to host
+                if isinstance(x, (jnp.ndarray, np.ndarray)):
+                    return np.array(jax.device_get(x))
+                return x
+                
+            params_copy = jax.tree_map(materialize_and_get, params)
+            
             params_history.append(params_copy)
-            losses.append(float(current_batch_cost))  # Convert to Python float
-            energies.append(float(current_batch_ref_e))  # Convert to Python float
+            losses.append(float(current_batch_cost))
+            energies.append(float(current_batch_ref_e))
 
             step_time_val = time.time() - start_time # Corrected variable name
             print(f"Step: {opt_step}, Var: {float(current_batch_cost):.6f}, E_mean: {float(current_batch_ref_e):.6f}+\-{float(current_batch_std_e):.6f}, "

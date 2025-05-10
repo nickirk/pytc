@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import optax
 import kfac_jax
 from jax import random
+from jax.lax import stop_gradient
 from typing import Dict, Any, List, Optional, Tuple
 from jax.tree_util import tree_map 
 
@@ -371,7 +372,7 @@ def _distribute_electrons_by_pairing(atom_charges, n_alpha, n_beta):
 
 def create_gradient_mask(ansatz, params, frozen_params):
     """Create a gradient mask PyTree for the combined params structure.
-
+    
     Assumes params = [jastrow_params, linear_coeffs]. The mask is applied
     only to the jastrow_params part based on frozen_params identifiers.
     The linear_coeffs part of the mask is always True (not frozen).
@@ -383,13 +384,11 @@ def create_gradient_mask(ansatz, params, frozen_params):
                        for Jastrow factors whose parameters should be frozen.
 
     Returns:
-        A PyTree with the same structure as params, containing booleans.
-        Returns None if frozen_params is None or empty.
-        Otherwise, returns [jastrow_mask, linear_coeffs_mask], where
-        jastrow_mask reflects frozen_params and linear_coeffs_mask is all True.
+        A PyTree with the same structure as params, where frozen parameters
+        are wrapped with `jax.lax.stop_gradient`.
     """
     if not frozen_params:
-        return None # No freezing requested, return None to signal skipping mask application
+        return params  # No freezing requested, return params unchanged
 
     if not isinstance(params, (list, tuple)) or len(params) != 2:
         raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
@@ -402,39 +401,47 @@ def create_gradient_mask(ansatz, params, frozen_params):
     if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
         raise TypeError(f"Jastrow params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
 
-    jastrow_mask_list = []
+    # Deep copy the parameters to avoid modifying the input
+    masked_jastrow_params = []
     for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
-        should_update = True  # Python boolean
+        should_freeze = False
         for fp in frozen_params:
             if isinstance(fp, int) and fp == i:
-                should_update = False; break
+                should_freeze = True
+                break
             elif isinstance(fp, str):
-                # Check against class name and potential 'name' attribute
                 if fp == jastrow.__class__.__name__ or fp == getattr(jastrow, 'name', None):
-                    should_update = False; break
+                    should_freeze = True
+                    break
+        
+        if should_freeze:
+            # Apply stop_gradient to all leaves in the frozen parameter PyTree
+            param_pytree = tree_map(stop_gradient, param_pytree)
+            print(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
+            print("Warning: Freezing parameters does not work for KFAC yet.")
+        masked_jastrow_params.append(param_pytree)
 
-        # Create mask pytree with Python booleans for this jastrow factor
-        mask_pytree_for_jastrow = tree_map(lambda _: should_update, param_pytree)
-        jastrow_mask_list.append(mask_pytree_for_jastrow)
-        print(f"  Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}, update={should_update}")
-
-    # Create the mask for linear coefficients (always True)
-    linear_coeffs_mask = tree_map(lambda _: False, linear_coeffs)
-
-    # Combine the masks into the final structure
-    full_mask = [jastrow_mask_list, linear_coeffs_mask]
-
-    return full_mask
+    # Return the masked parameters
+    return [masked_jastrow_params, linear_coeffs]
 
 def apply_gradient_mask(grads, mask):
-    """Apply a boolean mask to a gradient PyTree.
-
+    """Apply gradient mask to gradients to freeze parameters.
+    
     Args:
-        grads: The gradient PyTree.
-        mask: The boolean mask PyTree (same structure as grads).
-
+        grads: The gradient PyTree
+        mask: The mask PyTree created by create_gradient_mask
+        
     Returns:
-        The masked gradient PyTree (gradients corresponding to False in the mask are zeroed).
+        A PyTree with the same structure as grads, where gradients for frozen
+        parameters are set to zero.
     """
-    # Multiply gradient leaf by boolean mask leaf (True=1, False=0)
-    return tree_map(lambda g, m: g * m, grads, mask)
+    if mask is None:
+        return grads
+        
+    def _apply_mask(g, m):
+        # If m is already stop_gradient'd, zero out the gradient
+        if isinstance(m, type(stop_gradient(m))):
+            return jnp.zeros_like(g)
+        return g
+        
+    return tree_map(_apply_mask, grads, mask)

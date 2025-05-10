@@ -15,6 +15,7 @@ class NuclearCusp(Jastrow):
         super().__init__(name=name)
         self.n_radial = n_radial
         self.nelectron = mol.nelectron
+        self.X4_range = (-10.0, 10.0)  # Fixed range for X4
         self.setup_for_molecule(mol)
         
         
@@ -34,6 +35,15 @@ class NuclearCusp(Jastrow):
         # Convert atomic charges to indices using array ops
         unique_Z = jnp.sort(jnp.unique(self.charges))
         self.unique_Z = unique_Z
+        
+        # Set rc ranges for each nucleus type: 0.8/Z to 1.2/Z
+        self.rc_ranges = []
+        for Z in self.unique_Z:
+            min_rc = 0.8/float(Z)
+            max_rc = 1.2/float(Z)
+            self.rc_ranges.append((min_rc, max_rc))
+        self.rc_ranges = jnp.array(self.rc_ranges)
+        
         # Create reverse mapping array: Z -> idx
         max_Z = int(jnp.max(unique_Z))
         Z_to_idx = -jnp.ones(max_Z + 1, dtype=jnp.int32)
@@ -128,12 +138,19 @@ class NuclearCusp(Jastrow):
             self.Z_idx_to_nucleus.append(nucleus_idx)
         self.Z_idx_to_nucleus = jnp.array(self.Z_idx_to_nucleus)
         
+    def _clip_params(self, params):
+        """Clip parameters to valid ranges for each nucleus type."""
+        return {
+            'rc': jnp.clip(params['rc'], self.rc_ranges[:,0], self.rc_ranges[:,1]),
+            'X4': jnp.clip(params['X4'], self.X4_range[0], self.X4_range[1])
+        }
+
     def init_params(self):
         """Initialize parameter dictionary structure."""
         # Initialize parameters for each unique nuclear type
         params = {
-            'rc': jnp.array([1.0/float(Z) for Z in self.unique_Z]),  # Use unique_Z array
-            'X4': jnp.zeros(self.n_types),  # Only store X4 (phi_0) values
+            'rc': jnp.array([1.0/float(Z) for Z in self.unique_Z]), 
+            'X4': jnp.zeros(self.n_types),
         }
         
         # Initialize X4 and compute alpha coefficients for each nucleus type
@@ -146,7 +163,7 @@ class NuclearCusp(Jastrow):
         # Update all alpha coefficients
         #self._update_alpha_coeffs(params)
         self._validate_params(params)
-        return params
+        return self._clip_params(params)
     
     def _validate_params(self, params):
         """Validate parameter shapes."""
@@ -203,6 +220,9 @@ class NuclearCusp(Jastrow):
     @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
         """Compute nuclear cusp correction for a single electron."""
+        # Clip parameters before use
+        params = self._clip_params(params)
+
         # Compute polynomial coefficients from current params
         poly_coeffs = jnp.zeros((self.n_types, 5))
         for Z_idx, Z in enumerate(self.unique_Z):
