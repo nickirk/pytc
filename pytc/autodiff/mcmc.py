@@ -9,11 +9,11 @@ import kfac_jax
 import time
 from jax import random, value_and_grad
 from jax.lax import stop_gradient
-from typing import Dict, Optional
+from typing import Dict, Any, Optional
 
 from pytc.autodiff.mcmc_utils import (
     prepare_sampling_results, report_progress, create_optimizer,
-    init_electron_configs, create_gradient_mask, apply_gradient_mask
+    init_electron_configs, create_gradient_mask
 )
 
 
