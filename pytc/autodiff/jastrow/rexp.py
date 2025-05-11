@@ -2,6 +2,18 @@ from pytc.autodiff import jastrow
 import jax.numpy as jnp
 
 class REXP(jastrow.Jastrow):
+    """
+    A class representing a radial exponential (REXP) Jastrow factor.
+    
+    Parameters
+    ----------
+    name : str, optional
+        An optional name for the Jastrow factor. This can be used to identify
+        or label the instance. Defaults to None.
+    epsilon : float, optional
+        A small positive value added to norms to prevent division by zero
+        or other numerical instabilities. Defaults to 1e-8.
+    """
     def __init__(self, name=None, epsilon=1e-8):
         super().__init__(name=name)
         self.epsilon = epsilon
