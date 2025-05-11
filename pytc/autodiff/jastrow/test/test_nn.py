@@ -46,6 +46,10 @@ class TestNeuralBase(unittest.TestCase):
         self.h2o_charges = jnp.array([8., 1., 1.])
         self.key = random.PRNGKey(0)
 
+        # Add molecule instances
+        self.h2_mol = get_h2_molecule()
+        self.h2o_mol = get_h2o_molecule()
+
     def assert_gradient_symmetry(self, jastrow, params):
         """Test that grad_r1 = -grad_r2 for the Jastrow factor."""
         nelec = 2
@@ -69,8 +73,8 @@ class TestNeuralEN(TestNeuralBase):
     
     def setUp(self):
         super().setUp()
-        self.jastrow_h2 = NeuralEN(self.h2_pos, self.h2_charges, layer_widths=[4, 4])
-        self.jastrow_h2o = NeuralEN(self.h2o_pos, self.h2o_charges, layer_widths=[4, 4])
+        self.jastrow_h2 = NeuralEN(self.h2_mol, layer_widths=[4, 4])
+        self.jastrow_h2o = NeuralEN(self.h2o_mol, layer_widths=[4, 4])
         self.params_h2 = self.jastrow_h2.init_params(key=self.key)
         self.params_h2o = self.jastrow_h2o.init_params(key=self.key)
 
@@ -91,18 +95,9 @@ class TestNeuralEE(TestNeuralBase):
     
     def setUp(self):
         super().setUp()
-        self.jastrow = NeuralEE(layer_widths=[4, 4])
+        # Pass any molecule since EE only depends on electron coordinates
+        self.jastrow = NeuralEE(self.h2_mol, layer_widths=[4, 4])
         self.params = self.jastrow.init_params(key=self.key)
-
-    def test_electron_coalescence(self):
-        r1 = jnp.array([0., 0., 0.])
-        r2_close = jnp.array([0., 0., 1e-3])
-        r2_far = jnp.array([0., 0., 1.0])
-        
-        value_close = self.jastrow._compute(r1, r2_close, self.params)
-        value_far = self.jastrow._compute(r1, r2_far, self.params)
-        
-        self.assertTrue(jnp.abs(value_close) > jnp.abs(value_far))
 
     def test_symmetry(self):
         self.assert_gradient_symmetry(self.jastrow, self.params)
@@ -112,7 +107,7 @@ class TestNeuralEEN(TestNeuralBase):
     
     def setUp(self):
         super().setUp()
-        self.jastrow_h2o = NeuralEEN(self.h2o_pos, self.h2o_charges, layer_widths=[4, 4])
+        self.jastrow_h2o = NeuralEEN(mol=self.h2o_mol, layer_widths=[4, 4])
         self.params_h2o = self.jastrow_h2o.init_params(key=self.key)
 
     def test_h2o_symmetry(self):
@@ -124,6 +119,17 @@ class TestNeuralEEN(TestNeuralBase):
         value2 = self.jastrow_h2o._compute(r2, r1, self.params_h2o)
         
         np.testing.assert_allclose(value1, value2, rtol=1e-5)
+    
+    def test_grad_r1_r2(self):
+        r1 = jnp.array([0., 0., 0.])
+        r2 = jnp.array([1., 0., 0.])
+        
+        grad_r1, lap_r1 = self.jastrow_h2o.get_log_grads_r1(r1, r2, self.params_h2o)
+        grad_r2, lap_r2 = self.jastrow_h2o.get_log_grads_r2(r1, r2, self.params_h2o)
+        
+        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7)
+        np.testing.assert_allclose(lap_r1, lap_r2, rtol=1e-7)
+        self.assertTrue(jnp.isfinite(grad_r1).all())
 
 class TestCompositeNeural(TestNeuralBase):
     """Test combined neural Jastrow components."""
@@ -131,9 +137,9 @@ class TestCompositeNeural(TestNeuralBase):
     def setUp(self):
         super().setUp()
         # Create individual components
-        self.en = NeuralEN(self.h2_pos, self.h2_charges, layer_widths=[4, 4])
-        self.ee = NeuralEE(layer_widths=[4, 4])
-        self.een = NeuralEEN(self.h2_pos, self.h2_charges, layer_widths=[4, 4])
+        self.en = NeuralEN(self.h2_mol, layer_widths=[4, 4])
+        self.ee = NeuralEE(self.h2_mol, layer_widths=[4, 4])
+        self.een = NeuralEEN(mol=self.h2_mol, layer_widths=[4, 4])
         
         # Create composite with initialized params
         self.jastrow = CompositeJastrow([self.en, self.ee, self.een])

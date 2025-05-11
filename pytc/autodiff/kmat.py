@@ -27,7 +27,7 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, jastrow_params, grid_p
         
         @partial(jax.vmap, in_axes=(0, None))
         def get_grads(r1, r2):
-            return jastrow_factor.grad_r(r1, r2, jastrow_params)  # Added params argument
+            return jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]  # Added params argument
         
         u_grad_batch = jax.vmap(get_grads, in_axes=(None, 0))(grid_points, batch_points)
         
@@ -61,7 +61,7 @@ def calc_K3(rho_paired, jastrow_factor, jastrow_params, grid_points, weights, ba
         
         @partial(jax.vmap, in_axes=(0, None))
         def get_grads(r1, r2):
-            return jastrow_factor.grad_r(r1, r2, jastrow_params)  # Added params argument
+            return jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]  # Added params argument
         
         u_grad_batch = jax.vmap(get_grads, in_axes=(None, 0))(grid_points, batch_points)
         u_grad_squared = jnp.sum(u_grad_batch**2, axis=-1)
