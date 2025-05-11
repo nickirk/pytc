@@ -1,4 +1,5 @@
 import numpy as np
+import scipy
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -8,6 +9,7 @@ from pyscf.dft import numint
 
 einsum = partial(np.einsum, optimize=True)
 
+@partial(jax.jit, static_argnums=(0,))
 def value(det, coords):
     """JAX-compatible wrapper for SlaterDet.value()
     
@@ -25,6 +27,7 @@ def value(det, coords):
     result_shape = jax.ShapeDtypeStruct((coords.shape[0],), jnp.float64)
     return jax.pure_callback(value_callback, result_shape, coords)
 
+@partial(jax.jit, static_argnums=(0,))
 def grad(det, coords):
     """JAX-compatible wrapper for SlaterDet.grad()
     
@@ -37,15 +40,21 @@ def grad(det, coords):
         ((n_walkers, n_alpha, n_alpha, 3), (n_walkers, n_beta, n_beta, 3))
     """
     def grad_callback(coords_np):
-        # Call SlaterDet method directly - it handles batching
-        grad_up, grad_down = det.grad(np.array(coords_np))
-        return (np.asarray(grad_up), np.asarray(grad_down))
+        matrix_out, grad_out = det.grad(np.array(coords_np))
+        return (np.asarray(matrix_out[0]), np.asarray(matrix_out[1]),
+                np.asarray(grad_out[0]), np.asarray(grad_out[1]))
     
-    up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha, 3), jnp.float64)
-    down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta, 3), jnp.float64)
+    matrix_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
+    matrix_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
+    grad_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha, 3), jnp.float64)
+    grad_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta, 3), jnp.float64)
     
-    return jax.pure_callback(grad_callback, (up_shape, down_shape), coords)
+    return jax.pure_callback(grad_callback, 
+                           (matrix_up_shape, matrix_down_shape, 
+                            grad_up_shape, grad_down_shape), 
+                           coords)
 
+@partial(jax.jit, static_argnums=(0,))
 def laplacian(det, coords):
     """JAX-compatible wrapper for SlaterDet.laplacian()
     
@@ -58,15 +67,25 @@ def laplacian(det, coords):
         ((n_walkers, n_alpha, n_alpha), (n_walkers, n_beta, n_beta))
     """
     def laplacian_callback(coords_np):
-        # Call SlaterDet method directly - it handles batching
-        lap_up, lap_down = det.laplacian(np.array(coords_np))
-        return (np.asarray(lap_up), np.asarray(lap_down))
+        matrix_out, grad_out, lap_out = det.laplacian(np.array(coords_np))
+        return (np.asarray(matrix_out[0]), np.asarray(matrix_out[1]),
+                np.asarray(grad_out[0]), np.asarray(grad_out[1]),
+                np.asarray(lap_out[0]), np.asarray(lap_out[1]))
     
-    up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
-    down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
+    matrix_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
+    matrix_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
+    grad_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha, 3), jnp.float64)
+    grad_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta, 3), jnp.float64)
+    lap_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
+    lap_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
     
-    return jax.pure_callback(laplacian_callback, (up_shape, down_shape), coords)
+    return jax.pure_callback(laplacian_callback,
+                           (matrix_up_shape, matrix_down_shape,
+                            grad_up_shape, grad_down_shape,
+                            lap_up_shape, lap_down_shape),
+                           coords)
 
+@partial(jax.jit, static_argnums=(0,))
 def matrix(det, coords):
     """JAX-compatible wrapper for SlaterDet.matrix()
     
@@ -176,7 +195,57 @@ class SlaterDet:
         self.det_down = None
         self.last_positions = None
     
-    def __call__(self, coords):
+        # Add cache attributes
+        self._cached_hash = None
+        self._cached_matrix = None
+        self._cached_grad = None
+        self._cached_laplacian = None
+        self._cached_value = None
+
+    def _hash_coords(self, coords):
+        """Hash coordinates for cache comparison.
+        
+        Args:
+            coords: Array of shape (n_electrons, 3) or (n_walkers, n_electrons, 3)
+            
+        Returns:
+            int: Hash of the coordinates
+        """
+        return hash(np.asarray(coords).tobytes())
+        #return np.sum(np.asarray(coords))
+
+    def _check_cache(self, coords, cache_type):
+        """Check if cache needs to be updated.
+        
+        Args:
+            coords: Array of coordinates
+            cache_type: String indicating which cache to check ('matrix', 'grad', 'laplacian', 'value')
+            
+        Returns:
+            bool: True if cache needs to be updated
+        """
+        coords_hash = self._hash_coords(coords)
+        needs_update = (coords_hash != self._cached_hash)
+        
+        if needs_update:
+            # Clear all caches if coords change
+            self._cached_hash = coords_hash
+            self._cached_matrix = None
+            self._cached_grad = None
+            self._cached_laplacian = None
+            self._cached_value = None
+        
+        # Also return True if requested cache is empty
+        if cache_type == 'matrix':
+            return needs_update or self._cached_matrix is None
+        elif cache_type == 'grad':
+            return needs_update or self._cached_grad is None
+        elif cache_type == 'laplacian':
+            return needs_update or self._cached_laplacian is None
+        else:  # value
+            return needs_update or self._cached_value is None
+
+    def __call__(self, coords, params=None):
         """
         Convenience method to call value on a set of coordinates.
     
@@ -206,115 +275,28 @@ class SlaterDet:
         # For now, just return value and None for gradient
         return self.value(coords), None
 
-    def grad(self, coords):
-        """Compute the gradient of the Slater determinant.
+    def ao2mo(self, ao_vals, mo_coeff_alpha, mo_coeff_beta, n_walkers, n_electrons):
+        """Transform AO values to MO basis for both spins.
         
         Args:
-            coords: (n_up + n_down, 3) electron positions
-                  or (n_walkers, n_up + n_down, 3) for batched evaluation
-                  
+            ao_vals: Array of AO values
+            mo_coeff_alpha/beta: MO coefficients for each spin
+            n_walkers: Number of walkers
+            n_electrons: Total number of electrons
+            
         Returns:
-            tuple: (grad_up, grad_down)
-                 If input is batched, returns arrays of shape:
-                 (n_walkers, n_up, n_up, 3), (n_walkers, n_down, n_down, 3)
+            Tuple of (alpha_vals, beta_vals) in MO basis
         """
-        coords_batch, is_single = self._ensure_batch(coords)
-        n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
-        
-        # Reshape to (n_walkers * n_electrons, 3) for eval_ao
-        flat_coords = coords_batch.reshape(-1, 3)
-        
-        # Call eval_ao once for all walkers/electrons
-        ao_vals_deriv = numint.eval_ao(self.mol, flat_coords, deriv=1)
-        ao_vals = ao_vals_deriv[0]
-        ao_grads = ao_vals_deriv[1:].transpose(1, 2, 0)  # Reshape to (n_walkers*n_electrons, nAOs, 3)
-        
-        
         if not self.unrestricted:
-            grad_batch = np.zeros((n_walkers, self.n_electrons, self.mo_coeff_alpha_occ.shape[-1], 3))
+            mo_vals = np.dot(ao_vals, mo_coeff_alpha).reshape(n_walkers, n_electrons, -1)
+            return (mo_vals[:, :self.n_alpha, :self.n_alpha], 
+                    mo_vals[:, self.n_alpha:, :self.n_beta])
+        else:
+            ao_up = ao_vals.reshape(n_walkers, n_electrons, -1)[:, :self.n_alpha].reshape(-1, ao_vals.shape[-1])
+            ao_down = ao_vals.reshape(n_walkers, n_electrons, -1)[:, self.n_alpha:].reshape(-1, ao_vals.shape[-1])
+            return (np.dot(ao_up, mo_coeff_alpha).reshape(n_walkers, self.n_alpha, self.n_alpha),
+                    np.dot(ao_down, mo_coeff_beta).reshape(n_walkers, self.n_beta, self.n_beta))
 
-            # Vectorized computation for gradients in each direction
-            for d in range(3):
-                # Batch matrix multiplication using einsum
-                # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
-                grad_batch[..., d] = np.dot(ao_grads[..., d], self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_electrons, -1)
-            
-            grad_up_batch = grad_batch[:, :self.n_alpha, :self.n_alpha]
-            grad_down_batch = grad_batch[:, self.n_alpha:, :self.n_beta]
-            
-        else:
-            # Reshape back to batch form
-            ao_vals = ao_vals.reshape(n_walkers, n_electrons, -1)
-            ao_grads = ao_grads.reshape(n_walkers, n_electrons, -1, 3)
-            # Split by spin
-            ao_grads_up = ao_grads[:, :self.n_alpha]      # shape (n_walkers, n_up, nAOs, 3)
-            ao_grads_down = ao_grads[:, self.n_alpha:]    # shape (n_walkers, n_down, nAOs, 3)
-        
-            # Initialize output arrays
-            grad_up_batch = np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3))
-            grad_down_batch = np.zeros((n_walkers, self.n_beta, self.n_beta, 3))
-        
-            # Vectorized computation for gradients in each direction
-            for d in range(3):
-                # Batch matrix multiplication using einsum
-                # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
-                grad_up_batch[..., d] = einsum('wij,jk->wik', ao_grads_up[..., d], self.mo_coeff_alpha_occ)
-                grad_down_batch[..., d] = einsum('wij,jk->wik', ao_grads_down[..., d], self.mo_coeff_beta_occ)
-        
-        #grad_up_batch = einsum('wijc,jk->wikc', ao_grads_up, self.mo_coeff_alpha_occ)
-        #grad_down_batch = einsum('wijc,jk->wikc', ao_grads_down, self.mo_coeff_beta_occ)
-                
-        # Return single matrices if input was single walker
-        if is_single:
-            return grad_up_batch[0], grad_down_batch[0]
-        else:
-            return grad_up_batch, grad_down_batch
-    
-    def laplacian(self, coords):
-        """Compute the Laplacian of the Slater determinant.
-        
-        Args:
-            coords: (n_up + n_down, 3) electron positions
-                  or (n_walkers, n_up + n_down, 3) for batched evaluation
-                  
-        Returns:
-            tuple: (lap_up, lap_down)
-                 If input is batched, returns arrays of shape:
-                 (n_walkers, n_up, n_up), (n_walkers, n_down, n_down)
-        """
-        coords_batch, is_single = self._ensure_batch(coords)
-        n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
-        
-        # Reshape to (n_walkers * n_electrons, 3) for eval_ao
-        flat_coords = coords_batch.reshape(-1, 3)
-        
-        # Call eval_ao once for all walkers/electrons
-        # deriv=2 returns (10, N, nAOs) array with ao values, first, second derivatives
-        # val, x, y, z, xx, xy, xz, yy, yz, zz
-        ao_vals_deriv = numint.eval_ao(self.mol, flat_coords, deriv=2)
-        
-        ao_lapls = ao_vals_deriv[[4, 7, 9]].sum(axis=0)  # Sum only diagonal terms for Laplacian
-        
-        # Reshape back to batch form
-        ao_lapls = ao_lapls.reshape(n_walkers, n_electrons, -1)
-        
-        # Split by spin
-        ao_lapls_up = ao_lapls[:, :self.n_alpha].reshape(-1, ao_lapls.shape[-1])      # shape (n_walkers * n_up, nAOs)
-        ao_lapls_down = ao_lapls[:, self.n_alpha:].reshape(-1, ao_lapls.shape[-1])    # shape (n_walkers * n_down, nAOs)
-        
-        # Vectorized matrix multiplication for all walkers
-        # 'wij,jk->wik': w=walker index, i=electron index, j=AO index, k=orbital index
-        #lap_up_batch = einsum('wij,jk->wik', ao_lapls_up, self.mo_coeff_alpha_occ)
-        #lap_down_batch = einsum('wij,jk->wik', ao_lapls_down, self.mo_coeff_beta_occ)
-        lap_up_batch = np.dot(ao_lapls_up, self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_alpha, self.n_alpha)
-        lap_down_batch = np.dot(ao_lapls_down, self.mo_coeff_beta_occ).reshape(n_walkers, self.n_beta, self.n_beta)
-                
-        # Return single matrices if input was single walker
-        if is_single:
-            return lap_up_batch[0], lap_down_batch[0]
-        else:
-            return lap_up_batch, lap_down_batch
-    
     def matrix(self, coords):
         """
         Build the alpha/beta Slater matrices for all electrons given coords.
@@ -328,6 +310,9 @@ class SlaterDet:
                                   If input is batched, returns arrays of shape:
                                   (n_walkers, n_up, n_up), (n_walkers, n_down, n_down)
         """
+        if not self._check_cache(coords, 'matrix'):
+            return self._cached_matrix
+            
         coords_batch, is_single = self._ensure_batch(coords)
         n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
         
@@ -358,12 +343,119 @@ class SlaterDet:
             slater_up_batch = np.dot(ao_up, self.mo_coeff_alpha_occ).reshape(n_walkers, self.n_alpha, self.n_alpha)
             slater_down_batch = np.dot(ao_down, self.mo_coeff_beta_occ).reshape(n_walkers, self.n_beta, self.n_beta)
         
+        # Cache result before returning
+        self._cached_matrix = (slater_up_batch, slater_down_batch)
         # Return single matrices if input was single walker
         if is_single:
             return slater_up_batch[0], slater_down_batch[0]
         else:
             return slater_up_batch, slater_down_batch
-    
+
+    def grad(self, coords):
+        """Compute the gradient and matrix of the Slater determinant.
+        
+        Args:
+            coords: (n_up + n_down, 3) electron positions
+                  or (n_walkers, n_up + n_down, 3) for batched evaluation
+                  
+        Returns:
+            tuple: ((matrix_up, matrix_down), (grad_up, grad_down))
+                 If input is batched:
+                 matrix_up/down: (n_walkers, n_up/down, n_up/down)
+                 grad_up/down: (n_walkers, n_up/down, n_up/down, 3)
+        """
+        if not self._check_cache(coords, 'grad'):
+            return self._cached_grad
+            
+        coords_batch, is_single = self._ensure_batch(coords)
+        n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
+        
+        flat_coords = coords_batch.reshape(-1, 3)
+        ao_vals_deriv = numint.eval_ao(self.mol, flat_coords, deriv=1)
+        
+        # Get matrices
+        matrix_up, matrix_down = self.ao2mo(ao_vals_deriv[0], 
+                                          self.mo_coeff_alpha_occ,
+                                          self.mo_coeff_beta_occ,
+                                          n_walkers, n_electrons)
+        
+        # Get gradients
+        ao_grads = ao_vals_deriv[1:].transpose(1, 2, 0)
+        grad_up_batch = np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3))
+        grad_down_batch = np.zeros((n_walkers, self.n_beta, self.n_beta, 3))
+        
+        for d in range(3):
+            grad_up, grad_down = self.ao2mo(ao_grads[..., d],
+                                          self.mo_coeff_alpha_occ,
+                                          self.mo_coeff_beta_occ,
+                                          n_walkers, n_electrons)
+            grad_up_batch[..., d] = grad_up
+            grad_down_batch[..., d] = grad_down
+        
+        # Cache result before returning
+        result = ((matrix_up, matrix_down), (grad_up_batch, grad_down_batch))
+        self._cached_grad = result
+        if is_single:
+            return ((matrix_up[0], matrix_down[0]), 
+                    (grad_up_batch[0], grad_down_batch[0]))
+        return result
+
+    def laplacian(self, coords):
+        """Compute laplacian, gradient and matrix of the Slater determinant.
+        
+        Args:
+            coords: (n_up + n_down, 3) electron positions
+                  or (n_walkers, n_up + n_down, 3) for batched evaluation
+                  
+        Returns:
+            tuple: ((matrix_up, matrix_down), 
+                    (grad_up, grad_down),
+                    (lap_up, lap_down))
+        """
+        if not self._check_cache(coords, 'laplacian'):
+            return self._cached_laplacian
+            
+        coords_batch, is_single = self._ensure_batch(coords)
+        n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
+        
+        flat_coords = coords_batch.reshape(-1, 3)
+        ao_vals_deriv = numint.eval_ao(self.mol, flat_coords, deriv=2)
+        
+        # Get matrices
+        matrix_up, matrix_down = self.ao2mo(ao_vals_deriv[0],
+                                          self.mo_coeff_alpha_occ,
+                                          self.mo_coeff_beta_occ,
+                                          n_walkers, n_electrons)
+        
+        # Get gradients
+        ao_grads = ao_vals_deriv[1:4].transpose(1, 2, 0)
+        grad_up_batch = np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3))
+        grad_down_batch = np.zeros((n_walkers, self.n_beta, self.n_beta, 3))
+        
+        for d in range(3):
+            grad_up, grad_down = self.ao2mo(ao_grads[..., d],
+                                          self.mo_coeff_alpha_occ,
+                                          self.mo_coeff_beta_occ,
+                                          n_walkers, n_electrons)
+            grad_up_batch[..., d] = grad_up
+            grad_down_batch[..., d] = grad_down
+        
+        # Get laplacians (sum of diagonal terms)
+        ao_lapls = ao_vals_deriv[[4, 7, 9]].sum(axis=0)
+        lap_up, lap_down = self.ao2mo(ao_lapls,
+                                    self.mo_coeff_alpha_occ,
+                                    self.mo_coeff_beta_occ,
+                                    n_walkers, n_electrons)
+        
+        # Cache result before returning
+        result = ((matrix_up, matrix_down), (grad_up_batch, grad_down_batch), (lap_up, lap_down))
+        self._cached_laplacian = result
+        if is_single:
+            return ((matrix_up[0], matrix_down[0]),
+                    (grad_up_batch[0], grad_down_batch[0]),
+                    (lap_up[0], lap_down[0]))
+        return result
+
     def value(self, coords):
         """
         Full evaluation of the Slater determinant for the entire electron configuration.
@@ -376,6 +468,9 @@ class SlaterDet:
             float or array: determinant product(s)
                           If input is batched, returns array of shape (n_walkers,)
         """
+        if not self._check_cache(coords, 'value'):
+            return self._cached_value
+            
         coords_batch, is_single = self._ensure_batch(coords)
         
         # Get Slater matrices for all walkers
@@ -383,23 +478,22 @@ class SlaterDet:
         
         # Compute determinants
         if is_single:
-            det_up = np.linalg.det(slater_up_batch)
-            det_down = np.linalg.det(slater_down_batch)
+            det_up = scipy.linalg.det(slater_up_batch)
+            det_down = scipy.linalg.det(slater_down_batch)
             return det_up * det_down
         else:
-            # Compute determinants for each walker
-            n_walkers = coords_batch.shape[0]
-            
             # NumPy can compute determinants of batched matrices using a list comprehension
             # but we'll avoid loops by using built-in vectorization
             # Use optimized batched determinant calculation
-            det_up_batch = np.linalg.det(slater_up_batch)
-            det_down_batch = np.linalg.det(slater_down_batch)
+            det_up_batch = scipy.linalg.det(slater_up_batch)
+            det_down_batch = scipy.linalg.det(slater_down_batch)
             
             # Multiply the determinants
             values = det_up_batch * det_down_batch
-            return values
-    
+            # Cache result before returning
+            self._cached_value = values
+            return values if not is_single else (det_up * det_down)
+
     def init_inverse(self, coords):
         """
         Compute and store the inverse Slater matrices for the current coords,

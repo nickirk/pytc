@@ -47,9 +47,11 @@ class SlaterJastrow:
     def ion_ion_potential(self):
         """Return the ion-ion potential energy (nuclear-nuclear repulsion)."""
         return self._ion_ion_potential
-   
-    def __call__(self, elec_coords_batch, jastrow_params, linear_coeffs):
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def __call__(self, elec_coords_batch, params):
         """Evaluate wavefunction with explicit parameters."""
+        jastrow_params, linear_coeffs = params
         jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(elec_coords_batch)
         
         det_vals = []
@@ -80,25 +82,36 @@ class SlaterJastrow:
         """Return the number of electrons."""
         return self.dets[0].n_electrons
 
-
     @partial(jax.jit, static_argnums=(0,))
     def _compute_jastrow_terms(self, elec_coords, jastrow_params):
         """Compute ∇J/J and ∇²J/J with explicit parameters."""
         n_electrons = elec_coords.shape[0]
         
-        vmap_grads = jax.vmap(
-            lambda r1, r2: self.jastrow.get_log_grads(r1, r2, jastrow_params),
+        vmap_grads_r1 = jax.vmap(
+            lambda r1, r2: self.jastrow.get_log_grads_r1(r1, r2, jastrow_params),
             in_axes=(None, 0)
         )
-        vmap_all_grads = jax.vmap(vmap_grads, in_axes=(0, None))
+        vmap_all_grads_r1 = jax.vmap(vmap_grads_r1, in_axes=(0, None))
         
-        all_grads, all_laps = vmap_all_grads(elec_coords, elec_coords)
+        all_grads_r1, all_laps_r1 = vmap_all_grads_r1(elec_coords, elec_coords)
+
+        vmap_grads_r2 = jax.vmap(
+            lambda r1, r2: self.jastrow.get_log_grads_r2(r1, r2, jastrow_params),
+            in_axes=(None, 0)
+        )
+        vmap_all_grads_r2 = jax.vmap(vmap_grads_r2, in_axes=(0, None))
+        
+        all_grads_r2, all_laps_r2 = vmap_all_grads_r2(elec_coords, elec_coords)
         
         diag_mask = 1.0 - jnp.eye(n_electrons)
         diag_mask_3d = diag_mask[..., None]
         
-        grad_J_over_J = jnp.sum(all_grads * diag_mask_3d, axis=1)
-        lap_sum = jnp.sum(all_laps * diag_mask, axis=1)
+        grad_J_over_J = jnp.sum(all_grads_r1 * diag_mask_3d, axis=1)
+        grad_J_over_J += jnp.sum(all_grads_r2 * diag_mask_3d, axis=0)
+        grad_J_over_J /= 2.0
+        lap_sum = jnp.sum(all_laps_r1 * diag_mask, axis=1)
+        lap_sum += jnp.sum(all_laps_r2 * diag_mask, axis=0)
+        lap_sum /= 2.0
         grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
         lap_J_over_J = lap_sum + grad_squared
         
@@ -182,30 +195,30 @@ class SlaterJastrow:
         """Number of beta-spin electrons."""
         return self.n_electrons - self.n_alpha
     
-    def local_energy(self, elec_coords_batch, jastrow_params, linear_coeffs):
+    @partial(jax.jit, static_argnums=(0,))
+    def local_energy(self, elec_coords_batch, params):
         """Compute local energy for a batch of electron configurations.
         
         Args:
             elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
                             or (n_electrons, 3) for a single walker
-            jastrow_params: Jastrow parameters
-            linear_coeffs: Linear coefficients for determinants
+            params: Tuple of parameters (jastrow_params, linear_coeffs)
                             
         Returns:
             Array of local energy values with shape (n_walkers,)
             or a single value for a single walker
         """
-        import psutil
-        
-        
+        jastrow_params, linear_coeffs = params
         # Use vmap to compute Jastrow terms for all walkers
         grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(lambda x: self._compute_jastrow_terms(x, jastrow_params))(elec_coords_batch)
         
         # Get batched matrices, gradients, and laplacians using JAX wrappers
         det = self.dets[0]  # Using the first determinant (assuming single-determinant for now)
-        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords_batch)
-        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords_batch)
-        lap_alpha_batch, lap_beta_batch = laplacian(det, elec_coords_batch)
+
+        laps = laplacian(det, elec_coords_batch)
+        slater_alpha_batch, slater_beta_batch = laps[0], laps[1]
+        grad_alpha_batch, grad_beta_batch = laps[2], laps[3]
+        lap_alpha_batch, lap_beta_batch = laps[4], laps[5]
 
         energies = jax.vmap(self._compute_single_walker_energy)(
             elec_coords_batch, grad_J_over_J_batch, lap_J_over_J_batch,
@@ -258,30 +271,28 @@ class SlaterJastrow:
         
         return jnp.real(E_L)  # Ensure real value
 
-    def quantum_force(self, elec_coords, jastrow_params, linear_coeffs, cutoff=1.0):
+    @partial(jax.jit, static_argnums=(0,))
+    def quantum_force(self, elec_coords, params, cutoff=1.0):
         """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
         
         Args:
             elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
                            or (n_electrons, 3) for a single walker
-            jastrow_params: Jastrow parameters
-            linear_coeffs: Linear coefficients for determinants
+            params: Tuple of parameters (jastrow_params, linear_coeffs)
             cutoff: Maximum allowed magnitude for quantum forces
                            
         Returns:
             Array of quantum forces with shape (n_walkers, n_electrons, 3)
             or shape (n_electrons, 3) for a single walker
         """
-        # Handle single walker case by adding a batch dimension
-        
-        
+        jastrow_params, linear_coeffs = params 
         # Compute Jastrow gradient contributions
         grad_J_over_J_batch = jax.vmap(lambda coords: self._compute_jastrow_terms(coords, jastrow_params)[0])(elec_coords)
         
         # Get determinant gradient contributions using JAX wrappers
         det = self.dets[0]  # Using the first determinant
-        slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords)
-        grad_alpha_batch, grad_beta_batch = grad(det, elec_coords)
+        # slater_alpha_batch, slater_beta_batch = matrix(det, elec_coords)
+        slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch = grad(det, elec_coords)
         
         # Build quantum forces with vmap
         forces = jax.vmap(self._compute_quantum_force)(

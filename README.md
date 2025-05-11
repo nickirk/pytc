@@ -8,6 +8,7 @@
 - jax (autodiff and GPU acceleration)
 - flax (neural network)
 - optax (machine learning optimizers)
+- flax (neural networks)
 - tqdm (visual progress tracking)
 - pyscf (![modified version](https://github.com/nickirk/pyscf/tree/tc-ccsd) for tc-ccsd only. Otherwise, official pyscf also works)
 

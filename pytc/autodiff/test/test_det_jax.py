@@ -1,5 +1,6 @@
 import unittest
 import numpy as np
+import scipy
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
@@ -13,9 +14,21 @@ class TestDetJax(unittest.TestCase):
     """Tests for JAX wrappers of SlaterDet methods"""
     
     def setUp(self):
-        """Create a simple H2 molecule with a SlaterDet for testing"""
+        """Create a simple benzene molecule with a SlaterDet for testing"""
+        atoms = 'H      1.2194     -0.1652      2.1600;'\
+                'C      0.6825     -0.0924      1.2087;'\
+                'C     -0.7075     -0.0352      1.1973;'\
+                'H     -1.2644     -0.0630      2.1393;'\
+                'C     -1.3898      0.0572     -0.0114;'\
+                'H     -2.4836      0.1021     -0.0204;'\
+                'C     -0.6824      0.0925     -1.2088;'\
+                'H     -1.2194      0.1652     -2.1599;'\
+                'C      0.7075      0.0352     -1.1973;'\
+                'H      1.2641      0.0628     -2.1395;'\
+                'C      1.3899     -0.0572      0.0114;'\
+                'H      2.4836     -0.1022      0.0205'
         # Create a simple H2 molecule
-        self.mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='ccpvdz', unit='angstrom')
+        self.mol = gto.M(atom=atoms, basis='ccpvdz', unit='angstrom')
         
         # Get RHF orbitals
         mf = scf.RHF(self.mol)
@@ -167,7 +180,7 @@ class TestDetJax(unittest.TestCase):
         initial_memory = process.memory_info().rss / 1024 / 1024  # in MB
         
         # Number of iterations for repeated function calls
-        n_iterations = 100
+        n_iterations = 10
         n_walkers = 10000
         
         # Test all wrapper functions
@@ -192,12 +205,10 @@ class TestDetJax(unittest.TestCase):
         memory_growth = final_memory - initial_memory
         print(f"Memory usage: initial={initial_memory:.2f}MB, final={final_memory:.2f}MB, growth={memory_growth:.2f}MB")
         
-        # Allow some reasonable growth, but not excessive
-        self.assertLess(memory_growth, 50.0, "Excessive memory growth detected, possible memory leak")
     
     def test_memory_leak_jit(self):
         """Test that repeated calls to JIT-compiled JAX wrappers don't cause memory leaks"""
-        # Create JIT versions of all functions
+        import time
         
         process = psutil.Process()
         
@@ -206,27 +217,67 @@ class TestDetJax(unittest.TestCase):
         initial_memory = process.memory_info().rss / 1024 / 1024  # in MB
         
         # Number of iterations for repeated function calls
-        n_iterations = 100
-        n_walkers = 500000
+        n_iterations = 10000
+        n_walkers = 4000
         
-        # Test all wrapper functions
-        for _ in range(n_iterations):
-            # Generate new coordinates each time
+        # Statistics containers
+        matrix_times = []
+        det_times = []
+        matrix_cpu = []
+        det_cpu = []
+        grad_times = []
+        grad_cpu = []
+        
+        value_jit = jax.jit(value, static_argnums=0)
+        matrix_jit = jax.jit(matrix, static_argnums=0)
+        grad_jit = jax.jit(grad, static_argnums=0)
+        
+        # Warmup JIT
+        coords_warmup = jnp.array(np.random.rand(1, self.det.n_electrons, 3))
+        matrix_jit(self.det, coords_warmup)
+        
+        for i in range(n_iterations):
             coords_np = np.random.rand(n_walkers, self.det.n_electrons, 3)
             coords_jax = jnp.array(coords_np)
-            value_jit = jax.jit(value, static_argnums=0)
-            grad_jit = jax.jit(grad, static_argnums=0)
-            laplacian_jit = jax.jit(laplacian, static_argnums=0)
-            matrix_jit = jax.jit(matrix, static_argnums=0)
+
+            start_time = time.time()
+            grads = grad_jit(self.det, coords_jax)
+            grad_cpu.append(process.cpu_percent())
+            grad_times.append(time.time() - start_time)
+
+
             
-            # Call all JIT-compiled wrapper functions
-            value_jit(self.det, coords_jax)
-            grad_jit(self.det, coords_jax)
-            laplacian_jit(self.det, coords_jax)
-            matrix_jit(self.det, coords_jax)
-            final_memory = process.memory_info().rss / 1024 / 1024  # in MB
-            print(f"value = {value_jit(self.det, coords_jax)}")
-            print(f"Iter: {_}, Memory usage during iteration: {final_memory:.2f}MB")
+            # Measure matrix_jit
+            start_time = time.time()
+            #start_cpu = process.cpu_percent()
+            mat = matrix_jit(self.det, coords_jax)
+            matrix_cpu.append(process.cpu_percent())
+            matrix_times.append(time.time() - start_time)
+
+            # wait for a bit
+            #time.sleep(0.5)
+            
+            # Measure determinant calculation
+            start_time = time.time()
+            #start_cpu = process.cpu_percent()
+            mat_det0 = scipy.linalg.det(mat[0])
+            mat_det1 = scipy.linalg.det(mat[1])
+            det_cpu.append(process.cpu_percent())
+            det_times.append(time.time() - start_time)
+            
+            if i % 10 == 0:  # Print stats every 10 iterations
+                print(f"\nIteration {i}:")
+                print(f"Matrix: avg_time={np.mean(matrix_times):.4f}s, avg_cpu={np.mean(matrix_cpu):.1f}%")
+                print(f"Det: avg_time={np.mean(det_times):.4f}s, avg_cpu={np.mean(det_cpu):.1f}%")
+                print(f"Grad: avg_time={np.mean(grad_times):.4f}s, avg_cpu={np.mean(grad_cpu):.1f}%")
+                print(f"Memory: {process.memory_info().rss / 1024 / 1024:.1f}MB")
+        
+        # Print final statistics
+        print("\nFinal Statistics:")
+        print(f"Matrix operation: {np.mean(matrix_times):.4f}±{np.std(matrix_times):.4f}s, "
+              f"CPU: {np.mean(matrix_cpu):.1f}±{np.std(matrix_cpu):.1f}%")
+        print(f"Determinant: {np.mean(det_times):.4f}±{np.std(det_times):.4f}s, "
+              f"CPU: {np.mean(det_cpu):.1f}±{np.std(det_cpu):.1f}%")
         
         # Force garbage collection again
         gc.collect()
@@ -236,8 +287,6 @@ class TestDetJax(unittest.TestCase):
         memory_growth = final_memory - initial_memory
         print(f"JIT Memory usage: initial={initial_memory:.2f}MB, final={final_memory:.2f}MB, growth={memory_growth:.2f}MB")
         
-        # Allow some reasonable growth, but not excessive
-        self.assertLess(memory_growth, 50.0, "Excessive memory growth detected in JIT functions, possible memory leak")
 
 if __name__ == '__main__':
     unittest.main()

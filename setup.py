@@ -14,6 +14,7 @@ setup(
         "unittest",
         "jax",
         "optax",
+        "kfac_jax",
         "flax",
         "tqdm",
         "pyscf",

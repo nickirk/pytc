@@ -12,9 +12,18 @@ class Jastrow(ABC):
     This aligns better with JAX's philosophy for parameter handling and computational graph tracing.
     """
     
-    def __init__(self):
-        """Initialize Jastrow factor structure."""
-        pass
+    def __init__(self, name=None):
+        """Initialize Jastrow factor.
+        
+        Args:
+            name: Optional name for parameter filtering
+        """
+        self.name = name
+        
+    def set_name(self, name):
+        """Set instance name for parameter filtering."""
+        self.name = name
+        return self
     
     @abstractmethod
     def _compute(self, r1, r2, params):
@@ -73,6 +82,7 @@ class Jastrow(ABC):
             return self._compute(x, r2, params).reshape(-1)[0]
         return jnp.trace(jax.hessian(scalar_fn)(r1))
     
+    
     def grad_params(self, r1, r2, params):
         """Compute gradient of u w.r.t parameters.
         
@@ -86,8 +96,8 @@ class Jastrow(ABC):
         """
         return jax.grad(lambda p: self._compute(r1, r2, p))(params)
     
-    def get_log_grads(self, r1, r2, params):
-        """Compute both ∇u and ∇²u for the Jastrow exponent.
+    def get_log_grads_r1(self, r1, r2, params):
+        """Compute ∇u and ∇²u w.r.t first electron coordinates.
         
         Args:
             r1: Array of shape (3,) for first electron position
@@ -96,9 +106,35 @@ class Jastrow(ABC):
             
         Returns:
             tuple (grad_u, lapl_u) containing:
-                grad_u: gradient of u, shape (3,)
-                lapl_u: laplacian of u (scalar)
+                grad_u: gradient of u w.r.t r1, shape (3,)
+                lapl_u: laplacian of u w.r.t r1 (scalar)
         """
-        grad_u = self.grad_r(r1, r2, params)
-        lapl_u = self.laplacian_r(r1, r2, params)
+        def scalar_fn(x):
+            return self._compute(x, r2, params).reshape(-1)[0]
+        grad_u = jax.grad(scalar_fn)(r1)
+        lapl_u = jnp.trace(jax.hessian(scalar_fn)(r1))
         return grad_u, lapl_u
+    
+    def get_log_grads_r2(self, r1, r2, params):
+        """Compute ∇u and ∇²u w.r.t second electron coordinates.
+        
+        Args:
+            r1: Array of shape (3,) for first electron position
+            r2: Array of shape (3,) for second electron position
+            params: Jastrow parameters
+            
+        Returns:
+            tuple (grad_u, lapl_u) containing:
+                grad_u: gradient of u w.r.t r2, shape (3,)
+                lapl_u: laplacian of u w.r.t r2 (scalar)
+        """
+        def scalar_fn(x):
+            return self._compute(r1, x, params).reshape(-1)[0]
+        grad_u = jax.grad(scalar_fn)(r2)
+        lapl_u = jnp.trace(jax.hessian(scalar_fn)(r2))
+        return grad_u, lapl_u
+    
+    @abstractmethod
+    def init_params(self, **kwargs):
+        """Initialize parameters. Subclasses should implement this."""
+        pass
