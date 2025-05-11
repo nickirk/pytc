@@ -159,29 +159,22 @@ class NeuralEEN(NeuralBase):
         }
 
     def _compute(self, r1, r2, params):
-        # Extract raw decay parameters and network variables
-        rc_ee_raw = params['rc_ee_raw']
-        rc_en_raw = params['rc_en_raw']
         net_vars = params['net_vars']
 
-        # Ensure decay parameters are positive using softplus
-        rc_ee = nn.softplus(rc_ee_raw)
-        rc_en = nn.softplus(rc_en_raw)
-
         # Calculate distances
-        r12_dist = self._safe_norm(r1 - r2)
-        r1n_dist = self._safe_norm(r1[None, :] - self.nuclear_pos)
-        r2n_dist = self._safe_norm(r2[None, :] - self.nuclear_pos)
+        r12_dist = self._safe_norm(r1 - r2)[None]  # Add singleton dimension
+        r1n_dist = self._safe_norm(r1[None, :] - self.nuclear_pos)  # Shape: (N,)
+        r2n_dist = self._safe_norm(r2[None, :] - self.nuclear_pos)  # Shape: (N,)
 
-        # Apply decay parameters
-        r12_feat = r12_dist
-        r1n_feat = r1n_dist
-        r2n_feat = r2n_dist
-        features = jnp.concatenate([
-            jnp.asarray([r12_feat]), # Ensure it's an array
-            r1n_feat,
-            r2n_feat,
-        ], axis=-1).reshape(1, -1)
+        # Create symmetric features using min/max
+        min_dist = jnp.minimum(r1n_dist, r2n_dist)
+        max_dist = jnp.maximum(r1n_dist, r2n_dist)
         
-        # Use the standard Flax variable structure directly
+        # Concatenate features with consistent dimensions
+        features = jnp.concatenate([
+            r12_dist,  # Shape: (1,)
+            min_dist,  # Shape: (N,)
+            max_dist,  # Shape: (N,)
+        ], axis=0).reshape(1, -1)
+        
         return self.net.apply(net_vars, features)[0, 0]

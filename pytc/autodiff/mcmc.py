@@ -708,7 +708,7 @@ def optimize_ref_var(
             step_time_val = time.time() - start_time # Corrected variable name
             print(f"Step: {opt_step}, Var: {float(current_batch_cost):.6f}, E_mean: {float(current_batch_ref_e):.6f}+\-{float(current_batch_std_e):.6f}, "
                   f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s, "
-                  f"rc: {float(params[0][0]['rc'][0]):.6f}, X4: {float(params[0][0]['X4'][0]):.6f}")
+                  f"atom 0: rc: {float(params[0][0]['rc'][0]):.6f}, X4: {float(params[0][0]['X4'][0]):.6f},")
 
             start_time = time.time()
 

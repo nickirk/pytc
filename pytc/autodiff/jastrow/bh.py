@@ -38,10 +38,18 @@ class BoysHandy(Jastrow):
                 BHTerm(0, 0, 3, 0.001),  
                 BHTerm(0, 0, 4, -0.001),  
                 BHTerm(2, 0, 0, 0.001),  # e-n term
+                BHTerm(3, 0, 0, 0.0001),
+                BHTerm(4, 0, 0, 0.0001),   # higher order term
                 BHTerm(2, 2, 0, -0.001),    # e-n term
                 BHTerm(2, 0, 2, 0.1),
-                BHTerm(3, 0, 0, 0.0001),
-                BHTerm(4, 0, 0, 0.0001)   # higher order term
+                BHTerm(2, 2, 2, 0.1),
+                BHTerm(4, 0, 2, 0.1),
+                BHTerm(2, 0, 4, 0.1),
+                BHTerm(4, 2, 2, 0.1),
+                BHTerm(6, 0, 2, 0.1),
+                BHTerm(4, 0, 4, 0.1),
+                BHTerm(2, 2, 4, 0.1),
+                BHTerm(2, 0, 6, 0.1),
             ]
             # Create a list of default terms for each nucleus
             self.terms_per_nucleus = [default_terms_for_one_nucleus for _ in range(self.natom)]
@@ -95,7 +103,7 @@ class BoysHandy(Jastrow):
 
         def true_fun(r1_op, r2_op, params_op):
             # Function to execute if r1 and r2 are close
-            return 0.0
+            return jnp.array([0.0])
 
         def false_fun(r1_op, r2_op, params_op):
             # Function to execute if r1 and r2 are not close (original computation)
