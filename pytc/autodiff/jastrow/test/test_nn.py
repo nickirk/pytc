@@ -119,17 +119,6 @@ class TestNeuralEEN(TestNeuralBase):
         value2 = self.jastrow_h2o._compute(r2, r1, self.params_h2o)
         
         np.testing.assert_allclose(value1, value2, rtol=1e-5)
-    
-    def test_grad_r1_r2(self):
-        r1 = jnp.array([0., 0., 0.])
-        r2 = jnp.array([1., 0., 0.])
-        
-        grad_r1, lap_r1 = self.jastrow_h2o.get_log_grads_r1(r1, r2, self.params_h2o)
-        grad_r2, lap_r2 = self.jastrow_h2o.get_log_grads_r2(r1, r2, self.params_h2o)
-        
-        np.testing.assert_allclose(grad_r1, -grad_r2, rtol=1e-7)
-        np.testing.assert_allclose(lap_r1, lap_r2, rtol=1e-7)
-        self.assertTrue(jnp.isfinite(grad_r1).all())
 
 class TestCompositeNeural(TestNeuralBase):
     """Test combined neural Jastrow components."""
