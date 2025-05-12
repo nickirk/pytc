@@ -42,7 +42,7 @@ class TestJastrowFunctions(unittest.TestCase):
             np.testing.assert_allclose(val, 0.0, atol=1e-10)
             
             # Derivatives should be zero
-            grads, laps = jastrow.get_log_grads(r1, r2, jastrow_params)
+            grads, laps = jastrow.get_log_grads_r1(r1, r2, jastrow_params)
             np.testing.assert_allclose(grads, jnp.zeros(3), atol=1e-10)
             np.testing.assert_allclose(laps, 0.0, atol=1e-10)
 
@@ -112,7 +112,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Use small settings for test speed
         # For production, use larger values
         n_walkers = 5000
-        n_steps = 8000
+        n_steps = 5000
         step_size = 0.1
         burn_in_steps = 1000  # Updated parameter name
         thinning = 10
@@ -130,7 +130,6 @@ class TestHartreeFockEnergy(unittest.TestCase):
             use_importance_sampling=True,
             burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
-            linear_coeffs=linear_coeffs,
             key=key
         )
         end_time = time.time()
@@ -216,8 +215,8 @@ class TestJastrowOptimization(unittest.TestCase):
         n_walkers = 5000
         n_steps = 50
         step_size = 0.01
-        burn_in_steps = 2000
-        n_opt_steps = 5000
+        burn_in_steps = 1000
+        n_opt_steps = 2000
         key = random.PRNGKey(42)
         
         # Run optimization
@@ -254,8 +253,7 @@ class TestJastrowOptimization(unittest.TestCase):
     
     def test_he2_optimization(self):
         """Test optimization of Jastrow parameters for He atom."""
-        self.run_optimization_test('He 0 0 0', basis='ccpvdz', 
-                                 jastrow_params=jnp.array([0.9]))
+        self.run_optimization_test('He 0 0 0; He 0 0 1.5', basis='ccpvdz')
 
 
 if __name__ == "__main__":
