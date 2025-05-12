@@ -101,49 +101,36 @@ class BoysHandy(Jastrow):
     def _compute(self, r1, r2, params):
         """Compute Boys-Handy Jastrow exponent."""
 
-        def true_fun(r1_op, r2_op, params_op):
-            # Function to execute if r1 and r2 are close
-            return jnp.array([0.0])
+        # Function to execute if r1 and r2 are not close (original computation)
+        # Get positive b and d values using softplus
+        b = nn.softplus(params['b_raw'])
+        d = nn.softplus(params['d_raw'])
+        c = params['c_raw']  # Allow c to be both positive and negative
 
-        def false_fun(r1_op, r2_op, params_op):
-            # Function to execute if r1 and r2 are not close (original computation)
-            # Get positive b and d values using softplus
-            b = nn.softplus(params_op['b_raw'])
-            d = nn.softplus(params_op['d_raw'])
-            c = params_op['c_raw']  # Allow c to be both positive and negative
+        u_total = 0.0
 
-            u_total = 0.0
+        # Loop over nuclei
+        for I in range(self.natom):
+            # Compute scaled distances
+            r1I = self._scaled_r_en(r1, self.nuclear_pos[I], b[I])
+            r2I = self._scaled_r_en(r2, self.nuclear_pos[I], b[I])
+            r12 = self._scaled_r_ee(r1, r2, d[I])
 
-            # Loop over nuclei
-            for I in range(self.natom):
-                # Compute scaled distances
-                r1I = self._scaled_r_en(r1_op, self.nuclear_pos[I], b[I])
-                r2I = self._scaled_r_en(r2_op, self.nuclear_pos[I], b[I])
-                r12 = self._scaled_r_ee(r1_op, r2_op, d[I])
+            # Sum over terms for this nucleus
+            for k, term in enumerate(self.terms_per_nucleus[I]):
+                if term.m == 0 and term.n == 0 and term.o == 1:
+                    # Cusp term
+                    factor = self._delta(term.m, term.n) * 0.5
+                    u_term = r12**term.o
+                else:
+                    factor = self._delta(term.m, term.n) * c[I, k]
+                    # Symmetric combination of r1I and r2I terms
+                    u_term = (r1I**term.m * r2I**term.n +
+                             r2I**term.m * r1I**term.n) * r12**term.o
+                u_total += factor * u_term
 
-                # Sum over terms for this nucleus
-                for k, term in enumerate(self.terms_per_nucleus[I]):
-                    if term.m == 0 and term.n == 0 and term.o == 1:
-                        # Cusp term
-                        factor = self._delta(term.m, term.n) * 0.5
-                        u_term = r12**term.o
-                    else:
-                        factor = self._delta(term.m, term.n) * c[I, k]
-                        # Symmetric combination of r1I and r2I terms
-                        u_term = (r1I**term.m * r2I**term.n +
-                                 r2I**term.m * r1I**term.n) * r12**term.o
-                    u_total += factor * u_term
+        return u_total
 
-            return u_total
-
-        # Use jax.lax.cond for conditional execution compatible with JAX transformations
-        # Pass r1, r2, params as operands
-        return lax.cond(
-            jnp.allclose(r1, r2),  # Predicate
-            true_fun,             # Function if predicate is True
-            false_fun,            # Function if predicate is False
-            r1, r2, params        # Operands passed to the selected function
-        )
 
     def get_param_count(self):
         """Return total number of optimizable parameters."""

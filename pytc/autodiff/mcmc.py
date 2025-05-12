@@ -489,43 +489,46 @@ def optimize(
         else:
             walkers, acceptance = metropolis_hastings(
                 ansatz, walkers, step_size, subkey, params)
-            
-        # Update walkers using KFAC if applicable
-        if optimizer_type.lower() == "kfac":
-            key, subkey_step = random.split(key)
-            # KFAC's step function computes gradients internally and updates params
-            params, opt_state, stats = optimizer.step(
-                params, opt_state, subkey_step, batch=(walkers, None), global_step_int=opt_step
-            )
-            
-            current_batch_cost = stats['loss']
-            current_batch_mean_energy, current_batch_energy_variance = stats['aux']
-        else:
-            (cost_val, (mean_energy_val, var_e_val)), grads = value_and_grad_fn(params, walkers)
-            current_batch_cost = cost_val
-            current_batch_mean_energy = mean_energy_val
-            current_batch_energy_variance = var_e_val
-            
-            if gradient_mask is not None:
-                # Zero out gradients for frozen parameters
-                grads = jax.tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
-                                   grads, gradient_mask)
-            
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            
-        # Create materialized copies of parameters for history storage
-        params_copy = jax.tree_map(lambda x: jax.device_get(x), params)
-        params_history.append(params_copy)
-        losses.append(float(current_batch_mean_energy))  # Convert to Python float
-        acceptances.append(float(acceptance))  # Convert to Python float
+
+        if opt_step % n_steps == 0:    
+            # Update walkers using KFAC if applicable
+            if optimizer_type.lower() == "kfac":
+                key, subkey_step = random.split(key)
+                # KFAC's step function computes gradients internally and updates params
+                params, opt_state, stats = optimizer.step(
+                    params, opt_state, subkey_step, batch=(walkers, None), global_step_int=opt_step
+                )
+
+                current_batch_cost = stats['loss']
+                current_batch_mean_energy, current_batch_energy_variance = stats['aux']
+            else:
+                (cost_val, (mean_energy_val, var_e_val)), grads = value_and_grad_fn(params, walkers)
+                current_batch_cost = cost_val
+                current_batch_mean_energy = mean_energy_val
+                current_batch_energy_variance = var_e_val
+
+                if gradient_mask is not None:
+                    # Zero out gradients for frozen parameters
+                    grads = jax.tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
+                                       grads, gradient_mask)
+
+                updates, opt_state = optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+            # Create materialized copies of parameters for history storage
+            params_copy = jax.tree_map(lambda x: jax.device_get(x), params)
+            params_history.append(params_copy)
+
+            losses.append(float(current_batch_mean_energy))  # Convert to Python float
+            acceptances.append(float(acceptance))  # Convert to Python float
         
-        step_time = time.time() - start_time
-        print(f"Step: {opt_step}, Cost: {float(current_batch_cost):.6f}, "
-              f"Mean E (hist): {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
-              f"Batch Var E: {current_batch_energy_variance:.6f}, "
-              f"Acceptance: {acceptance:.3f}, "
-              f"Time: {step_time:.2f}s")
+            step_time = time.time() - start_time
+            start_time = time.time()
+            print(f"Step: {opt_step}, Cost: {float(current_batch_cost):.6f}, "
+                  f"Mean E (hist): {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
+                  f"Batch Var E: {current_batch_energy_variance:.6f}, "
+                  f"Acceptance: {acceptance:.3f}, "
+                  f"Time: {step_time:.2f}s")
         
     opt_history["energies"] = jnp.asarray(losses)
     opt_history["params"] = params_history
