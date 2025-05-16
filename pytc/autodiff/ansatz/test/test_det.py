@@ -130,44 +130,106 @@ class TestSlaterDet(unittest.TestCase):
         det = SlaterDet(self.mol, self.mo_coeff, nelec=(1, 1))
         slater_up, slater_down = det.matrix(self.test_coords)
         
-        self.assertEqual(slater_up.shape, (1, 1))
-        self.assertEqual(slater_down.shape, (1, 1))
+        self.assertEqual(slater_up.shape, (1, 1, 1))
+        self.assertEqual(slater_down.shape, (1, 1, 1))
         
         # Test with more electrons
         det_water = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         water_up, water_down = det_water.matrix(self.water_coords)
         
-        self.assertEqual(water_up.shape, (5, 5))
-        self.assertEqual(water_down.shape, (5, 5))
+        self.assertEqual(water_up.shape, (1, 5, 5))
+        self.assertEqual(water_down.shape, (1, 5, 5))
 
     def test_update_mechanism(self):
         """Test the update mechanism for moving electrons."""
         det = SlaterDet(self.mol, self.mo_coeff)
         
-        # Initialize
-        det.init_inverse(self.test_coords)
-        init_value = det.total_value()
+        # Initialize with batch dimension
+        batch_coords = self.test_coords[np.newaxis, :, :]
         
-        # Move up electron
+        # Create move mask for first electron
+        move_mask = np.zeros((1, 2), dtype=bool)
+        move_mask[0, 0] = True
+        
+        # Get initial value
+        init_value = det.value(batch_coords)
+        
+        # Move up electron with mask
         new_pos = np.array([0.1, 0.1, 0.1])
-        ratio = det.update(0, new_pos)
+        new_coords = batch_coords.copy()
+        new_coords[0, 0] = new_pos
         
-        # Check ratio against direct calculation
-        new_coords = self.test_coords.copy()
-        new_coords[0] = new_pos
-        direct_value = det.value(new_coords)[0]
+        # Test with move mask
+        value_with_mask = det.value(new_coords, move_mask)
         
-        self.assertAlmostEqual(ratio * init_value, direct_value, places=10)
+        # Test without mask (full recalculation)
+        value_without_mask = det.value(new_coords)
         
-        # Sequential moves - move down electron
-        new_pos2 = np.array([0.2, 0.2, 1.2])
-        ratio2 = det.update(1, new_pos2)
+        # Values should match regardless of method
+        np.testing.assert_allclose(value_with_mask, value_without_mask)
+
+    def test_batched_one_electron_moves(self):
+        """Test batched one-electron moves with move masks."""
+        det = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         
-        # Check against direct calculation
-        new_coords[1] = new_pos2
-        direct_value2 = det.value(new_coords)[0]
+        # Create batch of 3 walkers
+        batch_coords = np.stack([self.water_coords] * 3)
         
-        self.assertAlmostEqual(ratio2 * ratio * init_value, direct_value2, places=10)
+        # Move different electrons in each walker
+        move_mask = np.zeros((3, 10), dtype=bool)
+        move_mask[0, 0] = True   # Move first electron in first walker
+        move_mask[1, 4] = True   # Move fifth electron in second walker
+        move_mask[2, 8] = True   # Move ninth electron in third walker
+        
+        # Make moves
+        shifts = np.array([
+            [0.1, 0.1, 0.1],
+            [0.2, 0.2, 0.2],
+            [-0.1, -0.1, -0.1]
+        ])
+        
+        new_coords = batch_coords.copy()
+        for i in range(3):
+            electron_idx = np.where(move_mask[i])[0][0]
+            new_coords[i, electron_idx] += shifts[i]
+        
+        # Compare values with and without mask
+        values_with_mask = det.value(new_coords, move_mask)
+        values_without_mask = det.value(new_coords)
+        
+        np.testing.assert_allclose(values_with_mask, values_without_mask)
+        
+    def test_sequential_one_electron_moves(self):
+        """Test sequence of one-electron moves."""
+        det = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
+        coords = self.water_coords[np.newaxis, :, :]
+        
+        # Make series of moves
+        moves = [(0, [0.1, 0.1, 0.1]), 
+                (4, [-0.1, 0.2, 0.0]),
+                (8, [0.3, -0.1, 0.2])]
+        
+        current_coords = coords.copy()
+        current_value = det.value(current_coords)
+        
+        for electron_idx, shift in moves:
+            # Create move mask for this electron
+            move_mask = np.zeros((1, 10), dtype=bool)
+            move_mask[0, electron_idx] = True
+            
+            # Apply move
+            new_coords = current_coords.copy()
+            new_coords[0, electron_idx] += shift
+            
+            # Compare values with and without mask
+            value_with_mask = det.value(new_coords, move_mask)
+            value_without_mask = det.value(new_coords)
+            
+            np.testing.assert_allclose(value_with_mask, value_without_mask)
+            
+            # Update for next move
+            current_coords = new_coords
+            current_value = value_with_mask
 
     def test_value_sign_change(self):
         """Test if determinant changes sign when electrons are exchanged."""
@@ -229,7 +291,7 @@ class TestSlaterDet(unittest.TestCase):
         
         # Compare numerical vs analytical for this specific element
         self.assertAlmostEqual(
-            grad_up[e_idx, 0, d],  # [electron, orbital, direction]
+            grad_up[0, e_idx, 0, d],  # [electron, orbital, direction]
             numeric_grad[e_idx, 0],  # [electron, orbital]
             places=3
         )
@@ -242,12 +304,12 @@ class TestSlaterDet(unittest.TestCase):
         (matrix_up, matrix_down), (grad_up, grad_down), (lapl_up, lapl_down) = det.laplacian(self.test_coords)
         
         # Check shapes
-        self.assertEqual(matrix_up.shape, (1, 1))
-        self.assertEqual(matrix_down.shape, (1, 1))
-        self.assertEqual(grad_up.shape, (1, 1, 3))
-        self.assertEqual(grad_down.shape, (1, 1, 3))
-        self.assertEqual(lapl_up.shape, (1, 1))
-        self.assertEqual(lapl_down.shape, (1, 1))
+        self.assertEqual(matrix_up.shape, (1, 1, 1))
+        self.assertEqual(matrix_down.shape, (1, 1, 1))
+        self.assertEqual(grad_up.shape, (1, 1, 1, 3))
+        self.assertEqual(grad_down.shape, (1, 1, 1, 3))
+        self.assertEqual(lapl_up.shape, (1, 1, 1))
+        self.assertEqual(lapl_down.shape, (1, 1, 1))
         
         # Verify consistency with individual calls
         matrix_only_up, matrix_only_down = det.matrix(self.test_coords)
@@ -273,7 +335,6 @@ class TestSlaterDet(unittest.TestCase):
         val_normal = det_normal.value(self.water_coords)
         val_excited = det_excited.value(self.water_coords)
         self.assertNotEqual(val_normal, val_excited)        
-
 
 if __name__ == '__main__':
     unittest.main()

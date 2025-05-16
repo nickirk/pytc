@@ -113,12 +113,23 @@ class TestNeuralEEN(TestNeuralBase):
     def test_h2o_symmetry(self):
         z_offset = 0.3
         r1 = jnp.array([0., 0.5, z_offset])
-        r2 = jnp.array([0., -0.5, z_offset])
+        r2 = jnp.array([0., -0.3, z_offset])
         
         value1 = self.jastrow_h2o._compute(r1, r2, self.params_h2o)
         value2 = self.jastrow_h2o._compute(r2, r1, self.params_h2o)
         
         np.testing.assert_allclose(value1, value2, rtol=1e-5)
+    
+    def test_h2o_gradients(self):
+        # Test gradients with respect to r1 and r2 should not be equal
+        r1 = jnp.array([0., 0.5, 0.3])
+        r2 = jnp.array([0., -0.3, 0.3])
+        grad_r1 = jax.grad(lambda x: self.jastrow_h2o._compute(x, r2, self.params_h2o))(r1)
+        grad_r2 = jax.grad(lambda x: self.jastrow_h2o._compute(r1, x, self.params_h2o))(r2)
+        grad_r1_1 = jax.grad(lambda x: self.jastrow_h2o._compute(r2, x, self.params_h2o))(r1)
+        grad_r2_1 = jax.grad(lambda x: self.jastrow_h2o._compute(x, r1, self.params_h2o))(r2)
+        np.testing.assert_allclose(grad_r1, grad_r1_1, rtol=1e-5)
+        np.testing.assert_allclose(grad_r2, grad_r2_1, rtol=1e-5)
 
 class TestCompositeNeural(TestNeuralBase):
     """Test combined neural Jastrow components."""

@@ -49,14 +49,20 @@ class SlaterJastrow:
         return self._ion_ion_potential
     
     @partial(jax.jit, static_argnums=(0,))
-    def __call__(self, elec_coords_batch, params):
-        """Evaluate wavefunction with explicit parameters."""
+    def __call__(self, elec_coords_batch, params, move_mask=None):
+        """Evaluate wavefunction with explicit parameters.
+        
+        Args:
+            elec_coords_batch: Array of electron positions
+            params: (jastrow_params, linear_coeffs)
+            move_mask: Optional boolean mask indicating which electrons moved
+        """
         jastrow_params, linear_coeffs = params
         jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(elec_coords_batch)
         
         det_vals = []
         for det in self.dets:
-            det_batch_vals = value(det, elec_coords_batch)
+            det_batch_vals = value(det, elec_coords_batch, move_mask)
             det_vals.append(det_batch_vals)
         
         det_vals_array = jnp.array(det_vals).transpose()

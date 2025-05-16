@@ -25,10 +25,10 @@ class REXP(jastrow.Jastrow):
     def _compute(self, r1, r2, params):
         r12 = r1-r2
         r12_norm = self._safe_norm(r12)
-        return 0.5*jnp.exp(-params[0] * r12_norm) * r12_norm
+        return 0.5*jnp.exp(-params['alpha'] * r12_norm) * r12_norm
 
     def __call__(self, r1, r2, params):
         return super().__call__(r1, r2, params)
     
     def init_params(self, **kwargs):
-        return jnp.array([0.5])
+        return {'alpha': jnp.array([0.5])}

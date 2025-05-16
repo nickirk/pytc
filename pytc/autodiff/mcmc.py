@@ -17,7 +17,43 @@ from pytc.autodiff.mcmc_utils import (
 )
 
 
-def metropolis_hastings(ansatz, walkers, step_size, key, params):
+def _all_electron_move(ansatz, walkers, step_size, key, params):
+    """Move all electrons at once for each walker.
+    Returns: proposals, psi_values, new_psi_values"""
+    # Compute initial wavefunction values
+    psi_values = ansatz(walkers, params)
+    
+    # Generate proposals (one step)
+    key, subkey = random.split(key)
+    proposals = walkers + random.normal(subkey, walkers.shape) * step_size
+    
+    # Compute new wavefunction values
+    new_psi_values = ansatz(proposals, params)
+    
+    return proposals, psi_values, new_psi_values
+
+def _one_electron_move(ansatz, walkers, step_size, key, params):
+    """Move one randomly selected electron for each walker."""
+    # Create electron selection mask
+    key, subkey = random.split(key)
+    n_electrons = walkers.shape[1]
+    electron_indices = random.randint(subkey, (walkers.shape[0],), 0, n_electrons)
+    
+    # Create move mask
+    move_mask = (jnp.arange(n_electrons)[None, :] == electron_indices[:, None])
+    
+    # Generate moves only for selected electrons
+    key, subkey = random.split(key)
+    mask_3d = move_mask[:, :, None]
+    proposals = walkers + mask_3d * random.normal(subkey, walkers.shape) * step_size
+    
+    # Compute wavefunction values with mask for fast updates
+    psi_values = ansatz(walkers, params)
+    new_psi_values = ansatz(proposals, params, move_mask)
+    
+    return proposals, psi_values, new_psi_values
+
+def metropolis_hastings(ansatz, walkers, step_size, key, params, move_type="one"):
     """Perform one step of Metropolis-Hastings sampling for quantum wavefunction.
     
     Args:
@@ -25,22 +61,23 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params):
         walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
-        params: contians jastrow_params and linear_coeffs
+        params: contains jastrow_params and linear_coeffs
+        move_type: "all" to move all electrons at once, "one" to move one electron at a time
     
     Returns:
         Tuple containing:
         - new_walkers: New walker configurations after one sampling step
         - acceptance_rate: Fraction of proposals that were accepted
     """
-    # Compute initial wavefunction values with parameters
-    psi_values = ansatz(walkers, params)
+    # Choose move type
+    if move_type == "all":
+        proposals, psi_values, new_psi_values = _all_electron_move(ansatz, walkers, step_size, key, params)
+    elif move_type == "one":
+        proposals, psi_values, new_psi_values = _one_electron_move(ansatz, walkers, step_size, key, params)
+    else:
+        raise ValueError("move_type must be either 'all' or 'one'")
     
-    # Generate proposals (one step)
-    key, subkey = random.split(key)
-    proposals = walkers + random.normal(subkey, walkers.shape) * step_size
-    
-    # Compute acceptance probabilities with parameters
-    new_psi_values = ansatz(proposals, params)
+    # Compute acceptance probabilities
     acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
     
     # Accept or reject
@@ -49,7 +86,8 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params):
     accept_count = jnp.sum(accept_mask)
     
     # Create new walkers without modifying input
-    accept_mask_3d = accept_mask[:, jnp.newaxis, jnp.newaxis]
+    # Reshape accept_mask to match walker dimensions properly
+    accept_mask_3d = accept_mask[:, None, None]  # Shape: (n_walkers, 1, 1)
     new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
     
     # Calculate acceptance rate
@@ -111,14 +149,10 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=10
     start_time = time.time()
     for step in range(n_steps):
         key, subkey = random.split(key)
-        walkers, alpha_acceptance = metropolis_hastings(
+        walkers, acceptance = metropolis_hastings(
             ansatz, walkers, step_size, subkey, params)
         
-        key, subkey = random.split(key)
-        walkers, beta_acceptance = metropolis_hastings(
-            ansatz, walkers, step_size, subkey, params)
-        
-        acceptance_history.append((alpha_acceptance + beta_acceptance) / 2)
+        acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
             print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]:.3f}, time: {time.time() - start_time:.2f}s")
@@ -330,6 +364,7 @@ def sample(
         if step % 100 == 0 or step == n_steps - 1:
             step_time = time.time() - start_time
             step_times.append(step_time)
+            print(f"Batch mean energy: {jnp.mean(energies):.6f}")
             report_progress(step, n_steps, acceptance_history, step_times, 
                            collected_energies if collected_energies else None)
             start_time = time.time()
@@ -710,8 +745,7 @@ def optimize_ref_var(
 
             step_time_val = time.time() - start_time # Corrected variable name
             print(f"Step: {opt_step}, Var: {float(current_batch_cost):.6f}, E_mean: {float(current_batch_ref_e):.6f}+\-{float(current_batch_std_e):.6f}, "
-                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s, "
-                  f"atom 0: rc: {float(params[0][0]['rc'][0]):.6f}, X4: {float(params[0][0]['X4'][0]):.6f},")
+                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s ")
 
             start_time = time.time()
 
