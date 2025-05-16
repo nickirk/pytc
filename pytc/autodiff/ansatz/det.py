@@ -296,7 +296,6 @@ class SlaterDet:
         coords_batch, is_single = self._ensure_batch(coords)
         needs_update, new_hashes = self._check_cache(coords_batch)
         n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
-        
         # Initialize cache if needed
         if self._cached_matrix is None:
             self._cached_matrix = (
@@ -308,6 +307,9 @@ class SlaterDet:
         if not needs_update.any():
             return self._cached_matrix
             
+        # Copy the cached values
+        slater_up, slater_down = self._cached_matrix[0].copy(), self._cached_matrix[1].copy()
+        
         # Only process walkers that need updates
         coords_update = coords_batch[needs_update]
         n_update = len(coords_update)
@@ -327,11 +329,12 @@ class SlaterDet:
             up_new = np.dot(ao_up, self.mo_coeff_alpha_occ).reshape(n_update, self.n_alpha, self.n_alpha)
             down_new = np.dot(ao_down, self.mo_coeff_beta_occ).reshape(n_update, self.n_beta, self.n_beta)
             
-        # Update cache for changed walkers
-        slater_up, slater_down = self._cached_matrix
+        # Update copies for changed walkers
         slater_up[needs_update] = up_new
         slater_down[needs_update] = down_new
-        self._cached_matrix = (slater_up, slater_down)
+        
+        # Store back to cache
+        self._cached_matrix = (slater_up.copy(), slater_down.copy())
         self._update_hashes(new_hashes, needs_update)
         
         return self._cached_matrix
@@ -366,6 +369,12 @@ class SlaterDet:
         if not needs_update.any():
             return self._cached_grad
             
+        # Copy the cached values
+        ((mup, mdown), (gup, gdown)) = (
+            (self._cached_grad[0][0].copy(), self._cached_grad[0][1].copy()),
+            (self._cached_grad[1][0].copy(), self._cached_grad[1][1].copy())
+        )
+        
         # Process only walkers that need updates
         coords_update = coords_batch[needs_update]
         n_update = len(coords_update)
@@ -392,12 +401,14 @@ class SlaterDet:
             grad_up[..., d] = gup
             grad_down[..., d] = gdown
             
-        # Update cache for changed walkers
-        ((mup, mdown), (gup, gdown)) = self._cached_grad
+        # Update copies for changed walkers
         mup[needs_update] = matrix_up
         mdown[needs_update] = matrix_down
         gup[needs_update] = grad_up
         gdown[needs_update] = grad_down
+        
+        # Store back to cache
+        self._cached_grad = ((mup.copy(), mdown.copy()), (gup.copy(), gdown.copy()))
         self._update_hashes(new_hashes, needs_update)
         
         return self._cached_grad
@@ -417,22 +428,29 @@ class SlaterDet:
         coords_batch, is_single = self._ensure_batch(coords)
         needs_update, new_hashes = self._check_cache(coords_batch)
         n_walkers, n_electrons = coords_batch.shape[0], coords_batch.shape[1]
-        
+        needs_update = np.ones(n_walkers, dtype=bool)
         # Initialize cache if needed
         if self._cached_laplacian is None:
             self._cached_laplacian = (
-                (np.zeros((n_walkers, self.n_alpha, self.n_alpha)),
-                 np.zeros((n_walkers, self.n_beta, self.n_beta))),
-                (np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3)),
-                 np.zeros((n_walkers, self.n_beta, self.n_beta, 3))),
-                (np.zeros((n_walkers, self.n_alpha, self.n_alpha)),
-                 np.zeros((n_walkers, self.n_beta, self.n_beta)))
+                (np.zeros((n_walkers, self.n_alpha, self.n_alpha)), # matrix up
+                 np.zeros((n_walkers, self.n_beta, self.n_beta))),  # matrix down
+                (np.zeros((n_walkers, self.n_alpha, self.n_alpha, 3)), # grad up
+                 np.zeros((n_walkers, self.n_beta, self.n_beta, 3))),  # grad down
+                (np.zeros((n_walkers, self.n_alpha, self.n_alpha)), # lap up
+                 np.zeros((n_walkers, self.n_beta, self.n_beta)))   # lap down
             )
             needs_update = np.ones(n_walkers, dtype=bool)
-            
+
         if not needs_update.any():
             return self._cached_laplacian
             
+        # Copy the cached values
+        #((mup, mdown), (gup, gdown), (lup, ldown)) = (
+        #    (self._cached_laplacian[0][0].copy(), self._cached_laplacian[0][1].copy()),
+        #    (self._cached_laplacian[1][0].copy(), self._cached_laplacian[1][1].copy()),
+        #    (self._cached_laplacian[2][0].copy(), self._cached_laplacian[2][1].copy())
+        #)
+        
         # Process only walkers that need updates
         coords_update = coords_batch[needs_update]
         n_update = len(coords_update)
@@ -453,12 +471,12 @@ class SlaterDet:
         grad_down = np.zeros((n_update, self.n_beta, self.n_beta, 3))
         
         for d in range(3):
-            gup, gdown = self.ao2mo(ao_grads[..., d],
+            gup_d, gdown_d = self.ao2mo(ao_grads[..., d],
                                   self.mo_coeff_alpha_occ,
                                   self.mo_coeff_beta_occ,
                                   n_update, n_electrons)
-            grad_up[..., d] = gup
-            grad_down[..., d] = gdown
+            grad_up[..., d] = gup_d
+            grad_down[..., d] = gdown_d
             
         # Get laplacians
         ao_lapls = ao_vals_deriv[[4, 7, 9]].sum(axis=0)
@@ -467,17 +485,23 @@ class SlaterDet:
                                     self.mo_coeff_beta_occ,
                                     n_update, n_electrons)
         
-        # Update cache for changed walkers
-        ((mup, mdown), (gup, gdown), (lup, ldown)) = self._cached_laplacian
-        mup[needs_update] = matrix_up
-        mdown[needs_update] = matrix_down
-        gup[needs_update] = grad_up
-        gdown[needs_update] = grad_down
-        lup[needs_update] = lap_up
-        ldown[needs_update] = lap_down
-        self._update_hashes(new_hashes, needs_update)
+        # Update cache for changed walkers - ensure shapes match
+        #((mup, mdown), (gup, gdown), (lup, ldown)) = self._cached_laplacian
+        #mup[needs_update] = matrix_up      # (n_update, n_alpha, n_alpha)
+        #mdown[needs_update] = matrix_down  # (n_update, n_beta, n_beta)
+        #gup[needs_update] = grad_up        # (n_update, n_alpha, n_alpha, 3)
+        #gdown[needs_update] = grad_down    # (n_update, n_beta, n_beta, 3)
+        #lup[needs_update] = lap_up         # (n_update, n_alpha, n_alpha)
+        #ldown[needs_update] = lap_down     # (n_update, n_beta, n_beta)
         
-        return self._cached_laplacian
+        # Store updated tuple structure back to cache
+        #self._cached_laplacian = ((mup.copy(), mdown.copy()), 
+        #                          (gup.copy(), gdown.copy()), 
+        #                          (lup.copy(), ldown.copy()))
+        self._update_hashes(new_hashes, needs_update)
+        #print(f"mup[0], lup[0]: {matrix_up[0]}, {lap_up[0]}") 
+        
+        return (matrix_up, matrix_down), (grad_up, grad_down), (lap_up, lap_down)
 
 
     def value(self, coords, move_mask=None):
@@ -496,7 +520,7 @@ class SlaterDet:
         if not np.any(needs_update) and move_mask is None:
             return float(self._cached_value[0]) if is_single else self._cached_value
 
-        values = np.zeros(n_walkers) 
+        values = self._cached_value.copy()
         # If no inverse matrices stored or no move mask, compute full determinant for needed walkers
         if self.inv_up is None or move_mask is None:
             # Only compute for walkers that need updates
@@ -517,14 +541,13 @@ class SlaterDet:
             self.inv_up[needs_update] = np.linalg.inv(slater_up_batch)
             self.inv_down[needs_update] = np.linalg.inv(slater_down_batch)
             
-            self._cached_value[needs_update] = self.det_up[needs_update] * self.det_down[needs_update]
-            values = self._cached_value.copy()
+            values[needs_update] = self.det_up[needs_update] * self.det_down[needs_update]
         else:
             # Handle moves using existing cache
             det_up_all = self.det_up.copy()
             det_down_all = self.det_down.copy()
             inv_up_all = self.inv_up.copy()
-            inv_down_all = self.inv_down.copy()
+            inv_down_all = self.inv_down.copy();
             
             # Start with cached values for all walkers
             values = np.zeros(coords_batch.shape[0])
@@ -575,9 +598,10 @@ class SlaterDet:
             self.det_up = det_up_all
             self.det_down = det_down_all
             values = det_up_all * det_down_all
-            self._cached_value = values
 
+        self._cached_value = values.copy()
         self._update_hashes(new_hashes, needs_update)
+
         return float(values[0]) if is_single else values
 
     def _update_spin_block_all_walkers(self, walker_indices, electron_indices, 

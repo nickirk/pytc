@@ -47,9 +47,12 @@ class TestAnsatzH2(unittest.TestCase):
             [0.0, 0.1, 0.742],  # electron 2 near second H
         ]])  # Shape: (1, 2, 3)
 
+        # Create params tuple for ansatz calls
+        self.params = (self.jastrow_params, self.linear_coeffs)
+
     def test_wavefunction_evaluation(self):
         """Test full wavefunction evaluation for H2."""
-        value = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)
+        value = self.ansatz(self.test_pos, self.params)
         self.assertTrue(np.isreal(value[0]))  # Index into batch dimension
         self.assertNotEqual(float(value[0]), 0.0)  # Index into batch dimension
         
@@ -58,23 +61,23 @@ class TestAnsatzH2(unittest.TestCase):
             [0.0, 0.0, -5.0],
             [0.0, 0.0, 5.0],
         ]])  # Shape: (1, 2, 3)
-        far_value = self.ansatz(far_pos, self.jastrow_params, self.linear_coeffs)
+        far_value = self.ansatz(far_pos, self.params)
         self.assertLess(abs(float(far_value[0])), abs(float(value[0])))
 
     def test_jastrow_parameter_sensitivity(self):
         """Test sensitivity to Jastrow parameter changes."""
-        value_original = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)
+        value_original = self.ansatz(self.test_pos, self.params)
         
         # Change Jastrow parameter more significantly
-        new_params = jnp.array([2.0])  # Bigger change
-        value_new = self.ansatz(self.test_pos, new_params, self.linear_coeffs)
+        new_params = (jnp.array([2.0]), self.linear_coeffs)
+        value_new = self.ansatz(self.test_pos, new_params)
         
         # Values should be different
         self.assertNotAlmostEqual(float(value_original[0]), float(value_new[0]))
 
     def test_antisymmetry(self):
         """Test that wavefunction is antisymmetric under electron exchange."""
-        value1 = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)
+        value1 = self.ansatz(self.test_pos, self.params)
         
         # Swap electrons and check sign change
         # Note: For H2 in RHF, we need to swap within same spin block to see antisymmetry
@@ -85,9 +88,9 @@ class TestAnsatzH2(unittest.TestCase):
             [0.0, 0.1, 1.0],    # second spin-up electron
         ]])  # Shape: (1, 2, 3)
         
-        value1 = self.ansatz(spin_up_pos, self.jastrow_params, self.linear_coeffs)
+        value1 = self.ansatz(spin_up_pos, self.params)
         swapped_pos = spin_up_pos[:, ::-1, :]  # Swap along electron dimension
-        value2 = self.ansatz(swapped_pos, self.jastrow_params, self.linear_coeffs)
+        value2 = self.ansatz(swapped_pos, self.params)
         
         # Values should be equal and opposite
         np.testing.assert_allclose(value1[0], -value2[0])
@@ -332,7 +335,8 @@ class TestAnsatzH2(unittest.TestCase):
         
         # Create a function to get the wavefunction value for a given Jastrow parameter
         def wf_value(param):
-            return self.ansatz(self.test_pos, jnp.array([param]), self.linear_coeffs)[0]
+            param_tuple = (jnp.array([param]), self.linear_coeffs)
+            return self.ansatz(self.test_pos, param_tuple)[0]
         
         # Use JAX's automatic differentiation to compute gradient
         param_grad = jax.grad(wf_value)(0.5)
@@ -347,7 +351,7 @@ class TestAnsatzH2(unittest.TestCase):
         # dψ/dparam = ψ * (dJ/dparam) = ψ * 0.5 * |r_1 - r_2|
         
         # Get current wavefunction value
-        current_wf = self.ansatz(self.test_pos, self.jastrow_params, self.linear_coeffs)[0]
+        current_wf = self.ansatz(self.test_pos, (self.jastrow_params, self.linear_coeffs))[0]
         
         # Calculate dJ/da for this electron configuration
         # For two electrons, there's one term: 0.5 * |r_1 - r_2|
@@ -364,8 +368,9 @@ class TestAnsatzH2(unittest.TestCase):
         # Create Jastrow with different parameter
         different_jastrow_params = jnp.array([different_param])
         
-        # Get wavefunction value with different parameter
-        different_wf = self.ansatz(self.test_pos, different_jastrow_params, self.linear_coeffs)[0]
+        # Change params tuple for different parameter test
+        different_params = (different_jastrow_params, self.linear_coeffs)
+        different_wf = self.ansatz(self.test_pos, different_params)[0]
         
         # The dJ/da is the same (electron_dist), but the wavefunction value is different
         different_expected_grad = float(different_wf * dj_da)
