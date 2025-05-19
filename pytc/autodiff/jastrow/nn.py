@@ -116,14 +116,14 @@ class NeuralEN(NeuralBase):
 
         features = r1n_feat.reshape(1, -1)
         # Use the standard Flax variable structure directly
-        return self.net.apply(net_vars, features)[0, 0]/(self.nelectron - 1)*2
+        return self.net.apply(net_vars, features)[0, 0]/(self.nelectron - 1)
     
     def grad_r(self, r1, r2, params):
-        return super().grad_r(r1, r2, params) * (self.nelectron - 1)/self.nelectron/4.
+        return super().grad_r(r1, r2, params) * (self.nelectron - 1)/self.nelectron/2.
 
-    def get_log_grads_r1(self, r1, r2, params):
-        grad_u, lapl_u = super().get_log_grads_r1(r1, r2, params)
-        return grad_u, lapl_u
+    #def get_log_grads_r1(self, r1, r2, params):
+    #    grad_u, lapl_u = super().get_log_grads_r1(r1, r2, params)
+    #    return grad_u, lapl_u
 
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
