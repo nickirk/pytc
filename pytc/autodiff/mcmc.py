@@ -125,7 +125,14 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     
     return walkers
 
-def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=100):
+def burn_in(ansatz, 
+            walkers, 
+            n_steps=2000, 
+            step_size=0.01,
+            key=None, 
+            params=None, 
+            report_interval=100, 
+            move_type="one"):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -150,7 +157,7 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=10
     for step in range(n_steps):
         key, subkey = random.split(key)
         walkers, acceptance = metropolis_hastings(
-            ansatz, walkers, step_size, subkey, params)
+            ansatz, walkers, step_size, subkey, params, move_type=move_type)
         
         acceptance_history.append(acceptance)
         
@@ -295,7 +302,9 @@ def sample(
     initial_walkers=None,
     use_importance_sampling: bool = False,  # New parameter to toggle importance sampling
     params=None,
-    key=None
+    key=None,
+    move_type: str = "one",  # New parameter to specify move type
+    report_interval: int = 100
 ) -> Dict[str, Any]:
     """Perform MCMC sampling for quantum wavefunction.
     
@@ -321,17 +330,23 @@ def sample(
     # Initialize walkers
     walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
+    print("Starting production sampling...")
+    print(f"Burn-in steps = {burn_in_steps}")
+    print(f"Number of walkers = {n_walkers}")
+    print(f"Number of steps = {n_steps}")
+    print(f"Thinning factor = {thinning}")
+    print(f"Step size = {step_size:.4f}")
+    print(f"Using importance sampling: {use_importance_sampling}")
+    print(f"Move type: {move_type}")
     # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
             ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, params)
+            ansatz, walkers, burn_in_steps, step_size, key=key, params=params, move_type=move_type)
     
     
-    if burn_in_steps > 0:
-        print("Starting production sampling...")
     
     # Storage for collected samples
     collected_samples = []
@@ -348,7 +363,7 @@ def sample(
                 ansatz, walkers, step_size, subkey, params)
         else:
             walkers, acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, params)
+                ansatz, walkers, step_size, subkey, params, move_type=move_type)
             
         acceptance_history.append(acceptance)
         
@@ -361,7 +376,7 @@ def sample(
         
         
         # Print progress occasionally
-        if step % 100 == 0 or step == n_steps - 1:
+        if step % report_interval == 0 or step == n_steps - 1:
             step_time = time.time() - start_time
             step_times.append(step_time)
             print(f"Batch mean energy: {jnp.mean(energies):.6f}")
@@ -388,8 +403,9 @@ def optimize(
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
     opt_kwargs: Optional[Dict[str, Any]] = None,
-    params=None, # Combined params: [jastrow_params, linear_coeffs]
-    frozen_params=None  # Parameter freezing identifiers for Jastrow part
+    params=None,
+    frozen_params=None,
+    move_type: str = "one"  # Add move_type parameter with default
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -438,7 +454,7 @@ def optimize(
             ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, params)
+            ansatz, walkers, burn_in_steps, step_size, key, params, move_type=move_type)
     
     print("Starting optimization...")
     
@@ -523,7 +539,7 @@ def optimize(
                 ansatz, walkers, step_size, subkey, params)
         else:
             walkers, acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, params)
+                ansatz, walkers, step_size, subkey, params, move_type=move_type)
 
         if opt_step % n_steps == 0:    
             # Update walkers using KFAC if applicable
@@ -587,6 +603,7 @@ def optimize_ref_var(
     n_opt_steps: int = 100,
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
+    move_type: str = "one",  # "all" or "one" electron move
     opt_kwargs: Optional[Dict[str, Any]] = None,
     params=None, # Combined params: [jastrow_params, linear_coeffs]
     frozen_params=None  # Parameter freezing identifiers for Jastrow part
@@ -663,7 +680,7 @@ def optimize_ref_var(
 
     # Burn-in walkers using the initial combined parameters
     walkers, acceptance_history, key, step_size = burn_in(
-        ref_det, walkers, burn_in_steps, step_size, key, params)
+        ref_det, walkers, burn_in_steps, step_size, key, params=params, move_type=move_type)
 
     print("Starting optimization...")
     params_history = []
@@ -726,7 +743,7 @@ def optimize_ref_var(
             key, subkey_mcmc = random.split(key)
             current_acceptance_rate = 0.0
             walkers, current_acceptance_rate = metropolis_hastings(
-                ref_det, walkers, step_size, subkey_mcmc, params)
+                ref_det, walkers, step_size, subkey_mcmc, params, move_type=move_type)
             acceptances.append(current_acceptance_rate)
 
             # Create materialized copies of parameters for history storage

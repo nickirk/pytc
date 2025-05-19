@@ -1,10 +1,9 @@
+from functools import partial
 import jax.numpy as jnp
 from jax import random
 import flax.linen as nn
-from typing import Sequence, List, Tuple
 from dataclasses import dataclass
 import jax
-from jax import lax
 
 from pytc.autodiff.jastrow import Jastrow
 
@@ -41,15 +40,15 @@ class BoysHandy(Jastrow):
                 BHTerm(3, 0, 0, 0.0001),
                 BHTerm(4, 0, 0, 0.0001),   # higher order term
                 BHTerm(2, 2, 0, -0.001),    # e-n term
-                BHTerm(2, 0, 2, 0.1),
-                BHTerm(2, 2, 2, 0.1),
-                BHTerm(4, 0, 2, 0.1),
-                BHTerm(2, 0, 4, 0.1),
-                BHTerm(4, 2, 2, 0.1),
-                BHTerm(6, 0, 2, 0.1),
-                BHTerm(4, 0, 4, 0.1),
-                BHTerm(2, 2, 4, 0.1),
-                BHTerm(2, 0, 6, 0.1),
+                BHTerm(2, 0, 2, 0.01),
+                BHTerm(2, 2, 2, 0.01),
+                BHTerm(4, 0, 2, 0.01),
+                BHTerm(2, 0, 4, 0.01),
+                BHTerm(4, 2, 2, 0.01),
+                BHTerm(6, 0, 2, 0.01),
+                BHTerm(4, 0, 4, 0.01),
+                BHTerm(2, 2, 4, 0.01),
+                BHTerm(2, 0, 6, 0.01),
             ]
             # Create a list of default terms for each nucleus
             self.terms_per_nucleus = [default_terms_for_one_nucleus for _ in range(self.natom)]
@@ -98,6 +97,7 @@ class BoysHandy(Jastrow):
             'c_raw': c_raw
         }
 
+    @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
         """Compute Boys-Handy Jastrow exponent."""
 

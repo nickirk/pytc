@@ -275,17 +275,11 @@ class NuclearCusp(Jastrow):
         # Sum over all nuclei
         total, _ = jax.lax.scan(scan_nuclei, 0.0, jnp.arange(self.n_nuclei))
         
-        return total/(self.nelectron - 1)*2
+        return total/(self.nelectron - 1)
     
     def grad_r(self, r1, r2, params):
-        return super().grad_r(r1, r2, params)/4.*(self.nelectron - 1)/self.nelectron
+        return super().grad_r(r1, r2, params)/2.*(self.nelectron - 1)/self.nelectron
     
-    # overwrite get_log_grads_r2 to give the same value as get_log_grads_r1 from
-    # parent class
-    def get_log_grads_r1(self, r1, r2, params):
-        grad_u, lap_u = super().get_log_grads_r1(r1, r2, params)
-        return grad_u, lap_u
-
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
 
