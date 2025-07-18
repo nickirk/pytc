@@ -11,7 +11,6 @@ setup(
     install_requires=[
         "numpy",
         "scipy",
-        "unittest",
         "jax",
         "optax",
         "kfac_jax",
