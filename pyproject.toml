@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytc"
+version = "0.1.0"
+description = "Python TransCorrelation package"
+authors = [
+    {name = "Ke Liao", email = "ke.liao.whu@gmail.com"}
+]
+keywords = [
+    "quantum-chemistry", 
+    "transcorrelation", 
+    "jastrow-factors", 
+    "monte-carlo", 
+    "computational-chemistry"
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "scipy",
+    "jax",
+    "optax",
+    "kfac_jax",
+    "flax",
+    "tqdm",
+    "pyscf",
+]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "jaxlib[cuda]",
+]
+
+[project.urls]
+Homepage = "https://github.com/nickirk/pytc"
