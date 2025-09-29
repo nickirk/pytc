@@ -12,10 +12,7 @@
 .pytc 
 .tchint/
 .venv/
-doc/*
-!doc/*.tex
-!doc/*.bib
-!doc/*.pdf
+doc/
 *egg-info/
 build/
 tmp*
