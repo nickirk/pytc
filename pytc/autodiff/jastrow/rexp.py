@@ -31,4 +31,5 @@ class REXP(jastrow.Jastrow):
         return super().__call__(r1, r2, params)
     
     def init_params(self, **kwargs):
-        return {'alpha': jnp.array([0.5])}
+        alpha = kwargs.get('alpha', 0.5)
+        return {'alpha': jnp.array([alpha])}
