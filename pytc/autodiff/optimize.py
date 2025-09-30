@@ -2,6 +2,7 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)  # Enable float64 support
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import optax  # JAX's optimization library
 from functools import partial
 from pytc.autodiff import jastrow
@@ -10,7 +11,7 @@ from pyscf import gto, scf
 
 def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learning_rate=1e-3, opt_file='opt_data.npz'):
     """Optimize Jastrow parameters using advanced optimizers with adaptive learning rate."""
-    params = jnp.asarray(init_params, dtype=jnp.float64)
+    params = init_params.copy()
     
     # Add learning rate schedule parameters
     current_lr = learning_rate
@@ -62,10 +63,11 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     
     for step in range(n_steps):
         loss_val, grads = jax.value_and_grad(loss_fn)(params)
-        grad_norm = jnp.linalg.norm(grads)
+        flat_grads, _ = jtu.tree_flatten(grads)
+        grad_norm = jnp.linalg.norm(jnp.concatenate([jnp.ravel(g) for g in flat_grads]))
         
-        # Check for NaN gradients
-        if jnp.any(jnp.isnan(grads)):
+        # Check for NaN gradients using tree flattening
+        if any(jnp.any(jnp.isnan(g)) for g in flat_grads):
             print(f"Warning: NaN gradients at step {step}")
             break
             
@@ -118,28 +120,12 @@ def create_test_system(basis):
     mf.kernel()
     return mol, mf
 
-class REXP(jastrow.Jastrow):
-    def __init__(self, epsilon=1e-12):
-        super().__init__()
-        self.epsilon = epsilon
-        
-    def _safe_norm(self, x):
-        """Compute norm with a small epsilon to prevent division by zero."""
-        return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
-    
-    def _compute(self, r1, r2, params):
-        r12 = r1-r2
-        r12_norm = self._safe_norm(r12)
-        return 0.5*jnp.exp(-params[0] * r12_norm) * r12_norm
-
-    def __call__(self, r1, r2):
-        return super().__call__(r1, r2)
 
 def do_ccsd(params, basis):
     # Create new system with cc-pVTZ basis
-    mol, mf = create_test_system('ccpvtz')
+    mol, mf = create_test_system('ccpvdz')
     
-    my_jastrow = REXP()  # Remove params from constructor
+    my_jastrow = jastrow.REXP()  # Remove params from constructor
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
     eris = myxtc.make_eris(params)  # Pass params explicitly
     from pyscf.cc import rccsd
@@ -158,11 +144,11 @@ def do_ccsd(params, basis):
 def main():
     """Example usage with He atom."""
     # Create test system
-    mol, mf = create_test_system('ccpvtz')
+    mol, mf = create_test_system('ccpvdz')
 
     
-    init_params = jnp.array([0.5], dtype=jnp.float64)
-    my_jastrow = REXP()  # Remove params from constructor
+    my_jastrow = jastrow.REXP()  # Remove params from constructor
+    init_params = my_jastrow.init_params()  # Initialize parameters
     
     # Run optimization with smaller learning rate
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
@@ -180,7 +166,7 @@ def main():
                                           n_steps=20)
         print(f"{opt_name} optimized parameters:", optimized_params)
     
-    assert np.isclose(optimized_params, 0.39839909, atol=1e-5)
+    assert np.isclose(optimized_params['alpha'][0], 0.37550687, atol=1e-5)
     
     do_ccsd(optimized_params, 'ccpvtz')
 

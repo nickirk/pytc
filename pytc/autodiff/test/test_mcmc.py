@@ -17,7 +17,7 @@ from pytc.autodiff.mcmc_utils import init_electron_configs
 
 from pytc.autodiff.mcmc_utils import analyze_energies
 from pytc.autodiff.ansatz.sj import SlaterJastrow
-from pytc.autodiff.jastrow import REXP, Poly
+from pytc.autodiff.jastrow import REXP, Poly, CompositeJastrow, NuclearCusp
 from pytc.autodiff.ansatz.det import SlaterDet 
 
 
@@ -42,7 +42,7 @@ class TestJastrowFunctions(unittest.TestCase):
             np.testing.assert_allclose(val, 0.0, atol=1e-10)
             
             # Derivatives should be zero
-            grads, laps = jastrow.get_log_grads(r1, r2, jastrow_params)
+            grads, laps = jastrow.get_log_grads_r1(r1, r2, jastrow_params)
             np.testing.assert_allclose(grads, jnp.zeros(3), atol=1e-10)
             np.testing.assert_allclose(laps, 0.0, atol=1e-10)
 
@@ -112,7 +112,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Use small settings for test speed
         # For production, use larger values
         n_walkers = 5000
-        n_steps = 8000
+        n_steps = 5000
         step_size = 0.1
         burn_in_steps = 1000  # Updated parameter name
         thinning = 10
@@ -123,14 +123,13 @@ class TestHartreeFockEnergy(unittest.TestCase):
         start_time = time.time()
         sampling_results = sample(
             sj_ansatz,
+            params=[jastrow_params, linear_coeffs],
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
             use_importance_sampling=True,
             burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
-            jastrow_params=jastrow_params,
-            linear_coeffs=linear_coeffs,
             key=key
         )
         end_time = time.time()
@@ -204,20 +203,20 @@ class TestJastrowOptimization(unittest.TestCase):
         det = SlaterDet(mol, mf.mo_coeff)
         
         # Create REXP jastrow with given or default parameters
-        jastrow = REXP()
-        if jastrow_params is None:
-            jastrow_params = jnp.array([0.1])
-        
+        rexp = REXP()
+        jnuclear_cusp = NuclearCusp(mol)    
+        jastrow = CompositeJastrow([jnuclear_cusp, rexp])
+        jastrow_params = jastrow.init_params() if jastrow_params is None else jastrow_params 
         # Create SlaterJastrow ansatz
         sj_ansatz = SlaterJastrow(mol, jastrow, [det])
         linear_coeffs = jnp.ones(1)  # Single determinant
         
         # Use small settings for test speed
-        n_walkers = 100
-        n_steps = 10
-        step_size = 0.1
-        burn_in_steps = 2000
-        n_opt_steps = 5000
+        n_walkers = 5000
+        n_steps = 50
+        step_size = 0.01
+        burn_in_steps = 1000
+        n_opt_steps = 2000
         key = random.PRNGKey(42)
         
         # Run optimization
@@ -225,14 +224,14 @@ class TestJastrowOptimization(unittest.TestCase):
         start_time = time.time()
         opt_results = optimize(
             sj_ansatz,
-            jastrow_params=jastrow_params,
-            linear_coeffs=linear_coeffs,
+            params=[jastrow_params, linear_coeffs],
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
             burn_in_steps=burn_in_steps,
             n_opt_steps=n_opt_steps,
-            learning_rate=0.005,
+            optimizer_type='adam',
+            learning_rate=0.001,
             key=key
         )
         end_time = time.time()
@@ -240,8 +239,8 @@ class TestJastrowOptimization(unittest.TestCase):
         
         
         # Check energy improvement
-        initial_energy = jnp.asarray(opt_results["optimization_history"]["energy"][:500]).mean()
-        final_energy = jnp.asarray(opt_results["optimization_history"]["energy"][-500:]).mean()
+        initial_energy = jnp.asarray(opt_results["energies"][:500]).mean()
+        final_energy = jnp.asarray(opt_results["energies"][-500:]).mean()
         print(f"Initial energy: {initial_energy:.6f}")
         print(f"Final energy: {final_energy:.6f}")
         print(f"Reference HF energy: {hf_energy_reference:.6f}")
@@ -254,8 +253,7 @@ class TestJastrowOptimization(unittest.TestCase):
     
     def test_he2_optimization(self):
         """Test optimization of Jastrow parameters for He atom."""
-        self.run_optimization_test('He 0 0 0', basis='ccpvdz', 
-                                 jastrow_params=jnp.array([0.9]))
+        self.run_optimization_test('He 0 0 0; He 0 0 1.5', basis='ccpvdz')
 
 
 if __name__ == "__main__":

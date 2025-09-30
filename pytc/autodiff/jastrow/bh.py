@@ -1,10 +1,9 @@
+from functools import partial
 import jax.numpy as jnp
 from jax import random
 import flax.linen as nn
-from typing import Sequence, List, Tuple
 from dataclasses import dataclass
 import jax
-from jax import lax
 
 from pytc.autodiff.jastrow import Jastrow
 
@@ -41,15 +40,15 @@ class BoysHandy(Jastrow):
                 BHTerm(3, 0, 0, 0.0001),
                 BHTerm(4, 0, 0, 0.0001),   # higher order term
                 BHTerm(2, 2, 0, -0.001),    # e-n term
-                BHTerm(2, 0, 2, 0.1),
-                BHTerm(2, 2, 2, 0.1),
-                BHTerm(4, 0, 2, 0.1),
-                BHTerm(2, 0, 4, 0.1),
-                BHTerm(4, 2, 2, 0.1),
-                BHTerm(6, 0, 2, 0.1),
-                BHTerm(4, 0, 4, 0.1),
-                BHTerm(2, 2, 4, 0.1),
-                BHTerm(2, 0, 6, 0.1),
+                BHTerm(2, 0, 2, 0.01),
+                BHTerm(2, 2, 2, 0.01),
+                BHTerm(4, 0, 2, 0.01),
+                BHTerm(2, 0, 4, 0.01),
+                BHTerm(4, 2, 2, 0.01),
+                BHTerm(6, 0, 2, 0.01),
+                BHTerm(4, 0, 4, 0.01),
+                BHTerm(2, 2, 4, 0.01),
+                BHTerm(2, 0, 6, 0.01),
             ]
             # Create a list of default terms for each nucleus
             self.terms_per_nucleus = [default_terms_for_one_nucleus for _ in range(self.natom)]
@@ -98,52 +97,71 @@ class BoysHandy(Jastrow):
             'c_raw': c_raw
         }
 
+    @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
         """Compute Boys-Handy Jastrow exponent."""
+        
+        # Get positive b and d values using softplus
+        b = nn.softplus(params['b_raw'])
+        d = nn.softplus(params['d_raw'])
+        c = params['c_raw']  # Allow c to be both positive and negative
 
-        def true_fun(r1_op, r2_op, params_op):
-            # Function to execute if r1 and r2 are close
-            return jnp.array([0.0])
+        def nucleus_scan_fn(carry, nucleus_data):
+            """Scan function for looping over nuclei."""
+            u_total = carry
+            I, nuclear_pos_I, b_I, d_I, c_I = nucleus_data
+            
+            # Compute scaled distances for this nucleus
+            r1I = self._scaled_r_en(r1, nuclear_pos_I, b_I)
+            r2I = self._scaled_r_en(r2, nuclear_pos_I, b_I)
+            r12 = self._scaled_r_ee(r1, r2, d_I)
+            
+            def term_scan_fn(carry_inner, term_data):
+                """Scan function for looping over terms within a nucleus."""
+                u_nucleus = carry_inner
+                k, term_m, term_n, term_o = term_data
+                
+                # Check if this is a cusp term
+                is_cusp = (term_m == 0) & (term_n == 0) & (term_o == 1)
+                
+                # Compute factor
+                delta_factor = self._delta(term_m, term_n)
+                factor = jnp.where(is_cusp, 
+                                 delta_factor * 0.5,
+                                 delta_factor * c_I[k])
+                
+                # Compute u_term
+                u_term = jnp.where(is_cusp,
+                                 r12**term_o,
+                                 (r1I**term_m * r2I**term_n + 
+                                  r2I**term_m * r1I**term_n) * r12**term_o)
+                
+                u_nucleus += factor * u_term
+                return u_nucleus, None
+            
+            # Prepare term data for this nucleus
+            nucleus_terms = self.terms_per_nucleus[I]
+            term_indices = jnp.arange(len(nucleus_terms))
+            term_m = jnp.array([term.m for term in nucleus_terms])
+            term_n = jnp.array([term.n for term in nucleus_terms])
+            term_o = jnp.array([term.o for term in nucleus_terms])
+            term_data = (term_indices, term_m, term_n, term_o)
+            
+            # Scan over terms for this nucleus
+            u_nucleus, _ = jax.lax.scan(term_scan_fn, 0.0, term_data)
+            u_total += u_nucleus
+            
+            return u_total, None
 
-        def false_fun(r1_op, r2_op, params_op):
-            # Function to execute if r1 and r2 are not close (original computation)
-            # Get positive b and d values using softplus
-            b = nn.softplus(params_op['b_raw'])
-            d = nn.softplus(params_op['d_raw'])
-            c = params_op['c_raw']  # Allow c to be both positive and negative
+        # Prepare nucleus data
+        nucleus_indices = jnp.arange(self.natom)
+        nucleus_data = (nucleus_indices, self.nuclear_pos, b, d, c)
+        
+        # Scan over nuclei
+        u_total, _ = jax.lax.scan(nucleus_scan_fn, 0.0, nucleus_data)
+        
+        return u_total
 
-            u_total = 0.0
-
-            # Loop over nuclei
-            for I in range(self.natom):
-                # Compute scaled distances
-                r1I = self._scaled_r_en(r1_op, self.nuclear_pos[I], b[I])
-                r2I = self._scaled_r_en(r2_op, self.nuclear_pos[I], b[I])
-                r12 = self._scaled_r_ee(r1_op, r2_op, d[I])
-
-                # Sum over terms for this nucleus
-                for k, term in enumerate(self.terms_per_nucleus[I]):
-                    if term.m == 0 and term.n == 0 and term.o == 1:
-                        # Cusp term
-                        factor = self._delta(term.m, term.n) * 0.5
-                        u_term = r12**term.o
-                    else:
-                        factor = self._delta(term.m, term.n) * c[I, k]
-                        # Symmetric combination of r1I and r2I terms
-                        u_term = (r1I**term.m * r2I**term.n +
-                                 r2I**term.m * r1I**term.n) * r12**term.o
-                    u_total += factor * u_term
-
-            return u_total
-
-        # Use jax.lax.cond for conditional execution compatible with JAX transformations
-        # Pass r1, r2, params as operands
-        return lax.cond(
-            jnp.allclose(r1, r2),  # Predicate
-            true_fun,             # Function if predicate is True
-            false_fun,            # Function if predicate is False
-            r1, r2, params        # Operands passed to the selected function
-        )
 
     def get_param_count(self):
         """Return total number of optimizable parameters."""

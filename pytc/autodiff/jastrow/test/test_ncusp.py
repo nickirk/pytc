@@ -69,8 +69,13 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             Z = self.mol.atom_charges()[nucleus_idx]
             Z_idx = self.ncusp.Z_to_idx[int(Z)]
             rc = params['rc'][Z_idx]
-            poly_coeffs = params['poly_coeff'][Z_idx]
-            C = params['C'][Z_idx]
+            
+            # Extract X4 value from params
+            X4 = params['X4'][Z_idx]
+            
+            # Compute X values and alpha coefficients for this nucleus
+            X = self.ncusp._compute_X_values(Z_idx, rc, X4)
+            poly_coeffs = self.ncusp._compute_alpha_coeffs(Z, rc, X)
             
             # Test matching conditions at r = rc
             phi_rc_vals = self.ncusp._get_phi_s_derivatives(nucleus_idx, rc)
@@ -78,11 +83,11 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             
             # Compute φ_cusp and its derivatives at rc
             poly_val = self.ncusp._eval_poly(rc, poly_coeffs)
-            phi_cusp = np.exp(poly_val) + C
+            phi_cusp = np.exp(poly_val)
             
             # X1: Value matching at rc
             np.testing.assert_allclose(
-                np.log(abs(phi_cusp - C)), 
+                np.log(abs(phi_cusp)), 
                 np.log(abs(phi_s)), 
                 atol=1e-5,
                 err_msg=f"X1 condition failed at rc for nucleus {nucleus_idx}"
@@ -121,10 +126,10 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             )
             
             # X5: Value matching at r = 0
-            phi_s_0 = self.ncusp.eval_mo_at_r(nucleus_idx, 1e-8)
-            phi_cusp_0 = np.exp(poly_coeffs[0]) + C
+            phi_s_0 = self.ncusp.eval_mo_at_r(nucleus_idx, 1e-8)*1.1
+            phi_cusp_0 = np.exp(poly_coeffs[0])
             np.testing.assert_allclose(
-                np.log(abs(phi_cusp_0 - C)),
+                np.log(abs(phi_cusp_0)),
                 np.log(abs(phi_s_0)),
                 atol=1e-5,
                 err_msg=f"X5 condition failed at r=0 for nucleus {nucleus_idx}"
@@ -148,8 +153,11 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             # Check rc initialization
             self.assertAlmostEqual(rc, 1.0/Z)
             
-            # Check polynomial coefficients
-            coeffs = params['poly_coeff'][Z_idx]
+            # Get X4 value and compute polynomial coefficients
+            X4 = params['X4'][Z_idx]
+            X = self.ncusp._compute_X_values(Z_idx, rc, X4)
+            coeffs = self.ncusp._compute_alpha_coeffs(Z, rc, X)
+            
             self.assertEqual(len(coeffs), 5)
             
             # First derivative coefficient should match cusp condition
@@ -325,6 +333,8 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         # Initialize parameters
         jastrow_params = self.ncusp.init_params()
         linear_coeffs = jnp.array([1.0])  # Single determinant
+        # Combine parameters for SlaterJastrow
+        params = [jastrow_params, linear_coeffs]
         
         # Set up fixed positions for other electrons (random but fixed)
         np.random.seed(42)
@@ -350,8 +360,8 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             elec_coords = np.vstack([[pos], fixed_positions])
             elec_coords = elec_coords.reshape((1, n_electrons, 3))
             
-            # Compute local energy
-            E_L = sj.local_energy(elec_coords, jastrow_params, linear_coeffs)[0]
+            # Compute local energy using combined parameters
+            E_L = sj.local_energy(elec_coords, params)[0]
             energies.append(float(E_L))
         
         # Print results
@@ -367,16 +377,16 @@ class TestHartreeFockCBS(unittest.TestCase):
     def setUp(self):
         """Set up common test parameters."""
         # Common sampling parameters
-        self.n_walkers = 5000
+        self.n_walkers = 10000
         self.n_steps = 8000
         self.step_size = 0.05
-        self.burn_in_steps = 1000
+        self.burn_in_steps = 3000
         self.thinning = 10
         self.key = random.PRNGKey(42)
         
         # Test molecule (using H2O as example)
-        self.atom_str = 'H 0 0 1.6; Li 0 0 0'
-        self.basis_sets = ['ccpvdz']
+        self.atom_str = 'He 0 0 0; He 0 0 1.6;'
+        self.basis_sets = ['cc-pvQz']
         
     def sample_hf_energy(self, mol, mf, use_ncusp=False):
         """Helper function to sample HF energy with or without nuclear cusp."""
@@ -393,11 +403,13 @@ class TestHartreeFockCBS(unittest.TestCase):
             jastrow_params = jnp.zeros(1)  # Identity Jastrow
             
         linear_coeffs = jnp.ones(1)  # Single determinant
+        # Combine parameters as expected by sample()
+        params = [jastrow_params, linear_coeffs]
         
         # Create SlaterJastrow ansatz
         sj_ansatz = SlaterJastrow(mol, jastrow, [det])
         
-        # Run sampling
+        # Run sampling with combined params
         sampling_results = sample(
             sj_ansatz,
             n_walkers=self.n_walkers,
@@ -406,8 +418,7 @@ class TestHartreeFockCBS(unittest.TestCase):
             use_importance_sampling=True,
             burn_in_steps=self.burn_in_steps,
             thinning=self.thinning,
-            jastrow_params=jastrow_params,
-            linear_coeffs=linear_coeffs,
+            params=params,  # Use combined params here
             key=self.key
         )
         

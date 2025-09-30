@@ -9,6 +9,8 @@ class KFACDense(nn.Module):
     """Dense layer that registers with KFAC."""
     features: int
     use_bias: bool = True
+    is_een_first_layer: bool = False  # Flag for EEN first layer
+    num_nuclei: int = None  # Number of nuclei for EEN averaging
     
     @nn.compact
     def __call__(self, x):
@@ -18,6 +20,18 @@ class KFACDense(nn.Module):
         kernel = self.param('kernel', kernel_init, (x.shape[-1], self.features))
         bias = self.param('bias', bias_init, (self.features,)) if self.use_bias else None
         
+        if self.is_een_first_layer and self.num_nuclei is not None:
+            # Split kernel into r12, r1n, r2n parts
+            w_r12 = kernel[0:1]  # First row for r12
+            w_r1n = kernel[1:self.num_nuclei+1]  # Rows for r1n
+            w_r2n = kernel[self.num_nuclei+1:]  # Rows for r2n
+            
+            # Average the r1n and r2n weights
+            w_rn_avg = (w_r1n + w_r2n) / 2
+            
+            # Reconstruct kernel with averaged weights
+            kernel = jnp.concatenate([w_r12, w_rn_avg, w_rn_avg])
+            
         y = x @ kernel
         if bias is not None:
             y += bias
@@ -102,8 +116,15 @@ class NeuralEN(NeuralBase):
 
         features = r1n_feat.reshape(1, -1)
         # Use the standard Flax variable structure directly
-        return self.net.apply(net_vars, features)[0, 0] / (self.nelectron - 1)
+        return self.net.apply(net_vars, features)[0, 0]/(self.nelectron - 1)
     
+    def grad_r(self, r1, r2, params):
+        return super().grad_r(r1, r2, params) * (self.nelectron - 1)/self.nelectron/2.
+
+    #def get_log_grads_r1(self, r1, r2, params):
+    #    grad_u, lapl_u = super().get_log_grads_r1(r1, r2, params)
+    #    return grad_u, lapl_u
+
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
 
@@ -139,11 +160,41 @@ class NeuralEE(NeuralBase):
         return self.net.apply(net_vars, features)[0, 0]
 
 
+class EENMLP(nn.Module):
+    """MLP specifically for EEN with equivariant first layer."""
+    features: Sequence[int]
+    num_nuclei: int
+    
+    @nn.compact
+    def __call__(self, x):
+        # First layer is equivariant
+        x = KFACDense(
+            self.features[0], 
+            is_een_first_layer=True, 
+            num_nuclei=self.num_nuclei
+        )(x)
+        x = nn.tanh(x)
+        
+        # Remaining layers are standard
+        for feat in self.features[1:-1]:
+            layer_input = x
+            x = KFACDense(feat)(x)
+            x = nn.tanh(x)
+            if layer_input.shape[-1] == feat:
+                x = x + layer_input
+        
+        x = KFACDense(self.features[-1])(x)
+        return x
+
+
 class NeuralEEN(NeuralBase):
     """Neural network for electron-electron-nuclear correlations."""
     def __init__(self, mol, **kwargs):
         super().__init__(mol, **kwargs)
-
+        self.num_nuclei = len(self.nuclear_charges)
+        # Use EENMLP instead of standard MLP
+        self.net = EENMLP(features=self.features, num_nuclei=self.num_nuclei)
+    
     def init_params(self, **kwargs):
         key = kwargs.get('key', random.PRNGKey(0))
         input_size = 1+2*len(self.nuclear_charges)
@@ -166,15 +217,12 @@ class NeuralEEN(NeuralBase):
         r1n_dist = self._safe_norm(r1[None, :] - self.nuclear_pos)  # Shape: (N,)
         r2n_dist = self._safe_norm(r2[None, :] - self.nuclear_pos)  # Shape: (N,)
 
-        # Create symmetric features using min/max
-        min_dist = jnp.minimum(r1n_dist, r2n_dist)
-        max_dist = jnp.maximum(r1n_dist, r2n_dist)
         
         # Concatenate features with consistent dimensions
         features = jnp.concatenate([
             r12_dist,  # Shape: (1,)
-            min_dist,  # Shape: (N,)
-            max_dist,  # Shape: (N,)
+            r1n_dist,  # Shape: (N,)
+            r2n_dist,  # Shape: (N,)
         ], axis=0).reshape(1, -1)
         
         return self.net.apply(net_vars, features)[0, 0]

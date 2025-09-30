@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import optax
 import kfac_jax
 import time
+from jax.tree_util import tree_map
 from jax import random, value_and_grad
 from jax.lax import stop_gradient
 from typing import Dict, Any, Optional
@@ -17,7 +18,43 @@ from pytc.autodiff.mcmc_utils import (
 )
 
 
-def metropolis_hastings(ansatz, walkers, step_size, key, params):
+def _all_electron_move(ansatz, walkers, step_size, key, params):
+    """Move all electrons at once for each walker.
+    Returns: proposals, psi_values, new_psi_values"""
+    # Compute initial wavefunction values
+    psi_values = ansatz(walkers, params)
+    
+    # Generate proposals (one step)
+    key, subkey = random.split(key)
+    proposals = walkers + random.normal(subkey, walkers.shape) * step_size
+    
+    # Compute new wavefunction values
+    new_psi_values = ansatz(proposals, params)
+    
+    return proposals, psi_values, new_psi_values
+
+def _one_electron_move(ansatz, walkers, step_size, key, params):
+    """Move one randomly selected electron for each walker."""
+    # Create electron selection mask
+    key, subkey = random.split(key)
+    n_electrons = walkers.shape[1]
+    electron_indices = random.randint(subkey, (walkers.shape[0],), 0, n_electrons)
+    
+    # Create move mask
+    move_mask = (jnp.arange(n_electrons)[None, :] == electron_indices[:, None])
+    
+    # Generate moves only for selected electrons
+    key, subkey = random.split(key)
+    mask_3d = move_mask[:, :, None]
+    proposals = walkers + mask_3d * random.normal(subkey, walkers.shape) * step_size
+    
+    # Compute wavefunction values with mask for fast updates
+    psi_values = ansatz(walkers, params)
+    new_psi_values = ansatz(proposals, params, move_mask)
+    
+    return proposals, psi_values, new_psi_values
+
+def metropolis_hastings(ansatz, walkers, step_size, key, params, move_type="one"):
     """Perform one step of Metropolis-Hastings sampling for quantum wavefunction.
     
     Args:
@@ -25,22 +62,23 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params):
         walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
-        params: contians jastrow_params and linear_coeffs
+        params: contains jastrow_params and linear_coeffs
+        move_type: "all" to move all electrons at once, "one" to move one electron at a time
     
     Returns:
         Tuple containing:
         - new_walkers: New walker configurations after one sampling step
         - acceptance_rate: Fraction of proposals that were accepted
     """
-    # Compute initial wavefunction values with parameters
-    psi_values = ansatz(walkers, params)
+    # Choose move type
+    if move_type == "all":
+        proposals, psi_values, new_psi_values = _all_electron_move(ansatz, walkers, step_size, key, params)
+    elif move_type == "one":
+        proposals, psi_values, new_psi_values = _one_electron_move(ansatz, walkers, step_size, key, params)
+    else:
+        raise ValueError("move_type must be either 'all' or 'one'")
     
-    # Generate proposals (one step)
-    key, subkey = random.split(key)
-    proposals = walkers + random.normal(subkey, walkers.shape) * step_size
-    
-    # Compute acceptance probabilities with parameters
-    new_psi_values = ansatz(proposals, params)
+    # Compute acceptance probabilities
     acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
     
     # Accept or reject
@@ -49,7 +87,8 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params):
     accept_count = jnp.sum(accept_mask)
     
     # Create new walkers without modifying input
-    accept_mask_3d = accept_mask[:, jnp.newaxis, jnp.newaxis]
+    # Reshape accept_mask to match walker dimensions properly
+    accept_mask_3d = accept_mask[:, None, None]  # Shape: (n_walkers, 1, 1)
     new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
     
     # Calculate acceptance rate
@@ -87,7 +126,14 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     
     return walkers
 
-def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=100):
+def burn_in(ansatz, 
+            walkers, 
+            n_steps=2000, 
+            step_size=0.01,
+            key=None, 
+            params=None, 
+            report_interval=100, 
+            move_type="one"):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -111,14 +157,10 @@ def burn_in(ansatz, walkers, n_steps, step_size, key, params, report_interval=10
     start_time = time.time()
     for step in range(n_steps):
         key, subkey = random.split(key)
-        walkers, alpha_acceptance = metropolis_hastings(
-            ansatz, walkers, step_size, subkey, params)
+        walkers, acceptance = metropolis_hastings(
+            ansatz, walkers, step_size, subkey, params, move_type=move_type)
         
-        key, subkey = random.split(key)
-        walkers, beta_acceptance = metropolis_hastings(
-            ansatz, walkers, step_size, subkey, params)
-        
-        acceptance_history.append((alpha_acceptance + beta_acceptance) / 2)
+        acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
             print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]:.3f}, time: {time.time() - start_time:.2f}s")
@@ -261,7 +303,9 @@ def sample(
     initial_walkers=None,
     use_importance_sampling: bool = False,  # New parameter to toggle importance sampling
     params=None,
-    key=None
+    key=None,
+    move_type: str = "one",  # New parameter to specify move type
+    report_interval: int = 100
 ) -> Dict[str, Any]:
     """Perform MCMC sampling for quantum wavefunction.
     
@@ -287,17 +331,23 @@ def sample(
     # Initialize walkers
     walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
+    print("Starting production sampling...")
+    print(f"Burn-in steps = {burn_in_steps}")
+    print(f"Number of walkers = {n_walkers}")
+    print(f"Number of steps = {n_steps}")
+    print(f"Thinning factor = {thinning}")
+    print(f"Step size = {step_size:.4f}")
+    print(f"Using importance sampling: {use_importance_sampling}")
+    print(f"Move type: {move_type}")
     # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
             ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, params)
+            ansatz, walkers, burn_in_steps, step_size, key=key, params=params, move_type=move_type)
     
     
-    if burn_in_steps > 0:
-        print("Starting production sampling...")
     
     # Storage for collected samples
     collected_samples = []
@@ -314,7 +364,7 @@ def sample(
                 ansatz, walkers, step_size, subkey, params)
         else:
             walkers, acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, params)
+                ansatz, walkers, step_size, subkey, params, move_type=move_type)
             
         acceptance_history.append(acceptance)
         
@@ -327,9 +377,10 @@ def sample(
         
         
         # Print progress occasionally
-        if step % 100 == 0 or step == n_steps - 1:
+        if step % report_interval == 0 or step == n_steps - 1:
             step_time = time.time() - start_time
             step_times.append(step_time)
+            print(f"Batch mean energy: {jnp.mean(energies):.6f}")
             report_progress(step, n_steps, acceptance_history, step_times, 
                            collected_energies if collected_energies else None)
             start_time = time.time()
@@ -353,8 +404,9 @@ def optimize(
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
     opt_kwargs: Optional[Dict[str, Any]] = None,
-    params=None, # Combined params: [jastrow_params, linear_coeffs]
-    frozen_params=None  # Parameter freezing identifiers for Jastrow part
+    params=None,
+    frozen_params=None,
+    move_type: str = "one"  # Add move_type parameter with default
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -403,7 +455,7 @@ def optimize(
             ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, params)
+            ansatz, walkers, burn_in_steps, step_size, key, params, move_type=move_type)
     
     print("Starting optimization...")
     
@@ -488,44 +540,47 @@ def optimize(
                 ansatz, walkers, step_size, subkey, params)
         else:
             walkers, acceptance = metropolis_hastings(
-                ansatz, walkers, step_size, subkey, params)
-            
-        # Update walkers using KFAC if applicable
-        if optimizer_type.lower() == "kfac":
-            key, subkey_step = random.split(key)
-            # KFAC's step function computes gradients internally and updates params
-            params, opt_state, stats = optimizer.step(
-                params, opt_state, subkey_step, batch=(walkers, None), global_step_int=opt_step
-            )
-            
-            current_batch_cost = stats['loss']
-            current_batch_mean_energy, current_batch_energy_variance = stats['aux']
-        else:
-            (cost_val, (mean_energy_val, var_e_val)), grads = value_and_grad_fn(params, walkers)
-            current_batch_cost = cost_val
-            current_batch_mean_energy = mean_energy_val
-            current_batch_energy_variance = var_e_val
-            
-            if gradient_mask is not None:
-                # Zero out gradients for frozen parameters
-                grads = jax.tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
-                                   grads, gradient_mask)
-            
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            
-        # Create materialized copies of parameters for history storage
-        params_copy = jax.tree_map(lambda x: jax.device_get(x), params)
-        params_history.append(params_copy)
-        losses.append(float(current_batch_mean_energy))  # Convert to Python float
-        acceptances.append(float(acceptance))  # Convert to Python float
+                ansatz, walkers, step_size, subkey, params, move_type=move_type)
+
+        if opt_step % n_steps == 0:    
+            # Update walkers using KFAC if applicable
+            if optimizer_type.lower() == "kfac":
+                key, subkey_step = random.split(key)
+                # KFAC's step function computes gradients internally and updates params
+                params, opt_state, stats = optimizer.step(
+                    params, opt_state, subkey_step, batch=(walkers, None), global_step_int=opt_step
+                )
+
+                current_batch_cost = stats['loss']
+                current_batch_mean_energy, current_batch_energy_variance = stats['aux']
+            else:
+                (cost_val, (mean_energy_val, var_e_val)), grads = value_and_grad_fn(params, walkers)
+                current_batch_cost = cost_val
+                current_batch_mean_energy = mean_energy_val
+                current_batch_energy_variance = var_e_val
+
+                if gradient_mask is not None:
+                    # Zero out gradients for frozen parameters
+                    grads = tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
+                                       grads, gradient_mask)
+
+                updates, opt_state = optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+            # Create materialized copies of parameters for history storage
+            params_copy = tree_map(lambda x: jax.device_get(x), params)
+            params_history.append(params_copy)
+
+            losses.append(float(current_batch_mean_energy))  # Convert to Python float
+            acceptances.append(float(acceptance))  # Convert to Python float
         
-        step_time = time.time() - start_time
-        print(f"Step: {opt_step}, Cost: {float(current_batch_cost):.6f}, "
-              f"Mean E (hist): {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
-              f"Batch Var E: {current_batch_energy_variance:.6f}, "
-              f"Acceptance: {acceptance:.3f}, "
-              f"Time: {step_time:.2f}s")
+            step_time = time.time() - start_time
+            start_time = time.time()
+            print(f"Step: {opt_step}, Cost: {float(current_batch_cost):.6f}, "
+                  f"Mean E (hist): {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
+                  f"Batch Var E: {current_batch_energy_variance:.6f}, "
+                  f"Acceptance: {acceptance:.3f}, "
+                  f"Time: {step_time:.2f}s")
         
     opt_history["energies"] = jnp.asarray(losses)
     opt_history["params"] = params_history
@@ -549,6 +604,7 @@ def optimize_ref_var(
     n_opt_steps: int = 100,
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
+    move_type: str = "one",  # "all" or "one" electron move
     opt_kwargs: Optional[Dict[str, Any]] = None,
     params=None, # Combined params: [jastrow_params, linear_coeffs]
     frozen_params=None  # Parameter freezing identifiers for Jastrow part
@@ -625,7 +681,7 @@ def optimize_ref_var(
 
     # Burn-in walkers using the initial combined parameters
     walkers, acceptance_history, key, step_size = burn_in(
-        ref_det, walkers, burn_in_steps, step_size, key, params)
+        ref_det, walkers, burn_in_steps, step_size, key, params=params, move_type=move_type)
 
     print("Starting optimization...")
     params_history = []
@@ -688,7 +744,7 @@ def optimize_ref_var(
             key, subkey_mcmc = random.split(key)
             current_acceptance_rate = 0.0
             walkers, current_acceptance_rate = metropolis_hastings(
-                ref_det, walkers, step_size, subkey_mcmc, params)
+                ref_det, walkers, step_size, subkey_mcmc, params, move_type=move_type)
             acceptances.append(current_acceptance_rate)
 
             # Create materialized copies of parameters for history storage
@@ -699,7 +755,7 @@ def optimize_ref_var(
                     return np.array(jax.device_get(x))
                 return x
                 
-            params_copy = jax.tree_map(materialize_and_get, params)
+            params_copy = tree_map(materialize_and_get, params)
             
             params_history.append(params_copy)
             losses.append(float(current_batch_cost))
@@ -707,8 +763,7 @@ def optimize_ref_var(
 
             step_time_val = time.time() - start_time # Corrected variable name
             print(f"Step: {opt_step}, Var: {float(current_batch_cost):.6f}, E_mean: {float(current_batch_ref_e):.6f}+\-{float(current_batch_std_e):.6f}, "
-                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s, "
-                  f"atom 0: rc: {float(params[0][0]['rc'][0]):.6f}, X4: {float(params[0][0]['X4'][0]):.6f},")
+                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s ")
 
             start_time = time.time()
 
