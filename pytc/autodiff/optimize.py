@@ -118,28 +118,12 @@ def create_test_system(basis):
     mf.kernel()
     return mol, mf
 
-class REXP(jastrow.Jastrow):
-    def __init__(self, epsilon=1e-12):
-        super().__init__()
-        self.epsilon = epsilon
-        
-    def _safe_norm(self, x):
-        """Compute norm with a small epsilon to prevent division by zero."""
-        return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
-    
-    def _compute(self, r1, r2, params):
-        r12 = r1-r2
-        r12_norm = self._safe_norm(r12)
-        return 0.5*jnp.exp(-params[0] * r12_norm) * r12_norm
-
-    def __call__(self, r1, r2):
-        return super().__call__(r1, r2)
 
 def do_ccsd(params, basis):
     # Create new system with cc-pVTZ basis
     mol, mf = create_test_system('ccpvtz')
     
-    my_jastrow = REXP()  # Remove params from constructor
+    my_jastrow = jastrow.REXP()  # Remove params from constructor
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
     eris = myxtc.make_eris(params)  # Pass params explicitly
     from pyscf.cc import rccsd
@@ -162,7 +146,7 @@ def main():
 
     
     init_params = jnp.array([0.5], dtype=jnp.float64)
-    my_jastrow = REXP()  # Remove params from constructor
+    my_jastrow = jastrow.REXP()  # Remove params from constructor
     
     # Run optimization with smaller learning rate
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
