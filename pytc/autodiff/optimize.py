@@ -166,7 +166,7 @@ def main():
                                           n_steps=20)
         print(f"{opt_name} optimized parameters:", optimized_params)
     
-    assert np.isclose(optimized_params['alpha'], 0.37550687, atol=1e-5)
+    assert np.isclose(optimized_params['alpha'][0], 0.37550687, atol=1e-5)
     
     do_ccsd(optimized_params, 'ccpvtz')
 
