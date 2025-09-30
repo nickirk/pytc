@@ -2,6 +2,7 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)  # Enable float64 support
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import optax  # JAX's optimization library
 from functools import partial
 from pytc.autodiff import jastrow
@@ -10,7 +11,7 @@ from pyscf import gto, scf
 
 def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learning_rate=1e-3, opt_file='opt_data.npz'):
     """Optimize Jastrow parameters using advanced optimizers with adaptive learning rate."""
-    params = jnp.asarray(init_params, dtype=jnp.float64)
+    params = init_params.copy()
     
     # Add learning rate schedule parameters
     current_lr = learning_rate
@@ -62,10 +63,11 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
     
     for step in range(n_steps):
         loss_val, grads = jax.value_and_grad(loss_fn)(params)
-        grad_norm = jnp.linalg.norm(grads)
+        flat_grads, _ = jtu.tree_flatten(grads)
+        grad_norm = jnp.linalg.norm(jnp.concatenate([jnp.ravel(g) for g in flat_grads]))
         
-        # Check for NaN gradients
-        if jnp.any(jnp.isnan(grads)):
+        # Check for NaN gradients using tree flattening
+        if any(jnp.any(jnp.isnan(g)) for g in flat_grads):
             print(f"Warning: NaN gradients at step {step}")
             break
             
@@ -112,7 +114,7 @@ def optimize_jastrow(xtc, init_params, n_steps=50, optimizer_name='adam', learni
 
 def create_test_system(basis):
     """Create a test Be atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
+    mol = gto.M(atom='He 0 0 0;', basis=basis, unit='Bohr')
     mol.incore_anyway = True
     mf = scf.RHF(mol)
     mf.kernel()
@@ -121,7 +123,7 @@ def create_test_system(basis):
 
 def do_ccsd(params, basis):
     # Create new system with cc-pVTZ basis
-    mol, mf = create_test_system('ccpvtz')
+    mol, mf = create_test_system('ccpvdz')
     
     my_jastrow = jastrow.REXP()  # Remove params from constructor
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
@@ -142,11 +144,11 @@ def do_ccsd(params, basis):
 def main():
     """Example usage with He atom."""
     # Create test system
-    mol, mf = create_test_system('ccpvtz')
+    mol, mf = create_test_system('ccpvdz')
 
     
-    init_params = jnp.array([0.5], dtype=jnp.float64)
     my_jastrow = jastrow.REXP()  # Remove params from constructor
+    init_params = my_jastrow.init_params()  # Initialize parameters
     
     # Run optimization with smaller learning rate
     myxtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
