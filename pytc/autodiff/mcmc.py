@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import optax
 import kfac_jax
 import time
+from jax.tree_util import tree_map
 from jax import random, value_and_grad
 from jax.lax import stop_gradient
 from typing import Dict, Any, Optional
@@ -560,14 +561,14 @@ def optimize(
 
                 if gradient_mask is not None:
                     # Zero out gradients for frozen parameters
-                    grads = jax.tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
+                    grads = tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
                                        grads, gradient_mask)
 
                 updates, opt_state = optimizer.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
 
             # Create materialized copies of parameters for history storage
-            params_copy = jax.tree_map(lambda x: jax.device_get(x), params)
+            params_copy = tree_map(lambda x: jax.device_get(x), params)
             params_history.append(params_copy)
 
             losses.append(float(current_batch_mean_energy))  # Convert to Python float
@@ -754,7 +755,7 @@ def optimize_ref_var(
                     return np.array(jax.device_get(x))
                 return x
                 
-            params_copy = jax.tree_map(materialize_and_get, params)
+            params_copy = tree_map(materialize_and_get, params)
             
             params_history.append(params_copy)
             losses.append(float(current_batch_cost))
