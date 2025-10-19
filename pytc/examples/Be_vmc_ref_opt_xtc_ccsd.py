@@ -117,7 +117,7 @@ def main():
         n_steps=n_samples,
         step_size=step_size,
         burn_in_steps=burn_in_steps,
-        use_importance_sampling=True,
+        use_importance_sampling=False,
         key=key
     )
 

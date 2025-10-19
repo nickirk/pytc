@@ -92,7 +92,7 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params, move_type="one"
     new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
     
     # Calculate acceptance rate
-    acceptance_rate = float(accept_count) / walkers.shape[0]
+    acceptance_rate = accept_count / walkers.shape[0]
     
     return new_walkers, acceptance_rate
 
@@ -253,7 +253,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
     
     # Calculate acceptance rate
-    acceptance_rate = float(accept_count) / walkers.shape[0]
+    acceptance_rate = accept_count / walkers.shape[0]
     
     return new_walkers, acceptance_rate
 
