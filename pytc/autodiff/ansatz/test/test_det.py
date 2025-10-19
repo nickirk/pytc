@@ -334,7 +334,50 @@ class TestSlaterDet(unittest.TestCase):
         # Values should be different
         val_normal = det_normal.value(self.water_coords)
         val_excited = det_excited.value(self.water_coords)
-        self.assertNotEqual(val_normal, val_excited)        
+        self.assertNotEqual(val_normal, val_excited)
+
+    def test_parallel_det_speedup(self):
+        """Test that parallel determinant evaluation with threading."""
+        import time
+        import os
+        from pytc.lib import np_helper
+        
+        # Skip if CPU count is too low
+        cpu_count = os.cpu_count()
+        if cpu_count is None or cpu_count < 4:
+            self.skipTest("Need at least 4 CPU cores for meaningful parallel test")
+        
+        # Create a large batch of random matrices
+        batch_size = 100_000
+        matrix_size = 50
+        rng = np.random.default_rng(42)
+        matrices = rng.normal(size=(batch_size, matrix_size, matrix_size))
+        
+        # Warm up
+        _ = np_helper.batched_det(matrices[:100], parallel=True)
+        
+        # Time with 1 thread (serial)
+        start = time.perf_counter()
+        det_serial = np_helper.batched_det(matrices, parallel=False)
+        time_1_thread = time.perf_counter() - start
+        
+        # Time with 8 threads (parallel)
+        start = time.perf_counter()
+        det_parallel = np_helper.batched_det(matrices, parallel=True)
+        time_8_threads = time.perf_counter() - start
+        
+        # Verify results match
+        np.testing.assert_allclose(det_serial, det_parallel, rtol=1e-10, atol=1e-12)
+        
+        # Check speedup
+        speedup = time_1_thread / time_8_threads
+        print(f"\n1 thread:  {time_1_thread:.3f}s")
+        print(f"8 threads: {time_8_threads:.3f}s")
+        print(f"Speedup:   {speedup:.2f}x")
+        
+        # Parallel should be at least as fast (may not be much faster due to BLAS threading)
+        self.assertLessEqual(time_8_threads, time_1_thread * 1.1, 
+                            f"8 threads slower than 1 thread: {speedup:.2f}x")
 
 if __name__ == '__main__':
     unittest.main()

@@ -561,7 +561,7 @@ def optimize(
 
                 if gradient_mask is not None:
                     # Zero out gradients for frozen parameters
-                    grads = tree_map(lambda g, m: jnp.zeros_like(g) if not m else g, 
+                    grads = tree_map(lambda g, m: jnp.where(m, g, jnp.zeros_like(g)), 
                                        grads, gradient_mask)
 
                 updates, opt_state = optimizer.update(grads, opt_state, params)
