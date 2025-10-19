@@ -190,6 +190,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             use_adaptive_momentum=merged_kwargs.get("use_adaptive_momentum", True),
             use_adaptive_damping=merged_kwargs.get("use_adaptive_damping", True),
             initial_damping=merged_kwargs.get("initial_damping", 1.0),
+            num_burnin_steps=merged_kwargs.get("num_burnin_steps", 0),  # Set to 0 by default to avoid requiring data_iterator
             multi_device=merged_kwargs.get("multi_device", False),
         )
     elif optimizer_type.lower() == "adam":
