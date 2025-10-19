@@ -54,6 +54,33 @@ class BoysHandy(Jastrow):
             self.terms_per_nucleus = [default_terms_for_one_nucleus for _ in range(self.natom)]
         else:
             self.terms_per_nucleus = terms_per_nucleus
+
+        term_lengths = tuple(len(nucleus_terms) for nucleus_terms in self.terms_per_nucleus)
+        if len(term_lengths) > 0 and len(set(term_lengths)) != 1:
+            raise ValueError("BoysHandy requires the same number of terms per nucleus when using JAX scans.")
+
+        self.n_terms = term_lengths[0] if term_lengths else 0
+
+        term_m = []
+        term_n = []
+        term_o = []
+        for nucleus_terms in self.terms_per_nucleus:
+            term_m.append([term.m for term in nucleus_terms])
+            term_n.append([term.n for term in nucleus_terms])
+            term_o.append([term.o for term in nucleus_terms])
+
+        if self.n_terms > 0:
+            self._term_m = jnp.array(term_m, dtype=jnp.int32)
+            self._term_n = jnp.array(term_n, dtype=jnp.int32)
+            self._term_o = jnp.array(term_o, dtype=jnp.int32)
+            self._delta_factor = jnp.where(self._term_m == self._term_n, 0.5, 1.0)
+            self._cusp_mask = (self._term_m == 0) & (self._term_n == 0) & (self._term_o == 1)
+        else:
+            self._term_m = jnp.zeros((0, 0), dtype=jnp.int32)
+            self._term_n = jnp.zeros((0, 0), dtype=jnp.int32)
+            self._term_o = jnp.zeros((0, 0), dtype=jnp.int32)
+            self._delta_factor = jnp.zeros((0, 0))
+            self._cusp_mask = jnp.zeros((0, 0), dtype=bool)
             
     def _safe_norm(self, x):
         """Compute norm with a small epsilon to prevent division by zero."""
@@ -109,53 +136,42 @@ class BoysHandy(Jastrow):
         def nucleus_scan_fn(carry, nucleus_data):
             """Scan function for looping over nuclei."""
             u_total = carry
-            I, nuclear_pos_I, b_I, d_I, c_I = nucleus_data
+            nuclear_pos_I, b_I, d_I, c_I, term_m_I, term_n_I, term_o_I, delta_factor_I, cusp_mask_I = nucleus_data
             
             # Compute scaled distances for this nucleus
             r1I = self._scaled_r_en(r1, nuclear_pos_I, b_I)
             r2I = self._scaled_r_en(r2, nuclear_pos_I, b_I)
             r12 = self._scaled_r_ee(r1, r2, d_I)
-            
-            def term_scan_fn(carry_inner, term_data):
-                """Scan function for looping over terms within a nucleus."""
-                u_nucleus = carry_inner
-                k, term_m, term_n, term_o = term_data
-                
-                # Check if this is a cusp term
-                is_cusp = (term_m == 0) & (term_n == 0) & (term_o == 1)
-                
-                # Compute factor
-                delta_factor = self._delta(term_m, term_n)
-                factor = jnp.where(is_cusp, 
-                                 delta_factor * 0.5,
-                                 delta_factor * c_I[k])
-                
-                # Compute u_term
-                u_term = jnp.where(is_cusp,
-                                 r12**term_o,
-                                 (r1I**term_m * r2I**term_n + 
-                                  r2I**term_m * r1I**term_n) * r12**term_o)
-                
-                u_nucleus += factor * u_term
-                return u_nucleus, None
-            
-            # Prepare term data for this nucleus
-            nucleus_terms = self.terms_per_nucleus[I]
-            term_indices = jnp.arange(len(nucleus_terms))
-            term_m = jnp.array([term.m for term in nucleus_terms])
-            term_n = jnp.array([term.n for term in nucleus_terms])
-            term_o = jnp.array([term.o for term in nucleus_terms])
-            term_data = (term_indices, term_m, term_n, term_o)
-            
-            # Scan over terms for this nucleus
-            u_nucleus, _ = jax.lax.scan(term_scan_fn, 0.0, term_data)
-            u_total += u_nucleus
-            
+
+            r1I_pow_m = jnp.power(r1I, term_m_I)
+            r2I_pow_n = jnp.power(r2I, term_n_I)
+            r1I_pow_n = jnp.power(r1I, term_n_I)
+            r2I_pow_m = jnp.power(r2I, term_m_I)
+            r12_pow_o = jnp.power(r12, term_o_I)
+
+            non_cusp_terms = (r1I_pow_m * r2I_pow_n + r2I_pow_m * r1I_pow_n) * r12_pow_o
+            cusp_terms = r12_pow_o
+            u_terms = jnp.where(cusp_mask_I, cusp_terms, non_cusp_terms)
+
+            cusp_factor = delta_factor_I * 0.5
+            non_cusp_factor = delta_factor_I * c_I
+            factor = jnp.where(cusp_mask_I, cusp_factor, non_cusp_factor)
+
+            u_total += jnp.sum(factor * u_terms)
             return u_total, None
 
         # Prepare nucleus data
-        nucleus_indices = jnp.arange(self.natom)
-        nucleus_data = (nucleus_indices, self.nuclear_pos, b, d, c)
+        nucleus_data = (
+            self.nuclear_pos,
+            b,
+            d,
+            c,
+            self._term_m,
+            self._term_n,
+            self._term_o,
+            self._delta_factor,
+            self._cusp_mask,
+        )
         
         # Scan over nuclei
         u_total, _ = jax.lax.scan(nucleus_scan_fn, 0.0, nucleus_data)
