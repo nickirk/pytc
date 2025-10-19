@@ -3,6 +3,7 @@
 
 ## Dependencies
 - numpy
+- numba (optional: JIT compilation for heavy numerical functions on CPU)
 - scipy
 - unittest
 - jax (autodiff and GPU acceleration)

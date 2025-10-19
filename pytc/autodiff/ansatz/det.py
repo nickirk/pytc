@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from pyscf.dft import numint
+from pytc.lib import np_helper
 
 einsum = partial(np.einsum, optimize=True)
 
@@ -367,8 +368,8 @@ class SlaterDet:
         
         # Always compute full determinant
         slater_up, slater_down = self.matrix(coords_batch)
-        det_up = np.linalg.det(slater_up)
-        det_down = np.linalg.det(slater_down)
+        det_up = np_helper.batched_det(slater_up)
+        det_down = np_helper.batched_det(slater_down)
         values = det_up * det_down
         
         return float(values[0]) if is_single else values
