@@ -44,3 +44,11 @@ gpu = [
 
 [project.urls]
 Homepage = "https://github.com/nickirk/pytc"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pytc*"]
+exclude = ["logs*", "*.tests", "*.tests.*", "tests.*", "tests"]
+
+[tool.setuptools.package-data]
+pytc = ["py.typed"]

@@ -117,7 +117,7 @@ def main():
         n_steps=n_samples,
         step_size=step_size,
         burn_in_steps=burn_in_steps,
-        use_importance_sampling=True,
+        use_importance_sampling=False,
         key=key
     )
 
@@ -183,6 +183,7 @@ def do_ccsd(mf, jastrow_factor, params):
     tc_e_hf += -(tc_e_dir + tc_e_ex) + eris.e_core 
     print("Check xtc e_hf = ",  tc_e_hf)
     print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
+    print("Ref exact ground state energy =", -14.6673)
 
 if __name__ == "__main__":
     main()
