@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def build_h10_chain(separation=1.5, basis='cc-pvdz', unit='Angstrom'):
+def build_mol(separation=1.5, basis='cc-pvdz', unit='Angstrom'):
     """
     Build a linear H10 chain molecule.
     
@@ -146,9 +146,17 @@ def construct_iao(mol, mf, minao='minao'):
     """
     Construct Intrinsic Atomic Orbitals (IAO) from converged RHF molecular orbitals.
     
-    IAOs are localized atomic-like orbitals that span the occupied space and are
-    orthogonal to each other. They provide a chemically intuitive basis for 
+    IAOs are localized atomic-like orbitals that span the occupied space. This function
+    returns orthogonalized IAOs using Löwdin orthogonalization, which are suitable for
     fragment-based quantum embedding calculations.
+    
+    Note: Raw IAOs are non-orthogonal by design (they preserve maximal atomic character).
+    We apply Löwdin orthogonalization: C_orth = C (C^T S C)^{-1/2} to obtain orthonormal
+    IAOs while maintaining reasonable localization.
+    
+    IAO labels include both CORE and VALENCE orbitals:
+    - For second-row atoms (C, N, O, etc.): 1s (core), 2s and 2p (valence)
+    - For hydrogen: 1s (valence)
     
     Parameters
     ----------
@@ -162,9 +170,10 @@ def construct_iao(mol, mf, minao='minao'):
     Returns
     -------
     iao_coeff : np.ndarray
-        IAO coefficients in AO basis, shape (nao, niao)
+        Orthogonalized IAO coefficients in AO basis, shape (nao, niao)
     iao_labels : list
-        Labels for each IAO indicating which atom it belongs to
+        Labels for each IAO in format "atom_idx atom_symbol orbital_type"
+        Example: "0 O 1s", "0 O 2s", "1 H 1s"
     """
     logger.info("\n" + "="*60)
     logger.info("Step 3: Constructing Intrinsic Atomic Orbitals (IAO)")
@@ -179,46 +188,76 @@ def construct_iao(mol, mf, minao='minao'):
     logger.info(f"  Minimal basis: {minao}")
     logger.info(f"  Number of occupied MOs: {nocc}")
     
-    # Build IAOs - these span the occupied space
-    iao_coeff = lo.iao.iao(mol, mo_coeff_occ, minao=minao)
+    # Build IAOs - these span the occupied space (non-orthogonal)
+    iao_coeff_raw = lo.iao.iao(mol, mo_coeff_occ, minao=minao)
     
-    # For H10, each H atom contributes 1 IAO (from 1s minimal basis)
-    # Total of 10 IAOs for 10 H atoms
-    # Create labels: first 5 are occupied IAOs, next 5 are virtual IAOs
-    # (IAO also constructs virtual IAOs orthogonal to occupied ones)
-    niao = iao_coeff.shape[1]
+    niao = iao_coeff_raw.shape[1]
+    
+    # Orthogonalize IAOs using Löwdin orthogonalization
+    # C_orth = C (C^T S C)^{-1/2}
+    # This maintains reasonable localization while ensuring orthonormality
+    S = mol.intor('int1e_ovlp')
+    iao_overlap = iao_coeff_raw.T @ S @ iao_coeff_raw
+    
+    # Import orth module for Löwdin orthogonalization
+    from pyscf.lo import orth
+    lowdin_transform = orth.lowdin(iao_overlap)
+    iao_coeff = iao_coeff_raw @ lowdin_transform
+    
+    # Verify orthonormality
+    S_iao_orth = iao_coeff.T @ S @ iao_coeff
+    max_off_diag = np.max(np.abs(S_iao_orth - np.diag(np.diag(S_iao_orth))))
+    logger.info(f"  IAO orthogonalization: max off-diagonal = {max_off_diag:.2e}")
+    
+    # Use reference_mol to get IAO labels directly from PySCF
+    # This is more reliable than overlap-based methods
+    pmol = lo.iao.reference_mol(mol, minao=minao)
+    iao_labels_raw = pmol.ao_labels()
+    
+    # Validate that the number of IAOs matches the number of labels
+    if len(iao_labels_raw) != niao:
+        error_msg = (f"Mismatch between number of IAOs ({niao}) and "
+                    f"number of labels from reference_mol ({len(iao_labels_raw)})")
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    # Parse the labels to extract atom index, symbol, and orbital type
+    # Format: '0 O 1s' -> atom_idx=0, atom_symbol='O', orbital_type='1s'
     iao_labels = []
-    
-    # For each IAO, determine which atom it belongs to by checking overlap
-    s = mol.intor('int1e_ovlp')
-    for iao_idx in range(niao):
-        iao_vec = iao_coeff[:, iao_idx]
-        # Compute <iao | S | ao> for each AO
-        overlap_with_aos = s @ iao_vec
-        
-        # Find which atom this IAO is most localized on
-        max_overlap_atom = -1
-        max_overlap = 0.0
-        for iatom in range(mol.natm):
-            atom_label = mol.atom_symbol(iatom)
-            # Get AOs for this atom
-            ao_labels = mol.ao_labels()
-            atom_overlap = 0.0
-            for ao_idx, ao_label in enumerate(ao_labels):
-                if f'{atom_label}{iatom}' in ao_label:
-                    atom_overlap += np.abs(iao_vec[ao_idx])**2
-            
-            if atom_overlap > max_overlap:
-                max_overlap = atom_overlap
-                max_overlap_atom = iatom
-        
-        atom_symbol = mol.atom_symbol(max_overlap_atom)
-        iao_labels.append(f'{atom_symbol}{max_overlap_atom}_IAO{iao_idx}')
+    for i, label in enumerate(iao_labels_raw):
+        # The label format is: 'atom_idx atom_symbol orbital_type'
+        parts = label.split()
+        if len(parts) >= 3:
+            atom_idx = int(parts[0])
+            atom_symbol = parts[1]
+            orbital_type = parts[2]
+            iao_labels.append(f"{atom_idx} {atom_symbol} {orbital_type}")
+        else:
+            # Fallback if label format is unexpected
+            logger.warning(f"Unexpected label format for IAO {i}: {label}")
+            iao_labels.append(label)
     
     logger.info(f"\nIAO construction completed:")
     logger.info(f"  Number of IAOs: {niao}")
     logger.info(f"  IAO dimensions: {iao_coeff.shape}")
-    logger.info(f"  IAO labels: {iao_labels}")
+    logger.info(f"  IAOs are orthonormalized using Löwdin method")
+    logger.info(f"  IAO labels (first 10): {iao_labels[:10]}")
+    if niao > 10:
+        logger.info(f"  ... (total {niao} IAOs)")
+    
+    # Log information about core vs valence orbitals
+    # Core orbitals: 1s for second-row atoms (C, N, O, F, etc.), not H
+    core_count = 0
+    for label in iao_labels:
+        parts = label.split()
+        if len(parts) >= 3:
+            atom_symbol = parts[1]
+            orbital_type = parts[2]
+            # 1s is core for non-hydrogen atoms
+            if orbital_type == '1s' and atom_symbol != 'H':
+                core_count += 1
+    valence_count = niao - core_count
+    logger.info(f"  Core orbitals: {core_count}, Valence orbitals: {valence_count}")
     logger.info("="*60 + "\n")
     
     return iao_coeff, iao_labels
@@ -314,13 +353,17 @@ def construct_local_active_space(mol, mf, iao_coeff, iao_labels, fragment_size=1
         logger.info(f"Fragment {frag_idx}: Atoms {frag_atoms}")
         logger.info(f"{'='*60}")
         
-        # Get IAO indices for this fragment by matching atom labels
+        # Get IAO indices for this fragment by matching atom indices
+        # New label format: "atom_idx atom_symbol orbital_type" (e.g., "0 O 1s")
         frag_iao_indices = []
         for iatom in frag_atoms:
-            atom_label = mol.atom_symbol(iatom)
             for i, label in enumerate(iao_labels):
-                if f'{atom_label}{iatom}' in label:
-                    frag_iao_indices.append(i)
+                # Parse label to get atom index
+                parts = label.split()
+                if len(parts) >= 3:
+                    label_atom_idx = int(parts[0])
+                    if label_atom_idx == iatom:
+                        frag_iao_indices.append(i)
         
         logger.info(f"Fragment IAO indices: {frag_iao_indices}")
         logger.info(f"Number of fragment IAOs: {len(frag_iao_indices)}")
@@ -410,26 +453,39 @@ def construct_local_active_space(mol, mf, iao_coeff, iao_labels, fragment_size=1
             n_ext_virt = nvirt
             logger.info(f"\nNo virtual IAOs in fragment - all {nvirt} virtual orbitals are external")
         
-        # Transform W matrices from MO basis back to AO basis
-        # W_AO = C_MO @ W_MO
-        C_mo_occ = C_mo[:, :nocc]  # (nao, nocc)
-        C_mo_virt = C_mo[:, nocc:]  # (nao, nvirt)
-        
-        W_occ = C_mo_occ @ W_occ_MO  # (nao, n_int_occ)
-        W_tilde_occ = C_mo_occ @ W_tilde_occ_MO  # (nao, n_ext_occ)
-        W_virt = C_mo_virt @ W_virt_MO  # (nao, n_int_virt)
-        W_tilde_virt = C_mo_virt @ W_tilde_virt_MO  # (nao, n_ext_virt)
         
         logger.info(f"\nTransformation matrices in AO basis:")
-        logger.info(f"  W_occ shape: {W_occ.shape} - (nao, n_int_occ)")
-        logger.info(f"  W_tilde_occ shape: {W_tilde_occ.shape} - (nao, n_ext_occ)")
-        logger.info(f"  W_virt shape: {W_virt.shape} - (nao, n_int_virt)")
-        logger.info(f"  W_tilde_virt shape: {W_tilde_virt.shape} - (nao, n_ext_virt)")
-        
+        logger.info(f"  W_occ shape: {W_occ_MO.shape} - (nao, n_int_occ)")
+        logger.info(f"  W_tilde_occ shape: {W_tilde_occ_MO.shape} - (nao, n_ext_occ)")
+        logger.info(f"  W_virt shape: {W_virt_MO.shape} - (nao, n_int_virt)")
+        logger.info(f"  W_tilde_virt shape: {W_tilde_virt_MO.shape} - (nao, n_ext_virt)")
+
         logger.info(f"\nActive space summary:")
         logger.info(f"  Atoms: {frag_atoms}")
         logger.info(f"  Active space size: {n_int_occ + n_int_virt} orbitals")
         logger.info(f"    ({n_int_occ} occ + {n_int_virt} virt)")
+        
+        # Determine orbital indices for internal and external spaces
+        # Internal occupied: IAO indices with significant overlap (s > threshold)
+        # External occupied: all other occupied orbitals
+        if U_occ_F.shape[1] > 0:
+            internal_occ = [i for i, mask in enumerate(internal_occ_mask) if mask]
+            # External occupied orbitals are the complement
+            all_occ = list(range(nocc))
+            # Note: in IAO basis, we work with IAO indices, not MO indices
+            # But for tracking, we use the MO-space indexing
+            external_occ = list(range(n_int_occ, nocc))
+        else:
+            internal_occ = []
+            external_occ = list(range(nocc))
+        
+        # Same for virtual
+        if U_virt_F.shape[1] > 0:
+            internal_virt = [i for i, mask in enumerate(internal_virt_mask) if mask]
+            external_virt = list(range(n_int_virt, nvirt))
+        else:
+            internal_virt = []
+            external_virt = list(range(nvirt))
         
         # Store fragment's local space information
         local_space = {
@@ -440,10 +496,14 @@ def construct_local_active_space(mol, mf, iao_coeff, iao_labels, fragment_size=1
             'n_int_virt': n_int_virt,
             'n_ext_occ': n_ext_occ,
             'n_ext_virt': n_ext_virt,
-            'W_occ': W_occ,
-            'W_tilde_occ': W_tilde_occ,
-            'W_virt': W_virt,
-            'W_tilde_virt': W_tilde_virt,
+            'internal_occ': internal_occ,  # Indices in fragment local space
+            'external_occ': external_occ,  # Indices in fragment local space
+            'internal_virt': internal_virt,  # Indices in fragment local space
+            'external_virt': external_virt,  # Indices in fragment local space
+            'W_occ': W_occ_MO,
+            'W_tilde_occ': W_tilde_occ_MO,
+            'W_virt': W_virt_MO,
+            'W_tilde_virt': W_tilde_virt_MO,
         }
         
         local_spaces.append(local_space)
@@ -462,16 +522,15 @@ def construct_local_active_space(mol, mf, iao_coeff, iao_labels, fragment_size=1
     return local_spaces
 
 
-def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e-6, f_iao=None, eri_iao=None):
+def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e-6):
     """
-    Compress external orbital spaces using Local Natural Orbitals (LNOs) from MP2.
+    Compress external spaces using MP2 Local Natural Orbitals (LNOs).
     
-    This implements the LNO-based active space compression in IAO basis:
-    1. Compute MP1 amplitudes with mixed basis: t_{i_F ajb} where i_F are active occupied, a,j,b in IAO basis
-    2. Build MP2 density matrices for each fragment in IAO basis
-    3. Project density matrices into external spaces (Eq. 24)
-    4. Diagonalize to get LNOs and occupation numbers (Eq. 25)
-    5. Truncate based on thresholds eta_occ and eta_virt
+    This function implements MP2-LNO compression as described in the paper:
+    1. Compute MP1 amplitudes using semi-canonical orbitals
+    2. Build MP2 density matrices in external space (occupied and virtual)
+    3. Diagonalize density matrices to obtain LNOs
+    4. Select active LNOs based on eigenvalue thresholds
     
     Parameters
     ----------
@@ -485,60 +544,69 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
         Threshold for occupied LNO eigenvalues (default: 1e-6)
     eta_virt : float, optional
         Threshold for virtual LNO eigenvalues (default: 1e-6)
-    f_iao : np.ndarray
-        Fock matrix in IAO basis, shape (niao, niao)
-    eri_iao : np.ndarray
-        Two-electron integrals in IAO basis, shape (niao, niao, niao, niao)
     
     Returns
     -------
     local_spaces_lno : list of dict
-        Updated local spaces with LNO-compressed external spaces
+        Updated local spaces with LNO-compressed external spaces, including:
+        - 'X_occ', 'X_virt': LNO transformation matrices
+        - 'lno_occ_indices', 'lno_virt_indices': indices of selected active LNOs
+        - 'n_lno_occ', 'n_lno_virt': number of selected LNOs
     """
     logger.info("\n" + "="*60)
-    logger.info("Step 5: Compressing External Spaces with MP2 LNOs (IAO Basis)")
+    logger.info("Step 5: Compressing External Spaces with MP2 LNOs")
     logger.info("="*60)
     
     nocc = mol.nelectron // 2
-    niao = f_iao.shape[0]  # Number of IAOs
-    nvirt = niao - nocc    # Virtual IAOs
+    nmo = mf.mo_coeff.shape[1]
+    nvirt = nmo - nocc
     
     logger.info(f"\nMP2-LNO parameters:")
     logger.info(f"  Occupied threshold (eta_occ): {eta_occ}")
     logger.info(f"  Virtual threshold (eta_virt): {eta_virt}")
-    logger.info(f"  Number of occupied IAOs: {nocc}")
-    logger.info(f"  Number of virtual IAOs: {nvirt}")
-    logger.info(f"  Total IAOs: {niao}")
+    logger.info(f"  Number of occupied MOs: {nocc}")
+    logger.info(f"  Number of virtual MOs: {nvirt}")
+    logger.info(f"  Total MOs: {nmo}")
     
-    # Get IAO energies from diagonal of Fock matrix in IAO basis
-    eps_iao = np.diag(f_iao)  # Diagonal elements are orbital energies
-    eps_occ_iao = eps_iao[:nocc]
-    eps_virt_iao = eps_iao[nocc:]
+    # Get MO energies from mean-field object
+    eps_mo = mf.mo_energy  # All MO energies
+    eps_occ_mo = eps_mo[:nocc]  # Occupied
+    eps_virt_mo = eps_mo[nocc:]  # Virtual
     
-    logger.info(f"\nIAO Fock matrix shape: {f_iao.shape}")
-    logger.info(f"IAO ERI shape: {eri_iao.shape}")
+    logger.info(f"\nMO energies:")
+    logger.info(f"  Occupied: {eps_occ_mo.shape}")
+    logger.info(f"  Virtual: {eps_virt_mo.shape}")
+    
+    # Get ERIs in MO basis using PySCF's ao2mo module
+    # Note: PySCF uses chemist's notation (pq|rs)
+    logger.info(f"\nComputing ERIs in MO basis...")
+    eri_mo = ao2mo.kernel(mol, mf.mo_coeff, compact=False)
+    eri_mo = eri_mo.reshape(nmo, nmo, nmo, nmo)
+    logger.info(f"  ERI shape in MO basis: {eri_mo.shape}")
     
     # Process each fragment
     local_spaces_lno = []
     
     for frag_idx, ls in enumerate(local_spaces):
-        logger.info(f"\n--- Fragment {frag_idx}: LNO Compression (W Basis) ---")
+        logger.info(f"\n--- Fragment {frag_idx}: LNO Compression ---")
         
-        # Get W transformation matrices (these are in AO basis, shape: nao × n_orbitals)
-        W_occ = ls['W_occ']  # (nao, n_int_occ) - internal occupied orbitals
-        W_tilde_occ = ls['W_tilde_occ']  # (nao, n_ext_occ) - external occupied orbitals
-        W_virt = ls['W_virt']  # (nao, n_int_virt) - internal virtual orbitals
-        W_tilde_virt = ls['W_tilde_virt']  # (nao, n_ext_virt) - external virtual orbitals
+        # Get W transformation matrices from MO basis to internal/external spaces
+        # W_occ: (nocc, n_int_occ) - transforms MO occupied to internal occupied
+        # W_tilde_occ: (nocc, n_ext_occ) - transforms MO occupied to external occupied
+        # Similar for virtual
+        W_occ = ls['W_occ']  # (nocc, n_int_occ)
+        W_tilde_occ = ls['W_tilde_occ']  # (nocc, n_ext_occ)
+        W_virt = ls['W_virt']  # (nvirt, n_int_virt)
+        W_tilde_virt = ls['W_tilde_virt']  # (nvirt, n_ext_virt)
         
-        n_int_occ = W_occ.shape[1]
-        n_ext_occ = W_tilde_occ.shape[1]
-        n_int_virt = W_virt.shape[1]
-        n_ext_virt = W_tilde_virt.shape[1]
+        n_int_occ = W_occ.shape[1] if W_occ.size > 0 else 0
+        n_ext_occ = W_tilde_occ.shape[1] if W_tilde_occ.size > 0 else 0
+        n_int_virt = W_virt.shape[1] if W_virt.size > 0 else 0
+        n_ext_virt = W_tilde_virt.shape[1] if W_tilde_virt.size > 0 else 0
         
-        logger.info(f"  W_occ shape: {W_occ.shape} - {n_int_occ} internal occupied")
-        logger.info(f"  W_tilde_occ shape: {W_tilde_occ.shape} - {n_ext_occ} external occupied")
-        logger.info(f"  W_virt shape: {W_virt.shape} - {n_int_virt} internal virtual")
-        logger.info(f"  W_tilde_virt shape: {W_tilde_virt.shape} - {n_ext_virt} external virtual")
+        logger.info(f"  Fragment space dimensions:")
+        logger.info(f"    Internal: {n_int_occ} occ + {n_int_virt} virt")
+        logger.info(f"    External: {n_ext_occ} occ + {n_ext_virt} virt")
         
         # Skip MP2 if no internal occupied orbitals (can't do correlation)
         if n_int_occ == 0:
@@ -547,169 +615,188 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
             ls_lno.update({
                 'n_lno_occ': 0,
                 'n_lno_virt': 0,
-                'lno_occ_mask': np.array([], dtype=bool),
-                'lno_virt_mask': np.array([], dtype=bool),
+                'lno_occ_indices': np.array([], dtype=int),
+                'lno_virt_indices': np.array([], dtype=int),
                 'X_occ': np.eye(n_ext_occ) if n_ext_occ > 0 else np.zeros((0, 0)),
                 'X_virt': np.eye(n_ext_virt) if n_ext_virt > 0 else np.zeros((0, 0)),
-                'Lambda_occ': np.zeros(n_ext_occ),
-                'Lambda_virt': np.zeros(n_ext_virt),
             })
             local_spaces_lno.append(ls_lno)
             continue
         
-        # Transform Fock matrix to W basis for internal occupied orbitals
-        # F_int_occ = W_occ^T @ F_AO @ W_occ
-        h_core = mol.intor('int1e_kin') + mol.intor('int1e_nuc')
-        vhf = mf.get_veff()
-        f_ao = h_core + vhf
+        # Compute energies for internal occupied orbitals from Fock matrix
+        # Transform Fock to internal occupied basis: epsilon_iF = diag(W_occ^T @ F_MO @ W_occ)
+        f_mo = np.diag(eps_mo)  # Fock in MO basis (diagonal for canonical MOs)
+        f_int_occ = W_occ.T @ f_mo[:nocc, :nocc] @ W_occ
+        eps_int_occ = np.diag(f_int_occ)  # epsilon_iF for internal occupied
         
-        F_occ_int = W_occ.T @ f_ao @ W_occ  # (n_int_occ, n_int_occ)
-        eps_int_occ = np.diag(F_occ_int)  # Internal occupied orbital energies
+        logger.info(f"\n  Orbital energies:")
+        logger.info(f"    Internal occupied (epsilon_iF): {eps_int_occ.shape}")
+        logger.info(f"      Mean: {np.mean(eps_int_occ):.6f}, Min: {np.min(eps_int_occ):.6f}, Max: {np.max(eps_int_occ):.6f}")
         
-        logger.info(f"  Transformed Fock to internal occupied basis:")
-        logger.info(f"    F_occ_int shape: {F_occ_int.shape}")
-        logger.info(f"    Internal occupied energies: {eps_int_occ}")
+        # For other indices (i,j,a,b) we use MO energies directly
+        eps_j = eps_occ_mo  # All occupied MO energies
+        eps_a = eps_virt_mo  # All virtual MO energies
+        eps_b = eps_virt_mo  # All virtual MO energies
         
-        # For external occupied and all virtuals, we need energies in AO basis
-        # Get energies by diagonalizing in respective bases
-        if n_ext_occ > 0:
-            F_ext_occ = W_tilde_occ.T @ f_ao @ W_tilde_occ
-            eps_ext_occ = np.diag(F_ext_occ)
-        else:
-            eps_ext_occ = np.array([])
+        # Skip if external spaces are empty
+        if n_ext_occ == 0 or n_ext_virt == 0:
+            logger.info(f"  Skipping MP2: external space insufficient (n_ext_occ={n_ext_occ}, n_ext_virt={n_ext_virt})")
+            ls_lno = ls.copy()
+            ls_lno.update({
+                'n_lno_occ': 0,
+                'n_lno_virt': 0,
+                'lno_occ_indices': np.array([], dtype=int),
+                'lno_virt_indices': np.array([], dtype=int),
+                'X_occ': np.eye(n_ext_occ) if n_ext_occ > 0 else np.zeros((0, 0)),
+                'X_virt': np.eye(n_ext_virt) if n_ext_virt > 0 else np.zeros((0, 0)),
+            })
+            local_spaces_lno.append(ls_lno)
+            continue
         
-        if n_ext_virt > 0:
-            F_ext_virt = W_tilde_virt.T @ f_ao @ W_tilde_virt
-            eps_ext_virt = np.diag(F_ext_virt)
-        else:
-            eps_ext_virt = np.array([])
+        # Step 1: Compute MP1 amplitudes t_{iF,a,j,b}
+        # t_{iF,a,j,b} = V_{iF,a,j,b} / (epsilon_iF + epsilon_j - epsilon_a - epsilon_b)
+        # where V_{iF,a,j,b} is the ERI in mixed basis
         
-        logger.info(f"  External orbital energies computed")
+        logger.info(f"\n  Computing MP1 amplitudes...")
+        logger.info(f"    Transforming ERIs to mixed basis...")
         
-        # Transform ERIs to mixed basis: V_{i_int, a_ext, j_ext, b_ext}
-        # This is the key transformation for MP1 amplitudes
-        logger.info(f"  Transforming ERIs to mixed basis...")
+        # Transform ERIs: V_{iF,a,j,b} = sum_i W_{i,iF} * ERI_{i,a,j,b}
+        # ERIs are in chemist notation: (pq|rs) -> eri_mo[p,q,r,s]
+        # We need: V_{iF,a,j,b} = (iF a | j b) in chemist notation
         
-        # Get ERIs in AO basis
-        eri_ao = mol.intor('int2e', aosym='s1').reshape(mol.nao, mol.nao, mol.nao, mol.nao)
+        # First, transform first occupied index from MO to internal occupied
+        # V_{iF,a,j,b} = sum_i W_occ[i, iF] * eri_mo[i, a+nocc, j, b+nocc]
+        # Shape: (n_int_occ, nvirt, nocc, nvirt)
         
-        # Transform: V_{Iajb} = W_occ^T[I] @ eri_ao @ W_tilde_virt[a] @ W_tilde_occ[j] @ W_tilde_virt[b]
-        # Do this in stages to save memory
-        if n_ext_virt > 0 and n_ext_occ > 0:
-            nao = W_occ.shape[0]
-            # Stage 1: contract first AO index with W_occ
-            # W_occ: (nao, n_int_occ), W_occ.T: (n_int_occ, nao)
-            # eri_ao: (nao, nao, nao, nao)
-            # Contract eri_ao[i,:,:,:] with W_occ[:,I] -> need W_occ.T[I,i]
-            V_temp1 = np.einsum('Ii,ijkl->Ijkl', W_occ.T, eri_ao, optimize=True)  # (n_int_occ, nao, nao, nao)
-            logger.debug(f"    After stage 1: V_temp1 shape = {V_temp1.shape}, expected ({n_int_occ}, {nao}, {nao}, {nao})")
-            # Stage 2: contract second AO index with W_tilde_virt
-            V_temp2 = np.einsum('Ijkl,ja->Iakl', V_temp1, W_tilde_virt, optimize=True)  # (n_int_occ, n_ext_virt, nao, nao)
-            logger.debug(f"    After stage 2: V_temp2 shape = {V_temp2.shape}, expected ({n_int_occ}, {n_ext_virt}, {nao}, {nao})")
-            # Stage 3: contract third AO index with W_tilde_occ
-            V_temp3 = np.einsum('Iakl,kJ->IaJl', V_temp2, W_tilde_occ, optimize=True)  # (n_int_occ, n_ext_virt, n_ext_occ, nao)
-            logger.debug(f"    After stage 3: V_temp3 shape = {V_temp3.shape}, expected ({n_int_occ}, {n_ext_virt}, {n_ext_occ}, {nao})")
-            # Stage 4: contract fourth AO index with W_tilde_virt
-            V_Iajb = np.einsum('IaJl,lb->IaJb', V_temp3, W_tilde_virt, optimize=True)  # (n_int_occ, n_ext_virt, n_ext_occ, n_ext_virt)
-            
-            logger.info(f"    V_Iajb shape: {V_Iajb.shape}, expected ({n_int_occ}, {n_ext_virt}, {n_ext_occ}, {n_ext_virt})")
-            
-            # Compute MP1 amplitudes: t_{Iajb} = V_{Iajb} / (eps_I + eps_j - eps_a - eps_b)
-            eps_I = eps_int_occ[:, None, None, None]  # (n_int_occ, 1, 1, 1)
-            eps_a = eps_ext_virt[None, :, None, None]  # (1, n_ext_virt, 1, 1)
-            eps_j = eps_ext_occ[None, None, :, None]  # (1, 1, n_ext_occ, 1)
-            eps_b = eps_ext_virt[None, None, None, :]  # (1, 1, 1, n_ext_virt)
-            
-            denom = eps_I + eps_j - eps_a - eps_b
-            t_Iajb = np.divide(V_Iajb, denom, where=np.abs(denom) > 1e-10, out=np.zeros_like(V_Iajb))
-            
-            logger.info(f"    MP1 amplitude shape: {t_Iajb.shape}")
-            logger.info(f"    MP1 amplitude norm: {np.linalg.norm(t_Iajb):.6f}")
-        else:
-            t_Iajb = np.zeros((n_int_occ, max(n_ext_virt, 1), max(n_ext_occ, 1), max(n_ext_virt, 1)))
-            logger.info(f"    Skipping ERI transformation: n_ext_virt={n_ext_virt}, n_ext_occ={n_ext_occ}")
+        # Extract occupied-virtual-occupied-virtual block from ERI
+        # eri_mo[i, j, k, l] in chemist notation (ij|kl)
+        # We need (ia|jb) = eri_mo[i, a+nocc, j, b+nocc]
+        eri_oovv = eri_mo[:nocc, nocc:, :nocc, nocc:]  # (nocc, nvirt, nocc, nvirt)
         
-        # Build MP2 density matrices
-        # D_jj' (occupied): sum over I, a, b of t*_{Iajb} * (2*t_{Iaj'b} - t_{Ibj'a})
-        # D_ab (virtual): sum over I, j, c of expressions similar to before
-        logger.info(f"  Building MP2 density matrices...")
+        # Transform first index: (iF a | j b)
+        V_Iajb = np.einsum('iI,iajb->Iajb', W_occ, eri_oovv, optimize=True)
+        logger.info(f"    Transformed ERI shape: {V_Iajb.shape} = ({n_int_occ}, {nvirt}, {nocc}, {nvirt})")
         
-        if n_ext_occ > 0 and n_ext_virt > 0 and n_int_occ > 0:
-            # Occupied density: D_jj' in external occupied space
-            # t_Iajb shape: (n_int_occ, n_ext_virt, n_ext_occ, n_ext_virt)
-            # Index: I=internal occ, a=ext virt, j=ext occ, b=ext virt
-            # D[j,j'] = sum_I,a,b conj(t[I,a,j,b]) * (2*t[I,a,j',b] - t[I,b,j',a])
-            # First term: 2 * sum_{I,a,b} t*[I,a,j,b] * t[I,a,j',b]
-            term1 = np.einsum('Iajb,IaJb->jJ', np.conj(t_Iajb), t_Iajb, optimize=True)
-            # Second term: sum_{I,a,b} t*[I,a,j,b] * t[I,b,j',a]
-            term2 = np.einsum('Iajb,IbJa->jJ', np.conj(t_Iajb), t_Iajb, optimize=True)
-            D_occ = 2.0 * (2.0 * term1 - term2)
-            
-            # Virtual density: D_ab in external virtual space
-            # D[a,a'] = sum_{I,j,b} (2*t*[I,a,j,b]*t[I,a',j,b] - t*[I,b,j,a]*t[I,b,j,a'] 
-            #                        - t*[I,b,j,a]*t[I,a',j,b])
-            # First term: 2 * sum_{I,j,b} t*[I,a,j,b] * t[I,a',j,b]
-            term1 = np.einsum('Iajb,IAjb->aA', np.conj(t_Iajb), t_Iajb, optimize=True)
-            # Second term: sum_{I,j,b} t*[I,b,j,a] * t[I,b,j,a']
-            term2 = np.einsum('Ibja,IbjA->aA', np.conj(t_Iajb), t_Iajb, optimize=True)
-            # Third term: sum_{I,j,b} t*[I,b,j,a] * t[I,a',j,b]
-            term3 = np.einsum('Ibja,IAjb->aA', np.conj(t_Iajb), t_Iajb, optimize=True)
-            D_virt = 2.0 * (2.0 * term1 - term2 - term3)
-            
-            logger.info(f"    D_occ shape: {D_occ.shape}, norm: {np.linalg.norm(D_occ):.6f}")
-            logger.info(f"    D_virt shape: {D_virt.shape}, norm: {np.linalg.norm(D_virt):.6f}")
-        else:
-            D_occ = np.zeros((max(n_ext_occ, 1), max(n_ext_occ, 1)))
-            D_virt = np.zeros((max(n_ext_virt, 1), max(n_ext_virt, 1)))
-            logger.info(f"    Zero density matrices (insufficient orbitals for correlation)")
+        # Compute energy denominators
+        # denom[iF, a, j, b] = eps_iF + eps_j - eps_a - eps_b
+        eps_I = eps_int_occ[:, None, None, None]  # (n_int_occ, 1, 1, 1)
+        eps_a_arr = eps_a[None, :, None, None]  # (1, nvirt, 1, 1)
+        eps_j_arr = eps_j[None, None, :, None]  # (1, 1, nocc, 1)
+        eps_b_arr = eps_b[None, None, None, :]  # (1, 1, 1, nvirt)
         
-        # Diagonalize to get LNOs
-        logger.info(f"  Diagonalizing for LNOs...")
+        denom = eps_I + eps_j_arr - eps_a_arr - eps_b_arr
         
-        if n_ext_occ > 0:
-            Lambda_occ, X_occ = np.linalg.eigh(D_occ)
-            idx_occ = np.argsort(-np.abs(Lambda_occ))
-            Lambda_occ = Lambda_occ[idx_occ]
-            X_occ = X_occ[:, idx_occ]
-            logger.info(f"    Occupied eigenvalues (top 5): {Lambda_occ[:min(5, len(Lambda_occ))]}")
-        else:
-            Lambda_occ = np.array([])
-            X_occ = np.zeros((0, 0))
+        # Compute MP1 amplitudes with safe division
+        t_Iajb = np.divide(V_Iajb, denom, where=np.abs(denom) > 1e-10, out=np.zeros_like(V_Iajb))
         
-        if n_ext_virt > 0:
-            Lambda_virt, X_virt = np.linalg.eigh(D_virt)
-            idx_virt = np.argsort(-np.abs(Lambda_virt))
-            Lambda_virt = Lambda_virt[idx_virt]
-            X_virt = X_virt[:, idx_virt]
-            logger.info(f"    Virtual eigenvalues (top 5): {Lambda_virt[:min(5, len(Lambda_virt))]}")
-        else:
-            Lambda_virt = np.array([])
-            X_virt = np.zeros((0, 0))
+        logger.info(f"    MP1 amplitude shape: {t_Iajb.shape}")
+        logger.info(f"    MP1 amplitude norm: {np.linalg.norm(t_Iajb):.6f}")
+        logger.info(f"    Max amplitude: {np.max(np.abs(t_Iajb)):.6f}")
         
-        # Select LNOs based on thresholds
-        lno_occ_mask = np.abs(Lambda_occ) > eta_occ if len(Lambda_occ) > 0 else np.array([], dtype=bool)
-        lno_virt_mask = np.abs(Lambda_virt) > eta_virt if len(Lambda_virt) > 0 else np.array([], dtype=bool)
+        # Step 2: Build MP2 density matrices
+        # Equation 20a: D_jj'^(F) = 2 * sum_{kF,a,b} t*_{i,a,kF,b} * (2*t_{j,a,kF,b} - t_{j,b,kF,a})
+        # Equation 20b: D_ab^(F) = sum_{iF,j,c} 2*(t*_{iF,a,j,c}*t_{iF,b,j,c} + t*_{iF,c,j,a}*t_{iF,c,j,b})
+        #                                    - (t*_{iF,c,j,a}*t_{iF,b,j,c} + t*_{iF,a,j,c}*t_{iF,c,j,b})
         
-        n_lno_occ = np.sum(lno_occ_mask)
-        n_lno_virt = np.sum(lno_virt_mask)
+        logger.info(f"\n  Building MP2 density matrices...")
         
-        logger.info(f"\n  LNO selection:")
+        # Occupied density: D_jj'^(F) in full occupied MO space
+        # Equation 20a: D_jj' = 2 * sum_{kF,a,b} t*_{kF,a,j,b} * (2*t_{kF,a,j',b} - t_{kF,b,j',a})
+        # t_Iajb has shape (n_int_occ, nvirt, nocc, nvirt) with indices [I=kF, a, j, b]
+        
+        # First term: 2 * sum_{I,a,b} t*[I,a,j,b] * t[I,a,j',b]
+        # Both j and j' index into the nocc dimension (index 2 of t_Iajb)
+        term1_full = 2.0 * np.einsum('Iajb,IaJb->jJ', np.conj(t_Iajb), t_Iajb, optimize=True)
+        
+        # Second term: sum_{I,a,b} t*[I,a,j,b] * t[I,b,j',a]
+        # Note: we swap a<->b in the second tensor
+        term2_full = np.einsum('Iajb,IbJa->jJ', np.conj(t_Iajb), t_Iajb, optimize=True)
+        
+        D_occ_full = 2.0 * (term1_full - term2_full)
+        
+        logger.info(f"    D_occ (full MO) shape: {D_occ_full.shape}")
+        logger.info(f"    D_occ norm: {np.linalg.norm(D_occ_full):.6f}")
+        
+        # Virtual density: D_ab^(F) in full virtual MO space
+        # Equation 20b: D_ab = sum_{iF,j,c} 2*(t*_{iF,a,j,c}*t_{iF,b,j,c} + t*_{iF,c,j,a}*t_{iF,c,j,b})
+        #                                 - (t*_{iF,c,j,a}*t_{iF,b,j,c} + t*_{iF,a,j,c}*t_{iF,c,j,b})
+        # t_Iajb has shape (n_int_occ, nvirt, nocc, nvirt) with indices [I=iF, a, j, b]
+        
+        # First group: 2*(term1 + term2)
+        # term1: sum_{I,j,c} t*[I,a,j,c] * t[I,b,j,c]
+        term1 = np.einsum('Iajc,Ibjc->ab', np.conj(t_Iajb), t_Iajb, optimize=True)
+        # term2: sum_{I,j,c} t*[I,c,j,a] * t[I,c,j,b]
+        term2 = np.einsum('Icja,Icjb->ab', np.conj(t_Iajb), t_Iajb, optimize=True)
+        
+        # Second group: (term3 + term4)
+        # term3: sum_{I,j,c} t*[I,c,j,a] * t[I,b,j,c]
+        term3 = np.einsum('Icja,Ibjc->ab', np.conj(t_Iajb), t_Iajb, optimize=True)
+        # term4: sum_{I,j,c} t*[I,a,j,c] * t[I,c,j,b]
+        term4 = np.einsum('Iajc,Icjb->ab', np.conj(t_Iajb), t_Iajb, optimize=True)
+        
+        D_virt_full = 2.0 * (term1 + term2) - (term3 + term4)
+        
+        logger.info(f"    D_virt (full MO) shape: {D_virt_full.shape}")
+        logger.info(f"    D_virt norm: {np.linalg.norm(D_virt_full):.6f}")
+        
+        # Step 3: Project density matrices to external spaces
+        # D_occ_ext = W_tilde_occ^T @ D_occ_full @ W_tilde_occ
+        # D_virt_ext = W_tilde_virt^T @ D_virt_full @ W_tilde_virt
+        
+        logger.info(f"\n  Projecting to external spaces...")
+        
+        D_occ_ext = W_tilde_occ.T @ D_occ_full @ W_tilde_occ
+        D_virt_ext = W_tilde_virt.T @ D_virt_full @ W_tilde_virt
+        
+        logger.info(f"    D_occ_ext shape: {D_occ_ext.shape}")
+        logger.info(f"    D_virt_ext shape: {D_virt_ext.shape}")
+        
+        # Step 4: Diagonalize density matrices to get LNOs (Equation 25)
+        logger.info(f"\n  Diagonalizing for LNOs...")
+        
+        Lambda_occ, X_occ = np.linalg.eigh(D_occ_ext)
+        # Sort by descending absolute eigenvalue
+        idx_occ = np.argsort(-np.abs(Lambda_occ))
+        Lambda_occ = Lambda_occ[idx_occ]
+        X_occ = X_occ[:, idx_occ]
+        
+        logger.info(f"    Occupied eigenvalues shape: {Lambda_occ.shape}")
+        logger.info(f"    Occupied eigenvalues (top 5): {Lambda_occ[:min(5, len(Lambda_occ))]}")
+        
+        Lambda_virt, X_virt = np.linalg.eigh(D_virt_ext)
+        idx_virt = np.argsort(-np.abs(Lambda_virt))
+        Lambda_virt = Lambda_virt[idx_virt]
+        X_virt = X_virt[:, idx_virt]
+        
+        logger.info(f"    Virtual eigenvalues shape: {Lambda_virt.shape}")
+        logger.info(f"    Virtual eigenvalues (top 5): {Lambda_virt[:min(5, len(Lambda_virt))]}")
+        
+        # Step 5: Select active LNOs based on threshold (Equation 26)
+        lno_occ_indices = np.where(np.abs(Lambda_occ) >= eta_occ)[0]
+        lno_virt_indices = np.where(np.abs(Lambda_virt) >= eta_virt)[0]
+        
+        n_lno_occ = len(lno_occ_indices)
+        n_lno_virt = len(lno_virt_indices)
+        
+        logger.info(f"\n  LNO selection (threshold eta_occ={eta_occ}, eta_virt={eta_virt}):")
         logger.info(f"    Occupied LNOs selected: {n_lno_occ} / {n_ext_occ}")
         logger.info(f"    Virtual LNOs selected: {n_lno_virt} / {n_ext_virt}")
+        if n_lno_occ > 0:
+            logger.info(f"    Selected occ eigenvalues: {Lambda_occ[lno_occ_indices]}")
+        if n_lno_virt > 0:
+            logger.info(f"    Selected virt eigenvalues: {Lambda_virt[lno_virt_indices]}")
         
         # Update local space with LNO information
         ls_lno = ls.copy()
         ls_lno.update({
-            'Lambda_occ': Lambda_occ,
+            'X_occ': X_occ,  # LNO transformation matrix (n_ext_occ, n_ext_occ)
+            'X_virt': X_virt,  # LNO transformation matrix (n_ext_virt, n_ext_virt)
+            'Lambda_occ': Lambda_occ,  # Eigenvalues
             'Lambda_virt': Lambda_virt,
-            'X_occ': X_occ,
-            'X_virt': X_virt,
+            'lno_occ_indices': lno_occ_indices,  # Indices of selected LNOs
+            'lno_virt_indices': lno_virt_indices,
             'n_lno_occ': n_lno_occ,
             'n_lno_virt': n_lno_virt,
-            'lno_occ_mask': lno_occ_mask,
-            'lno_virt_mask': lno_virt_mask,
-            'eta_occ': eta_occ,
-            'eta_virt': eta_virt,
         })
         
         local_spaces_lno.append(ls_lno)
@@ -724,36 +811,310 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
     total_ext_after = 0
     
     for ls in local_spaces_lno:
-        n_ext_before = len(ls['external_occ']) + len(ls['external_virt'])
+        n_int_occ = ls['n_int_occ']
+        n_int_virt = ls['n_int_virt']
+        n_ext_occ = ls['n_ext_occ']
+        n_ext_virt = ls['n_ext_virt']
+        n_ext_before = n_ext_occ + n_ext_virt
         n_ext_after = ls['n_lno_occ'] + ls['n_lno_virt']
         total_ext_before += n_ext_before
         total_ext_after += n_ext_after
         
         logger.info(f"\nFragment {ls['fragment_id']}:")
-        logger.info(f"  Internal: {len(ls['internal_occ'])} occ + {len(ls['internal_virt'])} virt")
-        logger.info(f"  External (before): {len(ls['external_occ'])} occ + {len(ls['external_virt'])} virt = {n_ext_before}")
-        logger.info(f"  External (LNO): {ls['n_lno_occ']} occ + {ls['n_lno_virt']} virt = {n_ext_after}")
-        logger.info(f"  Compression ratio: {n_ext_after/n_ext_before:.2%}" if n_ext_before > 0 else "  No external space")
+        logger.info(f"  Internal: {n_int_occ} occ + {n_int_virt} virt = {n_int_occ + n_int_virt}")
+        logger.info(f"  External (before): {n_ext_occ} occ + {n_ext_virt} virt = {n_ext_before}")
+        logger.info(f"  External (after LNO): {ls['n_lno_occ']} occ + {ls['n_lno_virt']} virt = {n_ext_after}")
+        if n_ext_before > 0:
+            compression_ratio = n_ext_after / n_ext_before
+            logger.info(f"  Compression ratio: {compression_ratio:.2%} ({n_ext_after}/{n_ext_before})")
+        else:
+            logger.info(f"  No external space")
     
     logger.info(f"\nOverall compression:")
     logger.info(f"  Total external orbitals before: {total_ext_before}")
     logger.info(f"  Total external orbitals after LNO: {total_ext_after}")
-    logger.info(f"  Overall compression ratio: {total_ext_after/total_ext_before:.2%}" if total_ext_before > 0 else "  No external space")
+    if total_ext_before > 0:
+        overall_ratio = total_ext_after / total_ext_before
+        logger.info(f"  Overall compression ratio: {overall_ratio:.2%} ({total_ext_after}/{total_ext_before})")
+    else:
+        logger.info(f"  No external space to compress")
     logger.info("="*60 + "\n")
     
     return local_spaces_lno
 
 
-def solve_fragment_ccsd(mol, mf, local_spaces_lno, f_iao, eri_iao, iao_coeff):
+def construct_local_ham(mol, mf, local_space_lno):
     """
-    Solve fragment CCSD equations for each fragment and compute correlation energy.
+    Construct local Hamiltonian (Fock and ERIs) in active space for a single fragment.
     
-    This implements the local CCSD approach in IAO basis:
-    1. Construct local Hamiltonian H^(F) for each fragment in active space (internal + external LNO)
-    2. Transform Fock and ERIs from IAO basis to active space
-    3. Solve CCSD equations within active space A_F  
-    4. Transform amplitudes back to IAO basis
-    5. Project onto fragment IAOs for energy contributions
+    The active space comprises:
+    - Internal orbitals (from SVD with large singular values)
+    - Active LNOs (external orbitals selected by MP2-LNO compression)
+    
+    This follows the paper's orbital rotation scheme:
+    - Occupied and virtual projection of local orbitals (internal - red in paper)
+    - Occupied and virtual active LNOs (blue in paper)
+    - Frozen LNOs are excluded (gray in paper)
+    
+    Parameters
+    ----------
+    mol : pyscf.gto.Mole
+        Molecule object
+    mf : pyscf.scf.RHF
+        Converged RHF mean-field object
+    local_space_lno : dict
+        Local space information for a single fragment from compute_mp2_lno_compression
+        
+    Returns
+    -------
+    local_ham : dict
+        Dictionary containing:
+        - 'f_active': Fock matrix in active space (n_active, n_active)
+        - 'eri_active': ERIs in active space (n_active, n_active, n_active, n_active)
+        - 'n_active_occ': Number of occupied orbitals in active space
+        - 'n_active_virt': Number of virtual orbitals in active space
+        - 'U_act_occ': Transformation from MO occ to active occ (nocc, n_active_occ)
+        - 'U_act_virt': Transformation from MO virt to active virt (nvirt, n_active_virt)
+    """
+    logger.info(f"\n  Constructing local Hamiltonian for fragment {local_space_lno['fragment_id']}...")
+    
+    # Extract fragment information
+    W_occ = local_space_lno['W_occ']  # (nocc, n_int_occ)
+    W_tilde_occ = local_space_lno['W_tilde_occ']  # (nocc, n_ext_occ)
+    W_virt = local_space_lno['W_virt']  # (nvirt, n_int_virt)
+    W_tilde_virt = local_space_lno['W_tilde_virt']  # (nvirt, n_ext_virt)
+    
+    X_occ = local_space_lno['X_occ']  # (n_ext_occ, n_ext_occ)
+    X_virt = local_space_lno['X_virt']  # (n_ext_virt, n_ext_virt)
+    
+    lno_occ_indices = local_space_lno['lno_occ_indices']  # Indices of selected occ LNOs
+    lno_virt_indices = local_space_lno['lno_virt_indices']  # Indices of selected virt LNOs
+    
+    n_int_occ = W_occ.shape[1] if W_occ.size > 0 else 0
+    n_int_virt = W_virt.shape[1] if W_virt.size > 0 else 0
+    n_lno_occ = len(lno_occ_indices)
+    n_lno_virt = len(lno_virt_indices)
+    
+    n_active_occ = n_int_occ + n_lno_occ
+    n_active_virt = n_int_virt + n_lno_virt
+    n_active = n_active_occ + n_active_virt
+    
+    logger.info(f"    Active space dimensions:")
+    logger.info(f"      Internal: {n_int_occ} occ + {n_int_virt} virt")
+    logger.info(f"      Active LNOs: {n_lno_occ} occ + {n_lno_virt} virt")
+    logger.info(f"      Total active: {n_active_occ} occ + {n_active_virt} virt = {n_active}")
+    
+    # Check if active space is valid
+    if n_active_occ == 0 or n_active_virt == 0:
+        logger.warning(f"    Invalid active space (need occ>0 and virt>0)")
+        return None
+    
+    # Build transformation matrices U_act from MO to active space
+    # U_act_occ: (nocc, n_active_occ) = [W_occ | W_tilde_occ @ X_occ[:, lno_occ_indices]]
+    # U_act_virt: (nvirt, n_active_virt) = [W_virt | W_tilde_virt @ X_virt[:, lno_virt_indices]]
+    
+    nocc = mol.nelectron // 2
+    nvirt = mf.mo_coeff.shape[1] - nocc
+    
+    # Internal part
+    U_occ_int = W_occ  # (nocc, n_int_occ)
+    U_virt_int = W_virt  # (nvirt, n_int_virt)
+    
+    # External LNO part - select columns of X corresponding to active LNOs
+    if n_lno_occ > 0:
+        X_occ_active = X_occ[:, lno_occ_indices]  # (n_ext_occ, n_lno_occ)
+        U_occ_ext = W_tilde_occ @ X_occ_active  # (nocc, n_lno_occ)
+    else:
+        U_occ_ext = np.zeros((nocc, 0))
+    
+    if n_lno_virt > 0:
+        X_virt_active = X_virt[:, lno_virt_indices]  # (n_ext_virt, n_lno_virt)
+        U_virt_ext = W_tilde_virt @ X_virt_active  # (nvirt, n_lno_virt)
+    else:
+        U_virt_ext = np.zeros((nvirt, 0))
+    
+    # Combine internal and external LNOs: [internal | active_LNOs]
+    if n_int_occ > 0 and n_lno_occ > 0:
+        U_act_occ = np.hstack([U_occ_int, U_occ_ext])
+    elif n_int_occ > 0:
+        U_act_occ = U_occ_int
+    elif n_lno_occ > 0:
+        U_act_occ = U_occ_ext
+    else:
+        U_act_occ = np.zeros((nocc, 0))
+    
+    if n_int_virt > 0 and n_lno_virt > 0:
+        U_act_virt = np.hstack([U_virt_int, U_virt_ext])
+    elif n_int_virt > 0:
+        U_act_virt = U_virt_int
+    elif n_lno_virt > 0:
+        U_act_virt = U_virt_ext
+    else:
+        U_act_virt = np.zeros((nvirt, 0))
+    
+    logger.info(f"    Transformation matrices (active only):")
+    logger.info(f"      U_act_occ: {U_act_occ.shape}")
+    logger.info(f"      U_act_virt: {U_act_virt.shape}")
+    
+    # Build transformation to "active + ALL external LNOs" basis (including frozen)
+    # This is needed to construct the modified Fock with frozen orbital contributions
+    n_ext_occ = W_tilde_occ.shape[1]
+    n_ext_virt = W_tilde_virt.shape[1]
+    n_frozen_occ = n_ext_occ - n_lno_occ  # Frozen occupied LNOs
+    n_frozen_virt = n_ext_virt - n_lno_virt  # Frozen virtual LNOs
+    
+    logger.info(f"    Extended basis (active + frozen LNOs):")
+    logger.info(f"      Frozen: {n_frozen_occ} occ + {n_frozen_virt} virt")
+    
+    # Build full external LNO transformations: [W_tilde @ X]
+    # These include both active and frozen LNOs
+    if n_ext_occ > 0:
+        U_ext_occ_full = W_tilde_occ @ X_occ  # (nocc, n_ext_occ) - all external LNOs
+    else:
+        U_ext_occ_full = np.zeros((nocc, 0))
+    
+    if n_ext_virt > 0:
+        U_ext_virt_full = W_tilde_virt @ X_virt  # (nvirt, n_ext_virt) - all external LNOs
+    else:
+        U_ext_virt_full = np.zeros((nvirt, 0))
+    
+    # Combine: [internal | all_external_LNOs]
+    if n_int_occ > 0 and n_ext_occ > 0:
+        U_full_occ = np.hstack([U_occ_int, U_ext_occ_full])
+    elif n_int_occ > 0:
+        U_full_occ = U_occ_int
+    elif n_ext_occ > 0:
+        U_full_occ = U_ext_occ_full
+    else:
+        U_full_occ = np.zeros((nocc, 0))
+    
+    if n_int_virt > 0 and n_ext_virt > 0:
+        U_full_virt = np.hstack([U_virt_int, U_ext_virt_full])
+    elif n_int_virt > 0:
+        U_full_virt = U_virt_int
+    elif n_ext_virt > 0:
+        U_full_virt = U_ext_virt_full
+    else:
+        U_full_virt = np.zeros((nvirt, 0))
+    
+    n_full_occ = U_full_occ.shape[1]
+    n_full_virt = U_full_virt.shape[1]
+    n_full = n_full_occ + n_full_virt
+    
+    logger.info(f"    Full extended basis: {n_full_occ} occ + {n_full_virt} virt = {n_full}")
+    
+    # Transform core Hamiltonian and ERIs to extended basis
+    logger.info(f"    Transforming to extended basis (active + frozen)...")
+    
+    # Get core Hamiltonian in MO basis
+    h_core_ao = mol.intor('int1e_kin') + mol.intor('int1e_nuc')
+    h_mo = mf.mo_coeff.T @ h_core_ao @ mf.mo_coeff
+    
+    # Transform core Hamiltonian to extended basis
+    h_oo_full = U_full_occ.T @ h_mo[:nocc, :nocc] @ U_full_occ
+    h_ov_full = U_full_occ.T @ h_mo[:nocc, nocc:] @ U_full_virt
+    h_vo_full = U_full_virt.T @ h_mo[nocc:, :nocc] @ U_full_occ
+    h_vv_full = U_full_virt.T @ h_mo[nocc:, nocc:] @ U_full_virt
+    
+    # Assemble full core Hamiltonian in extended basis
+    h_full = np.zeros((n_full, n_full))
+    h_full[:n_full_occ, :n_full_occ] = h_oo_full
+    h_full[:n_full_occ, n_full_occ:] = h_ov_full
+    h_full[n_full_occ:, :n_full_occ] = h_vo_full
+    h_full[n_full_occ:, n_full_occ:] = h_vv_full
+    
+    logger.info(f"      h_full shape: {h_full.shape}, norm: {np.linalg.norm(h_full):.6f}")
+    
+    # Get ERIs in MO basis and transform to extended basis
+    nmo = mf.mo_coeff.shape[1]
+    eri_mo = ao2mo.kernel(mol, mf.mo_coeff, compact=False)
+    eri_mo = eri_mo.reshape(nmo, nmo, nmo, nmo)
+    
+    # Build combined transformation matrix for extended basis
+    U_full_mo = np.zeros((nmo, n_full))
+    U_full_mo[:nocc, :n_full_occ] = U_full_occ
+    U_full_mo[nocc:, n_full_occ:] = U_full_virt
+    
+    # Four-index transformation
+    logger.info(f"    Transforming ERIs (this may take a moment)...")
+    eri_temp1 = np.einsum('ip,ijkl->pjkl', U_full_mo, eri_mo, optimize=True)
+    eri_temp2 = np.einsum('jq,pjkl->pqkl', U_full_mo, eri_temp1, optimize=True)
+    eri_temp3 = np.einsum('kr,pqkl->pqrl', U_full_mo, eri_temp2, optimize=True)
+    eri_full = np.einsum('ls,pqrl->pqrs', U_full_mo, eri_temp3, optimize=True)
+    
+    logger.info(f"      ERI_full shape: {eri_full.shape}, norm: {np.linalg.norm(eri_full):.6f}")
+    
+    # Construct modified Fock matrix using Eq. (11)
+    # f_pq^(F) = h_pq + Σ_{i∉A_F} (2*V_{pqii} - V_piiq)
+    # where i∉A_F are the frozen occupied orbitals
+    logger.info(f"    Constructing modified Fock with frozen orbital contributions...")
+    
+    f_full = h_full.copy()
+    
+    # Frozen occupied orbitals are indices [n_int_occ + n_lno_occ : n_full_occ]
+    frozen_occ_start = n_int_occ + n_lno_occ
+    frozen_occ_end = n_full_occ
+    
+    if frozen_occ_end > frozen_occ_start:
+        logger.info(f"      Adding contributions from {frozen_occ_end - frozen_occ_start} frozen occupied orbitals")
+        # Sum over frozen occupied: i_bar in [frozen_occ_start : frozen_occ_end]
+        # Vectorized: f_pq += Σ_i_bar (2*V_pqii - V_piiq)
+        frozen_indices = slice(frozen_occ_start, frozen_occ_end)
+        
+        # Coulomb: 2 * Σ_i V[:,:,i,i]
+        coulomb = 2.0 * np.sum(eri_full[:, :, frozen_indices, frozen_indices].diagonal(axis1=2, axis2=3), axis=2)
+        
+        # Exchange: Σ_i V[:,i,i,:] - needs transpose because we want V_piiq
+        exchange = np.sum(eri_full[:, frozen_indices, frozen_indices, :].diagonal(axis1=1, axis2=2), axis=2)
+        
+        f_full += coulomb - exchange
+    else:
+        logger.info(f"      No frozen occupied orbitals - using core Hamiltonian only")
+    
+    logger.info(f"      f_full (modified) shape: {f_full.shape}, norm: {np.linalg.norm(f_full):.6f}")
+    
+    # Extract active space block from full extended basis
+    # Active occupied: [0 : n_int_occ + n_lno_occ]
+    # Active virtual: [n_full_occ : n_full_occ + n_int_virt + n_lno_virt]
+    active_occ_slice = slice(0, n_active_occ)
+    active_virt_slice = slice(n_full_occ, n_full_occ + n_active_virt)
+    
+    # Extract active blocks
+    f_active = np.zeros((n_active, n_active))
+    f_active[:n_active_occ, :n_active_occ] = f_full[active_occ_slice, active_occ_slice]
+    f_active[:n_active_occ, n_active_occ:] = f_full[active_occ_slice, active_virt_slice]
+    f_active[n_active_occ:, :n_active_occ] = f_full[active_virt_slice, active_occ_slice]
+    f_active[n_active_occ:, n_active_occ:] = f_full[active_virt_slice, active_virt_slice]
+    
+    # Extract ERIs for active space
+    # Vectorized: use advanced indexing with np.ix_
+    active_indices = np.array(list(range(n_active_occ)) + list(range(n_full_occ, n_full_occ + n_active_virt)))
+    eri_active = eri_full[np.ix_(active_indices, active_indices, active_indices, active_indices)].copy()
+    
+    logger.info(f"      f_active (extracted) shape: {f_active.shape}, norm: {np.linalg.norm(f_active):.6f}")
+    logger.info(f"      eri_active (extracted) shape: {eri_active.shape}, norm: {np.linalg.norm(eri_active):.6f}")
+    
+    local_ham = {
+        'f_active': f_active,
+        'eri_active': eri_active,
+        'n_active_occ': n_active_occ,
+        'n_active_virt': n_active_virt,
+        'U_act_occ': U_act_occ,
+        'U_act_virt': U_act_virt,
+    }
+    
+    return local_ham
+
+
+def solve_fragment_ccsd(mol, mf, local_spaces_lno):
+    """
+    Solve fragment CCSD equations for each fragment.
+    
+    This function:
+    1. Constructs local Hamiltonian for each fragment using construct_local_ham
+    2. Sets up and runs CCSD calculation in active space
+    3. Computes energy contribution matrix E_{ii'} in active space
+    4. Returns results for energy computation in IAO basis (done separately)
     
     Parameters
     ----------
@@ -762,165 +1123,50 @@ def solve_fragment_ccsd(mol, mf, local_spaces_lno, f_iao, eri_iao, iao_coeff):
     mf : pyscf.scf.RHF
         Converged RHF mean-field object
     local_spaces_lno : list of dict
-        Local active spaces with LNO compression
-    f_iao : np.ndarray
-        Fock matrix in IAO basis, shape (niao, niao)
-    eri_iao : np.ndarray
-        Two-electron integrals in IAO basis, shape (niao, niao, niao, niao)
-    iao_coeff : np.ndarray
-        IAO coefficients in AO basis, shape (nao, niao)
+        Local active spaces with LNO compression from compute_mp2_lno_compression
     
     Returns
     -------
     results : dict
         Dictionary containing:
-        - 'fragment_energies': correlation energy for each fragment
-        - 'total_correlation': total correlation energy
-        - 'fragment_ccsd': CCSD objects for each fragment
-        - 'fragment_amplitudes': amplitudes for each fragment
+        - 'fragment_results': list of fragment CCSD results
+        - 'fragment_hamiltonians': list of local Hamiltonians
     """
     logger.info("\n" + "="*60)
-    logger.info("Step 6: Solving Fragment CCSD Equations (W Orbital Basis)")
+    logger.info("Step 6: Solving Fragment CCSD Equations")
     logger.info("="*60)
-    
-    # Get AO Fock matrix and ERIs
-    f_ao = mf.get_fock()
-    # Get ERIs in AO basis - need to check if they're already available
-    if hasattr(mf, '_eri') and mf._eri is not None:
-        if isinstance(mf._eri, np.ndarray) and mf._eri.ndim == 4:
-            eri_ao = mf._eri
-        else:
-            # Reconstruct full 4D ERI tensor
-            eri_ao = ao2mo.restore(1, mf._eri, mf.mol.nao_nr())
-    else:
-        # Compute ERIs from scratch
-        eri_ao = mol.intor('int2e', aosym='s1')
-    
-    nao = f_ao.shape[0]
     
     logger.info(f"\nFragment CCSD setup:")
     logger.info(f"  Number of fragments: {len(local_spaces_lno)}")
-    logger.info(f"  AO basis size: {nao}")
-    logger.info(f"  ERI tensor shape: {eri_ao.shape}")
     
     fragment_results = []
-    fragment_energies = []
+    fragment_hamiltonians = []
     
     for frag_idx, ls in enumerate(local_spaces_lno):
-        logger.info(f"\n--- Fragment {frag_idx}: CCSD Calculation (W Basis) ---")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Fragment {frag_idx}: CCSD Calculation")
+        logger.info(f"{'='*60}")
         
-        # Get W transformation matrices (in AO basis)
-        W_occ = ls['W_occ']  # (nao, n_int_occ)
-        W_tilde_occ = ls['W_tilde_occ']  # (nao, n_ext_occ)
-        W_virt = ls['W_virt']  # (nao, n_int_virt)
-        W_tilde_virt = ls['W_tilde_virt']  # (nao, n_ext_virt)
+        # Construct local Hamiltonian in active space
+        local_ham = construct_local_ham(mol, mf, ls)
         
-        X_occ = ls['X_occ']  # (n_ext_occ, n_ext_occ) - LNO transformation for occ
-        X_virt = ls['X_virt']  # (n_ext_virt, n_ext_virt) - LNO transformation for virt
-        lno_occ_mask = ls['lno_occ_mask']
-        lno_virt_mask = ls['lno_virt_mask']
-        
-        n_int_occ = W_occ.shape[1]
-        n_int_virt = W_virt.shape[1]
-        n_lno_occ = np.sum(lno_occ_mask)
-        n_lno_virt = np.sum(lno_virt_mask)
-        n_active_occ = n_int_occ + n_lno_occ
-        n_active_virt = n_int_virt + n_lno_virt
-        n_active = n_active_occ + n_active_virt
-        
-        logger.info(f"  Active space: {n_active} orbitals ({n_active_occ} occ + {n_active_virt} virt)")
-        logger.info(f"    Internal: {n_int_occ} occ + {n_int_virt} virt")
-        logger.info(f"    External LNO: {n_lno_occ} occ + {n_lno_virt} virt")
-        
-        # Skip if active space is too small
-        if n_active_occ == 0 or n_active_virt == 0:
-            logger.info(f"  Skipping CCSD: active space too small (need occ>0 and virt>0)")
+        if local_ham is None:
+            logger.warning(f"  Skipping fragment {frag_idx}: invalid active space")
             fragment_results.append(None)
-            fragment_energies.append(0.0)
+            fragment_hamiltonians.append(None)
             continue
         
-        # Build transformation matrix U_act from AO basis to active space
-        # U_act_occ: (nao, n_active_occ) = [W_occ | W_tilde_occ @ X_occ[:, selected]]
-        # U_act_virt: (nao, n_active_virt) = [W_virt | W_tilde_virt @ X_virt[:, selected]]
+        # Extract Hamiltonian components
+        f_active = local_ham['f_active']
+        eri_active = local_ham['eri_active']
+        n_active_occ = local_ham['n_active_occ']
+        n_active_virt = local_ham['n_active_virt']
+        n_active = n_active_occ + n_active_virt
         
-        logger.info(f"  Building transformation U_act from AO to active space...")
-        
-        # Internal part (from SVD) - already in AO basis
-        U_occ_int = W_occ  # (nao, n_int_occ)
-        U_virt_int = W_virt  # (nao, n_int_virt)
-        
-        # External LNO part - transform W_tilde with LNO eigenvectors
-        if n_lno_occ > 0:
-            U_occ_ext = W_tilde_occ @ X_occ[:, lno_occ_mask]  # (nao, n_lno_occ)
-        else:
-            U_occ_ext = np.zeros((nao, 0))
-        
-        if n_lno_virt > 0:
-            U_virt_ext = W_tilde_virt @ X_virt[:, lno_virt_mask]  # (nao, n_lno_virt)
-        else:
-            U_virt_ext = np.zeros((nao, 0))
-        
-        # Combine: [internal | external_LNO]
-        if n_int_occ > 0 and n_lno_occ > 0:
-            U_act_occ = np.hstack([U_occ_int, U_occ_ext])  # (nao, n_active_occ)
-        elif n_int_occ > 0:
-            U_act_occ = U_occ_int
-        elif n_lno_occ > 0:
-            U_act_occ = U_occ_ext
-        else:
-            U_act_occ = np.zeros((nao, 0))
-            
-        if n_int_virt > 0 and n_lno_virt > 0:
-            U_act_virt = np.hstack([U_virt_int, U_virt_ext])  # (nao, n_active_virt)
-        elif n_int_virt > 0:
-            U_act_virt = U_virt_int
-        elif n_lno_virt > 0:
-            U_act_virt = U_virt_ext
-        else:
-            U_act_virt = np.zeros((nao, 0))
-        
-        logger.info(f"    U_act_occ shape: {U_act_occ.shape}")
-        logger.info(f"    U_act_virt shape: {U_act_virt.shape}")
-        
-        # Transform Fock matrix from AO basis to active space
-        # F_act = U_act^T @ F_AO @ U_act
-        logger.info(f"  Transforming Fock matrix to active space...")
-        
-        f_oo_act = U_act_occ.T @ f_ao @ U_act_occ  # (n_active_occ, n_active_occ)
-        f_ov_act = U_act_occ.T @ f_ao @ U_act_virt  # (n_active_occ, n_active_virt)
-        f_vo_act = U_act_virt.T @ f_ao @ U_act_occ  # (n_active_virt, n_active_occ)
-        f_vv_act = U_act_virt.T @ f_ao @ U_act_virt  # (n_active_virt, n_active_virt)
-        
-        # Assemble full Fock matrix in active space
-        f_active = np.zeros((n_active, n_active))
-        f_active[:n_active_occ, :n_active_occ] = f_oo_act
-        f_active[:n_active_occ, n_active_occ:] = f_ov_act
-        f_active[n_active_occ:, :n_active_occ] = f_vo_act
-        f_active[n_active_occ:, n_active_occ:] = f_vv_act
-        
-        logger.info(f"    F_active shape: {f_active.shape}, norm: {np.linalg.norm(f_active):.6f}")
-        
-        # Transform ERIs from AO basis to active space
-        # ERI_act = sum_{ijkl} U_occ[i,p] * U[j,q] * U[k,r] * U[l,s] * ERI_AO[i,j,k,l]
-        # where U for each index can be either U_act_occ or U_act_virt depending on the orbital type
-        logger.info(f"  Transforming ERIs to active space...")
-        
-        # Four-index transformation using einsum (one index at a time)
-        # Transform all 4 indices with combined occupied+virtual transformation
-        # We need to transform from AO (nao×nao×nao×nao) to active (n_act×n_act×n_act×n_act)
-        # Build U_full: (nao, n_active) where occupied come first, then virtual
-        U_full = np.hstack([U_act_occ, U_act_virt])  # (nao, n_active)
-        
-        eri_temp1 = np.einsum('ip,ijkl->pjkl', U_full, eri_ao, optimize=True)
-        eri_temp2 = np.einsum('jq,pjkl->pqkl', U_full, eri_temp1, optimize=True)
-        eri_temp3 = np.einsum('kr,pqkl->pqrl', U_full, eri_temp2, optimize=True)
-        eri_active = np.einsum('ls,pqrl->pqrs', U_full, eri_temp3, optimize=True)
-        
-        logger.info(f"    ERI_active shape: {eri_active.shape}, norm: {np.linalg.norm(eri_active):.6f}")
+        logger.info(f"\n  Setting up CCSD calculation...")
+        logger.info(f"    Active space: {n_active} orbitals ({n_active_occ} occ + {n_active_virt} virt)")
         
         # Create fake molecule and mean-field object for PySCF CCSD
-        logger.info(f"  Setting up fragment CCSD calculation...")
-        
         mol_frag = gto.M()
         mol_frag.nelectron = 2 * n_active_occ
         mol_frag.verbose = 0
@@ -939,6 +1185,7 @@ def solve_fragment_ccsd(mol, mf, local_spaces_lno, f_iao, eri_iao, iao_coeff):
         # Run CCSD
         logger.info(f"  Running CCSD...")
         mycc = cc.CCSD(mf_frag)
+        mycc.verbose = 0
         mycc.kernel()
         
         if mycc.converged:
@@ -947,87 +1194,202 @@ def solve_fragment_ccsd(mol, mf, local_spaces_lno, f_iao, eri_iao, iao_coeff):
         else:
             logger.warning(f"    CCSD did not converge!")
         
-        # Get amplitudes in active space basis
+        # Get amplitudes in active space
         t1_act = mycc.t1  # (n_active_occ, n_active_virt)
         t2_act = mycc.t2  # (n_active_occ, n_active_occ, n_active_virt, n_active_virt)
         
         logger.info(f"    T1 amplitude shape: {t1_act.shape}, norm: {np.linalg.norm(t1_act):.6f}")
         logger.info(f"    T2 amplitude shape: {t2_act.shape}, norm: {np.linalg.norm(t2_act):.6f}")
         
-        # Compute tau intermediate: tau_ijab = t_ijab + t_ia * t_jb
-        tau_act = t2_act + np.einsum('ia,jb->ijab', t1_act, t1_act, optimize=True)
+        # Compute tau intermediate: τ_{iajb} = t_{iajb} - t_{ia}*t_{jb}
+        # Note: t2_act has indices [i,j,a,b] but we need τ with indices [i,a,j,b]
+        # Following Equation 13, we need the difference, not the sum
+        # t1_outer[i,a,j,b] = t_ia * t_jb
+        t1_outer = np.einsum('ia,jb->iajb', t1_act, t1_act, optimize=True)
+        # tau_act[i,a,j,b] = t2_act[i,j,a,b] - t1_outer[i,a,j,b]
+        tau_act = t2_act.transpose(0, 2, 1, 3) - t1_outer  # Reorder t2 from ijab to iajb
         
-        logger.info(f"    Tau intermediate norm: {np.linalg.norm(tau_act):.6f}")
+        # Compute energy contribution matrix E_{ii'} using Equation 13:
+        # E_{ii'}^{(F)} = Σ_{jab∈A_F} τ_{iajb}^{(F)} (2V_{i'ajb} - V_{i'bja})
+        # In chemist notation: V_{i'ajb} = eri[i',a,j,b], V_{i'bja} = eri[i',b,j,a]
+        logger.info(f"  Computing energy contribution matrix E_{{ii'}} using Equation 13...")
         
-        # Compute energy matrix E_{ii'} in active occupied space
-        # E_{ii'} = sum_{ab} tau_{i'iab} * f_{ab}  (Eq. from paper)
-        # Then transform back to IAO basis: E_IAO = U_act_occ @ E_{ii'} @ U_act_occ^T
-        logger.info(f"  Computing energy contribution matrix...")
+        # Extract occupied-virtual blocks of ERIs in active space
+        # eri_active has shape (n_active, n_active, n_active, n_active)
+        # We need: occ x virt x occ x virt blocks
+        eri_ovov = eri_active[:n_active_occ, n_active_occ:, :n_active_occ, n_active_occ:]  # (nocc, nvirt, nocc, nvirt)
         
-        # Extract virtual block of Fock in active space
-        f_vv_act_for_energy = f_vv_act  # (n_active_virt, n_active_virt)
-        
-        # E[i, i'] = sum_a,b tau[i', i, a, b] * f_vv[a, b]
-        # tau: (n_active_occ, n_active_occ, n_active_virt, n_active_virt)
-        # f_vv: (n_active_virt, n_active_virt)
-        E_ii_prime = np.einsum('ijab,ab->ij', tau_act, f_vv_act_for_energy, optimize=True)
-        
-        logger.info(f"    E_ii' shape: {E_ii_prime.shape}, norm: {np.linalg.norm(E_ii_prime):.6f}")
-        
-        # Transform back to IAO basis: E_IAO = U_act_occ @ E_{ii'} @ U_act_occ^T
-        E_iao = U_act_occ @ E_ii_prime @ U_act_occ.T  # (nocc, nocc)
-        
-        logger.info(f"    E_IAO shape: {E_iao.shape}, norm: {np.linalg.norm(E_iao):.6f}")
-        
-        # Project onto fragment IAOs to get fragment energy
-        # For fragment F with internal occupied orbitals, sum over those diagonal elements
-        # E_F = sum_{i in F} E_IAO[i, i]
-        internal_occ_iao_idx = ls['internal_occ']  # IAO indices
-        fragment_energy = np.sum(E_iao[i, i] for i in internal_occ_iao_idx)
-        
-        logger.info(f"  Fragment {frag_idx} correlation energy: {fragment_energy:.8f} a.u.")
-        logger.info(f"    Internal occupied IAO indices: {internal_occ_iao_idx}")
+        # E[i, i'] = Σ_{jab} τ[i,a,j,b] * (2*V[i',a,j,b] - V[i',b,j,a])
+        # Using einsum: 'iajb,Iajb->iI' for coulomb, 'iajb,Ibja->iI' for exchange
+        coulomb = 2.0 * np.einsum('iajb,Iajb->iI', tau_act, eri_ovov, optimize=True)
+        exchange = np.einsum('iajb,Ibja->iI', tau_act, eri_ovov, optimize=True)
+        E_ii_prime = coulomb - exchange
+        # also add fock and t1 contributions
+        # construct active fock blocks
+        #eri_vooo = eri_active[n_active_occ:, :n_active_occ, :n_active_occ, :n_active_occ]  # (nvirt, nocc, nocc, nocc)
+        #f_ia = f_active[:n_active_occ, n_active_occ:]
+        #f_ia += 2*np.einsum('aijj->ia', eri_vooo)
+        #f_ia -= np.einsum('ajji->ia', eri_vooo)
+
+        #E_ii_prime += np.einsum('ia,Ia->iI', t1_act, f_ia, optimize=True)
+
+        logger.info(f"    E_{{ii'}} shape: {E_ii_prime.shape}, norm: {np.linalg.norm(E_ii_prime):.6f}")
         
         # Store results
         frag_result = {
             'fragment_id': frag_idx,
             'n_active_occ': n_active_occ,
             'n_active_virt': n_active_virt,
-            'f_active': f_active,
-            'eri_active': eri_active,
             'ccsd': mycc,
             't1': t1_act,
             't2': t2_act,
             'tau': tau_act,
-            'e_corr': fragment_energy,
-            'E_iao': E_iao,
+            'E_ii_prime': E_ii_prime,  # Energy matrix in active space
+            'e_corr_ccsd': mycc.e_corr,  # CCSD correlation energy in active space
         }
         
         fragment_results.append(frag_result)
-        fragment_energies.append(fragment_energy)
-    
-    # Compute total correlation energy
-    total_corr = np.sum(fragment_energies)
+        fragment_hamiltonians.append(local_ham)
     
     logger.info("\n" + "="*60)
-    logger.info("Fragment CCSD Results Summary")
+    logger.info("Fragment CCSD Completed")
     logger.info("="*60)
-    logger.info(f"Individual fragment correlation energies:")
-    for i, e in enumerate(fragment_energies):
-        logger.info(f"  Fragment {i}: {e:.8f} a.u.")
-    logger.info(f"\nTotal correlation energy (sum): {total_corr:.8f} a.u.")
-    logger.info(f"RHF energy: {mf.e_tot:.8f} a.u.")
-    logger.info(f"Estimated total energy: {mf.e_tot + total_corr:.8f} a.u.")
+    logger.info(f"Successfully computed {sum(1 for r in fragment_results if r is not None)} fragments")
     logger.info("="*60 + "\n")
     
     results = {
         'fragment_results': fragment_results,
-        'fragment_energies': fragment_energies,
-        'total_correlation': total_corr,
-        'total_energy': mf.e_tot + total_corr,
+        'fragment_hamiltonians': fragment_hamiltonians,
     }
     
     return results
+
+
+def compute_fragment_energies(mol, mf, iao_coeff, local_spaces_lno, ccsd_results):
+    """
+    Compute fragment correlation energies by transforming E_{ii'} to fragment IAO basis.
+    
+    For each fragment, the correlation energy is computed by:
+    1. Transform E_{ii'} from active space to MO basis using U_act_occ
+    2. Extract IAO columns belonging to this fragment from C_iao_mo_occ
+    3. Transform E_mo to fragment IAO basis: E_frag = C_frag^T @ E_mo @ C_frag
+    4. Sum all diagonal elements (trace): E_F = Tr(E_frag) = Σ_α E_frag[α,α]
+    
+    This approach correctly contracts over occupied indices i,i' while summing over
+    all IAOs α belonging to the fragment.
+    
+    Parameters
+    ----------
+    mol : pyscf.gto.Mole
+        Molecule object
+    mf : pyscf.scf.RHF
+        Converged RHF mean-field object
+    iao_coeff : np.ndarray
+        IAO coefficients in AO basis (nao, niao)
+    local_spaces_lno : list of dict
+        Local active spaces with LNO compression
+    ccsd_results : dict
+        Results from solve_fragment_ccsd containing fragment_results and fragment_hamiltonians
+        
+    Returns
+    -------
+    energy_results : dict
+        Dictionary containing:
+        - 'fragment_energies': list of correlation energy for each fragment
+        - 'total_correlation': total correlation energy (sum over fragments)
+        - 'total_energy': RHF energy + correlation energy
+    """
+    logger.info("\n" + "="*60)
+    logger.info("Computing Fragment Correlation Energies")
+    logger.info("="*60)
+    
+    fragment_results = ccsd_results['fragment_results']
+    fragment_hamiltonians = ccsd_results['fragment_hamiltonians']
+    
+    # Get overlap matrix and transform IAO to MO basis
+    S_ao = mf.get_ovlp()
+    C_mo = mf.mo_coeff  # (nao, nmo)
+    
+    # C_iao_mo = C_mo^T @ S_ao @ C_iao
+    C_iao_mo = C_mo.T @ S_ao @ iao_coeff  # (nmo, niao)
+    
+    nocc = mol.nelectron // 2
+    C_iao_mo_occ = C_iao_mo[:nocc, :]  # (nocc, niao)
+    
+    logger.info(f"\nTransformation matrices:")
+    logger.info(f"  IAO-MO (occupied): {C_iao_mo_occ.shape}")
+    
+    fragment_energies = []
+    
+    for frag_idx, (frag_result, local_ham, ls) in enumerate(
+        zip(fragment_results, fragment_hamiltonians, local_spaces_lno)
+    ):
+        logger.info(f"\nFragment {frag_idx}:")
+        
+        if frag_result is None or local_ham is None:
+            logger.info(f"  Skipped (no CCSD result)")
+            fragment_energies.append(0.0)
+            continue
+        
+        # Get E_{ii'} in active space and transformation matrix
+        E_ii_prime = frag_result['E_ii_prime']  # (n_active_occ, n_active_occ)
+        U_act_occ = local_ham['U_act_occ']  # (nocc, n_active_occ)
+        
+        # Transform E_{ii'} from active space to MO occupied space
+        # E_MO = U_act_occ @ E_{ii'} @ U_act_occ^T
+        E_mo = U_act_occ @ E_ii_prime @ U_act_occ.T  # (nocc, nocc)
+        
+        logger.info(f"  E_MO shape: {E_mo.shape}, norm: {np.linalg.norm(E_mo):.6f}")
+        
+        # Get IAO indices for this fragment
+        frag_iao_indices = ls['iao_indices']
+        
+        # Extract the slice of C_iao_mo_occ corresponding to this fragment's IAOs
+        # C_iao_mo_occ has shape (nocc, niao), we want columns for this fragment
+        C_frag = C_iao_mo_occ[:, frag_iao_indices]  # (nocc, n_frag_iao)
+        
+        logger.info(f"  Fragment IAO indices: {frag_iao_indices}")
+        logger.info(f"  C_frag shape: {C_frag.shape}")
+        
+        # Transform E_mo to fragment IAO basis:
+        # Contract C_frag^T from left and C_frag from right over occupied indices i and i'
+        # E_frag[α,β] = Σ_{ii'} C_frag[i,α] * E_mo[i,i'] * C_frag[i',β]
+        # This gives E in the IAO basis restricted to this fragment
+        E_frag = C_frag.T @ E_mo @ C_frag  # (n_frag_iao, n_frag_iao)
+        logger.info(f"  Transforming E_MO to fragment IAO basis...")
+        logger.info(E_frag)
+        
+        logger.info(f"  E_frag shape: {E_frag.shape}, norm: {np.linalg.norm(E_frag):.6f}")
+        
+        # Sum over all diagonal elements (all IAOs in the fragment)
+        # This gives the total correlation energy for this fragment
+        fragment_energy = np.trace(E_frag)
+        
+        logger.info(f"  Fragment correlation energy: {fragment_energy:.8f} a.u.")
+        
+        fragment_energies.append(fragment_energy)
+    
+    # Compute total correlation energy
+    total_corr = np.sum(fragment_energies)
+    total_energy = mf.e_tot + total_corr
+    
+    logger.info("="*60)
+    logger.info("Fragment Energy Summary")
+    logger.info("="*60)
+    for i, e in enumerate(fragment_energies):
+        logger.info(f"  Fragment {i}: {e:.8f} a.u.")
+    logger.info(f"\nTotal correlation energy: {total_corr:.8f} a.u.")
+    logger.info(f"RHF energy: {mf.e_tot:.8f} a.u.")
+    logger.info(f"Total energy: {total_energy:.8f} a.u.")
+    logger.info("="*60 + "\n")
+    
+    energy_results = {
+        'fragment_energies': fragment_energies,
+        'total_correlation': total_corr,
+        'total_energy': total_energy,
+    }
+    
+    return energy_results
 
 
 def main():
@@ -1044,7 +1406,11 @@ def main():
     separation = 1.5  # Angstrom, typical H-H distance in molecules
     basis = 'cc-pvdz'
     
-    mol = build_h10_chain(separation=separation, basis=basis)
+    mol = build_mol(separation=separation, basis=basis)
+    #mol = gto.M(
+    #    atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587",
+    #    basis="cc-pvdz"
+    #)
     
     # Step 2: Run RHF calculation
     mf = run_rhf(mol)
@@ -1058,37 +1424,12 @@ def main():
     # Transform Fock and ERIs to IAO basis (needed for all subsequent steps)
     logger.info(f"\nTransforming Fock matrix and ERIs to IAO basis...")
     
-    # Get Fock matrix in AO basis
-    h_core = mol.intor('int1e_kin') + mol.intor('int1e_nuc')
-    s_ao = mol.intor('int1e_ovlp')
-    dm = mf.make_rdm1()
-    vhf = mf.get_veff(mol, dm)
-    f_ao = h_core + vhf
-    
-    # Transform to IAO basis: F_IAO = C_IAO^T @ F_AO @ C_IAO
-    f_iao = iao_coeff.T @ f_ao @ iao_coeff
-    logger.info(f"  Fock matrix in IAO basis shape: {f_iao.shape}")
-    logger.info(f"  Fock matrix norm: {np.linalg.norm(f_iao):.6f}")
-    
-    # Get ERIs in AO basis and transform to IAO basis
-    logger.info(f"  Transforming ERIs to IAO basis (this may take a moment)...")
-    eri_ao = mol.intor('int2e', aosym='s1')
-    eri_ao = eri_ao.reshape(mol.nao, mol.nao, mol.nao, mol.nao)
-    
-    # Transform one index at a time: V_IAO = C^T @ C^T @ C^T @ C^T @ V_AO
-    eri_temp1 = np.einsum('ip,ijkl->pjkl', iao_coeff, eri_ao, optimize=True)
-    eri_temp2 = np.einsum('jq,pjkl->pqkl', iao_coeff, eri_temp1, optimize=True)
-    eri_temp3 = np.einsum('kr,pqkl->pqrl', iao_coeff, eri_temp2, optimize=True)
-    eri_iao = np.einsum('ls,pqrl->pqrs', iao_coeff, eri_temp3, optimize=True)
-    
-    logger.info(f"  ERIs in IAO basis shape: {eri_iao.shape}")
-    logger.info(f"  ERIs norm: {np.linalg.norm(eri_iao):.6f}")
     
     # Step 4: Construct Local Active Space for each fragment
     # Use fragment_size=1 to treat each H atom as a separate fragment
     # Or fragment_size=2 to pair up neighboring H atoms
     fragment_size = 1  # Each atom is a fragment
-    svd_threshold = 1e-6  # Threshold for determining internal space
+    svd_threshold = 1e-8  # Threshold for determining internal space
     
     local_spaces = construct_local_active_space(
         mol, mf, iao_coeff, iao_labels,
@@ -1097,19 +1438,20 @@ def main():
     )
     
     # Step 5: Compress external spaces using MP2-LNO
-    eta_occ = 1e-6  # Threshold for occupied LNO eigenvalues
+    eta_occ = 1e-5  # Threshold for occupied LNO eigenvalues
     eta_virt = 1e-6  # Threshold for virtual LNO eigenvalues
     
     local_spaces_lno = compute_mp2_lno_compression(
         mol, mf, local_spaces,
-        f_iao=f_iao,
-        eri_iao=eri_iao,
         eta_occ=eta_occ,
         eta_virt=eta_virt
     )
     
     # Step 6: Solve fragment CCSD equations
-    ccsd_results = solve_fragment_ccsd(mol, mf, local_spaces_lno, f_iao, eri_iao, iao_coeff)
+    ccsd_results = solve_fragment_ccsd(mol, mf, local_spaces_lno)
+    
+    # Step 7: Compute fragment correlation energies in IAO basis
+    energy_results = compute_fragment_energies(mol, mf, iao_coeff, local_spaces_lno, ccsd_results)
     
     # Store results for future use
     results = {
@@ -1129,11 +1471,13 @@ def main():
         'eta_occ': eta_occ,
         'eta_virt': eta_virt,
         'ccsd_results': ccsd_results,
-        'energy_corr': ccsd_results['total_correlation'],
-        'energy_total': ccsd_results['total_energy'],
+        'energy_results': energy_results,
+        'fragment_energies': energy_results['fragment_energies'],
+        'energy_corr': energy_results['total_correlation'],
+        'energy_total': energy_results['total_energy'],
     }
     
-    logger.info("\n" + "="*70)
+    logger.info("="*70)
     logger.info("All steps completed successfully!")
     logger.info("="*70)
     logger.info("\nWorkflow summary:")
@@ -1143,10 +1487,11 @@ def main():
     logger.info(f"  4. Defined {len(local_spaces)} local active spaces")
     logger.info(f"  5. Compressed external spaces with MP2-LNOs")
     logger.info(f"  6. Solved {len(local_spaces_lno)} fragment CCSD equations")
+    logger.info(f"  7. Computed fragment energies in IAO basis")
     logger.info(f"\nFinal energies:")
     logger.info(f"  RHF energy:         {mf.e_tot:.8f} a.u.")
-    logger.info(f"  Correlation energy: {ccsd_results['total_correlation']:.8f} a.u.")
-    logger.info(f"  Total energy:       {ccsd_results['total_energy']:.8f} a.u.")
+    logger.info(f"  Correlation energy: {energy_results['total_correlation']:.8f} a.u.")
+    logger.info(f"  Total energy:       {energy_results['total_energy']:.8f} a.u.")
     logger.info("="*70 + "\n")
     
     return results
@@ -1255,16 +1600,18 @@ def convergence_test(mol, mf, iao_coeff, local_spaces, eri_mo,
                 mol=mol,
                 mf=mf,
                 local_spaces=local_spaces,
-                eri_mo=eri_mo,
                 eta_occ=eta_occ,
                 eta_virt=eta_virt
             )
             
             # Solve fragment CCSD
-            ccsd_results = solve_fragment_ccsd(mol, mf, local_spaces_lno, eri_mo, iao_coeff)
+            ccsd_results = solve_fragment_ccsd(mol, mf, local_spaces_lno)
+            
+            # Compute fragment energies
+            energy_results = compute_fragment_energies(mol, mf, iao_coeff, local_spaces_lno, ccsd_results)
             
             # Compute error
-            e_corr = ccsd_results['total_correlation']
+            e_corr = energy_results['total_correlation']
             error = e_corr - e_ref
             
             # Count total orbitals
@@ -1385,7 +1732,7 @@ if __name__ == "__main__":
         logger.info("Running convergence test mode...")
         
         # Build system
-        mol = build_h10_chain(separation=1.5, basis='cc-pvdz')
+        mol = build_mol(separation=1.5, basis='cc-pvdz')
         mf = run_rhf(mol)
         iao_coeff, iao_labels = construct_iao(mol, mf, minao='minao')
         
@@ -1393,6 +1740,7 @@ if __name__ == "__main__":
             mol=mol,
             mf=mf,
             iao_coeff=iao_coeff,
+            iao_labels=iao_labels,
             fragment_size=1,
             svd_threshold=1e-6
         )
@@ -1417,6 +1765,13 @@ if __name__ == "__main__":
         plot_convergence(conv_results, filename='lno_convergence.png')
         
         logger.info("\nConvergence test completed!")
-    else:
+    elif len(sys.argv) > 1 and sys.argv[1] == '--full-ccsd':
+        # Run full CCSD calculation
+        logger.info("Running full CCSD calculation mode...")
+        mol = build_mol(separation=1.5, basis='cc-pvdz')
+        mf = run_rhf(mol)
+        full_ccsd_results = run_full_ccsd(mol, mf)
+        logger.info("\nFull CCSD calculation completed!")
+    else: 
         # Run standard workflow
         results = main()
