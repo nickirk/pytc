@@ -522,6 +522,76 @@ def construct_local_active_space(mol, mf, iao_coeff, iao_labels, fragment_size=1
     return local_spaces
 
 
+def compute_lno_compression(density_matrix, eta_threshold, space_name=""):
+    """
+    Compress a space using Local Natural Orbital (LNO) analysis.
+    
+    This function diagonalizes a density matrix, sorts eigenvalues in descending order,
+    and selects LNOs based on a threshold criterion.
+    
+    Parameters
+    ----------
+    density_matrix : ndarray
+        Density matrix in the external space (n_ext, n_ext)
+    eta_threshold : float
+        Threshold for selecting LNOs based on eigenvalue magnitude
+    space_name : str, optional
+        Name for logging (e.g., "occupied" or "virtual")
+    
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'X': Transformation matrix (n_ext, n_ext), sorted by eigenvalue
+        - 'Lambda': Eigenvalues array, sorted in descending order
+        - 'lno_indices': Indices of selected LNOs passing threshold
+        - 'n_lno': Number of selected LNOs
+    """
+    # Diagonalize density matrix
+    Lambda, X = np.linalg.eigh(density_matrix)
+    
+    # Sort by descending absolute eigenvalue
+    idx = np.argsort(-np.abs(Lambda))
+    Lambda = Lambda[idx]
+    X = X[:, idx]
+    
+    logger.info(f"    {space_name.capitalize()} eigenvalues shape: {Lambda.shape}")
+    logger.info(f"    {space_name.capitalize()} eigenvalues (top 5): {Lambda[:min(5, len(Lambda))]}")
+    
+    # Select LNOs based on threshold
+    lno_indices = np.where(np.abs(Lambda) >= eta_threshold)[0]
+    n_lno = len(lno_indices)
+    
+    return {
+        'X': X,
+        'Lambda': Lambda,
+        'lno_indices': lno_indices,
+        'n_lno': n_lno
+    }
+
+
+def create_empty_lno_result(n_ext):
+    """
+    Create identity/empty LNO result when space is empty or should not be compressed.
+    
+    Parameters
+    ----------
+    n_ext : int
+        Dimension of the external space
+    
+    Returns
+    -------
+    dict
+        Dictionary with empty/identity LNO results
+    """
+    return {
+        'X': np.eye(n_ext) if n_ext > 0 else np.zeros((0, 0)),
+        'Lambda': np.array([]),
+        'lno_indices': np.array([], dtype=int),
+        'n_lno': 0
+    }
+
+
 def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e-6):
     """
     Compress external spaces using MP2 Local Natural Orbitals (LNOs).
@@ -531,6 +601,10 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
     2. Build MP2 density matrices in external space (occupied and virtual)
     3. Diagonalize density matrices to obtain LNOs
     4. Select active LNOs based on eigenvalue thresholds
+    
+    The function handles occupied and virtual spaces independently. If one external
+    space is empty (n_ext_occ=0 or n_ext_virt=0), compression is still performed
+    on the non-empty space.
     
     Parameters
     ----------
@@ -638,17 +712,19 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
         eps_a = eps_virt_mo  # All virtual MO energies
         eps_b = eps_virt_mo  # All virtual MO energies
         
-        # Skip if external spaces are empty
-        if n_ext_occ == 0 or n_ext_virt == 0:
-            logger.info(f"  Skipping MP2: external space insufficient (n_ext_occ={n_ext_occ}, n_ext_virt={n_ext_virt})")
+        # Check if we can perform MP2 - need both external occ and virt for MP2 amplitudes
+        if n_ext_occ == 0 and n_ext_virt == 0:
+            logger.info(f"  Skipping MP2: both external spaces are empty (n_ext_occ={n_ext_occ}, n_ext_virt={n_ext_virt})")
             ls_lno = ls.copy()
+            occ_result = create_empty_lno_result(n_ext_occ)
+            virt_result = create_empty_lno_result(n_ext_virt)
             ls_lno.update({
-                'n_lno_occ': 0,
-                'n_lno_virt': 0,
-                'lno_occ_indices': np.array([], dtype=int),
-                'lno_virt_indices': np.array([], dtype=int),
-                'X_occ': np.eye(n_ext_occ) if n_ext_occ > 0 else np.zeros((0, 0)),
-                'X_virt': np.eye(n_ext_virt) if n_ext_virt > 0 else np.zeros((0, 0)),
+                'n_lno_occ': occ_result['n_lno'],
+                'n_lno_virt': virt_result['n_lno'],
+                'lno_occ_indices': occ_result['lno_indices'],
+                'lno_virt_indices': virt_result['lno_indices'],
+                'X_occ': occ_result['X'],
+                'X_virt': virt_result['X'],
             })
             local_spaces_lno.append(ls_lno)
             continue
@@ -671,10 +747,10 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
         # Extract occupied-virtual-occupied-virtual block from ERI
         # eri_mo[i, j, k, l] in chemist notation (ij|kl)
         # We need (ia|jb) = eri_mo[i, a+nocc, j, b+nocc]
-        eri_oovv = eri_mo[:nocc, nocc:, :nocc, nocc:]  # (nocc, nvirt, nocc, nvirt)
+        eri_ovov = eri_mo[:nocc, nocc:, :nocc, nocc:]  # (nocc, nvirt, nocc, nvirt)
         
         # Transform first index: (iF a | j b)
-        V_Iajb = np.einsum('iI,iajb->Iajb', W_occ, eri_oovv, optimize=True)
+        V_Iajb = np.einsum('iI,iajb->Iajb', W_occ, eri_ovov, optimize=True)
         logger.info(f"    Transformed ERI shape: {V_Iajb.shape} = ({n_int_occ}, {nvirt}, {nocc}, {nvirt})")
         
         # Compute energy denominators
@@ -739,64 +815,49 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
         logger.info(f"    D_virt (full MO) shape: {D_virt_full.shape}")
         logger.info(f"    D_virt norm: {np.linalg.norm(D_virt_full):.6f}")
         
-        # Step 3: Project density matrices to external spaces
-        # D_occ_ext = W_tilde_occ^T @ D_occ_full @ W_tilde_occ
-        # D_virt_ext = W_tilde_virt^T @ D_virt_full @ W_tilde_virt
+        # Step 3: Project density matrices to external spaces and compress with LNOs
+        logger.info(f"\n  Projecting to external spaces and computing LNOs...")
         
-        logger.info(f"\n  Projecting to external spaces...")
+        # Handle occupied space compression
+        if n_ext_occ > 0:
+            D_occ_ext = W_tilde_occ.T @ D_occ_full @ W_tilde_occ
+            logger.info(f"    D_occ_ext shape: {D_occ_ext.shape}")
+            logger.info(f"\n  Diagonalizing occupied space for LNOs...")
+            occ_result = compute_lno_compression(D_occ_ext, eta_occ, "occupied")
+        else:
+            logger.info(f"    Skipping occupied LNO compression (n_ext_occ=0)")
+            occ_result = create_empty_lno_result(n_ext_occ)
         
-        D_occ_ext = W_tilde_occ.T @ D_occ_full @ W_tilde_occ
-        D_virt_ext = W_tilde_virt.T @ D_virt_full @ W_tilde_virt
+        # Handle virtual space compression
+        if n_ext_virt > 0:
+            D_virt_ext = W_tilde_virt.T @ D_virt_full @ W_tilde_virt
+            logger.info(f"    D_virt_ext shape: {D_virt_ext.shape}")
+            logger.info(f"\n  Diagonalizing virtual space for LNOs...")
+            virt_result = compute_lno_compression(D_virt_ext, eta_virt, "virtual")
+        else:
+            logger.info(f"    Skipping virtual LNO compression (n_ext_virt=0)")
+            virt_result = create_empty_lno_result(n_ext_virt)
         
-        logger.info(f"    D_occ_ext shape: {D_occ_ext.shape}")
-        logger.info(f"    D_virt_ext shape: {D_virt_ext.shape}")
-        
-        # Step 4: Diagonalize density matrices to get LNOs (Equation 25)
-        logger.info(f"\n  Diagonalizing for LNOs...")
-        
-        Lambda_occ, X_occ = np.linalg.eigh(D_occ_ext)
-        # Sort by descending absolute eigenvalue
-        idx_occ = np.argsort(-np.abs(Lambda_occ))
-        Lambda_occ = Lambda_occ[idx_occ]
-        X_occ = X_occ[:, idx_occ]
-        
-        logger.info(f"    Occupied eigenvalues shape: {Lambda_occ.shape}")
-        logger.info(f"    Occupied eigenvalues (top 5): {Lambda_occ[:min(5, len(Lambda_occ))]}")
-        
-        Lambda_virt, X_virt = np.linalg.eigh(D_virt_ext)
-        idx_virt = np.argsort(-np.abs(Lambda_virt))
-        Lambda_virt = Lambda_virt[idx_virt]
-        X_virt = X_virt[:, idx_virt]
-        
-        logger.info(f"    Virtual eigenvalues shape: {Lambda_virt.shape}")
-        logger.info(f"    Virtual eigenvalues (top 5): {Lambda_virt[:min(5, len(Lambda_virt))]}")
-        
-        # Step 5: Select active LNOs based on threshold (Equation 26)
-        lno_occ_indices = np.where(np.abs(Lambda_occ) >= eta_occ)[0]
-        lno_virt_indices = np.where(np.abs(Lambda_virt) >= eta_virt)[0]
-        
-        n_lno_occ = len(lno_occ_indices)
-        n_lno_virt = len(lno_virt_indices)
-        
+        # LNO selection summary
         logger.info(f"\n  LNO selection (threshold eta_occ={eta_occ}, eta_virt={eta_virt}):")
-        logger.info(f"    Occupied LNOs selected: {n_lno_occ} / {n_ext_occ}")
-        logger.info(f"    Virtual LNOs selected: {n_lno_virt} / {n_ext_virt}")
-        if n_lno_occ > 0:
-            logger.info(f"    Selected occ eigenvalues: {Lambda_occ[lno_occ_indices]}")
-        if n_lno_virt > 0:
-            logger.info(f"    Selected virt eigenvalues: {Lambda_virt[lno_virt_indices]}")
+        logger.info(f"    Occupied LNOs selected: {occ_result['n_lno']} / {n_ext_occ}")
+        logger.info(f"    Virtual LNOs selected: {virt_result['n_lno']} / {n_ext_virt}")
+        if occ_result['n_lno'] > 0:
+            logger.info(f"    Selected occ eigenvalues: {occ_result['Lambda'][occ_result['lno_indices']]}")
+        if virt_result['n_lno'] > 0:
+            logger.info(f"    Selected virt eigenvalues: {virt_result['Lambda'][virt_result['lno_indices']]}")
         
         # Update local space with LNO information
         ls_lno = ls.copy()
         ls_lno.update({
-            'X_occ': X_occ,  # LNO transformation matrix (n_ext_occ, n_ext_occ)
-            'X_virt': X_virt,  # LNO transformation matrix (n_ext_virt, n_ext_virt)
-            'Lambda_occ': Lambda_occ,  # Eigenvalues
-            'Lambda_virt': Lambda_virt,
-            'lno_occ_indices': lno_occ_indices,  # Indices of selected LNOs
-            'lno_virt_indices': lno_virt_indices,
-            'n_lno_occ': n_lno_occ,
-            'n_lno_virt': n_lno_virt,
+            'X_occ': occ_result['X'],  # LNO transformation matrix (n_ext_occ, n_ext_occ)
+            'X_virt': virt_result['X'],  # LNO transformation matrix (n_ext_virt, n_ext_virt)
+            'Lambda_occ': occ_result['Lambda'],  # Eigenvalues
+            'Lambda_virt': virt_result['Lambda'],
+            'lno_occ_indices': occ_result['lno_indices'],  # Indices of selected LNOs
+            'lno_virt_indices': virt_result['lno_indices'],
+            'n_lno_occ': occ_result['n_lno'],
+            'n_lno_virt': virt_result['n_lno'],
         })
         
         local_spaces_lno.append(ls_lno)
@@ -809,6 +870,10 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
     
     total_ext_before = 0
     total_ext_after = 0
+    max_active_occ = 0
+    max_active_virt = 0
+    max_active_total = 0
+    max_active_frag_id = None
     
     for ls in local_spaces_lno:
         n_int_occ = ls['n_int_occ']
@@ -820,12 +885,25 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
         total_ext_before += n_ext_before
         total_ext_after += n_ext_after
         
+        # Calculate active space size (internal + selected LNOs)
+        active_occ = n_int_occ + ls['n_lno_occ']
+        active_virt = n_int_virt + ls['n_lno_virt']
+        active_total = active_occ + active_virt
+        
+        # Track maximum active space
+        if active_total > max_active_total:
+            max_active_total = active_total
+            max_active_occ = active_occ
+            max_active_virt = active_virt
+            max_active_frag_id = ls['fragment_id']
+        
         logger.info(f"\nFragment {ls['fragment_id']}:")
         logger.info(f"  Internal: {n_int_occ} occ + {n_int_virt} virt = {n_int_occ + n_int_virt}")
         logger.info(f"  External (before): {n_ext_occ} occ + {n_ext_virt} virt = {n_ext_before}")
         logger.info(f"  External (after LNO): {ls['n_lno_occ']} occ + {ls['n_lno_virt']} virt = {n_ext_after}")
+        logger.info(f"  Active space size: {active_occ} occ + {active_virt} virt = {active_total}")
         if n_ext_before > 0:
-            compression_ratio = n_ext_after / n_ext_before
+            compression_ratio = 1-n_ext_after / n_ext_before
             logger.info(f"  Compression ratio: {compression_ratio:.2%} ({n_ext_after}/{n_ext_before})")
         else:
             logger.info(f"  No external space")
@@ -834,10 +912,15 @@ def compute_mp2_lno_compression(mol, mf, local_spaces, eta_occ=1e-6, eta_virt=1e
     logger.info(f"  Total external orbitals before: {total_ext_before}")
     logger.info(f"  Total external orbitals after LNO: {total_ext_after}")
     if total_ext_before > 0:
-        overall_ratio = total_ext_after / total_ext_before
+        overall_ratio = 1-total_ext_after / total_ext_before
         logger.info(f"  Overall compression ratio: {overall_ratio:.2%} ({total_ext_after}/{total_ext_before})")
     else:
         logger.info(f"  No external space to compress")
+    
+    logger.info(f"\nLargest active space (Fragment {max_active_frag_id}):")
+    logger.info(f"  Occupied: {max_active_occ}")
+    logger.info(f"  Virtual: {max_active_virt}")
+    logger.info(f"  Total: {max_active_total}")
     logger.info("="*60 + "\n")
     
     return local_spaces_lno
@@ -1406,11 +1489,11 @@ def main():
     separation = 1.5  # Angstrom, typical H-H distance in molecules
     basis = 'cc-pvdz'
     
-    mol = build_mol(separation=separation, basis=basis)
-    #mol = gto.M(
-    #    atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587",
-    #    basis="cc-pvdz"
-    #)
+    #mol = build_mol(separation=separation, basis=basis)
+    mol = gto.M(
+        atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587",
+        basis="cc-pvdz"
+    )
     
     # Step 2: Run RHF calculation
     mf = run_rhf(mol)
@@ -1438,8 +1521,8 @@ def main():
     )
     
     # Step 5: Compress external spaces using MP2-LNO
-    eta_occ = 1e-5  # Threshold for occupied LNO eigenvalues
-    eta_virt = 1e-6  # Threshold for virtual LNO eigenvalues
+    eta_occ = 1e-2  # Threshold for occupied LNO eigenvalues
+    eta_virt = 1e-3  # Threshold for virtual LNO eigenvalues
     
     local_spaces_lno = compute_mp2_lno_compression(
         mol, mf, local_spaces,
@@ -1476,7 +1559,9 @@ def main():
         'energy_corr': energy_results['total_correlation'],
         'energy_total': energy_results['total_energy'],
     }
-    
+    ccsd_full = run_full_ccsd(mol, mf)
+    results['ccsd_full'] = ccsd_full
+
     logger.info("="*70)
     logger.info("All steps completed successfully!")
     logger.info("="*70)
@@ -1492,6 +1577,8 @@ def main():
     logger.info(f"  RHF energy:         {mf.e_tot:.8f} a.u.")
     logger.info(f"  Correlation energy: {energy_results['total_correlation']:.8f} a.u.")
     logger.info(f"  Total energy:       {energy_results['total_energy']:.8f} a.u.")
+    logger.info(f"  Full CCSD correlation energy:       {ccsd_full['e_corr']:.8f} a.u.")
+    logger.info(f"  Full CCSD total energy:       {ccsd_full['e_total']:.8f} a.u.")
     logger.info("="*70 + "\n")
     
     return results
@@ -1732,7 +1819,11 @@ if __name__ == "__main__":
         logger.info("Running convergence test mode...")
         
         # Build system
-        mol = build_mol(separation=1.5, basis='cc-pvdz')
+        #mol = build_mol(separation=1.5, basis='cc-pvdz')
+        mol = gto.M(
+            atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587",
+            basis="cc-pvtz"
+            )
         mf = run_rhf(mol)
         iao_coeff, iao_labels = construct_iao(mol, mf, minao='minao')
         
