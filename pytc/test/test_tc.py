@@ -15,7 +15,7 @@ def get_h2_sto3g():
     return mol, mf
 
 
-class SimpleJastrow(Jastrow):
+class REXP(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     def __call__(self, r1, r2, atomic_positions=None):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
@@ -37,7 +37,7 @@ class TestTC(unittest.TestCase):
     def setUpClass(cls):
         """Set up a simple H2 molecule for all tests in this class."""
         cls.mol, cls.mf = get_h2_sto3g()
-        cls.jastrow = SimpleJastrow([1])  # alpha = 0.5
+        cls.jastrow = REXP([1])  # alpha = 0.5
         # Update TC initialization to include jastrow_factor
         cls.tc = TC(cls.mf, cls.jastrow, grid_lvl=1)  # Use coarse grid for testing
     
