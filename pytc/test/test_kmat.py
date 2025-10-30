@@ -3,7 +3,7 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft
-from pytc.jastrow import SimpleJastrow
+from pytc.jastrow import REXP
 import time
 
 def get_be_ccpvdz():
@@ -21,7 +21,7 @@ class TestKmat(unittest.TestCase):
         """Set up a Be atom for all tests in this class."""
         cls.mol, cls.mf = get_be_ccpvdz()
         cls.n_orb = cls.mf.mo_coeff.shape[1]
-        cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
+        cls.jastrow = REXP([0.5])  # alpha = 0.5
         
         # Set up grid points for testing
         grids = dft.gen_grid.Grids(cls.mol)

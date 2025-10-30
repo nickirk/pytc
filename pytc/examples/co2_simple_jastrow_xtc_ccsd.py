@@ -9,7 +9,7 @@ mol = gto.M(atom='C 0 0 0; O 0 0 -5.63; O 0 0 5.63', basis='aug-ccpvtz', unit='B
 mf = scf.RHF(mol)                                                               
 mf.kernel()                                                                     
                                                                                 
-my_jastrow = jastrow.SimpleJastrow([1.4])                                       
+my_jastrow = jastrow.REXP([1.4])                                       
 my_xtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)                                    
                                                                                 
 print("Making eris")                                                            

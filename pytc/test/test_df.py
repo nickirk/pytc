@@ -5,7 +5,7 @@ import numpy as np
 from pyscf import gto, scf
 
 from pytc.xtc import XTC
-from pytc.jastrow import SimpleJastrow
+from pytc.jastrow import REXP
 from pytc.df import isdf_decompose_cholesky, reconstruct_rho, test_accuracy, test_multi_accuracy
 
 def get_be_ccpvdz():
@@ -24,8 +24,8 @@ class TestDF(unittest.TestCase):
         # Get mean-field data
         _, cls.mf = get_be_ccpvdz()
 
-        # Create SimpleJastrow instance
-        cls.jastrow = SimpleJastrow([1.4])
+        # Create REXP instance
+        cls.jastrow = REXP([1.4])
 
         # Initialize XTC
         cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)
