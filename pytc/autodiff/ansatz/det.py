@@ -182,7 +182,7 @@ def _update_grad_lap_rows(walker, ao_grad_vals, ao_lap_vals, moved_indices,
     grad_down = np.array(walker.grad_down)
     lap_up = np.array(walker.lap_up)
     lap_down = np.array(walker.lap_down)
-    
+
     # Convert moved_indices to arrays
     moved_indices_arr = np.array(moved_indices)
     walker_indices = moved_indices_arr[:, 0]
@@ -199,8 +199,11 @@ def _update_grad_lap_rows(walker, ao_grad_vals, ao_lap_vals, moved_indices,
         alpha_walker_idx = walker_indices[alpha_mask]
         alpha_electron_idx = electron_indices[alpha_mask]
         
-        # Transform gradients: (n_moved, n_aos, 3) @ (n_aos, n_alpha) -> (n_moved, n_alpha, 3)
-        alpha_mo_grad = np.einsum('ijk,jl->ilk', alpha_ao_grad, mo_coeff_alpha_occ)
+        # Transform gradients using np.dot over the spatial dimension
+        alpha_mo_grad = np.zeros((alpha_ao_grad.shape[0], mo_coeff_alpha_occ.shape[1], 3))
+        for d in range(3):
+            alpha_mo_grad[..., d] = np.dot(alpha_ao_grad[..., d], mo_coeff_alpha_occ)
+
         grad_up[alpha_walker_idx, alpha_electron_idx, :, :] = alpha_mo_grad
         
         # Transform laplacians
@@ -215,14 +218,79 @@ def _update_grad_lap_rows(walker, ao_grad_vals, ao_lap_vals, moved_indices,
         beta_electron_idx = electron_indices[beta_mask] - n_alpha
         
         # Transform gradients
-        beta_mo_grad = np.einsum('ijk,jl->ilk', beta_ao_grad, mo_coeff_beta_occ)
-        grad_down[beta_walker_idx, beta_electron_idx, :, :] = beta_mo_grad
-        
+        beta_ao_grad_mo_grad = np.zeros((beta_ao_grad.shape[0], mo_coeff_beta_occ.shape[1], 3))
+        for d in range(3):
+            beta_ao_grad_mo_grad[..., d] = np.dot(beta_ao_grad[..., d], mo_coeff_beta_occ)
+        grad_down[beta_walker_idx, beta_electron_idx, :, :] = beta_ao_grad_mo_grad
+
         # Transform laplacians
         beta_mo_lap = beta_ao_lap @ mo_coeff_beta_occ
         lap_down[beta_walker_idx, beta_electron_idx, :] = beta_mo_lap
     
     return grad_up, grad_down, lap_up, lap_down
+
+
+def _sherman_morrison_update_batch(old_matrices, old_inverses, old_dets, row_indices, new_rows):
+    """Batched Sherman-Morrison update for matrix determinants and inverses.
+    
+    For matrices A with inverses A^{-1} and determinants det(A), when row i is updated
+    from old_row to new_row, this computes the new determinants and inverses efficiently
+    for multiple matrices simultaneously.
+    
+    Sherman-Morrison formula:
+    - For rank-1 update A' = A + u*v^T, where u = e_i (unit vector), v = new_row - old_row
+    - New determinant: det(A') = det(A) * (1 + v^T * A^{-1} * u)
+    - New inverse: (A')^{-1} = A^{-1} - (A^{-1} * u * v^T * A^{-1}) / (1 + v^T * A^{-1} * u)
+    
+    Args:
+        old_matrices: Original matrices, shape (batch, n, n)
+        old_inverses: Inverses of original matrices, shape (batch, n, n)
+        old_dets: Determinants of original matrices, shape (batch,)
+        row_indices: Indices of rows that changed, shape (batch,)
+        new_rows: New row values, shape (batch, n)
+        
+    Returns:
+        Tuple of (new_dets, new_inverses)
+        - new_dets: Updated determinants, shape (batch,)
+        - new_inverses: Updated matrix inverses, shape (batch, n, n)
+    """
+    batch_size = old_matrices.shape[0]
+    n = old_matrices.shape[1]
+    
+    # Get the old rows using advanced indexing
+    # old_matrices[i, row_indices[i], :] for all i
+    batch_idx = np.arange(batch_size)
+    old_rows = old_matrices[batch_idx, row_indices, :]  # shape: (batch, n)
+    
+    # Compute the difference vectors v = new_rows - old_rows
+    v = new_rows - old_rows  # shape: (batch, n)
+    
+    # Get i-th columns of inverses: A^{-1}[:, i] for each matrix
+    # old_inverses[i, :, row_indices[i]] for all i
+    inv_cols = old_inverses[batch_idx, :, row_indices]  # shape: (batch, n)
+    
+    # Compute Sherman-Morrison denominators: (1 + v^T * A^{-1} * e_i)
+    # For each batch element: sum over n of v[i] * inv_col[i]
+    denominators = 1.0 + np.sum(v * inv_cols, axis=1)  # shape: (batch,)
+    
+    # Update determinants: det(A') = det(A) * denominator
+    new_dets = old_dets * denominators  # shape: (batch,)
+    
+    # Compute v^T * A^{-1} for each batch element
+    # v has shape (batch, n), old_inverses has shape (batch, n, n)
+    # Result: (batch, n)
+    v_T_inv = np.einsum('bi,bij->bj', v, old_inverses)  # shape: (batch, n)
+    
+    # Compute outer products: inv_cols[:, :, None] * v_T_inv[:, None, :]
+    # inv_cols has shape (batch, n), v_T_inv has shape (batch, n)
+    # Result: (batch, n, n)
+    update_matrices = np.einsum('bi,bj->bij', inv_cols, v_T_inv)  # shape: (batch, n, n)
+    
+    # Sherman-Morrison formula for inverses: (A')^{-1} = A^{-1} - update_matrix / denominator
+    # Reshape denominators for broadcasting: (batch, 1, 1)
+    new_inverses = old_inverses - update_matrices / denominators[:, None, None]
+    
+    return new_dets, new_inverses
 
 
 # to be deprecated
@@ -1016,26 +1084,66 @@ class SlaterDet:
         inv_down = np.array(walker.inv_down).copy()
         
         if np.any(walkers_with_moves):
-            # TODO: use fast update formulas here instead of full recompute
-            moved_walker_indices = np.where(walkers_with_moves)[0]
+            # Use Sherman-Morrison formula for fast update (vectorized)
+            moved_indices_arr = np.array(moved_indices)
+            walker_indices = moved_indices_arr[:, 0]
+            electron_indices = moved_indices_arr[:, 1]
             
-            # Extract matrices for moved walkers
-            slater_up_moved = updated_slater_up[moved_walker_indices]
-            slater_down_moved = updated_slater_down[moved_walker_indices]
+            # Separate alpha and beta electrons
+            alpha_mask = electron_indices < self.n_alpha
+            beta_mask = ~alpha_mask
             
-            # Compute determinants
-            new_det_up = np_helper.batched_det(slater_up_moved)
-            new_det_down = np_helper.batched_det(slater_down_moved)
+            # Process alpha electrons (vectorized)
+            if np.any(alpha_mask):
+                alpha_walker_idx = walker_indices[alpha_mask]
+                alpha_electron_idx = electron_indices[alpha_mask]
+                
+                # Extract old matrices, inverses, and dets for walkers with alpha moves
+                old_slater_up_alpha = np.array(walker.slater_up)[alpha_walker_idx]
+                old_inv_up_alpha = inv_up[alpha_walker_idx]
+                old_det_up_alpha = det_up[alpha_walker_idx]
+                
+                # Get new rows from updated Slater matrices
+                new_rows_alpha = updated_slater_up[alpha_walker_idx, alpha_electron_idx, :]
+                
+                # Apply batched Sherman-Morrison update
+                new_det_up_alpha, new_inv_up_alpha = _sherman_morrison_update_batch(
+                    old_slater_up_alpha,
+                    old_inv_up_alpha,
+                    old_det_up_alpha,
+                    alpha_electron_idx,
+                    new_rows_alpha
+                )
+                
+                # Update the det and inv arrays
+                det_up[alpha_walker_idx] = new_det_up_alpha
+                inv_up[alpha_walker_idx] = new_inv_up_alpha
             
-            # Compute inverses
-            new_inv_up = np.linalg.inv(slater_up_moved)
-            new_inv_down = np.linalg.inv(slater_down_moved)
-            
-            # Update only the moved walkers
-            det_up[moved_walker_indices] = new_det_up
-            det_down[moved_walker_indices] = new_det_down
-            inv_up[moved_walker_indices] = new_inv_up
-            inv_down[moved_walker_indices] = new_inv_down
+            # Process beta electrons (vectorized)
+            if np.any(beta_mask):
+                beta_walker_idx = walker_indices[beta_mask]
+                beta_electron_idx = electron_indices[beta_mask] - self.n_alpha
+                
+                # Extract old matrices, inverses, and dets for walkers with beta moves
+                old_slater_down_beta = np.array(walker.slater_down)[beta_walker_idx]
+                old_inv_down_beta = inv_down[beta_walker_idx]
+                old_det_down_beta = det_down[beta_walker_idx]
+                
+                # Get new rows from updated Slater matrices
+                new_rows_beta = updated_slater_down[beta_walker_idx, beta_electron_idx, :]
+                
+                # Apply batched Sherman-Morrison update
+                new_det_down_beta, new_inv_down_beta = _sherman_morrison_update_batch(
+                    old_slater_down_beta,
+                    old_inv_down_beta,
+                    old_det_down_beta,
+                    beta_electron_idx,
+                    new_rows_beta
+                )
+                
+                # Update the det and inv arrays
+                det_down[beta_walker_idx] = new_det_down_beta
+                inv_down[beta_walker_idx] = new_inv_down_beta
         
         # Compute final determinant values
         det_values = det_up * det_down
