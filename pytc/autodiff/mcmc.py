@@ -612,7 +612,7 @@ def optimize(
             actual_walkers_for_loss = batch_data_for_loss
 
         # Compute energies for all walkers with current parameters
-        energies_val, _ = ansatz.local_energy(actual_walkers_for_loss, current_params_for_loss)
+        energies_val = ansatz.local_energy(actual_walkers_for_loss, current_params_for_loss)
         
         # clip energies around the mean energy to avoid numerical instability
         median_energy_val = jnp.median(energies_val)
