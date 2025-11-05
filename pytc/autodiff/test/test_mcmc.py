@@ -12,7 +12,10 @@ import time
 from pyscf import gto, scf
 
 # Import our modules
-from pytc.autodiff.mcmc import optimize, sample 
+from pytc.autodiff.mcmc import (
+    optimize, sample, Walker, initialize_walker_state, 
+    initialize_walkers, metropolis_hastings, _one_electron_move, _all_electron_move
+)
 from pytc.autodiff.mcmc_utils import init_electron_configs
 
 from pytc.autodiff.mcmc_utils import analyze_energies
@@ -45,6 +48,173 @@ class TestJastrowFunctions(unittest.TestCase):
             grads, laps = jastrow.get_log_grads_r1(r1, r2, jastrow_params)
             np.testing.assert_allclose(grads, jnp.zeros(3), atol=1e-10)
             np.testing.assert_allclose(laps, 0.0, atol=1e-10)
+
+
+class TestWalkerDataclass(unittest.TestCase):
+    """Test Walker dataclass and related functions."""
+    
+    def setUp(self):
+        """Set up a simple molecule for testing."""
+        self.mol = gto.Mole()
+        self.mol.atom = 'H 0 0 0; H 0 0 1.0'
+        self.mol.basis = 'sto-3g'
+        self.mol.build()
+        
+        # Create simple ansatz
+        mf = scf.RHF(self.mol)
+        mf.kernel()
+        det = SlaterDet(self.mol, mf.mo_coeff)
+        jastrow = Poly()
+        self.ansatz = SlaterJastrow(self.mol, jastrow, [det])
+        
+        self.n_walkers = 10
+        self.n_electrons = self.mol.nelectron
+        self.n_alpha = self.ansatz.n_alpha
+        self.n_beta = self.n_electrons - self.n_alpha
+    
+    def test_walker_initialization(self):
+        """Test that Walker is initialized correctly."""
+        key = random.PRNGKey(42)
+        positions = init_electron_configs(
+            self.mol.atom_coords(), self.mol.atom_charges(),
+            self.n_electrons, self.n_walkers, key
+        )
+        
+        walker = initialize_walker_state(self.ansatz, positions)
+        
+        # Check it's a Walker instance
+        self.assertIsInstance(walker, Walker)
+        
+        # Check shapes
+        self.assertEqual(walker.positions.shape, (self.n_walkers, self.n_electrons, 3))
+        self.assertEqual(walker.slater_up.shape, (self.n_walkers, self.n_alpha, self.n_alpha))
+        self.assertEqual(walker.slater_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
+        self.assertEqual(walker.inv_up.shape, (self.n_walkers, self.n_alpha, self.n_alpha))
+        self.assertEqual(walker.inv_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
+        self.assertEqual(walker.det_up.shape, (self.n_walkers,))
+        self.assertEqual(walker.det_down.shape, (self.n_walkers,))
+        self.assertEqual(walker.move_mask.shape, (self.n_walkers, self.n_electrons))
+        
+        # Check move_mask is all True initially
+        self.assertTrue(jnp.all(walker.move_mask))
+        
+        # Check other fields are zeros
+        self.assertTrue(jnp.allclose(walker.slater_up, 0.0))
+        self.assertTrue(jnp.allclose(walker.det_up, 0.0))
+    
+    def test_initialize_walkers(self):
+        """Test initialize_walkers function."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Check it returns a Walker
+        self.assertIsInstance(walker, Walker)
+        self.assertEqual(walker.positions.shape, (self.n_walkers, self.n_electrons, 3))
+        self.assertTrue(jnp.all(walker.move_mask))
+    
+    def test_walker_immutability(self):
+        """Test that Walker.replace creates new instance."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Create new walker with modified positions
+        new_positions = walker.positions + 0.1
+        new_walker = walker.replace(positions=new_positions)
+        
+        # Original walker should be unchanged
+        self.assertFalse(jnp.allclose(walker.positions, new_walker.positions))
+        self.assertTrue(jnp.allclose(new_walker.positions, walker.positions + 0.1))
+    
+    def test_one_electron_move_mask(self):
+        """Test that _one_electron_move sets move_mask correctly."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Reset move_mask to False for current walker
+        walker = walker.replace(move_mask=jnp.zeros_like(walker.move_mask))
+        
+        # Create parameters
+        jastrow_params = jnp.zeros(1)
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
+        
+        # Perform one electron move
+        key, subkey = random.split(key)
+        proposals, psi_old, psi_new = _one_electron_move(
+            self.ansatz, walker, step_size=0.1, key=subkey, params=params
+        )
+        
+        # Check that proposals have exactly one True per walker
+        n_true_per_walker = jnp.sum(proposals.move_mask, axis=1)
+        self.assertTrue(jnp.all(n_true_per_walker == 1))
+        
+        # Check that positions changed only for masked electrons
+        for i in range(self.n_walkers):
+            electron_idx = jnp.where(proposals.move_mask[i])[0][0]
+            # Moved electron should have different position
+            self.assertFalse(jnp.allclose(
+                walker.positions[i, electron_idx], 
+                proposals.positions[i, electron_idx]
+            ))
+            # Other electrons should have same position
+            for j in range(self.n_electrons):
+                if j != electron_idx:
+                    self.assertTrue(jnp.allclose(
+                        walker.positions[i, j], 
+                        proposals.positions[i, j]
+                    ))
+    
+    def test_all_electron_move_mask(self):
+        """Test that _all_electron_move sets move_mask to all True."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Reset move_mask to False
+        walker = walker.replace(move_mask=jnp.zeros_like(walker.move_mask))
+        
+        # Create parameters
+        jastrow_params = jnp.zeros(1)
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
+        
+        # Perform all electron move
+        key, subkey = random.split(key)
+        proposals, psi_old, psi_new = _all_electron_move(
+            self.ansatz, walker, step_size=0.1, key=subkey, params=params
+        )
+        
+        # Check that proposals have all True
+        self.assertTrue(jnp.all(proposals.move_mask))
+        
+        # Check that all positions changed
+        self.assertFalse(jnp.allclose(walker.positions, proposals.positions))
+    
+    def test_metropolis_hastings_resets_mask(self):
+        """Test that metropolis_hastings resets move_mask after acceptance."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Reset move_mask to False
+        walker = walker.replace(move_mask=jnp.zeros_like(walker.move_mask))
+        
+        # Create parameters
+        jastrow_params = jnp.zeros(1)
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
+        
+        # Perform one MH step
+        key, subkey = random.split(key)
+        new_walker, acceptance_rate = metropolis_hastings(
+            self.ansatz, walker, step_size=0.1, key=subkey, 
+            params=params, move_type="one"
+        )
+        
+        # Check that move_mask is reset to all False
+        self.assertTrue(jnp.all(~new_walker.move_mask))
+        
+        # Check acceptance_rate is reasonable
+        self.assertGreaterEqual(acceptance_rate, 0.0)
+        self.assertLessEqual(acceptance_rate, 1.0)
 
 
 class TestElectronInitialization(unittest.TestCase):

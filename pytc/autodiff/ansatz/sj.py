@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from typing import List, Any
 from functools import partial
 
-from pytc.autodiff.ansatz.det import value, grad, laplacian, matrix
+from pytc.autodiff.ansatz.det import  value_and_grad, grad 
 
 
 class SlaterJastrow:
@@ -49,26 +49,47 @@ class SlaterJastrow:
         return self._ion_ion_potential
     
     @partial(jax.jit, static_argnums=(0,))
-    def __call__(self, elec_coords_batch, params, move_mask=None):
+    def __call__(self, walker, params):
         """Evaluate wavefunction with explicit parameters.
         
         Args:
-            elec_coords_batch: Array of electron positions
+            walker: Walker dataclass with positions, move_mask, and cached matrices
             params: (jastrow_params, linear_coeffs)
-            move_mask: Optional boolean mask indicating which electrons moved
+            
+        Returns:
+            Tuple of (psi_values, updated_walker) where:
+                psi_values: Wavefunction values, shape (n_walkers,)
+                updated_walker: Walker with updated determinant matrices
         """
         jastrow_params, linear_coeffs = params
-        jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(elec_coords_batch)
         
-        det_vals = []
-        for det in self.dets:
-            det_batch_vals = value(det, elec_coords_batch, move_mask)
-            det_vals.append(det_batch_vals)
+        # Compute Jastrow values on all positions (not optimized, as per plan)
+        jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(walker.positions)
         
-        det_vals_array = jnp.array(det_vals).transpose()
-        linear_combo = jnp.sum(linear_coeffs * det_vals_array, axis=1)
+        # Compute determinant values with efficient updates (updates Slater + grad + lap)
+        # For single determinant case (most common), avoid list accumulation
+        if len(self.dets) == 1:
+            det_batch_vals, final_updated_walker = value_and_grad(self.dets[0], walker)
+            linear_combo = linear_coeffs[0] * det_batch_vals
+        else:
+            # Multiple determinants: accumulate only det values, not walkers
+            det_vals_list = []
+            final_updated_walker = None
+            
+            for i, det in enumerate(self.dets):
+                det_batch_vals, updated_walker = value_and_grad(det, walker)
+                det_vals_list.append(np.array(det_batch_vals))
+                # Only keep the first walker
+                if i == 0:
+                    final_updated_walker = updated_walker
+            
+            det_vals_array = jnp.array(det_vals_list).transpose()
+            linear_combo = jnp.sum(linear_coeffs * det_vals_array, axis=1)
         
-        return jastrow_vals * linear_combo
+        psi_values = jastrow_vals * linear_combo
+        final_updated_walker = final_updated_walker.replace(psi_values=psi_values)
+        
+        return psi_values, final_updated_walker
 
     @partial(jax.jit, static_argnums=(0,))
     def _compute_jastrow_value(self, elec_coords, jastrow_params):
@@ -202,32 +223,39 @@ class SlaterJastrow:
         return self.n_electrons - self.n_alpha
     
     @partial(jax.jit, static_argnums=(0,))
-    def local_energy(self, elec_coords_batch, params):
-        """Compute local energy for a batch of electron configurations.
+    def local_energy(self, walker, params):
+        """Compute local energy for a batch of electron configurations using Walker.
+        
+        Uses the walker's cached Slater matrices, gradients, and laplacians which were
+        updated by the most recent __call__() invocation.
         
         Args:
-            elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
-                            or (n_electrons, 3) for a single walker
+            walker: Walker dataclass with positions and cached matrices/gradients/laplacians
             params: Tuple of parameters (jastrow_params, linear_coeffs)
                             
         Returns:
-            Array of local energy values with shape (n_walkers,)
-            or a single value for a single walker
+            Tuple of (energies, walker) where:
+                energies: Array of local energy values with shape (n_walkers,)
+                walker: Unchanged walker (no updates needed)
         """
         jastrow_params, linear_coeffs = params
-        # Use vmap to compute Jastrow terms for all walkers
-        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(lambda x: self._compute_jastrow_terms(x, jastrow_params))(elec_coords_batch)
         
-        # Get batched matrices, gradients, and laplacians using JAX wrappers
-        det = self.dets[0]  # Using the first determinant (assuming single-determinant for now)
-
-        laps = laplacian(det, elec_coords_batch)
-        slater_alpha_batch, slater_beta_batch = laps[0], laps[1]
-        grad_alpha_batch, grad_beta_batch = laps[2], laps[3]
-        lap_alpha_batch, lap_beta_batch = laps[4], laps[5]
+        # Use vmap to compute Jastrow terms for all walkers
+        grad_J_over_J_batch, lap_J_over_J_batch = jax.vmap(
+            lambda x: self._compute_jastrow_terms(x, jastrow_params)
+        )(walker.positions)
+        
+        # Use the walker's stored Slater matrices, gradients, and laplacians
+        # These were already updated in the most recent __call__() via value_and_grad()
+        slater_alpha_batch = walker.slater_up
+        slater_beta_batch = walker.slater_down
+        grad_alpha_batch = walker.grad_up
+        grad_beta_batch = walker.grad_down
+        lap_alpha_batch = walker.lap_up
+        lap_beta_batch = walker.lap_down
 
         energies = jax.vmap(self._compute_single_walker_energy)(
-            elec_coords_batch, grad_J_over_J_batch, lap_J_over_J_batch,
+            walker.positions, grad_J_over_J_batch, lap_J_over_J_batch,
             slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch,
             lap_alpha_batch, lap_beta_batch
         )
