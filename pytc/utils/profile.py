@@ -1,13 +1,12 @@
 # Add at the top of your script, BEFORE importing JAX
 import os
-os.environ['XLA_FLAGS'] = '--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=8'
 from line_profiler import LineProfiler
 import unittest
 import io
 from pytc.autodiff.test.test_mcmc import TestHartreeFockEnergy
 from pytc.autodiff.mcmc import metropolis_hastings, sample, metropolis_hastings_importance_sampling
 from pytc.autodiff.mcmc import burn_in_with_importance, metropolis_hastings, _one_electron_move
-from pytc.autodiff.ansatz.det import SlaterDet
+from pytc.autodiff.ansatz.det import SlaterDet, _update_grad_lap_rows
 from pytc.autodiff.ansatz.sj import SlaterJastrow
 from pyscf.dft import numint  # Import numint to profile AO evaluations
 
@@ -23,11 +22,12 @@ profile.add_function(metropolis_hastings)
 profile.add_function(sample)
 profile.add_function(metropolis_hastings)
 profile.add_function(_one_electron_move)
+profile.add_function(_update_grad_lap_rows)
 
 
 # Add SlaterDet functions that are likely bottlenecks
 profile.add_function(SlaterDet.__call__)
-profile.add_function(SlaterDet.value)
+profile.add_function(SlaterDet.value_and_grad)
 profile.add_function(SlaterDet.matrix)
 profile.add_function(SlaterDet.grad)
 profile.add_function(SlaterDet.laplacian)
