@@ -2,11 +2,14 @@
 """
 
 import numpy as np
+from functools import partial
+import gc
 import jax
 import jax.numpy as jnp
 import optax
 import kfac_jax
 import time
+import flax.struct
 from jax.tree_util import tree_map
 from jax import random, value_and_grad
 from jax.lax import stop_gradient
@@ -18,48 +21,144 @@ from pytc.autodiff.mcmc_utils import (
 )
 
 
-def _all_electron_move(ansatz, walkers, step_size, key, params):
-    """Move all electrons at once for each walker.
-    Returns: proposals, psi_values, new_psi_values"""
-    # Compute initial wavefunction values
-    psi_values = ansatz(walkers, params)
+@flax.struct.dataclass
+class Walker:
+    """Batched walker state for MCMC sampling.
     
-    # Generate proposals (one step)
+    All fields have shape (n_walkers, ...) in the first dimension.
+    Memory estimate: For 100k walkers with 42 electrons (benzene):
+    - Without grad/lap: ~1.5 GB
+    - With grad/lap: ~4.3 GB (acceptable for modern systems)
+    """
+    positions: jnp.ndarray      # (n_walkers, n_electrons, 3)
+    psi_values: jnp.ndarray   # (n_walkers,)
+    det_up: jnp.ndarray         # (n_walkers,)
+    det_down: jnp.ndarray       # (n_walkers,)
+    slater_up: jnp.ndarray      # (n_walkers, n_alpha, n_alpha)
+    slater_down: jnp.ndarray    # (n_walkers, n_beta, n_beta)
+    inv_up: jnp.ndarray         # (n_walkers, n_alpha, n_alpha)
+    inv_down: jnp.ndarray       # (n_walkers, n_beta, n_beta)
+    grad_up: jnp.ndarray        # (n_walkers, n_alpha, n_alpha, 3)
+    grad_down: jnp.ndarray      # (n_walkers, n_beta, n_beta, 3)
+    lap_up: jnp.ndarray         # (n_walkers, n_alpha, n_alpha)
+    lap_down: jnp.ndarray       # (n_walkers, n_beta, n_beta)
+    move_mask: jnp.ndarray      # (n_walkers, n_electrons) boolean - tracks which electrons moved
+
+
+def _all_electron_move(ansatz, walker, step_size, key, params):
+    """Move all electrons at once for each walker.
+    
+    Args:
+        ansatz: Wavefunction object
+        walker: Walker dataclass with current state
+        step_size: Standard deviation of Gaussian proposal
+        key: PRNG key
+        params: Parameters for the ansatz
+        
+    Returns:
+        proposals: Walker with proposed new positions and all-True move_mask
+        psi_values: Wavefunction values for current walker
+        new_psi_values: Wavefunction values for proposals
+    """
+    # Compute initial wavefunction values
+    psi_values, current_walker = ansatz(walker, params)
+    
+    # Generate proposals (all electrons move)
     key, subkey = random.split(key)
-    proposals = walkers + random.normal(subkey, walkers.shape) * step_size
+    new_positions = walker.positions + random.normal(subkey, walker.positions.shape) * step_size
+    
+    # Create proposal walker with all-True move_mask (all electrons moved)
+    proposals = current_walker.replace(
+        positions=new_positions,
+        move_mask=jnp.ones_like(walker.move_mask)
+    )
     
     # Compute new wavefunction values
-    new_psi_values = ansatz(proposals, params)
+    new_psi_values, proposals = ansatz(proposals, params)
     
-    return proposals, psi_values, new_psi_values
+    # Return updated current_walker
+    return psi_values, new_psi_values, current_walker, proposals
 
-def _one_electron_move(ansatz, walkers, step_size, key, params):
-    """Move one randomly selected electron for each walker."""
-    # Create electron selection mask
-    key, subkey = random.split(key)
-    n_electrons = walkers.shape[1]
-    electron_indices = random.randint(subkey, (walkers.shape[0],), 0, n_electrons)
+def _one_electron_move(ansatz, walker, step_size, key, params):
+    """Move one randomly selected electron for each walker.
     
-    # Create move mask
+    Args:
+        ansatz: Wavefunction object
+        walker: Walker dataclass with current state
+        step_size: Standard deviation of Gaussian proposal
+        key: PRNG key
+        params: Parameters for the ansatz
+        
+    Returns:
+        proposals: Walker with proposed new positions and move_mask set
+        psi_values: Wavefunction values for current walker
+        new_psi_values: Wavefunction values for proposals
+    """
+    # Select electron to move for each walker
+    key, subkey = random.split(key)
+    n_electrons = walker.positions.shape[1]
+    electron_indices = random.randint(subkey, (walker.positions.shape[0],), 0, n_electrons)
+    
+    # Create move mask indicating which electron moved
     move_mask = (jnp.arange(n_electrons)[None, :] == electron_indices[:, None])
     
-    # Generate moves only for selected electrons
+    # Generate proposals for selected electrons only
     key, subkey = random.split(key)
     mask_3d = move_mask[:, :, None]
-    proposals = walkers + mask_3d * random.normal(subkey, walkers.shape) * step_size
+    new_positions = walker.positions + mask_3d * random.normal(subkey, walker.positions.shape) * step_size
     
-    # Compute wavefunction values with mask for fast updates
-    psi_values = ansatz(walkers, params)
-    new_psi_values = ansatz(proposals, params, move_mask)
+    # Create proposal walker with new positions and move mask
+    proposals = walker.replace(
+        positions=new_positions,
+        move_mask=move_mask
+    )
     
-    return proposals, psi_values, new_psi_values
+    # Proposals have move_mask indicating moved electron
+    new_psi_values, proposals = ansatz(proposals, params)
+    
+    return walker.psi_values, new_psi_values, walker, proposals
 
-def metropolis_hastings(ansatz, walkers, step_size, key, params, move_type="one"):
+
+def initialize_walker_state(ansatz, positions):
+    """Initialize Walker state with positions and all-True move_mask.
+    
+    Args:
+        ansatz: Wavefunction object (contains determinant info)
+        positions: Array of initial positions with shape (n_walkers, n_electrons, 3)
+        
+    Returns:
+        Walker: Initialized walker state with:
+            - positions: provided positions
+            - move_mask: all True (indicates full computation needed)
+            - all other fields: zeros (will be computed on first ansatz call)
+    """
+    n_walkers, n_electrons = positions.shape[0], positions.shape[1]
+    n_alpha = ansatz.dets[0].n_alpha
+    n_beta = n_electrons - n_alpha
+    
+    return Walker(
+        positions=positions,
+        psi_values=jnp.zeros((n_walkers,)),
+        slater_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
+        slater_down=jnp.zeros((n_walkers, n_beta, n_beta)),
+        inv_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
+        inv_down=jnp.zeros((n_walkers, n_beta, n_beta)),
+        det_up=jnp.zeros((n_walkers,)),
+        det_down=jnp.zeros((n_walkers,)),
+        grad_up=jnp.zeros((n_walkers, n_alpha, n_alpha, 3)),
+        grad_down=jnp.zeros((n_walkers, n_beta, n_beta, 3)),
+        lap_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
+        lap_down=jnp.zeros((n_walkers, n_beta, n_beta)),
+        move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool)
+    )
+
+
+def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one"):
     """Perform one step of Metropolis-Hastings sampling for quantum wavefunction.
     
     Args:
         ansatz: Wavefunction object with __call__ method that returns ψ(R)
-        walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
+        walker: Walker dataclass with current state
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
         params: contains jastrow_params and linear_coeffs
@@ -67,14 +166,14 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params, move_type="one"
     
     Returns:
         Tuple containing:
-        - new_walkers: New walker configurations after one sampling step
+        - new_walker: New walker state after one sampling step
         - acceptance_rate: Fraction of proposals that were accepted
     """
     # Choose move type
     if move_type == "all":
-        proposals, psi_values, new_psi_values = _all_electron_move(ansatz, walkers, step_size, key, params)
+        psi_values, new_psi_values, current_walker, proposals = _all_electron_move(ansatz, walker, step_size, key, params)
     elif move_type == "one":
-        proposals, psi_values, new_psi_values = _one_electron_move(ansatz, walkers, step_size, key, params)
+        psi_values, new_psi_values, current_walker, proposals = _one_electron_move(ansatz, walker, step_size, key, params)
     else:
         raise ValueError("move_type must be either 'all' or 'one'")
     
@@ -83,18 +182,40 @@ def metropolis_hastings(ansatz, walkers, step_size, key, params, move_type="one"
     
     # Accept or reject
     key, subkey = random.split(key)
-    accept_mask = random.uniform(subkey, shape=(walkers.shape[0],)) < acceptance_prob
+    n_walkers = walker.positions.shape[0]
+    accept_mask = random.uniform(subkey, shape=(n_walkers,)) < acceptance_prob
     accept_count = jnp.sum(accept_mask)
     
-    # Create new walkers without modifying input
-    # Reshape accept_mask to match walker dimensions properly
-    accept_mask_3d = accept_mask[:, None, None]  # Shape: (n_walkers, 1, 1)
-    new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
+    # Create new walker by selecting accepted proposals or keeping current
+    # Reshape accept_mask for broadcasting
+    accept_mask_3d = accept_mask[:, None, None]  # For 2D matrices
+    accept_mask_4d = accept_mask[:, None, None, None]  # For gradients (3D tensors)
+
+
+    # Use current_walker (with updated matrices) instead of original walker
+    new_walker = current_walker.replace(
+        positions=jnp.where(accept_mask_4d[:, :, :, 0], proposals.positions, current_walker.positions),
+        psi_values=jnp.where(accept_mask, new_psi_values, current_walker.psi_values),
+        slater_up=jnp.where(accept_mask_3d, proposals.slater_up, current_walker.slater_up),
+        slater_down=jnp.where(accept_mask_3d, proposals.slater_down, current_walker.slater_down),
+        inv_up=jnp.where(accept_mask_3d, proposals.inv_up, current_walker.inv_up),
+        inv_down=jnp.where(accept_mask_3d, proposals.inv_down, current_walker.inv_down),
+        det_up=jnp.where(accept_mask, proposals.det_up, current_walker.det_up),
+        det_down=jnp.where(accept_mask, proposals.det_down, current_walker.det_down),
+        grad_up=jnp.where(accept_mask_4d, proposals.grad_up, current_walker.grad_up),
+        grad_down=jnp.where(accept_mask_4d, proposals.grad_down, current_walker.grad_down),
+        lap_up=jnp.where(accept_mask_3d, proposals.lap_up, current_walker.lap_up),
+        lap_down=jnp.where(accept_mask_3d, proposals.lap_down, current_walker.lap_down),
+        move_mask=jnp.zeros_like(current_walker.move_mask)  # Reset to all False after accept/reject
+    )
     
     # Calculate acceptance rate
-    acceptance_rate = accept_count / walkers.shape[0]
+    acceptance_rate = accept_count / n_walkers
     
-    return new_walkers, acceptance_rate
+    # Explicitly delete intermediate walkers to help garbage collection
+    del walker, psi_values, new_psi_values, current_walker, proposals, accept_mask, accept_mask_3d, accept_mask_4d
+
+    return new_walker, acceptance_rate
 
 def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     """Initialize walker configurations based on molecular structure.
@@ -102,29 +223,35 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
     Args:
         ansatz: Wavefunction object with molecular information
         n_walkers: Number of parallel walkers
-        initial_walkers: Optional initial positions
+        initial_walkers: Optional initial Walker state or positions
         key: PRNG key
         
     Returns:
-        Array of initialized walker positions with shape (n_walkers, n_electrons, 3)
+        Walker: Initialized walker state with all-True move_mask
     """
     if key is None:
         key = random.PRNGKey(int(time.time()))
-        
-    if initial_walkers is not None:
+    
+    # If initial_walkers is already a Walker, return it
+    if isinstance(initial_walkers, Walker):
         return initial_walkers
+    
+    # If initial_walkers are positions, use them
+    if initial_walkers is not None:
+        positions = initial_walkers
+    else:
+        # Get molecular information needed for initialization
+        atom_coords = ansatz.mol.atom_coords()
+        atom_charges = ansatz.mol.atom_charges()
+        n_electrons = ansatz.n_electrons
+        n_alpha = ansatz.n_alpha
         
-    # Get molecular information needed for initialization
-    atom_coords = ansatz.mol.atom_coords()
-    atom_charges = ansatz.mol.atom_charges()
-    n_electrons = ansatz.n_electrons
-    n_alpha = ansatz.n_alpha
+        # Initialize electron positions based on nuclear positions and spin counts
+        key, subkey = random.split(key)
+        positions = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey, n_alpha=n_alpha)
     
-    # Initialize electron positions based on nuclear positions and spin counts
-    key, subkey = random.split(key)
-    walkers = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey, n_alpha=n_alpha)
-    
-    return walkers
+    # Create Walker state with all-True move_mask
+    return initialize_walker_state(ansatz, positions)
 
 def burn_in(ansatz, 
             walkers, 
@@ -160,12 +287,16 @@ def burn_in(ansatz,
         walkers, acceptance = metropolis_hastings(
             ansatz, walkers, step_size, subkey, params, move_type=move_type)
         
-        acceptance_history.append(acceptance)
+        # Convert acceptance to Python float for history
+        acceptance_float = float(acceptance)
+        acceptance_history.append(acceptance_float)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]:.3f}, time: {time.time() - start_time:.2f}s")
-            step_size *= acceptance_history[-1]/0.5
+            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
+            step_size *= acceptance_float / 0.5
             start_time = time.time()
+            # Periodic garbage collection
+            gc.collect()
     
     print("Burn-in complete.")
     return walkers, acceptance_history, key, step_size
@@ -372,8 +503,9 @@ def sample(
             # Compute local energies with parameters
             energies = ansatz.local_energy(walkers, params)
             
-            collected_samples.append(walkers)
-            collected_energies.append(energies)
+            # Convert to numpy to avoid holding JAX device references
+            collected_samples.append(np.array(walkers.positions))
+            collected_energies.append(np.array(energies))
         
         
         # Print progress occasionally
@@ -384,6 +516,7 @@ def sample(
             report_progress(step, n_steps, acceptance_history, step_times, 
                            collected_energies if collected_energies else None)
             start_time = time.time()
+            gc.collect()
     
     # Prepare and return results
     return prepare_sampling_results(
@@ -479,7 +612,7 @@ def optimize(
             actual_walkers_for_loss = batch_data_for_loss
 
         # Compute energies for all walkers with current parameters
-        energies_val = ansatz.local_energy(actual_walkers_for_loss, current_params_for_loss)
+        energies_val, _ = ansatz.local_energy(actual_walkers_for_loss, current_params_for_loss)
         
         # clip energies around the mean energy to avoid numerical instability
         median_energy_val = jnp.median(energies_val)
@@ -568,7 +701,8 @@ def optimize(
                 params = optax.apply_updates(params, updates)
 
             # Create materialized copies of parameters for history storage
-            params_copy = tree_map(lambda x: jax.device_get(x), params)
+            # Use numpy conversion to fully detach from JAX device memory
+            params_copy = tree_map(lambda x: np.array(jax.device_get(x)), params)
             params_history.append(params_copy)
 
             losses.append(float(current_batch_mean_energy))  # Convert to Python float
@@ -579,7 +713,7 @@ def optimize(
             print(f"Step: {opt_step}, Cost: {float(current_batch_cost):.6f}, "
                   f"Mean E (hist): {jnp.mean(jnp.asarray(losses[-100:])):.6f}, "
                   f"Batch Var E: {current_batch_energy_variance:.6f}, "
-                  f"Acceptance: {acceptance:.3f}, "
+                  f"Acceptance: {float(acceptance):.3f}, "
                   f"Time: {step_time:.2f}s")
         
     opt_history["energies"] = jnp.asarray(losses)
@@ -763,7 +897,7 @@ def optimize_ref_var(
 
             step_time_val = time.time() - start_time # Corrected variable name
             print(f"Step: {opt_step}, Var: {float(current_batch_cost):.6f}, E_mean: {float(current_batch_ref_e):.6f}+\-{float(current_batch_std_e):.6f}, "
-                  f"Acceptance: {current_acceptance_rate:.3f}, Time: {step_time_val:.2f}s ")
+                  f"Acceptance: {float(current_acceptance_rate):.3f}, Time: {step_time_val:.2f}s ")
 
             start_time = time.time()
 

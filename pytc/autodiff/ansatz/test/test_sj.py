@@ -385,6 +385,77 @@ class TestAnsatzH2(unittest.TestCase):
         self.assertGreater(different_param, 0.5)  # Parameter increased
         ratio = different_wf / current_wf
         self.assertGreater(ratio, 1.0)  # Wavefunction increased
+
+
+class TestLocalEnergyWithWalker(unittest.TestCase):
+    """Test local_energy function with Walker dataclass."""
+    
+    def setUp(self):
+        """Set up H2 molecule for testing."""
+        self.mol = gto.M(
+            atom='H 0 0 0; H 0 0 0.742',
+            basis='sto-3g',
+            unit='bohr'
+        )
+        
+        # Run RHF
+        self.mf = scf.RHF(self.mol)
+        self.mf.kernel()
+        
+        # Create determinant and ansatz
+        self.det = SlaterDet(self.mol, self.mf.mo_coeff)
+        self.jastrow = Poly()
+        self.ansatz = SlaterJastrow(self.mol, self.jastrow, [self.det])
+        
+        # Parameters
+        self.jastrow_params = jnp.array([0.5])
+        self.linear_coeffs = jnp.array([1.0])
+        self.params = (self.jastrow_params, self.linear_coeffs)
+        
+    def test_local_energy_with_walker(self):
+        """Test that local_energy works with Walker and returns updated walker."""
+        from pytc.autodiff.mcmc import Walker
+        
+        # Create test positions
+        positions = jnp.array([
+            [[0.0, 0.1, 0.0], [0.0, 0.1, 0.742]],
+            [[0.1, 0.0, 0.0], [0.1, 0.0, 0.742]]
+        ])
+        
+        # Initialize Walker
+        n_walkers = 2
+        walker = Walker(
+            positions=positions,
+            slater_up=jnp.zeros((n_walkers, 1, 1)),
+            slater_down=jnp.zeros((n_walkers, 1, 1)),
+            inv_up=jnp.zeros((n_walkers, 1, 1)),
+            inv_down=jnp.zeros((n_walkers, 1, 1)),
+            det_up=jnp.zeros((n_walkers,)),
+            det_down=jnp.zeros((n_walkers,)),
+            grad_up=jnp.zeros((n_walkers, 1, 1, 3)),
+            grad_down=jnp.zeros((n_walkers, 1, 1, 3)),
+            lap_up=jnp.zeros((n_walkers, 1, 1)),
+            lap_down=jnp.zeros((n_walkers, 1, 1)),
+            move_mask=jnp.ones((n_walkers, 2), dtype=bool)
+        )
+        
+        # Call local_energy
+        energies, updated_walker = self.ansatz.local_energy(walker, self.params)
+        
+        # Verify energies shape
+        self.assertEqual(energies.shape, (n_walkers,))
+        
+        # Verify energies are finite
+        self.assertTrue(jnp.all(jnp.isfinite(energies)))
+        
+        # Verify updated_walker has non-zero gradients/laplacians
+        self.assertFalse(jnp.allclose(updated_walker.grad_up, 0.0))
+        self.assertFalse(jnp.allclose(updated_walker.lap_up, 0.0))
+        
+        # Verify energies are reasonable (finite and bounded)
+        self.assertTrue(jnp.all(jnp.isfinite(energies)))
+        self.assertTrue(jnp.all(jnp.abs(energies) < 100.0))  # Should be reasonable magnitude
+        
         
 
 if __name__ == '__main__':

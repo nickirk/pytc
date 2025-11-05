@@ -379,5 +379,107 @@ class TestSlaterDet(unittest.TestCase):
         self.assertLessEqual(time_8_threads, time_1_thread * 1.1, 
                             f"8 threads slower than 1 thread: {speedup:.2f}x")
 
+    def test_laplacian_with_walker(self):
+        """Test laplacian function with Walker dataclass for selective updates."""
+        import jax
+        import jax.numpy as jnp
+        from pytc.autodiff.mcmc import Walker
+        from pytc.autodiff.ansatz.det import laplacian
+        
+        # Enable 64-bit precision for JAX
+        jax.config.update("jax_enable_x64", True)
+        
+        # Create SlaterDet (nelec is a tuple)
+        det = SlaterDet(self.mol, self.mo_coeff, nelec=(1, 1))
+        
+        # Initialize walker with 3 walkers manually (without needing full ansatz)
+        n_walkers = 3
+        n_electrons = 2
+        positions = jnp.array([
+            [[0.0, 0.0, 0.1], [0.0, 0.0, 1.3]],  # Walker 0: different positions for each electron
+            [[0.1, 0.1, 0.2], [0.1, 0.1, 1.4]],  # Walker 1
+            [[0.2, 0.2, 0.3], [0.2, 0.2, 1.5]]   # Walker 2
+        ])
+        
+        # Verify positions are different
+        assert not np.allclose(positions[0, 0], positions[0, 1]), "Electrons should have different positions"
+        
+        # Manually create Walker with zeros (simulating uninitialized state)
+        walker = Walker(
+            positions=positions,
+            slater_up=jnp.zeros((n_walkers, det.n_alpha, det.n_alpha)),
+            slater_down=jnp.zeros((n_walkers, det.n_beta, det.n_beta)),
+            inv_up=jnp.zeros((n_walkers, det.n_alpha, det.n_alpha)),
+            inv_down=jnp.zeros((n_walkers, det.n_beta, det.n_beta)),
+            det_up=jnp.zeros((n_walkers,)),
+            det_down=jnp.zeros((n_walkers,)),
+            grad_up=jnp.zeros((n_walkers, det.n_alpha, det.n_alpha, 3)),
+            grad_down=jnp.zeros((n_walkers, det.n_beta, det.n_beta, 3)),
+            lap_up=jnp.zeros((n_walkers, det.n_alpha, det.n_alpha)),
+            lap_down=jnp.zeros((n_walkers, det.n_beta, det.n_beta)),
+            move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool)
+        )
+        
+        # First call should trigger full recomputation (grad/lap uninitialized)
+        (matrix_up_1, matrix_down_1), (grad_up_1, grad_down_1), (lap_up_1, lap_down_1), updated_walker_1 = laplacian(det, walker)
+        
+        # Verify shapes
+        self.assertEqual(matrix_up_1.shape, (n_walkers, det.n_alpha, det.n_alpha))
+        self.assertEqual(matrix_down_1.shape, (n_walkers, det.n_beta, det.n_beta))
+        self.assertEqual(grad_up_1.shape, (n_walkers, det.n_alpha, det.n_alpha, 3))
+        self.assertEqual(grad_down_1.shape, (n_walkers, det.n_beta, det.n_beta, 3))
+        self.assertEqual(lap_up_1.shape, (n_walkers, det.n_alpha, det.n_alpha))
+        self.assertEqual(lap_down_1.shape, (n_walkers, det.n_beta, det.n_beta))
+        
+        # Verify grad/lap are not all zeros after initialization
+        self.assertFalse(np.allclose(grad_up_1, 0.0))
+        self.assertFalse(np.allclose(lap_up_1, 0.0))
+        
+        # Verify updated_walker has non-zero grad/lap
+        self.assertFalse(np.allclose(updated_walker_1.grad_up, 0.0))
+        self.assertFalse(np.allclose(updated_walker_1.lap_up, 0.0))
+        
+        # Now simulate a move: update positions and set move_mask
+        new_positions = positions.at[0, 0].set(jnp.array([0.05, 0.05, 0.15]))  # Move first electron of first walker
+        move_mask = jnp.zeros((n_walkers, n_electrons), dtype=bool)
+        move_mask = move_mask.at[0, 0].set(True)
+        
+        # Update walker with new positions and move_mask, keeping grad/lap from previous call
+        walker_with_move = updated_walker_1.replace(
+            positions=new_positions,
+            move_mask=move_mask
+        )
+        
+        # Need to call value() first to update Slater matrices
+        from pytc.autodiff.ansatz.det import value
+        _, walker_with_updated_matrices = value(det, walker_with_move)
+        
+        # Now call laplacian with updated matrices
+        (matrix_up_2, matrix_down_2), (grad_up_2, grad_down_2), (lap_up_2, lap_down_2), updated_walker_2 = laplacian(det, walker_with_updated_matrices)
+        
+        # For H2 with (1,1) electrons:
+        # - grad_up has shape (n_walkers, 1, 1, 3) - gradient for 1 alpha electron at 1 alpha MO
+        # - grad_down has shape (n_walkers, 1, 1, 3) - gradient for 1 beta electron at 1 beta MO  
+        # When we move electron 0 (alpha), only grad_up should change
+        # When we move electron 1 (beta), only grad_down should change
+        
+        # Verify shapes
+        self.assertEqual(grad_up_1.shape, (n_walkers, 1, 1, 3))
+        self.assertEqual(grad_down_1.shape, (n_walkers, 1, 1, 3))
+        
+        # Walkers 1 and 2 should be completely unchanged (no moves)
+        np.testing.assert_allclose(grad_up_2[1], grad_up_1[1], rtol=1e-10)
+        np.testing.assert_allclose(grad_up_2[2], grad_up_1[2], rtol=1e-10)
+        np.testing.assert_allclose(lap_up_2[1], lap_up_1[1], rtol=1e-10)
+        np.testing.assert_allclose(lap_up_2[2], lap_up_1[2], rtol=1e-10)
+        
+        # Walker 0: alpha electron (electron 0) moved, so grad_up should change
+        self.assertFalse(np.allclose(grad_up_2[0, 0, 0], grad_up_1[0, 0, 0], rtol=1e-10))
+        self.assertFalse(np.allclose(lap_up_2[0, 0, 0], lap_up_1[0, 0, 0], rtol=1e-10))
+        
+        # Walker 0: beta electron (electron 1) did NOT move, so grad_down should be unchanged
+        np.testing.assert_allclose(grad_down_2[0], grad_down_1[0], rtol=1e-10)
+        np.testing.assert_allclose(lap_down_2[0], lap_down_1[0], rtol=1e-10)
+
 if __name__ == '__main__':
     unittest.main()
