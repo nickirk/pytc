@@ -8,6 +8,7 @@ from jax import random
 from pyscf import gto
 
 from pytc.autodiff.jastrow.bh import BoysHandy, BHTerm
+from pytc.jastrow.sm7 import SM7
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -21,7 +22,233 @@ def get_h2_molecule(bond_length=1.4):
     )
     return mol
 
+def get_atom_molecule(atom_symbol):
+    """Create single atom molecule at origin."""
+    mol = gto.M(
+        atom=f'{atom_symbol} 0 0 0',
+        basis='sto-3g',
+        unit='bohr'
+    )
+    return mol
+
+def sm7_coeffs_to_bh_terms(atom_symbol):
+    """Convert SM7 coefficients to BH terms.
+    
+    SM7 uses coefficients indexed by (m, n, o) tuples.
+    BH uses BHTerm(m, n, o, c) where c is the coefficient.
+    
+    Note: SM7 applies a factor of 0.5 when m == n, but BH handles
+    this internally via delta_factor, so we keep the full coefficient.
+    """
+    sm7_coeffs = SM7._coeff_table[atom_symbol]
+    terms = []
+    for (m, n, o), coeff in sm7_coeffs.items():
+        terms.append(BHTerm(m, n, o, coeff))
+    return terms
+
+class TestBoysHandyVsSM7(unittest.TestCase):
+    """Test Boys-Handy implementation against SM7 reference."""
+    
+    def setUp(self):
+        """Set up test cases."""
+        self.key = random.PRNGKey(42)
+        
+    def _setup_atom_comparison(self, atom_symbol):
+        """Set up BH and SM7 for a given atom."""
+        # Create molecule with atom at origin
+        mol = get_atom_molecule(atom_symbol)
+        
+        # Get SM7 coefficients and convert to BH terms
+        bh_terms = sm7_coeffs_to_bh_terms(atom_symbol)
+        
+        # Create BH Jastrow with single nucleus, so terms_per_nucleus is a list with one element
+        bh = BoysHandy(mol, terms_per_nucleus=[bh_terms])
+        
+        # Initialize parameters - b_raw and d_raw don't matter since scaling is r/(1+r)
+        bh_params = bh.init_params(key=self.key)
+        
+        # Create SM7 Jastrow
+        sm7 = SM7(atom=atom_symbol)
+        
+        return bh, bh_params, sm7
+    
+    def test_he_function_evaluation(self):
+        """Test He atom: compare BH and SM7 function values."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('He')
+        
+        # Generate random electron positions
+        key1, key2 = random.split(self.key)
+        r1 = random.normal(key1, (3,)) * 2.0  # Scale to ~[-2, 2] bohr
+        r2 = random.normal(key2, (3,)) * 2.0
+        
+        # Compute BH value
+        bh_value = bh._compute(r1, r2, bh_params)
+        
+        # Compute SM7 value
+        # SM7 expects numpy arrays; handle both scalar and array outputs
+        sm7_output = sm7(np.array(r1), np.array(r2))
+        sm7_value = float(np.atleast_1d(sm7_output).flat[0])
+        
+        # Compare values
+        np.testing.assert_allclose(
+            float(bh_value), sm7_value, rtol=1e-5, atol=1e-8,
+            err_msg=f"BH vs SM7 mismatch for He at r1={r1}, r2={r2}"
+        )
+    
+    def test_be_function_evaluation(self):
+        """Test Be atom: compare BH and SM7 function values."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('Be')
+        
+        # Generate random electron positions
+        key1, key2 = random.split(self.key)
+        r1 = random.normal(key1, (3,)) * 2.0
+        r2 = random.normal(key2, (3,)) * 2.0
+        
+        # Compute BH value
+        bh_value = bh._compute(r1, r2, bh_params)
+        
+        # Compute SM7 value
+        sm7_output = sm7(np.array(r1), np.array(r2))
+        sm7_value = float(np.atleast_1d(sm7_output).flat[0])
+        
+        # Compare values
+        np.testing.assert_allclose(
+            float(bh_value), sm7_value, rtol=1e-5, atol=1e-8,
+            err_msg=f"BH vs SM7 mismatch for Be at r1={r1}, r2={r2}"
+        )
+    
+    def test_he_function_evaluation_multiple_points(self):
+        """Test He atom with multiple random positions."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('He')
+        
+        # Test multiple random point pairs
+        n_tests = 10
+        for i in range(n_tests):
+            key_i = random.fold_in(self.key, i)
+            key1, key2 = random.split(key_i)
+            r1 = random.normal(key1, (3,)) * 2.0
+            r2 = random.normal(key2, (3,)) * 2.0
+            
+            bh_value = bh._compute(r1, r2, bh_params)
+            sm7_output = sm7(np.array(r1), np.array(r2))
+            sm7_value = float(np.atleast_1d(sm7_output).flat[0])
+            
+            np.testing.assert_allclose(
+                float(bh_value), sm7_value, rtol=1e-5, atol=1e-8,
+                err_msg=f"Test {i}: BH vs SM7 mismatch for He"
+            )
+    
+    def test_be_function_evaluation_multiple_points(self):
+        """Test Be atom with multiple random positions."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('Be')
+        
+        # Test multiple random point pairs
+        n_tests = 10
+        for i in range(n_tests):
+            key_i = random.fold_in(self.key, i)
+            key1, key2 = random.split(key_i)
+            r1 = random.normal(key1, (3,)) * 2.0
+            r2 = random.normal(key2, (3,)) * 2.0
+            
+            bh_value = bh._compute(r1, r2, bh_params)
+            sm7_output = sm7(np.array(r1), np.array(r2))
+            sm7_value = float(np.atleast_1d(sm7_output).flat[0])
+            
+            np.testing.assert_allclose(
+                float(bh_value), sm7_value, rtol=1e-5, atol=1e-8,
+                err_msg=f"Test {i}: BH vs SM7 mismatch for Be"
+            )
+    
+    def test_he_gradient_r1(self):
+        """Test He atom: compare gradients with respect to r1."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('He')
+        
+        # Generate random electron positions
+        key1, key2 = random.split(self.key)
+        r1 = random.normal(key1, (3,)) * 2.0
+        r2 = random.normal(key2, (3,)) * 2.0
+        
+        # Compute BH gradient using JAX autodiff on _compute
+        bh_grad_fn = jax.grad(lambda r: bh._compute(r, r2, bh_params))
+        bh_grad = bh_grad_fn(r1)
+        
+        # Compute SM7 gradient
+        # SM7.grad returns shape (1, 1, 3) for single points
+        sm7_grad = sm7.grad(np.array(r1), np.array(r2))[0, 0, :]
+        
+        # Compare gradients
+        np.testing.assert_allclose(
+            np.array(bh_grad), sm7_grad, rtol=1e-4, atol=1e-7,
+            err_msg=f"BH vs SM7 gradient mismatch for He at r1={r1}, r2={r2}"
+        )
+    
+    def test_be_gradient_r1(self):
+        """Test Be atom: compare gradients with respect to r1."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('Be')
+        
+        # Generate random electron positions
+        key1, key2 = random.split(self.key)
+        r1 = random.normal(key1, (3,)) * 2.0
+        r2 = random.normal(key2, (3,)) * 2.0
+        
+        # Compute BH gradient using JAX autodiff
+        bh_grad_fn = jax.grad(lambda r: bh._compute(r, r2, bh_params))
+        bh_grad = bh_grad_fn(r1)
+        
+        # Compute SM7 gradient
+        sm7_grad = sm7.grad(np.array(r1), np.array(r2))[0, 0, :]
+        
+        # Compare gradients
+        np.testing.assert_allclose(
+            np.array(bh_grad), sm7_grad, rtol=1e-4, atol=1e-7,
+            err_msg=f"BH vs SM7 gradient mismatch for Be at r1={r1}, r2={r2}"
+        )
+    
+    def test_he_gradient_r1_multiple_points(self):
+        """Test He atom gradients with multiple random positions."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('He')
+        
+        # Test multiple random point pairs
+        n_tests = 10
+        for i in range(n_tests):
+            key_i = random.fold_in(self.key, i)
+            key1, key2 = random.split(key_i)
+            r1 = random.normal(key1, (3,)) * 2.0
+            r2 = random.normal(key2, (3,)) * 2.0
+            
+            bh_grad_fn = jax.grad(lambda r: bh._compute(r, r2, bh_params))
+            bh_grad = bh_grad_fn(r1)
+            sm7_grad = sm7.grad(np.array(r1), np.array(r2))[0, 0, :]
+            
+            np.testing.assert_allclose(
+                np.array(bh_grad), sm7_grad, rtol=1e-4, atol=1e-7,
+                err_msg=f"Test {i}: BH vs SM7 gradient mismatch for He"
+            )
+    
+    def test_be_gradient_r1_multiple_points(self):
+        """Test Be atom gradients with multiple random positions."""
+        bh, bh_params, sm7 = self._setup_atom_comparison('Be')
+        
+        # Test multiple random point pairs
+        n_tests = 10
+        for i in range(n_tests):
+            key_i = random.fold_in(self.key, i)
+            key1, key2 = random.split(key_i)
+            r1 = random.normal(key1, (3,)) * 2.0
+            r2 = random.normal(key2, (3,)) * 2.0
+            
+            bh_grad_fn = jax.grad(lambda r: bh._compute(r, r2, bh_params))
+            bh_grad = bh_grad_fn(r1)
+            sm7_grad = sm7.grad(np.array(r1), np.array(r2))[0, 0, :]
+            
+            np.testing.assert_allclose(
+                np.array(bh_grad), sm7_grad, rtol=1e-4, atol=1e-7,
+                err_msg=f"Test {i}: BH vs SM7 gradient mismatch for Be"
+            )
+
+
 class TestBoysHandy(unittest.TestCase):
+
     """Test Boys-Handy Jastrow implementation."""
     
     def setUp(self):

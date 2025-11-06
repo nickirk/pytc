@@ -399,10 +399,10 @@ class TestJastrowOptimization(unittest.TestCase):
         
         # Create REXP jastrow with given or default parameters
         rexp = REXP()
-        #bh = BoysHandy(mol)
+        bh = BoysHandy(mol)
         jnuclear_cusp = NuclearCusp(mol)    
         #jastrow = NuclearCusp(mol)    
-        jastrow = CompositeJastrow([jnuclear_cusp, rexp])
+        jastrow = CompositeJastrow([jnuclear_cusp, bh])
         jastrow_params = jastrow.init_params() if jastrow_params is None else jastrow_params 
         # Create SlaterJastrow ansatz
         sj_ansatz = SlaterJastrow(mol, jastrow, [det])
@@ -410,7 +410,7 @@ class TestJastrowOptimization(unittest.TestCase):
         
         # Use small settings for test speed
         n_walkers = 5000
-        n_steps = 200
+        n_steps = 20
         step_size = 0.01
         burn_in_steps = 2000
         n_opt_steps = 10000
@@ -427,7 +427,7 @@ class TestJastrowOptimization(unittest.TestCase):
             step_size=step_size,
             burn_in_steps=burn_in_steps,
             n_opt_steps=n_opt_steps,
-            optimizer_type='adam',
+            optimizer_type='kfac',
             learning_rate=0.001,
             #use_importance_sampling=False,
             key=key
@@ -451,7 +451,7 @@ class TestJastrowOptimization(unittest.TestCase):
     
     def test_he2_optimization(self):
         """Test optimization of Jastrow parameters for He atom."""
-        self.run_optimization_test('He 0 0 0; He 0 0 1.0', basis='ccpvdz')
+        self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
     def test_benzene(self):
         """Test HF energy sampling for Benzene molecule."""

@@ -77,6 +77,8 @@ class SM7(Jastrow):
         for (m,n,o), coeff in self.params.items():
             if m == n: 
                 coeff_ = 0.5 * coeff
+            else:
+                coeff_ = coeff
             term = coeff_ * (r1_scaled**m * r2_scaled**n + r2_scaled**m * r1_scaled**n) * r12_scaled**o
             result += term
             
