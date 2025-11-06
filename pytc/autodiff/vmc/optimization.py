@@ -377,6 +377,7 @@ def optimize_ref_var(
                   f"Acceptance: {float(current_acceptance_rate):.3f}, Time: {step_time_val:.2f}s ")
 
             start_time = time.time()
+        gc.collect()
 
     opt_history["cost"] = jnp.asarray(losses)
     opt_history["energies"] = jnp.asarray(energies)

@@ -131,7 +131,11 @@ class BoysHandy(Jastrow):
         # Get positive b and d values using softplus
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])
-        c = params['c_raw']  # Allow c to be both positive and negative
+        c_raw = params['c_raw']  # Allow c to be both positive and negative
+        
+        # Fix cusp term coefficients (m=0, n=0, o=1) to 0.5 for e-e cusp condition
+        # This ensures the cusp condition is always satisfied regardless of optimization
+        c = jnp.where(self._cusp_mask, 0.5, c_raw)
 
         def nucleus_scan_fn(carry, nucleus_data):
             """Scan function for looping over nuclei."""
@@ -150,10 +154,11 @@ class BoysHandy(Jastrow):
             r12_pow_o = jnp.power(r12, term_o_I)
 
             non_cusp_terms = (r1I_pow_m * r2I_pow_n + r2I_pow_m * r1I_pow_n) * r12_pow_o
-            cusp_terms = r12_pow_o
+            # For cusp terms (m=0,n=0), the symmetric sum is (1*1 + 1*1) = 2, so multiply by 2
+            cusp_terms = 2.0 * r12_pow_o
             u_terms = jnp.where(cusp_mask_I, cusp_terms, non_cusp_terms)
 
-            cusp_factor = delta_factor_I * 0.5
+            cusp_factor = delta_factor_I * c_I
             non_cusp_factor = delta_factor_I * c_I
             factor = jnp.where(cusp_mask_I, cusp_factor, non_cusp_factor)
 
