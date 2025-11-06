@@ -660,16 +660,16 @@ class SlaterDet:
         self.det_down = None
         self.last_positions = None
 
-    def __call__(self, coords, params=None, move_mask=None):
+    def __call__(self, walkers, params=None):
         """
         Convenience method to call value on a set of coordinates.
     
         Args:
-            coords: (n_up + n_down, 3) electron positions
+            walkers: Walker dataclass with positions, move_mask, and cached matrices
         Returns:
             float: The product of alpha and beta determinants
         """
-        return self.value(coords, move_mask=move_mask)
+        return value_and_grad(self, walkers)
     
     @property
     def n_electrons(self):

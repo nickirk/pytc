@@ -7,10 +7,10 @@ from jax import random
 import jax.numpy as jnp
 
 from pytc.autodiff.jastrow import NuclearCusp, Poly
-from pytc.autodiff.mcmc import sample
+from pytc.autodiff.vmc import sample
 from pytc.autodiff.ansatz.sj import SlaterJastrow
 from pytc.autodiff.ansatz.det import SlaterDet
-from pytc.autodiff.mcmc_utils import analyze_energies
+from pytc.autodiff.vmc.mcmc_utils import analyze_energies
 
 class TestNuclearCuspJastrow(unittest.TestCase):
     """Test cases for NuclearCuspJastrow class."""
