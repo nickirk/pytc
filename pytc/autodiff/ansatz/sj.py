@@ -101,13 +101,16 @@ class SlaterJastrow:
         
         n_electrons = elec_coords.shape[0]
         diag_mask = 1.0 - jnp.eye(n_electrons)
+        #jax.debug.print("all_pairs:{}", all_pairs)
+        #jax.debug.print("diag_mask:{}", diag_mask)
+        #jax.debug.print("sum:{}", jnp.sum(all_pairs * diag_mask))
         
         return jnp.exp(1./2. * jnp.sum(all_pairs * diag_mask))
     
     @property
     def n_electrons(self):
         """Return the number of electrons."""
-        return self.dets[0].n_electrons
+        return self.mol.nelectron
 
     @partial(jax.jit, static_argnums=(0,))
     def _compute_jastrow_terms(self, elec_coords, jastrow_params):
@@ -215,7 +218,7 @@ class SlaterJastrow:
     @property
     def n_alpha(self):
         """Number of alpha-spin electrons."""
-        return self.dets[0].n_alpha if self.dets else 0
+        return self.mol.nelec[0]
 
     @property
     def n_beta(self):
@@ -249,6 +252,8 @@ class SlaterJastrow:
         # These were already updated in the most recent __call__() via value_and_grad()
         slater_alpha_batch = walker.slater_up
         slater_beta_batch = walker.slater_down
+        inv_alpha_batch = walker.inv_up
+        inv_beta_batch = walker.inv_down
         grad_alpha_batch = walker.grad_up
         grad_beta_batch = walker.grad_down
         lap_alpha_batch = walker.lap_up
@@ -256,7 +261,8 @@ class SlaterJastrow:
 
         energies = jax.vmap(self._compute_single_walker_energy)(
             walker.positions, grad_J_over_J_batch, lap_J_over_J_batch,
-            slater_alpha_batch, slater_beta_batch, grad_alpha_batch, grad_beta_batch,
+            slater_alpha_batch, slater_beta_batch, inv_alpha_batch, inv_beta_batch, 
+            grad_alpha_batch, grad_beta_batch,
             lap_alpha_batch, lap_beta_batch
         )
 
@@ -264,7 +270,8 @@ class SlaterJastrow:
             
     @partial(jax.jit, static_argnums=(0,))
     def _compute_single_walker_energy(self, coords, grad_J_over_J, lap_J_over_J,
-                                     slater_alpha, slater_beta, grad_alpha, grad_beta,
+                                     slater_alpha, slater_beta, inv_alpha, inv_beta, 
+                                     grad_alpha, grad_beta,
                                      lap_alpha, lap_beta):
         """Compute energy for a single walker with pre-computed quantities."""
         n_alpha = self.dets[0].n_alpha
@@ -276,8 +283,8 @@ class SlaterJastrow:
         lap_J_beta = lap_J_over_J[n_alpha:]      # shape: (n_beta,)
         
         # Build inverses
-        inv_alpha = jnp.linalg.inv(slater_alpha)
-        inv_beta = jnp.linalg.inv(slater_beta)
+        #inv_alpha = jnp.linalg.inv(slater_alpha)
+        #inv_beta = jnp.linalg.inv(slater_beta)
         
         # Compute kinetic terms
         B_kin_alpha = -0.5 * (

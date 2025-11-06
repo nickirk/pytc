@@ -12,15 +12,15 @@ import time
 from pyscf import gto, scf
 
 # Import our modules
-from pytc.autodiff.mcmc import (
-    optimize, sample, Walker, initialize_walker_state, 
+from pytc.autodiff.vmc import (
+    optimize, optimize_ref_var, sample, Walker, initialize_walker_state, 
     initialize_walkers, metropolis_hastings, _one_electron_move, _all_electron_move
 )
-from pytc.autodiff.mcmc_utils import init_electron_configs
+from pytc.autodiff.vmc.mcmc_utils import init_electron_configs
 
-from pytc.autodiff.mcmc_utils import analyze_energies
+from pytc.autodiff.vmc.mcmc_utils import analyze_energies
 from pytc.autodiff.ansatz.sj import SlaterJastrow
-from pytc.autodiff.jastrow import REXP, Poly, CompositeJastrow, NuclearCusp
+from pytc.autodiff.jastrow import REXP, Poly, CompositeJastrow, NuclearCusp, BoysHandy
 from pytc.autodiff.ansatz.det import SlaterDet 
 
 
@@ -297,7 +297,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
-            use_importance_sampling=False,
+            #use_importance_sampling=False,
             burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
             key=key
@@ -385,13 +385,23 @@ class TestJastrowOptimization(unittest.TestCase):
         mf = scf.RHF(mol)
         mf.kernel()
         hf_energy_reference = mf.e_tot
+
+        # run ccsd to get better reference
+        from pyscf.cc import ccsd
+        mycc = ccsd.CCSD(mf)
+        mycc.kernel()
+        hf_energy_reference += mycc.e_corr
+        print(f"Reference CCSD energy: {hf_energy_reference:.6f}")
+
         
         # Create determinant from HF solution
         det = SlaterDet(mol, mf.mo_coeff)
         
         # Create REXP jastrow with given or default parameters
         rexp = REXP()
+        #bh = BoysHandy(mol)
         jnuclear_cusp = NuclearCusp(mol)    
+        #jastrow = NuclearCusp(mol)    
         jastrow = CompositeJastrow([jnuclear_cusp, rexp])
         jastrow_params = jastrow.init_params() if jastrow_params is None else jastrow_params 
         # Create SlaterJastrow ansatz
@@ -400,16 +410,16 @@ class TestJastrowOptimization(unittest.TestCase):
         
         # Use small settings for test speed
         n_walkers = 5000
-        n_steps = 2000
+        n_steps = 200
         step_size = 0.01
-        burn_in_steps = 1000
-        n_opt_steps = 2000
+        burn_in_steps = 2000
+        n_opt_steps = 10000
         key = random.PRNGKey(42)
         
         # Run optimization
         print(f"Starting Jastrow optimization for {mol.atom}...")
         start_time = time.time()
-        opt_results = optimize(
+        opt_results = optimize_ref_var(
             sj_ansatz,
             params=[jastrow_params, linear_coeffs],
             n_walkers=n_walkers,
@@ -417,9 +427,9 @@ class TestJastrowOptimization(unittest.TestCase):
             step_size=step_size,
             burn_in_steps=burn_in_steps,
             n_opt_steps=n_opt_steps,
-            optimizer_type='kfac',
+            optimizer_type='adam',
             learning_rate=0.001,
-            use_importance_sampling=False,
+            #use_importance_sampling=False,
             key=key
         )
         end_time = time.time()
@@ -441,7 +451,7 @@ class TestJastrowOptimization(unittest.TestCase):
     
     def test_he2_optimization(self):
         """Test optimization of Jastrow parameters for He atom."""
-        self.run_optimization_test('He 0 0 0; He 0 0 1.5', basis='ccpvdz')
+        self.run_optimization_test('He 0 0 0; He 0 0 1.0', basis='ccpvdz')
     
     def test_benzene(self):
         """Test HF energy sampling for Benzene molecule."""
