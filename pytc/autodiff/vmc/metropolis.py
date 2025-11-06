@@ -4,7 +4,7 @@ This module contains the core Metropolis-Hastings sampling algorithms,
 including both standard MCMC and importance sampling with drift-diffusion.
 """
 
-import gc
+import jax
 import jax.numpy as jnp
 from jax import random
 
@@ -69,10 +69,6 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one")
     
     # Calculate acceptance rate
     acceptance_rate = accept_count / n_walkers
-    
-    # Explicitly delete intermediate walkers to help garbage collection
-    del walker, psi_values, new_psi_values, current_walker, proposals, accept_mask, accept_mask_3d, accept_mask_4d
-    gc.collect()
 
     return new_walker, acceptance_rate
 
@@ -135,3 +131,68 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     acceptance_rate = accept_count / walkers.shape[0]
     
     return new_walkers, acceptance_rate
+
+
+def make_mcmc_step(ansatz, step_size, move_type="one"):
+    """Factory to create a JIT-compilable MCMC step function.
+    
+    This function validates move_type at creation time (not JIT time) and returns
+    a JIT-compilable step function that performs Metropolis-Hastings sampling.
+    
+    Args:
+        ansatz: Wavefunction object with __call__ method that returns ψ(R)
+        step_size: Standard deviation of Gaussian proposal for MCMC moves
+        move_type: "all" to move all electrons at once, "one" to move one electron at a time
+    
+    Returns:
+        A JIT-compiled function with signature:
+            mcmc_step(walkers, key, params) -> (new_walkers, acceptance_rate)
+    
+    Raises:
+        ValueError: If move_type is not "all" or "one"
+    """
+    # Validate move_type at factory creation time (not JIT time)
+    if move_type not in ["all", "one"]:
+        raise ValueError(f"move_type must be either 'all' or 'one', got '{move_type}'")
+    
+    def mcmc_step(walkers, key, params):
+        """Single MCMC step - fully JIT-compatible.
+        
+        Args:
+            walkers: Walker dataclass with current state
+            key: PRNG key for random number generation
+            params: Parameters for the ansatz [jastrow_params, linear_coeffs]
+        
+        Returns:
+            new_walkers: Updated walker state after MCMC step
+            acceptance_rate: Fraction of proposals that were accepted
+        """
+        new_walkers, acceptance_rate = metropolis_hastings(
+            ansatz, walkers, step_size, key, params, move_type=move_type
+        )
+        return new_walkers, acceptance_rate
+    
+    # JIT compile the step function
+    return jax.jit(mcmc_step)
+
+
+def make_mcmc_step_importance(ansatz, time_step):
+    """Factory to create a JIT-compilable importance sampling MCMC step.
+    
+    Args:
+        ansatz: Wavefunction object with quantum_force method
+        time_step: Time step for the drift-diffusion process
+    
+    Returns:
+        A JIT-compiled function with signature:
+            mcmc_step(walkers, key, params) -> (new_walkers, acceptance_rate)
+    """
+    def mcmc_step(walkers, key, params):
+        """Single importance sampling MCMC step - fully JIT-compatible."""
+        new_walkers, acceptance_rate = metropolis_hastings_importance_sampling(
+            ansatz, walkers, time_step, key, params
+        )
+        return new_walkers, acceptance_rate
+    
+    # JIT compile the step function
+    return jax.jit(mcmc_step)

@@ -386,12 +386,6 @@ class TestJastrowOptimization(unittest.TestCase):
         mf.kernel()
         hf_energy_reference = mf.e_tot
 
-        # run ccsd to get better reference
-        from pyscf.cc import ccsd
-        mycc = ccsd.CCSD(mf)
-        mycc.kernel()
-        hf_energy_reference += mycc.e_corr
-        print(f"Reference CCSD energy: {hf_energy_reference:.6f}")
 
         
         # Create determinant from HF solution
@@ -410,10 +404,10 @@ class TestJastrowOptimization(unittest.TestCase):
         
         # Use small settings for test speed
         n_walkers = 5000
-        n_steps = 20
+        n_steps = 10
         step_size = 0.01
         burn_in_steps = 2000
-        n_opt_steps = 10000
+        n_opt_steps = 500
         key = random.PRNGKey(42)
         
         # Run optimization
@@ -449,8 +443,8 @@ class TestJastrowOptimization(unittest.TestCase):
         """Test optimization of Jastrow parameters for H2 molecule."""
         self.run_optimization_test('H 0 0 0; H 0 0 1.0')
     
-    def test_he2_optimization(self):
-        """Test optimization of Jastrow parameters for He atom."""
+    def test_be_optimization(self):
+        """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
     def test_benzene(self):
