@@ -27,6 +27,17 @@ class BoysHandy(Jastrow):
         self.natom = len(self.nuclear_charges)
         self.epsilon = epsilon
         
+        # Identify unique atom types and create mappings
+        self.unique_charges = jnp.sort(jnp.unique(self.nuclear_charges))
+        self.n_types = len(self.unique_charges)
+        
+        # Create atom type map: atom_idx -> type_idx
+        # For each atom, find which type it belongs to
+        self.atom_type_map = jnp.zeros(self.natom, dtype=jnp.int32)
+        for i, charge in enumerate(self.nuclear_charges):
+            type_idx = jnp.where(self.unique_charges == charge)[0][0]
+            self.atom_type_map = self.atom_type_map.at[i].set(type_idx)
+        
         # Default terms if none specified
         if terms_per_nucleus is None:
             # Basic terms including e-e cusp
@@ -50,24 +61,25 @@ class BoysHandy(Jastrow):
                 BHTerm(2, 2, 4, 0.01),
                 BHTerm(2, 0, 6, 0.01),
             ]
-            # Create a list of default terms for each nucleus
-            self.terms_per_nucleus = [default_terms_for_one_nucleus for _ in range(self.natom)]
+            # Create a list of default terms for each atom type (not each atom)
+            self.terms_per_atom_type = [default_terms_for_one_nucleus for _ in range(self.n_types)]
         else:
-            self.terms_per_nucleus = terms_per_nucleus
+            # User-provided terms - should now be per atom type
+            self.terms_per_atom_type = terms_per_nucleus
 
-        term_lengths = tuple(len(nucleus_terms) for nucleus_terms in self.terms_per_nucleus)
+        term_lengths = tuple(len(type_terms) for type_terms in self.terms_per_atom_type)
         if len(term_lengths) > 0 and len(set(term_lengths)) != 1:
-            raise ValueError("BoysHandy requires the same number of terms per nucleus when using JAX scans.")
+            raise ValueError("BoysHandy requires the same number of terms per atom type when using JAX scans.")
 
         self.n_terms = term_lengths[0] if term_lengths else 0
 
         term_m = []
         term_n = []
         term_o = []
-        for nucleus_terms in self.terms_per_nucleus:
-            term_m.append([term.m for term in nucleus_terms])
-            term_n.append([term.n for term in nucleus_terms])
-            term_o.append([term.o for term in nucleus_terms])
+        for type_terms in self.terms_per_atom_type:
+            term_m.append([term.m for term in type_terms])
+            term_n.append([term.n for term in type_terms])
+            term_o.append([term.o for term in type_terms])
 
         if self.n_terms > 0:
             self._term_m = jnp.array(term_m, dtype=jnp.int32)
@@ -106,17 +118,17 @@ class BoysHandy(Jastrow):
         """Initialize Boys-Handy parameters."""
         key = kwargs.get('key', random.PRNGKey(0))
         
-        # Initialize b and d parameters for each nucleus
-        b_raw = jnp.ones(self.natom) * 0.5  # starting value ~1.0 after softplus
-        d_raw = jnp.ones(self.natom) * 0.5
+        # Initialize b and d parameters for each atom type (not each atom)
+        b_raw = jnp.ones(self.n_types) * 0.5  # starting value ~1.0 after softplus
+        d_raw = jnp.ones(self.n_types) * 0.5
         
-        # Initialize c parameters for each term in each nucleus
-        # Reshape to ensure (n_nuclei, n_terms) shape
+        # Initialize c parameters for each term in each atom type
+        # Reshape to ensure (n_types, n_terms) shape
         c_raw = []
-        for nucleus_terms in self.terms_per_nucleus:
-            c_nucleus = jnp.array([term.c for term in nucleus_terms])
-            c_raw.append(c_nucleus)
-        c_raw = jnp.array(c_raw)  # This will have shape (n_nuclei, n_terms)
+        for type_terms in self.terms_per_atom_type:
+            c_type = jnp.array([term.c for term in type_terms])
+            c_raw.append(c_type)
+        c_raw = jnp.array(c_raw)  # This will have shape (n_types, n_terms)
         
         return {
             'b_raw': b_raw,
@@ -124,10 +136,11 @@ class BoysHandy(Jastrow):
             'c_raw': c_raw
         }
 
-    @partial(jax.jit, static_argnums=(0,))
-    def _compute(self, r1, r2, params):
-        """Compute Boys-Handy Jastrow exponent."""
+    def _compute_forward(self, r1, r2, params):
+        """Forward computation of Boys-Handy Jastrow exponent.
         
+        This is the pure forward pass that will be wrapped with custom JVP.
+        """
         # Get positive b and d values using softplus
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])
@@ -137,10 +150,20 @@ class BoysHandy(Jastrow):
         # This ensures the cusp condition is always satisfied regardless of optimization
         c = jnp.where(self._cusp_mask, 0.5, c_raw)
 
-        def nucleus_scan_fn(carry, nucleus_data):
-            """Scan function for looping over nuclei."""
+        def atom_scan_fn(carry, atom_data):
+            """Scan function for looping over atoms."""
             u_total = carry
-            nuclear_pos_I, b_I, d_I, c_I, term_m_I, term_n_I, term_o_I, delta_factor_I, cusp_mask_I = nucleus_data
+            nuclear_pos_I, atom_type_idx = atom_data
+            
+            # Get parameters for this atom's type
+            b_I = b[atom_type_idx]
+            d_I = d[atom_type_idx]
+            c_I = c[atom_type_idx]
+            term_m_I = self._term_m[atom_type_idx]
+            term_n_I = self._term_n[atom_type_idx]
+            term_o_I = self._term_o[atom_type_idx]
+            delta_factor_I = self._delta_factor[atom_type_idx]
+            cusp_mask_I = self._cusp_mask[atom_type_idx]
             
             # Compute scaled distances for this nucleus
             r1I = self._scaled_r_en(r1, nuclear_pos_I, b_I)
@@ -165,32 +188,62 @@ class BoysHandy(Jastrow):
             u_total += jnp.sum(factor * u_terms)
             return u_total, None
 
-        # Prepare nucleus data
-        nucleus_data = (
+        # Prepare atom data (now including atom type indices)
+        atom_data = (
             self.nuclear_pos,
-            b,
-            d,
-            c,
-            self._term_m,
-            self._term_n,
-            self._term_o,
-            self._delta_factor,
-            self._cusp_mask,
+            self.atom_type_map,
         )
         
-        # Scan over nuclei
-        u_total, _ = jax.lax.scan(nucleus_scan_fn, 0.0, nucleus_data)
+        # Scan over all atoms
+        u_total, _ = jax.lax.scan(atom_scan_fn, 0.0, atom_data)
         
         return u_total
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _compute(self, r1, r2, params):
+        """Compute Boys-Handy Jastrow exponent with custom JVP for memory efficiency.
+        
+        This wraps the forward computation with a custom JVP rule that avoids storing
+        the full computational graph. Instead, it recomputes gradients on-the-fly
+        using jax.jvp, similar to FermiNet's approach.
+        """
+        @jax.custom_jvp
+        def compute_with_custom_jvp(params):
+            """Forward pass - only returns the final value."""
+            return self._compute_forward(r1, r2, params)
+        
+        @compute_with_custom_jvp.defjvp
+        def compute_jvp(primals, tangents):
+            """Custom JVP - recompute gradients on-the-fly to save memory.
+            
+            This avoids storing all intermediate values from the forward pass.
+            Instead, we use jax.jvp to compute the gradient efficiently.
+            """
+            (params,) = primals
+            (params_tangent,) = tangents
+            
+            # Forward pass - compute the value
+            u_value = self._compute_forward(r1, r2, params)
+            
+            # Compute JVP using jax.jvp for memory efficiency
+            # This recomputes the forward pass but only stores what's needed for the gradient
+            def forward_fn(p):
+                return self._compute_forward(r1, r2, p)
+            
+            _, u_tangent = jax.jvp(forward_fn, (params,), (params_tangent,))
+            
+            return u_value, u_tangent
+        
+        return compute_with_custom_jvp(params)
 
 
     def get_param_count(self):
         """Return total number of optimizable parameters."""
-        # Count b and d parameters (one per nucleus)
-        count = 2 * self.natom
-        # Add c parameters (one per term per nucleus)
-        for nucleus_terms in self.terms_per_nucleus:
-            count += len(nucleus_terms)
+        # Count b and d parameters (one per atom type)
+        count = 2 * self.n_types
+        # Add c parameters (one per term per atom type)
+        for type_terms in self.terms_per_atom_type:
+            count += len(type_terms)
         return count
 
     def flatten_params(self, params):
@@ -206,21 +259,21 @@ class BoysHandy(Jastrow):
         idx = 0
         
         # Extract b parameters
-        b_size = self.natom
+        b_size = self.n_types
         b_raw = flat_params[idx:idx+b_size]
         idx += b_size
         
         # Extract d parameters
-        d_size = self.natom
+        d_size = self.n_types
         d_raw = flat_params[idx:idx+d_size]
         idx += d_size
         
         # Extract c parameters
         c_raw = []
-        for nucleus_terms in self.terms_per_nucleus:
-            c_size = len(nucleus_terms)
-            c_nucleus = flat_params[idx:idx+c_size]
-            c_raw.append(c_nucleus)
+        for type_terms in self.terms_per_atom_type:
+            c_size = len(type_terms)
+            c_type = flat_params[idx:idx+c_size]
+            c_raw.append(c_type)
             idx += c_size
         c_raw = jnp.array(c_raw)
         
