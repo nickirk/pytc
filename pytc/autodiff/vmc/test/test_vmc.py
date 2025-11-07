@@ -447,6 +447,10 @@ class TestJastrowOptimization(unittest.TestCase):
         """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
+    def test_h2o_optimization(self):
+        """Test optimization of Jastrow parameters for Be atom."""
+        self.run_optimization_test('H 0 0 0; O 0 0 1.0; H 0 1.0 0', basis='ccpvtz')
+
     def test_benzene(self):
         """Test HF energy sampling for Benzene molecule."""
         self.run_optimization_test(
