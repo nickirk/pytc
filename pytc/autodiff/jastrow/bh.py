@@ -201,40 +201,13 @@ class BoysHandy(Jastrow):
 
     @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1, r2, params):
-        """Compute Boys-Handy Jastrow exponent with custom JVP for memory efficiency.
+        """Compute Boys-Handy Jastrow exponent.
         
-        This wraps the forward computation with a custom JVP rule that avoids storing
-        the full computational graph. Instead, it recomputes gradients on-the-fly
-        using jax.jvp, similar to FermiNet's approach.
+        This is the standard forward computation without custom gradients.
+        Custom gradient handling for memory efficiency should be done at the
+        loss function level, not at individual component level (following FermiNet).
         """
-        @jax.custom_jvp
-        def compute_with_custom_jvp(params):
-            """Forward pass - only returns the final value."""
-            return self._compute_forward(r1, r2, params)
-        
-        @compute_with_custom_jvp.defjvp
-        def compute_jvp(primals, tangents):
-            """Custom JVP - recompute gradients on-the-fly to save memory.
-            
-            This avoids storing all intermediate values from the forward pass.
-            Instead, we use jax.jvp to compute the gradient efficiently.
-            """
-            (params,) = primals
-            (params_tangent,) = tangents
-            
-            # Forward pass - compute the value
-            u_value = self._compute_forward(r1, r2, params)
-            
-            # Compute JVP using jax.jvp for memory efficiency
-            # This recomputes the forward pass but only stores what's needed for the gradient
-            def forward_fn(p):
-                return self._compute_forward(r1, r2, p)
-            
-            _, u_tangent = jax.jvp(forward_fn, (params,), (params_tangent,))
-            
-            return u_value, u_tangent
-        
-        return compute_with_custom_jvp(params)
+        return self._compute_forward(r1, r2, params)
 
 
     def get_param_count(self):

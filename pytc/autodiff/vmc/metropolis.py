@@ -37,7 +37,11 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one")
         raise ValueError("move_type must be either 'all' or 'one'")
     
     # Compute acceptance probabilities
-    acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2
+    # psi_values and new_psi_values are now (sign, log|psi|) tuples
+    # Acceptance probability: |ψ'|²/|ψ|² = exp(2*(log|ψ'| - log|ψ|))
+    psi_sign, psi_logabs = psi_values
+    new_psi_sign, new_psi_logabs = new_psi_values
+    acceptance_prob = jnp.exp(2.0 * (new_psi_logabs - psi_logabs))
     
     # Accept or reject
     key, subkey = random.split(key)
@@ -51,15 +55,24 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one")
     accept_mask_4d = accept_mask[:, None, None, None]  # For gradients (3D tensors)
 
     # Use current_walker (with updated matrices) instead of original walker
+    # Handle det_up and det_down tuples (sign, log|det|) separately
+    new_det_up = (
+        jnp.where(accept_mask, proposals.det_up[0], current_walker.det_up[0]),  # signs
+        jnp.where(accept_mask, proposals.det_up[1], current_walker.det_up[1])   # log|det|
+    )
+    new_det_down = (
+        jnp.where(accept_mask, proposals.det_down[0], current_walker.det_down[0]),  # signs
+        jnp.where(accept_mask, proposals.det_down[1], current_walker.det_down[1])   # log|det|
+    )
+    
     new_walker = current_walker.replace(
         positions=jnp.where(accept_mask_4d[:, :, :, 0], proposals.positions, current_walker.positions),
-        psi_values=jnp.where(accept_mask, new_psi_values, current_walker.psi_values),
         slater_up=jnp.where(accept_mask_3d, proposals.slater_up, current_walker.slater_up),
         slater_down=jnp.where(accept_mask_3d, proposals.slater_down, current_walker.slater_down),
         inv_up=jnp.where(accept_mask_3d, proposals.inv_up, current_walker.inv_up),
         inv_down=jnp.where(accept_mask_3d, proposals.inv_down, current_walker.inv_down),
-        det_up=jnp.where(accept_mask, proposals.det_up, current_walker.det_up),
-        det_down=jnp.where(accept_mask, proposals.det_down, current_walker.det_down),
+        det_up=new_det_up,
+        det_down=new_det_down,
         grad_up=jnp.where(accept_mask_4d, proposals.grad_up, current_walker.grad_up),
         grad_down=jnp.where(accept_mask_4d, proposals.grad_down, current_walker.grad_down),
         lap_up=jnp.where(accept_mask_3d, proposals.lap_up, current_walker.lap_up),
@@ -101,34 +114,71 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     diffusion_coef = jnp.sqrt(time_step)
     
     key, subkey = random.split(key)
-    random_term = diffusion_coef * random.normal(subkey, walkers.shape)
+    random_term = diffusion_coef * random.normal(subkey, walkers.positions.shape)
     
-    # Combine drift and diffusion terms
-    proposals = walkers + drift_term + random_term
+    # Combine drift and diffusion terms for proposed positions
+    proposed_positions = walkers.positions + drift_term + random_term
+    
+    # Create proposal walkers with new positions and full recomputation mask
+    from .walker import initialize_walker_state
+    proposal_walkers = initialize_walker_state(ansatz, proposed_positions)
     
     # Compute new wavefunction values and quantum forces at proposed positions
-    new_psi_values = ansatz(proposals, params)
-    new_quantum_forces = ansatz.quantum_force(proposals, params)
+    new_psi_values = ansatz(proposal_walkers, params)
+    new_quantum_forces = ansatz.quantum_force(proposal_walkers, params)
     
     # Modified acceptance probability for importance sampling
     # G(R→R') = exp(-(R'-R-D*F(R)*τ)²/(2*τ))
-    forward_density = _compute_green_function(proposals, walkers, quantum_forces, time_step)
-    backward_density = _compute_green_function(walkers, proposals, new_quantum_forces, time_step)
+    forward_density = _compute_green_function(proposed_positions, walkers.positions, quantum_forces, time_step)
+    backward_density = _compute_green_function(walkers.positions, proposed_positions, new_quantum_forces, time_step)
     
     # Compute acceptance probabilities with Green's function ratio
-    acceptance_prob = (jnp.abs(new_psi_values) / jnp.abs(psi_values))**2 * (backward_density / forward_density)
+    # psi_values and new_psi_values are now (sign, log|psi|) tuples
+    # Acceptance probability: |ψ'|²/|ψ|² * (G_back/G_fwd) = exp(2*(log|ψ'| - log|ψ|)) * (G_back/G_fwd)
+    psi_sign, psi_logabs = psi_values
+    new_psi_sign, new_psi_logabs = new_psi_values
+    acceptance_prob = jnp.exp(2.0 * (new_psi_logabs - psi_logabs)) * (backward_density / forward_density)
     
     # Accept or reject
     key, subkey = random.split(key)
-    accept_mask = random.uniform(subkey, shape=(walkers.shape[0],)) < acceptance_prob
+    accept_mask = random.uniform(subkey, shape=(walkers.positions.shape[0],)) < acceptance_prob
     accept_count = jnp.sum(accept_mask)
     
-    # Create new walkers without modifying input
+    # Update walkers: accepted moves get new walker state, rejected keep old state
+    # We need to update all walker fields, not just positions
     accept_mask_3d = accept_mask[:, jnp.newaxis, jnp.newaxis]
-    new_walkers = jnp.where(accept_mask_3d, proposals, walkers)
+    accept_mask_4d = accept_mask[:, jnp.newaxis, jnp.newaxis, jnp.newaxis]
+    accept_mask_1d = accept_mask[:, jnp.newaxis]
+    
+    # For tuple fields (det_up, det_down), unpack and update each component
+    old_det_up_sign, old_det_up_logabs = walkers.det_up
+    new_det_up_sign, new_det_up_logabs = proposal_walkers.det_up
+    old_det_down_sign, old_det_down_logabs = walkers.det_down
+    new_det_down_sign, new_det_down_logabs = proposal_walkers.det_down
+    
+    new_walkers = walkers.replace(
+        positions=jnp.where(accept_mask_3d, proposed_positions, walkers.positions),
+        slater_up=jnp.where(accept_mask_3d, proposal_walkers.slater_up, walkers.slater_up),
+        slater_down=jnp.where(accept_mask_3d, proposal_walkers.slater_down, walkers.slater_down),
+        inv_up=jnp.where(accept_mask_3d, proposal_walkers.inv_up, walkers.inv_up),
+        inv_down=jnp.where(accept_mask_3d, proposal_walkers.inv_down, walkers.inv_down),
+        det_up=(
+            jnp.where(accept_mask, new_det_up_sign, old_det_up_sign),
+            jnp.where(accept_mask, new_det_up_logabs, old_det_up_logabs)
+        ),
+        det_down=(
+            jnp.where(accept_mask, new_det_down_sign, old_det_down_sign),
+            jnp.where(accept_mask, new_det_down_logabs, old_det_down_logabs)
+        ),
+        grad_up=jnp.where(accept_mask_4d, proposal_walkers.grad_up, walkers.grad_up),
+        grad_down=jnp.where(accept_mask_4d, proposal_walkers.grad_down, walkers.grad_down),
+        lap_up=jnp.where(accept_mask_3d, proposal_walkers.lap_up, walkers.lap_up),
+        lap_down=jnp.where(accept_mask_3d, proposal_walkers.lap_down, walkers.lap_down),
+        move_mask=jnp.ones_like(walkers.move_mask, dtype=bool)  # All electrons moved
+    )
     
     # Calculate acceptance rate
-    acceptance_rate = accept_count / walkers.shape[0]
+    acceptance_rate = accept_count / walkers.positions.shape[0]
     
     return new_walkers, acceptance_rate
 

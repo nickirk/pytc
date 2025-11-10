@@ -58,42 +58,61 @@ class SlaterJastrow:
             
         Returns:
             Tuple of (psi_values, updated_walker) where:
-                psi_values: Wavefunction values, shape (n_walkers,)
+                psi_values: Tuple of (sign, log|psi|) for numerical stability
                 updated_walker: Walker with updated determinant matrices
         """
         jastrow_params, linear_coeffs = params
         
-        # Compute Jastrow values on all positions (not optimized, as per plan)
-        jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_value(x, jastrow_params))(walker.positions)
+        # Compute Jastrow values on all positions (returns log|J|, Jastrow is always positive)
+        log_jastrow_vals = jax.vmap(lambda x: self._compute_jastrow_log_value(x, jastrow_params))(walker.positions)
         
-        # Compute determinant values with efficient updates (updates Slater + grad + lap)
+        # Compute determinant values with efficient updates (returns (sign, log|det|) tuples)
         # For single determinant case (most common), avoid list accumulation
         if len(self.dets) == 1:
             det_batch_vals, final_updated_walker = value_and_grad(self.dets[0], walker)
-            linear_combo = linear_coeffs[0] * det_batch_vals
+            # det_batch_vals is (sign, log|det|) tuple
+            det_sign, det_logabs = det_batch_vals
+            linear_combo_sign = jnp.sign(linear_coeffs[0]) * det_sign
+            linear_combo_logabs = jnp.log(jnp.abs(linear_coeffs[0])) + det_logabs
         else:
-            # Multiple determinants: accumulate only det values, not walkers
+            # Multiple determinants: accumulate in log space
             det_vals_list = []
             final_updated_walker = None
             
             for i, det in enumerate(self.dets):
                 det_batch_vals, updated_walker = value_and_grad(det, walker)
-                det_vals_list.append(np.array(det_batch_vals))
+                # Convert (sign, log|det|) back to regular values for linear combination
+                # TODO: Implement proper log-space linear combination
+                det_sign, det_logabs = det_batch_vals
+                det_vals = det_sign * jnp.exp(det_logabs)
+                det_vals_list.append(det_vals)
                 # Only keep the first walker
                 if i == 0:
                     final_updated_walker = updated_walker
             
             det_vals_array = jnp.array(det_vals_list).transpose()
             linear_combo = jnp.sum(linear_coeffs * det_vals_array, axis=1)
+            # Convert back to (sign, log) format
+            linear_combo_sign = jnp.sign(linear_combo)
+            linear_combo_logabs = jnp.log(jnp.abs(linear_combo) + 1e-100)
         
-        psi_values = jastrow_vals * linear_combo
-        final_updated_walker = final_updated_walker.replace(psi_values=psi_values)
+        # Combine Jastrow and determinant in log space
+        # ψ = J × D  =>  log|ψ| = log|J| + log|D|, sign(ψ) = sign(D) (J always positive)
+        psi_sign = linear_combo_sign
+        psi_logabs = log_jastrow_vals + linear_combo_logabs
+        psi_values = (psi_sign, psi_logabs)
         
+        # Return psi_values tuple and updated walker (no need to store psi_values in walker)
+        #jax.debug.print("Wavefunction log values: {}", psi_logabs) 
         return psi_values, final_updated_walker
 
     @partial(jax.jit, static_argnums=(0,))
-    def _compute_jastrow_value(self, elec_coords, jastrow_params):
-        """Compute Jastrow factor value with explicit parameters."""
+    def _compute_jastrow_log_value(self, elec_coords, jastrow_params):
+        """Compute Jastrow factor in log space for numerical stability.
+        
+        Returns:
+            log|J|: Logarithm of Jastrow factor (Jastrow is always positive, so no sign needed)
+        """
         vmap_single = jax.vmap(self.jastrow._compute, in_axes=(None, 0, None))
         vmap_all = jax.vmap(vmap_single, in_axes=(0, None, None))
         
@@ -101,11 +120,10 @@ class SlaterJastrow:
         
         n_electrons = elec_coords.shape[0]
         diag_mask = 1.0 - jnp.eye(n_electrons)
-        #jax.debug.print("all_pairs:{}", all_pairs)
-        #jax.debug.print("diag_mask:{}", diag_mask)
-        #jax.debug.print("sum:{}", jnp.sum(all_pairs * diag_mask))
         
-        return jnp.exp(1./2. * jnp.sum(all_pairs * diag_mask))
+        # Return log(J) instead of J = exp(sum/2)
+        # J = exp(sum/2) => log(J) = sum/2
+        return 0.5 * jnp.sum(all_pairs * diag_mask)
     
     @property
     def n_electrons(self):
@@ -266,7 +284,7 @@ class SlaterJastrow:
             lap_alpha_batch, lap_beta_batch
         )
 
-        return energies
+        return energies, walker
             
     @partial(jax.jit, static_argnums=(0,))
     def _compute_single_walker_energy(self, coords, grad_J_over_J, lap_J_over_J,
@@ -313,12 +331,11 @@ class SlaterJastrow:
         return jnp.real(E_L)  # Ensure real value
 
     @partial(jax.jit, static_argnums=(0,))
-    def quantum_force(self, elec_coords, params, cutoff=1.0):
+    def quantum_force(self, walkers, params, cutoff=5.0):
         """Compute quantum force (2∇ψ/ψ) for importance sampling with magnitude clipping.
         
         Args:
-            elec_coords_batch: Array with shape (n_walkers, n_electrons, 3)
-                           or (n_electrons, 3) for a single walker
+            walkers: Walker object containing electron coordinates and cached quantities
             params: Tuple of parameters (jastrow_params, linear_coeffs)
             cutoff: Maximum allowed magnitude for quantum forces
                            
@@ -327,6 +344,7 @@ class SlaterJastrow:
             or shape (n_electrons, 3) for a single walker
         """
         jastrow_params, linear_coeffs = params 
+        elec_coords = walkers.elec_coords
         # Compute Jastrow gradient contributions
         grad_J_over_J_batch = jax.vmap(lambda coords: self._compute_jastrow_terms(coords, jastrow_params)[0])(elec_coords)
         
