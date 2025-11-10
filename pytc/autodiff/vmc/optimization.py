@@ -579,7 +579,8 @@ def optimize_ref_var(
         loss_fn = make_variance_loss(
             ansatz=ansatz,
             optimizer_type=optimizer_type,
-            use_custom_jvp=False  # Standard autodiff works well for variance
+            use_custom_jvp=True,  # Standard autodiff works well for variance
+            max_vmap_batch_size=max_vmap_batch_size
         )
     else:
         loss_fn = cost_fn

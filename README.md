@@ -8,6 +8,7 @@
 - unittest
 - jax (autodiff and GPU acceleration)
 - flax (neural network)
+- folx 
 - optax (machine learning optimizers)
 - kfac_jax (2nd order optimizer)
 - tqdm (visual progress tracking)
