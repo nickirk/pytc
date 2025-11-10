@@ -502,7 +502,12 @@ class TestLocalEnergyWithWalker(unittest.TestCase):
         print(f"Wavefunction log values: {psi_values[1]}")
         
         # Now call local_energy with populated walker
-        energies, updated_walker = self.ansatz.local_energy(walker, self.params)
+        # local_energy works with single walkers, so vmap over batch
+        batch_local_energy = jax.vmap(
+            lambda w, p: self.ansatz.local_energy(w, p),
+            in_axes=(0, None)
+        )
+        energies, updated_walker = batch_local_energy(walker, self.params)
         
         # Verify energies shape
         self.assertEqual(energies.shape, (n_walkers,))

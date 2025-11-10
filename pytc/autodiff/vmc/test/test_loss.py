@@ -168,9 +168,82 @@ def test_combined_loss():
     print("✓ Combined loss test passed!\n")
 
 
+def test_batched_energy_loss():
+    """Test batched energy loss function for memory efficiency."""
+    # Create simple H2 molecule
+    mol = gto.Mole()
+    mol.atom = 'H 0 0 0; H 0 0 0.74'
+    mol.basis = 'sto-3g'
+    mol.build()
+    
+    # HF calculation
+    mf = scf.RHF(mol)
+    mf.kernel()
+    
+    # Create ansatz
+    det = SlaterDet(mol, mf.mo_coeff)
+    jastrow = REXP()
+    ansatz = SlaterJastrow([det], jastrow)
+    
+    # Initialize parameters
+    jastrow_params = jastrow.init_params()
+    linear_coeffs = jnp.ones(1)
+    params = [jastrow_params, linear_coeffs]
+    
+    # Initialize walkers
+    key = random.PRNGKey(42)
+    walkers = initialize_walkers(ansatz, n_walkers=50, key=key)
+    
+    # Create unbatched loss (max_vmap_batch_size=0 means standard vmap)
+    loss_fn_unbatched = make_energy_loss(ansatz, optimizer_type="adam", max_vmap_batch_size=0)
+    
+    # Create batched loss (max_vmap_batch_size=10 means use folx.batched_vmap)
+    loss_fn_batched = make_energy_loss(ansatz, optimizer_type="adam", max_vmap_batch_size=10)
+    
+    # Compute losses
+    loss_unbatched, aux_unbatched = loss_fn_unbatched(params, walkers)
+    loss_batched, aux_batched = loss_fn_batched(params, walkers)
+    
+    # Extract mean and std (namedtuples are indexable)
+    mean_e_unbatched, std_e_unbatched = aux_unbatched[0], aux_unbatched[1]
+    mean_e_batched, std_e_batched = aux_batched[0], aux_batched[1]
+    
+    print(f"Batched energy loss test (vmap vs batched_vmap):")
+    print(f"  Unbatched - Loss: {loss_unbatched:.6f}, Mean E: {mean_e_unbatched:.6f}")
+    print(f"  Batched   - Loss: {loss_batched:.6f}, Mean E: {mean_e_batched:.6f}")
+    print(f"  Difference: {abs(loss_unbatched - loss_batched):.10f}")
+    
+    # Test gradients match
+    grad_fn_unbatched = jax.grad(lambda p: loss_fn_unbatched(p, walkers)[0], argnums=0)
+    grad_fn_batched = jax.grad(lambda p: loss_fn_batched(p, walkers)[0], argnums=0)
+    
+    grads_unbatched = grad_fn_unbatched(params)
+    grads_batched = grad_fn_batched(params)
+    
+    # Check gradients are close
+    def flatten_pytree(tree):
+        leaves, _ = jax.tree_util.tree_flatten(tree)
+        return jnp.concatenate([jnp.ravel(x) for x in leaves])
+    
+    grad_diff = jnp.linalg.norm(
+        flatten_pytree(grads_unbatched) - flatten_pytree(grads_batched)
+    )
+    
+    print(f"  Gradient difference norm: {grad_diff:.10f}")
+    print(f"  Gradients computed successfully!")
+    
+    # Verify they're approximately equal
+    assert jnp.allclose(loss_unbatched, loss_batched, rtol=1e-10), \
+        "Batched and unbatched losses should match"
+    assert grad_diff < 1e-8, "Batched and unbatched gradients should match"
+    
+    print("✓ Batched energy loss test passed!\n")
+
+
 if __name__ == "__main__":
     print("Testing loss functions...\n")
     test_energy_loss()
     test_variance_loss()
     test_combined_loss()
+    test_batched_energy_loss()
     print("All loss tests passed! ✓")

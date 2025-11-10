@@ -403,11 +403,12 @@ def value_and_grad(det, walker):
     
     Args:
         det: SlaterDet object (static)
-        walker: Walker dataclass with positions, move_mask, and cached matrices
+        walker: Walker dataclass with single walker (positions shape: (n_electrons, 3))
+                For batches, use vmap externally.
         
     Returns:
         Tuple of (det_values, updated_walker) where:
-            det_values: JAX array of shape (n_walkers,)
+            det_values: Tuple of (sign, log|det|) scalars
             updated_walker: Walker with all quantities updated (Slater, grad, lap)
     """
     def value_and_grad_callback(positions_np, move_mask_np, slater_up_np, slater_down_np,
@@ -415,23 +416,63 @@ def value_and_grad(det, walker):
                                 det_up_sign_np, det_up_logabs_np,
                                 det_down_sign_np, det_down_logabs_np,
                                 grad_up_np, grad_down_np, lap_up_np, lap_down_np):
-        """Callback that calls SlaterDet.value_and_grad with numpy arrays."""
+        """Callback that calls SlaterDet.value_and_grad with numpy arrays.
+        
+        This callback preserves batch dimensions for expand_dims vmap method.
+        Input can be either (n_electrons, 3) or (batch, n_electrons, 3).
+        """
+        # Check if we have a batch dimension
+        is_batched = positions_np.ndim == 3
+        
+        if not is_batched:
+            # Single walker: add batch dimension temporarily
+            positions_batch = positions_np[None, ...]
+            move_mask_batch = move_mask_np[None, ...]
+            slater_up_batch = slater_up_np[None, ...]
+            slater_down_batch = slater_down_np[None, ...]
+            inv_up_batch = inv_up_np[None, ...]
+            inv_down_batch = inv_down_np[None, ...]
+            det_up_sign_batch = det_up_sign_np[None, ...]
+            det_up_logabs_batch = det_up_logabs_np[None, ...]
+            det_down_sign_batch = det_down_sign_np[None, ...]
+            det_down_logabs_batch = det_down_logabs_np[None, ...]
+            grad_up_batch = grad_up_np[None, ...]
+            grad_down_batch = grad_down_np[None, ...]
+            lap_up_batch = lap_up_np[None, ...]
+            lap_down_batch = lap_down_np[None, ...]
+        else:
+            # Already batched
+            positions_batch = positions_np
+            move_mask_batch = move_mask_np
+            slater_up_batch = slater_up_np
+            slater_down_batch = slater_down_np
+            inv_up_batch = inv_up_np
+            inv_down_batch = inv_down_np
+            det_up_sign_batch = det_up_sign_np
+            det_up_logabs_batch = det_up_logabs_np
+            det_down_sign_batch = det_down_sign_np
+            det_down_logabs_batch = det_down_logabs_np
+            grad_up_batch = grad_up_np
+            grad_down_batch = grad_down_np
+            lap_up_batch = lap_up_np
+            lap_down_batch = lap_down_np
+        
         # Create a temporary numpy-based walker structure
         class NumpyWalker:
             def __init__(self):
-                self.positions = positions_np
-                self.move_mask = move_mask_np
-                self.slater_up = slater_up_np
-                self.slater_down = slater_down_np
-                self.inv_up = inv_up_np
-                self.inv_down = inv_down_np
+                self.positions = positions_batch
+                self.move_mask = move_mask_batch
+                self.slater_up = slater_up_batch
+                self.slater_down = slater_down_batch
+                self.inv_up = inv_up_batch
+                self.inv_down = inv_down_batch
                 # det_up and det_down are tuples
-                self.det_up = (det_up_sign_np, det_up_logabs_np)
-                self.det_down = (det_down_sign_np, det_down_logabs_np)
-                self.grad_up = grad_up_np
-                self.grad_down = grad_down_np
-                self.lap_up = lap_up_np
-                self.lap_down = lap_down_np
+                self.det_up = (det_up_sign_batch, det_up_logabs_batch)
+                self.det_down = (det_down_sign_batch, det_down_logabs_batch)
+                self.grad_up = grad_up_batch
+                self.grad_down = grad_down_batch
+                self.lap_up = lap_up_batch
+                self.lap_down = lap_down_batch
         
         np_walker = NumpyWalker()
         det_values, updated_data = det.value_and_grad(np_walker)
@@ -441,40 +482,56 @@ def value_and_grad(det, walker):
         det_up_sign, det_up_logabs = updated_data['det_up']
         det_down_sign, det_down_logabs = updated_data['det_down']
         
-        # Return all updated values
-        return (np.asarray(det_sign),
-                np.asarray(det_logabs),
-                np.asarray(updated_data['slater_up']),
-                np.asarray(updated_data['slater_down']),
-                np.asarray(updated_data['inv_up']),
-                np.asarray(updated_data['inv_down']),
-                np.asarray(det_up_sign),
-                np.asarray(det_up_logabs),
-                np.asarray(det_down_sign),
-                np.asarray(det_down_logabs),
-                np.asarray(updated_data['grad_up']),
-                np.asarray(updated_data['grad_down']),
-                np.asarray(updated_data['lap_up']),
-                np.asarray(updated_data['lap_down']))
+        if not is_batched:
+            # Squeeze batch dimension for single walker
+            return (np.asarray(det_sign[0]),
+                    np.asarray(det_logabs[0]),
+                    np.asarray(updated_data['slater_up'][0]),
+                    np.asarray(updated_data['slater_down'][0]),
+                    np.asarray(updated_data['inv_up'][0]),
+                    np.asarray(updated_data['inv_down'][0]),
+                    np.asarray(det_up_sign[0]),
+                    np.asarray(det_up_logabs[0]),
+                    np.asarray(det_down_sign[0]),
+                    np.asarray(det_down_logabs[0]),
+                    np.asarray(updated_data['grad_up'][0]),
+                    np.asarray(updated_data['grad_down'][0]),
+                    np.asarray(updated_data['lap_up'][0]),
+                    np.asarray(updated_data['lap_down'][0]))
+        else:
+            # Keep batch dimension
+            return (np.asarray(det_sign),
+                    np.asarray(det_logabs),
+                    np.asarray(updated_data['slater_up']),
+                    np.asarray(updated_data['slater_down']),
+                    np.asarray(updated_data['inv_up']),
+                    np.asarray(updated_data['inv_down']),
+                    np.asarray(det_up_sign),
+                    np.asarray(det_up_logabs),
+                    np.asarray(det_down_sign),
+                    np.asarray(det_down_logabs),
+                    np.asarray(updated_data['grad_up']),
+                    np.asarray(updated_data['grad_down']),
+                    np.asarray(updated_data['lap_up']),
+                    np.asarray(updated_data['lap_down']))
     
-    n_walkers = walker.positions.shape[0]
     n_alpha, n_beta = det.n_alpha, det.n_beta
     
-    # Define output shapes - determinant values are tuples
-    det_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    det_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    slater_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
-    slater_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
-    inv_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
-    inv_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
-    det_up_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    det_up_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    det_down_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    det_down_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    grad_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha, 3), jnp.float64)
-    grad_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta, 3), jnp.float64)
-    lap_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
-    lap_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
+    # Define output shapes - single walker (no batch dimension)
+    det_sign_shape = jax.ShapeDtypeStruct((), jnp.float64)
+    det_logabs_shape = jax.ShapeDtypeStruct((), jnp.float64)
+    slater_up_shape = jax.ShapeDtypeStruct((n_alpha, n_alpha), jnp.float64)
+    slater_down_shape = jax.ShapeDtypeStruct((n_beta, n_beta), jnp.float64)
+    inv_up_shape = jax.ShapeDtypeStruct((n_alpha, n_alpha), jnp.float64)
+    inv_down_shape = jax.ShapeDtypeStruct((n_beta, n_beta), jnp.float64)
+    det_up_sign_shape = jax.ShapeDtypeStruct((), jnp.float64)
+    det_up_logabs_shape = jax.ShapeDtypeStruct((), jnp.float64)
+    det_down_sign_shape = jax.ShapeDtypeStruct((), jnp.float64)
+    det_down_logabs_shape = jax.ShapeDtypeStruct((), jnp.float64)
+    grad_up_shape = jax.ShapeDtypeStruct((n_alpha, n_alpha, 3), jnp.float64)
+    grad_down_shape = jax.ShapeDtypeStruct((n_beta, n_beta, 3), jnp.float64)
+    lap_up_shape = jax.ShapeDtypeStruct((n_alpha, n_alpha), jnp.float64)
+    lap_down_shape = jax.ShapeDtypeStruct((n_beta, n_beta), jnp.float64)
     
     (det_sign, det_logabs, slater_up, slater_down, inv_up, inv_down,
      det_up_sign, det_up_logabs, det_down_sign, det_down_logabs,
@@ -487,7 +544,8 @@ def value_and_grad(det, walker):
         walker.positions, walker.move_mask, walker.slater_up, walker.slater_down,
         walker.inv_up, walker.inv_down,
         walker.det_up[0], walker.det_up[1], walker.det_down[0], walker.det_down[1],
-        walker.grad_up, walker.grad_down, walker.lap_up, walker.lap_down
+        walker.grad_up, walker.grad_down, walker.lap_up, walker.lap_down,
+        vmap_method='expand_dims'
     )
     
     # Create updated walker with all quantities, using tuple format for determinants
@@ -509,31 +567,49 @@ def value_and_grad(det, walker):
     return det_values, updated_walker
 
 @partial(jax.jit, static_argnums=(0,))
-def grad(det, coords):
+def grad(det, walker):
     """JAX-compatible wrapper for SlaterDet.grad()
     
     Args:
         det: SlaterDet object (static)
-        coords: JAX array of shape (n_walkers, n_electrons, 3)
+        walker: Walker dataclass with single walker (positions shape: (n_electrons, 3))
+                For batches, use vmap externally.
         
     Returns:
-        Tuple of JAX arrays for (grad_up, grad_down) with shapes:
-        ((n_walkers, n_alpha, n_alpha, 3), (n_walkers, n_beta, n_beta, 3))
+        Tuple of (slater_up, slater_down, grad_up, grad_down) with shapes:
+        ((n_alpha, n_alpha), (n_beta, n_beta), (n_alpha, n_alpha, 3), (n_beta, n_beta, 3))
     """
     def grad_callback(coords_np):
-        matrix_out, grad_out = det.grad(np.array(coords_np))
-        return (np.asarray(matrix_out[0]), np.asarray(matrix_out[1]),
-                np.asarray(grad_out[0]), np.asarray(grad_out[1]))
+        # Check if we have a batch dimension
+        is_batched = coords_np.ndim == 3
+        
+        if not is_batched:
+            # Add batch dimension for PySCF (expects batched input)
+            coords_batch = coords_np[None, ...]
+        else:
+            coords_batch = coords_np
+        
+        matrix_out, grad_out = det.grad(coords_batch)
+        
+        if not is_batched:
+            # Squeeze batch dimension from outputs
+            return (np.asarray(matrix_out[0][0]), np.asarray(matrix_out[1][0]),
+                    np.asarray(grad_out[0][0]), np.asarray(grad_out[1][0]))
+        else:
+            # Keep batch dimension
+            return (np.asarray(matrix_out[0]), np.asarray(matrix_out[1]),
+                    np.asarray(grad_out[0]), np.asarray(grad_out[1]))
     
-    matrix_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha), jnp.float64)
-    matrix_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta), jnp.float64)
-    grad_up_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_alpha, det.n_alpha, 3), jnp.float64)
-    grad_down_shape = jax.ShapeDtypeStruct((coords.shape[0], det.n_beta, det.n_beta, 3), jnp.float64)
+    matrix_up_shape = jax.ShapeDtypeStruct((det.n_alpha, det.n_alpha), jnp.float64)
+    matrix_down_shape = jax.ShapeDtypeStruct((det.n_beta, det.n_beta), jnp.float64)
+    grad_up_shape = jax.ShapeDtypeStruct((det.n_alpha, det.n_alpha, 3), jnp.float64)
+    grad_down_shape = jax.ShapeDtypeStruct((det.n_beta, det.n_beta, 3), jnp.float64)
     
     return jax.pure_callback(grad_callback, 
                            (matrix_up_shape, matrix_down_shape, 
                             grad_up_shape, grad_down_shape), 
-                           coords)
+                           walker.positions,
+                           vmap_method='expand_dims')
 
 @partial(jax.jit, static_argnums=(0,))
 def laplacian(det, walker):

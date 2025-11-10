@@ -7,6 +7,7 @@ including both standard MCMC and importance sampling variants.
 import gc
 import time
 import numpy as np
+import jax
 import jax.numpy as jnp
 from jax import random
 from typing import Dict, Any
@@ -177,8 +178,12 @@ def sample(
         
         if step % thinning == 0:
             # Compute local energies with parameters
-            # local_energy returns (energies, walker) tuple
-            energies, _ = ansatz.local_energy(walkers, params)
+            # local_energy now works with single walkers, so vmap over batch
+            batch_local_energy = jax.vmap(
+                lambda w, p: ansatz.local_energy(w, p)[0],
+                in_axes=(0, None)
+            )
+            energies = batch_local_energy(walkers, params)
             
             # Convert to numpy to avoid holding JAX device references
             collected_samples.append(np.array(walkers.positions))
