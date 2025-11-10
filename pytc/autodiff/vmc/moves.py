@@ -15,7 +15,7 @@ def _all_electron_move(ansatz, walker, step_size, key, params):
     
     Args:
         ansatz: Wavefunction object
-        walker: Walker dataclass with current state
+        walker: Walker dataclass with current state (batched)
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
         params: Parameters for the ansatz
@@ -25,8 +25,11 @@ def _all_electron_move(ansatz, walker, step_size, key, params):
         psi_values: Wavefunction values for current walker
         new_psi_values: Wavefunction values for proposals
     """
+    # ansatz() now works with single walkers, so vmap over batch
+    batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+    
     # Compute initial wavefunction values
-    psi_values, current_walker = ansatz(walker, params)
+    psi_values, current_walker = batch_ansatz(walker, params)
     
     # Generate proposals (all electrons move)
     key, subkey = random.split(key)
@@ -39,7 +42,7 @@ def _all_electron_move(ansatz, walker, step_size, key, params):
     )
     
     # Compute new wavefunction values
-    new_psi_values, proposals = ansatz(proposals, params)
+    new_psi_values, proposals = batch_ansatz(proposals, params)
     
     # Return updated current_walker
     return psi_values, new_psi_values, current_walker, proposals
@@ -49,7 +52,7 @@ def _one_electron_move(ansatz, walker, step_size, key, params):
     
     Args:
         ansatz: Wavefunction object
-        walker: Walker dataclass with current state
+        walker: Walker dataclass with current state (batched)
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
         params: Parameters for the ansatz
@@ -59,6 +62,9 @@ def _one_electron_move(ansatz, walker, step_size, key, params):
         psi_values: Wavefunction values for current walker
         new_psi_values: Wavefunction values for proposals
     """
+    # ansatz() now works with single walkers, so vmap over batch
+    batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+    
     # Select electron to move for each walker
     key, subkey = random.split(key)
     n_electrons = walker.positions.shape[1]
@@ -81,10 +87,10 @@ def _one_electron_move(ansatz, walker, step_size, key, params):
     # Compute current wavefunction value in tuple format
     # Walker stores regular psi_values but we need tuple format for metropolis
     # We need to recompute to get the tuple format
-    psi_values, walker_updated = ansatz(walker, params)
+    psi_values, walker_updated = batch_ansatz(walker, params)
     
     # Proposals have move_mask indicating moved electron
-    new_psi_values, proposals = ansatz(proposals, params)
+    new_psi_values, proposals = batch_ansatz(proposals, params)
     
     return psi_values, new_psi_values, walker_updated, proposals
 

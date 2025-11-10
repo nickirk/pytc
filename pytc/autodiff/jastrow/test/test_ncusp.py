@@ -358,7 +358,8 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             
             # Create full electron configuration
             elec_coords = np.vstack([[pos], fixed_positions])
-            elec_coords = elec_coords.reshape((1, n_electrons, 3))
+            # local_energy now works with single walker (n_electrons, 3)
+            # So no need to reshape to (1, n_electrons, 3)
             
             # Compute local energy using combined parameters
             E_L = sj.local_energy(elec_coords, params)[0]

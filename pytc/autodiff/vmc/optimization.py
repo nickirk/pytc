@@ -40,7 +40,7 @@ from .metropolis import metropolis_hastings, metropolis_hastings_importance_samp
 from .walker import initialize_walkers, Walker
 from .sampling import burn_in, burn_in_with_importance
 from .mcmc_utils import create_gradient_mask, create_optimizer
-from .loss import make_energy_loss, make_variance_loss, make_combined_loss
+from .loss import make_energy_loss, make_variance_loss
 
 
 def make_opt_update_step(loss_fn, optimizer):
@@ -316,6 +316,7 @@ def optimize(
     key=None,
     # Optimization parameters
     n_opt_steps: int = 100,
+    max_vmap_batch_size: int = 0,
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
     opt_kwargs: Optional[Dict[str, Any]] = None,
@@ -338,6 +339,8 @@ def optimize(
         initial_walkers: Optional initial positions, otherwise initialized near nuclei
         key: PRNG key
         n_opt_steps: Number of optimization steps
+        max_vmap_batch_size: If 0, use standard vmap. If >0, use folx.batched_vmap with
+                            the given batch size for memory efficiency. Recommended: 10-50
         learning_rate: Learning rate for optimizer
         optimizer_type: Type of optimizer ("adam", "sgd", etc.)
         opt_kwargs: Additional optimizer parameters
@@ -389,7 +392,8 @@ def optimize(
         optimizer_type=optimizer_type,
         cost_fn=user_or_default_cost_fn,
         clip_multiplier=5.0,
-        use_custom_jvp=True
+        use_custom_jvp=True,
+        max_vmap_batch_size=max_vmap_batch_size
     )
 
     # Create mask for parameter freezing
@@ -460,9 +464,11 @@ def optimize(
         
         # Materialize values
         cost_val = float(jax.device_get(loss))
-        energy_val, std_val = jax.device_get(aux_data)
-        energy_val = float(energy_val)
-        std_val = float(std_val)
+        # aux_data is a namedtuple with (mean_energy, energy_std, clipped_energies, diff)
+        # Extract only the first two for backward compatibility
+        aux_data_materialized = jax.device_get(aux_data)
+        energy_val = float(aux_data_materialized[0])  # mean_energy
+        std_val = float(aux_data_materialized[1])     # energy_std
         pmove_val = float(jax.device_get(pmove))
         
         # Store history
@@ -509,6 +515,7 @@ def optimize_ref_var(
     key=None,
     # Optimization parameters
     n_opt_steps: int = 100,
+    max_vmap_batch_size: int = 0,
     learning_rate: float = 0.01,
     optimizer_type: str = "adam",
     move_type: str = "one",
@@ -529,6 +536,8 @@ def optimize_ref_var(
         initial_walkers: Optional initial positions, otherwise initialized near nuclei
         key: PRNG key
         n_opt_steps: Number of optimization steps
+        max_vmap_batch_size: If 0, use standard vmap. If >0, use folx.batched_vmap with
+                            the given batch size for memory efficiency. Recommended: 10-50
         learning_rate: Learning rate for optimizer
         optimizer_type: Type of optimizer ("adam", "sgd", "kfac", etc.)
         move_type: "one" or "all" for MCMC electron moves
@@ -646,7 +655,6 @@ def optimize_ref_var(
                 lambda x: np.array(jax.device_get(x)) if isinstance(x, jnp.ndarray) else x,
                 params
             )
-            print("Optimization step parameters:", params_copy)
             params_history.append(params_copy)
             
             # Print progress

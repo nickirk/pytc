@@ -92,7 +92,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     Args:
         ansatz: Wavefunction object with __call__ method that returns ψ(R)
                Should also have a quantum_force method
-        walkers: Array of walker configurations with shape (n_walkers, n_electrons, 3)
+        walkers: Batched walker configurations with shape (n_walkers, n_electrons, 3)
         time_step: Time step for the drift-diffusion process
         key: PRNG key
         params: Parameters for the ansatz, including jastrow and linear coefficients
@@ -103,10 +103,14 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
         - acceptance_rate: Fraction of proposals that were accepted
     """
     # Compute initial wavefunction values and quantum forces with parameters
-    psi_values = ansatz(walkers, params)
+    # ansatz() and quantum_force() now work with single walkers, so vmap over batch
+    batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+    batch_quantum_force = jax.vmap(lambda w, p: ansatz.quantum_force(w, p), in_axes=(0, None))
+    
+    psi_values = batch_ansatz(walkers, params)
     
     # Compute quantum force: F = 2∇ψ/ψ (gradient of log wavefunction)
-    quantum_forces = ansatz.quantum_force(walkers, params)
+    quantum_forces = batch_quantum_force(walkers, params)
     
     # Generate drift-diffusion proposals:
     # R' = R + D*F(R)*τ + √(2D*τ)*χ (D=0.5 in atomic units)
@@ -124,8 +128,8 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     proposal_walkers = initialize_walker_state(ansatz, proposed_positions)
     
     # Compute new wavefunction values and quantum forces at proposed positions
-    new_psi_values = ansatz(proposal_walkers, params)
-    new_quantum_forces = ansatz.quantum_force(proposal_walkers, params)
+    new_psi_values = batch_ansatz(proposal_walkers, params)
+    new_quantum_forces = batch_quantum_force(proposal_walkers, params)
     
     # Modified acceptance probability for importance sampling
     # G(R→R') = exp(-(R'-R-D*F(R)*τ)²/(2*τ))

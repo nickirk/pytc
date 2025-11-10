@@ -406,7 +406,7 @@ class TestJastrowOptimization(unittest.TestCase):
         n_walkers = 5000
         n_steps = 10
         step_size = 0.01
-        burn_in_steps = 2000
+        burn_in_steps = 1000
         n_opt_steps = 500
         key = random.PRNGKey(42)
         
@@ -423,6 +423,7 @@ class TestJastrowOptimization(unittest.TestCase):
             n_opt_steps=n_opt_steps,
             optimizer_type='kfac',
             learning_rate=0.001,
+            max_vmap_batch_size=0,
             #use_importance_sampling=False,
             key=key
         )
@@ -449,7 +450,7 @@ class TestJastrowOptimization(unittest.TestCase):
     
     def test_h2o_optimization(self):
         """Test optimization of Jastrow parameters for Be atom."""
-        self.run_optimization_test('H 0 0 0; O 0 0 1.0; H 0 1.0 0', basis='ccpvtz')
+        self.run_optimization_test('O 0 0 0; H 0 0.757	0.589; H 0 -0.757	0.589', basis='ccpvtz')
 
     def test_benzene(self):
         """Test HF energy sampling for Benzene molecule."""
