@@ -78,10 +78,15 @@ def _one_electron_move(ansatz, walker, step_size, key, params):
         move_mask=move_mask
     )
     
+    # Compute current wavefunction value in tuple format
+    # Walker stores regular psi_values but we need tuple format for metropolis
+    # We need to recompute to get the tuple format
+    psi_values, walker_updated = ansatz(walker, params)
+    
     # Proposals have move_mask indicating moved electron
     new_psi_values, proposals = ansatz(proposals, params)
     
-    return walker.psi_values, new_psi_values, walker, proposals
+    return psi_values, new_psi_values, walker_updated, proposals
 
 
 @jax.jit

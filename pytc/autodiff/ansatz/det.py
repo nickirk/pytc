@@ -245,13 +245,13 @@ def _sherman_morrison_update_batch(old_matrices, old_inverses, old_dets, row_ind
     Args:
         old_matrices: Original matrices, shape (batch, n, n)
         old_inverses: Inverses of original matrices, shape (batch, n, n)
-        old_dets: Determinants of original matrices, shape (batch,)
+        old_dets: Tuple of (signs, logabs) each with shape (batch,)
         row_indices: Indices of rows that changed, shape (batch,)
         new_rows: New row values, shape (batch, n)
         
     Returns:
         Tuple of (new_dets, new_inverses)
-        - new_dets: Updated determinants, shape (batch,)
+        - new_dets: Updated determinants as tuple (signs, logabs)
         - new_inverses: Updated matrix inverses, shape (batch, n, n)
     """
     batch_size = old_matrices.shape[0]
@@ -273,8 +273,18 @@ def _sherman_morrison_update_batch(old_matrices, old_inverses, old_dets, row_ind
     # For each batch element: sum over n of v[i] * inv_col[i]
     denominators = 1.0 + np.sum(v * inv_cols, axis=1)  # shape: (batch,)
     
-    # Update determinants: det(A') = det(A) * denominator
-    new_dets = old_dets * denominators  # shape: (batch,)
+    # Update determinants in log space
+    # old_dets is (sign, log|det|)
+    old_signs, old_logabs = old_dets
+    
+    # New determinant: det(A') = det(A) * denominator
+    # sign(det') = sign(det) * sign(denominator)
+    new_signs = old_signs * np.sign(denominators)
+    
+    # log|det'| = log|det| + log|denominator|
+    new_logabs = old_logabs + np.log(np.abs(denominators))
+    
+    new_dets = (new_signs, new_logabs)
     
     # Compute v^T * A^{-1} for each batch element
     # v has shape (batch, n), old_inverses has shape (batch, n, n)
@@ -308,7 +318,8 @@ def value(det, walker):
             updated_walker: Walker with updated slater matrices, dets, and inverses
     """
     def value_callback(positions_np, move_mask_np, slater_up_np, slater_down_np, 
-                       inv_up_np, inv_down_np, det_up_np, det_down_np):
+                       inv_up_np, inv_down_np, det_up_sign_np, det_up_logabs_np, 
+                       det_down_sign_np, det_down_logabs_np):
         """Callback that calls SlaterDet.value with numpy arrays."""
         # Create a temporary numpy-based walker structure
         class NumpyWalker:
@@ -319,51 +330,68 @@ def value(det, walker):
                 self.slater_down = slater_down_np
                 self.inv_up = inv_up_np
                 self.inv_down = inv_down_np
-                self.det_up = det_up_np
-                self.det_down = det_down_np
+                # det_up and det_down are tuples
+                self.det_up = (det_up_sign_np, det_up_logabs_np)
+                self.det_down = (det_down_sign_np, det_down_logabs_np)
         
         np_walker = NumpyWalker()
         det_values, updated_matrices = det.value(np_walker)
         
+        # Unpack det_values tuple
+        det_sign, det_logabs = det_values
+        det_up_sign, det_up_logabs = updated_matrices['det_up']
+        det_down_sign, det_down_logabs = updated_matrices['det_down']
+        
         # Return all updated values
-        return (np.asarray(det_values),
+        return (np.asarray(det_sign),
+                np.asarray(det_logabs),
                 np.asarray(updated_matrices['slater_up']),
                 np.asarray(updated_matrices['slater_down']),
                 np.asarray(updated_matrices['inv_up']),
                 np.asarray(updated_matrices['inv_down']),
-                np.asarray(updated_matrices['det_up']),
-                np.asarray(updated_matrices['det_down']))
+                np.asarray(det_up_sign),
+                np.asarray(det_up_logabs),
+                np.asarray(det_down_sign),
+                np.asarray(det_down_logabs))
     
     n_walkers = walker.positions.shape[0]
     n_alpha, n_beta = det.n_alpha, det.n_beta
     
-    # Define output shapes
-    det_values_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    # Define output shapes - determinant values are now tuples of (sign, log|det|)
+    det_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
     slater_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
     slater_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
     inv_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
     inv_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
-    det_up_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    det_down_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_up_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_up_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_down_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_down_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
     
-    det_values, slater_up, slater_down, inv_up, inv_down, det_up, det_down = jax.pure_callback(
+    (det_sign, det_logabs, slater_up, slater_down, inv_up, inv_down, 
+     det_up_sign, det_up_logabs, det_down_sign, det_down_logabs) = jax.pure_callback(
         value_callback,
-        (det_values_shape, slater_up_shape, slater_down_shape, 
-         inv_up_shape, inv_down_shape, det_up_shape, det_down_shape),
+        (det_sign_shape, det_logabs_shape, slater_up_shape, slater_down_shape, 
+         inv_up_shape, inv_down_shape, det_up_sign_shape, det_up_logabs_shape,
+         det_down_sign_shape, det_down_logabs_shape),
         walker.positions, walker.move_mask, walker.slater_up, walker.slater_down,
-        walker.inv_up, walker.inv_down, walker.det_up, walker.det_down
+        walker.inv_up, walker.inv_down, 
+        walker.det_up[0], walker.det_up[1], walker.det_down[0], walker.det_down[1]
     )
     
-    # Create updated walker
+    # Create updated walker with tuple format for determinants
     updated_walker = walker.replace(
         slater_up=slater_up,
         slater_down=slater_down,
         inv_up=inv_up,
         inv_down=inv_down,
-        det_up=det_up,
-        det_down=det_down
+        det_up=(det_up_sign, det_up_logabs),
+        det_down=(det_down_sign, det_down_logabs)
     )
     
+    # Return determinant values as tuple
+    det_values = (det_sign, det_logabs)
     return det_values, updated_walker
 
 @partial(jax.jit, static_argnums=(0,))
@@ -383,7 +411,9 @@ def value_and_grad(det, walker):
             updated_walker: Walker with all quantities updated (Slater, grad, lap)
     """
     def value_and_grad_callback(positions_np, move_mask_np, slater_up_np, slater_down_np,
-                                inv_up_np, inv_down_np, det_up_np, det_down_np,
+                                inv_up_np, inv_down_np, 
+                                det_up_sign_np, det_up_logabs_np,
+                                det_down_sign_np, det_down_logabs_np,
                                 grad_up_np, grad_down_np, lap_up_np, lap_down_np):
         """Callback that calls SlaterDet.value_and_grad with numpy arrays."""
         # Create a temporary numpy-based walker structure
@@ -395,8 +425,9 @@ def value_and_grad(det, walker):
                 self.slater_down = slater_down_np
                 self.inv_up = inv_up_np
                 self.inv_down = inv_down_np
-                self.det_up = det_up_np
-                self.det_down = det_down_np
+                # det_up and det_down are tuples
+                self.det_up = (det_up_sign_np, det_up_logabs_np)
+                self.det_down = (det_down_sign_np, det_down_logabs_np)
                 self.grad_up = grad_up_np
                 self.grad_down = grad_down_np
                 self.lap_up = lap_up_np
@@ -405,14 +436,22 @@ def value_and_grad(det, walker):
         np_walker = NumpyWalker()
         det_values, updated_data = det.value_and_grad(np_walker)
         
+        # Unpack det_values tuple
+        det_sign, det_logabs = det_values
+        det_up_sign, det_up_logabs = updated_data['det_up']
+        det_down_sign, det_down_logabs = updated_data['det_down']
+        
         # Return all updated values
-        return (np.asarray(det_values),
+        return (np.asarray(det_sign),
+                np.asarray(det_logabs),
                 np.asarray(updated_data['slater_up']),
                 np.asarray(updated_data['slater_down']),
                 np.asarray(updated_data['inv_up']),
                 np.asarray(updated_data['inv_down']),
-                np.asarray(updated_data['det_up']),
-                np.asarray(updated_data['det_down']),
+                np.asarray(det_up_sign),
+                np.asarray(det_up_logabs),
+                np.asarray(det_down_sign),
+                np.asarray(det_down_logabs),
                 np.asarray(updated_data['grad_up']),
                 np.asarray(updated_data['grad_down']),
                 np.asarray(updated_data['lap_up']),
@@ -421,44 +460,52 @@ def value_and_grad(det, walker):
     n_walkers = walker.positions.shape[0]
     n_alpha, n_beta = det.n_alpha, det.n_beta
     
-    # Define output shapes
-    det_values_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    # Define output shapes - determinant values are tuples
+    det_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
     slater_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
     slater_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
     inv_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
     inv_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
-    det_up_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
-    det_down_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_up_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_up_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_down_sign_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
+    det_down_logabs_shape = jax.ShapeDtypeStruct((n_walkers,), jnp.float64)
     grad_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha, 3), jnp.float64)
     grad_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta, 3), jnp.float64)
     lap_up_shape = jax.ShapeDtypeStruct((n_walkers, n_alpha, n_alpha), jnp.float64)
     lap_down_shape = jax.ShapeDtypeStruct((n_walkers, n_beta, n_beta), jnp.float64)
     
-    det_values, slater_up, slater_down, inv_up, inv_down, det_up, det_down, \
-    grad_up, grad_down, lap_up, lap_down = jax.pure_callback(
+    (det_sign, det_logabs, slater_up, slater_down, inv_up, inv_down,
+     det_up_sign, det_up_logabs, det_down_sign, det_down_logabs,
+     grad_up, grad_down, lap_up, lap_down) = jax.pure_callback(
         value_and_grad_callback,
-        (det_values_shape, slater_up_shape, slater_down_shape,
-         inv_up_shape, inv_down_shape, det_up_shape, det_down_shape,
+        (det_sign_shape, det_logabs_shape, slater_up_shape, slater_down_shape,
+         inv_up_shape, inv_down_shape, 
+         det_up_sign_shape, det_up_logabs_shape, det_down_sign_shape, det_down_logabs_shape,
          grad_up_shape, grad_down_shape, lap_up_shape, lap_down_shape),
         walker.positions, walker.move_mask, walker.slater_up, walker.slater_down,
-        walker.inv_up, walker.inv_down, walker.det_up, walker.det_down,
+        walker.inv_up, walker.inv_down,
+        walker.det_up[0], walker.det_up[1], walker.det_down[0], walker.det_down[1],
         walker.grad_up, walker.grad_down, walker.lap_up, walker.lap_down
     )
     
-    # Create updated walker with all quantities
+    # Create updated walker with all quantities, using tuple format for determinants
     updated_walker = walker.replace(
         slater_up=slater_up,
         slater_down=slater_down,
         inv_up=inv_up,
         inv_down=inv_down,
-        det_up=det_up,
-        det_down=det_down,
+        det_up=(det_up_sign, det_up_logabs),
+        det_down=(det_down_sign, det_down_logabs),
         grad_up=grad_up,
         grad_down=grad_down,
         lap_up=lap_up,
         lap_down=lap_down
     )
     
+    # Return determinant values as tuple
+    det_values = (det_sign, det_logabs)
     return det_values, updated_walker
 
 @partial(jax.jit, static_argnums=(0,))
@@ -871,16 +918,25 @@ class SlaterDet:
             coords_np = np.array(walker.positions)
             slater_up, slater_down = self.matrix(coords_np)
             
-            # Compute determinants
-            det_up = np_helper.batched_det(slater_up)
-            det_down = np_helper.batched_det(slater_down)
+            # Compute determinants using slogdet for numerical stability
+            # Returns (sign, log|det|) for each matrix
+            sign_up, logdet_up = np.linalg.slogdet(slater_up)
+            sign_down, logdet_down = np.linalg.slogdet(slater_down)
             
             # Compute inverses
             inv_up = np.linalg.inv(slater_up)
             inv_down = np.linalg.inv(slater_down)
             
-            # Compute final determinant values
-            det_values = det_up * det_down
+            # Compute final determinant values in log space
+            # sign(det_alpha * det_beta) = sign_alpha * sign_beta
+            # log|det_alpha * det_beta| = log|det_alpha| + log|det_beta|
+            det_sign = sign_up * sign_down
+            det_logabs = logdet_up + logdet_down
+            
+            # Store as tuple (sign, log|det|)
+            det_up = (sign_up, logdet_up)
+            det_down = (sign_down, logdet_down)
+            det_values = (det_sign, det_logabs)
             
             updated_matrices = {
                 'slater_up': slater_up,
@@ -911,8 +967,12 @@ class SlaterDet:
         walkers_with_moves = np.any(move_mask_np, axis=1)  # shape: (n_walkers,) boolean array
         
         # Compute determinants and inverses only for walkers with moves
-        det_up = np.array(walker.det_up).copy()
-        det_down = np.array(walker.det_down).copy()
+        # det_up and det_down are tuples of (sign, log|det|)
+        det_up_sign = np.array(walker.det_up[0]).copy()
+        det_up_logabs = np.array(walker.det_up[1]).copy()
+        det_down_sign = np.array(walker.det_down[0]).copy()
+        det_down_logabs = np.array(walker.det_down[1]).copy()
+        
         inv_up = np.array(walker.inv_up).copy()
         inv_down = np.array(walker.inv_down).copy()
         
@@ -926,9 +986,9 @@ class SlaterDet:
             slater_up_moved = updated_slater_up[moved_walker_indices]
             slater_down_moved = updated_slater_down[moved_walker_indices]
             
-            # Compute determinants using batched_det
-            new_det_up = np_helper.batched_det(slater_up_moved)
-            new_det_down = np_helper.batched_det(slater_down_moved)
+            # Compute determinants using slogdet for numerical stability
+            new_sign_up, new_logdet_up = np.linalg.slogdet(slater_up_moved)
+            new_sign_down, new_logdet_down = np.linalg.slogdet(slater_down_moved)
             
             # Compute inverses using vectorized linalg.inv
             # np.linalg.inv can handle batched inputs
@@ -936,13 +996,21 @@ class SlaterDet:
             new_inv_down = np.linalg.inv(slater_down_moved)
             
             # Update only the moved walkers
-            det_up[moved_walker_indices] = new_det_up
-            det_down[moved_walker_indices] = new_det_down
+            det_up_sign[moved_walker_indices] = new_sign_up
+            det_up_logabs[moved_walker_indices] = new_logdet_up
+            det_down_sign[moved_walker_indices] = new_sign_down
+            det_down_logabs[moved_walker_indices] = new_logdet_down
             inv_up[moved_walker_indices] = new_inv_up
             inv_down[moved_walker_indices] = new_inv_down
         
-        # Compute final determinant values
-        det_values = det_up * det_down
+        # Combine into tuples
+        det_up = (det_up_sign, det_up_logabs)
+        det_down = (det_down_sign, det_down_logabs)
+        
+        # Compute final determinant values in log space
+        det_sign = det_up_sign * det_down_sign
+        det_logabs = det_up_logabs + det_down_logabs
+        det_values = (det_sign, det_logabs)
         
         # Return det values and updated matrices
         updated_matrices = {
@@ -992,10 +1060,18 @@ class SlaterDet:
                                               self.mo_coeff_beta_occ,
                                               n_walkers, n_electrons)
             
-            # Compute determinants
-            det_up = np_helper.batched_det(slater_up)
-            det_down = np_helper.batched_det(slater_down)
-            det_values = det_up * det_down
+            # Compute determinants using slogdet for numerical stability
+            sign_up, logdet_up = np.linalg.slogdet(slater_up)
+            sign_down, logdet_down = np.linalg.slogdet(slater_down)
+            
+            # Compute final determinant values in log space
+            det_sign = sign_up * sign_down
+            det_logabs = logdet_up + logdet_down
+            det_values = (det_sign, det_logabs)
+            
+            # Store as tuples
+            det_up = (sign_up, logdet_up)
+            det_down = (sign_down, logdet_down)
             
             # Compute inverses
             inv_up = np.linalg.inv(slater_up)
@@ -1040,8 +1116,10 @@ class SlaterDet:
         moved_indices = _detect_moved_electrons(walker)
 
         if len(moved_indices) == 0:
-            # No moves, return existing values
-            det_values = np.array(walker.det_up) * np.array(walker.det_down)
+            # No moves, return existing values (tuple format)
+            det_sign = walker.det_up[0] * walker.det_down[0]
+            det_logabs = walker.det_up[1] + walker.det_down[1]
+            det_values = (det_sign, det_logabs)
             updated_data = {
                 'slater_up': np.array(walker.slater_up),
                 'slater_down': np.array(walker.slater_down),
@@ -1078,8 +1156,15 @@ class SlaterDet:
         walkers_with_moves = np.any(move_mask_np, axis=1)
         
         # Compute determinants and inverses only for walkers with moves
-        det_up = np.array(walker.det_up).copy()
-        det_down = np.array(walker.det_down).copy()
+        # det_up and det_down are tuples of (sign, log|det|)
+        det_up_sign = np.array(walker.det_up[0]).copy()
+        det_up_logabs = np.array(walker.det_up[1]).copy()
+        det_up = (det_up_sign, det_up_logabs)
+        
+        det_down_sign = np.array(walker.det_down[0]).copy()
+        det_down_logabs = np.array(walker.det_down[1]).copy()
+        det_down = (det_down_sign, det_down_logabs)
+        
         inv_up = np.array(walker.inv_up).copy()
         inv_down = np.array(walker.inv_down).copy()
         
@@ -1101,7 +1186,9 @@ class SlaterDet:
                 # Extract old matrices, inverses, and dets for walkers with alpha moves
                 old_slater_up_alpha = np.array(walker.slater_up)[alpha_walker_idx]
                 old_inv_up_alpha = inv_up[alpha_walker_idx]
-                old_det_up_alpha = det_up[alpha_walker_idx]
+                
+                # Extract det_up for these walkers (tuple format)
+                old_det_up_alpha = (det_up[0][alpha_walker_idx], det_up[1][alpha_walker_idx])
                 
                 # Get new rows from updated Slater matrices
                 new_rows_alpha = updated_slater_up[alpha_walker_idx, alpha_electron_idx, :]
@@ -1116,7 +1203,8 @@ class SlaterDet:
                 )
                 
                 # Update the det and inv arrays
-                det_up[alpha_walker_idx] = new_det_up_alpha
+                det_up[0][alpha_walker_idx] = new_det_up_alpha[0]
+                det_up[1][alpha_walker_idx] = new_det_up_alpha[1]
                 inv_up[alpha_walker_idx] = new_inv_up_alpha
             
             # Process beta electrons (vectorized)
@@ -1127,7 +1215,9 @@ class SlaterDet:
                 # Extract old matrices, inverses, and dets for walkers with beta moves
                 old_slater_down_beta = np.array(walker.slater_down)[beta_walker_idx]
                 old_inv_down_beta = inv_down[beta_walker_idx]
-                old_det_down_beta = det_down[beta_walker_idx]
+                
+                # Extract det_down for these walkers (tuple format)
+                old_det_down_beta = (det_down[0][beta_walker_idx], det_down[1][beta_walker_idx])
                 
                 # Get new rows from updated Slater matrices
                 new_rows_beta = updated_slater_down[beta_walker_idx, beta_electron_idx, :]
@@ -1142,11 +1232,14 @@ class SlaterDet:
                 )
                 
                 # Update the det and inv arrays
-                det_down[beta_walker_idx] = new_det_down_beta
+                det_down[0][beta_walker_idx] = new_det_down_beta[0]
+                det_down[1][beta_walker_idx] = new_det_down_beta[1]
                 inv_down[beta_walker_idx] = new_inv_down_beta
         
-        # Compute final determinant values
-        det_values = det_up * det_down
+        # Compute final determinant values in log space
+        det_sign = det_up[0] * det_down[0]
+        det_logabs = det_up[1] + det_down[1]
+        det_values = (det_sign, det_logabs)
         
         updated_data = {
             'slater_up': updated_slater_up,

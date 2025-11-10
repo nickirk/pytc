@@ -177,7 +177,8 @@ def sample(
         
         if step % thinning == 0:
             # Compute local energies with parameters
-            energies = ansatz.local_energy(walkers, params)
+            # local_energy returns (energies, walker) tuple
+            energies, _ = ansatz.local_energy(walkers, params)
             
             # Convert to numpy to avoid holding JAX device references
             collected_samples.append(np.array(walkers.positions))

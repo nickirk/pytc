@@ -21,11 +21,13 @@ class Walker:
     Memory estimate: For 100k walkers with 42 electrons (benzene):
     - Without grad/lap: ~1.5 GB
     - With grad/lap: ~4.3 GB (acceptable for modern systems)
+    
+    Note: psi_values are not stored in walker as they can be recomputed from
+    det_up, det_down, and Jastrow when needed. This avoids redundant storage.
     """
     positions: jnp.ndarray      # (n_walkers, n_electrons, 3)
-    psi_values: jnp.ndarray   # (n_walkers,)
-    det_up: jnp.ndarray         # (n_walkers,)
-    det_down: jnp.ndarray       # (n_walkers,)
+    det_up: jnp.ndarray         # (n_walkers,) or tuple of (sign, log|det|)
+    det_down: jnp.ndarray       # (n_walkers,) or tuple of (sign, log|det|)
     slater_up: jnp.ndarray      # (n_walkers, n_alpha, n_alpha)
     slater_down: jnp.ndarray    # (n_walkers, n_beta, n_beta)
     inv_up: jnp.ndarray         # (n_walkers, n_alpha, n_alpha)
@@ -35,6 +37,16 @@ class Walker:
     lap_up: jnp.ndarray         # (n_walkers, n_alpha, n_alpha)
     lap_down: jnp.ndarray       # (n_walkers, n_beta, n_beta)
     move_mask: jnp.ndarray      # (n_walkers, n_electrons) boolean - tracks which electrons moved
+    
+    @property
+    def elec_coords(self):
+        """Alias for positions for compatibility."""
+        return self.positions
+    
+    @property
+    def shape(self):
+        """Return shape of positions for compatibility."""
+        return self.positions.shape
 
 
 def initialize_walker_state(ansatz, positions):
@@ -56,13 +68,12 @@ def initialize_walker_state(ansatz, positions):
     
     return Walker(
         positions=positions,
-        psi_values=jnp.zeros((n_walkers,)),
         slater_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
         slater_down=jnp.zeros((n_walkers, n_beta, n_beta)),
         inv_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
         inv_down=jnp.zeros((n_walkers, n_beta, n_beta)),
-        det_up=jnp.zeros((n_walkers,)),
-        det_down=jnp.zeros((n_walkers,)),
+        det_up=(jnp.zeros((n_walkers,)), jnp.zeros((n_walkers,))),  # (sign, log|det|) format
+        det_down=(jnp.zeros((n_walkers,)), jnp.zeros((n_walkers,))),  # (sign, log|det|) format
         grad_up=jnp.zeros((n_walkers, n_alpha, n_alpha, 3)),
         grad_down=jnp.zeros((n_walkers, n_beta, n_beta, 3)),
         lap_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
