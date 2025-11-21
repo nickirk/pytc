@@ -258,23 +258,31 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
         
         # Pattern 2: Multiple optimization steps per MCMC (variance minimization)
         elif n_opt_per_mcmc > 1:
-            losses_list = []
-            aux_data_list = []
-            for _ in range(n_opt_per_mcmc):
-                key, subkey = random.split(key)
-                params, opt_state, stats = optimizer.step(
-                    params=params,
-                    state=opt_state,
-                    rng=subkey,
+            # Use jax.lax.scan for the optimization loop to avoid unrolling overhead
+            def opt_scan_body(carry, _):
+                p, s, k = carry
+                k, sk = random.split(k)
+                new_p, new_s, stats = optimizer.step(
+                    params=p,
+                    state=s,
+                    rng=sk,
                     batch=(walkers, None),
                     global_step_int=global_step
                 )
-                losses_list.append(stats['loss'])
-                aux_data_list.append(stats['aux'])
+                return (new_p, new_s, k), stats
+
+            (params, opt_state, key), stats_history = jax.lax.scan(
+                opt_scan_body,
+                (params, opt_state, key),
+                None,
+                length=n_opt_per_mcmc
+            )
             
             # Use the last loss and aux_data from the optimization loop
-            loss = losses_list[-1]
-            aux_data = aux_data_list[-1]
+            # stats_history contains stacked results from all steps
+            # We take the last element (index -1)
+            loss = jax.tree_util.tree_map(lambda x: x[-1], stats_history['loss'])
+            aux_data = jax.tree_util.tree_map(lambda x: x[-1], stats_history['aux'])
             
             # Single MCMC step
             key, subkey = random.split(key)
