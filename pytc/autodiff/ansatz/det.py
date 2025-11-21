@@ -2,64 +2,8 @@ import numpy as np
 from functools import partial
 import jax
 import jax.numpy as jnp
-from pyscf.dft import numint
-
-def eval_ao_jax(mol, coords, deriv=0):
-    """
-    JAX-compatible wrapper for PySCF's eval_ao.
-    
-    Args:
-        mol: PySCF molecule object
-        coords: JAX array of shape (..., 3)
-        deriv: Derivative order (0, 1, or 2)
-        
-    Returns:
-        If deriv=0: AO values, shape (..., nao)
-        If deriv=1: Tuple (ao_val, ao_grad), shapes (..., nao), (..., nao, 3)
-        If deriv=2: Tuple (ao_val, ao_grad, ao_lap), shapes (..., nao), (..., nao, 3), (..., nao)
-    """
-    nao = mol.nao_nr()
-    
-    # Define result shapes based on input coords (excluding vmap batch dim if present)
-    val_shape = jax.ShapeDtypeStruct(coords.shape[:-1] + (nao,), jnp.float64)
-    
-    if deriv == 0:
-        def callback(c):
-            # c is numpy array, potentially with vmap batch dimension
-            c_flat = c.reshape(-1, 3)
-            vals = numint.eval_ao(mol, c_flat, deriv=0)
-            return vals.reshape(c.shape[:-1] + (nao,))
-            
-        return jax.pure_callback(callback, val_shape, coords, vmap_method='expand_dims')
-        
-    elif deriv == 1:
-        grad_shape = jax.ShapeDtypeStruct(coords.shape[:-1] + (nao, 3), jnp.float64)
-        
-        def callback(c):
-            c_flat = c.reshape(-1, 3)
-            ao = numint.eval_ao(mol, c_flat, deriv=1)
-            val = ao[0].reshape(c.shape[:-1] + (nao,))
-            grad = ao[1:4].transpose(1, 2, 0).reshape(c.shape[:-1] + (nao, 3))
-            return val, grad
-            
-        return jax.pure_callback(callback, (val_shape, grad_shape), coords, vmap_method='expand_dims')
-                
-    elif deriv == 2:
-        grad_shape = jax.ShapeDtypeStruct(coords.shape[:-1] + (nao, 3), jnp.float64)
-        lap_shape = jax.ShapeDtypeStruct(coords.shape[:-1] + (nao,), jnp.float64)
-        
-        def callback(c):
-            c_flat = c.reshape(-1, 3)
-            ao = numint.eval_ao(mol, c_flat, deriv=2)
-            val = ao[0].reshape(c.shape[:-1] + (nao,))
-            grad = ao[1:4].transpose(1, 2, 0).reshape(c.shape[:-1] + (nao, 3))
-            # Laplacian = dxx + dyy + dzz (indices 4, 7, 9)
-            lap = ao[[4, 7, 9]].sum(axis=0).reshape(c.shape[:-1] + (nao,))
-            return val, grad, lap
-            
-        return jax.pure_callback(callback, (val_shape, grad_shape, lap_shape), coords, vmap_method='expand_dims')
-    else:
-        raise ValueError(f"Unsupported derivative order: {deriv}")
+from pytc.autodiff.ansatz.gto import MolGTO, eval_ao
+from pytc.autodiff.ansatz.gto_spherical import MolGTO_Spherical, eval_ao_spherical
 
 class SlaterDet:
     def __init__(self, mol, mo_coeff=None, nelec=None, excitations=None):
@@ -78,6 +22,14 @@ class SlaterDet:
             self.n_alpha, self.n_beta = mol.nelec 
         else:
             self.n_alpha, self.n_beta = nelec
+            
+        # Initialize the appropriate GTO evaluator
+        if self.mol.cart:
+            self.mol_gto = MolGTO(self.mol)
+            self.eval_ao_func = eval_ao
+        else:
+            self.mol_gto = MolGTO_Spherical(self.mol)
+            self.eval_ao_func = eval_ao_spherical
     
         # Detect if mo_coeff is restricted or unrestricted:
         if isinstance(mo_coeff, (list, tuple)):
@@ -151,7 +103,7 @@ class SlaterDet:
         is_batched = positions.ndim == 3
         
         # Evaluate AOs for all electrons
-        ao_vals = eval_ao_jax(self.mol, positions, deriv=0) 
+        ao_vals = self.eval_ao_func(self.mol_gto, positions, deriv=0) 
         
         # Split into alpha and beta
         if is_batched:
@@ -203,7 +155,7 @@ class SlaterDet:
         is_batched = positions.ndim == 3
         
         # Evaluate AOs, grads, laps
-        ao_vals, ao_grad, ao_lap = eval_ao_jax(self.mol, positions, deriv=2)
+        ao_vals, ao_grad, ao_lap = self.eval_ao_func(self.mol_gto, positions, deriv=2)
         
         # Split alpha/beta
         if is_batched:
@@ -279,7 +231,7 @@ class SlaterDet:
         positions = walker.positions
         is_batched = positions.ndim == 3
         
-        ao_vals, ao_grad = eval_ao_jax(self.mol, positions, deriv=1)
+        ao_vals, ao_grad = self.eval_ao_func(self.mol_gto, positions, deriv=1)
         
         if is_batched:
             ao_alpha = ao_vals[:, :self.n_alpha, :]
@@ -327,7 +279,7 @@ class SlaterDet:
             coords: (batch, nelec, 3) or (nelec, 3)
         """
         is_batched = coords.ndim == 3
-        ao_vals = eval_ao_jax(self.mol, coords, deriv=0)
+        ao_vals = self.eval_ao_func(self.mol_gto, coords, deriv=0)
         
         if is_batched:
             ao_alpha = ao_vals[:, :self.n_alpha, :]
@@ -355,3 +307,9 @@ def value_and_grad(det, walker):
 
 def grad(det, walker):
     return det.grad(walker)
+
+def laplacian(det, walker):
+    return det.laplacian(walker)
+
+def value(det, walker):
+    return det.value(walker)
