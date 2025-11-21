@@ -243,7 +243,6 @@ class SlaterJastrow:
         """Number of beta-spin electrons."""
         return self.n_electrons - self.n_alpha
     
-    @partial(jax.jit, static_argnums=(0,))
     def local_energy(self, walker, params):
         """Compute local energy for a single electron configuration using Walker.
         
@@ -260,6 +259,10 @@ class SlaterJastrow:
                 energy: Scalar local energy value
                 walker: Unchanged walker (no updates needed)
         """
+        return self._local_energy_impl(self, walker, params)
+
+    @partial(jax.custom_jvp, nondiff_argnums=(0,))
+    def _local_energy_impl(self, walker, params):
         jastrow_params, linear_coeffs = params
         
         # Compute Jastrow terms for single walker
@@ -272,6 +275,61 @@ class SlaterJastrow:
             walker.lap_up, walker.lap_down
         )
         return energy, walker
+
+    @_local_energy_impl.defjvp
+    def _local_energy_impl_jvp(self, primals, tangents):
+        """Custom JVP for local_energy to avoid expensive AD of Jastrow."""
+        walker, params = primals[0], primals[1]
+        walker_dot, params_dot = tangents[0], tangents[1]
+        
+        jastrow_params, linear_coeffs = params
+        jastrow_params_dot, linear_coeffs_dot = params_dot
+        
+        # 1. Primal calculation (Energy)
+        grad_J_over_J, lap_J_over_J = self._compute_jastrow_terms(walker.positions, jastrow_params)
+        energy = self._compute_single_walker_energy(
+            walker.positions, grad_J_over_J, lap_J_over_J,
+            walker.slater_up, walker.slater_down, 
+            walker.inv_up, walker.inv_down,
+            walker.grad_up, walker.grad_down,
+            walker.lap_up, walker.lap_down
+        )
+
+        # 2. Tangent calculation (delta E)
+        # JVP of Jastrow terms
+        # We only need the tangents here, but jax.jvp returns (primals, tangents)
+        _, (grad_J_dot, lap_J_dot) = jax.jvp(
+            lambda p: self._compute_jastrow_terms(walker.positions, p),
+            (jastrow_params,),
+            (jastrow_params_dot,)
+        )
+        
+        # Compute Quantum Force F = grad D / D
+        # Alpha
+        inv_alpha = walker.inv_up
+        grad_alpha = walker.grad_up
+        # Fix: Use 'ji' for inverse because we need sum_j (D^-1)_ji * (grad D)_ijk
+        F_alpha = jnp.einsum('ji,ijk->ik', inv_alpha, grad_alpha)
+        
+        # Beta
+        inv_beta = walker.inv_down
+        grad_beta = walker.grad_down
+        F_beta = jnp.einsum('ji,ijk->ik', inv_beta, grad_beta)
+        
+        F = jnp.concatenate([F_alpha, F_beta], axis=0)
+        
+        # Formula: delta E = -0.5 * sum( delta(lap J) + 2 * delta(grad J) . F )
+        # grad_J_dot is delta(grad J), lap_J_dot is delta(lap J)
+        
+        term1 = lap_J_dot
+        term2 = 2.0 * jnp.sum(grad_J_dot * F, axis=-1)
+        
+        energy_dot = -0.5 * jnp.sum(term1 + term2)
+        
+        # Return ((primal_out), (tangent_out))
+        # Output is (energy, walker)
+        # walker is not updated in local_energy, so its tangent is passed through
+        return (energy, walker), (energy_dot, walker_dot)
             
     @partial(jax.jit, static_argnums=(0,))
     def _compute_single_walker_energy(self, coords, grad_J_over_J, lap_J_over_J,
