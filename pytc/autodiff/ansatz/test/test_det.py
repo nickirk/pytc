@@ -127,6 +127,7 @@ class TestSlaterDet(unittest.TestCase):
         
         # Convert to regular value for testing
         value = det_sign * np.exp(det_logabs)
+        value = np.array(value)
         self.assertIsInstance(value, (float, np.ndarray))
         self.assertNotEqual(value, 0.0)
 
@@ -135,15 +136,15 @@ class TestSlaterDet(unittest.TestCase):
         det = SlaterDet(self.mol, self.mo_coeff, nelec=(1, 1))
         slater_up, slater_down = det.matrix(self.test_coords)
         
-        self.assertEqual(slater_up.shape, (1, 1, 1))
-        self.assertEqual(slater_down.shape, (1, 1, 1))
+        self.assertEqual(slater_up.shape, (1, 1))
+        self.assertEqual(slater_down.shape, (1, 1))
         
         # Test with more electrons
         det_water = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         water_up, water_down = det_water.matrix(self.water_coords)
         
-        self.assertEqual(water_up.shape, (1, 5, 5))
-        self.assertEqual(water_down.shape, (1, 5, 5))
+        self.assertEqual(water_up.shape, (5, 5))
+        self.assertEqual(water_down.shape, (5, 5))
 
     def test_update_mechanism(self):
         """Test the update mechanism for moving electrons."""
@@ -267,8 +268,13 @@ class TestSlaterDet(unittest.TestCase):
         eps = 1e-5
         coords = self.test_coords
         
+        from collections import namedtuple
+        Walker = namedtuple('Walker', ['positions'])
+        walker = Walker(positions=coords)
+        
         # Get analytical gradient and matrix
-        (matrix_up, matrix_down), (grad_up, grad_down) = det.grad(coords)
+        # det.grad returns (slater_up, slater_down, grad_up, grad_down)
+        matrix_up, matrix_down, grad_up, grad_down = det.grad(walker)
         
         # Compute numerical gradient for first electron, x direction
         d = 0  # x-direction
@@ -292,7 +298,7 @@ class TestSlaterDet(unittest.TestCase):
         
         # Compare numerical vs analytical for this specific element
         self.assertAlmostEqual(
-            grad_up[0, e_idx, 0, d],  # [electron, orbital, direction]
+            grad_up[e_idx, 0, d],  # [electron, orbital, direction]
             numeric_grad[e_idx, 0],  # [electron, orbital]
             places=3
         )
