@@ -106,8 +106,9 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
         positions = initial_walkers
     else:
         # Get molecular information needed for initialization
-        atom_coords = ansatz.mol.atom_coords()
-        atom_charges = ansatz.mol.atom_charges()
+        # ansatz here is a SlaterDet, which now has atom_coords and atom_charges as attributes
+        atom_coords = ansatz.atom_coords
+        atom_charges = ansatz.atom_charges
         n_electrons = ansatz.n_electrons
         n_alpha = ansatz.n_alpha
         

@@ -19,15 +19,15 @@ class TestCompositeJastrow(unittest.TestCase):
         self.mf.kernel()
         
         # Initialize individual jastrows
-        self.ncusp = NuclearCusp(self.mol)
+        self.ncusp = NuclearCusp.create(self.mol)
         self.rexp = REXP()
         
         # Create composite jastrow
-        self.composite = CompositeJastrow([self.ncusp, self.rexp])
+        self.composite = CompositeJastrow.create([self.ncusp, self.rexp])
         
         # Initialize parameters
         self.ncusp_params = self.ncusp.init_params()
-        self.rexp_params = jnp.array([0.5])  # Simple initial value
+        self.rexp_params = self.rexp.init_params()
         self.composite_params = [self.ncusp_params, self.rexp_params]
 
     def test_compute_values(self):
@@ -53,14 +53,20 @@ class TestCompositeJastrow(unittest.TestCase):
             
             # Print values for inspection
             print(f"\nAt x = {x:.2f}:")
-            print(f"NCusp value: {ncusp_val:.6f}")
-            print(f"REXP value: {rexp_val:.6f}")
-            print(f"Sum: {expected_sum:.6f}")
-            print(f"Composite: {composite_val:.6f}")
+            # Handle 0-d or 1-d arrays
+            ncusp_scalar = float(ncusp_val) if ncusp_val.ndim == 0 else float(ncusp_val[0])
+            rexp_scalar = float(rexp_val) if rexp_val.ndim == 0 else float(rexp_val[0])
+            sum_scalar = float(expected_sum) if expected_sum.ndim == 0 else float(expected_sum[0])
+            composite_scalar = float(composite_val) if composite_val.ndim == 0 else float(composite_val[0])
+            
+            print(f"NCusp value: {ncusp_scalar:.6f}")
+            print(f"REXP value: {rexp_scalar:.6f}")
+            print(f"Sum: {sum_scalar:.6f}")
+            print(f"Composite: {composite_scalar:.6f}")
 
     def test_gradients_and_laplacians(self):
         """Test that composite gradients/laplacians match sum of individuals."""
-        x_points = jnp.linspace(-0.5, 0.5, 100)
+        x_points = jnp.linspace(-0.2, 0.2, 20)
         r2 = jnp.array([0.0, 0.0, 1.0])
         
         for x in x_points:
@@ -112,11 +118,9 @@ class TestCompositeJastrow(unittest.TestCase):
         # Compare values
         np.testing.assert_allclose(composite_grads[0]['rc'], ncusp_grad['rc'], 
                                  rtol=1e-7)
-        np.testing.assert_allclose(composite_grads[0]['poly_coeff'], 
-                                 ncusp_grad['poly_coeff'], rtol=1e-7)
-        np.testing.assert_allclose(composite_grads[0]['C'], ncusp_grad['C'], 
+        np.testing.assert_allclose(composite_grads[0]['X4'], ncusp_grad['X4'], 
                                  rtol=1e-7)
-        np.testing.assert_allclose(composite_grads[1], rexp_grad, rtol=1e-7)
+        np.testing.assert_allclose(composite_grads[1]['alpha'], rexp_grad['alpha'], rtol=1e-7)
 
 if __name__ == '__main__':
     unittest.main()

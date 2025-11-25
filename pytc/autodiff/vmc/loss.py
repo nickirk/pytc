@@ -228,7 +228,8 @@ def make_variance_loss(
     ansatz,
     optimizer_type: str = "adam",
     use_custom_jvp: bool = False,
-    max_vmap_batch_size: int = 0
+    max_vmap_batch_size: int = 0,
+    use_hamiltonian_grad: bool = False
 ):
     """Factory to create variance-based loss function for reference variance optimization.
     
@@ -243,6 +244,10 @@ def make_variance_loss(
         use_custom_jvp: Whether to use custom JVP for memory-efficient gradients
         max_vmap_batch_size: If 0, use standard vmap. If >0, use folx.batched_vmap 
                             for memory efficiency. Recommended batch size: 10-50.
+        use_hamiltonian_grad: If True and use_custom_jvp=True, use Hamiltonian-based
+                            gradient method for Jastrow parameters:
+                            ∇σ² = 2/(n-1) Σ(E_L - Ē)[Ĥ(∂J/∂a) - E_L·∂J/∂a]
+                            This provides more memory-efficient gradients.
     
     Returns:
         Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_std))
@@ -299,13 +304,20 @@ def make_variance_loss(
         def loss_fn_jvp(primals, tangents):
             """Custom JVP for variance minimization.
             
-            This implements: ∇variance = 2 * E[(E_L - <E_L>) * ∇E_L]
-            
-            Using the chain rule and the fact that ∇E_L = E_L * ∇log|ψ| for VMC,
-            we get the memory-efficient gradient by only differentiating log|ψ|.
+            Implements two methods:
+            1. Standard (use_hamiltonian_grad=False): 
+               ∇variance = 2 * E[(E_L - ⟨E_L⟩) * ∇E_L]
+               
+            2. Hamiltonian-based (use_hamiltonian_grad=True):
+               For Jastrow parameters:
+               ∇_a σ² = 2/(n-1) Σ(E_L - Ē)[𝒢_a - E_L·f_a]
+               where 𝒢_a = Ĥ(∂J/∂a) = -½∇²(∂J/∂a) + V·∂J/∂a
+               
+               For linear coefficients: uses standard method (1)
             """
             params, batch_data = primals
             params_tangent, _ = tangents
+            jastrow_params_tangent, linear_coeffs_tangent = params_tangent
             
             # Extract walkers
             if isinstance(batch_data, tuple):
@@ -326,22 +338,118 @@ def make_variance_loss(
             if optimizer_type.lower() == "kfac":
                 kfac_jax.register_normal_predictive_distribution(energies[:, None])
             
-            # Compute JVP of local energies
-            def compute_energies(p):
-                return batch_local_energy(walkers, p)
-            
-            _, energy_tangent = jax.jvp(
-                compute_energies,
-                (params,),
-                (params_tangent,)
-            )
-            
-            # Variance gradient: ∇var = 2 * mean((E_L - <E>) * ∇E_L)
-            energy_diff = energies - e_mean
-            if n_walkers > 1:
-                variance_tangent = 2.0 * jnp.dot(energy_diff, energy_tangent) / (n_walkers - 1)
+            if use_hamiltonian_grad:
+                # ========== Hamiltonian-Based Gradient Method ==========
+                # Two-pass implementation for memory efficiency
+                
+                jastrow_params, linear_coeffs = params
+                
+                # Pass 1: Compute and cache E_L and V for all configurations
+                # E_L is already computed above
+                # Compute V for all walkers
+                def compute_V_single(walker):
+                    return ansatz._compute_potential_energy(walker.positions)
+                
+                V_all = jax.vmap(compute_V_single)(walkers)  # shape: (n_walkers,)
+                
+                # Pass 2: Accumulate gradients over all configurations
+                def accumulate_gradient_single_walker(i):
+                    """Compute gradient contribution from walker i."""
+                    walker_i = jax.tree_util.tree_map(lambda x: x[i], walkers)
+                    E_L_i = energies[i]
+                    V_i = V_all[i]
+                    
+                    # Compute f_a = ∂J/∂a
+                    f_a = ansatz._compute_jastrow_derivative(walker_i.positions, jastrow_params)
+                    
+                    # Compute 𝓛_a = Σⱼ ∇²ⱼ(∂J/∂a)
+                    laplacian_a = ansatz._compute_jastrow_derivative_laplacian(walker_i.positions, jastrow_params)
+                    
+                    # Compute 𝒢_a = -½𝓛_a + V·f_a
+                    def compute_G_a(f, lap):
+                        return -0.5 * lap + V_i * f
+                    G_a = jax.tree_util.tree_map(compute_G_a, f_a, laplacian_a)
+                    
+                    # Compute gradient contribution: (E_L - Ē) * [𝒢_a - E_L·f_a]
+                    energy_diff = E_L_i - e_mean
+                    
+                    def compute_contrib(G, f):
+                        return energy_diff * (G - E_L_i * f)
+                    
+                    return jax.tree_util.tree_map(compute_contrib, G_a, f_a)
+                
+                # Accumulate over all walkers using vmap and sum
+                # This computes the gradient for each walker, then sums them
+                grad_contributions = jax.vmap(accumulate_gradient_single_walker)(jnp.arange(n_walkers))
+                
+                # Sum over walkers and apply normalization factor
+                def sum_tree(tree):
+                    """Sum a pytree of arrays across the first axis (walkers)."""
+                    return jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), tree)
+                
+                jastrow_grad_sum = sum_tree(grad_contributions)
+                
+                # Apply normalization: 2.0/(n-1)
+                normalization = 2.0 / (n_walkers - 1) if n_walkers > 1 else 0.0
+                jastrow_grad_final = jax.tree_util.tree_map(lambda x: normalization * x, jastrow_grad_sum)
+                
+                # Apply tangent (chain rule for JVP)
+                # JVP: tangent_out = ⟨grad, tangent_in⟩
+                def apply_tangent_jastrow(grad, tangent):
+                    return jnp.sum(grad * tangent)
+                
+                jastrow_tangent_contrib = jax.tree_util.tree_map(
+                    apply_tangent_jastrow, 
+                    jastrow_grad_final, 
+                    jastrow_params_tangent
+                )
+                
+                # Sum all tangent contributions from Jastrow parameters
+                jastrow_variance_tangent = jax.tree_util.tree_reduce(
+                    lambda x, y: x + y, 
+                    jastrow_tangent_contrib
+                )
+                
+                # For linear coefficients, use standard method
+                # Compute JVP of local energies w.r.t. linear coefficients only
+                def compute_energies_linear_only(lin_coeffs):
+                    """Compute energies with only linear coeffs varying."""
+                    return batch_local_energy(walkers, [jastrow_params, lin_coeffs])
+                
+                _, energy_tangent_linear = jax.jvp(
+                    compute_energies_linear_only,
+                    (linear_coeffs,),
+                    (linear_coeffs_tangent,)
+                )
+                
+                # Variance gradient w.r.t. linear coefficients: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
+                energy_diff = energies - e_mean
+                if n_walkers > 1:
+                    linear_variance_tangent = 2.0 * jnp.dot(energy_diff, energy_tangent_linear) / (n_walkers - 1)
+                else:
+                    linear_variance_tangent = 0.0
+                
+                # Combine gradients from Jastrow and linear coefficients
+                variance_tangent = jastrow_variance_tangent + linear_variance_tangent
+                
             else:
-                variance_tangent = 0.0
+                # ========== Standard Gradient Method ==========
+                # Compute JVP of local energies
+                def compute_energies(p):
+                    return batch_local_energy(walkers, p)
+                
+                _, energy_tangent = jax.jvp(
+                    compute_energies,
+                    (params,),
+                    (params_tangent,)
+                )
+                
+                # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
+                energy_diff = energies - e_mean
+                if n_walkers > 1:
+                    variance_tangent = 2.0 * jnp.dot(energy_diff, energy_tangent) / (n_walkers - 1)
+                else:
+                    variance_tangent = 0.0
             
             return (variance, aux_data), (variance_tangent, aux_data)
         

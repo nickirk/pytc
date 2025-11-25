@@ -49,15 +49,16 @@ class TestSlaterDet(unittest.TestCase):
     
     def test_init_restricted(self):
         """Test initialization with restricted orbitals."""
-        det = SlaterDet(self.mol, self.mo_coeff)
+        det = SlaterDet.create(self.mol, self.mo_coeff)
         self.assertEqual(det.n_alpha, 1)
         self.assertEqual(det.n_beta, 1)
         self.assertFalse(det.unrestricted)
-        self.assertIs(det.mo_coeff_alpha, det.mo_coeff_beta)
+        # Check occupied coeffs are same (values)
+        np.testing.assert_array_equal(det.mo_coeff_alpha_occ, det.mo_coeff_beta_occ)
         
         # Check occupied orbital indices
-        self.assertEqual(det.alpha_occ, [0])
-        self.assertEqual(det.beta_occ, [0])
+        self.assertEqual(det.alpha_occ, (0,))
+        self.assertEqual(det.beta_occ, (0,))
         
         # Check occupied MO coefficients shape
         self.assertEqual(det.mo_coeff_alpha_occ.shape, (self.mol.nao, 1))
@@ -67,16 +68,15 @@ class TestSlaterDet(unittest.TestCase):
         """Test initialization with unrestricted orbitals."""
         # Simulate UHF with different coefficients
         mo_coeffs = [self.mo_coeff * 0.9, self.mo_coeff * 1.1]
-        det = SlaterDet(self.mol, mo_coeffs)
+        det = SlaterDet.create(self.mol, mo_coeffs)
         self.assertTrue(det.unrestricted)
-        self.assertIsNot(det.mo_coeff_alpha, det.mo_coeff_beta)
         
         # Check coefficient values differ
-        self.assertFalse(np.allclose(det.mo_coeff_alpha, det.mo_coeff_beta))
+        self.assertFalse(np.allclose(det.mo_coeff_alpha_occ, det.mo_coeff_beta_occ))
 
     def test_init_with_nelec(self):
         """Test initialization with custom electron counts."""
-        det = SlaterDet(self.mol, self.mo_coeff, nelec=(2, 0))
+        det = SlaterDet.create(self.mol, self.mo_coeff, nelec=(2, 0))
         self.assertEqual(det.n_alpha, 2)
         self.assertEqual(det.n_beta, 0)
         self.assertEqual(len(det.alpha_occ), 2)
@@ -87,7 +87,7 @@ class TestSlaterDet(unittest.TestCase):
         # Water molecule has more orbitals to play with
         # Single excitation: move one alpha electron from orbital 0 to 5
         excitation = (([0], [5]), ([], []))
-        det = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5), excitations=excitation)
+        det = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(5, 5), excitations=excitation)
         
         # Check the occupied orbitals
         self.assertNotIn(0, det.alpha_occ)
@@ -95,28 +95,28 @@ class TestSlaterDet(unittest.TestCase):
         self.assertEqual(len(det.alpha_occ), 5)  # Still 5 orbitals
         
         # No change in beta
-        self.assertEqual(det.beta_occ, list(range(5)))
+        self.assertEqual(det.beta_occ, tuple(range(5)))
 
     def test_invalid_excitation(self):
         """Test that invalid excitations raise appropriate errors."""
         # Try to excite from unoccupied orbital
         with self.assertRaises(ValueError):
-            SlaterDet(self.mol, self.mo_coeff, nelec=(1,1), 
+            SlaterDet.create(self.mol, self.mo_coeff, nelec=(1,1), 
                      excitations=(([2], [3]), ([], [])))
         
         # Try to excite to occupied orbital
         with self.assertRaises(ValueError):
-            SlaterDet(self.mol, self.mo_coeff, nelec=(1,1), 
+            SlaterDet.create(self.mol, self.mo_coeff, nelec=(1,1), 
                      excitations=(([0], [0]), ([], [])))
         
         # Mismatched from/to indices
         with self.assertRaises(ValueError):
-            SlaterDet(self.mol, self.mo_coeff, nelec=(1,1), 
+            SlaterDet.create(self.mol, self.mo_coeff, nelec=(1,1), 
                      excitations=(([0], [1, 2]), ([], [])))
 
     def test_determinant_value(self):
         """Test basic determinant evaluation."""
-        det = SlaterDet(self.mol, self.mo_coeff)
+        det = SlaterDet.create(self.mol, self.mo_coeff)
         # matrix() returns Slater matrices
         slater_up, slater_down = det.matrix(self.test_coords)
         # Compute determinant in new (sign, log|det|) format
@@ -133,14 +133,14 @@ class TestSlaterDet(unittest.TestCase):
 
     def test_matrix_shape(self):
         """Test shape of Slater matrices."""
-        det = SlaterDet(self.mol, self.mo_coeff, nelec=(1, 1))
+        det = SlaterDet.create(self.mol, self.mo_coeff, nelec=(1, 1))
         slater_up, slater_down = det.matrix(self.test_coords)
         
         self.assertEqual(slater_up.shape, (1, 1))
         self.assertEqual(slater_down.shape, (1, 1))
         
         # Test with more electrons
-        det_water = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
+        det_water = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         water_up, water_down = det_water.matrix(self.water_coords)
         
         self.assertEqual(water_up.shape, (5, 5))
@@ -148,7 +148,7 @@ class TestSlaterDet(unittest.TestCase):
 
     def test_update_mechanism(self):
         """Test the update mechanism for moving electrons."""
-        det = SlaterDet(self.mol, self.mo_coeff)
+        det = SlaterDet.create(self.mol, self.mo_coeff)
         
         # Get initial determinant value
         slater_up_init, slater_down_init = det.matrix(self.test_coords)
@@ -171,7 +171,7 @@ class TestSlaterDet(unittest.TestCase):
 
     def test_batched_one_electron_moves(self):
         """Test batched one-electron moves."""
-        det = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
+        det = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         
         # Create batch of 3 configurations
         batch_coords = np.stack([self.water_coords] * 3)
@@ -199,7 +199,7 @@ class TestSlaterDet(unittest.TestCase):
         
     def test_sequential_one_electron_moves(self):
         """Test sequence of one-electron moves."""
-        det = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
+        det = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         
         # Make series of moves
         moves = [(0, [0.1, 0.1, 0.1]), 
@@ -228,7 +228,7 @@ class TestSlaterDet(unittest.TestCase):
     def test_value_sign_change(self):
         """Test if determinant changes sign when electrons are exchanged."""
         # Need 2 electrons of same spin to test exchange
-        det = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(2, 0))
+        det = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(2, 0))
         coords1 = self.water_coords[:2]  # Just take first two electrons
         coords2 = np.array([coords1[1], coords1[0]])  # Exchange positions
         
@@ -246,7 +246,7 @@ class TestSlaterDet(unittest.TestCase):
 
     def test_boundary_conditions(self):
         """Test behavior at large distances."""
-        det = SlaterDet(self.mol, self.mo_coeff)
+        det = SlaterDet.create(self.mol, self.mo_coeff)
         far_coords = np.array([
             [0.0, 0.0, 10.0],  # far from molecule
             [0.0, 0.0, -10.0]   # far from molecule
@@ -264,7 +264,7 @@ class TestSlaterDet(unittest.TestCase):
 
     def test_numerical_gradient(self):
         """Test gradient against numerical differentiation."""
-        det = SlaterDet(self.mol, self.mo_coeff)
+        det = SlaterDet.create(self.mol, self.mo_coeff)
         eps = 1e-5
         coords = self.test_coords
         
@@ -311,10 +311,10 @@ class TestSlaterDet(unittest.TestCase):
     def test_excitation_det_value(self):
         """Test determinant value with excitation."""
         # Regular determinant
-        det_normal = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
+        det_normal = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(5, 5))
         
         # Excited determinant (HOMO → LUMO)
-        det_excited = SlaterDet(self.mol_water, self.mo_coeff_water, nelec=(5, 5),
+        det_excited = SlaterDet.create(self.mol_water, self.mo_coeff_water, nelec=(5, 5),
                               excitations=(([4], [5]), ([], [])))  
         
         # Compute values
@@ -347,7 +347,7 @@ class TestSlaterDet(unittest.TestCase):
         jax.config.update("jax_enable_x64", True)
         
         # Create SlaterDet (nelec is a tuple)
-        det = SlaterDet(self.mol, self.mo_coeff, nelec=(1, 1))
+        det = SlaterDet.create(self.mol, self.mo_coeff, nelec=(1, 1))
         
         # Initialize walker with 3 walkers manually (without needing full ansatz)
         n_walkers = 3

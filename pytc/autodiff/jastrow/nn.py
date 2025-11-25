@@ -1,9 +1,11 @@
 import jax.numpy as jnp
 from jax import random
 import flax.linen as nn
-from typing import Sequence
+from typing import Sequence, List
 import kfac_jax
 from pytc.autodiff.jastrow import Jastrow 
+from flax import struct
+import jax
 
 class KFACDense(nn.Module):
     """Dense layer that registers with KFAC."""
@@ -58,18 +60,33 @@ class MLP(nn.Module):
         x = KFACDense(self.features[-1])(x)
         return x
 
-
+@struct.dataclass
 class NeuralBase(Jastrow):
     """Base class for neural network-based Jastrow factors."""
-    def __init__(self, mol, layer_widths=[16, 16], epsilon=1e-8, name=None, **kwargs):
-        super().__init__(name=name)
-        self.mol = mol
-        self.nelectron = mol.nelectron
-        self.nuclear_pos = jnp.array(mol.atom_coords())
-        self.nuclear_charges = jnp.array(mol.atom_charges())
-        self.features = [*layer_widths, 1]
-        self.epsilon = epsilon
-        self.net = MLP(features=self.features)
+    nuclear_pos: jax.Array
+    nuclear_charges: jax.Array
+    net: nn.Module
+    features: Sequence[int] = struct.field(pytree_node=False)
+    nelectron: int = struct.field(pytree_node=False)
+    epsilon: float = struct.field(pytree_node=False, default=1e-8)
+    name: str = struct.field(pytree_node=False, default=None)
+
+    @classmethod
+    def create(cls, mol, layer_widths=[16, 16], epsilon=1e-8, name=None, **kwargs):
+        nuclear_pos = jnp.array(mol.atom_coords())
+        nuclear_charges = jnp.array(mol.atom_charges())
+        features = list(layer_widths) + [1]
+        net = MLP(features=features)
+        
+        return cls(
+            name=name,
+            nuclear_pos=nuclear_pos,
+            nuclear_charges=nuclear_charges,
+            net=net,
+            features=features,
+            nelectron=mol.nelectron,
+            epsilon=epsilon
+        )
 
     def _safe_norm(self, x):
         """Compute norm with a small epsilon to prevent division by zero."""
@@ -84,11 +101,23 @@ class NeuralBase(Jastrow):
             prev_width = width
         return total
 
-
+@struct.dataclass
 class NeuralEN(NeuralBase):
     """Neural network for electron-nuclear correlations."""
-    def __init__(self, mol, **kwargs):
-        super().__init__(mol, **kwargs)
+    
+    @classmethod
+    def create(cls, mol, **kwargs):
+        # Reuse base create but ensure correct class
+        base = NeuralBase.create(mol, **kwargs)
+        return cls(
+            name=base.name,
+            nuclear_pos=base.nuclear_pos,
+            nuclear_charges=base.nuclear_charges,
+            net=base.net,
+            features=base.features,
+            nelectron=base.nelectron,
+            epsilon=base.epsilon
+        )
 
     def init_params(self, **kwargs):
         key = kwargs.get('key', random.PRNGKey(0))
@@ -121,16 +150,26 @@ class NeuralEN(NeuralBase):
     def grad_r(self, r1, r2, params):
         return super().grad_r(r1, r2, params) * (self.nelectron - 1)/self.nelectron/2.
 
-    #def get_log_grads_r1(self, r1, r2, params):
-    #    grad_u, lapl_u = super().get_log_grads_r1(r1, r2, params)
-    #    return grad_u, lapl_u
-
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
 
-
+@struct.dataclass
 class NeuralEE(NeuralBase):
     """Neural network for electron-electron correlations."""
+    
+    @classmethod
+    def create(cls, mol, **kwargs):
+        base = NeuralBase.create(mol, **kwargs)
+        return cls(
+            name=base.name,
+            nuclear_pos=base.nuclear_pos,
+            nuclear_charges=base.nuclear_charges,
+            net=base.net,
+            features=base.features,
+            nelectron=base.nelectron,
+            epsilon=base.epsilon
+        )
+
     def init_params(self, **kwargs):
         key = kwargs.get('key', random.PRNGKey(0))
         dummy_x = jnp.zeros((1, 1))
@@ -186,14 +225,29 @@ class EENMLP(nn.Module):
         x = KFACDense(self.features[-1])(x)
         return x
 
-
+@struct.dataclass
 class NeuralEEN(NeuralBase):
     """Neural network for electron-electron-nuclear correlations."""
-    def __init__(self, mol, **kwargs):
-        super().__init__(mol, **kwargs)
-        self.num_nuclei = len(self.nuclear_charges)
-        # Use EENMLP instead of standard MLP
-        self.net = EENMLP(features=self.features, num_nuclei=self.num_nuclei)
+    num_nuclei: int = struct.field(pytree_node=False, default=0)
+    
+    @classmethod
+    def create(cls, mol, layer_widths=[16, 16], epsilon=1e-8, name=None, **kwargs):
+        nuclear_pos = jnp.array(mol.atom_coords())
+        nuclear_charges = jnp.array(mol.atom_charges())
+        num_nuclei = len(nuclear_charges)
+        features = list(layer_widths) + [1]
+        net = EENMLP(features=features, num_nuclei=num_nuclei)
+        
+        return cls(
+            name=name,
+            nuclear_pos=nuclear_pos,
+            nuclear_charges=nuclear_charges,
+            net=net,
+            features=features,
+            nelectron=mol.nelectron,
+            epsilon=epsilon,
+            num_nuclei=num_nuclei
+        )
     
     def init_params(self, **kwargs):
         key = kwargs.get('key', random.PRNGKey(0))

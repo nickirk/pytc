@@ -107,9 +107,11 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
     batch_quantum_force = jax.vmap(lambda w, p: ansatz.quantum_force(w, p), in_axes=(0, None))
     
-    psi_values = batch_ansatz(walkers, params)
+    # ansatz returns ((sign, log), updated_walker)
+    (psi_sign, psi_logabs), walkers = batch_ansatz(walkers, params)
     
     # Compute quantum force: F = 2∇ψ/ψ (gradient of log wavefunction)
+    # Note: We use the updated walkers which might have cached matrices if ansatz updates them
     quantum_forces = batch_quantum_force(walkers, params)
     
     # Generate drift-diffusion proposals:
@@ -128,7 +130,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     proposal_walkers = initialize_walker_state(ansatz, proposed_positions)
     
     # Compute new wavefunction values and quantum forces at proposed positions
-    new_psi_values = batch_ansatz(proposal_walkers, params)
+    (new_psi_sign, new_psi_logabs), proposal_walkers = batch_ansatz(proposal_walkers, params)
     new_quantum_forces = batch_quantum_force(proposal_walkers, params)
     
     # Modified acceptance probability for importance sampling
@@ -139,8 +141,6 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     # Compute acceptance probabilities with Green's function ratio
     # psi_values and new_psi_values are now (sign, log|psi|) tuples
     # Acceptance probability: |ψ'|²/|ψ|² * (G_back/G_fwd) = exp(2*(log|ψ'| - log|ψ|)) * (G_back/G_fwd)
-    psi_sign, psi_logabs = psi_values
-    new_psi_sign, new_psi_logabs = new_psi_values
     acceptance_prob = jnp.exp(2.0 * (new_psi_logabs - psi_logabs)) * (backward_density / forward_density)
     
     # Accept or reject

@@ -3,29 +3,25 @@
 from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
+from flax import struct
+from typing import Optional
 
-class Jastrow(ABC):
+@struct.dataclass
+class Jastrow:
     """Abstract base class for JAX-based Jastrow factors.
     
     This class defines the interface for Jastrow factors. Unlike the previous implementation,
     parameters are not stored in the instance but passed directly to methods that need them.
     This aligns better with JAX's philosophy for parameter handling and computational graph tracing.
     """
+    # name field is removed from base to avoid dataclass inheritance issues with defaults.
+    # Subclasses should define 'name' field if needed.
     
-    def __init__(self, name=None):
-        """Initialize Jastrow factor.
-        
-        Args:
-            name: Optional name for parameter filtering
-        """
-        self.name = name
-        
     def set_name(self, name):
         """Set instance name for parameter filtering."""
-        self.name = name
-        return self
+        # Since dataclasses are immutable by default in flax, we return a new instance
+        return self.replace(name=name)
     
-    @abstractmethod
     def _compute(self, r1, r2, params):
         """Core computation of Jastrow exponent u.
         
@@ -37,7 +33,7 @@ class Jastrow(ABC):
         Returns:
             Jastrow exponent value u
         """
-        pass
+        raise NotImplementedError
 
     def __call__(self, r1, r2, params):
         """Evaluate Jastrow factor J = exp(u) for a single pair.
@@ -94,7 +90,7 @@ class Jastrow(ABC):
         Returns:
             Gradient array with same shape as params
         """
-        return jax.grad(lambda p: self._compute(r1, r2, p))(params)
+        return jax.grad(lambda p: jnp.sum(self._compute(r1, r2, p)))(params)
     
     def get_log_grads_r1(self, r1, r2, params):
         """Compute ∇u and ∇²u w.r.t first electron coordinates.
@@ -134,7 +130,6 @@ class Jastrow(ABC):
         lapl_u = jnp.trace(jax.hessian(scalar_fn)(r2))
         return grad_u, lapl_u
     
-    @abstractmethod
     def init_params(self, **kwargs):
         """Initialize parameters. Subclasses should implement this."""
         pass
