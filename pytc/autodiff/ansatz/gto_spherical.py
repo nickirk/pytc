@@ -122,10 +122,9 @@ class MolGTO_Spherical:
             n_contractions = cs.shape[1]
             base_ao_idx = ao_loc[i]
             
-            # Convert Cartesian norm to Spherical norm
-            # N_sph = N_cart * sqrt(4pi / (2l+1))
-            spherical_factor = np.sqrt(4 * np.pi / (2 * ell + 1))
-            norms = np.array([gto.gto_norm(ell, e) for e in es]) * spherical_factor
+            # Normalize coefficients
+            # PySCF's gto_norm gives normalization for r^l * exp(-alpha * r^2)
+            norms = np.array([gto.gto_norm(ell, e) for e in es])
             
             n_prim = len(es)
             
@@ -133,21 +132,10 @@ class MolGTO_Spherical:
                 c_vec = cs[:, c_idx]
                 c_vec_normalized = c_vec * norms
                 
-                # Normalize contraction
-                norm_sq = 0.0
-                for p1 in range(n_prim):
-                    for p2 in range(n_prim):
-                        a1 = es[p1]
-                        a2 = es[p2]
-                        # Overlap of two normalized spherical Gaussians
-                        s12 = (2 * np.sqrt(a1 * a2) / (a1 + a2)) ** (ell + 1.5)
-                        norm_sq += c_vec_normalized[p1] * c_vec_normalized[p2] * s12
-                
-                contraction_norm = 1.0 / np.sqrt(norm_sq)
-                c_vec_normalized *= contraction_norm
-                
                 start = base_ao_idx + c_idx * (2*ell + 1)
                 end = start + (2*ell + 1)
+                # Indices for this contraction
+                # Each contraction produces 2l+1 functions
                 indices = np.arange(start, end)
                 
                 if ell not in data_by_l:
