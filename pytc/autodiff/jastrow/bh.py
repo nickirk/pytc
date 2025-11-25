@@ -1,3 +1,4 @@
+from pytc.autodiff.jastrow import Jastrow
 from functools import partial
 import jax.numpy as jnp
 from jax import random
@@ -7,23 +8,27 @@ import jax
 from flax import struct
 from typing import List, Any
 
-from pytc.autodiff.jastrow import Jastrow
+
 
 @dataclass
 class BHTerm:
     """Single term in Boys-Handy expansion"""
     m: int
     n: int
-    o: int  # renamed from alpha to o
-    c: float  # initial value, will be optimized
+    o: int
+    c: float
 
 @struct.dataclass
 class BoysHandy(Jastrow):
-    """Boys-Handy Jastrow factor implementation."""
+    """Optimized Boys-Handy Jastrow factor implementation using polynomial basis."""
     nuclear_pos: jax.Array
     nuclear_charges: jax.Array
     atom_type_map: jax.Array
     unique_charges: jax.Array
+    
+    # Store terms as separate arrays for each type to avoid padding if possible,
+    # or use padded arrays. Here we use padded arrays for simplicity in JAX.
+    # We will store indices for polynomial basis.
     _term_m: jax.Array
     _term_n: jax.Array
     _term_o: jax.Array
@@ -34,6 +39,7 @@ class BoysHandy(Jastrow):
     natom: int = struct.field(pytree_node=False)
     n_types: int = struct.field(pytree_node=False)
     n_terms: int = struct.field(pytree_node=False)
+    max_degree: int = struct.field(pytree_node=False)
     epsilon: float = struct.field(pytree_node=False, default=1e-8)
     terms_per_atom_type: List[List[BHTerm]] = struct.field(pytree_node=False, default=None)
     nuclei_by_type: List[jax.Array] = struct.field(default=None)
@@ -46,29 +52,25 @@ class BoysHandy(Jastrow):
         nuclear_charges = jnp.array(mol.atom_charges())
         natom = len(nuclear_charges)
         
-        # Identify unique atom types and create mappings
         unique_charges = jnp.sort(jnp.unique(nuclear_charges))
         n_types = len(unique_charges)
         
-        # Create atom type map: atom_idx -> type_idx
         atom_type_map = jnp.zeros(natom, dtype=jnp.int32)
         for i, charge in enumerate(nuclear_charges):
             type_idx = jnp.where(unique_charges == charge)[0][0]
             atom_type_map = atom_type_map.at[i].set(type_idx)
         
-        # Default terms if none specified
         if terms_per_nucleus is None:
-            # Basic terms including e-e cusp
-            d_cusp = 0.5  # cusp coefficient 1/(2d)
+            d_cusp = 0.5
             default_terms_for_one_nucleus = [
-                BHTerm(0, 0, 1, d_cusp),  # e-e cusp term with c = 1/(2d)
+                BHTerm(0, 0, 1, d_cusp),
                 BHTerm(0, 0, 2, 0.01),  
                 BHTerm(0, 0, 3, 0.001),  
                 BHTerm(0, 0, 4, -0.001),  
-                BHTerm(2, 0, 0, 0.001),  # e-n term
+                BHTerm(2, 0, 0, 0.001),
                 BHTerm(3, 0, 0, 0.0001),
-                BHTerm(4, 0, 0, 0.0001),   # higher order term
-                BHTerm(2, 2, 0, -0.001),    # e-n term
+                BHTerm(4, 0, 0, 0.0001),
+                BHTerm(2, 2, 0, -0.001),
                 BHTerm(2, 0, 2, 0.01),
                 BHTerm(2, 2, 2, 0.01),
                 BHTerm(4, 0, 2, 0.01),
@@ -92,10 +94,18 @@ class BoysHandy(Jastrow):
         term_m = []
         term_n = []
         term_o = []
+        max_degree = 0
+        
         for type_terms in terms_per_atom_type:
-            term_m.append([term.m for term in type_terms])
-            term_n.append([term.n for term in type_terms])
-            term_o.append([term.o for term in type_terms])
+            ms = [term.m for term in type_terms]
+            ns = [term.n for term in type_terms]
+            os = [term.o for term in type_terms]
+            term_m.append(ms)
+            term_n.append(ns)
+            term_o.append(os)
+            
+            curr_max = max(max(ms), max(ns), max(os)) if ms else 0
+            max_degree = max(max_degree, curr_max)
 
         if n_terms > 0:
             _term_m = jnp.array(term_m, dtype=jnp.int32)
@@ -110,19 +120,8 @@ class BoysHandy(Jastrow):
             _delta_factor = jnp.zeros((0, 0))
             _cusp_mask = jnp.zeros((0, 0), dtype=bool)
             
-        # Group nuclei by type for efficient computation
         nuclei_by_type = []
         for i in range(n_types):
-            type_mask = (atom_type_map == i)
-            # We can't use boolean indexing on JAX arrays during creation if we want static shapes?
-            # Actually, create is called eagerly (not JITted usually), so we can use numpy or boolean indexing.
-            # atom_type_map is a JAX array, but we can convert to numpy if needed or just use JAX.
-            # Since create returns the class instance which is a Pytree, the arrays in nuclei_by_type
-            # will be leaves. They must have fixed shapes.
-            # Using boolean indexing on JAX array returns a concrete array if not traced.
-            # If traced, it might be dynamic. Ideally create is called outside JIT.
-            
-            # Use numpy for grouping to ensure static shapes
             mask_np = jnp.array(atom_type_map) == i
             nuclei_group = nuclear_pos[jnp.array(mask_np)]
             nuclei_by_type.append(nuclei_group)
@@ -141,6 +140,7 @@ class BoysHandy(Jastrow):
             natom=natom,
             n_types=n_types,
             n_terms=n_terms,
+            max_degree=max_degree,
             epsilon=epsilon,
             terms_per_atom_type=terms_per_atom_type,
             nuclei_by_type=nuclei_by_type,
@@ -148,30 +148,20 @@ class BoysHandy(Jastrow):
         )
             
     def _safe_norm(self, x):
-        """Compute norm with a small epsilon to prevent division by zero."""
         return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
     
-    def _delta(self, m, n):
-        """Implements the Delta function for Boys-Handy."""
-        return jnp.where(m == n, 0.5, 1.0)
-    
     def _scaled_r_en(self, r_electron, r_nuclear, b):
-        """Compute scaled electron-nuclear distance."""
         r = self._safe_norm(r_electron - r_nuclear)
-        return r / (1.0 + r)
-    
+        return r / (1.0 + r) 
+        
     def _scaled_r_ee(self, r1, r2, d):
-        """Compute scaled electron-electron distance."""
         r = self._safe_norm(r1 - r2)
-        return  r / (1.0 +  r)
-
+        return r / (1.0 + r) 
+        
     def init_params(self, **kwargs):
-        """Initialize Boys-Handy parameters."""
-        # Initialize b and d parameters for each atom type
         b_raw = jnp.ones(self.n_types) * 0.5  
         d_raw = jnp.ones(self.n_types) * 0.5
         
-        # Initialize c parameters
         c_raw = []
         for type_terms in self.terms_per_atom_type:
             c_type = jnp.array([term.c for term in type_terms])
@@ -185,7 +175,6 @@ class BoysHandy(Jastrow):
         }
 
     def _compute_forward(self, r1, r2, params):
-        """Forward computation of Boys-Handy Jastrow exponent."""
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
@@ -194,45 +183,74 @@ class BoysHandy(Jastrow):
 
         u_total = 0.0
         
-        # Iterate over atom types (static loop)
         for i in range(self.n_types):
-            # Get parameters for this type
             b_I = b[i]
             d_I = d[i]
-            c_I = c[i] # Shape (n_terms,)
+            c_I = c[i]
             
-            term_m = self._term_m[i] # Shape (n_terms,)
+            term_m = self._term_m[i]
             term_n = self._term_n[i]
             term_o = self._term_o[i]
             delta = self._delta_factor[i]
             mask = self._cusp_mask[i]
             
-            # Get nuclei of this type
             nuclei_group = self.nuclei_by_type[i]
             
-            # Skip if no nuclei of this type
             if nuclei_group.shape[0] == 0:
                 continue
                 
-            # Vectorized computation over nuclei of this type
+            # Use checkpoint/remat to save memory by recomputing terms during backward pass
+            @jax.checkpoint
             def compute_for_nucleus(nuc_pos):
                 r1I = self._scaled_r_en(r1, nuc_pos, b_I)
                 r2I = self._scaled_r_en(r2, nuc_pos, b_I)
                 r12 = self._scaled_r_ee(r1, r2, d_I)
                 
-                r1I_pow_m = jnp.power(r1I, term_m)
-                r2I_pow_n = jnp.power(r2I, term_n)
-                r1I_pow_n = jnp.power(r1I, term_n)
-                r2I_pow_m = jnp.power(r2I, term_m)
-                r12_pow_o = jnp.power(r12, term_o)
+                def get_powers(x, degree):
+                    exponents = jnp.arange(degree + 1)
+                    return jnp.power(x, exponents)
                 
-                non_cusp = (r1I_pow_m * r2I_pow_n + r2I_pow_m * r1I_pow_n) * r12_pow_o
-                cusp = 2.0 * r12_pow_o
-                terms = jnp.where(mask, cusp, non_cusp)
+                p_r1I = get_powers(r1I, self.max_degree)
+                p_r2I = get_powers(r2I, self.max_degree)
+                p_r12 = get_powers(r12, self.max_degree)
                 
-                return jnp.sum(delta * c_I * terms)
+                # Iterate over terms in Python to generate scalar graph
+                total_val = 0.0
+                terms_list = self.terms_per_atom_type[i]
+                
+                for j, term in enumerate(terms_list):
+                    m, n, o = term.m, term.n, term.o
+                    
+                    # Get coefficients and factors
+                    # We can use the arrays or compute static values
+                    # Using arrays allows JAX to track dependencies if needed, but m,n,o are static
+                    c_val = c_I[j]
+                    
+                    # Recompute static factors to avoid indexing overhead/dependency
+                    delta_val = 0.5 if m == n else 1.0
+                    is_cusp = (m == 0 and n == 0 and o == 1)
+                    
+                    v_r1I_m = p_r1I[m]
+                    v_r2I_n = p_r2I[n]
+                    v_r2I_m = p_r2I[m]
+                    v_r1I_n = p_r1I[n]
+                    v_r12_o = p_r12[o]
+                    
+                    non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
+                    cusp_term = 2.0 * v_r12_o
+                    
+                    # Select term type
+                    # We can use jnp.where or python if/else since is_cusp is static
+                    # But to keep graph consistent (though is_cusp is bool), python if is fine for graph construction
+                    if is_cusp:
+                        term_val = cusp_term
+                    else:
+                        term_val = non_cusp_term
+                        
+                    total_val += delta_val * c_val * term_val
+                
+                return total_val
 
-            # Sum over nuclei of this type
             contributions = jax.vmap(compute_for_nucleus)(nuclei_group)
             u_total += jnp.sum(contributions)
             

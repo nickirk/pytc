@@ -422,7 +422,7 @@ class TestJastrowOptimization(unittest.TestCase):
             step_size=step_size,
             burn_in_steps=burn_in_steps,
             n_opt_steps=n_opt_steps,
-            optimizer_type='kfac',
+            optimizer_type='adam',
             learning_rate=0.001,
             max_vmap_batch_size=0,
             #use_importance_sampling=False,
