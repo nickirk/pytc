@@ -537,7 +537,6 @@ def optimize_ref_var(
     move_type: str = "one",
     opt_kwargs: Optional[Dict[str, Any]] = None,
     params=None,
-    use_hamiltonian_grad: bool = False,
 ):
     """Perform reference variance optimization using MCMC sampling.
     
@@ -560,8 +559,6 @@ def optimize_ref_var(
         move_type: "one" or "all" for MCMC electron moves
         opt_kwargs: Additional optimizer parameters
         params: Initial combined parameters [jastrow_params, linear_coeffs].
-        use_hamiltonian_grad: If True, use Hamiltonian-based gradient method for Jastrow
-                            parameters: ∇σ² = 2/(n-1) Σ(E_L - Ē)[Ĥ(∂J/∂a) - E_L·∂J/∂a]
 
     Returns:
         Dictionary with optimization results and statistics
@@ -597,9 +594,8 @@ def optimize_ref_var(
         loss_fn = make_variance_loss(
             ansatz=ansatz,
             optimizer_type=optimizer_type,
-            use_custom_jvp=False,
-            max_vmap_batch_size=max_vmap_batch_size,
-            use_hamiltonian_grad=use_hamiltonian_grad
+            use_custom_jvp=True,
+            max_vmap_batch_size=max_vmap_batch_size
         )
     else:
         loss_fn = cost_fn
