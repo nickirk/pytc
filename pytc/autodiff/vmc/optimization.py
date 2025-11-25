@@ -75,7 +75,9 @@ def make_opt_update_step(loss_fn, optimizer):
             aux_data: Auxiliary data from loss function (e.g., energy, variance)
         """
         # Compute loss and gradients
-        (loss, aux_data), grads = loss_and_grad(params, walkers, ansatz)
+        # Compute loss and gradients
+        # Note: loss_fn expects (params, walkers), ansatz is baked in or handled via wrapper
+        (loss, aux_data), grads = loss_and_grad(params, walkers)
         
         # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -641,7 +643,45 @@ def optimize_ref_var(
     
     start_time = time.time()
     
-    for opt_step in range(n_opt_steps):
+    # Run first step separately to measure compilation time
+    print("Compiling training step...")
+    compilation_start = time.time()
+    
+    key, subkey = random.split(key)
+    if optimizer_type.lower() == "kfac":
+        walkers, params, opt_state, loss, aux_data, pmove = training_step(
+            ansatz, walkers, params, opt_state, subkey, 0
+        )
+    else:
+        walkers, params, opt_state, loss, aux_data, pmove = training_step(
+            ansatz, walkers, params, opt_state, subkey
+        )
+    compilation_end = time.time()
+    print(f"Compilation finished in {compilation_end - compilation_start:.2f}s")
+    
+    # Process first step results
+    variance_val = float(jax.device_get(loss))
+    energy_val, std_val = jax.device_get(aux_data)
+    energy_val = float(energy_val)
+    std_val = float(std_val)
+    pmove_val = float(jax.device_get(pmove))
+    
+    losses.append(variance_val)
+    energies.append(energy_val)
+    stds.append(std_val)
+    acceptances.append(pmove_val)
+    
+    params_copy = tree_map(
+        lambda x: np.array(jax.device_get(x)) if isinstance(x, jnp.ndarray) else x,
+        params
+    )
+    params_history.append(params_copy)
+    
+    print(f"Step     0 | Var: {variance_val:.6f} | "
+          f"E: {energy_val:.6f}±{std_val:.6f} | "
+          f"Accept: {pmove_val:.3f} | Time: {compilation_end - start_time:.2f}s")
+
+    for opt_step in range(1, n_opt_steps):
         key, subkey = random.split(key)
         
         if optimizer_type.lower() == "kfac":

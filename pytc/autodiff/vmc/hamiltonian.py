@@ -56,11 +56,6 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     lap_J_over_J = lap_sum + grad_squared
     
     return grad_J_over_J, lap_J_over_J
-    
-    grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
-    lap_J_over_J = lap_sum + grad_squared
-    
-    return grad_J_over_J, lap_J_over_J
 
 
 def compute_potential_matrix(sj, elec_coords, slater_alpha, slater_beta):

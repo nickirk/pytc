@@ -10,10 +10,7 @@ import os
 
 from pytc.autodiff.ansatz.sj import SlaterJastrow
 from pytc.autodiff.ansatz.det import SlaterDet
-from pytc.autodiff.jastrow.poly import Poly
-from pytc.autodiff.jastrow.composite import CompositeJastrow
-from pytc.autodiff.jastrow.ncusp import NuclearCusp
-from pytc.autodiff.jastrow.bh import BoysHandy
+from pytc.autodiff.jastrow import REXP, CompositeJastrow, NuclearCusp, BoysHandy, Poly, NeuralEEN
 from pytc.autodiff.vmc.walker import initialize_walker_state, initialize_walkers
 from pytc.autodiff.vmc.hamiltonian import (
     compute_jastrow_terms,
@@ -36,7 +33,7 @@ class TestHamiltonian(unittest.TestCase):
         self.hf_energy = mf.e_tot
         
         det = SlaterDet.create(self.mol, mf.mo_coeff)
-        jastrow = Poly()
+        jastrow = Poly.create(self.mol)
         self.ansatz = SlaterJastrow.create(self.mol, jastrow, [det])
         
         self.jastrow_params = jnp.zeros(1)
@@ -330,7 +327,9 @@ class TestHamiltonianGrad(unittest.TestCase):
         # Use more realistic Jastrow for Benzene
         ncusp = NuclearCusp.create(self.mol)
         bh = BoysHandy.create(self.mol)
-        jastrow = CompositeJastrow.create([ncusp, bh])
+        bh_new = BoysHandyNew.create(self.mol)
+        #my_een = NeuralEEN.create(self.mol)
+        jastrow = CompositeJastrow.create([ncusp, bh_new])
         
         self.ansatz = SlaterJastrow.create(self.mol, jastrow, [det])
         self.jastrow_params = jastrow.init_params()
@@ -347,7 +346,7 @@ class TestHamiltonianGrad(unittest.TestCase):
         # Create loss function
         # Pass None as static ansatz to force dynamic passing
         # Use batched_vmap to reduce memory usage
-        loss_fn = make_energy_loss(None, max_vmap_batch_size=100, use_custom_jvp=False)
+        loss_fn = make_variance_loss(None, max_vmap_batch_size=0, use_custom_jvp=False)
         
         # JIT compile gradient function
         print("Compiling gradient function...")
