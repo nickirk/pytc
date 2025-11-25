@@ -49,14 +49,6 @@ def make_energy_loss(
     else:
         vmap_impl = functools.partial(folx.batched_vmap, max_batch_size=max_vmap_batch_size)
     
-    # Create vectorized local_energy function
-    # ansatz.local_energy now works with single walker, so we vmap over walkers
-    batch_local_energy = vmap_impl(
-        lambda w, p: ansatz.local_energy(w, p)[0],  # Extract energy, discard unchanged walker
-        in_axes=(0, None), 
-        out_axes=0
-    )
-    
     # Note: We don't need batch_log_psi anymore - in the JVP we call ansatz directly on the batch
     
     if use_custom_jvp:
@@ -78,10 +70,19 @@ def make_energy_loss(
                      Can be indexed as aux[0], aux[1] for backward compatibility
             """
             # Extract walkers from batch
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg
             else:
                 walkers = batch_data
+                ansatz_dynamic = ansatz
+            
+            # Define batch_local_energy using the current ansatz
+            batch_local_energy = vmap_impl(
+                lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
+                in_axes=(0, None), 
+                out_axes=0
+            )
             
             # Compute all local energies using vmap (or batched_vmap)
             energies = batch_local_energy(walkers, params)
@@ -137,11 +138,13 @@ def make_energy_loss(
             clipped_energies = aux_data.clipped_energies
             diff = aux_data.diff
             
-            # Extract walkers
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            # Extract walkers and ansatz
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg
             else:
                 walkers = batch_data
+                ansatz_dynamic = ansatz
             
             # diff is already computed in forward pass - no need to recompute energies!
             # This saves a full batch_local_energy call (major optimization!)
@@ -150,7 +153,7 @@ def make_energy_loss(
             # ansatz() now works with single walkers, so we vmap over the batch
             def batch_log_psi_direct(p):
                 """Evaluate log|ψ| for all walkers at once (batch call)."""
-                batch_ansatz = jax.vmap(lambda w, params: ansatz(w, params), in_axes=(0, None))
+                batch_ansatz = jax.vmap(lambda w, params: ansatz_dynamic(w, params), in_axes=(0, None))
                 psi_values, _ = batch_ansatz(walkers, p)
                 _, log_psi = psi_values
                 return log_psi
@@ -193,10 +196,19 @@ def make_energy_loss(
                 aux: Tuple of (mean_energy, energy_std)
             """
             # Extract walkers from batch
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg
             else:
                 walkers = batch_data
+                ansatz_dynamic = ansatz
+            
+            # Define batch_local_energy using the current ansatz
+            batch_local_energy = vmap_impl(
+                lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
+                in_axes=(0, None), 
+                out_axes=0
+            )
             
             # Compute all local energies using vmap
             energies = batch_local_energy(walkers, params)
@@ -258,13 +270,7 @@ def make_variance_loss(
     else:
         vmap_impl = functools.partial(folx.batched_vmap, max_batch_size=max_vmap_batch_size)
     
-    # Create vectorized local_energy function
-    # ansatz.local_energy now works with single walker, so we vmap over walkers
-    batch_local_energy = vmap_impl(
-        lambda w, p: ansatz.local_energy(w, p)[0],  # Extract energy, discard unchanged walker
-        in_axes=(0, None), 
-        out_axes=0
-    )
+
     
     if use_custom_jvp:
         @jax.custom_jvp
@@ -319,14 +325,26 @@ def make_variance_loss(
             params_tangent, _ = tangents
             jastrow_params_tangent, linear_coeffs_tangent = params_tangent
             
-            # Extract walkers
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            # Extract walkers and ansatz
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg
             else:
                 walkers = batch_data
+                ansatz_dynamic = ansatz
             
+            if ansatz_dynamic is None:
+                raise ValueError("Ansatz must be provided either in make_variance_loss or in batch_data")
+
+            # Define batch_local_energy using the current ansatz
+            batch_local_energy = vmap_impl(
+                lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
+                in_axes=(0, None), 
+                out_axes=0
+            )
+
             # Forward pass
-            energies = batch_local_energy(walkers, params)
+            energies = batch_local_energy(walkers, params) # Pass ansatz
             e_mean = jnp.mean(energies)
             e_std = jnp.std(energies)
             
@@ -348,7 +366,8 @@ def make_variance_loss(
                 # E_L is already computed above
                 # Compute V for all walkers
                 def compute_V_single(walker):
-                    return ansatz._compute_potential_energy(walker.positions)
+                    # Use the dynamic ansatz here
+                    return ansatz_dynamic._compute_potential_energy(walker.positions)
                 
                 V_all = jax.vmap(compute_V_single)(walkers)  # shape: (n_walkers,)
                 
@@ -360,10 +379,12 @@ def make_variance_loss(
                     V_i = V_all[i]
                     
                     # Compute f_a = ∂J/∂a
-                    f_a = ansatz._compute_jastrow_derivative(walker_i.positions, jastrow_params)
+                    # Use the dynamic ansatz here
+                    f_a = ansatz_dynamic._compute_jastrow_derivative(walker_i.positions, jastrow_params)
                     
                     # Compute 𝓛_a = Σⱼ ∇²ⱼ(∂J/∂a)
-                    laplacian_a = ansatz._compute_jastrow_derivative_laplacian(walker_i.positions, jastrow_params)
+                    # Use the dynamic ansatz here
+                    laplacian_a = ansatz_dynamic._compute_jastrow_derivative_laplacian(walker_i.positions, jastrow_params)
                     
                     # Compute 𝒢_a = -½𝓛_a + V·f_a
                     def compute_G_a(f, lap):
@@ -389,7 +410,7 @@ def make_variance_loss(
                 
                 jastrow_grad_sum = sum_tree(grad_contributions)
                 
-                # Apply normalization: 2.0/(n-1)
+                # Apply normalization: 2.0 / (n-1)
                 normalization = 2.0 / (n_walkers - 1) if n_walkers > 1 else 0.0
                 jastrow_grad_final = jax.tree_util.tree_map(lambda x: normalization * x, jastrow_grad_sum)
                 
@@ -414,6 +435,7 @@ def make_variance_loss(
                 # Compute JVP of local energies w.r.t. linear coefficients only
                 def compute_energies_linear_only(lin_coeffs):
                     """Compute energies with only linear coeffs varying."""
+                    # Use the dynamic ansatz here
                     return batch_local_energy(walkers, [jastrow_params, lin_coeffs])
                 
                 _, energy_tangent_linear = jax.jvp(
@@ -436,6 +458,7 @@ def make_variance_loss(
                 # ========== Standard Gradient Method ==========
                 # Compute JVP of local energies
                 def compute_energies(p):
+                    # Use the dynamic ansatz here
                     return batch_local_energy(walkers, p)
                 
                 _, energy_tangent = jax.jvp(
@@ -469,10 +492,19 @@ def make_variance_loss(
                 aux: Tuple of (mean_energy, energy_std)
             """
             # Extract walkers from batch
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg
             else:
                 walkers = batch_data
+                ansatz_dynamic = ansatz
+            
+            # Define batch_local_energy using the current ansatz
+            batch_local_energy = vmap_impl(
+                lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
+                in_axes=(0, None), 
+                out_axes=0
+            )
             
             # Compute local energies
             energies = batch_local_energy(walkers, params)

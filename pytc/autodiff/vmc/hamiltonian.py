@@ -3,35 +3,60 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+import folx
 
 
 def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     """Compute ∇J/J and ∇²J/J with explicit parameters."""
     n_electrons = elec_coords.shape[0]
     
-    vmap_grads_r1 = jax.vmap(
-        lambda r1, r2: sj.jastrow.get_log_grads_r1(r1, r2, jastrow_params),
-        in_axes=(None, 0)
-    )
-    vmap_all_grads_r1 = jax.vmap(vmap_grads_r1, in_axes=(0, None))
-    all_grads_r1, all_laps_r1 = vmap_all_grads_r1(elec_coords, elec_coords)
+    # Memory-efficient implementation of the original averaged strategy
+    # We use jax.lax.map to loop over electrons sequentially (O(N) memory)
+    # instead of vmapping over all pairs (O(N^2) memory).
+    # This preserves the exact math of:
+    # grad[i] = 0.5 * (sum_{j!=i} grad_1(ri, rj) + sum_{j!=i} grad_2(rj, ri))
+    
+    indices = jnp.arange(n_electrons)
+    
+    def compute_electron_i(carrier):
+        idx_i, r_i = carrier
+        
+        # Inner vmap over all other electrons j
+        def compute_pair(idx_j, r_j):
+            # Mask self-interaction
+            mask = jnp.where(idx_i == idx_j, 0.0, 1.0)
+            
+            # grad_1(ri, rj) and lap_1(ri, rj)
+            g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j, jastrow_params)
+            
+            # grad_2(rj, ri) and lap_2(rj, ri)
+            g2, l2 = sj.jastrow.get_log_grads_r2(r_j, r_i, jastrow_params)
+            
+            return (g1 * mask, l1 * mask, g2 * mask, l2 * mask)
+            
+        # vmap over j
+        g1s, l1s, g2s, l2s = jax.vmap(compute_pair, in_axes=(0, 0))(indices, elec_coords)
+        
+        # Sum over j
+        sum_g1 = jnp.sum(g1s, axis=0)
+        sum_l1 = jnp.sum(l1s, axis=0)
+        sum_g2 = jnp.sum(g2s, axis=0)
+        sum_l2 = jnp.sum(l2s, axis=0)
+        
+        # Average
+        grad_i = 0.5 * (sum_g1 + sum_g2)
+        lap_i = 0.5 * (sum_l1 + sum_l2)
+        
+        return grad_i, lap_i
 
-    vmap_grads_r2 = jax.vmap(
-        lambda r1, r2: sj.jastrow.get_log_grads_r2(r1, r2, jastrow_params),
-        in_axes=(None, 0)
-    )
-    vmap_all_grads_r2 = jax.vmap(vmap_grads_r2, in_axes=(0, None))
-    all_grads_r2, all_laps_r2 = vmap_all_grads_r2(elec_coords, elec_coords)
+    # Map over electrons (sequential to save memory)
+    grad_J_over_J, lap_sum = jax.lax.map(compute_electron_i, (indices, elec_coords))
     
-    diag_mask = 1.0 - jnp.eye(n_electrons)
-    diag_mask_3d = diag_mask[..., None]
+    grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
+    lap_J_over_J = lap_sum + grad_squared
     
-    grad_J_over_J = jnp.sum(all_grads_r1 * diag_mask_3d, axis=1)
-    grad_J_over_J += jnp.sum(all_grads_r2 * diag_mask_3d, axis=0)
-    grad_J_over_J /= 2.0
-    lap_sum = jnp.sum(all_laps_r1 * diag_mask, axis=1)
-    lap_sum += jnp.sum(all_laps_r2 * diag_mask, axis=0)
-    lap_sum /= 2.0
+    return grad_J_over_J, lap_J_over_J
+    
     grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
     lap_J_over_J = lap_sum + grad_squared
     
