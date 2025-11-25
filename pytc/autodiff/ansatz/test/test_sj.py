@@ -13,24 +13,27 @@ from pytc.autodiff.vmc.walker import Walker
 
 
 def create_test_walker(positions, det):
-    """Helper to create a Walker for testing."""
-    n_walkers = positions.shape[0]
+    """Helper to create a Walker for testing.
+    
+    Creates unbatched walker - positions should have shape (n_electrons, 3).
+    """
     n_alpha = det.n_alpha
     n_beta = det.n_beta
+    n_electrons = n_alpha + n_beta
     
     return Walker(
         positions=positions,
-        det_up=(jnp.zeros((n_walkers,)), jnp.zeros((n_walkers,))),  # (sign, log|det|)
-        det_down=(jnp.zeros((n_walkers,)), jnp.zeros((n_walkers,))),  # (sign, log|det|)
-        slater_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
-        slater_down=jnp.zeros((n_walkers, n_beta, n_beta)),
-        inv_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
-        inv_down=jnp.zeros((n_walkers, n_beta, n_beta)),
-        grad_up=jnp.zeros((n_walkers, n_alpha, n_alpha, 3)),
-        grad_down=jnp.zeros((n_walkers, n_beta, n_beta, 3)),
-        lap_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
-        lap_down=jnp.zeros((n_walkers, n_beta, n_beta)),
-        move_mask=jnp.ones((n_walkers, positions.shape[1]), dtype=bool)  # All true for full recalculation
+        det_up=(jnp.array(1.0), jnp.array(0.0)),  # Single values, not batched
+        det_down=(jnp.array(1.0), jnp.array(0.0)),
+        slater_up=jnp.zeros((n_alpha, n_alpha)),
+        slater_down=jnp.zeros((n_beta, n_beta)),
+        inv_up=jnp.zeros((n_alpha, n_alpha)),
+        inv_down=jnp.zeros((n_beta, n_beta)),
+        grad_up=jnp.zeros((n_alpha, n_alpha, 3)),
+        grad_down=jnp.zeros((n_beta, n_beta, 3)),
+        lap_up=jnp.zeros((n_alpha, n_alpha)),
+        lap_down=jnp.zeros((n_beta, n_beta)),
+        move_mask=jnp.ones(n_electrons, dtype=bool)
     )
 
 
@@ -52,7 +55,7 @@ class TestAnsatzH2(unittest.TestCase):
         self.mf.kernel()
         
         # Create determinant with RHF orbitals
-        self.det = SlaterDet(self.mol, self.mf.mo_coeff)
+        self.det = SlaterDet.create(self.mol, self.mf.mo_coeff)
         
         # Create simple Jastrow without parameters and store params separately
         self.jastrow_params = jnp.array([0.5])
@@ -62,13 +65,13 @@ class TestAnsatzH2(unittest.TestCase):
         self.linear_coeffs = jnp.array([1.0])
         
         # Create ansatz without coefficients
-        self.ansatz = SlaterJastrow(self.mol, self.jastrow, [self.det])
+        self.ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det])
         
-        # Test positions: two electrons slightly offset from nuclei
-        self.test_pos = jnp.array([[
+        # Test positions: two electrons slightly offset from nuclei (unbatched)
+        self.test_pos = jnp.array([
             [0.0, 0.1, 0.0],    # electron 1 near first H
             [0.0, 0.1, 0.742],  # electron 2 near second H
-        ]])  # Shape: (1, 2, 3)
+        ])  # Shape: (2, 3) - unbatched
 
         # Create params tuple for ansatz calls
         self.params = (self.jastrow_params, self.linear_coeffs)
@@ -82,36 +85,43 @@ class TestAnsatzH2(unittest.TestCase):
         psi_sign, psi_logabs = psi_values
         psi_val = psi_sign * jnp.exp(psi_logabs)
         
-        self.assertTrue(np.isreal(psi_val[0]))  # Index into batch dimension
-        self.assertNotEqual(float(psi_val[0]), 0.0)  # Index into batch dimension
+        self.assertTrue(np.isreal(psi_val))  # Unbatched walker
+        self.assertNotEqual(float(psi_val), 0.0)  # Unbatched walker
         
         # Test that moving electrons far apart gives smaller absolute value
-        far_pos = jnp.array([[
+        far_pos = jnp.array([
             [0.0, 0.0, -5.0],
             [0.0, 0.0, 5.0],
-        ]])  # Shape: (1, 2, 3)
+        ])  # Shape: (2, 3) - unbatched
         far_walker = create_test_walker(far_pos, self.det)
         far_psi_values, _ = self.ansatz(far_walker, self.params)
         far_psi_sign, far_psi_logabs = far_psi_values
         far_psi_val = far_psi_sign * jnp.exp(far_psi_logabs)
         
-        self.assertLess(abs(float(far_psi_val[0])), abs(float(psi_val[0])))
+        self.assertLess(abs(float(far_psi_val)), abs(float(psi_val)))
 
     def test_jastrow_parameter_sensitivity(self):
         """Test sensitivity to Jastrow parameter changes."""
+        # Create walker and populate it with determinant values first
         walker = create_test_walker(self.test_pos, self.det)
-        psi_values_original, _ = self.ansatz(walker, self.params)
+        
+        # First populate the walker with the determinant values
+        from pytc.autodiff.ansatz.det import value_and_grad
+        _, populated_walker = value_and_grad(self.det, walker)
+        
+        # Now evaluate wavefunction with original parameters
+        psi_values_original, _ = self.ansatz(populated_walker, self.params)
         psi_sign_orig, psi_logabs_orig = psi_values_original
         value_original = psi_sign_orig * jnp.exp(psi_logabs_orig)
         
         # Change Jastrow parameter more significantly
         new_params = (jnp.array([2.0]), self.linear_coeffs)
-        psi_values_new, _ = self.ansatz(walker, new_params)
+        psi_values_new, _ = self.ansatz(populated_walker, new_params)
         psi_sign_new, psi_logabs_new = psi_values_new
         value_new = psi_sign_new * jnp.exp(psi_logabs_new)
         
         # Values should be different
-        self.assertNotAlmostEqual(float(value_original[0]), float(value_new[0]))
+        self.assertNotAlmostEqual(float(value_original), float(value_new))
 
     def test_antisymmetry(self):
         """Test that wavefunction is antisymmetric under electron exchange."""
@@ -145,7 +155,8 @@ class TestAnsatzH2(unittest.TestCase):
 
     def test_jastrow_terms(self):
         """Test computation of Jastrow gradient and laplacian terms."""
-        grad_J, lap_J = self.ansatz._compute_jastrow_terms(self.test_pos[0], self.jastrow_params)
+        from pytc.autodiff.vmc.hamiltonian import compute_jastrow_terms
+        grad_J, lap_J = compute_jastrow_terms(self.ansatz, self.test_pos, self.jastrow_params)
         
         # Check shapes
         self.assertEqual(grad_J.shape, (2, 3))  # (n_electrons, xyz)
@@ -162,7 +173,7 @@ class TestAnsatzH2(unittest.TestCase):
         """
         # Use a simple Jastrow with u(r_ij) = 0.5*r_ij
         simple_jastrow = Poly()  # Single parameter a=0.5
-        simple_ansatz = SlaterJastrow(self.mol, simple_jastrow, [self.det])
+        simple_ansatz = SlaterJastrow.create(self.mol, simple_jastrow, [self.det])
         simple_jastrow_params = jnp.array([0.5])
         
         # Use simple positions for easier analytical calculation
@@ -180,8 +191,8 @@ class TestAnsatzH2(unittest.TestCase):
         # ∇_1 u(r_12) = 0.5 * ([0,0,0] - [1,0,0])/1 = [-0.5, 0, 0]
         # ∇_2 u(r_21) = 0.5 * ([1,0,0] - [0,0,0])/1 = [0.5, 0, 0]
         
-        # Calculate the actual values from our implementation
-        grad_J_over_J, lap_J_over_J = simple_ansatz._compute_jastrow_terms(positions, simple_jastrow_params)
+        from pytc.autodiff.vmc.hamiltonian import compute_jastrow_terms
+        grad_J_over_J, lap_J_over_J = compute_jastrow_terms(simple_ansatz, positions, simple_jastrow_params)
         
         # Expected values based on our implementation
         expected_grad = jnp.array([
@@ -199,10 +210,10 @@ class TestAnsatzH2(unittest.TestCase):
         
         # Test with a different parameter
         different_jastrow_params = jnp.array([2.0])  # Parameter a=2.0
-        different_ansatz = SlaterJastrow(self.mol, simple_jastrow, [self.det])
+        different_ansatz = SlaterJastrow.create(self.mol, simple_jastrow, [self.det])
         
         # Recalculate with different parameter
-        grad_J_over_J_2, lap_J_over_J_2 = different_ansatz._compute_jastrow_terms(positions, different_jastrow_params)
+        grad_J_over_J_2, lap_J_over_J_2 = compute_jastrow_terms(different_ansatz, positions, different_jastrow_params)
         
         # For a=2.0, all gradients and laplacians should scale by 4
         np.testing.assert_allclose(grad_J_over_J_2, 4.0 * expected_grad, rtol=1e-5)
@@ -216,7 +227,7 @@ class TestAnsatzH2(unittest.TestCase):
         ])
         
         # Calculate for three electrons
-        grad_J_over_J_3, lap_J_over_J_3 = simple_ansatz._compute_jastrow_terms(three_electron_pos, simple_jastrow_params)
+        grad_J_over_J_3, lap_J_over_J_3 = compute_jastrow_terms(simple_ansatz, three_electron_pos, simple_jastrow_params)
         
         # For three electrons with u(r) = 0.5*r, analytical results:
         # ∇_1 J/J = 0.5*([1,0,0] + [0,1,0]) = [0.5, 0.5, 0]
@@ -298,20 +309,14 @@ class TestAnsatzH2(unittest.TestCase):
         
         # Compute potential matrices
         # internal functions with _ are not batched since they are vmapped.
-        B_pot_up, B_pot_down = self.ansatz._compute_potential_matrix(
-            self.test_pos[0],  # Remove batch dimension for potential calculation
-            slater_up[0],      # Remove batch dimension
-            slater_down[0]     # Remove batch dimension
+        from pytc.autodiff.vmc.hamiltonian import compute_potential_matrix, compute_jastrow_terms
+
+        B_pot_up, B_pot_down = compute_potential_matrix(
+            self.ansatz,
+            self.test_pos,  # Unbatched positions
+            slater_up,
+            slater_down
         )
-        
-        # Extract values safely from batched outputs
-        slater_up = slater_up[0]  # Remove batch dimension
-        slater_down = slater_down[0]
-        B_pot_up = B_pot_up  # Remove batch dimension
-        B_pot_down = B_pot_down
-        
-        # Test positions are now batched [1, n_elec, 3], need to use [0] to get actual positions
-        test_positions = self.test_pos[0]
         
         # Check if we have both alpha and beta electrons
         n_alpha = self.det.n_alpha
@@ -342,7 +347,7 @@ class TestAnsatzH2(unittest.TestCase):
             return -jnp.sum(atom_charges / (dists + 1e-10))
         
         # Calculate potentials for the available electrons
-        positions = self.test_pos[0]  # Remove batch dimension
+        positions = self.test_pos
         n_electrons = len(positions)
         for i in range(n_electrons):
             e_n = compute_nuclear_pot(positions[i])
@@ -378,17 +383,20 @@ class TestAnsatzH2(unittest.TestCase):
         # - Test positions at [0.0, 0.1, 0.0] and [0.0, 0.1, 0.742]
         
         # Fix electron distance calculation for batched coordinates
-        electron_dist = jnp.linalg.norm(self.test_pos[0, 0] - self.test_pos[0, 1])
+        electron_dist = jnp.linalg.norm(self.test_pos[0] - self.test_pos[1])
         self.assertAlmostEqual(float(electron_dist), 0.742, places=3)
         
         # Create a function to get the wavefunction value for a given Jastrow parameter
         def wf_value(param):
             param_tuple = (jnp.array([param]), self.linear_coeffs)
             walker = create_test_walker(self.test_pos, self.det)
-            psi_values, _ = self.ansatz(walker, param_tuple)
+            # Populate walker with determinant values first
+            from pytc.autodiff.ansatz.det import value_and_grad
+            _, populated_walker = value_and_grad(self.det, walker)
+            psi_values, _ = self.ansatz(populated_walker, param_tuple)
             # Return regular value for gradient computation
             psi_sign, psi_logabs = psi_values
-            return (psi_sign * jnp.exp(psi_logabs))[0]
+            return psi_sign * jnp.exp(psi_logabs)
         
         # Use JAX's automatic differentiation to compute gradient
         param_grad = jax.grad(wf_value)(0.5)
@@ -404,9 +412,11 @@ class TestAnsatzH2(unittest.TestCase):
         
         # Get current wavefunction value
         walker = create_test_walker(self.test_pos, self.det)
-        psi_values, _ = self.ansatz(walker, (self.jastrow_params, self.linear_coeffs))
+        from pytc.autodiff.ansatz.det import value_and_grad
+        _, populated_walker = value_and_grad(self.det, walker)
+        psi_values, _ = self.ansatz(populated_walker, (self.jastrow_params, self.linear_coeffs))
         psi_sign, psi_logabs = psi_values
-        current_wf = (psi_sign * jnp.exp(psi_logabs))[0]
+        current_wf = psi_sign * jnp.exp(psi_logabs)
         
         # Calculate dJ/da for this electron configuration
         # For two electrons, there's one term: 0.5 * |r_1 - r_2|
@@ -428,7 +438,7 @@ class TestAnsatzH2(unittest.TestCase):
         walker_diff = create_test_walker(self.test_pos, self.det)
         psi_values_diff, _ = self.ansatz(walker_diff, different_params)
         psi_sign_diff, psi_logabs_diff = psi_values_diff
-        different_wf = (psi_sign_diff * jnp.exp(psi_logabs_diff))[0]
+        different_wf = psi_sign_diff * jnp.exp(psi_logabs_diff)
         
         # The dJ/da is the same (electron_dist), but the wavefunction value is different
         different_expected_grad = float(different_wf * dj_da)
@@ -461,9 +471,9 @@ class TestLocalEnergyWithWalker(unittest.TestCase):
         self.mf.kernel()
         
         # Create determinant and ansatz
-        self.det = SlaterDet(self.mol, self.mf.mo_coeff)
+        self.det = SlaterDet.create(self.mol, self.mf.mo_coeff)
         self.jastrow = Poly()
-        self.ansatz = SlaterJastrow(self.mol, self.jastrow, [self.det])
+        self.ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det])
         
         # Parameters
         self.jastrow_params = jnp.array([0.5])

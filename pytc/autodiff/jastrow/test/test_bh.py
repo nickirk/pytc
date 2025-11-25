@@ -62,7 +62,7 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         bh_terms = sm7_coeffs_to_bh_terms(atom_symbol)
         
         # Create BH Jastrow with single nucleus, so terms_per_nucleus is a list with one element
-        bh = BoysHandy(mol, terms_per_nucleus=[bh_terms])
+        bh = BoysHandy.create(mol, terms_per_nucleus=[bh_terms])
         
         # Initialize parameters - b_raw and d_raw don't matter since scaling is r/(1+r)
         bh_params = bh.init_params(key=self.key)
@@ -264,13 +264,13 @@ class TestBoysHandy(unittest.TestCase):
              BHTerm(1, 0, 0, -0.1), # e-n term (attractive)
              BHTerm(2, 0, 0, -0.1)] # higher order term (attractive)
         ]
-        self.jastrow = BoysHandy(self.mol, terms_per_nucleus=terms)
+        self.jastrow = BoysHandy.create(self.mol, terms_per_nucleus=terms)
         self.params = self.jastrow.init_params(key=self.key)
 
     def test_init(self):
         """Test initialization."""
         # Test default initialization
-        jastrow = BoysHandy(self.mol)
+        jastrow = BoysHandy.create(self.mol)
         params = jastrow.init_params()
         
         # Check parameter structure

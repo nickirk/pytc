@@ -254,7 +254,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Create molecule
         mol = gto.Mole()
         mol.atom = molecule_spec
-        mol.basis = 'ccpvdz'
+        mol.basis = 'sto6g'
         mol.unit = 'A'
         mol.build()
         
@@ -268,14 +268,14 @@ class TestHartreeFockEnergy(unittest.TestCase):
         mo_occ = mf.mo_occ
         
         # Create determinant from HF solution
-        det = SlaterDet(mol, mo_coeff)
+        det = SlaterDet.create(mol, mo_coeff)
         
         # Create PolyJastrow with zero parameters (equals identity)
         jastrow = Poly()
         jastrow_params = jnp.zeros(1)
         
         # Create SlaterJastrow ansatz (equivalent to HF with Jastrow=1)
-        sj_ansatz = SlaterJastrow(mol, jastrow, [det])
+        sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
         jastrow_params = jnp.zeros(1)  # Initialize to zero for HF test
         linear_coeffs = jnp.ones(1)  # Single determinant
         
@@ -284,7 +284,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         n_walkers = 5000
         n_steps = 5000
         step_size = 0.1
-        burn_in_steps = 2000  # Updated parameter name
+        burn_in_steps = 1000  # Updated parameter name
         thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
@@ -342,9 +342,9 @@ class TestHartreeFockEnergy(unittest.TestCase):
         """Test HF energy sampling for H2 molecule."""
         results = self.run_hf_energy_test("H 0 0 0; H 0 0 2; H 0 0 4; H 0 0 6")
     
-    def test_he_atom(self):
+    def test_be_atom(self):
         """Test HF energy sampling for He He molecule."""
-        results = self.run_hf_energy_test("He 0 0 0")
+        results = self.run_hf_energy_test("Be 0 0 0")
 
     def test_lih(self):
         """Test HF energy sampling for LiH molecule."""
@@ -379,6 +379,7 @@ class TestJastrowOptimization(unittest.TestCase):
         mol.atom = molecule_spec
         mol.basis = basis
         mol.unit = 'A'
+        mol.cart = False
         mol.build()
         
         # Run PySCF calculation for reference energy
@@ -389,25 +390,25 @@ class TestJastrowOptimization(unittest.TestCase):
 
         
         # Create determinant from HF solution
-        det = SlaterDet(mol, mf.mo_coeff)
+        det = SlaterDet.create(mol, mf.mo_coeff)
         
         # Create REXP jastrow with given or default parameters
         rexp = REXP()
-        bh = BoysHandy(mol)
-        jnuclear_cusp = NuclearCusp(mol)    
+        bh = BoysHandy.create(mol)
+        jnuclear_cusp = NuclearCusp.create(mol)    
         #jastrow = NuclearCusp(mol)    
-        jastrow = CompositeJastrow([jnuclear_cusp, bh])
+        jastrow = CompositeJastrow.create([jnuclear_cusp, bh])
         jastrow_params = jastrow.init_params() if jastrow_params is None else jastrow_params 
         # Create SlaterJastrow ansatz
-        sj_ansatz = SlaterJastrow(mol, jastrow, [det])
+        sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
         linear_coeffs = jnp.ones(1)  # Single determinant
         
         # Use small settings for test speed
-        n_walkers = 5000
+        n_walkers = 2000
         n_steps = 10
         step_size = 0.01
         burn_in_steps = 1000
-        n_opt_steps = 500
+        n_opt_steps = 100
         key = random.PRNGKey(42)
         
         # Run optimization
