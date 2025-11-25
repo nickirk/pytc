@@ -36,6 +36,7 @@ class BoysHandy(Jastrow):
     n_terms: int = struct.field(pytree_node=False)
     epsilon: float = struct.field(pytree_node=False, default=1e-8)
     terms_per_atom_type: List[List[BHTerm]] = struct.field(pytree_node=False, default=None)
+    nuclei_by_type: List[jax.Array] = struct.field(default=None)
     name: str = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -109,6 +110,23 @@ class BoysHandy(Jastrow):
             _delta_factor = jnp.zeros((0, 0))
             _cusp_mask = jnp.zeros((0, 0), dtype=bool)
             
+        # Group nuclei by type for efficient computation
+        nuclei_by_type = []
+        for i in range(n_types):
+            type_mask = (atom_type_map == i)
+            # We can't use boolean indexing on JAX arrays during creation if we want static shapes?
+            # Actually, create is called eagerly (not JITted usually), so we can use numpy or boolean indexing.
+            # atom_type_map is a JAX array, but we can convert to numpy if needed or just use JAX.
+            # Since create returns the class instance which is a Pytree, the arrays in nuclei_by_type
+            # will be leaves. They must have fixed shapes.
+            # Using boolean indexing on JAX array returns a concrete array if not traced.
+            # If traced, it might be dynamic. Ideally create is called outside JIT.
+            
+            # Use numpy for grouping to ensure static shapes
+            mask_np = jnp.array(atom_type_map) == i
+            nuclei_group = nuclear_pos[jnp.array(mask_np)]
+            nuclei_by_type.append(nuclei_group)
+
         return cls(
             nuclear_pos=nuclear_pos,
             nuclear_charges=nuclear_charges,
@@ -125,6 +143,7 @@ class BoysHandy(Jastrow):
             n_terms=n_terms,
             epsilon=epsilon,
             terms_per_atom_type=terms_per_atom_type,
+            nuclei_by_type=nuclei_by_type,
             name=name
         )
             
@@ -173,47 +192,50 @@ class BoysHandy(Jastrow):
         
         c = jnp.where(self._cusp_mask, 0.5, c_raw)
 
-        def atom_scan_fn(carry, atom_data):
-            u_total = carry
-            nuclear_pos_I, atom_type_idx = atom_data
-            
-            b_I = b[atom_type_idx]
-            d_I = d[atom_type_idx]
-            c_I = c[atom_type_idx]
-            term_m_I = self._term_m[atom_type_idx]
-            term_n_I = self._term_n[atom_type_idx]
-            term_o_I = self._term_o[atom_type_idx]
-            delta_factor_I = self._delta_factor[atom_type_idx]
-            cusp_mask_I = self._cusp_mask[atom_type_idx]
-            
-            r1I = self._scaled_r_en(r1, nuclear_pos_I, b_I)
-            r2I = self._scaled_r_en(r2, nuclear_pos_I, b_I)
-            r12 = self._scaled_r_ee(r1, r2, d_I)
-
-            r1I_pow_m = jnp.power(r1I, term_m_I)
-            r2I_pow_n = jnp.power(r2I, term_n_I)
-            r1I_pow_n = jnp.power(r1I, term_n_I)
-            r2I_pow_m = jnp.power(r2I, term_m_I)
-            r12_pow_o = jnp.power(r12, term_o_I)
-
-            non_cusp_terms = (r1I_pow_m * r2I_pow_n + r2I_pow_m * r1I_pow_n) * r12_pow_o
-            cusp_terms = 2.0 * r12_pow_o
-            u_terms = jnp.where(cusp_mask_I, cusp_terms, non_cusp_terms)
-
-            cusp_factor = delta_factor_I * c_I
-            non_cusp_factor = delta_factor_I * c_I
-            factor = jnp.where(cusp_mask_I, cusp_factor, non_cusp_factor)
-
-            u_total += jnp.sum(factor * u_terms)
-            return u_total, None
-
-        atom_data = (
-            self.nuclear_pos,
-            self.atom_type_map,
-        )
+        u_total = 0.0
         
-        u_total, _ = jax.lax.scan(atom_scan_fn, 0.0, atom_data)
-        
+        # Iterate over atom types (static loop)
+        for i in range(self.n_types):
+            # Get parameters for this type
+            b_I = b[i]
+            d_I = d[i]
+            c_I = c[i] # Shape (n_terms,)
+            
+            term_m = self._term_m[i] # Shape (n_terms,)
+            term_n = self._term_n[i]
+            term_o = self._term_o[i]
+            delta = self._delta_factor[i]
+            mask = self._cusp_mask[i]
+            
+            # Get nuclei of this type
+            nuclei_group = self.nuclei_by_type[i]
+            
+            # Skip if no nuclei of this type
+            if nuclei_group.shape[0] == 0:
+                continue
+                
+            # Vectorized computation over nuclei of this type
+            def compute_for_nucleus(nuc_pos):
+                r1I = self._scaled_r_en(r1, nuc_pos, b_I)
+                r2I = self._scaled_r_en(r2, nuc_pos, b_I)
+                r12 = self._scaled_r_ee(r1, r2, d_I)
+                
+                r1I_pow_m = jnp.power(r1I, term_m)
+                r2I_pow_n = jnp.power(r2I, term_n)
+                r1I_pow_n = jnp.power(r1I, term_n)
+                r2I_pow_m = jnp.power(r2I, term_m)
+                r12_pow_o = jnp.power(r12, term_o)
+                
+                non_cusp = (r1I_pow_m * r2I_pow_n + r2I_pow_m * r1I_pow_n) * r12_pow_o
+                cusp = 2.0 * r12_pow_o
+                terms = jnp.where(mask, cusp, non_cusp)
+                
+                return jnp.sum(delta * c_I * terms)
+
+            # Sum over nuclei of this type
+            contributions = jax.vmap(compute_for_nucleus)(nuclei_group)
+            u_total += jnp.sum(contributions)
+            
         return u_total
 
     def _compute(self, r1, r2, params):

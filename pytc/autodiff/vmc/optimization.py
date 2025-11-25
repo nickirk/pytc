@@ -53,16 +53,17 @@ def make_opt_update_step(loss_fn, optimizer):
     
     Returns:
         A JIT-compiled function with signature:
-            opt_step(params, walkers, opt_state, key) -> (params, opt_state, loss, aux_data)
+            opt_step(ansatz, params, walkers, opt_state, key) -> (params, opt_state, loss, aux_data)
     """
     # Create value_and_grad function
     loss_and_grad = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
     
-    def opt_step(params, walkers, opt_state, key):
+    def opt_step(ansatz, params, walkers, opt_state, key):
         """Single optimizer step - fully JIT-compatible.
         
         Args:
-            params: Current parameters [jastrow_params, linear_coeffs]
+            ansatz: Wavefunction object
+            params: Parameters to optimize
             walkers: Walker dataclass with current MCMC configurations
             opt_state: Optimizer internal state
             key: PRNG key (for potential stochastic operations)
@@ -70,17 +71,17 @@ def make_opt_update_step(loss_fn, optimizer):
         Returns:
             params: Updated parameters
             opt_state: Updated optimizer state
-            loss: Scalar loss value
+            loss: Loss value
             aux_data: Auxiliary data from loss function (e.g., energy, variance)
         """
         # Compute loss and gradients
-        (loss, aux_data), grads = loss_and_grad(params, walkers)
+        (loss, aux_data), grads = loss_and_grad(params, walkers, ansatz)
         
         # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
+        new_params = optax.apply_updates(params, updates)
         
-        return params, opt_state, loss, aux_data
+        return new_params, opt_state, loss, aux_data
     
     # JIT compile the step function
     return jax.jit(opt_step)
@@ -96,14 +97,16 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
     
     Args:
         mcmc_step: JIT-compiled MCMC step function from make_mcmc_step()
+                   Signature: (ansatz, walkers, key, params) -> (walkers, pmove)
         opt_update_step: JIT-compiled optimizer step from make_opt_update_step()
+                         Signature: (ansatz, params, walkers, opt_state, key) -> (params, opt_state, loss, aux_data)
         n_mcmc_per_opt: Number of MCMC steps before each optimization update (default: 1)
         n_opt_per_mcmc: Number of optimization steps per MCMC update (default: 1)
                         Note: If n_mcmc_per_opt > 1, this should typically be 1.
     
     Returns:
         A JIT-compiled function with signature:
-            training_step(walkers, params, opt_state, key) ->
+            training_step(ansatz, walkers, params, opt_state, key) ->
                 (walkers, params, opt_state, loss, aux_data, pmove)
     
     Design patterns:
@@ -112,13 +115,14 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
         - Variance minimization: n_mcmc_per_opt=1, n_opt_per_mcmc=5-20
           (multiple gradient steps on same walker configuration)
     """
-    def training_step(walkers, params, opt_state, key):
+    def training_step(ansatz, walkers, params, opt_state, key):
         """One full training iteration: MCMC + optimization.
         
         This function is fully JIT-compilable and contains no side effects.
         All values are returned as JAX arrays - materialization happens outside.
         
         Args:
+            ansatz: Wavefunction object
             walkers: Walker dataclass with current MCMC configurations
             params: Current parameters [jastrow_params, linear_coeffs]
             opt_state: Optimizer internal state
@@ -137,7 +141,7 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
             def mcmc_scan_fn(carry, _):
                 walkers_carry, key_carry, params_carry = carry
                 key_carry, subkey = random.split(key_carry)
-                walkers_carry, pmove_carry = mcmc_step(walkers_carry, subkey, params_carry)
+                walkers_carry, pmove_carry = mcmc_step(ansatz, walkers_carry, subkey, params_carry)
                 return (walkers_carry, key_carry, params_carry), pmove_carry
             
             # Run MCMC loop
@@ -152,7 +156,7 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
             # Single optimization step after MCMC
             key, subkey = random.split(key)
             params, opt_state, loss, aux_data = opt_update_step(
-                params, walkers, opt_state, subkey
+                ansatz, params, walkers, opt_state, subkey
             )
         
         # Pattern 2: Multiple optimization steps per MCMC (variance minimization)
@@ -161,7 +165,7 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
                 params_carry, opt_state_carry, key_carry = carry
                 key_carry, subkey = random.split(key_carry)
                 params_carry, opt_state_carry, loss_carry, aux_data_carry = opt_update_step(
-                    params_carry, walkers, opt_state_carry, subkey
+                    ansatz, params_carry, walkers, opt_state_carry, subkey
                 )
                 return (params_carry, opt_state_carry, key_carry), (loss_carry, aux_data_carry)
             
@@ -179,18 +183,18 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
             
             # Single MCMC step after optimization
             key, subkey = random.split(key)
-            walkers, pmove = mcmc_step(walkers, subkey, params)
+            walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
         
         # Pattern 3: Balanced (1 MCMC, 1 opt) - default simple case
         else:
             # Single MCMC step
             key, subkey = random.split(key)
-            walkers, pmove = mcmc_step(walkers, subkey, params)
+            walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
             
             # Single optimization step
             key, subkey = random.split(key)
             params, opt_state, loss, aux_data = opt_update_step(
-                params, walkers, opt_state, subkey
+                ansatz, params, walkers, opt_state, subkey
             )
         
         return walkers, params, opt_state, loss, aux_data, pmove
@@ -206,21 +210,23 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
     
     Args:
         mcmc_step: JIT-compiled MCMC step function from make_mcmc_step()
+                   Signature: (ansatz, walkers, key, params) -> (walkers, pmove)
         optimizer: KFAC optimizer instance
         n_mcmc_per_opt: Number of MCMC steps before each optimization update (default: 1)
         n_opt_per_mcmc: Number of optimization steps per MCMC update (default: 1)
     
     Returns:
         A function (not JIT-compiled yet) with signature:
-            training_step(walkers, params, opt_state, key, global_step) ->
+            training_step(ansatz, walkers, params, opt_state, key, global_step) ->
                 (walkers, params, opt_state, loss, aux_data, pmove)
     """
-    def training_step(walkers, params, opt_state, key, global_step):
+    def training_step(ansatz, walkers, params, opt_state, key, global_step):
         """One full training iteration: MCMC + optimization.
         
         Note: This is NOT JIT-compiled because KFAC handles JIT internally.
         
         Args:
+            ansatz: Wavefunction object
             walkers: Walker dataclass with current MCMC configurations
             params: Current parameters [jastrow_params, linear_coeffs]
             opt_state: KFAC optimizer internal state
@@ -240,7 +246,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
             pmove_list = []
             for _ in range(n_mcmc_per_opt):
                 key, subkey = random.split(key)
-                walkers, pmove = mcmc_step(walkers, subkey, params)
+                walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
                 pmove_list.append(pmove)
             pmove = pmove_list[-1]  # Use last acceptance rate
             
@@ -250,7 +256,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                 params=params,
                 state=opt_state,
                 rng=subkey,
-                batch=(walkers, None),
+                batch=(walkers, ansatz), # Pass ansatz in batch
                 global_step_int=global_step
             )
             loss = stats['loss']
@@ -266,7 +272,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                     params=p,
                     state=s,
                     rng=sk,
-                    batch=(walkers, None),
+                    batch=(walkers, ansatz), # Pass ansatz in batch
                     global_step_int=global_step
                 )
                 return (new_p, new_s, k), stats
@@ -284,15 +290,15 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
             loss = jax.tree_util.tree_map(lambda x: x[-1], stats_history['loss'])
             aux_data = jax.tree_util.tree_map(lambda x: x[-1], stats_history['aux'])
             
-            # Single MCMC step
+            # Single MCMC step after optimization
             key, subkey = random.split(key)
-            walkers, pmove = mcmc_step(walkers, subkey, params)
+            walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
         
         # Pattern 3: Balanced (1 MCMC, 1 opt)
         else:
             # Single MCMC step
             key, subkey = random.split(key)
-            walkers, pmove = mcmc_step(walkers, subkey, params)
+            walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
             
             # Single optimization step
             key, subkey = random.split(key)
@@ -300,7 +306,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                 params=params,
                 state=opt_state,
                 rng=subkey,
-                batch=(walkers, None),
+                batch=(walkers, ansatz), # Pass ansatz in batch
                 global_step_int=global_step
             )
             loss = stats['loss']
@@ -421,7 +427,7 @@ def optimize(
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
-        opt_state = optimizer.init(params, subkey, (walkers, None))
+        opt_state = optimizer.init(params, subkey, (walkers, ansatz))
         
         # Create KFAC training step with n_mcmc_per_opt pattern
         training_step = make_kfac_training_step(
@@ -463,11 +469,11 @@ def optimize(
         
         if optimizer_type.lower() == "kfac":
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
-                walkers, params, opt_state, subkey, opt_step
+                ansatz, walkers, params, opt_state, subkey, opt_step
             )
         else:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
-                walkers, params, opt_state, subkey
+                ansatz, walkers, params, opt_state, subkey
             )
         
         # Materialize values
@@ -607,7 +613,7 @@ def optimize_ref_var(
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
-        opt_state = optimizer.init(params, subkey, (walkers, None))
+        opt_state = optimizer.init(params, subkey, (walkers, ansatz))
         
         # Create KFAC training step with n_opt_per_mcmc pattern
         training_step = make_kfac_training_step(
@@ -640,11 +646,11 @@ def optimize_ref_var(
         
         if optimizer_type.lower() == "kfac":
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
-                walkers, params, opt_state, subkey, opt_step
+                ansatz, walkers, params, opt_state, subkey, opt_step
             )
         else:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
-                walkers, params, opt_state, subkey
+                ansatz, walkers, params, opt_state, subkey
             )
         
         variance_val = float(jax.device_get(loss))

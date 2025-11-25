@@ -3,9 +3,9 @@
 from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
-from flax import struct
 from typing import Optional
-
+import folx
+from flax import struct
 @struct.dataclass
 class Jastrow:
     """Abstract base class for JAX-based Jastrow factors.
@@ -76,7 +76,12 @@ class Jastrow:
         """
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
-        return jnp.trace(jax.hessian(scalar_fn)(r1))
+            
+        def scalar_fn(x):
+            return self._compute(x, r2, params).reshape(-1)[0]
+            
+        # Use folx for efficient forward-mode Laplacian
+        return folx.forward_laplacian(scalar_fn)(r1).laplacian
     
     
     def grad_params(self, r1, r2, params):
@@ -107,8 +112,12 @@ class Jastrow:
         """
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
-        grad_u = jax.grad(scalar_fn)(r1)
-        lapl_u = jnp.trace(jax.hessian(scalar_fn)(r1))
+            
+        # Use folx for efficient forward-mode gradient and Laplacian
+        fwd_lapl = folx.forward_laplacian(scalar_fn)(r1)
+        grad_u = fwd_lapl.jacobian.dense_array
+        lapl_u = fwd_lapl.laplacian
+            
         return grad_u, lapl_u
     
     def get_log_grads_r2(self, r1, r2, params):
@@ -126,8 +135,12 @@ class Jastrow:
         """
         def scalar_fn(x):
             return self._compute(r1, x, params).reshape(-1)[0]
-        grad_u = jax.grad(scalar_fn)(r2)
-        lapl_u = jnp.trace(jax.hessian(scalar_fn)(r2))
+            
+        # Use folx for efficient forward-mode gradient and Laplacian
+        fwd_lapl = folx.forward_laplacian(scalar_fn)(r2)
+        grad_u = fwd_lapl.jacobian.dense_array
+        lapl_u = fwd_lapl.laplacian
+            
         return grad_u, lapl_u
     
     def init_params(self, **kwargs):

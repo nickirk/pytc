@@ -231,8 +231,8 @@ class NuclearCusp(Jastrow):
             alpha = self._compute_alpha_coeffs(Z, rc, X)
             poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
 
-        def scan_nuclei(carry, nucleus_idx):
-            total = carry
+        # Vectorized computation over nuclei
+        def compute_nucleus_contribution(nucleus_idx):
             # Get distance from electron to this nucleus
             dr = r1 - self.coords[nucleus_idx]
             r = jnp.sqrt(jnp.sum(dr**2))
@@ -242,37 +242,30 @@ class NuclearCusp(Jastrow):
             Z_idx = self.Z_to_idx[Z.astype(jnp.int32)]
             rc = params['rc'][Z_idx]
             
+            # Use computed poly_coeffs instead of params
+            coeffs = poly_coeffs[Z_idx]
+            
+            # Compute φ_cusp = exp(poly(r))
             # Use where to conditionally evaluate only when r <= rc
-            def evaluate_contribution(r):
-                # Use computed poly_coeffs instead of params
-                coeffs = poly_coeffs[Z_idx]
-                
-                # Compute φ_cusp = exp(poly(r))
-                poly_val = jnp.where(r<=rc, self._eval_poly(r, coeffs), 0.0)
-                phi_cusp = jnp.exp(poly_val)
-                
-                # Get φ_s value with numerical safeguard
-                phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
-                
-                # Add small constants to prevent division by zero or log(0)
-                eps = 0.0
-                ratio = (phi_cusp + eps)/(phi_s + eps)
-                # Use log1p for better numerical stability when ratio is close to 1
-                log_term = jnp.log(ratio)
-                
-                # Combine using cutoff
-                cutoff = self._cutoff_function(r, rc)
-                return log_term * cutoff
+            poly_val = jnp.where(r<=rc, self._eval_poly(r, coeffs), 0.0)
+            phi_cusp = jnp.exp(poly_val)
             
-            # Only evaluate when r <= rc, otherwise return 0
-            contrib = jnp.where(r <= rc, 
-                              evaluate_contribution(r),
-                              0.0)
+            # Get φ_s value with numerical safeguard
+            phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
             
-            return total + contrib, None
-        
-        # Sum over all nuclei
-        total, _ = jax.lax.scan(scan_nuclei, 0.0, jnp.arange(self.n_nuclei))
+            # Add small constants to prevent division by zero or log(0)
+            eps = 0.0
+            ratio = (phi_cusp + eps)/(phi_s + eps)
+            # Use log1p for better numerical stability when ratio is close to 1
+            log_term = jnp.log(ratio)
+            
+            # Combine using cutoff
+            cutoff = self._cutoff_function(r, rc)
+            return jnp.where(r <= rc, log_term * cutoff, 0.0)
+
+        # Sum over all nuclei using vmap
+        contributions = jax.vmap(compute_nucleus_contribution)(jnp.arange(self.n_nuclei))
+        total = jnp.sum(contributions)
         
         return total/(self.nelectron - 1)
     
@@ -304,7 +297,10 @@ class NuclearCusp(Jastrow):
             
             # Compute all indices and t values at once (JAX-traceable)
             indices = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
-            indices_int = jnp.floor(indices).astype(jnp.int32)
+            # Compute all indices and t values at once (JAX-traceable)
+            indices = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
+            indices_stopped = jax.lax.stop_gradient(indices)
+            indices_int = jnp.floor(indices_stopped).astype(jnp.int32)
             
             # Calculate local coordinates relative to left endpoint
             x_i = jnp.take(x, indices_int)
@@ -322,7 +318,8 @@ class NuclearCusp(Jastrow):
             dx = x[1] - x[0]
             # Compute index and t value same as array case
             index = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
-            indices_int = jnp.floor(index).astype(jnp.int32)
+            index_stopped = jax.lax.stop_gradient(index)
+            indices_int = jnp.floor(index_stopped).astype(jnp.int32)
             # Calculate local coordinate
             x_i = jnp.take(x, indices_int)
             t = r - x_i
@@ -343,7 +340,8 @@ class NuclearCusp(Jastrow):
         # Find interval using safe integer operations
         dx = x[1] - x[0]
         index = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
-        index_int = jnp.floor(index).astype(jnp.int32)
+        index_stopped = jax.lax.stop_gradient(index)
+        index_int = jnp.floor(index_stopped).astype(jnp.int32)
         
         # Get local coordinate
         t = r - x[index_int]  # Note: not normalized by dx here

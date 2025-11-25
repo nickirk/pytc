@@ -194,13 +194,13 @@ def make_mcmc_step(ansatz, step_size, move_type="one"):
     a JIT-compilable step function that performs Metropolis-Hastings sampling.
     
     Args:
-        ansatz: Wavefunction object with __call__ method that returns ψ(R)
+        ansatz: Wavefunction object (used for validation, not captured)
         step_size: Standard deviation of Gaussian proposal for MCMC moves
         move_type: "all" to move all electrons at once, "one" to move one electron at a time
     
     Returns:
         A JIT-compiled function with signature:
-            mcmc_step(walkers, key, params) -> (new_walkers, acceptance_rate)
+            mcmc_step(ansatz, walkers, key, params) -> (new_walkers, acceptance_rate)
     
     Raises:
         ValueError: If move_type is not "all" or "one"
@@ -209,10 +209,11 @@ def make_mcmc_step(ansatz, step_size, move_type="one"):
     if move_type not in ["all", "one"]:
         raise ValueError(f"move_type must be either 'all' or 'one', got '{move_type}'")
     
-    def mcmc_step(walkers, key, params):
+    def mcmc_step(ansatz, walkers, key, params):
         """Single MCMC step - fully JIT-compatible.
         
         Args:
+            ansatz: Wavefunction object
             walkers: Walker dataclass with current state
             key: PRNG key for random number generation
             params: Parameters for the ansatz [jastrow_params, linear_coeffs]
@@ -234,14 +235,14 @@ def make_mcmc_step_importance(ansatz, time_step):
     """Factory to create a JIT-compilable importance sampling MCMC step.
     
     Args:
-        ansatz: Wavefunction object with quantum_force method
+        ansatz: Wavefunction object (used for validation, not captured)
         time_step: Time step for the drift-diffusion process
     
     Returns:
         A JIT-compiled function with signature:
-            mcmc_step(walkers, key, params) -> (new_walkers, acceptance_rate)
+            mcmc_step(ansatz, walkers, key, params) -> (new_walkers, acceptance_rate)
     """
-    def mcmc_step(walkers, key, params):
+    def mcmc_step(ansatz, walkers, key, params):
         """Single importance sampling MCMC step - fully JIT-compatible."""
         new_walkers, acceptance_rate = metropolis_hastings_importance_sampling(
             ansatz, walkers, time_step, key, params
