@@ -75,7 +75,6 @@ def make_opt_update_step(loss_fn, optimizer):
             aux_data: Auxiliary data from loss function (e.g., energy, variance)
         """
         # Compute loss and gradients
-        # Compute loss and gradients
         # Note: loss_fn expects (params, walkers), ansatz is baked in or handled via wrapper
         (loss, aux_data), grads = loss_and_grad(params, walkers)
         
@@ -338,7 +337,10 @@ def optimize(
     opt_kwargs: Optional[Dict[str, Any]] = None,
     params=None,
     frozen_params=None,
-    move_type: str = "one"
+    move_type: str = "one",
+    use_custom_jvp: bool = True,
+    adaptive_step_size: bool = True,
+    step_size_adjust_interval: int = 10,
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -408,7 +410,7 @@ def optimize(
         optimizer_type=optimizer_type,
         cost_fn=user_or_default_cost_fn,
         clip_multiplier=5.0,
-        use_custom_jvp=True,
+        use_custom_jvp=use_custom_jvp,
         max_vmap_batch_size=max_vmap_batch_size
     )
 
@@ -457,12 +459,15 @@ def optimize(
 
     # ========== MAIN LOOP (Uses JIT-compiled step) ==========
     print(f"Starting optimization with {n_opt_steps} steps...")
+    if adaptive_step_size:
+        print(f"Adaptive step-size enabled (target accept=0.5, adjust every {step_size_adjust_interval} steps)")
     
     losses = []
     energies = []
     stds = []
     acceptances = []
     params_history = []
+    step_sizes = [step_size]  # Track step_size history
     
     start_time = time.time()
     
@@ -500,23 +505,51 @@ def optimize(
         )
         params_history.append(params_copy)
         
+        # Adaptive step-size adjustment (similar to burn-in)
+        if adaptive_step_size and (opt_step + 1) % step_size_adjust_interval == 0:
+            # Calculate mean acceptance over last interval
+            recent_accept = np.mean(acceptances[-step_size_adjust_interval:])
+            # Adjust step_size to target 0.5 acceptance rate
+            step_size *= recent_accept / 0.5
+            step_sizes.append(step_size)
+            
+            # Recreate mcmc_step with new step_size
+            if use_importance_sampling:
+                mcmc_step = make_mcmc_step_importance(ansatz, step_size)
+            else:
+                mcmc_step = make_mcmc_step(ansatz, step_size, move_type)
+            
+            # Recreate training_step with new mcmc_step
+            if optimizer_type.lower() == "kfac":
+                training_step = make_kfac_training_step(
+                    mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
+                )
+            else:
+                training_step = make_training_step(
+                    mcmc_step, opt_update_step, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
+                )
+        
         # Print progress
         log_frequency = 1  # Log ~100 times
         if opt_step % log_frequency == 0 or opt_step == n_opt_steps - 1:
             elapsed = time.time() - start_time
+            step_size_str = f" | StepSize: {step_size:.4f}" if adaptive_step_size else ""
             print(f"Step {opt_step:5d} | Cost: {cost_val:.6f} | "
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
-                  f"Accept: {pmove_val:.3f} | Time: {elapsed:.2f}s")
+                  f"Accept: {pmove_val:.3f}{step_size_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
     
     print("Optimization complete!")
+    if adaptive_step_size:
+        print(f"Final step size: {step_size:.4f}")
     
     return {
         "cost": np.array(losses),
         "energies": np.array(energies),
         "stds": np.array(stds),
         "acceptance": np.array(acceptances),
-        "params": params_history
+        "params": params_history,
+        "step_sizes": np.array(step_sizes) if adaptive_step_size else None
     }
 
 
@@ -537,9 +570,10 @@ def optimize_ref_var(
     move_type: str = "one",
     opt_kwargs: Optional[Dict[str, Any]] = None,
     params=None,
+    adaptive_step_size: bool = True,
+    step_size_adjust_interval: int = 10,
 ):
-    """Perform reference variance optimization using MCMC sampling.
-    
+    """Perform variational Monte Carlo optimization using MCMC sampling.
 
     Args:
         ansatz: Wavefunction object with __call__ method that returns ψ(R)

@@ -62,6 +62,12 @@ class SlaterJastrow:
     def quantum_force(self, walker, params, cutoff=5.0):
         return eval_sj_quantum_force(self, walker, params, cutoff)
 
+    def init_params(self, key):
+        """Initialize parameters for the ansatz."""
+        jastrow_params = self.jastrow.init_params()
+        linear_coeffs = jnp.ones(len(self.dets))
+        return [jastrow_params, linear_coeffs]
+
 
 # Standalone functions
 

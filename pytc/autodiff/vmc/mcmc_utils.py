@@ -186,6 +186,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             value_func_has_aux=merged_kwargs.get("value_func_has_aux", False),
             value_func_has_state=merged_kwargs.get("value_func_has_state", False),
             value_func_has_rng=merged_kwargs.get("value_func_has_rng", False),
+            learning_rate_schedule=merged_kwargs.get("learning_rate_schedule", None),
             use_adaptive_learning_rate=merged_kwargs.get("use_adaptive_learning_rate", True),
             use_adaptive_momentum=merged_kwargs.get("use_adaptive_momentum", True),
             use_adaptive_damping=merged_kwargs.get("use_adaptive_damping", True),

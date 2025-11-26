@@ -49,6 +49,18 @@ def make_energy_loss(
     else:
         vmap_impl = functools.partial(folx.batched_vmap, max_batch_size=max_vmap_batch_size)
     
+    batch_local_energy = vmap_impl(
+        lambda w, p: ansatz.local_energy(w, p)[0],
+        in_axes=(0, None), 
+        out_axes=0
+    )
+
+    batch_network = vmap_impl(
+        lambda w, p: ansatz(w, p)[0][1],  # Returns log_psi
+        in_axes=(0, None), 
+        out_axes=0
+    )
+    
     # Note: We don't need batch_log_psi anymore - in the JVP we call ansatz directly on the batch
     
     if use_custom_jvp:
@@ -77,13 +89,6 @@ def make_energy_loss(
                 walkers = batch_data
                 ansatz_dynamic = ansatz
             
-            # Define batch_local_energy using the current ansatz
-            batch_local_energy = vmap_impl(
-                lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
-                in_axes=(0, None), 
-                out_axes=0
-            )
-            
             # Compute all local energies using vmap (or batched_vmap)
             energies = batch_local_energy(walkers, params)
             
@@ -104,10 +109,6 @@ def make_energy_loss(
             
             # Compute cost
             cost = cost_fn(clipped_energies)
-            
-            # For KFAC, register predictive distribution
-            if optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(energies[:, None])
             
             # Return cost and auxiliary data (namedtuple is indexable and JIT-compatible)
             return cost, AuxData(mean_energy, energy_std, clipped_energies, diff)
@@ -138,29 +139,20 @@ def make_energy_loss(
             clipped_energies = aux_data.clipped_energies
             diff = aux_data.diff
             
-            # Extract walkers and ansatz
-            if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                walkers, ansatz_arg = batch_data
-                ansatz_dynamic = ansatz_arg
+            # Extract walkers from batch_data
+            if isinstance(batch_data, tuple):
+                walkers = batch_data[0]
             else:
                 walkers = batch_data
-                ansatz_dynamic = ansatz
             
-            # diff is already computed in forward pass - no need to recompute energies!
-            # This saves a full batch_local_energy call (major optimization!)
+         # batch_network takes (walkers, params) but we only differentiate params
+            # So we curry it to make a function of just params
+            def log_psi_fn(p):
+                return batch_network(walkers, p)
             
-            # Compute JVP of log|ψ| directly on the batch
-            # ansatz() now works with single walkers, so we vmap over the batch
-            def batch_log_psi_direct(p):
-                """Evaluate log|ψ| for all walkers at once (batch call)."""
-                batch_ansatz = jax.vmap(lambda w, params: ansatz_dynamic(w, params), in_axes=(0, None))
-                psi_values, _ = batch_ansatz(walkers, p)
-                _, log_psi = psi_values
-                return log_psi
-            
-            # Single JVP call on the batch
+            # Single JVP call - now only differentiating wrt params
             log_psi_primal, log_psi_tangent = jax.jvp(
-                batch_log_psi_direct,
+                log_psi_fn,
                 (params,),
                 (params_tangent,)
             )
@@ -172,7 +164,7 @@ def make_energy_loss(
             
             # For KFAC compatibility - register distributions
             if optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(clipped_energies[:, None])
+                #kfac_jax.register_normal_predictive_distribution(clipped_energies[:, None])
                 kfac_jax.register_normal_predictive_distribution(log_psi_primal[:, None])
             
             # Return primal cost and tangent
@@ -345,25 +337,24 @@ def make_variance_loss(
             if optimizer_type.lower() == "kfac":
                 kfac_jax.register_normal_predictive_distribution(energies[:, None])
             
+            # ========== Standard Gradient Method ==========
+            # Compute JVP of local energies
+            def compute_energies(p):
+                # Use the dynamic ansatz here
+                return batch_local_energy(walkers, p)
+            
+            _, energy_tangent = jax.jvp(
+                compute_energies,
+                (params,),
+                (params_tangent,)
+            )
+            
+            # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
+            energy_diff = energies - e_mean
+            if n_walkers > 1:
+                variance_tangent = 2.0 * jnp.dot(energy_diff, energy_tangent) / (n_walkers - 1)
             else:
-                # ========== Standard Gradient Method ==========
-                # Compute JVP of local energies
-                def compute_energies(p):
-                    # Use the dynamic ansatz here
-                    return batch_local_energy(walkers, p)
-                
-                _, energy_tangent = jax.jvp(
-                    compute_energies,
-                    (params,),
-                    (params_tangent,)
-                )
-                
-                # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
-                energy_diff = energies - e_mean
-                if n_walkers > 1:
-                    variance_tangent = 2.0 * jnp.dot(energy_diff, energy_tangent) / (n_walkers - 1)
-                else:
-                    variance_tangent = 0.0
+                variance_tangent = 0.0
             
             return (variance, aux_data), (variance_tangent, aux_data)
         
