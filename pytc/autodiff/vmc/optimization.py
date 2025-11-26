@@ -506,7 +506,7 @@ def optimize(
         params_history.append(params_copy)
         
         # Adaptive step-size adjustment (similar to burn-in)
-        if adaptive_step_size and (opt_step + 1) % step_size_adjust_interval == 0:
+        if adaptive_step_size and (opt_step + 1) % step_size_adjust_interval == 0 and opt_step < 5*step_size_adjust_interval:
             # Calculate mean acceptance over last interval
             recent_accept = np.mean(acceptances[-step_size_adjust_interval:])
             # Adjust step_size to target 0.5 acceptance rate
