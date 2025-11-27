@@ -30,6 +30,7 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.scipy.sparse.linalg as spla
 from jax import random, value_and_grad
 from jax.tree_util import tree_map
 import optax
@@ -317,6 +318,107 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
     
     # KFAC handles JIT internally, so we don't JIT compile here
     return training_step
+
+
+def make_mfgn_update_step(ansatz, damping=1e-3, maxiter=10, learning_rate=0.1):
+    """Factory to create a Matrix-Free Gauss-Newton update step.
+
+    This implements a matrix-free Newton method for variance minimization,
+    solving (G + λI)δ = -g using Conjugate Gradient, where G is the
+    Gauss-Newton approximation to the Hessian (J^T J).
+
+    Args:
+        ansatz: Wavefunction object
+        damping: Damping factor (lambda) for Levenberg-Marquardt
+        maxiter: Maximum iterations for CG solver
+
+    Returns:
+        A JIT-compiled function with signature:
+            update_step(ansatz, params, walkers, opt_state, key) ->
+                (params, opt_state, loss, aux_data)
+    """
+    
+    # Define batched local energy function
+    # We use vmap to handle the batch of walkers
+    batch_local_energy = jax.vmap(
+        lambda w, p: ansatz.local_energy(w, p)[0],
+        in_axes=(0, None),
+        out_axes=0
+    )
+
+    def update_step(ansatz, params, walkers, opt_state, key):
+        # 1. Define energy function for this batch
+        def local_energy_fn(p):
+            return batch_local_energy(walkers, p)
+
+        # 2. Compute Residuals and Gradient
+        # We need both the values (residuals) and the VJP function for the MVP
+        el, vjp_fun = jax.vjp(local_energy_fn, params)
+        el_mean = jnp.mean(el)
+        residuals = el - el_mean      # r in Least Squares
+        
+        # Compute variance loss and auxiliary data
+        variance = jnp.mean(residuals**2) # This is slightly biased (N vs N-1) but consistent with optimization
+        # For reporting, we calculate the unbiased variance and other stats
+        n_walkers = el.shape[0]
+        unbiased_variance = jnp.sum(residuals**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
+        energy_std = jnp.std(el)
+        aux_data = (el_mean, energy_std)
+        
+        # Gradient of Variance: g = 2/N * J.T @ r
+        # We can get this via standard grad, or vjp
+        # grad_loss = jax.grad(lambda p: jnp.mean((local_energy_fn(p) - jnp.mean(local_energy_fn(p)))**2))(params)
+        # Using VJP is more direct given we have residuals:
+        # J.T @ residuals gives sum(J_i * r_i). We need mean, so divide by N.
+        # Actually, grad(mean(r^2)) = 2 * mean(r * grad(r)) = 2/N * J.T @ r
+        # The vjp_fun computes J.T @ v.
+        grad_loss = vjp_fun(2.0 * residuals / n_walkers)[0]
+
+        # 3. Define the Matrix-Vector Product (MVP) for G @ v = (J.T @ J) @ v
+        # This represents the curvature operator G @ v
+        def mvp(v):
+            # A. Forward: J @ v (Directional derivative of E_L)
+            # Efficiently propagates tangent v through the Laplacian graph
+            _, tangent_el = jax.jvp(local_energy_fn, (params,), (v,))
+            
+            # Centering (since we minimize variance of fluctuations)
+            # The Jacobian of (E - <E>) is (J - <J>)
+            tangent_el_centered = tangent_el - jnp.mean(tangent_el)
+            
+            # B. Backward: J.T @ w
+            # Backprop the tangent residuals to parameter space
+            # (Using the vjp_fun saved from step 1 is efficient)
+            # Note: We need 2/N factor because the loss is mean squared error
+            # G = 2/N * J.T @ J
+            w = 2.0 * tangent_el_centered / n_walkers
+            result_tree = vjp_fun(w)[0]
+            
+            # Add Damping (Levenberg-Marquardt): (G + lambda I) v
+            return jax.tree_util.tree_map(lambda r, x: r + damping * x, result_tree, v)
+
+        # 4. Solve the linear system (G + lambda I) * delta = -g
+        # CG requires a linear operator input
+        # We need to handle the PyTree structure of params
+        
+        # Flatten params for CG if they are a PyTree
+        # But jax.scipy.sparse.linalg.cg supports PyTrees if we use a wrapper or if mvp handles it?
+        # Actually jax.scipy.sparse.linalg.cg expects 'b' to be a tree and 'A' to take a tree.
+        # So we can pass the tree directly!
+        
+        delta, info = spla.cg(
+            mvp, 
+            jax.tree_util.tree_map(lambda x: -x, grad_loss), 
+            maxiter=maxiter
+        )
+
+        new_params = jax.tree_util.tree_map(lambda p, d: p + learning_rate * d, params, delta)
+        
+        # Update opt_state (just a counter)
+        new_opt_state = opt_state + 1 if opt_state is not None else 1
+        
+        return new_params, new_opt_state, unbiased_variance, aux_data
+
+    return jax.jit(update_step)
 
 
 def optimize(
@@ -650,6 +752,22 @@ def optimize_ref_var(
         # Create KFAC training step with n_opt_per_mcmc pattern
         training_step = make_kfac_training_step(
             mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
+        )
+    elif optimizer_type.lower() == "mfgn":
+        # Matrix-Free Gauss-Newton setup
+        print("Using Matrix-Free Gauss-Newton optimizer")
+        opt_state = 0 # Simple step counter
+        
+        # Create MFGN update step
+        # We can extract damping/maxiter from opt_kwargs if needed
+        damping = opt_kwargs.get("damping", 1e-3)
+        cg_maxiter = opt_kwargs.get("maxiter", 100)
+        
+        opt_update_step = make_mfgn_update_step(ansatz, damping=damping, maxiter=cg_maxiter)
+        
+        # Use n_opt_per_mcmc pattern
+        training_step = make_training_step(
+            mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
         )
     else:
         # Optax setup
