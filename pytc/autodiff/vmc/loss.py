@@ -260,7 +260,18 @@ def make_variance_loss(
         vmap_impl = jax.vmap
     else:
         vmap_impl = functools.partial(folx.batched_vmap, max_batch_size=max_vmap_batch_size)
-    
+    # Define batch_local_energy using the current ansatz
+    batch_local_energy = vmap_impl(
+        lambda w, p: ansatz.local_energy(w, p)[0],
+        in_axes=(0, None), 
+        out_axes=0
+    )
+    # Define batch_network using the current ansatz
+    batch_network = vmap_impl(
+        lambda w, p: ansatz(w, p)[0][1],  # Returns log_psi
+        in_axes=(0, None), 
+        out_axes=0
+    )
 
     
     if use_custom_jvp:
@@ -291,10 +302,6 @@ def make_variance_loss(
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             
-            # For KFAC, register predictive distribution
-            if optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(energies[:, None])
-            
             return variance, (e_mean, e_std)
         
         @loss_fn.defjvp
@@ -317,13 +324,6 @@ def make_variance_loss(
             if ansatz_dynamic is None:
                 raise ValueError("Ansatz must be provided either in make_variance_loss or in batch_data")
 
-            # Define batch_local_energy using the current ansatz
-            batch_local_energy = vmap_impl(
-                lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
-                in_axes=(0, None), 
-                out_axes=0
-            )
-
             # Forward pass
             energies = batch_local_energy(walkers, params) # Pass ansatz
             e_mean = jnp.mean(energies)
@@ -333,9 +333,7 @@ def make_variance_loss(
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             aux_data = (e_mean, e_std)
             
-            # For KFAC compatibility
-            if optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(energies[:, None])
+
             
             # ========== Standard Gradient Method ==========
             # Compute JVP of local energies
@@ -348,7 +346,11 @@ def make_variance_loss(
                 (params,),
                 (params_tangent,)
             )
-            
+            # Single JVP call - now only differentiating wrt params
+            #log_psi_primal = batch_network(walkers, params)
+            # For KFAC compatibility
+            if optimizer_type.lower() == "kfac":
+                kfac_jax.register_normal_predictive_distribution(energies[:, None])
             # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
             energy_diff = energies - e_mean
             if n_walkers > 1:
