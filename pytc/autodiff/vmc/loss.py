@@ -164,7 +164,6 @@ def make_energy_loss(
             
             # For KFAC compatibility - register distributions
             if optimizer_type.lower() == "kfac":
-                #kfac_jax.register_normal_predictive_distribution(clipped_energies[:, None])
                 kfac_jax.register_normal_predictive_distribution(log_psi_primal[:, None])
             
             # Return primal cost and tangent
