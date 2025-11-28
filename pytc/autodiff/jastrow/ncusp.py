@@ -13,7 +13,7 @@ class NuclearCusp(Jastrow):
     coords: jax.Array
     charges: jax.Array
     unique_Z: jax.Array
-    rc_ranges: jax.Array
+    rc_range: jax.Array
     Z_to_idx: jax.Array
     r_grids: jax.Array
     spline_xs: jax.Array
@@ -24,7 +24,7 @@ class NuclearCusp(Jastrow):
     n_nuclei: int = struct.field(pytree_node=False)
     n_types: int = struct.field(pytree_node=False)
     n_radial: int = struct.field(pytree_node=False)
-    X4_range: Tuple[float, float] = struct.field(pytree_node=False, default=(-10.0, 10.0))
+    X4_range: jax.Array
     name: str = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -41,12 +41,12 @@ class NuclearCusp(Jastrow):
         n_types = len(unique_Z)
         
         # Set rc ranges for each nucleus type: 0.8/Z to 1.2/Z
-        rc_ranges_list = []
+        rc_range_list = []
         for Z in unique_Z:
             min_rc = 0.8/float(Z)
             max_rc = 1.2/float(Z)
-            rc_ranges_list.append((min_rc, max_rc))
-        rc_ranges = jnp.array(rc_ranges_list)
+            rc_range_list.append((min_rc, max_rc))
+        rc_range = jnp.array(rc_range_list)
         
         # Create reverse mapping array: Z -> idx
         max_Z = int(jnp.max(unique_Z))
@@ -104,29 +104,41 @@ class NuclearCusp(Jastrow):
         # Instead of storing CubicSpline objects, store their coefficients
         spline_coeffs_list = []
         spline_xs_list = []
+        phi_0_list = []
         for i in range(n_nuclei):
             x = np.array(r_grids[i])
             y = np.array(sao_sums[i])
             spline = CubicSpline(x, y, bc_type='natural')
             spline_xs_list.append(jnp.array(x))
             spline_coeffs_list.append(jnp.array(spline.c))
+            phi_0_list.append(spline(0.0))
             
         spline_xs = jnp.stack(spline_xs_list)
         spline_coeffs = jnp.stack(spline_coeffs_list)
         
         # Add mapping from Z_idx to first nucleus of that type
         Z_idx_to_nucleus_list = []
+        X4_range_list = []
         for Z_idx, Z in enumerate(unique_Z):
             nucleus_idx = int(np.where(charges == Z)[0][0])
             Z_idx_to_nucleus_list.append(nucleus_idx)
+            
+            # Compute X4 range
+            phi_0 = phi_0_list[nucleus_idx]
+            initial_X4 = np.log(np.abs(phi_0 * 1.1))
+            min_X4 = min(0.8 * initial_X4, 1.4 * initial_X4)
+            max_X4 = max(0.8 * initial_X4, 1.4 * initial_X4)
+            X4_range_list.append((min_X4, max_X4))
+            
         Z_idx_to_nucleus = jnp.array(Z_idx_to_nucleus_list)
+        X4_range = jnp.array(X4_range_list)
         
         return cls(
             name=name,
             coords=coords,
             charges=charges,
             unique_Z=unique_Z,
-            rc_ranges=rc_ranges,
+            rc_range=rc_range,
             Z_to_idx=Z_to_idx,
             r_grids=r_grids,
             spline_xs=spline_xs,
@@ -135,14 +147,15 @@ class NuclearCusp(Jastrow):
             nelectron=nelectron,
             n_nuclei=n_nuclei,
             n_types=n_types,
-            n_radial=n_radial
+            n_radial=n_radial,
+            X4_range=X4_range
         )
         
     def _clip_params(self, params):
         """Clip parameters to valid ranges for each nucleus type."""
         return {
-            'rc': jnp.clip(params['rc'], self.rc_ranges[:,0], self.rc_ranges[:,1]),
-            'X4': jnp.clip(params['X4'], self.X4_range[0], self.X4_range[1])
+            'rc': jnp.clip(params['rc'], self.rc_range[:,0], self.rc_range[:,1]),
+            'X4': jnp.clip(params['X4'], self.X4_range[:,0], self.X4_range[:,1])
         }
 
     def init_params(self):
