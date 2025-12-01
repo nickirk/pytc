@@ -65,7 +65,7 @@ class NeuralBase(Jastrow):
     """Base class for neural network-based Jastrow factors."""
     nuclear_pos: jax.Array
     nuclear_charges: jax.Array
-    net: nn.Module
+    net: nn.Module = struct.field(pytree_node=False)
     features: Sequence[int] = struct.field(pytree_node=False)
     nelectron: int = struct.field(pytree_node=False)
     epsilon: float = struct.field(pytree_node=False, default=1e-8)

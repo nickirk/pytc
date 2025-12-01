@@ -214,40 +214,33 @@ class BoysHandy(Jastrow):
                 p_r2I = get_powers(r2I, self.max_degree)
                 p_r12 = get_powers(r12, self.max_degree)
                 
-                # Iterate over terms in Python to generate scalar graph
-                total_val = 0.0
-                terms_list = self.terms_per_atom_type[i]
+                # Vectorized computation of terms
+                # Retrieve indices for all terms of this atom type
+                m_indices = self._term_m[i]
+                n_indices = self._term_n[i]
+                o_indices = self._term_o[i]
                 
-                for j, term in enumerate(terms_list):
-                    m, n, o = term.m, term.n, term.o
-                    
-                    # Get coefficients and factors
-                    # We can use the arrays or compute static values
-                    # Using arrays allows JAX to track dependencies if needed, but m,n,o are static
-                    c_val = c_I[j]
-                    
-                    # Recompute static factors to avoid indexing overhead/dependency
-                    delta_val = 0.5 if m == n else 1.0
-                    is_cusp = (m == 0 and n == 0 and o == 1)
-                    
-                    v_r1I_m = p_r1I[m]
-                    v_r2I_n = p_r2I[n]
-                    v_r2I_m = p_r2I[m]
-                    v_r1I_n = p_r1I[n]
-                    v_r12_o = p_r12[o]
-                    
-                    non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
-                    cusp_term = 2.0 * v_r12_o
-                    
-                    # Select term type
-                    # We can use jnp.where or python if/else since is_cusp is static
-                    # But to keep graph consistent (though is_cusp is bool), python if is fine for graph construction
-                    if is_cusp:
-                        term_val = cusp_term
-                    else:
-                        term_val = non_cusp_term
-                        
-                    total_val += delta_val * c_val * term_val
+                # Get powers for all terms at once using advanced indexing
+                v_r1I_m = p_r1I[m_indices]
+                v_r2I_n = p_r2I[n_indices]
+                v_r2I_m = p_r2I[m_indices]
+                v_r1I_n = p_r1I[n_indices]
+                v_r12_o = p_r12[o_indices]
+                
+                # Compute term values
+                non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
+                cusp_term = 2.0 * v_r12_o
+                
+                # Select term type based on cusp mask
+                mask = self._cusp_mask[i]
+                term_vals = jnp.where(mask, cusp_term, non_cusp_term)
+                
+                # Get coefficients and delta factors
+                c_vals = c_I
+                delta_vals = self._delta_factor[i]
+                
+                # Sum contributions
+                total_val = jnp.sum(delta_vals * c_vals * term_vals)
                 
                 return total_val
 
