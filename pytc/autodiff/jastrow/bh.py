@@ -181,71 +181,55 @@ class BoysHandy(Jastrow):
         
         c = jnp.where(self._cusp_mask, 0.5, c_raw)
 
-        u_total = 0.0
-        
-        for i in range(self.n_types):
-            b_I = b[i]
-            d_I = d[i]
-            c_I = c[i]
+        def compute_term(atom_idx):
+            type_idx = self.atom_type_map[atom_idx]
+            nuc_pos = self.nuclear_pos[atom_idx]
             
-            term_m = self._term_m[i]
-            term_n = self._term_n[i]
-            term_o = self._term_o[i]
-            delta = self._delta_factor[i]
-            mask = self._cusp_mask[i]
+            b_I = b[type_idx]
+            d_I = d[type_idx]
+            c_I = c[type_idx]
             
-            nuclei_group = self.nuclei_by_type[i]
+            # Retrieve indices for all terms of this atom type
+            m_indices = self._term_m[type_idx]
+            n_indices = self._term_n[type_idx]
+            o_indices = self._term_o[type_idx]
             
-            if nuclei_group.shape[0] == 0:
-                continue
-                
-            # Use checkpoint/remat to save memory by recomputing terms during backward pass
-            @jax.checkpoint
-            def compute_for_nucleus(nuc_pos):
-                r1I = self._scaled_r_en(r1, nuc_pos, b_I)
-                r2I = self._scaled_r_en(r2, nuc_pos, b_I)
-                r12 = self._scaled_r_ee(r1, r2, d_I)
-                
-                def get_powers(x, degree):
-                    exponents = jnp.arange(degree + 1)
-                    return jnp.power(x, exponents)
-                
-                p_r1I = get_powers(r1I, self.max_degree)
-                p_r2I = get_powers(r2I, self.max_degree)
-                p_r12 = get_powers(r12, self.max_degree)
-                
-                # Vectorized computation of terms
-                # Retrieve indices for all terms of this atom type
-                m_indices = self._term_m[i]
-                n_indices = self._term_n[i]
-                o_indices = self._term_o[i]
-                
-                # Get powers for all terms at once using advanced indexing
-                v_r1I_m = p_r1I[m_indices]
-                v_r2I_n = p_r2I[n_indices]
-                v_r2I_m = p_r2I[m_indices]
-                v_r1I_n = p_r1I[n_indices]
-                v_r12_o = p_r12[o_indices]
-                
-                # Compute term values
-                non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
-                cusp_term = 2.0 * v_r12_o
-                
-                # Select term type based on cusp mask
-                mask = self._cusp_mask[i]
-                term_vals = jnp.where(mask, cusp_term, non_cusp_term)
-                
-                # Get coefficients and delta factors
-                c_vals = c_I
-                delta_vals = self._delta_factor[i]
-                
-                # Sum contributions
-                total_val = jnp.sum(delta_vals * c_vals * term_vals)
-                
-                return total_val
+            delta_vals = self._delta_factor[type_idx]
+            mask = self._cusp_mask[type_idx]
+            
+            r1I = self._scaled_r_en(r1, nuc_pos, b_I)
+            r2I = self._scaled_r_en(r2, nuc_pos, b_I)
+            r12 = self._scaled_r_ee(r1, r2, d_I)
+            
+            def get_powers(x, degree):
+                exponents = jnp.arange(degree + 1)
+                return jnp.power(x, exponents)
+            
+            p_r1I = get_powers(r1I, self.max_degree)
+            p_r2I = get_powers(r2I, self.max_degree)
+            p_r12 = get_powers(r12, self.max_degree)
+            
+            # Get powers for all terms at once using advanced indexing
+            v_r1I_m = p_r1I[m_indices]
+            v_r2I_n = p_r2I[n_indices]
+            v_r2I_m = p_r2I[m_indices]
+            v_r1I_n = p_r1I[n_indices]
+            v_r12_o = p_r12[o_indices]
+            
+            # Compute term values
+            non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
+            cusp_term = 2.0 * v_r12_o
+            
+            # Select term type based on cusp mask
+            term_vals = jnp.where(mask, cusp_term, non_cusp_term)
+            
+            # Sum contributions
+            total_val = jnp.sum(delta_vals * c_I * term_vals)
+            return total_val
 
-            contributions = jax.vmap(compute_for_nucleus)(nuclei_group)
-            u_total += jnp.sum(contributions)
+        u_total = 0.0
+        for i in range(self.natom):
+            u_total += compute_term(i)
             
         return u_total
 
