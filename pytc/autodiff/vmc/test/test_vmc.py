@@ -424,7 +424,7 @@ class TestJastrowOptimization(unittest.TestCase):
             n_opt_steps=n_opt_steps,
             optimizer_type='adam',
             learning_rate=0.001,
-            max_vmap_batch_size=0,
+            max_vmap_batch_size=100,
             #use_importance_sampling=False,
             key=key
         )

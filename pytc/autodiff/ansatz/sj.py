@@ -77,15 +77,30 @@ def compute_jastrow_log_value(sj: SlaterJastrow, elec_coords, jastrow_params):
     Assumes unbatched elec_coords with shape (n_electrons, 3).
     Use vmap for batched processing.
     """
-    vmap_single = jax.vmap(sj.jastrow._compute, in_axes=(None, 0, None))
-    vmap_all = jax.vmap(vmap_single, in_axes=(0, None, None))
-    
-    all_pairs = vmap_all(elec_coords, elec_coords, jastrow_params)
-    
     n_electrons = elec_coords.shape[0]
-    diag_mask = 1.0 - jnp.eye(n_electrons)
     
-    return 0.5 * jnp.sum(all_pairs * diag_mask)
+    # Create indices for unique pairs (i < j)
+    # We use triu_indices to get the upper triangle indices
+    rows, cols = jnp.triu_indices(n_electrons, k=1)
+    
+    # Pre-bind the compute function to avoid overhead
+    compute_fn = sj.jastrow._compute
+    
+    def scan_body(carry, pair_idx):
+        i, j = pair_idx
+        r1 = elec_coords[i]
+        r2 = elec_coords[j]
+        
+        val = compute_fn(r1, r2, jastrow_params)
+        return carry + val, None
+
+    # Scan over all unique pairs
+    # We stack rows and cols to scan over them together
+    pair_indices = jnp.stack([rows, cols], axis=1)
+    
+    log_j_val, _ = jax.lax.scan(scan_body, 0.0, pair_indices)
+            
+    return log_j_val
 
 def eval_sj(sj: SlaterJastrow, walker, params):
     """Evaluate wavefunction for a single walker with explicit parameters."""

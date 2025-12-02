@@ -453,6 +453,8 @@ def optimize(
         training_step = make_kfac_training_step(
             mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
         )
+        # MFGN needs explicit JIT since it doesn't handle it internally like KFAC
+        training_step = jax.jit(training_step)
     else:
         # Optax setup
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
@@ -540,6 +542,8 @@ def optimize(
                 training_step = make_kfac_training_step(
                     mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
                 )
+                if optimizer_type.lower() == "mfgn":
+                    training_step = jax.jit(training_step)
             else:
                 training_step = make_training_step(
                     mcmc_step, opt_update_step, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
@@ -679,6 +683,8 @@ def optimize_ref_var(
         training_step = make_kfac_training_step(
             mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
         )
+        # MFGN needs explicit JIT since it doesn't handle it internally like KFAC
+        training_step = jax.jit(training_step)
     else:
         # Optax setup
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)

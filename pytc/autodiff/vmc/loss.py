@@ -147,8 +147,15 @@ def make_energy_loss(
             
          # batch_network takes (walkers, params) but we only differentiate params
             # So we curry it to make a function of just params
+            # batch_network takes (walkers, params) but we only differentiate params
+            # So we curry it to make a function of just params
             def log_psi_fn(p):
-                return batch_network(walkers, p)
+                # Use standard vmap with checkpointing for correct global gradients
+                return vmap_impl(
+                    jax.checkpoint(lambda w, p: ansatz_dynamic(w, p)[0][1]),
+                    in_axes=(0, None),
+                    out_axes=0
+                    )(walkers, p)
             
             # Single JVP call - now only differentiating wrt params
             log_psi_primal, log_psi_tangent = jax.jvp(
@@ -337,8 +344,12 @@ def make_variance_loss(
             # ========== Standard Gradient Method ==========
             # Compute JVP of local energies
             def compute_energies(p):
-                # Use the dynamic ansatz here
-                return batch_local_energy(walkers, p)
+                # Use standard vmap with checkpointing
+                return vmap_impl(
+                        jax.checkpoint(lambda w, p: ansatz_dynamic.local_energy(w, p)[0]),
+                        in_axes=(0, None),
+                        out_axes=0
+                        )(walkers, p)
             
             _, energy_tangent = jax.jvp(
                 compute_energies,
