@@ -7,7 +7,9 @@ import kfac_jax
 from jax import random
 from jax.lax import stop_gradient
 from typing import Dict, Any, List, Optional, Tuple
-from jax.tree_util import tree_map 
+from jax import tree_util
+import jax
+import jax.scipy.sparse.linalg as spla 
 
 def analyze_energies(sampling_results: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze energy convergence and statistics from sampling results.
@@ -165,6 +167,101 @@ def report_progress(step, total_steps, acceptance_history, step_times, energies=
         recent_energy = jnp.mean(jnp.concatenate(energies))
         print(f"  Current energy: {recent_energy:.6f}")
 
+class MatrixFreeOptimizer:
+    """Matrix-Free Optimizer using Conjugate Gradient.
+    
+    Supports:
+    - Stochastic Reconfiguration (SR) / Natural Gradient for Energy Minimization
+      (curvature="fisher")
+    - Gauss-Newton for Variance Minimization
+      (curvature="gauss_newton")
+    """
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher"):
+        self.value_and_grad_func = value_and_grad_func
+        self.learning_rate = learning_rate
+        self.damping = damping
+        self.maxiter = maxiter
+        self.curvature_type = curvature_type
+
+    def init(self, params, rng, batch):
+        return 0  # step count
+
+    def step(self, params, state, rng, batch, global_step_int=None):
+        walkers, ansatz = batch
+        
+        # 1. Compute Gradients
+        # We pass batch directly to value_and_grad_func.
+        # It should handle (walkers, ansatz) or walkers.
+        (loss, aux_data), grads = self.value_and_grad_func(params, batch)
+        
+        # 2. Define MVP
+        if self.curvature_type == "fisher":
+            # SR: S = Cov(grad_log_psi)
+            # S v = <O_k (O_l v_l)> - <O_k> <O_l v_l>
+            #     = Cov(O, O v)
+            
+            # Define log_psi function for this batch
+            def log_psi_fn(p):
+                # ansatz.__call__ returns (sign, log_det)
+                # We only care about log_det for real parameters
+                return jax.vmap(lambda w: ansatz(w, p)[0][1])(walkers)
+
+            def mvp(v):
+                # Forward: w = J v = O v
+                _, w = jax.jvp(log_psi_fn, (params,), (v,))
+                w_centered = w - jnp.mean(w)
+                
+                # Backward: J.T w_centered
+                # We can use vjp
+                _, vjp_fun = jax.vjp(log_psi_fn, params)
+                u = vjp_fun(w_centered)[0]
+                
+                # S = 1/N * J.T @ (J @ v centered)
+                n_walkers = walkers.shape[0]
+                return jax.tree_util.tree_map(lambda x: x / n_walkers, u)
+
+        elif self.curvature_type == "gauss_newton":
+            # GN: G = 2/N * J.T @ J
+            # where J is Jacobian of E_L
+            
+            def local_energy_fn(p):
+                return jax.vmap(lambda w: ansatz.local_energy(w, p)[0])(walkers)
+                
+            def mvp(v):
+                # Forward: J v
+                _, w = jax.jvp(local_energy_fn, (params,), (v,))
+                w_centered = w - jnp.mean(w)
+                
+                # Backward: J.T w
+                _, vjp_fun = jax.vjp(local_energy_fn, params)
+                u = vjp_fun(w_centered)[0]
+                
+                n_walkers = walkers.shape[0]
+                return jax.tree_util.tree_map(lambda x: 2.0 * x / n_walkers, u)
+        
+        else:
+            raise ValueError(f"Unknown curvature type: {self.curvature_type}")
+
+        # Add damping
+        def damped_mvp(v):
+            mvp_val = mvp(v)
+            return jax.tree_util.tree_map(lambda x, y: x + self.damping * y, mvp_val, v)
+
+        # 3. Solve (S + lambda I) delta = -g
+        # RHS is -grads
+        rhs = jax.tree_util.tree_map(lambda x: -x, grads)
+        
+        delta, info = spla.cg(
+            damped_mvp, 
+            rhs, 
+            maxiter=self.maxiter
+        )
+        
+        # 4. Update
+        new_params = jax.tree_util.tree_map(lambda p, d: p + self.learning_rate * d, params, delta)
+        
+        return new_params, state + 1, {"loss": loss, "aux": aux_data}
+
 def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
     """Create an optimizer based on specified type and parameters."""
     if opt_kwargs is None:
@@ -212,6 +309,17 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
         )
     elif optimizer_type.lower() == "lion":
         return optax.lion(learning_rate=learning_rate, b1=merged_kwargs.get("b1", 0.9), b2=merged_kwargs.get("b2", 0.99))
+    elif optimizer_type.lower() == "mfgn":
+        if "value_and_grad_func" not in merged_kwargs:
+            raise ValueError("MFGN optimizer requires value_and_grad_func in opt_kwargs")
+            
+        return MatrixFreeOptimizer(
+            value_and_grad_func=merged_kwargs["value_and_grad_func"],
+            learning_rate=learning_rate,
+            damping=merged_kwargs.get("damping", 1e-3),
+            maxiter=merged_kwargs.get("maxiter", 100),
+            curvature_type=merged_kwargs.get("curvature", "fisher")
+        )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
