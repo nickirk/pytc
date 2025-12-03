@@ -46,7 +46,7 @@ def make_ncusp_jastrow(mol, n_radial=1000):
     ao_values_list = []
     
     for atom_id in range(n_nuclei):
-        r_grid = jnp.linspace(1e-8, 1.5, n_radial)
+        r_grid = jnp.linspace(0.0, 1.5, n_radial)
         coords_r = jnp.zeros((n_radial, 3))
         coords_r = coords_r.at[:,0].set(r_grid)
         coords_r = coords_r + coords[atom_id]
@@ -86,6 +86,7 @@ def make_ncusp_jastrow(mol, n_radial=1000):
         # For now, just take the first s-orbital (1s) contribution
         # Assuming first s-orbital in the basis set is 1s
         sao_sum = s_ao_vals[:, 0] if s_ao_vals.shape[1] > 0 else jnp.zeros(n_radial)
+                
         sao_sums.append(sao_sum)
     
     # Instead of storing CubicSpline objects, store their coefficients
@@ -95,7 +96,8 @@ def make_ncusp_jastrow(mol, n_radial=1000):
     for i in range(n_nuclei):
         x = np.array(r_grids[i])
         y = np.array(sao_sums[i])
-        spline = CubicSpline(x, y, bc_type='natural')
+        spline = CubicSpline(x, y, bc_type='clamped')
+            
         spline_xs_list.append(jnp.array(x))
         spline_coeffs_list.append(jnp.array(spline.c))
         phi_0_list.append(spline(0.0))
@@ -237,7 +239,7 @@ def make_ncusp_jastrow(mol, n_radial=1000):
         alpha = alpha.at[2].set(
             6*X1/rc**2 - 3*X2/rc + X3/2 - 3*X4/rc - 6*X5/rc**2 - X2**2/2
         )
-        # α₃ = -8X₁/rc³ + 5X₂/rc² - X₃/rc + 3X₄/rc² + 8X₅/rc³ + X₂²/rc
+        # α₃ = -8X₁/rc³ + 5X₂/rc² - X₃/rc + 3X₄/rc² + 8X₅/rc³ + X2**2/rc
         alpha = alpha.at[3].set(
             -8*X1/rc**3 + 5*X2/rc**2 - X3/rc + 3*X4/rc**2 + 8*X5/rc**3 + X2**2/rc
         )
@@ -314,6 +316,7 @@ def make_ncusp_jastrow(mol, n_radial=1000):
             X4 = params['X4'][Z_idx]
             X = _compute_X_values(Z_idx, rc, X4)
             alpha = _compute_alpha_coeffs(Z, rc, X)
+                
             poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
 
         # Vectorized computation over nuclei
@@ -346,14 +349,15 @@ def make_ncusp_jastrow(mol, n_radial=1000):
             
             # Combine using cutoff
             cutoff = _cutoff_function(r, rc)
+            
             return jnp.where(r <= rc, log_term * cutoff, 0.0)
 
         # Sum over all nuclei using vmap
         contributions = jax.vmap(compute_nucleus_contribution)(jnp.arange(n_nuclei))
-        # contributions: (n_nuclei, nelec)
         
         total = jnp.sum(contributions)
         
-        return total/(nelectron - 1)
+        return total
 
+    apply.constrain = _clip_params
     return init, apply

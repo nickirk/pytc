@@ -155,7 +155,9 @@ def make_variance_loss(
         # Let's define batch_network
         batch_network = vmap(network, in_axes=(None, 0, 0, 0, 0), out_axes=0)
         log_psi = batch_network(params, data.positions, data.spins, data.atoms, data.charges)
-        kfac_jax.register_normal_predictive_distribution(log_psi[:, None])
+        kfac_jax.register_normal_predictive_distribution(aux_data.local_energy[:, None])
+        # kfac_jax.register_normal_predictive_distribution(diff[:, None])
+        # kfac_jax.register_normal_predictive_distribution(log_psi[:, None])
 
         return (loss, aux_data), (variance_tangent, aux_data)
 

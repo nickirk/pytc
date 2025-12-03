@@ -37,9 +37,7 @@ import optax
 import kfac_jax
 from typing import Dict, Any, Optional
 
-from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling, make_mcmc_step, make_mcmc_step_importance
-from .walker import initialize_walkers, Walker
-from .sampling import burn_in, burn_in_with_importance
+
 from .mcmc_utils import create_gradient_mask, create_optimizer
 from .loss import make_variance_loss
 

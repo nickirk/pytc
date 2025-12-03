@@ -45,7 +45,6 @@ def make_bh_jastrow(mol, terms_per_nucleus=None, epsilon=1e-8):
             BHTerm(0, 0, 2, 0.01),  
             BHTerm(0, 0, 3, 0.001),  
             BHTerm(0, 0, 4, -0.001),
-            BHTerm(1, 0, 0, -1),
             BHTerm(2, 0, 0, 0.001),
             BHTerm(3, 0, 0, 0.0001),
             BHTerm(4, 0, 0, 0.0001),
@@ -166,8 +165,10 @@ def make_bh_jastrow(mol, terms_per_nucleus=None, epsilon=1e-8):
             r_ij = r_ee + jnp.eye(n_elec) # (N, N)
             
             # Scaled distances
-            r_iI_bar = b_I * r_iI / (1.0 + b_I * r_iI)
-            r_ij_bar = d_I * r_ij / (1.0 + d_I * r_ij)
+            # Restore scaling using b and d parameters
+            # Using form x = b*r / (1 + b*r) which maps [0, inf) to [0, 1)
+            r_iI_bar = r_iI / (1.0 + r_iI)
+            r_ij_bar = r_ij / (1.0 + r_ij)
             
             # Powers
             p_r_iI = get_powers(r_iI_bar, max_degree) # (N, deg+1)
