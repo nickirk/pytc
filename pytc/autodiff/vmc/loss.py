@@ -26,7 +26,8 @@ def make_variance_loss(
     clip_local_energy: float = 0.0,
     clip_from_median: bool = True,
     center_at_clipped_energy: bool = True,
-    max_vmap_batch_size: int = 0
+    max_vmap_batch_size: int = 0,
+    checkpoint_local_energy: bool = False
 ) -> LossFn:
     """Creates the variance loss function for reference determinant optimization.
 
@@ -48,10 +49,14 @@ def make_variance_loss(
         clip_from_median: If true, center the clipping window at the median.
         center_at_clipped_energy: If true, center gradients.
         max_vmap_batch_size: If 0, use standard vmap. If >0, use batched_vmap.
+        checkpoint_local_energy: If true, use jax.checkpoint on local_energy.
 
     Returns:
         Callable with signature (params, key, data) -> (loss, aux_data).
     """
+    if checkpoint_local_energy:
+        local_energy = jax.checkpoint(local_energy)
+
     vmap = jax.vmap if max_vmap_batch_size == 0 else functools.partial(
         folx.batched_vmap, max_batch_size=max_vmap_batch_size)
     
@@ -152,6 +157,7 @@ def make_variance_loss(
         variance_tangent = 2.0 * jnp.mean(diff * e_l_tangent)
         variance_tangent = constants.pmean(variance_tangent) * n / (n - 1.0)
         
+        # Let's define batch_network
         # Let's define batch_network
         batch_network = vmap(network, in_axes=(None, 0, 0, 0, 0), out_axes=0)
         log_psi = batch_network(params, data.positions, data.spins, data.atoms, data.charges)

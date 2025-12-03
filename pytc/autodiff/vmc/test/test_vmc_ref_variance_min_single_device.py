@@ -47,71 +47,75 @@ if 'n_opt' not in FLAGS:
     flags.DEFINE_integer('n_opt', 10, 'Number of optimization steps per MCMC step.')
 if 'optimizer' not in FLAGS:
     flags.DEFINE_string('optimizer', 'kfac', 'Optimizer type: kfac, adam, etc.')
+if 'atoms' not in FLAGS:
+    flags.DEFINE_string('atoms', 'Be 0 0 0', 'Specify pyscf geometry')
+if 'basis' not in FLAGS:
+    flags.DEFINE_string('basis', 'ccpvdz', 'Specify basis')
+if 'n_burn_in' not in FLAGS:
+    flags.DEFINE_integer('n_burn_in', 1000, 'Number of burn in steps')
+
+if 'max_vmap_batch_size' not in FLAGS:
+    flags.DEFINE_integer('max_vmap_batch_size', 0, 'Maximum batch size for vmap. 0 means no batching.')
+
+if 'checkpoint_local_energy' not in FLAGS:
+    flags.DEFINE_bool('checkpoint_local_energy', True, 'Whether to checkpoint local energy calculation.')
 
 def main(argv):
   del argv
 
   logging.info("Starting Be atom Variance Optimization (Reference Det) test...")
 
-  # 1. System Definition: Be atom
-  atoms = [system.Atom('Be', (0, 0, 0))]
-  electrons = (2, 2) # Be: 1s2 2s2
+  # 1. System Definition
+  import pyscf
+  
+  logging.info(f"Initializing molecule with atoms='{FLAGS.atoms}', basis='{FLAGS.basis}'")
+  
+  pyscf_mol = pyscf.gto.M(
+      atom=FLAGS.atoms,
+      basis=FLAGS.basis,
+      unit='bohr',
+      charge=0,
+      spin=0, # Default to singlet, or let pyscf decide? Let's assume spin 0 for now or infer?
+      # Better to let pyscf decide spin if not provided, but we need to be careful.
+      # For Be (4e) it's spin 0. For H2 (2e) it's spin 0.
+      # Let's verify if we need to set spin explicitly.
+      # If we don't set spin, pyscf defaults to 0 or 1 depending on electrons.
+      # Let's stick to explicit spin=0 for now as per original code, or maybe remove it to be more general?
+      # Original code had: spin=electrons[0]-electrons[1] which was 0 for Be.
+      # Let's try not setting spin and letting pyscf handle it, or default to 0.
+      verbose=0
+  )
+  pyscf_mol.build()
+
+  # Derive FermiNet system atoms from PySCF molecule
+  atoms = []
+  for i in range(pyscf_mol.natm):
+      symbol = pyscf_mol.atom_symbol(i)
+      coords = pyscf_mol.atom_coord(i)
+      atoms.append(system.Atom(symbol, coords))
+  
+  electrons = pyscf_mol.nelec
   
   logging.info(f"Atoms: {atoms}")
   logging.info(f"Electrons: {electrons}")
 
   # 2. Hartree-Fock
   logging.info("Solving Hartree-Fock...")
-  
-  class PytcMolWrapper:
-      def __init__(self, atoms, electrons):
-          self.atoms = atoms
-          self.nelectron = sum(electrons)
-          # We need pyscf mol for basis info
-          import pyscf
-          self.pyscf_mol = pyscf.gto.M(
-              atom=[[a.symbol, a.coords] for a in atoms],
-              basis='ccpvdz',
-              unit='bohr',
-              spin=electrons[0]-electrons[1],
-              charge=0
-          )
-          self.nbas = self.pyscf_mol.nbas
-          
-      def atom_coords(self):
-          return [a.coords for a in self.atoms]
-      
-      def atom_charges(self):
-          return [a.atomic_number for a in self.atoms]
-          
-      def bas_atom(self, i):
-          return self.pyscf_mol.bas_atom(i)
-          
-      def bas_angular(self, i):
-          return self.pyscf_mol.bas_angular(i)
-          
-      def eval_gto(self, mode, coords, shls_slice=None):
-          # mode is 'GTOval_sph'
-          # coords: (n, 3)
-          # shls_slice: (start, end)
-          return self.pyscf_mol.eval_gto(mode, coords, shls_slice=shls_slice)
-
-  pytc_mol = PytcMolWrapper(atoms, electrons)
 
   hf_solution = get_hf_det(
       molecule=atoms,
       nspins=electrons,
-      basis='ccpvdz',
+      basis=FLAGS.basis,
       restricted=True
   )
   logging.info("Hartree-Fock solved.")
 
   # 3. Jastrows
   # Boys-Handy
-  bh_init, bh_apply = make_bh_jastrow(pytc_mol)
+  bh_init, bh_apply = make_bh_jastrow(pyscf_mol)
   
   # Nuclear Cusp
-  ncusp_init, ncusp_apply = make_ncusp_jastrow(pytc_mol)
+  ncusp_init, ncusp_apply = make_ncusp_jastrow(pyscf_mol)
 
   simple_ee_init, simple_ee_apply_orig = make_simple_ee_jastrow()
   
@@ -204,9 +208,9 @@ def main(argv):
   current_pmove = 0.5
 
   logging.info("Burning in MCMC (Reference Det)...")
-  for i in range(1000):
+  for i in range(FLAGS.n_burn_in):
       if i % 100 == 0:
-          logging.info(f"Burn-in step {i}/1000... pmove={current_pmove:.2f}, width={mcmc_width:.4f}")
+          logging.info(f"Burn-in step {i}/{FLAGS.n_burn_in}... pmove={current_pmove:.2f}, width={mcmc_width:.4f}")
       key, subkey = jax.random.split(key)
       data, pmove = mcmc_step(params, data, subkey, width=mcmc_width)
       
@@ -236,7 +240,9 @@ def main(argv):
       local_energy=local_energy_fn,
       clip_local_energy=0,
       clip_from_median=True,
-      center_at_clipped_energy=True
+      center_at_clipped_energy=True,
+      max_vmap_batch_size=FLAGS.max_vmap_batch_size,
+      checkpoint_local_energy=FLAGS.checkpoint_local_energy
   )
 
   if optimizer_type == 'kfac':
