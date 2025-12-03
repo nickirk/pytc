@@ -167,42 +167,64 @@ def make_bh_jastrow(mol, terms_per_nucleus=None, epsilon=1e-8):
             # Scaled distances
             # Restore scaling using b and d parameters
             # Using form x = b*r / (1 + b*r) which maps [0, inf) to [0, 1)
-            r_iI_bar = r_iI / (1.0 + r_iI)
-            r_ij_bar = r_ij / (1.0 + r_ij)
+            r_iI_bar = b_I * r_iI / (1.0 + b_I * r_iI)
+            r_ij_bar = d_I * r_ij / (1.0 + d_I * r_ij)
             
             # Powers
-            p_r_iI = get_powers(r_iI_bar, max_degree) # (N, deg+1)
-            p_r_ij = get_powers(r_ij_bar, max_degree) # (N, N, deg+1)
+            # p_r_iI = get_powers(r_iI_bar, max_degree) # (N, deg+1)
+            # p_r_ij = get_powers(r_ij_bar, max_degree) # (N, N, deg+1)
             
             # Terms: sum_{i<j} [ r_iI^m r_jI^n + r_iI^n r_jI^m ] r_ij^o
             # = sum_{i!=j} r_iI^m r_jI^n r_ij^o
             
-            # We can compute this for all terms at once
-            # v_r_iI_m: (N, n_terms)
-            v_r_iI_m = p_r_iI[:, m_inds]
-            v_r_iI_n = p_r_iI[:, n_inds]
-            
-            # v_r_ij_o: (N, N, n_terms)
-            v_r_ij_o = p_r_ij[:, :, o_inds]
-            
-            # Term values for each pair (i, j) and term k
-            # (N, 1, K) * (1, N, K) * (N, N, K) -> (N, N, K)
-            term_vals = v_r_iI_m[:, None, :] * v_r_iI_n[None, :, :] * v_r_ij_o
-            
             # Mask diagonal (i=j)
             n = r_ee.shape[0]
             mask_diag = 1.0 - jnp.eye(n)
-            term_vals = term_vals * mask_diag[..., None]
-            
-            # Sum over pairs (i, j)
-            # Result: (K,)
-            term_sums = jnp.sum(term_vals, axis=(0, 1))
-            
-            weighted_sum = jnp.sum(delta * c_I * term_sums)
+
+            # Use scan over terms to avoid (N, N, K) tensor
+            @jax.checkpoint
+            def term_scan_body(carry, idx):
+                m = m_inds[idx]
+                n = n_inds[idx]
+                o = o_inds[idx]
+                c_val = c_I[idx]
+                d_val = delta[idx]
+                
+                # Compute powers on the fly to save memory
+                # (N,)
+                v_m = r_iI_bar ** m
+                v_n = r_iI_bar ** n
+                # (N, N)
+                v_o = r_ij_bar ** o
+                
+                # (N, N)
+                # We can use einsum here for clarity and potential optimization
+                # term = v_m[:, None] * v_n[None, :] * v_o * mask_diag
+                # term_sum = jnp.sum(term)
+                
+                # Equivalent einsum: sum_{i,j} v_m[i] * v_n[j] * v_o[i,j] * mask[i,j]
+                # But mask is just diagonal.
+                # sum_{i!=j} v_m[i] * v_n[j] * v_o[i,j]
+                # = sum_{i,j} ... - sum_{i=j} ...
+                
+                full_sum = jnp.einsum('i,j,ij->', v_m, v_n, v_o)
+                diag_sum = jnp.einsum('i,i,ii->', v_m, v_n, v_o)
+                
+                term_sum = full_sum - diag_sum
+                
+                return carry + term_sum * c_val * d_val, None
+
+            weighted_sum, _ = jax.lax.scan(term_scan_body, 0.0, jnp.arange(len(m_inds)))
             return weighted_sum
 
         # Sum over all atoms
-        total_val = jnp.sum(jax.vmap(compute_atom_contribution)(jnp.arange(natom)))
+        #total_val = jnp.sum(jax.vmap(compute_atom_contribution)(jnp.arange(natom)))
+        # use scan to avoid (N, natom) tensor
+        @jax.checkpoint
+        def atom_scan_body(carry, idx):
+            return compute_atom_contribution(idx) + carry, None
+        
+        total_val, _ = jax.lax.scan(atom_scan_body, 0.0, jnp.arange(natom))
         
         return total_val
 

@@ -60,6 +60,9 @@ if 'max_vmap_batch_size' not in FLAGS:
 if 'checkpoint_local_energy' not in FLAGS:
     flags.DEFINE_bool('checkpoint_local_energy', True, 'Whether to checkpoint local energy calculation.')
 
+if 'jastrow_type' not in FLAGS:
+    flags.DEFINE_string('jastrow_type', 'bh', 'Jastrow type: bh or simple_ee')
+
 def main(argv):
   del argv
 
@@ -73,7 +76,7 @@ def main(argv):
   pyscf_mol = pyscf.gto.M(
       atom=FLAGS.atoms,
       basis=FLAGS.basis,
-      unit='bohr',
+      unit='A',
       charge=0,
       spin=0, # Default to singlet, or let pyscf decide? Let's assume spin 0 for now or infer?
       # Better to let pyscf decide spin if not provided, but we need to be careful.
@@ -124,9 +127,18 @@ def main(argv):
   
   # 4. Ansatz
   # Full Slater-Jastrow Ansatz    # Create the network (ansatz)
+  if FLAGS.jastrow_type == 'bh':
+      jastrow_apply_fn = bh_apply
+      logging.info("Using Boys-Handy Jastrow")
+  elif FLAGS.jastrow_type == 'simple_ee':
+      jastrow_apply_fn = simple_ee_apply
+      logging.info("Using Simple EE Jastrow")
+  else:
+      raise ValueError(f"Unknown jastrow_type: {FLAGS.jastrow_type}")
+
   log_psi = make_slater_jastrow(
       hf_solution, 
-      jastrow_apply=bh_apply,
+      jastrow_apply=jastrow_apply_fn,
       ncusp_apply=ncusp_apply
   )
   # Wrapper for signed log_psi (needed for local energy)
@@ -166,7 +178,10 @@ def main(argv):
   key, subkey = jax.random.split(key)
   
   params = {}
-  params['jastrow'] = bh_init()
+  if FLAGS.jastrow_type == 'bh':
+      params['jastrow'] = bh_init()
+  elif FLAGS.jastrow_type == 'simple_ee':
+      params['jastrow'] = simple_ee_init()
   params['ncusp'] = ncusp_init()
 
   
