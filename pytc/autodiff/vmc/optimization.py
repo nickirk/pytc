@@ -41,7 +41,7 @@ from .metropolis import metropolis_hastings, metropolis_hastings_importance_samp
 from .walker import initialize_walkers, Walker
 from .sampling import burn_in, burn_in_with_importance
 from .mcmc_utils import create_gradient_mask, create_optimizer
-from .loss import make_energy_loss, make_variance_loss
+from .loss import make_variance_loss
 
 
 def make_opt_update_step(loss_fn, optimizer):
@@ -409,14 +409,15 @@ def optimize(
 
     # Create loss function using modular factory
     # If user provides custom cost_fn, use it; otherwise use default mean energy
-    internal_loss_fn = make_energy_loss(
-        ansatz=ansatz,
-        optimizer_type=optimizer_type,
-        cost_fn=user_or_default_cost_fn,
-        clip_multiplier=5.0,
-        use_custom_jvp=use_custom_jvp,
-        max_vmap_batch_size=max_vmap_batch_size
-    )
+    # internal_loss_fn = make_energy_loss(
+    #     ansatz=ansatz,
+    #     optimizer_type=optimizer_type,
+    #     cost_fn=user_or_default_cost_fn,
+    #     clip_multiplier=5.0,
+    #     use_custom_jvp=use_custom_jvp,
+    #     max_vmap_batch_size=max_vmap_batch_size
+    # )
+    raise NotImplementedError("make_energy_loss has been removed. Use ferminet.loss.make_loss directly or update this function.")
 
     # Create mask for parameter freezing
     gradient_mask = create_gradient_mask(ansatz, params, frozen_params)

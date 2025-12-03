@@ -1,6 +1,6 @@
 """Ansatz module for quantum many-body wavefunctions."""
 
-from .sj import SlaterJastrow
-from .det import SlaterDet
+from .sj import make_slater_jastrow
+from .det import get_hf_det
 
-__all__ = ['SlaterJastrow', 'SlaterDet']
+__all__ = ['make_slater_jastrow', 'get_hf_det']
