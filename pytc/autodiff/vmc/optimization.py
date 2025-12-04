@@ -394,7 +394,8 @@ def optimize(
             ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key, params, move_type=move_type)
+            ansatz, walkers, burn_in_steps, step_size, key, params, 
+            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
     
     print("Starting optimization...")
     
@@ -425,7 +426,7 @@ def optimize(
     if use_importance_sampling:
         mcmc_step = make_mcmc_step_importance(ansatz, step_size)
     else:
-        mcmc_step = make_mcmc_step(ansatz, step_size, move_type)
+        mcmc_step = make_mcmc_step(ansatz, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
 
     # Create optimizer and training step using factory functions
     if optimizer_type.lower() == "kfac":
@@ -535,7 +536,7 @@ def optimize(
             if use_importance_sampling:
                 mcmc_step = make_mcmc_step_importance(ansatz, step_size)
             else:
-                mcmc_step = make_mcmc_step(ansatz, step_size, move_type)
+                mcmc_step = make_mcmc_step(ansatz, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
             
             # Recreate training_step with new mcmc_step
             if optimizer_type.lower() in ["kfac", "mfgn"]:
@@ -638,7 +639,8 @@ def optimize_ref_var(
     # Burn-in walkers using the initial combined parameters
     print("Performing burn-in...")
     walkers, acceptance_history, key, step_size = burn_in(
-        ref_det, walkers, burn_in_steps, step_size, key, params=params, move_type=move_type)
+        ref_det, walkers, burn_in_steps, step_size, key, params=params, 
+        move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
     print(f"Burn-in complete. Final step size: {step_size:.4f}")
 
 
@@ -655,7 +657,7 @@ def optimize_ref_var(
         loss_fn = cost_fn
 
     # Create MCMC step function
-    mcmc_step = make_mcmc_step(ref_det, step_size, move_type)
+    mcmc_step = make_mcmc_step(ref_det, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
 
     # Create optimizer and training step
     if optimizer_type.lower() == "kfac":

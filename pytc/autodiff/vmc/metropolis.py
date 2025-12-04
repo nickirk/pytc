@@ -7,12 +7,14 @@ including both standard MCMC and importance sampling with drift-diffusion.
 import jax
 import jax.numpy as jnp
 from jax import random
+import folx
+import functools
 
 from .moves import _all_electron_move, _one_electron_move, _compute_green_function
 from .walker import Walker
 
 
-def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one"):
+def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one", batch_ansatz=None):
     """Perform one step of Metropolis-Hastings sampling for quantum wavefunction.
     
     Args:
@@ -22,6 +24,7 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one")
         key: PRNG key
         params: contains jastrow_params and linear_coeffs
         move_type: "all" to move all electrons at once, "one" to move one electron at a time
+        batch_ansatz: Optional pre-vmapped ansatz function
     
     Returns:
         Tuple containing:
@@ -30,9 +33,11 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one")
     """
     # Choose move type
     if move_type == "all":
-        psi_values, new_psi_values, current_walker, proposals = _all_electron_move(ansatz, walker, step_size, key, params)
+        psi_values, new_psi_values, current_walker, proposals = _all_electron_move(
+            ansatz, walker, step_size, key, params, batch_ansatz=batch_ansatz)
     elif move_type == "one":
-        psi_values, new_psi_values, current_walker, proposals = _one_electron_move(ansatz, walker, step_size, key, params)
+        psi_values, new_psi_values, current_walker, proposals = _one_electron_move(
+            ansatz, walker, step_size, key, params, batch_ansatz=batch_ansatz)
     else:
         raise ValueError("move_type must be either 'all' or 'one'")
     
@@ -187,7 +192,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     return new_walkers, acceptance_rate
 
 
-def make_mcmc_step(ansatz, step_size, move_type="one"):
+def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
     """Factory to create a JIT-compilable MCMC step function.
     
     This function validates move_type at creation time (not JIT time) and returns
@@ -197,6 +202,7 @@ def make_mcmc_step(ansatz, step_size, move_type="one"):
         ansatz: Wavefunction object (used for validation, not captured)
         step_size: Standard deviation of Gaussian proposal for MCMC moves
         move_type: "all" to move all electrons at once, "one" to move one electron at a time
+        max_vmap_batch_size: If > 0, use folx.batched_vmap with this batch size
     
     Returns:
         A JIT-compiled function with signature:
@@ -208,6 +214,16 @@ def make_mcmc_step(ansatz, step_size, move_type="one"):
     # Validate move_type at factory creation time (not JIT time)
     if move_type not in ["all", "one"]:
         raise ValueError(f"move_type must be either 'all' or 'one', got '{move_type}'")
+    
+    # Create batch_ansatz based on max_vmap_batch_size
+    if max_vmap_batch_size > 0:
+        batch_ansatz = folx.batched_vmap(
+            lambda w, p: ansatz(w, p), 
+            in_axes=(0, None), 
+            max_batch_size=max_vmap_batch_size
+        )
+    else:
+        batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
     
     def mcmc_step(ansatz, walkers, key, params):
         """Single MCMC step - fully JIT-compatible.
@@ -223,7 +239,8 @@ def make_mcmc_step(ansatz, step_size, move_type="one"):
             acceptance_rate: Fraction of proposals that were accepted
         """
         new_walkers, acceptance_rate = metropolis_hastings(
-            ansatz, walkers, step_size, key, params, move_type=move_type
+            ansatz, walkers, step_size, key, params, 
+            move_type=move_type, batch_ansatz=batch_ansatz
         )
         return new_walkers, acceptance_rate
     
