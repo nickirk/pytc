@@ -152,11 +152,11 @@ class BoysHandy(Jastrow):
     
     def _scaled_r_en(self, r_electron, r_nuclear, b):
         r = self._safe_norm(r_electron - r_nuclear)
-        return r / (1.0 + r) 
+        return r * b / (1.0 + r * b) 
         
     def _scaled_r_ee(self, r1, r2, d):
         r = self._safe_norm(r1 - r2)
-        return r / (1.0 + r) 
+        return r * d / (1.0 + r * d) 
         
     def init_params(self, **kwargs):
         b_raw = jnp.ones(self.n_types) * 0.5  
@@ -179,7 +179,7 @@ class BoysHandy(Jastrow):
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
         
-        c = jnp.where(self._cusp_mask, 0.5, c_raw)
+        c = jnp.where(self._cusp_mask, 1/(2*d[:, None]), c_raw)
 
         def compute_term(atom_idx):
             type_idx = self.atom_type_map[atom_idx]
