@@ -73,8 +73,8 @@ class TestNeuralEN(TestNeuralBase):
     
     def setUp(self):
         super().setUp()
-        self.jastrow_h2 = NeuralEN(self.h2_mol, layer_widths=[4, 4])
-        self.jastrow_h2o = NeuralEN(self.h2o_mol, layer_widths=[4, 4])
+        self.jastrow_h2 = NeuralEN.create(self.h2_mol, layer_widths=[4, 4])
+        self.jastrow_h2o = NeuralEN.create(self.h2o_mol, layer_widths=[4, 4])
         self.params_h2 = self.jastrow_h2.init_params(key=self.key)
         self.params_h2o = self.jastrow_h2o.init_params(key=self.key)
 
@@ -96,7 +96,7 @@ class TestNeuralEE(TestNeuralBase):
     def setUp(self):
         super().setUp()
         # Pass any molecule since EE only depends on electron coordinates
-        self.jastrow = NeuralEE(self.h2_mol, layer_widths=[4, 4])
+        self.jastrow = NeuralEE.create(self.h2_mol, layer_widths=[4, 4])
         self.params = self.jastrow.init_params(key=self.key)
 
     def test_symmetry(self):
@@ -107,7 +107,7 @@ class TestNeuralEEN(TestNeuralBase):
     
     def setUp(self):
         super().setUp()
-        self.jastrow_h2o = NeuralEEN(mol=self.h2o_mol, layer_widths=[4, 4])
+        self.jastrow_h2o = NeuralEEN.create(mol=self.h2o_mol, layer_widths=[4, 4])
         self.params_h2o = self.jastrow_h2o.init_params(key=self.key)
 
     def test_h2o_symmetry(self):
@@ -137,12 +137,12 @@ class TestCompositeNeural(TestNeuralBase):
     def setUp(self):
         super().setUp()
         # Create individual components
-        self.en = NeuralEN(self.h2_mol, layer_widths=[4, 4])
-        self.ee = NeuralEE(self.h2_mol, layer_widths=[4, 4])
-        self.een = NeuralEEN(mol=self.h2_mol, layer_widths=[4, 4])
+        self.en = NeuralEN.create(self.h2_mol, layer_widths=[4, 4])
+        self.ee = NeuralEE.create(self.h2_mol, layer_widths=[4, 4])
+        self.een = NeuralEEN.create(mol=self.h2_mol, layer_widths=[4, 4])
         
         # Create composite with initialized params
-        self.jastrow = CompositeJastrow([self.en, self.ee, self.een])
+        self.jastrow = CompositeJastrow.create([self.en, self.ee, self.een])
         self.params = [
             self.en.init_params(key=self.key),
             self.ee.init_params(key=self.key),

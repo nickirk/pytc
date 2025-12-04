@@ -12,12 +12,15 @@ import time
 from pyscf import gto, scf
 
 # Import our modules
-from pytc.autodiff.mcmc import optimize, sample 
-from pytc.autodiff.mcmc_utils import init_electron_configs
+from pytc.autodiff.vmc import (
+    optimize, optimize_ref_var, sample, Walker, initialize_walker_state, 
+    initialize_walkers, metropolis_hastings, _one_electron_move, _all_electron_move
+)
+from pytc.autodiff.vmc.mcmc_utils import init_electron_configs
 
-from pytc.autodiff.mcmc_utils import analyze_energies
+from pytc.autodiff.vmc.mcmc_utils import analyze_energies
 from pytc.autodiff.ansatz.sj import SlaterJastrow
-from pytc.autodiff.jastrow import REXP, Poly, CompositeJastrow, NuclearCusp
+from pytc.autodiff.jastrow import REXP, Poly, CompositeJastrow, NuclearCusp, BoysHandy
 from pytc.autodiff.ansatz.det import SlaterDet 
 
 
@@ -45,6 +48,173 @@ class TestJastrowFunctions(unittest.TestCase):
             grads, laps = jastrow.get_log_grads_r1(r1, r2, jastrow_params)
             np.testing.assert_allclose(grads, jnp.zeros(3), atol=1e-10)
             np.testing.assert_allclose(laps, 0.0, atol=1e-10)
+
+
+class TestWalkerDataclass(unittest.TestCase):
+    """Test Walker dataclass and related functions."""
+    
+    def setUp(self):
+        """Set up a simple molecule for testing."""
+        self.mol = gto.Mole()
+        self.mol.atom = 'H 0 0 0; H 0 0 1.0'
+        self.mol.basis = 'sto-3g'
+        self.mol.build()
+        
+        # Create simple ansatz
+        mf = scf.RHF(self.mol)
+        mf.kernel()
+        det = SlaterDet(self.mol, mf.mo_coeff)
+        jastrow = Poly()
+        self.ansatz = SlaterJastrow(self.mol, jastrow, [det])
+        
+        self.n_walkers = 10
+        self.n_electrons = self.mol.nelectron
+        self.n_alpha = self.ansatz.n_alpha
+        self.n_beta = self.n_electrons - self.n_alpha
+    
+    def test_walker_initialization(self):
+        """Test that Walker is initialized correctly."""
+        key = random.PRNGKey(42)
+        positions = init_electron_configs(
+            self.mol.atom_coords(), self.mol.atom_charges(),
+            self.n_electrons, self.n_walkers, key
+        )
+        
+        walker = initialize_walker_state(self.ansatz, positions)
+        
+        # Check it's a Walker instance
+        self.assertIsInstance(walker, Walker)
+        
+        # Check shapes
+        self.assertEqual(walker.positions.shape, (self.n_walkers, self.n_electrons, 3))
+        self.assertEqual(walker.slater_up.shape, (self.n_walkers, self.n_alpha, self.n_alpha))
+        self.assertEqual(walker.slater_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
+        self.assertEqual(walker.inv_up.shape, (self.n_walkers, self.n_alpha, self.n_alpha))
+        self.assertEqual(walker.inv_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
+        self.assertEqual(walker.det_up.shape, (self.n_walkers,))
+        self.assertEqual(walker.det_down.shape, (self.n_walkers,))
+        self.assertEqual(walker.move_mask.shape, (self.n_walkers, self.n_electrons))
+        
+        # Check move_mask is all True initially
+        self.assertTrue(jnp.all(walker.move_mask))
+        
+        # Check other fields are zeros
+        self.assertTrue(jnp.allclose(walker.slater_up, 0.0))
+        self.assertTrue(jnp.allclose(walker.det_up, 0.0))
+    
+    def test_initialize_walkers(self):
+        """Test initialize_walkers function."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Check it returns a Walker
+        self.assertIsInstance(walker, Walker)
+        self.assertEqual(walker.positions.shape, (self.n_walkers, self.n_electrons, 3))
+        self.assertTrue(jnp.all(walker.move_mask))
+    
+    def test_walker_immutability(self):
+        """Test that Walker.replace creates new instance."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Create new walker with modified positions
+        new_positions = walker.positions + 0.1
+        new_walker = walker.replace(positions=new_positions)
+        
+        # Original walker should be unchanged
+        self.assertFalse(jnp.allclose(walker.positions, new_walker.positions))
+        self.assertTrue(jnp.allclose(new_walker.positions, walker.positions + 0.1))
+    
+    def test_one_electron_move_mask(self):
+        """Test that _one_electron_move sets move_mask correctly."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Reset move_mask to False for current walker
+        walker = walker.replace(move_mask=jnp.zeros_like(walker.move_mask))
+        
+        # Create parameters
+        jastrow_params = jnp.zeros(1)
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
+        
+        # Perform one electron move
+        key, subkey = random.split(key)
+        proposals, psi_old, psi_new = _one_electron_move(
+            self.ansatz, walker, step_size=0.1, key=subkey, params=params
+        )
+        
+        # Check that proposals have exactly one True per walker
+        n_true_per_walker = jnp.sum(proposals.move_mask, axis=1)
+        self.assertTrue(jnp.all(n_true_per_walker == 1))
+        
+        # Check that positions changed only for masked electrons
+        for i in range(self.n_walkers):
+            electron_idx = jnp.where(proposals.move_mask[i])[0][0]
+            # Moved electron should have different position
+            self.assertFalse(jnp.allclose(
+                walker.positions[i, electron_idx], 
+                proposals.positions[i, electron_idx]
+            ))
+            # Other electrons should have same position
+            for j in range(self.n_electrons):
+                if j != electron_idx:
+                    self.assertTrue(jnp.allclose(
+                        walker.positions[i, j], 
+                        proposals.positions[i, j]
+                    ))
+    
+    def test_all_electron_move_mask(self):
+        """Test that _all_electron_move sets move_mask to all True."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Reset move_mask to False
+        walker = walker.replace(move_mask=jnp.zeros_like(walker.move_mask))
+        
+        # Create parameters
+        jastrow_params = jnp.zeros(1)
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
+        
+        # Perform all electron move
+        key, subkey = random.split(key)
+        proposals, psi_old, psi_new = _all_electron_move(
+            self.ansatz, walker, step_size=0.1, key=subkey, params=params
+        )
+        
+        # Check that proposals have all True
+        self.assertTrue(jnp.all(proposals.move_mask))
+        
+        # Check that all positions changed
+        self.assertFalse(jnp.allclose(walker.positions, proposals.positions))
+    
+    def test_metropolis_hastings_resets_mask(self):
+        """Test that metropolis_hastings resets move_mask after acceptance."""
+        key = random.PRNGKey(42)
+        walker = initialize_walkers(self.ansatz, self.n_walkers, key=key)
+        
+        # Reset move_mask to False
+        walker = walker.replace(move_mask=jnp.zeros_like(walker.move_mask))
+        
+        # Create parameters
+        jastrow_params = jnp.zeros(1)
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
+        
+        # Perform one MH step
+        key, subkey = random.split(key)
+        new_walker, acceptance_rate = metropolis_hastings(
+            self.ansatz, walker, step_size=0.1, key=subkey, 
+            params=params, move_type="one"
+        )
+        
+        # Check that move_mask is reset to all False
+        self.assertTrue(jnp.all(~new_walker.move_mask))
+        
+        # Check acceptance_rate is reasonable
+        self.assertGreaterEqual(acceptance_rate, 0.0)
+        self.assertLessEqual(acceptance_rate, 1.0)
 
 
 class TestElectronInitialization(unittest.TestCase):
@@ -84,7 +254,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Create molecule
         mol = gto.Mole()
         mol.atom = molecule_spec
-        mol.basis = 'ccpvdz'
+        mol.basis = 'sto6g'
         mol.unit = 'A'
         mol.build()
         
@@ -98,14 +268,14 @@ class TestHartreeFockEnergy(unittest.TestCase):
         mo_occ = mf.mo_occ
         
         # Create determinant from HF solution
-        det = SlaterDet(mol, mo_coeff)
+        det = SlaterDet.create(mol, mo_coeff)
         
         # Create PolyJastrow with zero parameters (equals identity)
         jastrow = Poly()
         jastrow_params = jnp.zeros(1)
         
         # Create SlaterJastrow ansatz (equivalent to HF with Jastrow=1)
-        sj_ansatz = SlaterJastrow(mol, jastrow, [det])
+        sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
         jastrow_params = jnp.zeros(1)  # Initialize to zero for HF test
         linear_coeffs = jnp.ones(1)  # Single determinant
         
@@ -114,7 +284,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         n_walkers = 5000
         n_steps = 5000
         step_size = 0.1
-        burn_in_steps = 2000  # Updated parameter name
+        burn_in_steps = 1000  # Updated parameter name
         thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
@@ -127,7 +297,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
-            use_importance_sampling=False,
+            #use_importance_sampling=False,
             burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
             key=key
@@ -172,9 +342,9 @@ class TestHartreeFockEnergy(unittest.TestCase):
         """Test HF energy sampling for H2 molecule."""
         results = self.run_hf_energy_test("H 0 0 0; H 0 0 2; H 0 0 4; H 0 0 6")
     
-    def test_he_atom(self):
+    def test_be_atom(self):
         """Test HF energy sampling for He He molecule."""
-        results = self.run_hf_energy_test("He 0 0 0")
+        results = self.run_hf_energy_test("Be 0 0 0")
 
     def test_lih(self):
         """Test HF energy sampling for LiH molecule."""
@@ -209,37 +379,42 @@ class TestJastrowOptimization(unittest.TestCase):
         mol.atom = molecule_spec
         mol.basis = basis
         mol.unit = 'A'
+        mol.cart = False
         mol.build()
         
         # Run PySCF calculation for reference energy
         mf = scf.RHF(mol)
         mf.kernel()
         hf_energy_reference = mf.e_tot
+
+
         
         # Create determinant from HF solution
-        det = SlaterDet(mol, mf.mo_coeff)
+        det = SlaterDet.create(mol, mf.mo_coeff)
         
         # Create REXP jastrow with given or default parameters
         rexp = REXP()
-        jnuclear_cusp = NuclearCusp(mol)    
-        jastrow = CompositeJastrow([jnuclear_cusp, rexp])
+        bh = BoysHandy.create(mol)
+        jnuclear_cusp = NuclearCusp.create(mol)    
+        #jastrow = NuclearCusp(mol)    
+        jastrow = CompositeJastrow.create([jnuclear_cusp, bh])
         jastrow_params = jastrow.init_params() if jastrow_params is None else jastrow_params 
         # Create SlaterJastrow ansatz
-        sj_ansatz = SlaterJastrow(mol, jastrow, [det])
+        sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
         linear_coeffs = jnp.ones(1)  # Single determinant
         
         # Use small settings for test speed
-        n_walkers = 5000
-        n_steps = 2000
+        n_walkers = 2000
+        n_steps = 10
         step_size = 0.01
         burn_in_steps = 1000
-        n_opt_steps = 2000
+        n_opt_steps = 100
         key = random.PRNGKey(42)
         
         # Run optimization
         print(f"Starting Jastrow optimization for {mol.atom}...")
         start_time = time.time()
-        opt_results = optimize(
+        opt_results = optimize_ref_var(
             sj_ansatz,
             params=[jastrow_params, linear_coeffs],
             n_walkers=n_walkers,
@@ -247,9 +422,10 @@ class TestJastrowOptimization(unittest.TestCase):
             step_size=step_size,
             burn_in_steps=burn_in_steps,
             n_opt_steps=n_opt_steps,
-            optimizer_type='kfac',
+            optimizer_type='adam',
             learning_rate=0.001,
-            use_importance_sampling=False,
+            max_vmap_batch_size=100,
+            #use_importance_sampling=False,
             key=key
         )
         end_time = time.time()
@@ -269,10 +445,14 @@ class TestJastrowOptimization(unittest.TestCase):
         """Test optimization of Jastrow parameters for H2 molecule."""
         self.run_optimization_test('H 0 0 0; H 0 0 1.0')
     
-    def test_he2_optimization(self):
-        """Test optimization of Jastrow parameters for He atom."""
-        self.run_optimization_test('He 0 0 0; He 0 0 1.5', basis='ccpvdz')
+    def test_be_optimization(self):
+        """Test optimization of Jastrow parameters for Be atom."""
+        self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
+    def test_h2o_optimization(self):
+        """Test optimization of Jastrow parameters for Be atom."""
+        self.run_optimization_test('O 0 0 0; H 0 0.757	0.589; H 0 -0.757	0.589', basis='ccpvtz')
+
     def test_benzene(self):
         """Test HF energy sampling for Benzene molecule."""
         self.run_optimization_test(

@@ -1,6 +1,8 @@
 from pytc.autodiff import jastrow
 import jax.numpy as jnp
+from flax import struct
 
+@struct.dataclass
 class REXP(jastrow.Jastrow):
     """
     A class representing a radial exponential (REXP) Jastrow factor.
@@ -14,9 +16,8 @@ class REXP(jastrow.Jastrow):
         A small positive value added to norms to prevent division by zero
         or other numerical instabilities. Defaults to 1e-8.
     """
-    def __init__(self, name=None, epsilon=1e-8):
-        super().__init__(name=name)
-        self.epsilon = epsilon
+    epsilon: float = struct.field(pytree_node=False, default=1e-8)
+    name: str = struct.field(pytree_node=False, default=None)
         
     def _safe_norm(self, x):
         """Compute norm with a small epsilon to prevent division by zero."""

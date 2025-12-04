@@ -2,14 +2,13 @@
 
 import jax.numpy as jnp
 from .jastrow import Jastrow
+from flax import struct
 
+@struct.dataclass
 class Poly(Jastrow):
     """Polynomial Jastrow factor."""
-    
-    def __init__(self, n=1):
-        self.n = n
-        """Initialize polynomial Jastrow factor structure."""
-        super().__init__()
+    n: int = struct.field(pytree_node=False, default=1)
+    name: str = struct.field(pytree_node=False, default=None)
     
     def _compute(self, r1, r2, params):
         """Compute Jastrow exponent u(r).

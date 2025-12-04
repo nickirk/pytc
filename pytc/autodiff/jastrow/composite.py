@@ -5,21 +5,22 @@ import h5py
 import pickle
 import numpy as np # Needed for saving/loading attributes
 import os
+from flax import struct
+from typing import List
 
+@struct.dataclass
 class CompositeJastrow(Jastrow):
     """Combines multiple Jastrow factors by adding their exponents."""
+    jastrows: List[Jastrow]
+    jastrow_types: List[str] = struct.field(pytree_node=False)
+    jastrow_names: List[str] = struct.field(pytree_node=False)
+    name: str = struct.field(pytree_node=False, default=None)
     
-    def __init__(self, jastrows):
-        """Initialize with list of Jastrow factors.
-        
-        Args:
-            jastrows: List of Jastrow instances to combine
-        """
-        super().__init__()
-        self.jastrows = jastrows
-        # Track jastrow identifiers for filtering
-        self.jastrow_types = [j.__class__.__name__ for j in jastrows]
-        self.jastrow_names = [j.name for j in jastrows]
+    @classmethod
+    def create(cls, jastrows, name=None):
+        jastrow_types = [j.__class__.__name__ for j in jastrows]
+        jastrow_names = [j.name for j in jastrows]
+        return cls(name=name, jastrows=jastrows, jastrow_types=jastrow_types, jastrow_names=jastrow_names)
         
     def _compute(self, r1, r2, params):
         """Compute sum of Jastrow exponents.
