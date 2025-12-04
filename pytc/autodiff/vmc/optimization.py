@@ -445,6 +445,7 @@ def optimize(
         # MFGN setup
         opt_kwargs["value_and_grad_func"] = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
         opt_kwargs["curvature"] = "fisher" # Energy minimization uses SR
+        opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
@@ -677,6 +678,7 @@ def optimize_ref_var(
         # MFGN setup
         opt_kwargs["value_and_grad_func"] = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
+        opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)

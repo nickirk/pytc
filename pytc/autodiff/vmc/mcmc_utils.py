@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from jax import tree_util
 import jax
 import jax.scipy.sparse.linalg as spla 
+import folx
+import functools 
 
 def analyze_energies(sampling_results: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze energy convergence and statistics from sampling results.
@@ -176,12 +178,13 @@ class MatrixFreeOptimizer:
     - Gauss-Newton for Variance Minimization
       (curvature="gauss_newton")
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher"):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
         self.maxiter = maxiter
         self.curvature_type = curvature_type
+        self.max_vmap_batch_size = max_vmap_batch_size
 
     def init(self, params, rng, batch):
         return 0  # step count
@@ -195,26 +198,41 @@ class MatrixFreeOptimizer:
         (loss, aux_data), grads = self.value_and_grad_func(params, batch)
         
         # 2. Define MVP
+        # 2. Define MVP
         if self.curvature_type == "fisher":
             # SR: S = Cov(grad_log_psi)
-            # S v = <O_k (O_l v_l)> - <O_k> <O_l v_l>
-            #     = Cov(O, O v)
             
-            # Define log_psi function for this batch
-            def log_psi_fn(p):
-                # ansatz.__call__ returns (sign, log_det)
-                # We only care about log_det for real parameters
-                return jax.vmap(lambda w: ansatz(w, p)[0][1])(walkers)
+            # Helper for single walker log_psi
+            def single_log_psi(w, p):
+                return ansatz(w, p)[0][1]
 
             def mvp(v):
-                # Forward: w = J v = O v
-                _, w = jax.jvp(log_psi_fn, (params,), (v,))
+                # Forward: w = J v
+                # Compute JVP per walker: d(log_psi)/dp * v
+                def compute_jvp(w):
+                    _, tangent = jax.jvp(lambda p: single_log_psi(w, p), (params,), (v,))
+                    return tangent
+
+                if self.max_vmap_batch_size > 0:
+                    w = folx.batched_vmap(compute_jvp, max_batch_size=self.max_vmap_batch_size)(walkers)
+                else:
+                    w = jax.vmap(compute_jvp)(walkers)
+                
                 w_centered = w - jnp.mean(w)
                 
                 # Backward: J.T w_centered
-                # We can use vjp
-                _, vjp_fun = jax.vjp(log_psi_fn, params)
-                u = vjp_fun(w_centered)[0]
+                # Compute VJP per walker: (d(log_psi)/dp)^T * w_i
+                def compute_vjp(w_el, w_val):
+                    _, vjp_fun = jax.vjp(lambda p: single_log_psi(w_el, p), params)
+                    return vjp_fun(w_val)[0]
+                
+                if self.max_vmap_batch_size > 0:
+                    per_walker_grads = folx.batched_vmap(compute_vjp, max_batch_size=self.max_vmap_batch_size)(walkers, w_centered)
+                else:
+                    per_walker_grads = jax.vmap(compute_vjp)(walkers, w_centered)
+                
+                # Sum over walkers
+                u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
                 
                 # S = 1/N * J.T @ (J @ v centered)
                 n_walkers = walkers.shape[0]
@@ -222,19 +240,36 @@ class MatrixFreeOptimizer:
 
         elif self.curvature_type == "gauss_newton":
             # GN: G = 2/N * J.T @ J
-            # where J is Jacobian of E_L
             
-            def local_energy_fn(p):
-                return jax.vmap(lambda w: ansatz.local_energy(w, p)[0])(walkers)
-                
+            # Helper for single walker local energy
+            def single_local_energy(w, p):
+                return ansatz.local_energy(w, p)[0]
+
             def mvp(v):
-                # Forward: J v
-                _, w = jax.jvp(local_energy_fn, (params,), (v,))
+                # Forward: w = J v
+                def compute_jvp(w):
+                    _, tangent = jax.jvp(lambda p: single_local_energy(w, p), (params,), (v,))
+                    return tangent
+
+                if self.max_vmap_batch_size > 0:
+                    w = folx.batched_vmap(compute_jvp, max_batch_size=self.max_vmap_batch_size)(walkers)
+                else:
+                    w = jax.vmap(compute_jvp)(walkers)
+                
                 w_centered = w - jnp.mean(w)
                 
                 # Backward: J.T w
-                _, vjp_fun = jax.vjp(local_energy_fn, params)
-                u = vjp_fun(w_centered)[0]
+                def compute_vjp(w_el, w_val):
+                    _, vjp_fun = jax.vjp(lambda p: single_local_energy(w_el, p), params)
+                    return vjp_fun(w_val)[0]
+                
+                if self.max_vmap_batch_size > 0:
+                    per_walker_grads = folx.batched_vmap(compute_vjp, max_batch_size=self.max_vmap_batch_size)(walkers, w_centered)
+                else:
+                    per_walker_grads = jax.vmap(compute_vjp)(walkers, w_centered)
+                
+                # Sum over walkers
+                u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
                 
                 n_walkers = walkers.shape[0]
                 return jax.tree_util.tree_map(lambda x: 2.0 * x / n_walkers, u)
@@ -318,7 +353,8 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             learning_rate=learning_rate,
             damping=merged_kwargs.get("damping", 1e-3),
             maxiter=merged_kwargs.get("maxiter", 100),
-            curvature_type=merged_kwargs.get("curvature", "fisher")
+            curvature_type=merged_kwargs.get("curvature", "fisher"),
+            max_vmap_batch_size=merged_kwargs.get("max_vmap_batch_size", 0)
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
