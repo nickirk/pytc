@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax import random
 
 
-def _all_electron_move(ansatz, walker, step_size, key, params):
+def _all_electron_move(ansatz, walker, step_size, key, params, batch_ansatz=None):
     """Move all electrons at once for each walker.
     
     Args:
@@ -19,14 +19,17 @@ def _all_electron_move(ansatz, walker, step_size, key, params):
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
         params: Parameters for the ansatz
+        batch_ansatz: Optional pre-vmapped ansatz function
         
     Returns:
         proposals: Walker with proposed new positions and all-True move_mask
         psi_values: Wavefunction values for current walker
         new_psi_values: Wavefunction values for proposals
+        current_walker: Updated current walker (if ansatz updates it)
     """
-    # ansatz() now works with single walkers, so vmap over batch
-    batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+    # Use provided batch_ansatz or create default vmap
+    if batch_ansatz is None:
+        batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
     
     # Compute initial wavefunction values
     psi_values, current_walker = batch_ansatz(walker, params)
@@ -47,7 +50,7 @@ def _all_electron_move(ansatz, walker, step_size, key, params):
     # Return updated current_walker
     return psi_values, new_psi_values, current_walker, proposals
 
-def _one_electron_move(ansatz, walker, step_size, key, params):
+def _one_electron_move(ansatz, walker, step_size, key, params, batch_ansatz=None):
     """Move one randomly selected electron for each walker.
     
     Args:
@@ -56,14 +59,17 @@ def _one_electron_move(ansatz, walker, step_size, key, params):
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
         params: Parameters for the ansatz
+        batch_ansatz: Optional pre-vmapped ansatz function
         
     Returns:
         proposals: Walker with proposed new positions and move_mask set
         psi_values: Wavefunction values for current walker
         new_psi_values: Wavefunction values for proposals
+        walker_updated: Updated current walker
     """
-    # ansatz() now works with single walkers, so vmap over batch
-    batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+    # Use provided batch_ansatz or create default vmap
+    if batch_ansatz is None:
+        batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
     
     # Select electron to move for each walker
     key, subkey = random.split(key)

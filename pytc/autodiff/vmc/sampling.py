@@ -16,6 +16,7 @@ from .metropolis import metropolis_hastings, metropolis_hastings_importance_samp
 from .walker import initialize_walkers
 from .mcmc_utils import prepare_sampling_results, report_progress
 from functools import partial
+import folx
 
 
 def burn_in(ansatz, 
@@ -25,7 +26,8 @@ def burn_in(ansatz,
             key=None, 
             params=None, 
             report_interval=100, 
-            move_type="one"):
+            move_type="one",
+            max_vmap_batch_size=0):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -51,7 +53,11 @@ def burn_in(ansatz,
     # We partial out move_type since it's a static string argument
     # step_size is passed as argument so it can vary without recompilation
     mcmc_step = jax.jit(
-        partial(metropolis_hastings, move_type=move_type)
+        partial(metropolis_hastings, move_type=move_type, batch_ansatz=folx.batched_vmap(
+            lambda w, p: ansatz(w, p), 
+            in_axes=(0, None), 
+            max_batch_size=max_vmap_batch_size
+        ) if max_vmap_batch_size > 0 else None)
     )
     
     start_time = time.time()
@@ -127,7 +133,8 @@ def sample(
     params=None,
     key=None,
     move_type: str = "one",
-    report_interval: int = 100
+    report_interval: int = 100,
+    max_vmap_batch_size: int = 0
 ) -> Dict[str, Any]:
     """Perform MCMC sampling for quantum wavefunction.
     
@@ -168,7 +175,8 @@ def sample(
             ansatz, walkers, burn_in_steps, step_size, key, params)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
-            ansatz, walkers, burn_in_steps, step_size, key=key, params=params, move_type=move_type)
+            ansatz, walkers, burn_in_steps, step_size, key=key, params=params, 
+            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
     
     # Storage for collected samples
     collected_samples = []
@@ -180,7 +188,11 @@ def sample(
         mcmc_step = jax.jit(metropolis_hastings_importance_sampling)
     else:
         mcmc_step = jax.jit(
-            partial(metropolis_hastings, move_type=move_type)
+            partial(metropolis_hastings, move_type=move_type, batch_ansatz=folx.batched_vmap(
+            lambda w, p: ansatz(w, p), 
+            in_axes=(0, None), 
+            max_batch_size=max_vmap_batch_size
+        ) if max_vmap_batch_size > 0 else None)
         )
         
     # JIT-compile energy evaluation
