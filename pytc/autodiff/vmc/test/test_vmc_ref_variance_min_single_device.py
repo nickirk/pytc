@@ -29,6 +29,7 @@ from pytc.autodiff.ansatz.sj import make_slater_jastrow
 from pytc.autodiff.ansatz.det import get_hf_det
 from pytc.autodiff.vmc.loss import make_variance_loss
 from pytc.autodiff.vmc.mcmc_utils import create_optimizer
+from pytc.utils.checkpoint import Checkpoint
 
 # Patch constants for serial execution
 constants.pmean = lambda x, axis_name=None: x
@@ -58,10 +59,13 @@ if 'max_vmap_batch_size' not in FLAGS:
     flags.DEFINE_integer('max_vmap_batch_size', 0, 'Maximum batch size for vmap. 0 means no batching.')
 
 if 'checkpoint_local_energy' not in FLAGS:
-    flags.DEFINE_bool('checkpoint_local_energy', True, 'Whether to checkpoint local energy calculation.')
+    flags.DEFINE_bool('checkpoint_local_energy', False, 'Whether to checkpoint local energy calculation.')
 
 if 'jastrow_type' not in FLAGS:
     flags.DEFINE_string('jastrow_type', 'bh', 'Jastrow type: bh or simple_ee')
+
+if 'checkpoint_path' not in FLAGS:
+    flags.DEFINE_string('checkpoint_path', None, 'Path to save/load checkpoints.')
 
 def main(argv):
   del argv
@@ -78,14 +82,7 @@ def main(argv):
       basis=FLAGS.basis,
       unit='A',
       charge=0,
-      spin=0, # Default to singlet, or let pyscf decide? Let's assume spin 0 for now or infer?
-      # Better to let pyscf decide spin if not provided, but we need to be careful.
-      # For Be (4e) it's spin 0. For H2 (2e) it's spin 0.
-      # Let's verify if we need to set spin explicitly.
-      # If we don't set spin, pyscf defaults to 0 or 1 depending on electrons.
-      # Let's stick to explicit spin=0 for now as per original code, or maybe remove it to be more general?
-      # Original code had: spin=electrons[0]-electrons[1] which was 0 for Be.
-      # Let's try not setting spin and letting pyscf handle it, or default to 0.
+      spin=0, 
       verbose=0
   )
   pyscf_mol.build()
@@ -184,6 +181,20 @@ def main(argv):
       params['jastrow'] = simple_ee_init()
   params['ncusp'] = ncusp_init()
 
+  # Load from checkpoint if available
+  if FLAGS.checkpoint_path:
+      checkpointer = Checkpoint(FLAGS.checkpoint_path)
+      loaded_params = checkpointer.load()
+      if loaded_params:
+          logging.info(f"Loaded parameters from checkpoint {FLAGS.checkpoint_path}")
+          # Depending on how params are saved (wrapped or not), unwrap if needed.
+          # Our Checkpoint utility saves 'items' which is just params in our case.
+          # But if we saved as {'params': params}, we'd need to extract.
+          # For now, assuming direct save.
+          params = loaded_params
+      else:
+          logging.info(f"No checkpoint found at {FLAGS.checkpoint_path}, using initial params.")
+
   
   logging.info("Params initialized.")
 
@@ -257,82 +268,37 @@ def main(argv):
       clip_from_median=True,
       center_at_clipped_energy=True,
       max_vmap_batch_size=FLAGS.max_vmap_batch_size,
-      checkpoint_local_energy=FLAGS.checkpoint_local_energy
+      checkpoint_local_energy=FLAGS.checkpoint_local_energy,
   )
 
-  if optimizer_type == 'kfac':
-      def value_and_grad_func(params, rng, batch):
-          return jax.value_and_grad(evaluate_loss, argnums=0, has_aux=True)(params, rng, batch)
-          
-      optimizer = create_optimizer(
-          'kfac', 
-          learning_rate, 
-          opt_kwargs={
-              'value_and_grad_func': value_and_grad_func,
-              'value_func_has_aux': True,
-              'value_func_has_rng': True,
-              'initial_damping': 1.0,
-              'use_adaptive_learning_rate': False,
-              'norm_constraint': 1e-3,
-          }
-      )
-      
-      # Initialize KFAC state
-      opt_state = optimizer.init(params, subkey, data)
-      
-      def opt_step(data, params, state, key, global_step_int):
-          new_params, new_state, stats = optimizer.step(params, state, key, batch=data, learning_rate=learning_rate)
-          loss_val = stats['loss']
-          aux_data = stats['aux']
-          return new_params, new_state, loss_val, aux_data
+  from pytc.autodiff.vmc.optimization import optimize_ref_var
 
-  else:
-      optimizer = create_optimizer(optimizer_type, learning_rate)
-      opt_state = optimizer.init(params)
-      
-      def opt_step(data, params, state, key, global_step_int=None):
-          loss_key = key
-          (loss_val, aux_data), grads = jax.value_and_grad(evaluate_loss, argnums=0, has_aux=True)(
-              params, loss_key, data
-          )
-          updates, new_state = optimizer.update(grads, state, params)
-          new_params = optax.apply_updates(params, updates)
-          return new_params, new_state, loss_val, aux_data
+  # Create a simple wrapper for ansatz to satisfy optimization interface
+  class AnsatzWrapper:
+      def __init__(self, ncusp_apply):
+          self.ncusp_apply = ncusp_apply
+          # Add other attributes if needed by optimize_ref_var defaults, 
+          # but we are passing explicit params/data/mcmc_step so they shouldn't be touched.
+          self.dets = [None] # Dummy
+          self.jastrow = None # Dummy
 
-      opt_step = jax.jit(opt_step)
+  ansatz_wrapper = AnsatzWrapper(ncusp_apply)
 
-  # opt_step = jax.jit(opt_step)
-  
-  # mcmc_width = jnp.asarray(0.1)
-  # adapt_frequency = 10
-  # pmoves = np.zeros(adapt_frequency)
-  
-  logging.info("Starting optimization...")
-  
-  for t in range(FLAGS.iterations):
-      # MCMC Step
-      key, subkey = jax.random.split(key)
-      data, pmove = mcmc_step(params, data, subkey, mcmc_width)
-      
-      # Update MCMC width
-      pmoves[t % adapt_frequency] = pmove
-      if t > 0 and t % adapt_frequency == 0:
-          mcmc_width, pmoves = mcmc.update_mcmc_width(
-              t, mcmc_width, adapt_frequency, current_pmove, pmoves
-          )
-      current_pmove = pmove
-
-      # Optimization Steps (now a single step per outer loop iteration)
-      key, subkey = jax.random.split(key) # New subkey for opt_step
-      global_step = t # global_step is now just t
-      params, opt_state, loss_val, aux_data = opt_step(data, params, opt_state, subkey, global_step)
-      
-      # Constrain ncusp parameters
-      if 'ncusp' in params:
-          params['ncusp'] = ncusp_apply.constrain(params['ncusp'])
-      
-      if t % 1 == 0:
-          logging.info(f"Step {t}: Variance = {loss_val:.6f}, Energy = {aux_data.energy:.6f}, pmove = {pmove:.2f}")
+  # Run optimization using the refactored function
+  results = optimize_ref_var(
+      ansatz=ansatz_wrapper,
+      params=params,
+      data=data,
+      mcmc_step=mcmc_step,
+      loss_fn=evaluate_loss,
+      optimizer_type=optimizer_type,
+      learning_rate=learning_rate,
+      n_opt_steps=FLAGS.iterations,
+      checkpoint_path=FLAGS.checkpoint_path,
+      mcmc_width=mcmc_width, # Pass current width
+      adapt_frequency=FLAGS.n_opt, # Pass adapt frequency
+      burn_in_steps=FLAGS.n_burn_in
+  )
 
 if __name__ == '__main__':
   app.run(main)

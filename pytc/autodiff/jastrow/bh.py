@@ -49,15 +49,15 @@ def make_bh_jastrow(mol, terms_per_nucleus=None, epsilon=1e-8):
             BHTerm(3, 0, 0, 0.0001),
             BHTerm(4, 0, 0, 0.0001),
             BHTerm(2, 2, 0, -0.001),
-            BHTerm(2, 0, 2, 0.01),
-            BHTerm(2, 2, 2, 0.01),
-            BHTerm(4, 0, 2, 0.01),
-            BHTerm(2, 0, 4, 0.01),
-            BHTerm(4, 2, 2, 0.01),
-            BHTerm(6, 0, 2, 0.01),
-            BHTerm(4, 0, 4, 0.01),
-            BHTerm(2, 2, 4, 0.01),
-            BHTerm(2, 0, 6, 0.01),
+            BHTerm(2, 0, 2, 0.0001),
+            BHTerm(2, 2, 2, 0.0001),
+            BHTerm(4, 0, 2, 0.0001),
+            BHTerm(2, 0, 4, 0.0001),
+            BHTerm(4, 2, 2, 0.0001),
+            BHTerm(6, 0, 2, 0.0001),
+            BHTerm(4, 0, 4, 0.0001),
+            BHTerm(2, 2, 4, 0.0001),
+            BHTerm(2, 0, 6, 0.0001),
         ]
         terms_per_atom_type = [default_terms_for_one_nucleus for _ in range(n_types)]
     else:
@@ -129,11 +129,10 @@ def make_bh_jastrow(mol, terms_per_nucleus=None, epsilon=1e-8):
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
         
-        # Apply cusp mask to c parameters (fix cusp coeff to 0.5 if masked)
-        # Note: In original code, it was 0.5. But usually cusp depends on spin.
-        # Here we assume spin-independent or average cusp?
-        # Original code: c = jnp.where(self._cusp_mask, 0.5, c_raw)
-        c = jnp.where(cusp_mask, 0.5, c_raw)
+        # Apply cusp mask to c parameters (fix cusp coeff to 1/(2d) if masked)
+        # c = 1 / (2d) ensures the cusp condition is satisfied regardless of d
+        d_expanded = d[:, None]
+        c = jnp.where(cusp_mask, 1.0 / (2.0 * d_expanded), c_raw)
         
         # Helper to compute powers
         def get_powers(x, degree):
@@ -207,7 +206,7 @@ def make_bh_jastrow(mol, terms_per_nucleus=None, epsilon=1e-8):
                 # sum_{i!=j} v_m[i] * v_n[j] * v_o[i,j]
                 # = sum_{i,j} ... - sum_{i=j} ...
                 
-                full_sum = jnp.einsum('i,j,ij->', v_m, v_n, v_o)
+                full_sum = jnp.einsum('i,j,ij->', v_m, v_n, v_o) 
                 diag_sum = jnp.einsum('i,i,ii->', v_m, v_n, v_o)
                 
                 term_sum = full_sum - diag_sum
