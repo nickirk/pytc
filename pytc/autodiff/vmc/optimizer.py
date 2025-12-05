@@ -59,7 +59,7 @@ class NewtonOptimizer:
                 # Compute Jacobian for all walkers: Shape (N, P)
                 # Use batched_vmap if requested to avoid OOM
                 if self.max_vmap_batch_size > 0:
-                    jac = folx.batched_vmap(single_log_psi_grad, max_batch_size=self.max_vmap_batch_size)(walkers, params)
+                    jac = folx.batched_vmap(single_log_psi_grad, max_batch_size=self.max_vmap_batch_size, in_axes=(0, None))(walkers, params)
                 else:
                     jac = jax.vmap(single_log_psi_grad, in_axes=(0, None))(walkers, params)
                 
@@ -86,7 +86,7 @@ class NewtonOptimizer:
                 
                 # Compute Jacobian for all walkers: Shape (N, P)
                 if self.max_vmap_batch_size > 0:
-                    jac = folx.batched_vmap(single_local_energy_grad, max_batch_size=self.max_vmap_batch_size)(walkers, params)
+                    jac = folx.batched_vmap(single_local_energy_grad, max_batch_size=self.max_vmap_batch_size, in_axes=(0, None))(walkers, params)
                 else:
                     jac = jax.vmap(single_local_energy_grad, in_axes=(0, None))(walkers, params)
                 
