@@ -8,6 +8,7 @@ import folx
 
 def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     """Compute ∇J/J and ∇²J/J with explicit parameters."""
+    # TODO: improve the efficiency of this function
     n_electrons = elec_coords.shape[0]
     
     # Memory-efficient implementation of the original averaged strategy
