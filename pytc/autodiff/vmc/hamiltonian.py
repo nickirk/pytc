@@ -8,50 +8,54 @@ import folx
 
 def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     """Compute ∇J/J and ∇²J/J with explicit parameters."""
-    # TODO: improve the efficiency of this function
     n_electrons = elec_coords.shape[0]
     
-    # Memory-efficient implementation of the original averaged strategy
-    # We use jax.lax.map to loop over electrons sequentially (O(N) memory)
-    # instead of vmapping over all pairs (O(N^2) memory).
-    # This preserves the exact math of:
-    # grad[i] = 0.5 * (sum_{j!=i} grad_1(ri, rj) + sum_{j!=i} grad_2(rj, ri))
+    # Fully vectorized implementation (O(N^2) parallelism)
+    # Optimized for symmetric Jastrow factors (u(r1, r2) = u(r2, r1))
     
-    indices = jnp.arange(n_electrons)
+    # 1. Create all pairs (i, j)
+    # Broadcast to (N, N, 3)
+    r1 = elec_coords[:, None, :]  # (N, 1, 3) - represents i
+    r2 = elec_coords[None, :, :]  # (1, N, 3) - represents j
     
-    def compute_electron_i(carrier):
-        idx_i, r_i = carrier
+    # 2. Compute gradients and laplacians for all pairs
+    # We only compute gradients w.r.t first argument (r_i)
+    # Due to symmetry, sum_j grad_1(ri, rj) == sum_i grad_2(ri, rj)
+    # And specifically for the total gradient on electron k:
+    # grad_k U = sum_{j!=k} grad_1(rk, rj)
+    
+    def compute_pair_grads(r_i, r_j):
+        g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j, jastrow_params)
+        return g1, l1
         
-        # Inner vmap over all other electrons j
-        def compute_pair(idx_j, r_j):
-            # Mask self-interaction
-            mask = jnp.where(idx_i == idx_j, 0.0, 1.0)
-            
-            # grad_1(ri, rj) and lap_1(ri, rj)
-            g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j, jastrow_params)
-            
-            # grad_2(rj, ri) and lap_2(rj, ri)
-            g2, l2 = sj.jastrow.get_log_grads_r2(r_j, r_i, jastrow_params)
-            
-            return (g1 * mask, l1 * mask, g2 * mask, l2 * mask)
-            
-        # vmap over j
-        g1s, l1s, g2s, l2s = jax.vmap(compute_pair, in_axes=(0, 0))(indices, elec_coords)
-        
-        # Sum over j
-        sum_g1 = jnp.sum(g1s, axis=0)
-        sum_l1 = jnp.sum(l1s, axis=0)
-        sum_g2 = jnp.sum(g2s, axis=0)
-        sum_l2 = jnp.sum(l2s, axis=0)
-        
-        # Average
-        grad_i = 0.5 * (sum_g1 + sum_g2)
-        lap_i = 0.5 * (sum_l1 + sum_l2)
-        
-        return grad_i, lap_i
-
-    # Map over electrons (sequential to save memory)
-    grad_J_over_J, lap_sum = jax.lax.map(compute_electron_i, (indices, elec_coords))
+    # vmap over j (inner), then i (outer)
+    inner_vmap = jax.vmap(compute_pair_grads, in_axes=(None, 0))
+    outer_vmap = jax.vmap(inner_vmap, in_axes=(0, None))
+    
+    # Compute for all pairs
+    # g1s: (N, N, 3), l1s: (N, N)
+    g1s, l1s = outer_vmap(elec_coords, elec_coords)
+    
+    # 3. Mask diagonal (i == j)
+    mask = 1.0 - jnp.eye(n_electrons)
+    # Expand mask for gradients (N, N, 1)
+    mask_grad = mask[:, :, None]
+    
+    g1s = g1s * mask_grad
+    l1s = l1s * mask
+    
+    # 4. Sum over j to get values for each electron i
+    sum_g1 = jnp.sum(g1s, axis=1)
+    sum_l1 = jnp.sum(l1s, axis=1)
+    
+    # 5. Result
+    # grad_k U = sum_{j!=k} grad_1(rk, rj)
+    # The factor of 0.5 from the definition U = 0.5 * sum u(ri, rj) cancels with the 
+    # fact that we have two identical sums (one for i=k, one for j=k).
+    # So we just take the sum over j of grad_1.
+    
+    grad_J_over_J = sum_g1
+    lap_sum = sum_l1
     
     grad_squared = jnp.sum(grad_J_over_J**2, axis=1)
     lap_J_over_J = lap_sum + grad_squared
