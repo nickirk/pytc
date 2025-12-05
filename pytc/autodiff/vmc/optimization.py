@@ -40,7 +40,8 @@ from typing import Dict, Any, Optional
 from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling, make_mcmc_step, make_mcmc_step_importance
 from .walker import initialize_walkers, Walker
 from .sampling import burn_in, burn_in_with_importance
-from .mcmc_utils import create_gradient_mask, create_optimizer
+from .mcmc_utils import init_electron_configs
+from .optimizer import create_optimizer, create_gradient_mask
 from .loss import make_energy_loss, make_variance_loss
 
 
@@ -428,10 +429,13 @@ def optimize(
     else:
         mcmc_step = make_mcmc_step(ansatz, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
 
+    # Define loss function JVP for KFAC and Newton
+    loss_fn_jvp = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
+
     # Create optimizer and training step using factory functions
     if optimizer_type.lower() == "kfac":
         # KFAC specific setup
-        opt_kwargs["value_and_grad_func"] = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
+        opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["value_func_has_aux"] = True
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
@@ -443,8 +447,8 @@ def optimize(
         )
     elif optimizer_type.lower() == "mfgn":
         # MFGN setup
-        opt_kwargs["value_and_grad_func"] = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
-        opt_kwargs["curvature"] = "fisher" # Energy minimization uses SR
+        opt_kwargs["value_and_grad_func"] = loss_fn_jvp
+        opt_kwargs["curvature"] = "fisher" # Variance minimization uses Fisher
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
@@ -661,9 +665,12 @@ def optimize_ref_var(
     mcmc_step = make_mcmc_step(ref_det, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
 
     # Create optimizer and training step
+    # Define loss function JVP for KFAC and Newton
+    loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+
     if optimizer_type.lower() == "kfac":
         # KFAC setup
-        opt_kwargs["value_and_grad_func"] = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+        opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["value_func_has_aux"] = True
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
@@ -674,9 +681,9 @@ def optimize_ref_var(
         training_step = make_kfac_training_step(
             mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
         )
-    elif optimizer_type.lower() == "mfgn":
-        # MFGN setup
-        opt_kwargs["value_and_grad_func"] = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+    elif optimizer_type.lower() == "newton":
+        # Newton setup
+        opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
@@ -716,7 +723,7 @@ def optimize_ref_var(
     compilation_start = time.time()
     
     key, subkey = random.split(key)
-    if optimizer_type.lower() in ["kfac", "mfgn"]:
+    if optimizer_type.lower() in ["kfac", "newton"]:
         walkers, params, opt_state, loss, aux_data, pmove = training_step(
             ansatz, walkers, params, opt_state, subkey, 0
         )
@@ -725,7 +732,7 @@ def optimize_ref_var(
             ansatz, walkers, params, opt_state, subkey
         )
     compilation_end = time.time()
-    print(f"Compilation finished in {compilation_end - compilation_start:.2f}s")
+    print(f"Compilation + First Step finished in {compilation_end - compilation_start:.2f}s")
     
     # Process first step results
     variance_val = float(jax.device_get(loss))
@@ -752,7 +759,7 @@ def optimize_ref_var(
     for opt_step in range(1, n_opt_steps):
         key, subkey = random.split(key)
         
-        if optimizer_type.lower() in ["kfac", "mfgn"]:
+        if optimizer_type.lower() in ["kfac", "newton"]:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
                 ansatz, walkers, params, opt_state, subkey, opt_step
             )
