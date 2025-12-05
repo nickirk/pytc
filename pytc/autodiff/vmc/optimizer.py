@@ -285,7 +285,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             maxiter=merged_kwargs.get("maxiter", 100),
             curvature_type=merged_kwargs.get("curvature", "fisher"),
             max_vmap_batch_size=merged_kwargs.get("max_vmap_batch_size", 0),
-            solver=merged_kwargs.get("solver", "cg"),
+            solver=merged_kwargs.get("solver", "exact"),
             solve_kwargs=merged_kwargs.get("solve_kwargs", None)
         )
     else:
