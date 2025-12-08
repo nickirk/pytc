@@ -7,9 +7,10 @@ from .metropolis import metropolis_hastings, metropolis_hastings_importance_samp
 from .sampling import burn_in, burn_in_with_importance, sample
 from .optimization import optimize, optimize_ref_var
 from .mcmc_utils import (
-    prepare_sampling_results, report_progress, create_optimizer,
-    init_electron_configs, create_gradient_mask
+    prepare_sampling_results, report_progress,
+    init_electron_configs
 )
+from .optimizer import create_optimizer, create_gradient_mask
 
 __all__ = [
     # Walker functions

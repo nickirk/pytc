@@ -404,8 +404,8 @@ class TestJastrowOptimization(unittest.TestCase):
         linear_coeffs = jnp.ones(1)  # Single determinant
         
         # Use small settings for test speed
-        n_walkers = 2000
-        n_steps = 10
+        n_walkers = 1000
+        n_steps = 20
         step_size = 0.01
         burn_in_steps = 1000
         n_opt_steps = 100
@@ -422,10 +422,10 @@ class TestJastrowOptimization(unittest.TestCase):
             step_size=step_size,
             burn_in_steps=burn_in_steps,
             n_opt_steps=n_opt_steps,
-            optimizer_type='adam',
-            learning_rate=0.001,
-            max_vmap_batch_size=100,
-            #use_importance_sampling=False,
+            optimizer_type='newton',
+            learning_rate=0.1,
+            max_vmap_batch_size=0,
+            opt_kwargs={'damping': 1e-6, 'solver': 'exact'},
             key=key
         )
         end_time = time.time()
@@ -441,17 +441,21 @@ class TestJastrowOptimization(unittest.TestCase):
         
         return opt_results
     
-    def test_h2_optimization(self):
+    def test_h2(self):
         """Test optimization of Jastrow parameters for H2 molecule."""
         self.run_optimization_test('H 0 0 0; H 0 0 1.0')
     
-    def test_be_optimization(self):
+    def test_be(self):
         """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
-    def test_h2o_optimization(self):
+    def test_h2o(self):
         """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('O 0 0 0; H 0 0.757	0.589; H 0 -0.757	0.589', basis='ccpvtz')
+
+    def test_n2(self):
+        """Test optimization of Jastrow parameters for Be atom."""
+        self.run_optimization_test('N 0 0 0; N 0 0 1.097', basis='ccpvdz')
 
     def test_benzene(self):
         """Test HF energy sampling for Benzene molecule."""
