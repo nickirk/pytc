@@ -159,8 +159,8 @@ class BoysHandy(Jastrow):
         return r * d / (1.0 + r * d) 
         
     def init_params(self, **kwargs):
-        b_raw = jnp.ones(self.n_types) * 0.5  
-        d_raw = jnp.ones(self.n_types) * 0.5
+        b_raw = jnp.ones(self.n_types)   
+        d_raw = jnp.ones(self.n_types)   
         
         c_raw = []
         for type_terms in self.terms_per_atom_type:

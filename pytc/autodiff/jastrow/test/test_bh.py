@@ -64,8 +64,16 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         # Create BH Jastrow with single nucleus, so terms_per_nucleus is a list with one element
         bh = BoysHandy.create(mol, terms_per_nucleus=[bh_terms])
         
-        # Initialize parameters - b_raw and d_raw don't matter since scaling is r/(1+r)
+        # Initialize parameters
         bh_params = bh.init_params(key=self.key)
+        
+        # SM7 uses fixed scaling with b=1.0 and d=1.0
+        # We need to set BH parameters to match this for comparison
+        # softplus(x) = 1.0 => x = log(exp(1) - 1)
+        val_1 = 1.0
+        raw_val = float(np.log(np.exp(val_1) - 1.0))
+        bh_params['b_raw'] = jnp.ones_like(bh_params['b_raw']) * raw_val
+        bh_params['d_raw'] = jnp.ones_like(bh_params['d_raw']) * raw_val
         
         # Create SM7 Jastrow
         sm7 = SM7(atom=atom_symbol)
