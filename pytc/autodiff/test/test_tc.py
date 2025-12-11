@@ -8,6 +8,7 @@ from pyscf import gto, scf
 from pytc.tc import TC as TC_numpy
 from pytc.autodiff.tc import TC as TC_jax
 from pytc.autodiff.jastrow import Poly
+from pytc.autodiff import tc_helper
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -49,7 +50,7 @@ class TestTC(unittest.TestCase):
         self.jastrow_numpy = PolyNumpy(self.params)
         
         # Create TC objects
-        self.tc_jax = TC_jax(self.mf, self.jastrow_jax)  # No params in constructor
+        self.tc_jax = TC_jax.from_pyscf(self.mf, self.jastrow_jax)
         self.tc_numpy = TC_numpy(self.mf, self.jastrow_numpy)
         
     def test_grid_initialization(self):
@@ -61,7 +62,10 @@ class TestTC(unittest.TestCase):
         
     def test_basis_evaluation(self):
         """Test basis function evaluation on grid."""
-        rho_jax, nabla_rho_jax = self.tc_jax._eval_basis_on_grid()
+        # In new design, rho is pre-computed and stored in struct
+        rho_jax = self.tc_jax.rho
+        nabla_rho_jax = self.tc_jax.nabla_rho
+        
         rho_numpy, nabla_rho_numpy = self.tc_numpy._eval_basis_on_grid()
         
         np.testing.assert_allclose(
@@ -77,8 +81,16 @@ class TestTC(unittest.TestCase):
         
     def test_get_2b_against_numpy(self):
         """Test two-body term calculation against numpy version."""
-        # Compute two-body terms with explicit parameter passing
-        result_jax = self.tc_jax.get_2b(self.params)
+        # Compute two-body correction with explicit parameter passing
+        correction_jax = self.tc_jax.get_2b(self.params)
+        
+        # Get standard ERI
+        eri1 = tc_helper.get_eri(self.mf)
+        
+        # Combine to get full effective ERI
+        result_jax = eri1 + correction_jax
+        
+        # Numpy version returns full effective ERI
         result_numpy = self.tc_numpy.get_2b()
         
         # Convert JAX array to numpy for comparison
@@ -94,10 +106,14 @@ class TestTC(unittest.TestCase):
         """Test handling of molecular orbital coefficients."""
         # Test with explicit mo_coeff
         new_mo = self.mf.mo_coeff + 0.1
-        tc_jax_new = TC_jax(self.mf, self.jastrow_jax, mo_coeff=new_mo)
+        
+        tc_jax_new = TC_jax.from_pyscf(self.mf, self.jastrow_jax, mo_coeff=new_mo)
         tc_numpy_new = TC_numpy(self.mf, self.jastrow_numpy, mo_coeff=new_mo)
         
-        result_jax = tc_jax_new.get_2b(self.params)
+        correction_jax = tc_jax_new.get_2b(self.params)
+        eri1 = tc_helper.get_eri(self.mf, mo_coeff=new_mo)
+        result_jax = eri1 + correction_jax
+        
         result_numpy = tc_numpy_new.get_2b()
         
         np.testing.assert_allclose(

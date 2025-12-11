@@ -1,89 +1,104 @@
 """JAX implementation of Transcorrelated method."""
 
 from functools import partial
+from typing import Any, Optional
 import numpy as np
 import jax
 import jax.numpy as jnp
-from pyscf import dft, ao2mo
+from flax import struct
+from pyscf import dft
 from . import kmat as kmat_jax
 
+@struct.dataclass
 class TC:
-    """JAX implementation of Transcorrelated method."""
+    """JAX implementation of Transcorrelated method using flax dataclass.
     
-    def __init__(self, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
-        """Initialize the TC object.
+    Attributes:
+        grid_points: Grid points for numerical integration (N_grid, 3)
+        weights: Grid weights (N_grid,)
+        rho: Basis functions evaluated on grid (N_orb, N_grid)
+        nabla_rho: Basis function gradients on grid (N_orb, N_grid, 3)
+        n_orb: Number of orbitals (static)
+        grid_lvl: Grid level (static)
+        jastrow_factor: Jastrow factor instance (PyTree)
+        mo_coeff: Molecular orbital coefficients (N_ao, N_orb)
+    """
+    grid_points: jnp.ndarray
+    weights: jnp.ndarray
+    rho: jnp.ndarray
+    nabla_rho: jnp.ndarray
+    n_orb: int = struct.field(pytree_node=False)
+    grid_lvl: int = struct.field(pytree_node=False)
+    jastrow_factor: Any = struct.field(pytree_node=True)
+    mo_coeff: jnp.ndarray = struct.field(default=None)
+
+    @classmethod
+    def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
+        """Initialize TC object from PySCF mean-field object.
         
         Args:
             mf: PySCF mean-field object
-            jastrow_factor: JAX Jastrow factor instance without parameters
+            jastrow_factor: JAX Jastrow factor instance
             mo_coeff: Optional molecular orbital coefficients
             grid_lvl: Grid level for numerical integration
+            
+        Returns:
+            TC: Initialized TC object
         """
-        self.mf = mf
-        self.mol = mf.mol
-        self.mo_coeff = mo_coeff if mo_coeff is not None else mf.mo_coeff
-        self.n_orb = self.mo_coeff.shape[1]
-        self.verbose = mf.verbose if hasattr(mf, 'verbose') else 0
-        self.jastrow_factor = jastrow_factor
-        
-        # Cache for evaluated quantities
-        self._rho = None
-        self._nabla_rho = None
-        self._eri1 = None
+        mol = mf.mol
+        if mo_coeff is None:
+            mo_coeff = mf.mo_coeff
+        n_orb = mo_coeff.shape[1]
         
         # Initialize grid
-        self._init_grid(grid_lvl)
-        self._eval_basis_on_grid()
-    
-    def _init_grid(self, grid_lvl=2):
-        """Initialize numerical integration grid using PySCF."""
-        grids = dft.gen_grid.Grids(self.mol)
+        grids = dft.gen_grid.Grids(mol)
         grids.level = grid_lvl
         grids.build()
         
-        # Convert to JAX arrays immediately
-        self.grid_points = jnp.asarray(grids.coords)
-        self.weights = jnp.asarray(grids.weights)
-    
-    def _eval_basis_on_grid(self):
-        """Evaluate basis functions using PySCF's numint."""
-        if self._rho is not None and self._nabla_rho is not None:
-            return self._rho, self._nabla_rho
+        grid_points = jnp.asarray(grids.coords)
+        weights = jnp.asarray(grids.weights)
         
+        # Evaluate basis on grid
         # Use PySCF to evaluate AOs with numpy arrays
-        ao = dft.numint.eval_ao(self.mol, jax.device_get(self.grid_points), deriv=1)
+        ao = dft.numint.eval_ao(mol, grids.coords, deriv=1)
         ao_values = ao[0].T  # (N_ao, N_grid)
         ao_gradients = ao[1:4].transpose(2, 1, 0)  # (N_ao, N_grid, 3)
         
         # Transform to MO basis
-        if self.mo_coeff is not None:
-            mo_values = np.dot(self.mo_coeff.T, ao_values)
-            mo_gradients = np.einsum('ji,jnc->inc', self.mo_coeff, ao_gradients)
-            ao_values, ao_gradients = mo_values, mo_gradients
+        mo_values = np.dot(mo_coeff.T, ao_values)
+        mo_gradients = np.einsum('ji,jnc->inc', mo_coeff, ao_gradients)
         
-        # Cache as JAX arrays
-        self._rho = jnp.asarray(ao_values)
-        self._nabla_rho = jnp.asarray(ao_gradients)
+        rho = jnp.asarray(mo_values)
+        nabla_rho = jnp.asarray(mo_gradients)
         
-        return self._rho, self._nabla_rho
+        return cls(
+            grid_points=grid_points,
+            weights=weights,
+            rho=rho,
+            nabla_rho=nabla_rho,
+            n_orb=n_orb,
+            grid_lvl=grid_lvl,
+            jastrow_factor=jastrow_factor,
+            mo_coeff=jnp.asarray(mo_coeff)
+        )
     
-    @partial(jax.jit, static_argnums=(0,))
-    def get_2b(self, jastrow_params, dm1=None, dm2=None):
-        """Calculate two-body terms K1 + K2 + K3.
+    @jax.jit
+    def get_2b(self, jastrow_params):
+        """Calculate TC correction terms (K1 + K2 + K3).
         
         Args:
             jastrow_params: Parameters for the Jastrow factor
-            dm1: Optional one-body density matrix
-            dm2: Optional two-body density matrix
+            
+        Returns:
+            jnp.ndarray: The TC correction term (negative of the K terms sum)
+                         such that H_TC = H_MF + correction
         """
-        # Get orbital values on grid
-        rho, nabla_rho = self._eval_basis_on_grid()
-        
         # Prepare paired quantities
-        rho_paired = jnp.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
-        rho_nabla_rho_paired = jnp.einsum('pnd,rn->prnd', nabla_rho, rho).reshape(-1, len(self.weights), 3)
+        # rho shape: (n_orb, n_grid)
+        rho_paired = jnp.einsum('in,jn->ijn', self.rho, self.rho).reshape(-1, len(self.weights))
+        rho_nabla_rho_paired = jnp.einsum('pnd,rn->prnd', self.nabla_rho, self.rho).reshape(-1, len(self.weights), 3)
         
-        # Compute K terms with explicit parameter passing
+        # Compute K terms
         k_nabla = kmat_jax.calc_K1(
             rho_paired, rho_nabla_rho_paired,
             self.jastrow_factor, jastrow_params,
@@ -105,18 +120,7 @@ class TC:
         result += k_nabla
         result += result.transpose(2, 3, 0, 1)
         
-        # Get ERI and convert at the end
-        eri1 = jnp.asarray(self.get_eri1())
-        return eri1 - result
-    
-    def get_eri1(self):
-        """Get two-body integrals in MO basis."""
-        if self._eri1 is None:
-            # Compute ERI using PySCF with numpy arrays
-            eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
-            eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
-            self._eri1 = eri1
-        return self._eri1
+        return -result
 
     def get_3b(self):
         """Compute all three-body integrals."""
