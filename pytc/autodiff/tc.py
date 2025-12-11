@@ -82,9 +82,8 @@ class TC:
             mo_coeff=jnp.asarray(mo_coeff)
         )
     
-    @jax.jit
     def get_2b(self, jastrow_params):
-        """Calculate TC correction terms (K1 + K2 + K3).
+        """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
         
         Args:
             jastrow_params: Parameters for the Jastrow factor
@@ -93,22 +92,68 @@ class TC:
             jnp.ndarray: The TC correction term (negative of the K terms sum)
                          such that H_TC = H_MF + correction
         """
-        # Prepare paired quantities
-        # rho shape: (n_orb, n_grid)
-        rho_paired = jnp.einsum('in,jn->ijn', self.rho, self.rho).reshape(-1, len(self.weights))
-        rho_nabla_rho_paired = jnp.einsum('pnd,rn->prnd', self.nabla_rho, self.rho).reshape(-1, len(self.weights), 3)
+        n_devices = jax.local_device_count()
+        n_grid = self.grid_points.shape[0]
         
-        # Compute K terms
-        k_nabla = kmat_jax.calc_K1(
-            rho_paired, rho_nabla_rho_paired,
-            self.jastrow_factor, jastrow_params,
-            self.grid_points, self.weights
+        # Pad grid to be divisible by n_devices
+        remainder = n_grid % n_devices
+        if remainder != 0:
+            padding = n_devices - remainder
+            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+            padded_weights = jnp.pad(self.weights, ((0, padding),))
+            padded_rho = jnp.pad(self.rho, ((0, 0), (0, padding)))
+            padded_nabla_rho = jnp.pad(self.nabla_rho, ((0, 0), (0, padding), (0, 0)))
+        else:
+            padded_grid_points = self.grid_points
+            padded_weights = self.weights
+            padded_rho = self.rho
+            padded_nabla_rho = self.nabla_rho
+            
+        n_grid_padded = padded_grid_points.shape[0]
+        n_per_device = n_grid_padded // n_devices
+        
+        # Shard arrays: (n_devices, n_per_device, ...)
+        # grid: (N, 3) -> (n_dev, N_per, 3)
+        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
+        # weights: (N,) -> (n_dev, N_per)
+        sharded_weights = padded_weights.reshape(n_devices, n_per_device)
+        # rho: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
+        sharded_rho = padded_rho.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
+        # nabla_rho: (Nb, N, 3) -> (Nb, n_dev, N_per, 3) -> (n_dev, Nb, N_per, 3)
+        sharded_nabla_rho = padded_nabla_rho.reshape(self.n_orb, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
+        
+        # Define pmapped function
+        def compute_on_device(rho, nabla_rho, grid, weights):
+            # Compute K terms for this device's grid chunk
+            # Note: kmat functions integrate over the provided grid chunk
+            # but return the full (Nb, Nb) matrix contribution
+            
+            k1 = kmat_jax.calc_K1(
+                rho, nabla_rho,
+                self.jastrow_factor, jastrow_params,
+                grid, weights
+            )
+            
+            k3 = kmat_jax.calc_K3(
+                rho, self.jastrow_factor, jastrow_params,
+                grid, weights
+            )
+            
+            # Sum results across devices
+            k1_sum = jax.lax.psum(k1, axis_name='devices')
+            k3_sum = jax.lax.psum(k3, axis_name='devices')
+            
+            return k1_sum, k3_sum
+
+        # Execute pmap
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices')
+        k_nabla_sum, k_square_sum = pmapped_compute(
+            sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights
         )
         
-        k_square = kmat_jax.calc_K3(
-            rho_paired, self.jastrow_factor, jastrow_params,
-            self.grid_points, self.weights
-        )
+        # Result is replicated on all devices, take the first one
+        k_nabla = k_nabla_sum[0]
+        k_square = k_square_sum[0]
         
         # Reshape results
         k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)

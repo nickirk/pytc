@@ -49,113 +49,72 @@ class XTC(TC):
         """Number of grid points."""
         return len(self.grid_points)
     
-    @jax.jit
-    def calc_v_vector(self, rho_paired, jastrow_params, batch_size=1000, inner_batch_size=1000):
-        """Calculate V_qt(r₁) vector with memory-efficient nested batching.
+    @partial(jax.jit, static_argnames=('batch_size',))
+    def _calc_v_batch(self, r1_batch, rho, weights, jastrow_params, batch_size=1000):
+        """Calculate V_qt(r₁) for a batch of r1 points by scanning over r2.
         
         Args:
-            rho_paired: Array of shape (Nb*Nb, N_grid)
-            jastrow_params: Parameters for the Jastrow factor
-            batch_size: Number of r1 points to process at once (outer loop)
-            inner_batch_size: Number of r2 points to process at once (inner loop)
+            r1_batch: (batch_size, 3)
+            rho: (Nb, N_grid)
+            weights: (N_grid,)
+            jastrow_params: Jastrow parameters
+            batch_size: Inner batch size for r2 scan
+            
+        Returns:
+            V_batch: (Nb^2, batch_size, 3)
         """
-        Nb2, N_grid = rho_paired.shape
-        weighted_rho = rho_paired * self.weights[None, :]
-
-        # Pad grid to multiple of batch_size for outer loop
-        padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
-        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - N_grid), (0, 0)))
+        n_orb, n_grid = rho.shape
+        nb2 = n_orb * n_orb
         
-        padded_weighted_rho = jnp.pad(weighted_rho, ((0, 0), (0, padded_size - N_grid)))
+        # Pad grid for r2 scan
+        padded_size = ((n_grid + batch_size - 1) // batch_size) * batch_size
+        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - n_grid), (0, 0)))
+        padded_weights = jnp.pad(weights, (0, padded_size - n_grid))
+        padded_rho = jnp.pad(rho, ((0, 0), (0, padded_size - n_grid)))
         
-        batched_grid = padded_grid.reshape(-1, batch_size, 3)
+        # Reshape for scanning
+        r2_batches = padded_grid.reshape(-1, batch_size, 3)
+        weights_batches = padded_weights.reshape(-1, batch_size)
+        rho_batches = padded_rho.reshape(n_orb, -1, batch_size)
         
-        # Inner loop batches
-        inner_batched_grid = padded_grid.reshape(-1, inner_batch_size, 3)
-        inner_batched_rho = padded_weighted_rho.reshape(Nb2, -1, inner_batch_size) # (Nb2, n_batches, inner_bs)
-
-        # Create a mask for valid grid points
-        grid_mask = jnp.arange(padded_size) < N_grid
-        inner_batched_mask = grid_mask.reshape(-1, inner_batch_size)
-
-        def outer_scan_body(carry, r1_batch):
-            # r1_batch: (batch_size, 3)
+        def scan_body(carry, args):
+            r2_batch, w_batch, rho_batch_r2 = args
             
-            def inner_scan_body(inner_carry, args):
-                r2_batch, rho_batch, mask_batch = args
-                # r2_batch: (inner_batch_size, 3)
-                # rho_batch: (Nb2, inner_batch_size)
-                # mask_batch: (inner_batch_size,)
-                
-                # Compute gradients for this block of r1 and r2
-                # Shape: (batch_size, inner_batch_size, 3)
-                
-                @partial(jax.vmap, in_axes=(None, 0))
-                def grad_fn(r1, r2):
-                    return self.jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]
+            # Compute rho_paired for this r2 batch
+            rho_paired_r2 = jnp.einsum('in,jn->ijn', rho_batch_r2, rho_batch_r2).reshape(nb2, -1)
+            weighted_rho_r2 = rho_paired_r2 * w_batch[None, :]
             
-                grads = jax.vmap(grad_fn, in_axes=(0, None))(r1_batch, r2_batch)
-                
-                # Apply mask to grads
-                grads = grads * mask_batch[None, :, None]
-                
-                # Contract: sum_j rho(j) * grad(i, j)
-                # rho_batch: (Nb2, inner_batch_size)
-                # grads: (batch_size, inner_batch_size, 3)
-                grads_reshaped = grads.transpose(1, 0, 2).reshape(inner_batch_size, -1)
-                
-                # rho_batch @ grads_reshaped -> (Nb2, batch_size * 3)
-                block_contribution_flat = jnp.dot(rho_batch, grads_reshaped)
-                
-                # Reshape back to (Nb2, batch_size, 3)
-                block_contribution = block_contribution_flat.reshape(Nb2, batch_size, 3)
-                
-                return inner_carry + block_contribution, None
+            # Compute gradients
+            grads = self.jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
+            
+            # Contract: sum_{r2} rho(r2) * grad(r1, r2)
+            term = jnp.einsum('ki,oij->okj', weighted_rho_r2, grads)
+            
+            return carry + term, None
 
-            # Initialize accumulation for this r1_batch
-            init_val = jnp.zeros((Nb2, batch_size, 3))
-            
-            # Scan over inner batches
-            final_val, _ = jax.lax.scan(inner_scan_body, init_val, (inner_batched_grid, inner_batched_rho.transpose(1, 0, 2), inner_batched_mask))
-            
-            return carry, final_val
-
-        _, results = jax.lax.scan(outer_scan_body, 0, batched_grid)
+        init_val = jnp.zeros((len(r1_batch), nb2, 3))
+        final_val, _ = jax.lax.scan(scan_body, init_val, (r2_batches, weights_batches, rho_batches.transpose(1, 0, 2)))
         
-        # results: (n_outer_batches, Nb2, batch_size, 3)
-        # Transpose to (Nb2, n_outer_batches, batch_size, 3) -> reshape -> (Nb2, padded_size, 3)
-        return results.transpose(1, 0, 2, 3).reshape(Nb2, padded_size, 3)[:, :N_grid, :]
+        return final_val.transpose(1, 0, 2)
 
     @jax.jit
-    def get_const(self, jastrow_params, dm1=None):
-        """Compute constant contribution."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
+    def calc_delta_U(self, v_vector, rho_paired, dm1, weights):
+        """Calculate delta_U contribution for a batch.
         
-        delta_h = self.get_delta_h(jastrow_params, dm1)
-        const = -2/3 * jnp.einsum('qp,pq->', delta_h, dm1)
-        const += self.energy_nuc
-        return const
-    
-    @jax.jit
-    def _calc_delta_h(self, delta_U, dm1=None):
-        """Calculate δh using δU and density matrix."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
+        Args:
+            v_vector: (Nb^2, batch_size, 3)
+            rho_paired: (Nb^2, batch_size)
+            dm1: (Nb, Nb)
+            weights: (batch_size,)
             
-        term1 = 2*jnp.einsum('qpsr,rs->qp', delta_U, dm1)
-        term2 = jnp.einsum('spqr,rs->qp', delta_U, dm1)
-        delta_h = -0.5 * (term1 - term2)
-        return delta_h
-    
-    @jax.jit
-    def calc_delta_U(self, v_vector, rho_paired, dm1):
-        """Calculate delta_U matrix."""
+        Returns:
+            contribution: (Nb, Nb, Nb, Nb)
+        """
         nb = dm1.shape[1]
         
         V = jnp.reshape(v_vector, (nb, nb, -1, 3))
         rho = jnp.reshape(rho_paired, (nb, nb, -1))
-        rho_weighted = rho * self.weights[None, None, :]
+        rho_weighted = rho * weights[None, None, :]
         
         compute_W = jax.vmap(lambda V, dm: 2 * jnp.einsum('utx,tu->x', V, dm), 
                             in_axes=(2, None), out_axes=0)
@@ -192,12 +151,109 @@ class XTC(TC):
         term2 = jnp.einsum('qpix,srix->qpsr', V, B)
         
         result = -(term1 + term2)
-        return result + result.transpose(2, 3, 0, 1)
+        return result
 
-    def _get_mf_dm(self):
-        """Get mean-field 1-body density matrix for closed shell system."""
-        dm1 = jnp.diag(self.mo_occ)/2
-        return dm1
+    def get_delta_U(self, jastrow_params, dm1, batch_size=1000):
+        """Get delta_U matrix with memory-efficient batching and multi-GPU support."""
+        n_devices = jax.local_device_count()
+        n_grid = self.n_grid
+        
+        # Pad grid to be divisible by n_devices
+        remainder = n_grid % n_devices
+        if remainder != 0:
+            padding = n_devices - remainder
+            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+            padded_weights = jnp.pad(self.weights, ((0, padding),))
+            padded_rho = jnp.pad(self.rho, ((0, 0), (0, padding)))
+        else:
+            padded_grid_points = self.grid_points
+            padded_weights = self.weights
+            padded_rho = self.rho
+            
+        n_grid_padded = padded_grid_points.shape[0]
+        n_per_device = n_grid_padded // n_devices
+        
+        # Shard arrays for r1: (n_devices, n_per_device, ...)
+        sharded_grid_r1 = padded_grid_points.reshape(n_devices, n_per_device, 3)
+        sharded_weights_r1 = padded_weights.reshape(n_devices, n_per_device)
+        # rho: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
+        sharded_rho_r1 = padded_rho.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
+        
+        # Define n_orb and nb2 for closure
+        n_orb = self.n_orb
+        nb2 = n_orb * n_orb
+
+        def compute_on_device(grid_r1, weights_r1, rho_r1):
+            n_local = grid_r1.shape[0]
+            local_remainder = n_local % batch_size
+            if local_remainder != 0:
+                local_padding = batch_size - local_remainder
+                grid_r1_batched = jnp.pad(grid_r1, ((0, local_padding), (0, 0)))
+                weights_r1_batched = jnp.pad(weights_r1, ((0, local_padding),))
+                rho_r1_batched = jnp.pad(rho_r1, ((0, 0), (0, local_padding)))
+            else:
+                grid_r1_batched = grid_r1
+                weights_r1_batched = weights_r1
+                rho_r1_batched = rho_r1
+                
+            # Reshape for scanning
+            r1_batches = grid_r1_batched.reshape(-1, batch_size, 3)
+            weights_batches = weights_r1_batched.reshape(-1, batch_size)
+            rho_batches = rho_r1_batched.reshape(n_orb, -1, batch_size)
+            
+            def scan_body(carry, args):
+                r1_batch, w_batch, rho_batch = args
+                
+                # Compute rho_paired for this batch
+                rho_paired_batch = jnp.einsum('in,jn->ijn', rho_batch, rho_batch).reshape(nb2, -1)
+                
+                # Compute V vector for this batch (integrating over all r2)
+                v_batch = self._calc_v_batch(r1_batch, self.rho, self.weights, jastrow_params, batch_size)
+                
+                # Compute contribution to delta_U
+                contrib = self.calc_delta_U(v_batch, rho_paired_batch, dm1, w_batch)
+                
+                return carry + contrib, None
+
+            init_val = jnp.zeros((n_orb, n_orb, n_orb, n_orb))
+            
+            local_delta_U, _ = jax.lax.scan(scan_body, init_val, (r1_batches, weights_batches, rho_batches.transpose(1, 0, 2)))
+            
+            # Sum results across devices
+            total_delta_U = jax.lax.psum(local_delta_U, axis_name='devices')
+            return total_delta_U
+
+        # Execute pmap
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices')
+        
+        delta_U_replicated = pmapped_compute(sharded_grid_r1, sharded_weights_r1, sharded_rho_r1)
+        
+        total_delta_U = delta_U_replicated[0]
+        
+        # Symmetrize
+        return total_delta_U + total_delta_U.transpose(2, 3, 0, 1)
+
+    @jax.jit
+    def get_const(self, jastrow_params, dm1=None):
+        """Compute constant contribution."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+        
+        delta_h = self.get_delta_h(jastrow_params, dm1)
+        const = -2/3 * jnp.einsum('qp,pq->', delta_h, dm1)
+        const += self.energy_nuc
+        return const
+    
+    @jax.jit
+    def _calc_delta_h(self, delta_U, dm1=None):
+        """Calculate δh using δU and density matrix."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+            
+        term1 = 2*jnp.einsum('qpsr,rs->qp', delta_U, dm1)
+        term2 = jnp.einsum('spqr,rs->qp', delta_U, dm1)
+        delta_h = -0.5 * (term1 - term2)
+        return delta_h
 
     def get_delta_h(self, jastrow_params, dm1=None):
         """Get or compute delta_h."""
@@ -205,13 +261,6 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
         delta_U = self.get_delta_U(jastrow_params, dm1)
         return self._calc_delta_h(delta_U, dm1)
-    
-    def get_delta_U(self, jastrow_params, dm1):
-        """Get delta_U matrix."""
-        n_orb = self.n_orb
-        rho_paired = jnp.einsum('in,jn->ijn', self.rho, self.rho).reshape((n_orb * n_orb, -1))
-        v_vector = self.calc_v_vector(rho_paired, jastrow_params)
-        return self.calc_delta_U(v_vector, rho_paired, dm1)
 
     @jax.jit
     def get_1b(self, jastrow_params, dm1=None):
@@ -234,6 +283,11 @@ class XTC(TC):
         delta_U = self.get_delta_U(jastrow_params, dm1)
         
         return tc_correction + delta_U
+
+    def _get_mf_dm(self):
+        """Get mean-field 1-body density matrix for closed shell system."""
+        dm1 = jnp.diag(self.mo_occ)/2
+        return dm1
 
     def get_3b(self):
         """Get three-body extended correlation."""

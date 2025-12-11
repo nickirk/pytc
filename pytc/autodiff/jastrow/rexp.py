@@ -46,3 +46,39 @@ class REXP(jastrow.Jastrow):
     def init_params(self, **kwargs):
         alpha = kwargs.get('alpha', 0.5)
         return {'alpha': jnp.array([alpha])}
+
+    def grad_r_batch(self, r1_batch, r2_batch, params):
+        """Compute gradients for a batch of r1 and r2 points analytically.
+        
+        Args:
+            r1_batch: (batch_size_out, 3)
+            r2_batch: (batch_size_in, 3)
+            params: Jastrow parameters
+            
+        Returns:
+            Gradients of shape (batch_size_out, batch_size_in, 3)
+        """
+        # r1_batch: (N_out, 3)
+        # r2_batch: (N_in, 3)
+        
+        # diff: (N_out, N_in, 3)
+        diff = r1_batch[:, None, :] - r2_batch[None, :, :]
+        
+        # dist: (N_out, N_in)
+        dist = _safe_norm_np(diff, self.epsilon)
+        
+        alpha = params['alpha'][0]
+        
+        # u = 0.5 * r * exp(-alpha * r)
+        # grad = 0.5 * exp(-alpha * r) * (1 - alpha * r) * (diff / r)
+        
+        prefactor = 0.5 * jnp.exp(-alpha * dist) * (1 - alpha * dist)
+        
+        # Avoid division by zero (handled by safe norm, but explicit safety for direction)
+        # safe_dist = dist + epsilon (already done in _safe_norm_np if we used it directly, 
+        # but _safe_norm_np returns r+eps)
+        
+        # diff / dist: (N_out, N_in, 3)
+        direction = diff / dist[..., None]
+        
+        return prefactor[..., None] * direction

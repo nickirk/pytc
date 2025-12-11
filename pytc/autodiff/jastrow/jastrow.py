@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from typing import Optional
 import folx
 from flax import struct
+from functools import partial
 @struct.dataclass
 class Jastrow:
     """Abstract base class for JAX-based Jastrow factors.
@@ -62,6 +63,24 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
         return jax.grad(scalar_fn)(r1)
+
+    def grad_r_batch(self, r1_batch, r2_batch, params):
+        """Compute gradients for a batch of r1 and r2 points.
+        
+        Args:
+            r1_batch: (batch_size_out, 3)
+            r2_batch: (batch_size_in, 3)
+            params: Jastrow parameters
+            
+        Returns:
+            Gradients of shape (batch_size_out, batch_size_in, 3)
+        """
+        # Default implementation using vmap over grad_r
+        @partial(jax.vmap, in_axes=(None, 0))
+        def grad_fn(r1, r2):
+            return self.grad_r(r1, r2, params)
+        
+        return jax.vmap(grad_fn, in_axes=(0, None))(r1_batch, r2_batch)
     
     def laplacian_r(self, r1, r2, params):
         """Compute Laplacian of u w.r.t r1 coordinates.
