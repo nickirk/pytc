@@ -170,3 +170,99 @@ class TC:
     def get_3b(self):
         """Compute all three-body integrals."""
         raise NotImplementedError("JAX implementation pending")
+
+
+@struct.dataclass
+class ISDFTC(TC):
+    """JAX implementation of Transcorrelated method using ISDF.
+    
+    Attributes:
+        C_rho: ISDF basis for density (Nb^2, N_fused)
+        xi_rho: ISDF coefficients for density (N_fused, N_grid)
+        C_grad: ISDF basis for gradients (Nb^2, N_fused, 3)
+        xi_grad: ISDF coefficients for gradients (N_fused, N_grid, 3)
+        pivots: ISDF pivot indices (N_fused,)
+    """
+    C_rho: jnp.ndarray = struct.field(default=None)
+    xi_rho: jnp.ndarray = struct.field(default=None)
+    C_grad: jnp.ndarray = struct.field(default=None)
+    xi_grad: jnp.ndarray = struct.field(default=None)
+    pivots: jnp.ndarray = struct.field(default=None)
+
+    @classmethod
+    def from_tc(cls, tc_obj, n_rank=None):
+        """Initialize ISDFTC object from TC object.
+        
+        Args:
+            tc_obj: TC object
+            n_rank: Rank for ISDF decomposition (default: N_grid // 4)
+            
+        Returns:
+            ISDFTC: Initialized ISDFTC object
+        """
+        from . import df
+        
+        if n_rank is None:
+            n_rank = tc_obj.grid_points.shape[0] // 4
+            
+        # Perform ISDF decomposition
+        # We use the same rank for both rho and grad for simplicity, 
+        # matching the numpy implementation default behavior
+        C_rho, xi_rho, C_grad, xi_grad, pivots = df.isdf_decompose(
+            tc_obj.rho, tc_obj.nabla_rho, n_rank, n_rank, weights=tc_obj.weights
+        )
+        
+        return cls(
+            grid_points=tc_obj.grid_points,
+            weights=tc_obj.weights,
+            rho=tc_obj.rho,
+            nabla_rho=tc_obj.nabla_rho,
+            n_orb=tc_obj.n_orb,
+            grid_lvl=tc_obj.grid_lvl,
+            jastrow_factor=tc_obj.jastrow_factor,
+            mo_coeff=tc_obj.mo_coeff,
+            C_rho=C_rho,
+            xi_rho=xi_rho,
+            C_grad=C_grad,
+            xi_grad=xi_grad,
+            pivots=pivots
+        )
+
+    def get_2b(self, jastrow_params):
+        """Calculate TC correction terms using ISDF."""
+        # Use ISDF method
+        k_nabla = kmat_jax.calc_K1_isdf(
+            self.C_rho,
+            self.xi_rho,
+            self.C_grad,
+            self.xi_grad,
+            self.jastrow_factor,
+            jastrow_params,
+            self.grid_points,
+            self.weights
+        )
+        # k_laplacian = -(k_nabla + k_nabla^T)
+        # We reshape first to swap axes correctly
+        k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
+        
+        k_square = kmat_jax.calc_K3_isdf(
+            self.C_rho,
+            self.xi_rho,
+            self.jastrow_factor,
+            jastrow_params,
+            self.grid_points,
+            self.weights
+        )
+        
+        # Reshape results
+        # k_nabla is already reshaped
+        # k_laplacian is already reshaped
+        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        
+        # Combine results
+        result = 0.5 * (k_laplacian + k_square)
+        result += k_nabla
+        result += result.transpose(2, 3, 0, 1)
+        
+        return -result

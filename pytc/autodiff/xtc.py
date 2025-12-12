@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from flax import struct
 from .tc import TC
 from . import tc_helper
+from . import kmat as kmat_jax
 
 @struct.dataclass
 class XTC(TC):
@@ -153,10 +154,13 @@ class XTC(TC):
         result = -(term1 + term2)
         return result
 
-    def get_delta_U(self, jastrow_params, dm1, batch_size=1000):
+    def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
         """Get delta_U matrix with memory-efficient batching and multi-GPU support."""
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
+        
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
         
         # Pad grid to be divisible by n_devices
         remainder = n_grid % n_devices
@@ -346,3 +350,164 @@ class XTC(TC):
         eris.vvvv = h2e[nocc:,nocc:,nocc:,nocc:].copy()
 
         return eris
+
+
+@struct.dataclass
+class ISDFXTC(XTC):
+    """JAX implementation of Extended Transcorrelated method using ISDF.
+    
+    Attributes:
+        C_rho: ISDF basis for density (Nb^2, N_fused)
+        xi_rho: ISDF coefficients for density (N_fused, N_grid)
+        C_grad: ISDF basis for gradients (Nb^2, N_fused, 3)
+        xi_grad: ISDF coefficients for gradients (N_fused, N_grid, 3)
+        pivots: ISDF pivot indices (N_fused,)
+    """
+    C_rho: jnp.ndarray = struct.field(default=None)
+    xi_rho: jnp.ndarray = struct.field(default=None)
+    C_grad: jnp.ndarray = struct.field(default=None)
+    xi_grad: jnp.ndarray = struct.field(default=None)
+    pivots: jnp.ndarray = struct.field(default=None)
+
+    @classmethod
+    def from_xtc(cls, xtc_obj, n_rank=None):
+        """Initialize ISDFXTC object from XTC object."""
+        from . import df
+        
+        if n_rank is None:
+            n_rank = xtc_obj.grid_points.shape[0] // 4
+            
+        # Perform ISDF decomposition
+        C_rho, xi_rho, C_grad, xi_grad, pivots = df.isdf_decompose(
+            xtc_obj.rho, xtc_obj.nabla_rho, n_rank, n_rank, weights=xtc_obj.weights
+        )
+        
+        return cls(
+            grid_points=xtc_obj.grid_points,
+            weights=xtc_obj.weights,
+            rho=xtc_obj.rho,
+            nabla_rho=xtc_obj.nabla_rho,
+            n_orb=xtc_obj.n_orb,
+            grid_lvl=xtc_obj.grid_lvl,
+            jastrow_factor=xtc_obj.jastrow_factor,
+            mo_coeff=xtc_obj.mo_coeff,
+            mo_occ=xtc_obj.mo_occ,
+            energy_nuc=xtc_obj.energy_nuc,
+            C_rho=C_rho,
+            xi_rho=xi_rho,
+            C_grad=C_grad,
+            xi_grad=xi_grad,
+            pivots=pivots
+        )
+
+    def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
+        """Get delta_U matrix using ISDF."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+            
+        return self._calc_delta_U_isdf(jastrow_params, dm1, batch_size)
+
+    def _calc_delta_U_isdf(self, jastrow_params, dm1, batch_size=1000):
+        """Calculate ΔU^{QS}_{PR} using ISDF intermediates with batched processing."""
+        from . import kmat as kmat_jax
+        
+        N_grid = self.n_grid
+        Nb = self.n_orb
+        N_rank = self.C_rho.shape[1]
+        
+        # Reshape C_rho for easier contraction
+        C_rho_reshaped = self.C_rho.reshape(Nb, Nb, N_rank)
+        
+        # Initialize accumulator for M tensor
+        M = jnp.zeros((N_rank, N_rank, N_rank))
+        
+        # Process r2 points in batches
+        def scan_body(carry, args):
+            r2_batch, w_batch, xi_rho_batch = args
+            M_acc = carry
+            
+            grads = self.jastrow_factor.grad_r_batch(self.grid_points, r2_batch, jastrow_params) # (N_grid, batch, 3)
+            
+            G = jnp.einsum('j,bj,jic->bic', self.weights, self.xi_rho, grads) # (N_rank, batch, 3)
+            
+            K = jnp.einsum('bic,dic->bdi', G, G) # (N_rank, N_rank, batch)
+            
+            weighted_xi = xi_rho_batch * w_batch[None, :] # (N_rank, batch)
+            
+            M_update = jnp.einsum('ai,bdi->abd', weighted_xi, K)
+            
+            return M_acc + M_update, None
+
+        # Prepare batched inputs
+        padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
+        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - N_grid), (0, 0)))
+        padded_weights = jnp.pad(self.weights, (0, padded_size - N_grid))
+        padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padded_size - N_grid)))
+        
+        r2_batches = padded_grid.reshape(-1, batch_size, 3)
+        w_batches = padded_weights.reshape(-1, batch_size)
+        xi_rho_batches = padded_xi_rho.reshape(N_rank, -1, batch_size).transpose(1, 0, 2)
+        
+        M, _ = jax.lax.scan(scan_body, M, (r2_batches, w_batches, xi_rho_batches))
+        
+        Gb = jnp.einsum('tub,tu->b', C_rho_reshaped, dm1)
+        
+        GM = jnp.einsum('b,abd->ad', Gb, M)
+        
+        T = jnp.einsum('pqa,ad->pqd', C_rho_reshaped, GM)
+        
+        term1 = 2 * jnp.einsum('pqd,rsd->pqrs', T, C_rho_reshaped)
+        
+        L = jnp.einsum('tu,tsc->usc', dm1, C_rho_reshaped)
+        
+        T2 = jnp.einsum('abc,usc->usab', M, L)
+        
+        Q = jnp.einsum('usab,rub->rsa', T2, C_rho_reshaped)
+        
+        term2 = -jnp.einsum('pqa,rsa->pqrs', C_rho_reshaped, Q)
+        
+        Mt = M + M.transpose(2, 1, 0)
+        T3 = jnp.einsum('cab,usc->usab', Mt, L)
+        Q3 = jnp.einsum('usab,rub->rsa', T3, C_rho_reshaped)
+        term3 = -jnp.einsum('pqa,rsa->pqrs', C_rho_reshaped, Q3)
+        
+        term4_inter = jnp.einsum('b,bac->ac', Gb, M)
+        term4_inter = jnp.einsum('ac,pqa->pqc', term4_inter, C_rho_reshaped)
+        term4 = jnp.einsum('pqc,rsc->pqrs', term4_inter, C_rho_reshaped)
+        term4_inter = jnp.einsum('b,bac->ac', Gb, M)
+        term4_inter = jnp.einsum('ac,pqa->pqc', term4_inter, C_rho_reshaped)
+        term4 = jnp.einsum('pqc,rsc->pqrs', term4_inter, C_rho_reshaped)
+        
+        result = term1 + term2 + term3 + term4
+        
+        # Symmetrize
+        return -(result + result.transpose(2, 3, 0, 1))
+
+    def get_2b(self, jastrow_params, dm1=None):
+        """Compute two-body integrals correction using ISDF."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+            
+        k_nabla = kmat_jax.calc_K1_isdf(
+            self.C_rho, self.xi_rho, self.C_grad, self.xi_grad,
+            self.jastrow_factor, jastrow_params, self.grid_points, self.weights
+        )
+        # k_laplacian = -(k_nabla + k_nabla^T)
+        k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
+        
+        k_square = kmat_jax.calc_K3_isdf(
+            self.C_rho, self.xi_rho,
+            self.jastrow_factor, jastrow_params, self.grid_points, self.weights
+        )
+        
+        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        
+        tc_correction = 0.5 * (k_laplacian + k_square) + k_nabla
+        tc_correction += tc_correction.transpose(2, 3, 0, 1)
+        tc_correction = -tc_correction
+        
+        # Add delta_U
+        delta_U = self.get_delta_U(jastrow_params, dm1)
+        
+        return tc_correction + delta_U
