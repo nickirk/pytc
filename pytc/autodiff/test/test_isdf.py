@@ -37,7 +37,7 @@ class TestISDF(unittest.TestCase):
 
     def test_isdf_vs_numpy_integrals(self):
         """Compare JAX ISDF integrals directly with NumPy ISDF integrals."""
-        n_rank = 400 # Sufficient rank based on convergence benchmark
+        n_rank = 200 # Sufficient rank based on convergence benchmark
         
         # --- NumPy ISDF ---
         print("\nRunning NumPy ISDF...")
@@ -152,7 +152,7 @@ class TestISDF(unittest.TestCase):
         """Verify convergence of ISDF intermediates (Rho/Grad) with rank."""
         from pytc.autodiff.df import isdf_decompose
         
-        ranks = [50, 100, 200]
+        ranks = [100, 200, 400]
         errors = []
         
         rho = self.tc_jax.rho
@@ -203,9 +203,6 @@ class TestISDF(unittest.TestCase):
         
         print(f"\nJAX ISDF vs Exact Accuracy: {rel_err:.2e}")
         self.assertTrue(rel_err < 1e-4, f"ISDF TC error too high: {rel_err}")
-
-if __name__ == '__main__':
-    unittest.main()
 
 if __name__ == '__main__':
     unittest.main()

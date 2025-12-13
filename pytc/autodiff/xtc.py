@@ -401,87 +401,168 @@ class ISDFXTC(XTC):
         )
 
     def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
-        """Get delta_U matrix using ISDF."""
+        """Get delta_U matrix using ISDF with pmap support."""
+        n_devices = jax.local_device_count()
+        n_grid = self.n_grid
+        
         if dm1 is None:
             dm1 = self._get_mf_dm()
-            
-        return self._calc_delta_U_isdf(jastrow_params, dm1, batch_size)
-
-    def _calc_delta_U_isdf(self, jastrow_params, dm1, batch_size=1000):
-        """Calculate ΔU^{QS}_{PR} using ISDF intermediates with batched processing."""
-        from . import kmat as kmat_jax
         
-        N_grid = self.n_grid
+        # Pad grid to be divisible by n_devices
+        remainder = n_grid % n_devices
+        if remainder != 0:
+            padding = n_devices - remainder
+            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+            padded_weights = jnp.pad(self.weights, ((0, padding),))
+            padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padding)))
+        else:
+            padded_grid_points = self.grid_points
+            padded_weights = self.weights
+            padded_xi_rho = self.xi_rho
+            
+        n_grid_padded = padded_grid_points.shape[0]
+        n_per_device = n_grid_padded // n_devices
+        
+        # Shard arrays
+        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
+        sharded_weights = padded_weights.reshape(n_devices, n_per_device)
+        # xi_rho: (N_rank, N) -> (N_rank, n_dev, N_per) -> (n_dev, N_rank, N_per)
+        sharded_xi_rho = padded_xi_rho.reshape(self.C_rho.shape[1], n_devices, n_per_device).transpose(1, 0, 2)
+        
+        # Pre-compute device-independent quantities
+        Gb = jnp.einsum('tub,tu->b', self.C_rho.reshape(self.n_orb, self.n_orb, -1), dm1)
+        
+        # Full arrays for integration (replicated on each device)
+        full_grid = self.grid_points
+        full_weights = self.weights
+        full_xi_rho = self.xi_rho
+
+        def compute_on_device(grid_shard, weights_shard, xi_shard):
+            return self._calc_delta_U_isdf_shard(
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, 
+                full_grid, full_weights, full_xi_rho, Gb, batch_size
+            )
+
+        # Execute pmap
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices')
+        
+        # Returns tuple of accumulators: (X, X1, Q, Q3)
+        # Each has shape (n_devices, ...)
+        X_rep, X1_rep, Q_rep, Q3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho)
+        
+        # Sum over devices
+        X = jnp.sum(X_rep, axis=0)
+        X1 = jnp.sum(X1_rep, axis=0)
+        Q = jnp.sum(Q_rep, axis=0)
+        Q3 = jnp.sum(Q3_rep, axis=0)
+        
+        # Reconstruct Terms
         Nb = self.n_orb
         N_rank = self.C_rho.shape[1]
-        
-        # Reshape C_rho for easier contraction
         C_rho_reshaped = self.C_rho.reshape(Nb, Nb, N_rank)
         
-        # Initialize accumulator for M tensor
-        M = jnp.zeros((N_rank, N_rank, N_rank))
+        # Term 1: 2 * C^a C^d X1_{ad}
+        term1 = 2 * jnp.einsum('pqa,ad,rsd->pqrs', C_rho_reshaped, X1, C_rho_reshaped)
         
-        # Process r2 points in batches
-        def scan_body(carry, args):
-            r2_batch, w_batch, xi_rho_batch = args
-            M_acc = carry
-            
-            grads = self.jastrow_factor.grad_r_batch(self.grid_points, r2_batch, jastrow_params) # (N_grid, batch, 3)
-            
-            G = jnp.einsum('j,bj,jic->bic', self.weights, self.xi_rho, grads) # (N_rank, batch, 3)
-            
-            K = jnp.einsum('bic,dic->bdi', G, G) # (N_rank, N_rank, batch)
-            
-            weighted_xi = xi_rho_batch * w_batch[None, :] # (N_rank, batch)
-            
-            M_update = jnp.einsum('ai,bdi->abd', weighted_xi, K)
-            
-            return M_acc + M_update, None
-
-        # Prepare batched inputs
-        padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
-        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - N_grid), (0, 0)))
-        padded_weights = jnp.pad(self.weights, (0, padded_size - N_grid))
-        padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padded_size - N_grid)))
-        
-        r2_batches = padded_grid.reshape(-1, batch_size, 3)
-        w_batches = padded_weights.reshape(-1, batch_size)
-        xi_rho_batches = padded_xi_rho.reshape(N_rank, -1, batch_size).transpose(1, 0, 2)
-        
-        M, _ = jax.lax.scan(scan_body, M, (r2_batches, w_batches, xi_rho_batches))
-        
-        Gb = jnp.einsum('tub,tu->b', C_rho_reshaped, dm1)
-        
-        GM = jnp.einsum('b,abd->ad', Gb, M)
-        
-        T = jnp.einsum('pqa,ad->pqd', C_rho_reshaped, GM)
-        
-        term1 = 2 * jnp.einsum('pqd,rsd->pqrs', T, C_rho_reshaped)
-        
-        L = jnp.einsum('tu,tsc->usc', dm1, C_rho_reshaped)
-        
-        T2 = jnp.einsum('abc,usc->usab', M, L)
-        
-        Q = jnp.einsum('usab,rub->rsa', T2, C_rho_reshaped)
-        
+        # Term 2: - C^a Q_{rsa}
         term2 = -jnp.einsum('pqa,rsa->pqrs', C_rho_reshaped, Q)
         
-        Mt = M + M.transpose(2, 1, 0)
-        T3 = jnp.einsum('cab,usc->usab', Mt, L)
-        Q3 = jnp.einsum('usab,rub->rsa', T3, C_rho_reshaped)
+        # Term 3: - C^a Q3_{rsa}
         term3 = -jnp.einsum('pqa,rsa->pqrs', C_rho_reshaped, Q3)
         
-        term4_inter = jnp.einsum('b,bac->ac', Gb, M)
-        term4_inter = jnp.einsum('ac,pqa->pqc', term4_inter, C_rho_reshaped)
-        term4 = jnp.einsum('pqc,rsc->pqrs', term4_inter, C_rho_reshaped)
-        term4_inter = jnp.einsum('b,bac->ac', Gb, M)
-        term4_inter = jnp.einsum('ac,pqa->pqc', term4_inter, C_rho_reshaped)
-        term4 = jnp.einsum('pqc,rsc->pqrs', term4_inter, C_rho_reshaped)
+        # Term 4: C^a C^c X_{ac}
+        term4 = jnp.einsum('pqa,rsc,ac->pqrs', C_rho_reshaped, C_rho_reshaped, X)
         
         result = term1 + term2 + term3 + term4
         
         # Symmetrize
         return -(result + result.transpose(2, 3, 0, 1))
+
+    def _calc_delta_U_isdf_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, 
+                                 full_grid, full_weights, full_xi_rho, Gb, batch_size=1000):
+        """Calculate ΔU contribution for a shard of grid points."""
+        Nb = self.n_orb
+        N_rank = self.C_rho.shape[1]
+        N_shard = grid_points.shape[0]
+        
+        C_rho_reshaped = self.C_rho.reshape(Nb, Nb, N_rank)
+        
+        # Pre-compute L for Terms 2 & 3
+        L = jnp.einsum('tu,tsc->usc', dm1, C_rho_reshaped)
+        
+        # Initialize accumulators
+        X_acc = jnp.zeros((N_rank, N_rank))
+        X1_acc = jnp.zeros((N_rank, N_rank))
+        Q_acc = jnp.zeros((Nb, Nb, N_rank))
+        Q3_acc = jnp.zeros((Nb, Nb, N_rank))
+        
+        # Prepare batches for the SHARD
+        # We loop over the shard points (index i)
+        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+        padded_grid = jnp.pad(grid_points, ((0, padded_size - N_shard), (0, 0)))
+        padded_weights = jnp.pad(weights, (0, padded_size - N_shard))
+        padded_xi = jnp.pad(xi_rho, ((0, 0), (0, padded_size - N_shard)))
+        
+        r_batches = padded_grid.reshape(-1, batch_size, 3)
+        w_batches = padded_weights.reshape(-1, batch_size)
+        xi_batches = padded_xi.reshape(N_rank, -1, batch_size).transpose(1, 0, 2)
+        
+        def scan_body(carry, args):
+            r_batch, w_batch, xi_batch = args
+            X_curr, X1_curr, Q_curr, Q3_curr = carry
+            
+            # Compute Gradients: grad(full_grid, r_batch)
+            # This gives gradients for all j (full_grid) wrt r_batch (i)
+            # Shape: (N_full, batch, 3)
+            grads = self.jastrow_factor.grad_r_batch(full_grid, r_batch, jastrow_params)
+            
+            # Compute G: (N_rank, batch, 3)
+            # G_{bi\alpha} = \sum_j w_j \xi_b(j) \nabla_\alpha J(r_j, r_i)
+            G = jnp.einsum('j,bj,jic->bic', full_weights, full_xi_rho, grads)
+            
+            # --- Term 4 (Easy Term) ---
+            # \tilde{w}_i = w_i \sum_b G_b \xi_b(i)
+            w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
+            
+            # X_{ac} += \sum_i \tilde{w}_i K_{ac}(i)
+            # K_{ac}(i) = \sum_k G_{ak}(i) G_{ck}(i)
+            X_update = jnp.einsum('i,aik,cik->ac', w_tilde, G, G)
+            
+            # --- Term 1 (Easy Term) ---
+            # H_k(i) = \sum_b G_b G_{bk}(i)
+            H = jnp.einsum('b,bik->ik', Gb, G)
+            # V_d(i) = \sum_k H_k(i) G_{dk}(i)
+            V = jnp.einsum('ik,dik->di', H, G)
+            # X1_{ad} += \sum_i w_i \xi_a(i) V_d(i)
+            X1_update = jnp.einsum('i,ai,di->ad', w_batch, xi_batch, V)
+            
+            # --- Term 2 (Hard Term) ---
+            # Y_{usk}(i) = \sum_c L_{usc} G_{ck}(i)
+            Y = jnp.einsum('usc,cik->usik', L, G)
+            
+            # Z_{ruk}(i) = \sum_b C_{rub} G_{bk}(i)
+            Z = jnp.einsum('rub,bik->ruik', C_rho_reshaped, G)
+            
+            # Q_{rsa} += \sum_i w_i \xi_a(i) \sum_{uk} Y_{usk}(i) Z_{ruk}(i)
+            YZ = jnp.einsum('usik,ruik->rsi', Y, Z)
+            Q_update = jnp.einsum('i,ai,rsi->rsa', w_batch, xi_batch, YZ)
+            
+            # --- Term 3 (Hard Term) ---
+            # Part 1: Q3_1
+            L_tilde = jnp.einsum('ci,usc->usi', xi_batch, L)
+            GZ = jnp.einsum('aik,ruik->ruia', G, Z)
+            Q3_1_update = jnp.einsum('i,usi,ruia->rsa', w_batch, L_tilde, GZ)
+            
+            # Part 2: Q3_2
+            C_tilde = jnp.einsum('bi,rub->rui', xi_batch, C_rho_reshaped)
+            YC = jnp.einsum('usik,rui->rski', Y, C_tilde)
+            Q3_2_update = jnp.einsum('i,aik,rski->rsa', w_batch, G, YC)
+            
+            return (X_curr + X_update, X1_curr + X1_update, Q_curr + Q_update, Q3_curr + Q3_1_update + Q3_2_update), None
+
+        final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches))
+        
+        return final_accumulators
 
     def get_2b(self, jastrow_params, dm1=None):
         """Compute two-body integrals correction using ISDF."""
