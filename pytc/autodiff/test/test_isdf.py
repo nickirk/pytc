@@ -37,7 +37,7 @@ class TestISDF(unittest.TestCase):
 
     def test_isdf_vs_numpy_integrals(self):
         """Compare JAX ISDF integrals directly with NumPy ISDF integrals."""
-        n_rank = 200 # Sufficient rank based on convergence benchmark
+        n_rank = 400 # Sufficient rank based on convergence benchmark
         
         # --- NumPy ISDF ---
         print("\nRunning NumPy ISDF...")
@@ -108,6 +108,28 @@ class TestISDF(unittest.TestCase):
         # Compare K1
         err_k1 = np.linalg.norm(k1_np - k1_jax) / np.linalg.norm(k1_np)
         print(f"K1 Relative Error: {err_k1:.2e}")
+
+        # --- Cross-Check: JAX K1 with NumPy Intermediates ---
+        print("\nK1 Cross-Check (NumPy Intermediates -> JAX K1):")
+        C_rho_np = jnp.array(res_np['C_rho'])
+        xi_rho_np = jnp.array(res_np['xi_rho'])
+        C_grad_np = jnp.array(res_np['C_grad'])
+        xi_grad_np = jnp.array(res_np['xi_grad'])
+        
+        k1_jax_cross = kmat_jax.calc_K1_isdf(C_rho_np, xi_rho_np, C_grad_np, xi_grad_np,
+                                             self.jastrow_jax, self.jastrow_params_jax, 
+                                             self.tc_jax.grid_points, self.tc_jax.weights)
+        k1_jax_cross = np.array(k1_jax_cross)
+        err_k1_cross = np.linalg.norm(k1_np - k1_jax_cross) / np.linalg.norm(k1_np)
+        print(f"K1 Cross-Check Error: {err_k1_cross:.2e}")
+        
+        # Also check K2 cross-check
+        k2_jax_cross = kmat_jax.calc_K2_isdf(C_rho_np, xi_rho_np, C_grad_np, xi_grad_np,
+                                             self.jastrow_jax, self.jastrow_params_jax,
+                                             self.tc_jax.grid_points, self.tc_jax.weights)
+        k2_jax_cross = np.array(k2_jax_cross)
+        err_k2_cross = np.linalg.norm(k2_np - k2_jax_cross) / np.linalg.norm(k2_np)
+        print(f"K2 Cross-Check Error: {err_k2_cross:.2e}")
         
         # Compare K2 (NumPy uses calc_K2_isdf, JAX uses calc_K2_isdf for this check)
         err_k2 = np.linalg.norm(k2_np - k2_jax_func) / np.linalg.norm(k2_np)
@@ -162,7 +184,7 @@ class TestISDF(unittest.TestCase):
 
     def test_isdf_tc_accuracy(self):
         """Verify accuracy of JAX ISDF TC against JAX Exact TC."""
-        n_rank = 200
+        n_rank = 400
         
         # Create ISDFTC
         isdf_tc = ISDFTC.from_tc(self.tc_jax, n_rank=n_rank)

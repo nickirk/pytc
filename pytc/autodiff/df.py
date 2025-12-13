@@ -103,24 +103,33 @@ def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
         w_sqrt = jnp.sqrt(jnp.abs(weights)) # Use abs to avoid NaN
         
     
+    # Pre-compute diagonal for rho to calculate shift
+    orb_sq = jnp.sum(mo_values**2, axis=0)
+    diag_rho = orb_sq**2
+    shift_rho = 1e-12 * jnp.max(jnp.abs(diag_rho))
+
     def gram_diag_rho():
-        # S_ii = (sum_p phi_p(i)^2)^2
-        orb_sq = jnp.sum(mo_values**2, axis=0)
-        return orb_sq**2
+        # S_ii = (sum_p phi_p(i)^2)^2 + shift
+        return diag_rho + shift_rho
         
     def gram_col_rho(idx):
         # S_ij = (sum_p phi_p(i) phi_p(idx))^2
         # dot = phi(i) @ phi(idx)
         dot = jnp.dot(mo_values.T, mo_values[:, idx])
-        return dot**2
+        col = dot**2
+        return col.at[idx].add(shift_rho)
         
     pivots_rho = pivoted_cholesky_matrix_free(gram_diag_rho, gram_col_rho, n_grid, n_rank_rho)
     
     
+    # Pre-compute diagonal for grad to calculate shift
+    A_diag = jnp.sum(mo_values**2, axis=0)
+    B_diag = jnp.sum(jnp.sum(mo_grads**2, axis=2), axis=0)
+    diag_grad = A_diag * B_diag
+    shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
+
     def gram_diag_grad():
-        A_diag = jnp.sum(mo_values**2, axis=0)
-        B_diag = jnp.sum(jnp.sum(mo_grads**2, axis=2), axis=0)
-        return A_diag * B_diag
+        return diag_grad + shift_grad
         
     def gram_col_grad(idx):
         A_col = jnp.dot(mo_values.T, mo_values[:, idx])
@@ -128,7 +137,8 @@ def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
         B_col = jnp.zeros(n_grid)
         for c in range(3):
             B_col += jnp.dot(mo_grads[:, :, c].T, mo_grads[:, idx, c])
-        return A_col * B_col
+        col = A_col * B_col
+        return col.at[idx].add(shift_grad)
         
     pivots_grad = pivoted_cholesky_matrix_free(gram_diag_grad, gram_col_grad, n_grid, n_rank_grad)
     
@@ -159,7 +169,7 @@ def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
         
         # Solve C_rho * xi = rho_batch
         # C_rho: (N^2, k), rho_batch: (N^2, width)
-        xi_rho_batch, _, _, _ = jnp.linalg.lstsq(C_rho, rho_batch, rcond=1e-10)
+        xi_rho_batch, _, _, _ = jnp.linalg.lstsq(C_rho, rho_batch, rcond=1e-14)
         
         # 2. Solve xi_grad
         # nabla_rho_batch: (N_orb^2, width, 3)
@@ -172,7 +182,7 @@ def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
             nabla_rho_c = jnp.einsum('pi,qi->pqi', mo_grad_batch[:, :, c], mo_val_batch).reshape(-1, width)
             
             # Solve C_grad[..., c] * xi = nabla_rho_c
-            xi_c, _, _, _ = jnp.linalg.lstsq(C_grad[:, :, c], nabla_rho_c, rcond=1e-10)
+            xi_c, _, _, _ = jnp.linalg.lstsq(C_grad[:, :, c], nabla_rho_c, rcond=1e-14)
             xi_grad_batch_list.append(xi_c)
             
         xi_grad_batch = jnp.stack(xi_grad_batch_list, axis=-1) # (k, width, 3)
