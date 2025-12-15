@@ -261,7 +261,7 @@ class XTC(TC):
         Ns = get_size(slice_s, self.n_orb)
         Nocc = get_size(slice_occ, self.n_orb)
 
-        def compute_on_device(grid_r1, weights_r1, rho_r1):
+        def compute_on_device(grid_r1, weights_r1, rho_r1, jastrow_params):
             n_local = grid_r1.shape[0]
             local_remainder = n_local % batch_size
             if local_remainder != 0:
@@ -431,9 +431,9 @@ class XTC(TC):
             return total_delta_U
 
         # Execute pmap
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices')
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, None))
         
-        delta_U_replicated = pmapped_compute(sharded_grid_r1, sharded_weights_r1, sharded_rho_r1)
+        delta_U_replicated = pmapped_compute(sharded_grid_r1, sharded_weights_r1, sharded_rho_r1, jastrow_params)
         
         total_delta_U = delta_U_replicated[0]
         
@@ -642,18 +642,18 @@ class ISDFXTC(XTC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
 
-        def compute_on_device(grid_shard, weights_shard, xi_shard):
+        def compute_on_device(grid_shard, weights_shard, xi_shard, jastrow_params):
             return self._calc_delta_U_isdf_shard(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, 
                 full_grid, full_weights, full_xi_rho, Gb, batch_size
             )
 
         # Execute pmap
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices')
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, None))
         
         # Returns tuple of accumulators: (X, X1, Q, Q3)
         # Each has shape (n_devices, ...)
-        X_rep, X1_rep, Q_rep, Q3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho)
+        X_rep, X1_rep, Q_rep, Q3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, jastrow_params)
         
         # Sum over devices
         X = jnp.sum(X_rep, axis=0)
