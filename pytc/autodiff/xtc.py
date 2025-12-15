@@ -41,6 +41,7 @@ class XTC(TC):
             grid_lvl=tc_obj.grid_lvl,
             jastrow_factor=tc_obj.jastrow_factor,
             mo_coeff=tc_obj.mo_coeff,
+            nocc=tc_obj.nocc,
             mo_occ=mo_occ,
             energy_nuc=energy_nuc
         )
@@ -50,6 +51,70 @@ class XTC(TC):
         """Number of grid points."""
         return len(self.grid_points)
     
+    def _calc_v_block(self, r1_batch, rho, weights, jastrow_params, slice_rows, slice_cols, batch_size=1000):
+        """Calculate V_qt(r₁) for a batch of r1 points and specific row/col slices.
+        
+        Args:
+            r1_batch: (batch_size, 3)
+            rho: (Nb, N_grid)
+            weights: (N_grid,)
+            jastrow_params: Jastrow parameters
+            slice_rows: slice object for row indices (q)
+            slice_cols: slice object for col indices (t)
+            batch_size: Inner batch size for r2 scan
+            
+        Returns:
+            V_batch: (N_rows, N_cols, batch_size, 3)
+        """
+        n_orb, n_grid = rho.shape
+        
+        # Extract relevant rho blocks
+        rho_rows = rho[slice_rows]  # (N_rows, N_grid)
+        rho_cols = rho[slice_cols]  # (N_cols, N_grid)
+        
+        n_rows = rho_rows.shape[0]
+        n_cols = rho_cols.shape[0]
+        
+        # Pad grid for r2 scan
+        padded_size = ((n_grid + batch_size - 1) // batch_size) * batch_size
+        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - n_grid), (0, 0)))
+        padded_weights = jnp.pad(weights, (0, padded_size - n_grid))
+        padded_rho_rows = jnp.pad(rho_rows, ((0, 0), (0, padded_size - n_grid)))
+        padded_rho_cols = jnp.pad(rho_cols, ((0, 0), (0, padded_size - n_grid)))
+        
+        # Reshape for scanning
+        r2_batches = padded_grid.reshape(-1, batch_size, 3)
+        weights_batches = padded_weights.reshape(-1, batch_size)
+        rho_rows_batches = padded_rho_rows.reshape(n_rows, -1, batch_size)
+        rho_cols_batches = padded_rho_cols.reshape(n_cols, -1, batch_size)
+        
+        def scan_body(carry, args):
+            r2_batch, w_batch, rho_row_batch, rho_col_batch = args
+            
+            # Compute rho_paired for this r2 batch: rho_q(r2) * rho_t(r2)
+            # (N_rows, batch) * (N_cols, batch) -> (N_rows, N_cols, batch)
+            rho_paired_r2 = jnp.einsum('ib,jb->ijb', rho_row_batch, rho_col_batch)
+            weighted_rho_r2 = rho_paired_r2 * w_batch[None, None, :]
+            
+            # Compute gradients: grad_J(r1, r2) -> (batch_r1, batch_r2, 3)
+            grads = self.jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
+            
+            # Contract: sum_{r2} rho(r2) * grad(r1, r2)
+            # weighted_rho_r2: (N_rows, N_cols, batch_r2)
+            # grads: (batch_r1, batch_r2, 3)
+            # Result: (N_rows, N_cols, batch_r1, 3)
+            term = jnp.einsum('ijb,obd->ijod', weighted_rho_r2, grads)
+            
+            return carry + term, None
+
+        init_val = jnp.zeros((n_rows, n_cols, len(r1_batch), 3))
+        final_val, _ = jax.lax.scan(scan_body, init_val, 
+                                   (r2_batches, weights_batches, 
+                                    rho_rows_batches.transpose(1, 0, 2), 
+                                    rho_cols_batches.transpose(1, 0, 2)))
+        
+        return final_val
+
     @partial(jax.jit, static_argnames=('batch_size',))
     def _calc_v_batch(self, r1_batch, rho, weights, jastrow_params, batch_size=1000):
         """Calculate V_qt(r₁) for a batch of r1 points by scanning over r2.
@@ -64,39 +129,11 @@ class XTC(TC):
         Returns:
             V_batch: (Nb^2, batch_size, 3)
         """
-        n_orb, n_grid = rho.shape
-        nb2 = n_orb * n_orb
-        
-        # Pad grid for r2 scan
-        padded_size = ((n_grid + batch_size - 1) // batch_size) * batch_size
-        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - n_grid), (0, 0)))
-        padded_weights = jnp.pad(weights, (0, padded_size - n_grid))
-        padded_rho = jnp.pad(rho, ((0, 0), (0, padded_size - n_grid)))
-        
-        # Reshape for scanning
-        r2_batches = padded_grid.reshape(-1, batch_size, 3)
-        weights_batches = padded_weights.reshape(-1, batch_size)
-        rho_batches = padded_rho.reshape(n_orb, -1, batch_size)
-        
-        def scan_body(carry, args):
-            r2_batch, w_batch, rho_batch_r2 = args
-            
-            # Compute rho_paired for this r2 batch
-            rho_paired_r2 = jnp.einsum('in,jn->ijn', rho_batch_r2, rho_batch_r2).reshape(nb2, -1)
-            weighted_rho_r2 = rho_paired_r2 * w_batch[None, :]
-            
-            # Compute gradients
-            grads = self.jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
-            
-            # Contract: sum_{r2} rho(r2) * grad(r1, r2)
-            term = jnp.einsum('ki,oij->okj', weighted_rho_r2, grads)
-            
-            return carry + term, None
-
-        init_val = jnp.zeros((len(r1_batch), nb2, 3))
-        final_val, _ = jax.lax.scan(scan_body, init_val, (r2_batches, weights_batches, rho_batches.transpose(1, 0, 2)))
-        
-        return final_val.transpose(1, 0, 2)
+        n_orb = rho.shape[0]
+        # Use the block implementation with full slices
+        full_slice = slice(None)
+        v_block = self._calc_v_block(r1_batch, rho, weights, jastrow_params, full_slice, full_slice, batch_size)
+        return v_block.reshape(n_orb * n_orb, -1, 3)
 
     @jax.jit
     def calc_delta_U(self, v_vector, rho_paired, dm1, weights):
@@ -154,13 +191,32 @@ class XTC(TC):
         result = -(term1 + term2)
         return result
 
-    def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
-        """Get delta_U matrix with memory-efficient batching and multi-GPU support."""
+    def get_delta_U(self, jastrow_params, dm1=None, ranges=None, batch_size=1000):
+        """Get delta_U matrix with memory-efficient batching and multi-GPU support.
+        
+        Args:
+            jastrow_params: Jastrow parameters
+            dm1: Density matrix (must be diagonal if provided)
+            ranges: Tuple of slices (p, q, r, s) for block calculation
+            batch_size: Batch size for grid integration
+            
+        Returns:
+            delta_U: The correction term.
+                     If ranges provided: (Np, Nr, Nq, Ns)
+                     Otherwise: (N, N, N, N)
+        """
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
         if dm1 is None:
             dm1 = self._get_mf_dm()
+            
+        # Check if dm1 is diagonal
+        is_diagonal = jnp.allclose(dm1, jnp.diag(jnp.diagonal(dm1)))
+        if not is_diagonal:
+            raise ValueError("Non-diagonal density matrix for XTC calculation is not supported.")
+        
+        n_occ_vec = jnp.diagonal(dm1)
         
         # Pad grid to be divisible by n_devices
         remainder = n_grid % n_devices
@@ -183,9 +239,27 @@ class XTC(TC):
         # rho: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
         sharded_rho_r1 = padded_rho.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
         
-        # Define n_orb and nb2 for closure
-        n_orb = self.n_orb
-        nb2 = n_orb * n_orb
+        # Define ranges
+        if ranges is None:
+            full_slice = slice(None)
+            ranges = (full_slice, full_slice, full_slice, full_slice)
+            
+        slice_p, slice_q, slice_r, slice_s = ranges
+        slice_occ = slice(0, self.nocc) if self.nocc is not None else slice(None)
+        
+        # Slice n_occ_vec to match slice_occ
+        n_occ_vec_active = n_occ_vec[slice_occ]
+        
+        # Helper to get size
+        def get_size(s, size):
+            start, stop, step = s.indices(size)
+            return (stop - start + (step - 1)) // step
+            
+        Np = get_size(slice_p, self.n_orb)
+        Nq = get_size(slice_q, self.n_orb)
+        Nr = get_size(slice_r, self.n_orb)
+        Ns = get_size(slice_s, self.n_orb)
+        Nocc = get_size(slice_occ, self.n_orb)
 
         def compute_on_device(grid_r1, weights_r1, rho_r1):
             n_local = grid_r1.shape[0]
@@ -203,23 +277,152 @@ class XTC(TC):
             # Reshape for scanning
             r1_batches = grid_r1_batched.reshape(-1, batch_size, 3)
             weights_batches = weights_r1_batched.reshape(-1, batch_size)
-            rho_batches = rho_r1_batched.reshape(n_orb, -1, batch_size)
+            rho_batches = rho_r1_batched.reshape(self.n_orb, -1, batch_size)
             
             def scan_body(carry, args):
                 r1_batch, w_batch, rho_batch = args
                 
-                # Compute rho_paired for this batch
-                rho_paired_batch = jnp.einsum('in,jn->ijn', rho_batch, rho_batch).reshape(nb2, -1)
+                # Current batch size (might be padded)
+                curr_batch_size = r1_batch.shape[0]
                 
-                # Compute V vector for this batch (integrating over all r2)
-                v_batch = self._calc_v_batch(r1_batch, self.rho, self.weights, jastrow_params, batch_size)
+                # --- Compute V blocks ---
+                # We need V blocks for:
+                # (p, r), (q, s)
+                # (occ, p), (occ, r), (occ, q), (occ, s)
+                # (occ, occ) for W
                 
-                # Compute contribution to delta_U
-                contrib = self.calc_delta_U(v_batch, rho_paired_batch, dm1, w_batch)
+                # Optimization: Compute unique blocks only
+                # V is symmetric in orbital indices, so V_ij = V_ji
+                # But _calc_v_block returns (rows, cols, batch, 3)
+                # So V_ji = V_ij.swapaxes(0, 1)
+                
+                # 1. V_occ_occ (for W)
+                V_occ_occ = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                              slice_occ, slice_occ, batch_size)
+                
+                # 2. V_pr
+                V_pr = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                         slice_p, slice_r, batch_size)
+                
+                # 3. V_qs
+                V_qs = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                         slice_q, slice_s, batch_size)
+                
+                # 4. V_occ_blocks
+                # We need V_{k,p}, V_{k,r}, V_{k,q}, V_{k,s} where k in occ
+                # We can compute V_{occ, p} etc.
+                V_occ_p = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                            slice_occ, slice_p, batch_size)
+                V_occ_r = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                            slice_occ, slice_r, batch_size)
+                V_occ_q = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                            slice_occ, slice_q, batch_size)
+                V_occ_s = self._calc_v_block(r1_batch, self.rho, self.weights, jastrow_params, 
+                                            slice_occ, slice_s, batch_size)
+                
+                # --- Compute Intermediates (Diagonal dm1) ---
+                
+                # W = 2 * sum_k V_{kk} n_k
+                # V_occ_occ: (Nocc, Nocc, batch, 3)
+                # Diagonal V_{kk}: (Nocc, batch, 3)
+                V_kk = jnp.einsum('ii...->i...', V_occ_occ)
+                # n_occ_vec: (Nocc,)
+                # W: (batch, 3)
+                W = 2 * jnp.einsum('i,ibd->bd', n_occ_vec_active, V_kk)
+                
+                # Wbar = 2 * sum_k rho_{kk} n_k
+                # rho_batch: (N_orb, batch)
+                rho_occ = rho_batch[slice_occ] # (Nocc, batch)
+                # rho_{kk} is just rho_occ * rho_occ? No, rho_{kk}(r) = |phi_k(r)|^2
+                rho_kk = rho_occ * rho_occ
+                # Wbar: (batch,)
+                Wbar = 2 * jnp.einsum('i,ib->b', n_occ_vec_active, rho_kk)
+                
+                # --- Block (q, s) Terms ---
+                
+                # Zbar_{qs} = sum_k V_{kq} V_{sk} n_k
+                # V_{kq} = V_{qk} = V_occ_q (Nocc, Nq, batch, 3)
+                # V_{sk} = V_{ks} = V_occ_s (Nocc, Ns, batch, 3)
+                # Zbar_{qs}: (Nq, Ns, batch)
+                Zbar_qs = jnp.einsum('i,iqbd,isbd->qsb', n_occ_vec_active, V_occ_q, V_occ_s)
+                
+                # G_{qs} = sum_k (rho_{kq} V_{sk} + rho_{ks} V_{qk}) n_k
+                # rho_{kq} = rho_k * rho_q
+                rho_q = rho_batch[slice_q] # (Nq, batch)
+                rho_s = rho_batch[slice_s] # (Ns, batch)
+                # rho_{kq}: (Nocc, Nq, batch)
+                rho_kq = jnp.einsum('ib,qb->iqb', rho_occ, rho_q)
+                rho_ks = jnp.einsum('ib,sb->isb', rho_occ, rho_s)
+                
+                # G_{qs}: (Nq, Ns, batch, 3)
+                G_qs = jnp.einsum('i,iqb,isbd->qsbd', n_occ_vec_active, rho_kq, V_occ_s) + \
+                       jnp.einsum('i,isb,iqbd->qsbd', n_occ_vec_active, rho_ks, V_occ_q)
+                       
+                # Vbar_{qs} = sum_d W_d * V_{qs,d}
+                Vbar_qs = jnp.einsum('bd,qsbd->qsb', W, V_qs)
+                A_qs = Vbar_qs - Zbar_qs # (Nq, Ns, batch)
+                
+                # B_{qs} = 0.5 * Wbar * V_{qs} - G_{qs}
+                # B_{qs}: (Nq, Ns, batch, 3)
+                B_qs = 0.5 * Wbar[None, None, :, None] * V_qs - G_qs
+                
+                # --- Block (p, r) Terms ---
+                # Symmetric to (q, s)
+                
+                # Zbar_{pr}
+                Zbar_pr = jnp.einsum('i,ipbd,irbd->prb', n_occ_vec_active, V_occ_p, V_occ_r)
+                
+                # G_{pr}
+                rho_p = rho_batch[slice_p]
+                rho_r = rho_batch[slice_r]
+                rho_kp = jnp.einsum('ib,pb->ipb', rho_occ, rho_p)
+                rho_kr = jnp.einsum('ib,rb->irb', rho_occ, rho_r)
+                
+                G_pr = jnp.einsum('i,ipb,irbd->prbd', n_occ_vec_active, rho_kp, V_occ_r) + \
+                       jnp.einsum('i,irb,ipbd->prbd', n_occ_vec_active, rho_kr, V_occ_p)
+                       
+                # A_{pr}
+                Vbar_pr = jnp.einsum('bd,prbd->prb', W, V_pr)
+                A_pr = Vbar_pr - Zbar_pr
+                
+                # B_{pr}
+                B_pr = 0.5 * Wbar[None, None, :, None] * V_pr - G_pr
+                
+                # --- Combine Terms ---
+                
+                # term1 = rho_{pr} * A_{qs}
+                # rho_{pr} = rho_p * rho_r
+                rho_pr = jnp.einsum('pb,rb->prb', rho_p, rho_r)
+                # Weighted rho_pr for integration
+                rho_pr_w = rho_pr * w_batch[None, None, :]
+                
+                # term1: (Np, Nr, Nq, Ns)
+                # einsum: prb, qsb -> prqs (sum over b)
+                term1 = jnp.einsum('prb,qsb->prqs', rho_pr_w, A_qs)
+                
+                # term2 = V_{pr} * B_{qs}
+                # V_{pr}: (Np, Nr, batch, 3)
+                # B_{qs}: (Nq, Ns, batch, 3)
+                # term2: (Np, Nr, Nq, Ns)
+                # We can weight V_pr
+                V_pr_w = V_pr * w_batch[None, None, :, None]
+                term2 = jnp.einsum('prbd,qsbd->prqs', V_pr_w, B_qs)
+                
+                # term1_sym = rho_{qs} * A_{pr}
+                rho_qs = jnp.einsum('qb,sb->qsb', rho_q, rho_s)
+                rho_qs_w = rho_qs * w_batch[None, None, :]
+                term1_sym = jnp.einsum('qsb,prb->prqs', rho_qs_w, A_pr)
+                
+                # term2_sym = V_{qs} * B_{pr}
+                V_qs_w = V_qs * w_batch[None, None, :, None]
+                term2_sym = jnp.einsum('qsbd,prbd->prqs', V_qs_w, B_pr)
+                
+                # Total for this batch
+                contrib = term1 + term2 + term1_sym + term2_sym
                 
                 return carry + contrib, None
 
-            init_val = jnp.zeros((n_orb, n_orb, n_orb, n_orb))
+            init_val = jnp.zeros((Np, Nr, Nq, Ns))
             
             local_delta_U, _ = jax.lax.scan(scan_body, init_val, (r1_batches, weights_batches, rho_batches.transpose(1, 0, 2)))
             
@@ -234,8 +437,25 @@ class XTC(TC):
         
         total_delta_U = delta_U_replicated[0]
         
-        # Symmetrize
-        return total_delta_U + total_delta_U.transpose(2, 3, 0, 1)
+        # Result is -(term1 + term2 + term1_sym + term2_sym)
+        # Note: term1_sym + term2_sym corresponds to the transpose part in the full code
+        # In full code: result + result.T
+        # Here we computed both explicitly.
+        # But wait, term1_sym indices are (p, r, q, s) because we einsum'd that way.
+        # Is that correct?
+        # Full code: result + result.transpose(2, 3, 0, 1)
+        # result indices: q, p, s, r (internal) -> p, r, q, s (external)
+        # result.T indices: s, r, q, p (internal) -> q, s, p, r (external)
+        # Here:
+        # term1 indices: p, r, q, s
+        # term1_sym indices: p, r, q, s (constructed as rho_qs * A_pr)
+        # Does term1_sym correspond to result.T?
+        # result.T corresponds to swapping (p,r) with (q,s).
+        # term1: (p,r) from rho/V, (q,s) from A/B.
+        # term1_sym: (q,s) from rho/V, (p,r) from A/B.
+        # Yes, this covers both symmetric parts.
+        
+        return -total_delta_U
 
     @jax.jit
     def get_const(self, jastrow_params, dm1=None):
@@ -274,17 +494,20 @@ class XTC(TC):
             
         return self.get_delta_h(jastrow_params, dm1)
 
-    @jax.jit
-    def get_2b(self, jastrow_params, dm1=None):
+    @partial(jax.jit, static_argnames=('block_str', 'ranges'))
+    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None):
         """Compute two-body integrals correction."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
+            
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
         
         # Get TC's two-body correction (negative of K terms)
-        tc_correction = super().get_2b(jastrow_params)
+        tc_correction = super().get_2b(jastrow_params, ranges=ranges)
         
         # Add delta_U
-        delta_U = self.get_delta_U(jastrow_params, dm1)
+        delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges)
         
         return tc_correction + delta_U
 

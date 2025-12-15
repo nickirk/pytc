@@ -108,7 +108,7 @@ class TestXTC(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(delta_U_jax),
             delta_U_numpy,
-            rtol=1e-5, atol=1e-5
+            rtol=1e-6, atol=1e-6
         )
         
         # Test symmetry property
