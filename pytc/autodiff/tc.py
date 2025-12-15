@@ -175,10 +175,18 @@ class TC:
         
         # block_str indices: 0->p, 1->r, 2->q, 3->s
         # calc_K1 expects: (p, q, r, s)
-        p = ranges_list[0]
-        r = ranges_list[1]
-        q = ranges_list[2]
-        s = ranges_list[3]
+        if len(ranges_list) == 4:
+            p = ranges_list[0]
+            r = ranges_list[1]
+            q = ranges_list[2]
+            s = ranges_list[3]
+        elif len(ranges_list) == 2:
+            p = ranges_list[0]
+            r = ranges_list[1]
+            q = ranges_list[0]
+            s = ranges_list[1]
+        else:
+            raise ValueError("block_str must have 2 or 4 characters")
         
         return (p, q, r, s)
 

@@ -54,7 +54,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     @jax.jit
     def loss_fn(params):
         # Get corrections
-        delta_h = xtc_obj.get_1b(params)
+        delta_h = xtc_obj.get_1b(params, block_str='ov')
         
         # Compute specific 2-body blocks to save memory
         # V_iajb corresponds to (o, v, o, v)
@@ -69,7 +69,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
         
         # Combine with standard integrals (sliced)
         # h1e_std is (N, N), delta_h is (N, N)
-        one_body_ia = h1e_std[:nocc, nocc:] + delta_h[:nocc, nocc:]
+        one_body_ia = h1e_std[:nocc, nocc:] + delta_h
         
         # V_iajb = eri_ovov + delta_ovov
         V_iajb = eri_std[:nocc, nocc:, :nocc, nocc:] + delta_ovov
