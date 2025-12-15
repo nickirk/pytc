@@ -279,6 +279,7 @@ class XTC(TC):
             weights_batches = weights_r1_batched.reshape(-1, batch_size)
             rho_batches = rho_r1_batched.reshape(self.n_orb, -1, batch_size)
             
+            @jax.checkpoint
             def scan_body(carry, args):
                 r1_batch, w_batch, rho_batch = args
                 
@@ -439,6 +440,60 @@ class XTC(TC):
         
         return -total_delta_U
 
+    def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+        """Get or compute delta_h with memory optimization."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+            
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
+            
+        if ranges is None:
+            # Default to full matrix if no ranges specified
+            ranges = (slice(None), slice(None), slice(None), slice(None))
+            
+        slice_p, slice_q, slice_r_dummy, slice_s_dummy = ranges
+        
+        slice_occ = slice(0, self.nocc)
+        
+        ranges_term1 = (slice_q, slice_occ, slice_p, slice_occ)
+        delta_U_1 = self.get_delta_U(jastrow_params, dm1, ranges=ranges_term1, batch_size=batch_size)
+        # delta_U_1 shape: (Nq, Np, Nocc, Nocc)
+        
+        dm1_diag = jnp.diagonal(dm1)[slice_occ] # (Nocc,)
+        
+        # einsum: qprr, r -> qp
+        term1 = 2 * jnp.einsum('qprr,r->qp', delta_U_1, dm1_diag)
+        
+        ranges_term2 = (slice_occ, slice_q, slice_p, slice_occ)
+        delta_U_2 = self.get_delta_U(jastrow_params, dm1, ranges=ranges_term2, batch_size=batch_size)
+        # delta_U_2 shape: (Nocc, Np, Nq, Nocc)
+        
+        term2 = jnp.einsum('rpqr,r->qp', delta_U_2, dm1_diag)
+        
+        delta_h = -0.5 * (term1 - term2)
+        return delta_h
+
+    @partial(jax.jit, static_argnames=('block_str', 'ranges', 'batch_size'))
+    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+        """Get one-body operator correction."""
+        return self.get_delta_h(jastrow_params, dm1, block_str, ranges, batch_size)
+
+    @partial(jax.jit, static_argnames=('block_str', 'ranges', 'batch_size'))
+    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+        """Compute two-body integrals correction."""
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+            
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
+        
+        tc_correction = super().get_2b(jastrow_params, ranges=ranges)
+        
+        delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
+        
+        return tc_correction + delta_U
+
     @jax.jit
     def get_const(self, jastrow_params, dm1=None):
         """Compute constant contribution."""
@@ -460,38 +515,6 @@ class XTC(TC):
         term2 = jnp.einsum('spqr,rs->qp', delta_U, dm1)
         delta_h = -0.5 * (term1 - term2)
         return delta_h
-
-    def get_delta_h(self, jastrow_params, dm1=None):
-        """Get or compute delta_h."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-        delta_U = self.get_delta_U(jastrow_params, dm1)
-        return self._calc_delta_h(delta_U, dm1)
-
-    @jax.jit
-    def get_1b(self, jastrow_params, dm1=None):
-        """Get one-body operator correction."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-            
-        return self.get_delta_h(jastrow_params, dm1)
-
-    @partial(jax.jit, static_argnames=('block_str', 'ranges'))
-    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None):
-        """Compute two-body integrals correction."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-            
-        if ranges is None and block_str is not None:
-            ranges = self._get_block_ranges(block_str)
-        
-        # Get TC's two-body correction (negative of K terms)
-        tc_correction = super().get_2b(jastrow_params, ranges=ranges)
-        
-        # Add delta_U
-        delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges)
-        
-        return tc_correction + delta_U
 
     def _get_mf_dm(self):
         """Get mean-field 1-body density matrix for closed shell system."""

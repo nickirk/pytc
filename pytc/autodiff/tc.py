@@ -165,6 +165,8 @@ class TC:
                 ranges_list.append(slice(0, self.nocc))
             elif char == 'v':
                 ranges_list.append(slice(self.nocc, self.n_orb))
+            elif char == 'g':
+                ranges_list.append(slice(0, self.n_orb))
             else:
                 raise ValueError(f"Invalid block character: {char}")
         
@@ -223,8 +225,6 @@ class TC:
         sharded_nabla_rho = padded_nabla_rho.reshape(self.n_orb, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
         
         # Execute pmap
-        # We use static_broadcasted_argnums for jastrow_factor (5) and ranges (6)
-        # jastrow_params (4) is broadcasted (in_axes=None)
         pmapped_compute = jax.pmap(
             _compute_2b_shard, 
             axis_name='devices',
@@ -251,16 +251,6 @@ class TC:
             # Symmetric block (e.g. 'oooo'), just add transpose of result
             result += result.transpose(2, 3, 0, 1)
         else:
-            # Asymmetric block (e.g. 'oovv'), must compute transpose block explicitly
-            # Transpose ranges: (q, p, s, r) -> No, (q, s, p, r) ?
-            # Original: (p, r, q, s)
-            # Transpose: (q, s, p, r)
-            # Ranges passed to calc_K1 are (p, q, r, s)
-            # So we need ranges for (q, p, s, r) passed to calc_K1?
-            # Wait, calc_K1 output is (p, r, q, s).
-            # If we want output (q, s, p, r), we need inputs corresponding to q, s, p, r.
-            # calc_K1 args: (p, q, r, s) -> output (p, r, q, s).
-            # So if we want output (q, s, p, r), we need args (q, p, s, r).
             ranges_T = (slice_q, slice_p, slice_s, slice_r)
             
             result_sum_T = pmapped_compute(
@@ -269,11 +259,6 @@ class TC:
             )
             result_T = result_sum_T[0]
             
-            # result_T shape is (Nq, Ns, Np, Nr)
-            # We want to add it to result (Np, Nr, Nq, Ns)
-            # So we transpose result_T to (Np, Nr, Nq, Ns)
-            # Axes of result_T: 0->q, 1->s, 2->p, 3->r
-            # Target: p, r, q, s -> 2, 3, 0, 1
             result += result_T.transpose(2, 3, 0, 1)
         
         return -result

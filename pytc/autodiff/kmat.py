@@ -61,10 +61,12 @@ def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights
     batched_rho_s = padded_rho_s.reshape(Ns, -1, batch_size).transpose(1, 0, 2)
     batched_weights_r2 = padded_weights_r2.reshape(-1, batch_size)
     
+    @jax.checkpoint
     def outer_scan(carry, args):
         r2_batch, rho_q_batch, rho_s_batch, w_batch = args
         
         # Inner scan over r1 batches (bra side: p, r)
+        @jax.checkpoint
         def inner_scan(inner_carry, inner_args):
             r1_batch, nabla_rho_p_batch, rho_r_batch, nabla_rho_r_batch, rho_p_batch, weights_batch = inner_args
             
@@ -160,10 +162,12 @@ def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_siz
     batched_rho_s = padded_rho_s.reshape(Ns, -1, batch_size).transpose(1, 0, 2)
     batched_weights_r2 = padded_weights_r2.reshape(-1, batch_size)
     
+    @jax.checkpoint
     def outer_scan(carry, args):
         r2_batch, rho_q_batch, rho_s_batch, w_batch_r2 = args
         
         # Inner scan over r1 batches (bra side: p, r)
+        @jax.checkpoint
         def inner_scan(inner_carry, inner_args):
             r1_batch, rho_p_batch, rho_r_batch, weights_batch_r1 = inner_args
             

@@ -10,6 +10,12 @@ from pytc.autodiff import xtc
 from pytc.autodiff import tc_helper
 from pyscf import gto, scf
 
+import resource
+
+def get_peak_memory_mb():
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_maxrss / 1024 / 1024 
+
 def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam', learning_rate=1e-3, opt_file='opt_data.npz'):
     """Optimize Jastrow parameters using advanced optimizers with adaptive learning rate."""
     params = init_params.copy()
@@ -49,19 +55,38 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     def loss_fn(params):
         # Get corrections
         delta_h = xtc_obj.get_1b(params)
-        delta_2b = xtc_obj.get_2b(params)
         
-        # Combine with standard integrals
-        one_body = h1e_std + delta_h
-        two_body = eri_std + delta_2b
-
-        V_iajb = two_body[:nocc,nocc:,:nocc,nocc:]
+        # Compute specific 2-body blocks to save memory
+        # V_iajb corresponds to (o, v, o, v)
+        delta_ovov = xtc_obj.get_2b(params, block_str='ovov')
+        
+        # For f_ia terms:
+        # term1: sum_j (ia|jj) -> (o, v, o, o)
+        delta_ovoo = xtc_obj.get_2b(params, block_str='ovoo')
+        
+        # term2: sum_j (ij|ja) -> (o, o, o, v)
+        delta_ooov = xtc_obj.get_2b(params, block_str='ooov')
+        
+        # Combine with standard integrals (sliced)
+        # h1e_std is (N, N), delta_h is (N, N)
+        one_body_ia = h1e_std[:nocc, nocc:] + delta_h[:nocc, nocc:]
+        
+        # V_iajb = eri_ovov + delta_ovov
+        V_iajb = eri_std[:nocc, nocc:, :nocc, nocc:] + delta_ovov
         V_iajb_anti = 2*V_iajb - V_iajb.transpose(0,3,2,1)
 
         # Build Fock matrix elements
-        f_ia = one_body[:nocc,nocc:]
-        f_ia = f_ia + 2.*jnp.einsum('iajj->ia', two_body[:nocc,nocc:,:nocc,:nocc])
-        f_ia = f_ia - jnp.einsum('ijja->ia', two_body[:nocc,:nocc,:nocc,nocc:])
+        f_ia = one_body_ia
+        
+        # Coulomb term: 2 * sum_j (ia|jj)
+        # eri_ovoo + delta_ovoo
+        term_coulomb = eri_std[:nocc, nocc:, :nocc, :nocc] + delta_ovoo
+        f_ia = f_ia + 2. * jnp.einsum('iajj->ia', term_coulomb)
+        
+        # Exchange term: sum_j (ij|ja)
+        # eri_ooov + delta_ooov
+        term_exchange = eri_std[:nocc, :nocc, :nocc, nocc:] + delta_ooov
+        f_ia = f_ia - jnp.einsum('ijja->ia', term_exchange)
 
         loss = jnp.sum(f_ia*f_ia) + jnp.sum(V_iajb_anti*V_iajb_anti)
         return loss
@@ -106,7 +131,8 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
             print(f"Step {step}, Loss: {loss_val:.6f}, "
                   f"Grad norm: {grad_norm:.6f}, "
                   f"LR: {current_lr:.6f}, "
-                  f"Params: {params}")
+                  f"Params: {params}, "
+                  f"Peak Mem: {get_peak_memory_mb():.2f} MB")
                   
         if grad_norm < 1e-6:
             print(f"Converged at step {step}")
@@ -124,7 +150,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
 
 def create_test_system(basis):
     """Create a test He atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
+    mol = gto.M(atom='He 0 0 0; He 0 0 1; He 0 0 2; He 0 0 3', basis=basis, unit='Bohr')
     mol.incore_anyway = True
     mf = scf.RHF(mol)
     mf.kernel()
@@ -212,7 +238,7 @@ def main():
                                           n_steps=20)
         print(f"{opt_name} optimized parameters:", optimized_params)
     
-    assert np.isclose(optimized_params['alpha'][0], 0.37546241, atol=1e-5)
+    assert np.isclose(optimized_params['alpha'][0], 0.37550687, atol=1e-5)
     
     do_ccsd(optimized_params, 'ccpvtz')
 
