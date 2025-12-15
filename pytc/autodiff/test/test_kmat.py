@@ -33,8 +33,18 @@ class TestKmat(unittest.TestCase):
             # Create test data for each configuration
             config['grid_points'] = rng.randn(N_grid, 3)
             config['weights'] = rng.rand(N_grid)  # Random weights
-            config['rho_paired'] = rng.randn(Nb * Nb, N_grid)
-            config['nabla_rho_paired'] = rng.randn(Nb * Nb, N_grid, 3)
+            
+            # Generate orbitals (rho) and gradients (nabla_rho)
+            config['rho'] = rng.randn(Nb, N_grid)
+            config['nabla_rho'] = rng.randn(Nb, N_grid, 3)
+            
+            # Compute paired densities for NumPy reference (which expects pairs)
+            # rho_paired_ij = rho_i * rho_j
+            config['rho_paired'] = np.einsum('in,jn->ijn', config['rho'], config['rho']).reshape(Nb * Nb, N_grid)
+            
+            # nabla_rho_paired_ij = nabla_rho_i * rho_j
+            # Note: This matches JAX calc_K1 logic (nabla on first index)
+            config['nabla_rho_paired'] = np.einsum('ind,jn->ijnd', config['nabla_rho'], config['rho']).reshape(Nb * Nb, N_grid, 3)
         
         # Create Jastrow factors
         self.params = jnp.array([1.0])
@@ -71,8 +81,8 @@ class TestKmat(unittest.TestCase):
             with self.subTest(size=config['name']):
                 Nb = config['Nb']
                 result = calc_K1(
-                    jnp.asarray(config['rho_paired']),
-                    jnp.asarray(config['nabla_rho_paired']),
+                    jnp.asarray(config['rho']),
+                    jnp.asarray(config['nabla_rho']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -84,14 +94,17 @@ class TestKmat(unittest.TestCase):
         """Compare JAX K1 implementation against numpy for different sizes."""
         for config in self.test_configs:
             with self.subTest(size=config['name']):
-                k1_jax = calc_K1(
-                    jnp.asarray(config['rho_paired']),
-                    jnp.asarray(config['nabla_rho_paired']),
+                k1_jax_raw = calc_K1(
+                    jnp.asarray(config['rho']),
+                    jnp.asarray(config['nabla_rho']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights'])
                 )
+                # JAX returns (Nb, Nb, Nb, Nb) flattened to (Nb^2, Nb^2)
+                # This matches NumPy (Nb^2, Nb^2)
+                k1_jax = k1_jax_raw
                 
                 k1_numpy = calc_K1_numpy(
                     config['rho_paired'],
@@ -113,7 +126,7 @@ class TestKmat(unittest.TestCase):
             with self.subTest(size=config['name']):
                 Nb = config['Nb']
                 result = calc_K3(
-                    jnp.asarray(config['rho_paired']),
+                    jnp.asarray(config['rho']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -126,7 +139,7 @@ class TestKmat(unittest.TestCase):
         for config in self.test_configs:
             with self.subTest(size=config['name']):
                 k3_jax = calc_K3(
-                    jnp.asarray(config['rho_paired']),
+                    jnp.asarray(config['rho']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -153,8 +166,8 @@ class TestKmat(unittest.TestCase):
         
         # Get reference result with default batch size
         ref_k1 = calc_K1(
-            jnp.asarray(config['rho_paired']),
-            jnp.asarray(config['nabla_rho_paired']),
+            jnp.asarray(config['rho']),
+            jnp.asarray(config['nabla_rho']),
             self.jastrow_jax,
             self.params,  # Add params argument
             jnp.asarray(config['grid_points']),
@@ -162,7 +175,7 @@ class TestKmat(unittest.TestCase):
         )
         
         ref_k3 = calc_K3(
-            jnp.asarray(config['rho_paired']),
+            jnp.asarray(config['rho']),
             self.jastrow_jax,
             self.params,  # Add params argument
             jnp.asarray(config['grid_points']),
@@ -173,8 +186,8 @@ class TestKmat(unittest.TestCase):
             with self.subTest(batch_size=batch_size):
                 # Test K1
                 k1 = calc_K1(
-                    jnp.asarray(config['rho_paired']),
-                    jnp.asarray(config['nabla_rho_paired']),
+                    jnp.asarray(config['rho']),
+                    jnp.asarray(config['nabla_rho']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -185,7 +198,7 @@ class TestKmat(unittest.TestCase):
                 
                 # Test K3
                 k3 = calc_K3(
-                    jnp.asarray(config['rho_paired']),
+                    jnp.asarray(config['rho']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -377,7 +390,7 @@ class TestISDF(unittest.TestCase):
         from pytc.autodiff.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
         
         # Test different ranks as fractions of grid points
-        ranks = [len(self.weights) // n for n in [200, 50, 10]]
+        ranks = [len(self.weights) // n for n in [100, 50, 10]]
         errors_k1, errors_k2, errors_k3 = [], [], []
         
         for rank in ranks:

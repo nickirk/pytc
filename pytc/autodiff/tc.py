@@ -9,6 +9,69 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 
+def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_factor, ranges):
+    """Compute K terms for a grid shard (pmapped)."""
+    # Unpack ranges (p, q, r, s)
+    slice_p, slice_q, slice_r, slice_s = ranges
+    
+    # Helper to get size
+    def get_size(s, size):
+        start, stop, step = s.indices(size)
+        return (stop - start + (step - 1)) // step
+    
+    n_orb = rho.shape[0]
+    Np = get_size(slice_p, n_orb)
+    Nq = get_size(slice_q, n_orb)
+    Nr = get_size(slice_r, n_orb)
+    Ns = get_size(slice_s, n_orb)
+    
+    # Compute K1 (nabla on p)
+    k1_raw = kmat_jax.calc_K1(
+        rho, nabla_rho,
+        jastrow_factor, jastrow_params,
+        grid, weights,
+        ranges=ranges
+    )
+    k1 = k1_raw.reshape(Np, Nr, Nq, Ns)
+    
+    # Compute K2 (nabla on r)
+    if slice_p == slice_r:
+        # If p and r ranges are identical, K2 is just K1 with p,r swapped
+        k2 = k1.swapaxes(0, 1)
+    else:
+        # Must compute explicitly: swap p and r in ranges
+        ranges_k2 = (slice_r, slice_q, slice_p, slice_s)
+        k2_raw = kmat_jax.calc_K1(
+            rho, nabla_rho,
+            jastrow_factor, jastrow_params,
+            grid, weights,
+            ranges=ranges_k2
+        )
+        # Result is (Nr, Np, Nq, Ns), transpose to (Np, Nr, Nq, Ns)
+        k2 = k2_raw.reshape(Nr, Np, Nq, Ns).transpose(1, 0, 2, 3)
+        
+    # Compute K3
+    k3_raw = kmat_jax.calc_K3(
+        rho, jastrow_factor, jastrow_params,
+        grid, weights,
+        ranges=ranges
+    )
+    k3 = k3_raw.reshape(Np, Nr, Nq, Ns)
+    
+    # Combine: 0.5 * (K1 - K2 + K3)
+    # Note: get_2b (full) logic:
+    # k_nabla = K1
+    # k_laplacian = -(K1 + K2)
+    # result = 0.5 * (k_laplacian + k_square) + k_nabla
+    #        = 0.5 * (-K1 - K2 + K3) + K1
+    #        = 0.5 * (K1 - K2 + K3)
+    result_local = 0.5 * (k1 - k2 + k3)
+    
+    # Sum results across devices
+    result_sum = jax.lax.psum(result_local, axis_name='devices')
+    
+    return result_sum
+
 @struct.dataclass
 class TC:
     """JAX implementation of Transcorrelated method using flax dataclass.
@@ -31,6 +94,7 @@ class TC:
     grid_lvl: int = struct.field(pytree_node=False)
     jastrow_factor: Any = struct.field(pytree_node=True)
     mo_coeff: jnp.ndarray = struct.field(default=None)
+    nocc: int = struct.field(pytree_node=False, default=None)
 
     @classmethod
     def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
@@ -49,6 +113,7 @@ class TC:
         if mo_coeff is None:
             mo_coeff = mf.mo_coeff
         n_orb = mo_coeff.shape[1]
+        nocc = int(np.sum(mf.mo_occ > 0))
         
         # Initialize grid
         grids = dft.gen_grid.Grids(mol)
@@ -79,19 +144,54 @@ class TC:
             n_orb=n_orb,
             grid_lvl=grid_lvl,
             jastrow_factor=jastrow_factor,
-            mo_coeff=jnp.asarray(mo_coeff)
+            mo_coeff=jnp.asarray(mo_coeff),
+            nocc=nocc
         )
     
-    def get_2b(self, jastrow_params):
+    def _get_block_ranges(self, block_str):
+        """Parse block string into slice ranges.
+        
+        block_str is expected to be in chemists' notation (p, r, q, s),
+        where p, r share coordinate 1 and q, s share coordinate 2.
+        
+        Returns ranges in the order (p, q, r, s) expected by calc_K1.
+        """
+        if self.nocc is None:
+            raise ValueError("nocc must be set to use block_str")
+        
+        ranges_list = []
+        for char in block_str:
+            if char == 'o':
+                ranges_list.append(slice(0, self.nocc))
+            elif char == 'v':
+                ranges_list.append(slice(self.nocc, self.n_orb))
+            else:
+                raise ValueError(f"Invalid block character: {char}")
+        
+        # block_str indices: 0->p, 1->r, 2->q, 3->s
+        # calc_K1 expects: (p, q, r, s)
+        p = ranges_list[0]
+        r = ranges_list[1]
+        q = ranges_list[2]
+        s = ranges_list[3]
+        
+        return (p, q, r, s)
+
+    def get_2b(self, jastrow_params, block_str=None, ranges=None):
         """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
         
         Args:
             jastrow_params: Parameters for the Jastrow factor
+            block_str: Optional string specifying the block (e.g. 'oovv')
+            ranges: Optional tuple of slices (slice_p, slice_q, slice_r, slice_s)
             
         Returns:
-            jnp.ndarray: The TC correction term (negative of the K terms sum)
-                         such that H_TC = H_MF + correction
+            jnp.ndarray: The TC correction term.
+                         If block_str/ranges is provided, returns the raw block (Np, Nr, Nq, Ns).
+                         Otherwise, returns the full symmetrized correction (N, N, N, N).
         """
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
         
@@ -122,48 +222,59 @@ class TC:
         # nabla_rho: (Nb, N, 3) -> (Nb, n_dev, N_per, 3) -> (n_dev, Nb, N_per, 3)
         sharded_nabla_rho = padded_nabla_rho.reshape(self.n_orb, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
         
-        # Define pmapped function
-        def compute_on_device(rho, nabla_rho, grid, weights):
-            # Compute K terms for this device's grid chunk
-            # Note: kmat functions integrate over the provided grid chunk
-            # but return the full (Nb, Nb) matrix contribution
-            
-            k1 = kmat_jax.calc_K1(
-                rho, nabla_rho,
-                self.jastrow_factor, jastrow_params,
-                grid, weights
-            )
-            
-            k3 = kmat_jax.calc_K3(
-                rho, self.jastrow_factor, jastrow_params,
-                grid, weights
-            )
-            
-            # Sum results across devices
-            k1_sum = jax.lax.psum(k1, axis_name='devices')
-            k3_sum = jax.lax.psum(k3, axis_name='devices')
-            
-            return k1_sum, k3_sum
-
         # Execute pmap
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices')
-        k_nabla_sum, k_square_sum = pmapped_compute(
-            sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights
+        # We use static_broadcasted_argnums for jastrow_factor (5) and ranges (6)
+        # jastrow_params (4) is broadcasted (in_axes=None)
+        pmapped_compute = jax.pmap(
+            _compute_2b_shard, 
+            axis_name='devices',
+            in_axes=(0, 0, 0, 0, None, None, None),
+            static_broadcasted_argnums=(5, 6)
         )
         
-        # Result is replicated on all devices, take the first one
-        k_nabla = k_nabla_sum[0]
-        k_square = k_square_sum[0]
+        if ranges is None:
+            full_slice = slice(None)
+            ranges = (full_slice, full_slice, full_slice, full_slice)
+            
+        # Compute main block: 0.5 * (K1 - K2 + K3)
+        result_sum = pmapped_compute(
+            sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,
+            jastrow_params, self.jastrow_factor, ranges
+        )
+        result = result_sum[0]
         
-        # Reshape results
-        k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        k_laplacian = -(k_nabla + k_nabla.swapaxes(0,1))
-        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
+        # Add transpose block: (q, s, p, r)
+        # Check if ranges imply symmetry
+        slice_p, slice_q, slice_r, slice_s = ranges
         
-        # Combine results
-        result = 0.5 * (k_laplacian + k_square)
-        result += k_nabla
-        result += result.transpose(2, 3, 0, 1)
+        if slice_p == slice_q and slice_r == slice_s:
+            # Symmetric block (e.g. 'oooo'), just add transpose of result
+            result += result.transpose(2, 3, 0, 1)
+        else:
+            # Asymmetric block (e.g. 'oovv'), must compute transpose block explicitly
+            # Transpose ranges: (q, p, s, r) -> No, (q, s, p, r) ?
+            # Original: (p, r, q, s)
+            # Transpose: (q, s, p, r)
+            # Ranges passed to calc_K1 are (p, q, r, s)
+            # So we need ranges for (q, p, s, r) passed to calc_K1?
+            # Wait, calc_K1 output is (p, r, q, s).
+            # If we want output (q, s, p, r), we need inputs corresponding to q, s, p, r.
+            # calc_K1 args: (p, q, r, s) -> output (p, r, q, s).
+            # So if we want output (q, s, p, r), we need args (q, p, s, r).
+            ranges_T = (slice_q, slice_p, slice_s, slice_r)
+            
+            result_sum_T = pmapped_compute(
+                sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,
+                jastrow_params, self.jastrow_factor, ranges_T
+            )
+            result_T = result_sum_T[0]
+            
+            # result_T shape is (Nq, Ns, Np, Nr)
+            # We want to add it to result (Np, Nr, Nq, Ns)
+            # So we transpose result_T to (Np, Nr, Nq, Ns)
+            # Axes of result_T: 0->q, 1->s, 2->p, 3->r
+            # Target: p, r, q, s -> 2, 3, 0, 1
+            result += result_T.transpose(2, 3, 0, 1)
         
         return -result
 
@@ -228,8 +339,11 @@ class ISDFTC(TC):
             pivots=pivots
         )
 
-    def get_2b(self, jastrow_params):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None):
         """Calculate TC correction terms using ISDF."""
+        if block_str is not None or ranges is not None:
+            raise NotImplementedError("Block calculation not implemented for ISDFTC yet.")
+            
         # Use ISDF method
         k_nabla = kmat_jax.calc_K1_isdf(
             self.C_rho,

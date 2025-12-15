@@ -3,7 +3,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000):
+def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000, ranges=None):
     """JAX implementation of K1 term with memory-efficient batching using scan.
     
     Args:
@@ -14,11 +14,35 @@ def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights
         grid_points: Array of shape (N_grid, 3)
         weights: Array of shape (N_grid,) for integration weights
         batch_size: Number of grid points to process at once
+        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s).
+                If None, computes full (Nb^2, Nb^2) matrix.
     """
     n_orb = rho.shape[0]
-    Nb2 = n_orb * n_orb
     N_grid = grid_points.shape[0]
     weights = jnp.asarray(weights)
+    
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+        Np = Nq = Nr = Ns = n_orb
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+        # Helper to get size from slice
+        def get_size(s, size):
+            start, stop, step = s.indices(size)
+            return (stop - start + (step - 1)) // step
+        Np = get_size(slice_p, n_orb)
+        Nq = get_size(slice_q, n_orb)
+        Nr = get_size(slice_r, n_orb)
+        Ns = get_size(slice_s, n_orb)
+
+    # Slice input arrays
+    rho_p = rho[slice_p]
+    rho_q = rho[slice_q]
+    rho_r = rho[slice_r]
+    rho_s = rho[slice_s]
+    
+    nabla_rho_p = nabla_rho[slice_p]
+    nabla_rho_r = nabla_rho[slice_r]
     
     # Pad grid to multiple of batch_size
     padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
@@ -27,24 +51,27 @@ def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights
     # Reshape for scanning
     batched_grid = padded_grid.reshape(-1, batch_size, 3)
     
-    # Prepare outer scan inputs
-    padded_rho = jnp.pad(rho, ((0, 0), (0, padded_size - N_grid)))
+    # Prepare outer scan inputs (ket side: q, s)
+    # We need rho_q and rho_s for the outer loop (r2 integration)
+    padded_rho_q = jnp.pad(rho_q, ((0, 0), (0, padded_size - N_grid)))
+    padded_rho_s = jnp.pad(rho_s, ((0, 0), (0, padded_size - N_grid)))
     padded_weights_r2 = jnp.pad(weights, ((0, padded_size - N_grid),))
     
-    batched_rho = padded_rho.reshape(n_orb, -1, batch_size).transpose(1, 0, 2) # (n_batches, Nb, batch_size)
+    batched_rho_q = padded_rho_q.reshape(Nq, -1, batch_size).transpose(1, 0, 2)
+    batched_rho_s = padded_rho_s.reshape(Ns, -1, batch_size).transpose(1, 0, 2)
     batched_weights_r2 = padded_weights_r2.reshape(-1, batch_size)
     
     def outer_scan(carry, args):
-        r2_batch, rho_batch, w_batch = args
-        # Compute rho_paired for this batch of r2
-        # original code:
-        # rho_paired = einsum('in,jn->ijn', rho, rho)
-        # rho_nabla_rho_paired = einsum('pnd,rn->prnd', nabla_rho, rho)
+        r2_batch, rho_q_batch, rho_s_batch, w_batch = args
         
-        # Inner scan over r1 batches
+        # Inner scan over r1 batches (bra side: p, r)
         def inner_scan(inner_carry, inner_args):
-            r1_batch, nabla_rho_batch_r1, rho_batch_r1, weights_batch = inner_args
-            nabla_rho_paired_batch = jnp.einsum('pnd,rn->prnd', nabla_rho_batch_r1, rho_batch_r1).reshape(Nb2, -1, 3)
+            r1_batch, nabla_rho_p_batch, rho_r_batch, nabla_rho_r_batch, rho_p_batch, weights_batch = inner_args
+            
+            # nabla_rho_paired_bra = nabla_rho_p * rho_r
+            # Shape: (Np*Nr, batch, 3)
+            nabla_rho_paired_batch = jnp.einsum('pnd,rn->prnd', nabla_rho_p_batch, rho_r_batch).reshape(Np*Nr, -1, 3)
+            
             grads = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
             term = jnp.einsum('ijc,j,jkc->ik', nabla_rho_paired_batch, weights_batch, grads)
             return inner_carry + term, None
@@ -54,30 +81,34 @@ def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights
         padded_inner_size = n_inner * inner_bs
         
         padded_r1 = jnp.pad(grid_points, ((0, padded_inner_size - N_grid), (0, 0)))
-        padded_nabla = jnp.pad(nabla_rho, ((0, 0), (0, padded_inner_size - N_grid), (0, 0)))
-        padded_rho_inner = jnp.pad(rho, ((0, 0), (0, padded_inner_size - N_grid)))
+        padded_nabla_p = jnp.pad(nabla_rho_p, ((0, 0), (0, padded_inner_size - N_grid), (0, 0)))
+        padded_rho_r = jnp.pad(rho_r, ((0, 0), (0, padded_inner_size - N_grid)))
+        padded_nabla_r = jnp.pad(nabla_rho_r, ((0, 0), (0, padded_inner_size - N_grid), (0, 0)))
+        padded_rho_p = jnp.pad(rho_p, ((0, 0), (0, padded_inner_size - N_grid)))
         padded_weights = jnp.pad(weights, ((0, padded_inner_size - N_grid),))
         
         batched_r1 = padded_r1.reshape(n_inner, inner_bs, 3)
-        batched_nabla = padded_nabla.reshape(n_orb, n_inner, inner_bs, 3).transpose(1, 0, 2, 3) # (n_inner, Nb, inner_bs, 3)
-        batched_rho_inner = padded_rho_inner.reshape(n_orb, n_inner, inner_bs).transpose(1, 0, 2) # (n_inner, Nb, inner_bs)
+        batched_nabla_p = padded_nabla_p.reshape(Np, n_inner, inner_bs, 3).transpose(1, 0, 2, 3)
+        batched_rho_r = padded_rho_r.reshape(Nr, n_inner, inner_bs).transpose(1, 0, 2)
+        batched_nabla_r = padded_nabla_r.reshape(Nr, n_inner, inner_bs, 3).transpose(1, 0, 2, 3)
+        batched_rho_p = padded_rho_p.reshape(Np, n_inner, inner_bs).transpose(1, 0, 2)
         batched_weights = padded_weights.reshape(n_inner, inner_bs)
         
-        tmp_init = jnp.zeros((Nb2, batch_size))
-        tmp, _ = jax.lax.scan(inner_scan, tmp_init, (batched_r1, batched_nabla, batched_rho_inner, batched_weights))
+        tmp_init = jnp.zeros((Np*Nr, batch_size))
+        tmp, _ = jax.lax.scan(inner_scan, tmp_init, (batched_r1, batched_nabla_p, batched_rho_r, batched_nabla_r, batched_rho_p, batched_weights))
         
-        rho_paired_batch = jnp.einsum('in,jn->ijn', rho_batch, rho_batch).reshape(Nb2, -1)
-        # original code 
-        # contrib = jnp.dot(rho_batch * w_batch[None, :], tmp.T)
+        # rho_paired_ket = rho_q * rho_s
+        rho_paired_batch = jnp.einsum('qn,sn->qsn', rho_q_batch, rho_s_batch).reshape(Nq*Ns, -1)
+        
         contrib = jnp.dot(rho_paired_batch * w_batch[None, :], tmp.T)
         return carry + contrib, None
 
-    result_init = jnp.zeros((Nb2, Nb2))
-    final_result, _ = jax.lax.scan(outer_scan, result_init, (batched_grid, batched_rho, batched_weights_r2))
+    result_init = jnp.zeros((Nq*Ns, Np*Nr))
+    final_result, _ = jax.lax.scan(outer_scan, result_init, (batched_grid, batched_rho_q, batched_rho_s, batched_weights_r2))
     
     return final_result.T
 
-def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000):
+def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000, ranges=None):
     """JAX implementation of K3 term with memory-efficient batching using scan.
     
     Args:
@@ -87,11 +118,32 @@ def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_siz
         grid_points: Array of shape (N_grid, 3)
         weights: Array of shape (N_grid,) for integration weights
         batch_size: Number of grid points to process at once
+        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s).
+                If None, computes full (Nb^2, Nb^2) matrix.
     """
     n_orb = rho.shape[0]
-    Nb2 = n_orb * n_orb
     N_grid = grid_points.shape[0]
     weights = jnp.asarray(weights)
+    
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+        Np = Nq = Nr = Ns = n_orb
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+        # Helper to get size from slice
+        def get_size(s, size):
+            start, stop, step = s.indices(size)
+            return (stop - start + (step - 1)) // step
+        Np = get_size(slice_p, n_orb)
+        Nq = get_size(slice_q, n_orb)
+        Nr = get_size(slice_r, n_orb)
+        Ns = get_size(slice_s, n_orb)
+
+    # Slice input arrays
+    rho_p = rho[slice_p]
+    rho_q = rho[slice_q]
+    rho_r = rho[slice_r]
+    rho_s = rho[slice_s]
     
     # Pad grid to multiple of batch_size
     padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
@@ -99,22 +151,24 @@ def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_siz
     
     batched_grid = padded_grid.reshape(-1, batch_size, 3)
     
-    # Prepare inputs for outer scan (over r2 batches)
-    padded_rho = jnp.pad(rho, ((0, 0), (0, padded_size - N_grid)))
+    # Prepare inputs for outer scan (over r2 batches, ket side: q, s)
+    padded_rho_q = jnp.pad(rho_q, ((0, 0), (0, padded_size - N_grid)))
+    padded_rho_s = jnp.pad(rho_s, ((0, 0), (0, padded_size - N_grid)))
     padded_weights_r2 = jnp.pad(weights, ((0, padded_size - N_grid),))
     
-    batched_rho = padded_rho.reshape(n_orb, -1, batch_size).transpose(1, 0, 2) # (n_batches, Nb, batch_size)
+    batched_rho_q = padded_rho_q.reshape(Nq, -1, batch_size).transpose(1, 0, 2)
+    batched_rho_s = padded_rho_s.reshape(Ns, -1, batch_size).transpose(1, 0, 2)
     batched_weights_r2 = padded_weights_r2.reshape(-1, batch_size)
     
     def outer_scan(carry, args):
-        r2_batch, rho_batch_r2, w_batch_r2 = args
+        r2_batch, rho_q_batch, rho_s_batch, w_batch_r2 = args
         
-        # Inner scan over r1 batches
+        # Inner scan over r1 batches (bra side: p, r)
         def inner_scan(inner_carry, inner_args):
-            r1_batch, rho_batch_r1, weights_batch_r1 = inner_args
+            r1_batch, rho_p_batch, rho_r_batch, weights_batch_r1 = inner_args
             
             # Compute rho_paired for this batch of r1
-            rho_paired_batch_r1 = jnp.einsum('in,jn->ijn', rho_batch_r1, rho_batch_r1).reshape(Nb2, -1)
+            rho_paired_batch_r1 = jnp.einsum('pn,rn->prn', rho_p_batch, rho_r_batch).reshape(Np*Nr, -1)
             
             # Compute gradients
             grads = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params) # (inner_bs, batch_size, 3)
@@ -132,26 +186,28 @@ def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_siz
         padded_inner_size = n_inner * inner_bs
         
         padded_r1 = jnp.pad(grid_points, ((0, padded_inner_size - N_grid), (0, 0)))
-        padded_rho = jnp.pad(rho, ((0, 0), (0, padded_inner_size - N_grid)))
+        padded_rho_p = jnp.pad(rho_p, ((0, 0), (0, padded_inner_size - N_grid)))
+        padded_rho_r = jnp.pad(rho_r, ((0, 0), (0, padded_inner_size - N_grid)))
         padded_weights = jnp.pad(weights, ((0, padded_inner_size - N_grid),))
         
         batched_r1 = padded_r1.reshape(n_inner, inner_bs, 3)
-        batched_rho_r1 = padded_rho.reshape(n_orb, n_inner, inner_bs).transpose(1, 0, 2)
+        batched_rho_p = padded_rho_p.reshape(Np, n_inner, inner_bs).transpose(1, 0, 2)
+        batched_rho_r = padded_rho_r.reshape(Nr, n_inner, inner_bs).transpose(1, 0, 2)
         batched_weights_r1 = padded_weights.reshape(n_inner, inner_bs)
         
-        tmp_init = jnp.zeros((Nb2, batch_size))
-        tmp, _ = jax.lax.scan(inner_scan, tmp_init, (batched_r1, batched_rho_r1, batched_weights_r1))
+        tmp_init = jnp.zeros((Np*Nr, batch_size))
+        tmp, _ = jax.lax.scan(inner_scan, tmp_init, (batched_r1, batched_rho_p, batched_rho_r, batched_weights_r1))
         
-        # tmp is (Nb2, batch_size) = sum_j [ rho_paired(r1_j) * w(r1_j) * w(r2_k) * |grad|^2 ]
-        # Now accumulate result: sum_k [ rho_paired(r2_k) * tmp[p, k] ] -> (Nb2, Nb2)
+        # tmp is (Np*Nr, batch_size)
+        # Now accumulate result: sum_k [ rho_paired(r2_k) * tmp[p, k] ]
         
-        rho_paired_batch_r2 = jnp.einsum('in,jn->ijn', rho_batch_r2, rho_batch_r2).reshape(Nb2, -1)
+        rho_paired_batch_r2 = jnp.einsum('qn,sn->qsn', rho_q_batch, rho_s_batch).reshape(Nq*Ns, -1)
         
-        contrib = jnp.dot(tmp, rho_paired_batch_r2.T) # (Nb2, Nb2)
+        contrib = jnp.dot(tmp, rho_paired_batch_r2.T) # (Np*Nr, Nq*Ns)
         return carry + contrib, None
 
-    result_init = jnp.zeros((Nb2, Nb2))
-    final_result, _ = jax.lax.scan(outer_scan, result_init, (batched_grid, batched_rho, batched_weights_r2))
+    result_init = jnp.zeros((Np*Nr, Nq*Ns))
+    final_result, _ = jax.lax.scan(outer_scan, result_init, (batched_grid, batched_rho_q, batched_rho_s, batched_weights_r2))
     
     return final_result
 
