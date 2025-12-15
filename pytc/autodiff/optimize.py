@@ -150,7 +150,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
 
 def create_test_system(basis):
     """Create a test He atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='He 0 0 0; He 0 0 1; He 0 0 2; He 0 0 3', basis=basis, unit='Bohr')
+    mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
     mol.incore_anyway = True
     mf = scf.RHF(mol)
     mf.kernel()

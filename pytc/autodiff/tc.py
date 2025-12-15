@@ -9,7 +9,7 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 
-def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_factor, ranges):
+def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
     # Unpack ranges (p, q, r, s)
     slice_p, slice_q, slice_r, slice_s = ranges
@@ -30,7 +30,8 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
         rho, nabla_rho,
         jastrow_factor, jastrow_params,
         grid, weights,
-        ranges=ranges
+        ranges=ranges,
+        batch_size=batch_size
     )
     k1 = k1_raw.reshape(Np, Nr, Nq, Ns)
     
@@ -45,7 +46,8 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
             rho, nabla_rho,
             jastrow_factor, jastrow_params,
             grid, weights,
-            ranges=ranges_k2
+            ranges=ranges_k2,
+            batch_size=batch_size
         )
         # Result is (Nr, Np, Nq, Ns), transpose to (Np, Nr, Nq, Ns)
         k2 = k2_raw.reshape(Nr, Np, Nq, Ns).transpose(1, 0, 2, 3)
@@ -54,7 +56,8 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
     k3_raw = kmat_jax.calc_K3(
         rho, jastrow_factor, jastrow_params,
         grid, weights,
-        ranges=ranges
+        ranges=ranges,
+        batch_size=batch_size
     )
     k3 = k3_raw.reshape(Np, Nr, Nq, Ns)
     
@@ -179,7 +182,7 @@ class TC:
         
         return (p, q, r, s)
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
         
         Args:
@@ -228,8 +231,8 @@ class TC:
         pmapped_compute = jax.pmap(
             _compute_2b_shard, 
             axis_name='devices',
-            in_axes=(0, 0, 0, 0, None, None, None),
-            static_broadcasted_argnums=(5, 6)
+            in_axes=(0, 0, 0, 0, None, None, None, None),
+            static_broadcasted_argnums=(5, 6, 7)
         )
         
         if ranges is None:
@@ -239,7 +242,7 @@ class TC:
         # Compute main block: 0.5 * (K1 - K2 + K3)
         result_sum = pmapped_compute(
             sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,
-            jastrow_params, self.jastrow_factor, ranges
+            jastrow_params, self.jastrow_factor, ranges, batch_size
         )
         result = result_sum[0]
         
@@ -255,7 +258,7 @@ class TC:
             
             result_sum_T = pmapped_compute(
                 sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,
-                jastrow_params, self.jastrow_factor, ranges_T
+                jastrow_params, self.jastrow_factor, ranges_T, batch_size
             )
             result_T = result_sum_T[0]
             
@@ -324,7 +327,7 @@ class ISDFTC(TC):
             pivots=pivots
         )
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF."""
         if block_str is not None or ranges is not None:
             raise NotImplementedError("Block calculation not implemented for ISDFTC yet.")
@@ -338,7 +341,8 @@ class ISDFTC(TC):
             self.jastrow_factor,
             jastrow_params,
             self.grid_points,
-            self.weights
+            self.weights,
+            batch_size=batch_size
         )
         # k_laplacian = -(k_nabla + k_nabla^T)
         # We reshape first to swap axes correctly
@@ -351,7 +355,8 @@ class ISDFTC(TC):
             self.jastrow_factor,
             jastrow_params,
             self.grid_points,
-            self.weights
+            self.weights,
+            batch_size=batch_size
         )
         
         # Reshape results
