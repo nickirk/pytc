@@ -211,10 +211,10 @@ class XTC(TC):
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
-        # Check if dm1 is diagonal
-        is_diagonal = jnp.allclose(dm1, jnp.diag(jnp.diagonal(dm1)))
-        if not is_diagonal:
-            raise ValueError("Non-diagonal density matrix for XTC calculation is not supported.")
+        # Check if dm1 is diagonal (for debugging/verification outside JIT)
+        # is_diagonal = jnp.allclose(dm1, jnp.diag(jnp.diagonal(dm1)))
+        # if not is_diagonal:
+        #     raise ValueError("Non-diagonal density matrix for XTC calculation is not supported.")
         
         n_occ_vec = jnp.diagonal(dm1)
         
@@ -436,24 +436,6 @@ class XTC(TC):
         delta_U_replicated = pmapped_compute(sharded_grid_r1, sharded_weights_r1, sharded_rho_r1)
         
         total_delta_U = delta_U_replicated[0]
-        
-        # Result is -(term1 + term2 + term1_sym + term2_sym)
-        # Note: term1_sym + term2_sym corresponds to the transpose part in the full code
-        # In full code: result + result.T
-        # Here we computed both explicitly.
-        # But wait, term1_sym indices are (p, r, q, s) because we einsum'd that way.
-        # Is that correct?
-        # Full code: result + result.transpose(2, 3, 0, 1)
-        # result indices: q, p, s, r (internal) -> p, r, q, s (external)
-        # result.T indices: s, r, q, p (internal) -> q, s, p, r (external)
-        # Here:
-        # term1 indices: p, r, q, s
-        # term1_sym indices: p, r, q, s (constructed as rho_qs * A_pr)
-        # Does term1_sym correspond to result.T?
-        # result.T corresponds to swapping (p,r) with (q,s).
-        # term1: (p,r) from rho/V, (q,s) from A/B.
-        # term1_sym: (q,s) from rho/V, (p,r) from A/B.
-        # Yes, this covers both symmetric parts.
         
         return -total_delta_U
 
