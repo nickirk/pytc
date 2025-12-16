@@ -12,7 +12,7 @@ from . import kmat as kmat_jax
 def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
     # Unpack ranges (p, q, r, s)
-    slice_p, slice_q, slice_r, slice_s = ranges
+    slice_p, slice_r, slice_q, slice_s = ranges
     
     # Helper to get size
     def get_size(s, size):
@@ -41,7 +41,7 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
         k2 = k1.swapaxes(0, 1)
     else:
         # Must compute explicitly: swap p and r in ranges
-        ranges_k2 = (slice_r, slice_q, slice_p, slice_s)
+        ranges_k2 = (slice_r, slice_p, slice_q, slice_s)
         k2_raw = kmat_jax.calc_K1(
             rho, nabla_rho,
             jastrow_factor, jastrow_params,
@@ -157,7 +157,7 @@ class TC:
         block_str is expected to be in chemists' notation (p, r, q, s),
         where p, r share coordinate 1 and q, s share coordinate 2.
         
-        Returns ranges in the order (p, q, r, s) expected by calc_K1.
+        Returns ranges in the order (p, r, q, s) expected by calc_K1.
         """
         if self.nocc is None:
             raise ValueError("nocc must be set to use block_str")
@@ -188,7 +188,7 @@ class TC:
         else:
             raise ValueError("block_str must have 2 or 4 characters")
         
-        return (p, q, r, s)
+        return (p, r, q, s)
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
@@ -256,13 +256,13 @@ class TC:
         
         # Add transpose block: (q, s, p, r)
         # Check if ranges imply symmetry
-        slice_p, slice_q, slice_r, slice_s = ranges
+        slice_p, slice_r, slice_q, slice_s = ranges
         
         if slice_p == slice_q and slice_r == slice_s:
             # Symmetric block (e.g. 'oooo'), just add transpose of result
             result += result.transpose(2, 3, 0, 1)
         else:
-            ranges_T = (slice_q, slice_p, slice_s, slice_r)
+            ranges_T = (slice_q, slice_s, slice_p, slice_r)
             
             result_sum_T = pmapped_compute(
                 sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,

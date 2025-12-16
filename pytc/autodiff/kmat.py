@@ -25,7 +25,7 @@ def calc_K1(rho, nabla_rho, jastrow_factor, jastrow_params, grid_points, weights
         slice_p = slice_q = slice_r = slice_s = slice(None)
         Np = Nq = Nr = Ns = n_orb
     else:
-        slice_p, slice_q, slice_r, slice_s = ranges
+        slice_p, slice_r, slice_q, slice_s = ranges
         # Helper to get size from slice
         def get_size(s, size):
             start, stop, step = s.indices(size)
@@ -131,7 +131,7 @@ def calc_K3(rho, jastrow_factor, jastrow_params, grid_points, weights, batch_siz
         slice_p = slice_q = slice_r = slice_s = slice(None)
         Np = Nq = Nr = Ns = n_orb
     else:
-        slice_p, slice_q, slice_r, slice_s = ranges
+        slice_p, slice_r, slice_q, slice_s = ranges
         # Helper to get size from slice
         def get_size(s, size):
             start, stop, step = s.indices(size)

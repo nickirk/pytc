@@ -244,7 +244,7 @@ class XTC(TC):
             full_slice = slice(None)
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
-        slice_p, slice_q, slice_r, slice_s = ranges
+        slice_p, slice_r, slice_q, slice_s = ranges
         slice_occ = slice(0, self.nocc) if self.nocc is not None else slice(None)
         
         # Slice n_occ_vec to match slice_occ
@@ -452,24 +452,24 @@ class XTC(TC):
             # Default to full matrix if no ranges specified
             ranges = (slice(None), slice(None), slice(None), slice(None))
             
-        slice_p, slice_q, slice_r_dummy, slice_s_dummy = ranges
+        slice_p, slice_r, slice_q, slice_s = ranges
         
         slice_occ = slice(0, self.nocc)
         
-        ranges_term1 = (slice_q, slice_occ, slice_p, slice_occ)
+        ranges_term1 = (slice_p, slice_r, slice_occ,  slice_occ)
         delta_U_1 = self.get_delta_U(jastrow_params, dm1, ranges=ranges_term1, batch_size=batch_size)
         # delta_U_1 shape: (Nq, Np, Nocc, Nocc)
         
         dm1_diag = jnp.diagonal(dm1)[slice_occ] # (Nocc,)
         
         # einsum: qprr, r -> qp
-        term1 = 2 * jnp.einsum('qprr,r->qp', delta_U_1, dm1_diag)
+        term1 = 2 * jnp.einsum('proo,o->pr', delta_U_1, dm1_diag)
         
-        ranges_term2 = (slice_occ, slice_q, slice_p, slice_occ)
+        ranges_term2 = (slice_occ, slice_p, slice_r, slice_occ)
         delta_U_2 = self.get_delta_U(jastrow_params, dm1, ranges=ranges_term2, batch_size=batch_size)
         # delta_U_2 shape: (Nocc, Np, Nq, Nocc)
         
-        term2 = jnp.einsum('rpqr,r->qp', delta_U_2, dm1_diag)
+        term2 = jnp.einsum('opro,o->pr', delta_U_2, dm1_diag)
         
         delta_h = -0.5 * (term1 - term2)
         return delta_h
