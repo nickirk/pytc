@@ -22,7 +22,11 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     
     # Precompute standard integrals
     h1e_std = jnp.asarray(tc_helper.get_hcore(mf, xtc_obj.mo_coeff))
-    eri_std = jnp.asarray(tc_helper.get_eri(mf, xtc_obj.mo_coeff))
+    # on host RAM store eri full block, and slice it for each block for GPU
+    eri = tc_helper.get_eri(mf, xtc_obj.mo_coeff)
+    eri_ovov = jnp.asarray(eri[:nocc, nocc:, :nocc, nocc:])
+    eri_ovoo = jnp.asarray(eri[:nocc, nocc:, :nocc, :nocc])
+    eri_ooov = jnp.asarray(eri[:nocc, :nocc, :nocc, nocc:])
     nocc = int(sum(mf.mo_occ == 2))
 
     # Add learning rate schedule parameters
@@ -72,7 +76,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
         one_body_ia = h1e_std[:nocc, nocc:] + delta_h
         
         # V_iajb = eri_ovov + delta_ovov
-        V_iajb = eri_std[:nocc, nocc:, :nocc, nocc:] + delta_ovov
+        V_iajb = eri_ovov + delta_ovov
         V_iajb_anti = 2*V_iajb - V_iajb.transpose(0,3,2,1)
 
         # Build Fock matrix elements
@@ -80,12 +84,12 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
         
         # Coulomb term: 2 * sum_j (ia|jj)
         # eri_ovoo + delta_ovoo
-        term_coulomb = eri_std[:nocc, nocc:, :nocc, :nocc] + delta_ovoo
+        term_coulomb = eri_ovoo + delta_ovoo
         f_ia = f_ia + 2. * jnp.einsum('iajj->ia', term_coulomb)
         
         # Exchange term: sum_j (ij|ja)
         # eri_ooov + delta_ooov
-        term_exchange = eri_std[:nocc, :nocc, :nocc, nocc:] + delta_ooov
+        term_exchange = eri_ooov + delta_ooov
         f_ia = f_ia - jnp.einsum('ijja->ia', term_exchange)
 
         loss = jnp.sum(f_ia*f_ia) + jnp.sum(V_iajb_anti*V_iajb_anti)
@@ -150,7 +154,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
 
 def create_test_system(basis):
     """Create a test He atom system with cc-pVDZ basis."""
-    mol = gto.M(atom='He 0 0 0', basis=basis, unit='Bohr')
+    mol = gto.M(atom='He 0 0 0; He 0 0 1', basis=basis, unit='Bohr')
     mol.incore_anyway = True
     mf = scf.RHF(mol)
     mf.kernel()

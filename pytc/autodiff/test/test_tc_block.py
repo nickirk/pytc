@@ -59,7 +59,7 @@ class TestTCBlock(unittest.TestCase):
         range_r = slice(0, 7)
         range_s = slice(1, 10)
         
-        block_2b = self.tc.get_2b(self.jastrow_params, ranges=(range_p, range_q, range_r, range_s))
+        block_2b = self.tc.get_2b(self.jastrow_params, ranges=(range_p, range_r, range_q, range_s))
         full_2b = self.tc.get_2b(self.jastrow_params)
         
         expected = full_2b[range_p, range_r, range_q, range_s]
