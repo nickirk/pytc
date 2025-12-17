@@ -240,7 +240,7 @@ class TC:
             _compute_2b_shard, 
             axis_name='devices',
             in_axes=(0, 0, 0, 0, None, None, None, None),
-            static_broadcasted_argnums=(5, 6, 7)
+            static_broadcasted_argnums=(6, 7)
         )
         
         if ranges is None:
@@ -274,9 +274,161 @@ class TC:
         
         return -result
 
-    def get_3b(self):
-        """Compute all three-body integrals."""
-        raise NotImplementedError("JAX implementation pending")
+    def get_1b_fock(self, jastrow_params, dm1=None):
+        """Get one-body Fock matrix correction (AO basis)."""
+        return jnp.zeros((self.n_orb, self.n_orb))
+
+    def get_2b_fock(self, jastrow_params, dm1):
+        """Get 2-body Fock matrix correction.
+        
+        Args:
+            jastrow_params: Jastrow parameters
+            dm1: Density matrix (AO basis), shape (N, N)
+            
+        Returns:
+            Fock matrix contribution (N, N)
+        """
+        k_2b = self.get_2b(jastrow_params) # (p, r, q, s) in chemists notation?
+        T = k_2b # (p, r, q, s)
+        
+        # Coulomb-like contribution
+        # \sum_{q,s} T_{prqs} P_{qs}
+        J_mat = jnp.einsum('prqs,qs->pr', T, dm1)
+        K_mat = jnp.einsum('pqrs,qs->pr', T, dm1)
+        
+        return J_mat - 0.5 * K_mat
+
+    def get_3b_fock(self, jastrow_params, dm1):
+        """Get 3-body Fock matrix correction (on-the-fly).
+        
+        Args:
+            jastrow_params: Jastrow parameters
+            dm1: Density matrix (AO basis)
+            
+        Returns:
+            Fock matrix contribution (N, N)
+        """
+        rho_g = jnp.einsum('mg,ng,mn->g', self.rho, self.rho, dm1)
+        
+        N_grid = self.grid_points.shape[0]
+        batch_size = 1000
+        
+        def compute_W_batch(r_batch):
+            def inner_scan(carry, chunk_idx):
+                start = chunk_idx * batch_size
+                end = jnp.minimum(start + batch_size, N_grid)
+                
+                # Using dynamic_slice
+                slice_len = batch_size # Fixed size slice
+                r2_chunk = jax.lax.dynamic_slice(self.grid_points, (start, 0), (slice_len, 3))
+                w_chunk = jax.lax.dynamic_slice(self.weights, (start,), (slice_len,))
+                rho_chunk = jax.lax.dynamic_slice(rho_g, (start,), (slice_len,))
+                
+                # grad(r_batch, r2_chunk) -> (B, B_inner, 3)
+                grads = self.jastrow_factor.grad_r_batch(r_batch, r2_chunk, jastrow_params)
+                
+                # sum_j w_j rho_j grad_ij
+                weighted_grads = grads * (w_chunk * rho_chunk)[None, :, None]
+                chunk_sum = jnp.sum(weighted_grads, axis=1)
+                
+                return carry + chunk_sum, None
+                
+            n_chunks = (N_grid + batch_size - 1) // batch_size
+            W_batch, _ = jax.lax.scan(inner_scan, jnp.zeros((r_batch.shape[0], 3)), jnp.arange(n_chunks))
+            return W_batch
+
+        # Compute W for all grid points
+        # Scan over r_batch
+        n_batches = (N_grid + batch_size - 1) // batch_size
+        
+        # Pad grid arrays to be divisible by batch_size to avoid slicing issues
+        padded_size = n_batches * batch_size
+        padding = padded_size - N_grid
+        if padding > 0:
+            grid_padded = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+            weights_padded = jnp.pad(self.weights, ((0, padding),))
+            rho_g_padded = jnp.pad(rho_g, ((0, padding),))
+        else:
+            grid_padded = self.grid_points
+            weights_padded = self.weights
+            rho_g_padded = rho_g
+            
+        def compute_W_batch_padded(r_batch, grid_p, weights_p, rho_p):
+            def inner_scan_p(carry, chunk_idx):
+                start = chunk_idx * batch_size
+                # Fixed size slice on padded arrays
+                r2_chunk = jax.lax.dynamic_slice(grid_p, (start, 0), (batch_size, 3))
+                w_chunk = jax.lax.dynamic_slice(weights_p, (start,), (batch_size,))
+                rho_chunk = jax.lax.dynamic_slice(rho_p, (start,), (batch_size,))
+                
+                grads = self.jastrow_factor.grad_r_batch(r_batch, r2_chunk, jastrow_params)
+                weighted_grads = grads * (w_chunk * rho_chunk)[None, :, None]
+                chunk_sum = jnp.sum(weighted_grads, axis=1)
+                return carry + chunk_sum, None
+            
+            n_chunks = (grid_p.shape[0]) // batch_size
+            W_batch, _ = jax.lax.scan(inner_scan_p, jnp.zeros((r_batch.shape[0], 3), dtype=jnp.complex128), jnp.arange(n_chunks))
+            return W_batch
+
+        def outer_scan(carry, batch_idx):
+            start = batch_idx * batch_size
+            # Slice from padded grid
+            r_batch = jax.lax.dynamic_slice(grid_padded, (start, 0), (batch_size, 3))
+            W_batch = compute_W_batch_padded(r_batch, grid_padded, weights_padded, rho_g_padded)
+            return carry, W_batch 
+            
+        _, W_all = jax.lax.scan(outer_scan, None, jnp.arange(n_batches))
+        W_all = W_all.reshape(-1, 3)[:N_grid] # Flatten and trim padding if any
+        
+        # 3. Compute V_3b_direct(r) = |W(r)|^2
+        V_3b_g = jnp.sum(W_all**2, axis=1) # (N_grid,)
+        
+        # 4. Integrate to get Fock matrix elements
+        # F_mn = \int \phi_m(r) \phi_n(r) V_3b(r) dr
+        #      = \sum_g w_g \phi_m(g) \phi_n(g) V_3b(g)
+        
+        # (N_orb, N_grid) * (N_grid,) -> (N_orb, N_grid)
+        weighted_phi = self.rho * (self.weights * V_3b_g)[None, :]
+        F_3b = jnp.dot(weighted_phi, self.rho.T)
+        
+        return F_3b
+
+    def get_3b_fock_full(self, jastrow_params, dm1):
+        """Get 3-body Fock matrix correction (full tensor calculation).
+        
+        Args:
+            jastrow_params: Jastrow parameters
+            dm1: Density matrix (AO basis)
+            
+        Returns:
+            Fock matrix contribution (N, N)
+        """
+        # 1. Compute rho on grid
+        rho_g = jnp.einsum('mg,ng,mn->g', self.rho, self.rho, dm1)
+        
+        # 2. Compute W(r) on grid using full broadcasting
+        # W(r_i) = \sum_j w_j rho(r_j) \nabla_i u(r_i, r_j)
+        
+        # grads: (N_grid, N_grid, 3)
+        # This might be memory intensive for large grids!
+        grads = self.jastrow_factor.grad_r_batch(self.grid_points, self.grid_points, jastrow_params)
+        
+        # Weighted rho: (N_grid,)
+        w_rho = self.weights * rho_g
+        
+        # Contract: (N_i, N_j, 3) * (N_j,) -> (N_i, 3)
+        W_all = jnp.einsum('ijc,j->ic', grads, w_rho)
+        
+        # 3. Compute V_3b_direct(r) = |W(r)|^2
+        V_3b_g = jnp.sum(W_all**2, axis=1) # (N_grid,)
+        
+        # 4. Integrate to get Fock matrix elements
+        weighted_phi = self.rho * (self.weights * V_3b_g)[None, :]
+        F_3b = jnp.dot(weighted_phi, self.rho.T)
+        
+        return F_3b
+
+
 
 
 @struct.dataclass
