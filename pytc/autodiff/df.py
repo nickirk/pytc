@@ -1,6 +1,7 @@
 """JAX implementation of Density Fitting / ISDF."""
 import jax
 import jax.numpy as jnp
+import numpy as np
 from functools import partial
 import logging
 import time
@@ -124,7 +125,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
         
     pivots_phi = pivoted_cholesky_matrix_free(gram_diag_phi, gram_col_phi, n_grid, n_rank_phi)
     t1 = time.perf_counter()
-    logging.debug(f"Phi decomposition completed in {t1 - t0:.4f} s")
+    logging.info(f"Phi decomposition completed in {t1 - t0:.4f} s")
 
     # --- 2. Gradient Decomposition ---
     t0 = time.perf_counter()
@@ -148,17 +149,18 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
         
     pivots_grad = pivoted_cholesky_matrix_free(gram_diag_grad, gram_col_grad, n_grid, n_rank_grad)
     t1 = time.perf_counter()
-    logging.debug(f"Grad decomposition completed in {t1 - t0:.4f} s")
+    logging.info(f"Grad decomposition completed in {t1 - t0:.4f} s")
     
     # --- 3. Fuse pivots ---
     t0 = time.perf_counter()
     
     # --- 3. Fuse pivots ---
-    pivots_all = jnp.concatenate([pivots_phi, pivots_grad])
-    pivots = jnp.unique(pivots_all)
+    # Use numpy for unique to avoid JAX dynamic shape overhead
+    pivots_all = np.concatenate([np.array(pivots_phi), np.array(pivots_grad)])
+    pivots = jnp.array(np.unique(pivots_all))
     n_fused = pivots.shape[0]
     t1 = time.perf_counter()
-    logging.debug(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
+    logging.info(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
     
     # --- 4. Construct C matrices ---
     t0 = time.perf_counter()
@@ -169,8 +171,13 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
     
     grad_phi_piv = grad_phi[:, pivots, :] # (N_orb, N_fused, 3)
     C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, n_fused, 3)
+    
+    # Pre-compute pseudo-inverses for least squares
+    C_phi_pinv = jnp.linalg.pinv(C_phi)
+    C_grad_pinv = jnp.stack([jnp.linalg.pinv(C_grad[:, :, c]) for c in range(3)], axis=0) # (3, n_fused, -1)
+    
     t1 = time.perf_counter()
-    logging.debug(f"C matrices constructed in {t1 - t0:.4f} s")
+    logging.info(f"C matrices and pinv constructed in {t1 - t0:.4f} s")
     
     # --- 5. Solve for xi_phi and xi_grad (Block-wise Least Squares) ---
     t0 = time.perf_counter()
@@ -188,8 +195,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
         phi_batch = jax.lax.dynamic_slice(phi, (0, start), (n_orb, width))
         phi_paired_batch = jnp.einsum('pi,qi->pqi', phi_batch, phi_batch).reshape(-1, width)
         
-        # Solve C_phi * xi = phi_paired_batch
-        xi_phi_batch, _, _, _ = jnp.linalg.lstsq(C_phi, phi_paired_batch, rcond=1e-14)
+        # Solve C_phi * xi = phi_paired_batch using pre-computed pinv
+        xi_phi_batch = C_phi_pinv @ phi_paired_batch
         
         # 2. Solve xi_grad
         grad_phi_batch = jax.lax.dynamic_slice(grad_phi, (0, start, 0), (n_orb, width, 3))
@@ -199,8 +206,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
             # Construct grad_phi_paired_batch for component c
             grad_phi_paired_c = jnp.einsum('pi,qi->pqi', grad_phi_batch[:, :, c], phi_batch).reshape(-1, width)
             
-            # Solve C_grad[..., c] * xi = grad_phi_paired_c
-            xi_c, _, _, _ = jnp.linalg.lstsq(C_grad[:, :, c], grad_phi_paired_c, rcond=1e-14)
+            # Solve C_grad[..., c] * xi = grad_phi_paired_c using pre-computed pinv
+            xi_c = C_grad_pinv[c] @ grad_phi_paired_c
             xi_grad_batch_list.append(xi_c)
             
         xi_grad_batch = jnp.stack(xi_grad_batch_list, axis=-1) # (k, width, 3)
@@ -218,7 +225,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
     xi_phi = jnp.concatenate(xi_phi_list, axis=1)
     xi_grad = jnp.concatenate(xi_grad_list, axis=1)
     t1 = time.perf_counter()
-    logging.debug(f"Xi solved in {t1 - t0:.4f} s")
+    logging.info(f"Xi solved in {t1 - t0:.4f} s")
     
     total_time = time.perf_counter() - start_time
     logging.debug(f"Total fused ranks = {n_fused}")
