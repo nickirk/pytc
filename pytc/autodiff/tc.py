@@ -473,13 +473,9 @@ class ISDFTC(TC):
         # Perform ISDF decomposition
         # We use the same rank for both phi and grad for simplicity, 
         # matching the numpy implementation default behavior
-        _, xi_rho, _, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_rho, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights
         )
-        
-        # Extract phi_isdf and grad_phi_isdf using pivots
-        phi_isdf = tc_obj.phi[:, pivots]
-        grad_phi_isdf = tc_obj.grad_phi[:, pivots, :]
         
         return cls(
             grid_points=tc_obj.grid_points,

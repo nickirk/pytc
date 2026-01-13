@@ -90,9 +90,9 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
                  If provided, pivot selection is weighted by these weights.
         
     Returns:
-        C_phi: (N_orb^2, N_fused)
+        phi_piv: (N_orb, N_fused)
         xi_phi: (N_fused, N_grid)
-        C_grad: (N_orb^2, N_fused, 3)
+        grad_phi_piv: (N_orb, N_fused, 3)
         xi_grad: (N_fused, N_grid, 3)
         pivots: (N_fused,)
     """
@@ -223,4 +223,4 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
     total_time = time.perf_counter() - start_time
     logging.info(f"ISDF decomposition total time: {total_time:.4f} s")
     
-    return C_phi, xi_phi, C_grad, xi_grad, pivots
+    return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots

@@ -272,30 +272,31 @@ class TestISDF(unittest.TestCase):
     
     def test_isdf_shapes(self):
         """Test ISDF output shapes for different input sizes."""
-        from pytc.df import isdf_decompose_multi
+        from pytc.autodiff.df import isdf_decompose
         from pytc.autodiff.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
         
         # Test with a moderate rank
         rank = len(self.weights) // 100
-        C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-            self.phi_paired, 
-            self.grad_phi_paired,
-            rank, rank
+        phi_piv, xi_phi, grad_phi_piv, xi_grad, fused_pivots = isdf_decompose(
+            jnp.asarray(self.phi), 
+            jnp.asarray(self.grad_phi),
+            rank, rank, weights=jnp.asarray(self.weights)
         )
         
         # Test K1_isdf
         result_k1 = calc_K1_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-            jnp.asarray(C_grad), jnp.asarray(xi_grad),
+            phi_piv, xi_phi, 
+            grad_phi_piv, xi_grad,
             self.jastrow_jax, self.params,
+            jnp.asarray(self.grid_points), jnp.asarray(self.weights),
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         self.assertEqual(result_k1.shape, (self.n_orb, self.n_orb, self.n_orb, self.n_orb))
         
         # Test K2_isdf
         result_k2 = calc_K2_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-            jnp.asarray(C_grad), jnp.asarray(xi_grad),
+            phi_piv, xi_phi, 
+            grad_phi_piv, xi_grad,
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
@@ -303,15 +304,16 @@ class TestISDF(unittest.TestCase):
         
         # Test K3_isdf
         result_k3 = calc_K3_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi),
+            phi_piv, xi_phi, xi_phi,
             self.jastrow_jax, self.params,
+            jnp.asarray(self.grid_points), jnp.asarray(self.weights),
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         self.assertEqual(result_k3.shape, (self.n_orb, self.n_orb, self.n_orb, self.n_orb))
     
     def test_isdf_against_numpy(self):
         """Compare JAX ISDF implementation against numpy ISDF."""
-        from pytc.df import isdf_decompose_multi
+        from pytc.autodiff.df import isdf_decompose
         from pytc.kmat import calc_K1_isdf as calc_K1_isdf_numpy
         from pytc.kmat import calc_K2_isdf as calc_K2_isdf_numpy
         from pytc.kmat import calc_K3_isdf as calc_K3_isdf_numpy
@@ -319,17 +321,22 @@ class TestISDF(unittest.TestCase):
         
         # Test with a moderate rank
         rank = len(self.weights) // 100
-        C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-            self.phi_paired, 
-            self.grad_phi_paired,
-            rank, rank
+        phi_piv, xi_phi, grad_phi_piv, xi_grad, fused_pivots = isdf_decompose(
+            jnp.asarray(self.phi), 
+            jnp.asarray(self.grad_phi),
+            rank, rank, weights=jnp.asarray(self.weights)
         )
         
+        # Reconstruct C_phi and C_grad for NumPy comparison
+        C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, len(fused_pivots))
+        C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, len(fused_pivots), 3)
+
         # Test K1_isdf
         k1_jax = calc_K1_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-            jnp.asarray(C_grad), jnp.asarray(xi_grad),
+            phi_piv, xi_phi, 
+            grad_phi_piv, xi_grad,
             self.jastrow_jax, self.params,
+            jnp.asarray(self.grid_points), jnp.asarray(self.weights),
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
@@ -346,8 +353,8 @@ class TestISDF(unittest.TestCase):
         
         # Test K2_isdf
         k2_jax = calc_K2_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-            jnp.asarray(C_grad), jnp.asarray(xi_grad),
+            phi_piv, xi_phi, 
+            grad_phi_piv, xi_grad,
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
@@ -365,8 +372,9 @@ class TestISDF(unittest.TestCase):
         
         # Test K3_isdf
         k3_jax = calc_K3_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi),
+            phi_piv, xi_phi, xi_phi,
             self.jastrow_jax, self.params,
+            jnp.asarray(self.grid_points), jnp.asarray(self.weights),
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
@@ -383,7 +391,7 @@ class TestISDF(unittest.TestCase):
     
     def test_isdf_convergence(self):
         """Test if ISDF functions converge with increasing rank."""
-        from pytc.df import isdf_decompose_multi
+        from pytc.autodiff.df import isdf_decompose
         from pytc.kmat import calc_K1_isdf as calc_K1_isdf_numpy
         from pytc.kmat import calc_K2_isdf as calc_K2_isdf_numpy
         from pytc.kmat import calc_K3_isdf as calc_K3_isdf_numpy
@@ -395,30 +403,36 @@ class TestISDF(unittest.TestCase):
         
         for rank in ranks:
             # Perform ISDF decomposition
-            C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-                self.phi_paired, 
-                self.grad_phi_paired,
-                rank, rank
+            phi_piv, xi_phi, grad_phi_piv, xi_grad, fused_pivots = isdf_decompose(
+                jnp.asarray(self.phi), 
+                jnp.asarray(self.grad_phi),
+                rank, rank, weights=jnp.asarray(self.weights)
             )
             
+            # Reconstruct C_phi and C_grad for NumPy comparison
+            C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, len(fused_pivots))
+            C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, len(fused_pivots), 3)
+
             # Compute JAX ISDF functions
             k1_jax = calc_K1_isdf(
-                jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-                jnp.asarray(C_grad), jnp.asarray(xi_grad),
+                phi_piv, xi_phi, 
+                grad_phi_piv, xi_grad,
                 self.jastrow_jax, self.params,
+                jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                 jnp.asarray(self.grid_points), jnp.asarray(self.weights)
             )
             
             k2_jax = calc_K2_isdf(
-                jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-                jnp.asarray(C_grad), jnp.asarray(xi_grad),
+                phi_piv, xi_phi, 
+                grad_phi_piv, xi_grad,
                 self.jastrow_jax, self.params,
                 jnp.asarray(self.grid_points), jnp.asarray(self.weights)
             )
             
             k3_jax = calc_K3_isdf(
-                jnp.asarray(C_phi), jnp.asarray(xi_phi),
+                phi_piv, xi_phi, xi_phi,
                 self.jastrow_jax, self.params,
+                jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                 jnp.asarray(self.grid_points), jnp.asarray(self.weights)
             )
             
@@ -456,30 +470,32 @@ class TestISDF(unittest.TestCase):
     
     def test_isdf_batch_sizes(self):
         """Test different batch sizes produce same results."""
-        from pytc.df import isdf_decompose_multi
+        from pytc.autodiff.df import isdf_decompose
         from pytc.autodiff.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
         
         # Use moderate rank
         rank = len(self.weights) // 10
-        C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-            self.phi_paired, 
-            self.grad_phi_paired,
-            rank, rank
+        phi_piv, xi_phi, grad_phi_piv, xi_grad, fused_pivots = isdf_decompose(
+            jnp.asarray(self.phi), 
+            jnp.asarray(self.grad_phi),
+            rank, rank, weights=jnp.asarray(self.weights)
         )
         
         batch_sizes = [100, 500, 1000]
         
         # Get reference result with default batch size
         ref_k1 = calc_K1_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-            jnp.asarray(C_grad), jnp.asarray(xi_grad),
+            phi_piv, xi_phi, 
+            grad_phi_piv, xi_grad,
             self.jastrow_jax, self.params,
+            jnp.asarray(self.grid_points), jnp.asarray(self.weights),
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
         ref_k3 = calc_K3_isdf(
-            jnp.asarray(C_phi), jnp.asarray(xi_phi),
+            phi_piv, xi_phi, xi_phi,
             self.jastrow_jax, self.params,
+            jnp.asarray(self.grid_points), jnp.asarray(self.weights),
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
@@ -487,9 +503,10 @@ class TestISDF(unittest.TestCase):
             with self.subTest(batch_size=batch_size):
                 # Test K1_isdf
                 k1 = calc_K1_isdf(
-                    jnp.asarray(C_phi), jnp.asarray(xi_phi), 
-                    jnp.asarray(C_grad), jnp.asarray(xi_grad),
+                    phi_piv, xi_phi, 
+                    grad_phi_piv, xi_grad,
                     self.jastrow_jax, self.params,
+                    jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                     jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                     batch_size=batch_size
                 )
@@ -497,8 +514,9 @@ class TestISDF(unittest.TestCase):
                 
                 # Test K3_isdf
                 k3 = calc_K3_isdf(
-                    jnp.asarray(C_phi), jnp.asarray(xi_phi),
+                    phi_piv, xi_phi, xi_phi,
                     self.jastrow_jax, self.params,
+                    jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                     jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                     batch_size=batch_size
                 )

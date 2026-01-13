@@ -50,19 +50,23 @@ class TestISDFReconstruction(unittest.TestCase):
         
         for n_rank in ranks:
             # Perform ISDF decomposition
-            C_phi, xi_phi, C_grad, xi_grad, pivots = isdf_decompose(
+            phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots = isdf_decompose(
                 self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights
             )
             
             # Reconstruct overlaps
             # S_reconst_ij = sum_m C_phi_ij,m * (sum_g xi_phi_m,g * w_g)
+            # C_phi_ij,m = phi_i,m * phi_j,m
             xi_phi_weighted_sum = jnp.dot(xi_phi, self.weights)
+            C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, len(pivots))
             S_reconst = jnp.dot(C_phi, xi_phi_weighted_sum).reshape(n_orb, n_orb)
             
             # G_reconst_ij,c = sum_m C_grad_ij,m,c * (sum_g xi_grad_m,g,c * w_g)
             # xi_grad is (n_fused, n_grid, 3)
             xi_grad_weighted_sum = jnp.einsum('mgc,g->mc', xi_grad, self.weights)
             # C_grad is (n_orb^2, n_fused, 3)
+            # C_grad_ij,m,c = grad_phi_i,m,c * phi_j,m
+            C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, len(pivots), 3)
             G_reconst = jnp.einsum('nmc,mc->nc', C_grad, xi_grad_weighted_sum).reshape(n_orb, n_orb, 3)
             
             # Compute relative errors

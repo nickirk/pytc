@@ -7,7 +7,7 @@ import time
 import jax
 import jax.numpy as jnp
 from flax import struct
-from .tc import TC
+from .tc import TC, ISDFTC
 from . import tc_helper
 from . import kmat as kmat_jax
 
@@ -642,21 +642,17 @@ class XTC(TC):
 
 
 @struct.dataclass
-class ISDFXTC(XTC):
+class ISDFXTC(XTC, ISDFTC):
     """JAX implementation of extended transcorrelated methods using ISDF.
     
     Attributes:
         xi_rho: ISDF coefficients for density (N_fused, N_grid)
         xi_grad: ISDF coefficients for gradients (N_fused, N_grid, 3)
         pivots: ISDF pivot indices (N_fused,)
-        phi: ISDF basis for density (Nb, N_fused)
-        grad_phi: ISDF basis for gradients (Nb, N_fused, 3)
+        phi_isdf: ISDF basis for density (Nb, N_fused)
+        grad_phi_isdf: ISDF basis for gradients (Nb, N_fused, 3)
     """
-    xi_rho: jnp.ndarray = struct.field(default=None)
-    xi_grad: jnp.ndarray = struct.field(default=None)
-    pivots: jnp.ndarray = struct.field(default=None)
-    phi_isdf: jnp.ndarray = struct.field(default=None)
-    grad_phi_isdf: jnp.ndarray = struct.field(default=None)
+    # Fields are inherited from ISDFTC
 
     @classmethod
     def from_xtc(cls, xtc_obj, n_rank=None):
@@ -667,13 +663,9 @@ class ISDFXTC(XTC):
             n_rank = xtc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        _, xi_rho, _, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_rho, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights
         )
-        
-        # Extract phi_isdf and grad_phi_isdf using pivots
-        phi_isdf = xtc_obj.phi[:, pivots]
-        grad_phi_isdf = xtc_obj.grad_phi[:, pivots, :]
         
         return cls(
             grid_points=xtc_obj.grid_points,
@@ -694,8 +686,11 @@ class ISDFXTC(XTC):
             grad_phi_isdf=grad_phi_isdf
         )
 
-    def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
+    def get_delta_U(self, jastrow_params, dm1=None, ranges=None, batch_size=1000):
         """Get delta_U matrix using ISDF with pmap support."""
+        if ranges is not None:
+            raise NotImplementedError("Block calculation not implemented for ISDFXTC yet.")
+            
         start_time = time.perf_counter()
         logging.info("Starting ISDFXTC.get_delta_U")
         n_devices = jax.local_device_count()
@@ -869,32 +864,3 @@ class ISDFXTC(XTC):
         final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches))
         
         return final_accumulators
-
-    def get_2b(self, jastrow_params, dm1=None, batch_size=1000):
-        """Compute two-body integrals correction using ISDF."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-            
-        k_nabla = kmat_jax.calc_K1_isdf(
-            self.phi_isdf, self.xi_rho, self.grad_phi_isdf, self.xi_grad,
-            self.jastrow_factor, jastrow_params, self.grid_points, self.weights,
-            batch_size=batch_size
-        )
-        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
-        
-        k_square = kmat_jax.calc_K3_isdf(
-            self.phi_isdf, self.xi_rho,
-            self.jastrow_factor, jastrow_params, self.grid_points, self.weights,
-            batch_size=batch_size
-        )
-        
-        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
-        tc_correction = 0.5 * (k_laplacian + k_square) + k_nabla
-        tc_correction += tc_correction.transpose(2, 3, 0, 1)
-        tc_correction = -tc_correction
-        
-        # Add delta_U
-        delta_U = self.get_delta_U(jastrow_params, dm1, batch_size=batch_size)
-        
-        return tc_correction + delta_U
