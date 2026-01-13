@@ -135,6 +135,39 @@ class TestISDF(unittest.TestCase):
             
         # Final assertion for high rank
         self.assertLess(rel_err_2b, 1e-4, f"Final relative error {rel_err_2b} is too high")
+    
+    def test_get_2b_convergence(self):
+        """Verify that get_2b (overall ISDFXTC) converges with rank."""
+        # --- JAX Exact 2-Body Correction (Overall) ---
+        print("\nRunning JAX Exact Overall 2-Body Correction...")
+        k2b_exact_jax = self.xtc_jax.get_2b(self.jastrow_params_jax)
+        norm_exact_jax = np.linalg.norm(np.array(k2b_exact_jax))
+        
+        ranks = [100, 200, 300, 400]
+        
+        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Time (s)':<10}")
+        print("-" * 35)
+        
+        prev_error = float('inf')
+        for n_rank in ranks:
+            start_time = time.time()
+            isdf_xtc_jax = ISDFXTC.from_xtc(self.xtc_jax, n_rank=n_rank)
+            k2b_isdf = isdf_xtc_jax.get_2b(self.jastrow_params_jax)
+            end_time = time.time()
+            
+            diff_2b = np.linalg.norm(np.array(k2b_exact_jax) - np.array(k2b_isdf))
+            rel_err_2b = diff_2b / norm_exact_jax
+            
+            print(f"{n_rank:<10} {rel_err_2b:<15.2e} {end_time - start_time:<10.2f}")
+            
+            if n_rank > 100:
+                if rel_err_2b > 1e-4:
+                    self.assertLess(rel_err_2b, prev_error, f"Error increased at rank {n_rank}")
+            
+            prev_error = rel_err_2b
+            
+        # Final assertion for high rank
+        self.assertLess(rel_err_2b, 1e-4, f"Final relative error {rel_err_2b} is too high")
 
 if __name__ == '__main__':
     unittest.main()

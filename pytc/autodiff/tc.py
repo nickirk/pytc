@@ -3,6 +3,8 @@
 from functools import partial
 from typing import Any, Optional
 import numpy as np
+import logging
+import time
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -203,6 +205,8 @@ class TC:
                          If block_str/ranges is provided, returns the raw block (Np, Nr, Nq, Ns).
                          Otherwise, returns the full symmetrized correction (N, N, N, N).
         """
+        start_time = time.perf_counter()
+        logging.info("Starting TC.get_2b")
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         n_devices = jax.local_device_count()
@@ -272,6 +276,10 @@ class TC:
             
             result += result_T.transpose(2, 3, 0, 1)
         
+            result += result_T.transpose(2, 3, 0, 1)
+        
+        total_time = time.perf_counter() - start_time
+        logging.info(f"TC.get_2b completed in {total_time:.4f} s")
         return -result
 
     def get_1b_fock(self, jastrow_params, dm1=None):
@@ -494,6 +502,8 @@ class ISDFTC(TC):
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF."""
+        start_time = time.perf_counter()
+        logging.info("Starting ISDFTC.get_2b")
         if block_str is not None or ranges is not None:
             raise NotImplementedError("Block calculation not implemented for ISDFTC yet.")
             
@@ -527,4 +537,8 @@ class ISDFTC(TC):
         result += k_nabla
         result += result.transpose(2, 3, 0, 1)
         
+        result += result.transpose(2, 3, 0, 1)
+        
+        total_time = time.perf_counter() - start_time
+        logging.info(f"ISDFTC.get_2b completed in {total_time:.4f} s")
         return -result

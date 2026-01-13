@@ -1,8 +1,9 @@
 """JAX implementation of X transcorrelated methods."""
 
 from functools import partial, reduce
-from typing import Any, Optional
 import numpy as np
+import logging
+import time
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -257,6 +258,8 @@ class XTC(TC):
                      If ranges provided: (Np, Nr, Nq, Ns)
                      Otherwise: (N, N, N, N)
         """
+        start_time = time.perf_counter()
+        logging.info("Starting XTC.get_delta_U")
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
@@ -490,6 +493,8 @@ class XTC(TC):
         
         total_delta_U = delta_U_replicated[0]
         
+        total_time = time.perf_counter() - start_time
+        logging.info(f"XTC.get_delta_U completed in {total_time:.4f} s")
         return -total_delta_U
 
     def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -534,6 +539,8 @@ class XTC(TC):
     @partial(jax.jit, static_argnames=('block_str', 'ranges', 'batch_size'))
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
+        start_time = time.perf_counter()
+        logging.info("Starting XTC.get_2b")
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -544,6 +551,8 @@ class XTC(TC):
         
         delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         
+        total_time = time.perf_counter() - start_time
+        logging.info(f"XTC.get_2b completed in {total_time:.4f} s")
         return tc_correction + delta_U
 
     @jax.jit
@@ -687,6 +696,8 @@ class ISDFXTC(XTC):
 
     def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
         """Get delta_U matrix using ISDF with pmap support."""
+        start_time = time.perf_counter()
+        logging.info("Starting ISDFXTC.get_delta_U")
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
@@ -753,7 +764,11 @@ class ISDFXTC(XTC):
         result = term1 + term2 + term3 + term4
         
         # Symmetrize
-        return -(result + result.transpose(2, 3, 0, 1))
+        result = -(result + result.transpose(2, 3, 0, 1))
+        
+        total_time = time.perf_counter() - start_time
+        logging.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        return result
 
     def _calc_delta_U_isdf_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, 
                                  full_grid, full_weights, full_xi_rho, Gb, phi, batch_size=1000):
@@ -798,8 +813,21 @@ class ISDFXTC(XTC):
             
             # --- Term 4 (Easy Term) ---
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
-            P = jnp.einsum('aik,cik->aci', G, G)
-            X_update = jnp.einsum('i,aci->ac', w_tilde, P)
+            
+            # OPTIMIZATION: Avoid forming P = jnp.einsum('aik,cik->aci', G, G) which is (N_rank, N_rank, batch)
+            # P_{aci} = \sum_k G_{aik} G_{cik}
+            # X_update_{ac} = \sum_i w_tilde_i P_{aci}
+            #               = \sum_{i,k} w_tilde_i G_{aik} G_{cik}
+            #               = \sum_{i,k} (w_tilde_i * G_{aik}) * G_{cik}
+            
+            # Flatten G to (N_rank, batch * 3)
+            G_flat = G.reshape(N_rank, -1)
+            # Create weighted G: (N_rank, batch, 3)
+            G_weighted = G * w_tilde[None, :, None]
+            G_weighted_flat = G_weighted.reshape(N_rank, -1)
+            
+            # X_update = G_weighted_flat @ G_flat.T
+            X_update = jnp.dot(G_weighted_flat, G_flat.T)
             
             # --- Term 1 (Easy Term) ---
             H = jnp.einsum('b,bik->ik', Gb, G)
@@ -842,20 +870,22 @@ class ISDFXTC(XTC):
         
         return final_accumulators
 
-    def get_2b(self, jastrow_params, dm1=None):
+    def get_2b(self, jastrow_params, dm1=None, batch_size=1000):
         """Compute two-body integrals correction using ISDF."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
         k_nabla = kmat_jax.calc_K1_isdf(
             self.phi_isdf, self.xi_rho, self.grad_phi_isdf, self.xi_grad,
-            self.jastrow_factor, jastrow_params, self.grid_points, self.weights
+            self.jastrow_factor, jastrow_params, self.grid_points, self.weights,
+            batch_size=batch_size
         )
         k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
         
         k_square = kmat_jax.calc_K3_isdf(
             self.phi_isdf, self.xi_rho,
-            self.jastrow_factor, jastrow_params, self.grid_points, self.weights
+            self.jastrow_factor, jastrow_params, self.grid_points, self.weights,
+            batch_size=batch_size
         )
         
         k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
@@ -865,6 +895,6 @@ class ISDFXTC(XTC):
         tc_correction = -tc_correction
         
         # Add delta_U
-        delta_U = self.get_delta_U(jastrow_params, dm1)
+        delta_U = self.get_delta_U(jastrow_params, dm1, batch_size=batch_size)
         
         return tc_correction + delta_U

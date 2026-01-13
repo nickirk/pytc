@@ -2,6 +2,8 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
+import logging
+import time
 
 def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
     """Calculate K1 matrix: K1_{pqrs} = \sum_i w_i \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
@@ -241,9 +243,14 @@ def calc_K1_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params,
     weights = jnp.asarray(weights)
     weighted_xi_grad = xi_grad * weights[None, :, None]
     
+    start_time = time.perf_counter()
+    logging.info(f"Starting calc_K1_isdf with {N_grid} grid points")
+    
     # Process r2 points in batches
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
+        if i % (batch_size * 5) == 0:
+             logging.debug(f"calc_K1_isdf progress: {i}/{N_grid}")
         batch_points = grid_points[i:i_end]
         
         @partial(jax.vmap, in_axes=(None, 0))
@@ -271,6 +278,11 @@ def calc_K1_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params,
         # Factorized form: C_phi_{rs, l} = phi_{r,l} phi_{s,l}
         result += jnp.einsum('pql,rl,sl->pqrs', G2, phi, phi)
     
+        # Factorized form: C_phi_{rs, l} = phi_{r,l} phi_{s,l}
+        result += jnp.einsum('pql,rl,sl->pqrs', G2, phi, phi)
+    
+    total_time = time.perf_counter() - start_time
+    logging.info(f"calc_K1_isdf completed in {total_time:.4f} s")
     return result
 
 
@@ -320,9 +332,14 @@ def calc_K3_isdf(phi, xi_phi, jastrow_factor, jastrow_params, grid_points, weigh
     result = jnp.zeros((Nb, Nb, Nb, Nb))
     weights = jnp.asarray(weights)
     
+    start_time = time.perf_counter()
+    logging.info(f"Starting calc_K3_isdf with {N_grid} grid points")
+    
     # Process r2 points in batches
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
+        if i % (batch_size * 5) == 0:
+             logging.debug(f"calc_K3_isdf progress: {i}/{N_grid}")
         batch_points = grid_points[i:i_end]
         
         @partial(jax.vmap, in_axes=(None, 0))
@@ -344,4 +361,9 @@ def calc_K3_isdf(phi, xi_phi, jastrow_factor, jastrow_params, grid_points, weigh
         # Factorized form: C_phi_{pq, k} = phi_{p,k} phi_{q,k}
         result += jnp.einsum('kl,pk,qk,rl,sl->pqrs', G1, phi, phi, phi, phi)
     
+        # Factorized form: C_phi_{pq, k} = phi_{p,k} phi_{q,k}
+        result += jnp.einsum('kl,pk,qk,rl,sl->pqrs', G1, phi, phi, phi, phi)
+    
+    total_time = time.perf_counter() - start_time
+    logging.info(f"calc_K3_isdf completed in {total_time:.4f} s")
     return result

@@ -2,6 +2,8 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+import logging
+import time
 
 @partial(jax.jit, static_argnames=('gram_diag_fn', 'gram_col_fn', 'n_grid', 'n_rank'))
 def pivoted_cholesky_matrix_free(gram_diag_fn, gram_col_fn, n_grid, n_rank):
@@ -101,6 +103,12 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
     else:
         w_sqrt = jnp.sqrt(jnp.abs(weights)) # Use abs to avoid NaN
         
+    start_time = time.perf_counter()
+    logging.info(f"Starting ISDF decomposition with n_orb={n_orb}, n_grid={n_grid}, n_rank_phi={n_rank_phi}, n_rank_grad={n_rank_grad}")
+
+    # --- 1. Phi Decomposition ---
+    t0 = time.perf_counter()
+        
     # Pre-compute diagonal for phi to calculate shift
     orb_sq = jnp.sum(phi**2, axis=0)
     diag_phi = orb_sq**2
@@ -115,6 +123,11 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
         return col.at[idx].add(shift_phi)
         
     pivots_phi = pivoted_cholesky_matrix_free(gram_diag_phi, gram_col_phi, n_grid, n_rank_phi)
+    t1 = time.perf_counter()
+    logging.debug(f"Phi decomposition completed in {t1 - t0:.4f} s")
+
+    # --- 2. Gradient Decomposition ---
+    t0 = time.perf_counter()
     
     # Pre-compute diagonal for grad to calculate shift
     A_diag = jnp.sum(phi**2, axis=0)
@@ -134,11 +147,21 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
         return col.at[idx].add(shift_grad)
         
     pivots_grad = pivoted_cholesky_matrix_free(gram_diag_grad, gram_col_grad, n_grid, n_rank_grad)
+    t1 = time.perf_counter()
+    logging.debug(f"Grad decomposition completed in {t1 - t0:.4f} s")
+    
+    # --- 3. Fuse pivots ---
+    t0 = time.perf_counter()
     
     # --- 3. Fuse pivots ---
     pivots_all = jnp.concatenate([pivots_phi, pivots_grad])
     pivots = jnp.unique(pivots_all)
     n_fused = pivots.shape[0]
+    t1 = time.perf_counter()
+    logging.debug(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
+    
+    # --- 4. Construct C matrices ---
+    t0 = time.perf_counter()
     
     # --- 4. Construct C matrices ---
     phi_piv = phi[:, pivots]
@@ -146,6 +169,11 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
     
     grad_phi_piv = grad_phi[:, pivots, :] # (N_orb, N_fused, 3)
     C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, n_fused, 3)
+    t1 = time.perf_counter()
+    logging.debug(f"C matrices constructed in {t1 - t0:.4f} s")
+    
+    # --- 5. Solve for xi_phi and xi_grad (Block-wise Least Squares) ---
+    t0 = time.perf_counter()
     
     # --- 5. Solve for xi_phi and xi_grad (Block-wise Least Squares) ---
     batch_size = 4096
@@ -189,5 +217,10 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
         
     xi_phi = jnp.concatenate(xi_phi_list, axis=1)
     xi_grad = jnp.concatenate(xi_grad_list, axis=1)
+    t1 = time.perf_counter()
+    logging.debug(f"Xi solved in {t1 - t0:.4f} s")
+    
+    total_time = time.perf_counter() - start_time
+    logging.info(f"ISDF decomposition total time: {total_time:.4f} s")
     
     return C_phi, xi_phi, C_grad, xi_grad, pivots
