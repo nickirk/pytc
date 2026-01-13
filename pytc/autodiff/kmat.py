@@ -6,7 +6,7 @@ import logging
 import time
 
 def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
-    """Calculate K1 matrix: K1_{pqrs} = \sum_i w_i \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
+    r"""Calculate K1 matrix: K1_{pqrs} = \sum_i w_i \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
     
     Args:
         phi: Orbitals on grid (Nb, N_grid)
@@ -113,7 +113,7 @@ def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights,
     return final_result.T
 
 def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
-    """Calculate K3 matrix: K3_{pqrs} = \sum_i w_i \phi_p(i) \phi_q(i) (\nabla_i u(i, j))^2 \phi_r(j) \phi_s(j)
+    r"""Calculate K3 matrix: K3_{pqrs} = \sum_i w_i \phi_p(i) \phi_q(i) (\nabla_i u(i, j))^2 \phi_r(j) \phi_s(j)
     
     Args:
         phi: Orbitals on grid (Nb, N_grid)
@@ -218,72 +218,90 @@ def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=No
     return final_result
 
 
-def calc_K1_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000):
+def calc_K1_isdf(phi, xi_phi_r2, grad_phi, xi_grad_r1, jastrow_factor, jastrow_params, 
+                 grid_r1, weights_r1, grid_r2, weights_r2, batch_size=1000):
     """JAX implementation of K1 term using ISDF intermediates with memory-efficient batching.
     
     Args:
         phi: (Nb, n_fused) Selected columns for phi
-        xi_phi: (n_fused, N_grid) Interpolation coeffs for phi
+        xi_phi_r2: (n_fused, N_grid_r2) Interpolation coeffs for phi (r2)
         grad_phi: (Nb, n_fused, 3) Selected columns for grad_phi
-        xi_grad: (n_fused, N_grid, 3) Interpolation coeffs for grad
+        xi_grad_r1: (n_fused, N_grid_r1, 3) Interpolation coeffs for grad (r1)
         jastrow_factor: JAX Jastrow factor instance
         jastrow_params: Parameters for the Jastrow factor
-        grid_points: (N_grid, 3) Grid points
-        weights: (N_grid,) Grid weights
+        grid_r1: (N_grid_r1, 3) Grid points for r1
+        weights_r1: (N_grid_r1,) Grid weights for r1
+        grid_r2: (N_grid_r2, 3) Grid points for r2
+        weights_r2: (N_grid_r2,) Grid weights for r2
         batch_size: Number of grid points to process at once
     
     Returns:
         (Nb, Nb, Nb, Nb) array in chemists' notation (pr|qs)
     """
-    N_grid = grid_points.shape[0]
+    N_grid_r2 = grid_r2.shape[0]
     Nb = phi.shape[0]
-    n_fused = xi_phi.shape[0]
+    n_fused = xi_phi_r2.shape[0]
     
-    result = jnp.zeros((Nb, Nb, Nb, Nb))
-    weights = jnp.asarray(weights)
-    weighted_xi_grad = xi_grad * weights[None, :, None]
+    weights_r1 = jnp.asarray(weights_r1)
+    weights_r2 = jnp.asarray(weights_r2)
+    weighted_xi_grad_r1 = xi_grad_r1 * weights_r1[None, :, None]
     
-    start_time = time.perf_counter()
-    logging.info(f"Starting calc_K1_isdf with {N_grid} grid points")
+    # Pad r2 inputs to be divisible by batch_size
+    padded_size = ((N_grid_r2 + batch_size - 1) // batch_size) * batch_size
+    padding = padded_size - N_grid_r2
     
-    # Process r2 points in batches
-    for i in range(0, N_grid, batch_size):
-        i_end = min(i + batch_size, N_grid)
-        if i % (batch_size * 5) == 0:
-             logging.debug(f"calc_K1_isdf progress: {i}/{N_grid}")
-        batch_points = grid_points[i:i_end]
+    if padding > 0:
+        grid_r2_padded = jnp.pad(grid_r2, ((0, padding), (0, 0)))
+        weights_r2_padded = jnp.pad(weights_r2, ((0, padding),))
+        xi_phi_r2_padded = jnp.pad(xi_phi_r2, ((0, 0), (0, padding)))
+    else:
+        grid_r2_padded = grid_r2
+        weights_r2_padded = weights_r2
+        xi_phi_r2_padded = xi_phi_r2
+        
+    # Reshape for scanning
+    n_batches = padded_size // batch_size
+    grid_r2_batches = grid_r2_padded.reshape(n_batches, batch_size, 3)
+    weights_r2_batches = weights_r2_padded.reshape(n_batches, batch_size)
+    xi_phi_r2_batches = xi_phi_r2_padded.reshape(n_fused, n_batches, batch_size).transpose(1, 0, 2)
+    
+    def scan_body(carry, args):
+        r2_batch, w2_batch, xi_phi_batch = args
+        
+        # Calculate gradients: grad_r1 u(r1, r2)
+        # r1 is full grid, r2 is batch
+        # u_grad_batch: (N_grid_r1, batch, 3)
         
         @partial(jax.vmap, in_axes=(None, 0))
         def get_grads(r1, r2):
             return jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]
         
-        u_grad_batch = jax.vmap(get_grads, in_axes=(0, None))(grid_points, batch_points)  # (N_grid, batch, 3)
+        u_grad_batch = jax.vmap(get_grads, in_axes=(0, None))(grid_r1, r2_batch)
         
         # Process each spatial component
-        G1_components = []
-        for c in range(3):
-            xi_slice = weighted_xi_grad[:, :, c]  # (n_fused, N_grid)
-            u_slice = u_grad_batch[:, :, c]      # (N_grid, batch)
-            G1_c = jnp.dot(xi_slice, u_slice)     # (n_fused, batch)
-            G1_components.append(G1_c)
+        # G1_{k,b,c} = sum_g weighted_xi_grad_r1_{k,g,c} * u_grad_batch_{g,b,c}
+        # (n_fused, N_grid_r1, 3) * (N_grid_r1, batch, 3) -> (n_fused, batch, 3)
+        G1 = jnp.einsum('kgc,gbc->kbc', weighted_xi_grad_r1, u_grad_batch)
         
-        G1 = jnp.stack(G1_components, axis=-1)    # (n_fused, batch, 3)
         # Factorized form: C_grad_{pq, k, c} = grad_phi_{p,k,c} phi_{q,k}
-        G1_factorized = jnp.einsum('kmc,pkc,qk->pqm', G1, grad_phi, phi) # (Nb, Nb, batch)
+        # (n_fused, batch, 3) * (Nb, n_fused, 3) * (Nb, n_fused) -> (Nb, Nb, batch)
+        G1_factorized = jnp.einsum('kmc,pkc,qk->pqm', G1, grad_phi, phi)
         
-        # Contract with xi_phi and weights for this batch
-        G2 = jnp.einsum('pqm,lm,m->pql', G1_factorized, xi_phi[:, i:i_end], weights[i:i_end])
+        # Contract with xi_phi_r2 and weights_r2 for this batch
+        # (Nb, Nb, batch) * (n_fused, batch) * (batch,) -> (Nb, Nb, n_fused)
+        G2 = jnp.einsum('pqm,lm,m->pql', G1_factorized, xi_phi_batch, w2_batch)
         
         # Accumulate result
         # Factorized form: C_phi_{rs, l} = phi_{r,l} phi_{s,l}
-        result += jnp.einsum('pql,rl,sl->pqrs', G2, phi, phi)
+        # (Nb, Nb, n_fused) * (Nb, n_fused) * (Nb, n_fused) -> (Nb, Nb, Nb, Nb)
+        term = jnp.einsum('pql,rl,sl->pqrs', G2, phi, phi)
+        
+        return carry + term, None
+
+    result_init = jnp.zeros((Nb, Nb, Nb, Nb))
+    final_result, _ = jax.lax.scan(scan_body, result_init, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
     
-        # Factorized form: C_phi_{rs, l} = phi_{r,l} phi_{s,l}
-        result += jnp.einsum('pql,rl,sl->pqrs', G2, phi, phi)
-    
-    total_time = time.perf_counter() - start_time
-    logging.info(f"calc_K1_isdf completed in {total_time:.4f} s")
-    return result
+    return final_result
 
 
 def calc_K2_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000):
@@ -301,69 +319,98 @@ def calc_K2_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params,
         batch_size: Number of grid points to process at once
     
     Returns:
-        (Nb, Nb, Nb, Nb) array in chemists' notation (pr|qs)
+        (Nb, Nb, Nb, Nb) array in chemists' notation (pq|rs)
     """
-    res1 = calc_K1_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params, grid_points, weights, batch_size)
+    # Pass grid_points and weights for both r1 and r2
+    res1 = calc_K1_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params, 
+                        grid_points, weights, grid_points, weights, batch_size)
     # Transpose p and q for the second part of combined_C_grad
     res2 = jnp.einsum('pqrs->qprs', res1)
     
     return -(res1 + res2)
 
 
-def calc_K3_isdf(phi, xi_phi, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000):
+def calc_K3_isdf(phi, xi_phi_r1, xi_phi_r2, jastrow_factor, jastrow_params, 
+                 grid_r1, weights_r1, grid_r2, weights_r2, batch_size=1000):
     """JAX implementation of K3 term using ISDF intermediates with memory-efficient batching.
     
     Args:
         phi: (Nb, n_fused) Selected columns for phi
-        xi_phi: (n_fused, N_grid) Interpolation coeffs for phi
+        xi_phi_r1: (n_fused, N_grid_r1) Interpolation coeffs for phi (r1)
+        xi_phi_r2: (n_fused, N_grid_r2) Interpolation coeffs for phi (r2)
         jastrow_factor: JAX Jastrow factor instance
         jastrow_params: Parameters for the Jastrow factor
-        grid_points: (N_grid, 3) Grid points
-        weights: (N_grid,) Grid weights
+        grid_r1: (N_grid_r1, 3) Grid points for r1
+        weights_r1: (N_grid_r1,) Grid weights for r1
+        grid_r2: (N_grid_r2, 3) Grid points for r2
+        weights_r2: (N_grid_r2,) Grid weights for r2
         batch_size: Number of grid points to process at once
     
     Returns:
         (Nb, Nb, Nb, Nb) array in chemists' notation (pr|qs)
     """
-    N_grid = grid_points.shape[0]
+    N_grid_r2 = grid_r2.shape[0]
     Nb = phi.shape[0]
-    n_fused = xi_phi.shape[0]
+    n_fused = xi_phi_r1.shape[0]
     
-    result = jnp.zeros((Nb, Nb, Nb, Nb))
-    weights = jnp.asarray(weights)
+    weights_r1 = jnp.asarray(weights_r1)
+    weights_r2 = jnp.asarray(weights_r2)
     
-    start_time = time.perf_counter()
-    logging.info(f"Starting calc_K3_isdf with {N_grid} grid points")
+    # Pad r2 inputs
+    padded_size = ((N_grid_r2 + batch_size - 1) // batch_size) * batch_size
+    padding = padded_size - N_grid_r2
     
-    # Process r2 points in batches
-    for i in range(0, N_grid, batch_size):
-        i_end = min(i + batch_size, N_grid)
-        if i % (batch_size * 5) == 0:
-             logging.debug(f"calc_K3_isdf progress: {i}/{N_grid}")
-        batch_points = grid_points[i:i_end]
+    if padding > 0:
+        grid_r2_padded = jnp.pad(grid_r2, ((0, padding), (0, 0)))
+        weights_r2_padded = jnp.pad(weights_r2, ((0, padding),))
+        xi_phi_r2_padded = jnp.pad(xi_phi_r2, ((0, 0), (0, padding)))
+    else:
+        grid_r2_padded = grid_r2
+        weights_r2_padded = weights_r2
+        xi_phi_r2_padded = xi_phi_r2
+        
+    # Reshape for scanning
+    n_batches = padded_size // batch_size
+    grid_r2_batches = grid_r2_padded.reshape(n_batches, batch_size, 3)
+    weights_r2_batches = weights_r2_padded.reshape(n_batches, batch_size)
+    xi_phi_r2_batches = xi_phi_r2_padded.reshape(n_fused, n_batches, batch_size).transpose(1, 0, 2)
+    
+    def scan_body(carry, args):
+        r2_batch, w2_batch, xi_phi_batch = args
         
         @partial(jax.vmap, in_axes=(None, 0))
         def get_grads(r1, r2):
             return jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]
         
-        u_grad_batch = jax.vmap(get_grads, in_axes=(0, None))(grid_points, batch_points)  # (N_grid, batch, 3)
+        u_grad_batch = jax.vmap(get_grads, in_axes=(0, None))(grid_r1, r2_batch)  # (N_grid_r1, batch, 3)
         
         # Compute squared magnitude of gradient
-        u_grad_squared = jnp.sum(u_grad_batch**2, axis=-1)  # (N_grid, batch)
+        u_grad_squared = jnp.sum(u_grad_batch**2, axis=-1)  # (N_grid_r1, batch)
         
         # Weight both coordinates
-        weighted_u_squared = u_grad_squared * weights[:, None] * weights[None, i:i_end]  # (N_grid, batch)
+        # (N_grid_r1, batch) * (N_grid_r1, 1) * (1, batch)
+        weighted_u_squared = u_grad_squared * weights_r1[:, None] * w2_batch[None, :]
         
         # Contract with xi_phi for this batch
-        G1 = jnp.einsum('ki,ij,lj->kl', xi_phi, weighted_u_squared, xi_phi[:, i:i_end])
+        # G1 = xi_phi_r1 @ weighted_u_squared @ xi_phi_batch.T
+        # (n_fused, N_grid_r1) @ (N_grid_r1, batch) -> (n_fused, batch)
+        # (n_fused, batch) @ (batch, n_fused) -> (n_fused, n_fused)
+        
+        # First contract r1:
+        # temp = xi_phi_r1 @ weighted_u_squared  -> (n_fused, batch)
+        temp = jnp.dot(xi_phi_r1, weighted_u_squared)
+        
+        # Then contract r2 (batch):
+        # G1 = temp @ xi_phi_batch.T -> (n_fused, n_fused)
+        G1 = jnp.dot(temp, xi_phi_batch.T)
         
         # Accumulate result
         # Factorized form: C_phi_{pq, k} = phi_{p,k} phi_{q,k}
-        result += jnp.einsum('kl,pk,qk,rl,sl->pqrs', G1, phi, phi, phi, phi)
+        term = jnp.einsum('kl,pk,qk,rl,sl->pqrs', G1, phi, phi, phi, phi)
+        
+        return carry + term, None
+
+    result_init = jnp.zeros((Nb, Nb, Nb, Nb))
+    final_result, _ = jax.lax.scan(scan_body, result_init, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
     
-        # Factorized form: C_phi_{pq, k} = phi_{p,k} phi_{q,k}
-        result += jnp.einsum('kl,pk,qk,rl,sl->pqrs', G1, phi, phi, phi, phi)
-    
-    total_time = time.perf_counter() - start_time
-    logging.info(f"calc_K3_isdf completed in {total_time:.4f} s")
-    return result
+    return final_result

@@ -276,8 +276,6 @@ class TC:
             
             result += result_T.transpose(2, 3, 0, 1)
         
-            result += result_T.transpose(2, 3, 0, 1)
-        
         total_time = time.perf_counter() - start_time
         logging.info(f"TC.get_2b completed in {total_time:.4f} s")
         return -result
@@ -500,43 +498,114 @@ class ISDFTC(TC):
             grad_phi_isdf=grad_phi_isdf
         )
 
+    def _compute_2b_isdf_shard(self, phi, grad_phi, grid_shard, weights_shard, xi_phi_shard, 
+                               full_grid, full_weights, xi_grad_full, xi_phi_full, 
+                               jastrow_params, batch_size):
+        """Compute ISDF K terms for a grid shard (pmapped)."""
+        
+        # Compute K1 (nabla on p)
+        # r1 is full grid, r2 is shard
+        k_nabla = kmat_jax.calc_K1_isdf(
+            phi,
+            xi_phi_shard,
+            grad_phi,
+            xi_grad_full,
+            self.jastrow_factor,
+            jastrow_params,
+            full_grid,
+            full_weights,
+            grid_shard,
+            weights_shard,
+            batch_size=batch_size
+        )
+        
+        # Compute K3
+        k_square = kmat_jax.calc_K3_isdf(
+            phi,
+            xi_phi_full,
+            xi_phi_shard,
+            self.jastrow_factor,
+            jastrow_params,
+            full_grid,
+            full_weights,
+            grid_shard,
+            weights_shard,
+            batch_size=batch_size
+        )
+        
+        # k_laplacian = -(k_nabla + k_nabla^T)
+        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
+        
+        # Combine results
+        result_local = 0.5 * (k_laplacian + k_square) + k_nabla
+        
+        # Sum results across devices
+        result_sum = jax.lax.psum(result_local, axis_name='devices')
+        
+        return result_sum
+
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
-        """Calculate TC correction terms using ISDF."""
+        """Calculate TC correction terms using ISDF with multi-GPU support."""
         start_time = time.perf_counter()
         logging.info("Starting ISDFTC.get_2b")
         if block_str is not None or ranges is not None:
             raise NotImplementedError("Block calculation not implemented for ISDFTC yet.")
             
-        # Use ISDF method
-        k_nabla = kmat_jax.calc_K1_isdf(
-            self.phi_isdf,
-            self.xi_rho,
-            self.grad_phi_isdf,
-            self.xi_grad,
-            self.jastrow_factor,
-            jastrow_params,
-            self.grid_points,
-            self.weights,
-            batch_size=batch_size
+        n_devices = jax.local_device_count()
+        n_grid = self.grid_points.shape[0]
+        
+        # Pad grid to be divisible by n_devices
+        remainder = n_grid % n_devices
+        if remainder != 0:
+            padding = n_devices - remainder
+            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+            padded_weights = jnp.pad(self.weights, ((0, padding),))
+            padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padding)))
+        else:
+            padded_grid_points = self.grid_points
+            padded_weights = self.weights
+            padded_xi_rho = self.xi_rho
+            
+        n_grid_padded = padded_grid_points.shape[0]
+        n_per_device = n_grid_padded // n_devices
+        
+        # Shard arrays: (n_devices, n_per_device, ...)
+        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
+        sharded_weights = padded_weights.reshape(n_devices, n_per_device)
+        # xi_rho: (N_rank, N) -> (N_rank, n_dev, N_per) -> (n_dev, N_rank, N_per)
+        sharded_xi_rho = padded_xi_rho.reshape(self.xi_rho.shape[0], n_devices, n_per_device).transpose(1, 0, 2)
+        
+        # Full arrays (replicated)
+        full_grid = self.grid_points
+        full_weights = self.weights
+        xi_grad_full = self.xi_grad
+        xi_phi_full = self.xi_rho
+        
+        # Execute pmap
+        pmapped_compute = jax.pmap(
+            self._compute_2b_isdf_shard, 
+            axis_name='devices',
+            in_axes=(None, None, 0, 0, 0, None, None, None, None, None, None),
+            static_broadcasted_argnums=(10,)
         )
-        # k_laplacian = -(k_nabla + k_nabla^T)
-        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
         
-        k_square = kmat_jax.calc_K3_isdf(
-            self.phi_isdf,
-            self.xi_rho,
-            self.jastrow_factor,
+        result_sum = pmapped_compute(
+            self.phi_isdf, 
+            self.grad_phi_isdf, 
+            sharded_grid, 
+            sharded_weights, 
+            sharded_xi_rho,
+            full_grid,
+            full_weights,
+            xi_grad_full,
+            xi_phi_full,
             jastrow_params,
-            self.grid_points,
-            self.weights,
-            batch_size=batch_size
+            batch_size
         )
         
-        # Combine results
-        result = 0.5 * (k_laplacian + k_square)
-        result += k_nabla
-        result += result.transpose(2, 3, 0, 1)
+        result = result_sum[0]
         
+        # Symmetrize result
         result += result.transpose(2, 3, 0, 1)
         
         total_time = time.perf_counter() - start_time

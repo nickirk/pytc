@@ -69,7 +69,7 @@ class TestISDF(unittest.TestCase):
         for n_rank in ranks:
             start_time = time.time()
             isdf_xtc_jax = ISDFXTC.from_xtc(self.xtc_jax, n_rank=n_rank)
-            delta_U_isdf = isdf_xtc_jax.get_delta_U(self.jastrow_params_jax)
+            delta_U_isdf = isdf_xtc_jax.get_delta_U(self.jastrow_params_jax).block_until_ready()
             end_time = time.time()
             
             diff_dU = np.linalg.norm(np.array(delta_U_exact_jax) - np.array(delta_U_isdf))
@@ -119,7 +119,9 @@ class TestISDF(unittest.TestCase):
         for n_rank in ranks:
             start_time = time.time()
             isdf_tc_jax = ISDFTC.from_tc(self.tc_jax, n_rank=n_rank)
-            k2b_isdf = isdf_tc_jax.get_2b(self.jastrow_params_jax)
+            k2b_isdf = isdf_tc_jax.get_2b(self.jastrow_params_jax).block_until_ready()
+            # block_until_ready()
+            
             end_time = time.time()
             
             diff_2b = np.linalg.norm(np.array(k2b_exact_jax) - np.array(k2b_isdf))
@@ -152,7 +154,7 @@ class TestISDF(unittest.TestCase):
         for n_rank in ranks:
             start_time = time.time()
             isdf_xtc_jax = ISDFXTC.from_xtc(self.xtc_jax, n_rank=n_rank)
-            k2b_isdf = isdf_xtc_jax.get_2b(self.jastrow_params_jax)
+            k2b_isdf = isdf_xtc_jax.get_2b(self.jastrow_params_jax).block_until_ready()
             end_time = time.time()
             
             diff_2b = np.linalg.norm(np.array(k2b_exact_jax) - np.array(k2b_isdf))
