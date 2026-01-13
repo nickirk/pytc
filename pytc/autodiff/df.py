@@ -221,6 +221,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
     logging.debug(f"Xi solved in {t1 - t0:.4f} s")
     
     total_time = time.perf_counter() - start_time
+    logging.debug(f"Total fused ranks = {n_fused}")
     logging.info(f"ISDF decomposition total time: {total_time:.4f} s")
     
     return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots
