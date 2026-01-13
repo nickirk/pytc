@@ -62,19 +62,19 @@ class TestTC(unittest.TestCase):
         
     def test_basis_evaluation(self):
         """Test basis function evaluation on grid."""
-        # In new design, rho is pre-computed and stored in struct
-        rho_jax = self.tc_jax.rho
-        nabla_rho_jax = self.tc_jax.nabla_rho
+        # In new design, phi is pre-computed and stored in struct
+        phi_jax = self.tc_jax.phi
+        grad_phi_jax = self.tc_jax.grad_phi
         
         rho_numpy, nabla_rho_numpy = self.tc_numpy._eval_basis_on_grid()
         
         np.testing.assert_allclose(
-            np.asarray(rho_jax), rho_numpy,
+            np.asarray(phi_jax), rho_numpy,
             rtol=1e-5, atol=1e-5,
             err_msg="JAX and numpy basis evaluations don't match"
         )
         np.testing.assert_allclose(
-            np.asarray(nabla_rho_jax), nabla_rho_numpy,
+            np.asarray(grad_phi_jax), nabla_rho_numpy,
             rtol=1e-5, atol=1e-5,
             err_msg="JAX and numpy basis gradients don't match"
         )

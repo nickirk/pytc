@@ -9,7 +9,7 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 
-def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
+def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
     # Unpack ranges (p, q, r, s)
     slice_p, slice_r, slice_q, slice_s = ranges
@@ -19,7 +19,7 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
         start, stop, step = s.indices(size)
         return (stop - start + (step - 1)) // step
     
-    n_orb = rho.shape[0]
+    n_orb = phi.shape[0]
     Np = get_size(slice_p, n_orb)
     Nq = get_size(slice_q, n_orb)
     Nr = get_size(slice_r, n_orb)
@@ -27,7 +27,7 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
     
     # Compute K1 (nabla on p)
     k1_raw = kmat_jax.calc_K1(
-        rho, nabla_rho,
+        phi, grad_phi,
         jastrow_factor, jastrow_params,
         grid, weights,
         ranges=ranges,
@@ -54,7 +54,7 @@ def _compute_2b_shard(rho, nabla_rho, grid, weights, jastrow_params, jastrow_fac
         
     # Compute K3
     k3_raw = kmat_jax.calc_K3(
-        rho, jastrow_factor, jastrow_params,
+        phi, jastrow_factor, jastrow_params,
         grid, weights,
         ranges=ranges,
         batch_size=batch_size
@@ -82,8 +82,8 @@ class TC:
     Attributes:
         grid_points: Grid points for numerical integration (N_grid, 3)
         weights: Grid weights (N_grid,)
-        rho: Basis functions evaluated on grid (N_orb, N_grid)
-        nabla_rho: Basis function gradients on grid (N_orb, N_grid, 3)
+        phi: Basis functions evaluated on grid (N_orb, N_grid)
+        grad_phi: Basis function gradients on grid (N_orb, N_grid, 3)
         n_orb: Number of orbitals (static)
         grid_lvl: Grid level (static)
         jastrow_factor: Jastrow factor instance (PyTree)
@@ -91,8 +91,8 @@ class TC:
     """
     grid_points: jnp.ndarray
     weights: jnp.ndarray
-    rho: jnp.ndarray
-    nabla_rho: jnp.ndarray
+    phi: jnp.ndarray
+    grad_phi: jnp.ndarray
     n_orb: int = struct.field(pytree_node=False)
     grid_lvl: int = struct.field(pytree_node=False)
     jastrow_factor: Any = struct.field(pytree_node=True)
@@ -136,14 +136,14 @@ class TC:
         mo_values = np.dot(mo_coeff.T, ao_values)
         mo_gradients = np.einsum('ji,jnc->inc', mo_coeff, ao_gradients)
         
-        rho = jnp.asarray(mo_values)
-        nabla_rho = jnp.asarray(mo_gradients)
+        phi = jnp.asarray(mo_values)
+        grad_phi = jnp.asarray(mo_gradients)
         
         return cls(
             grid_points=grid_points,
             weights=weights,
-            rho=rho,
-            nabla_rho=nabla_rho,
+            phi=phi,
+            grad_phi=grad_phi,
             n_orb=n_orb,
             grid_lvl=grid_lvl,
             jastrow_factor=jastrow_factor,
@@ -214,13 +214,13 @@ class TC:
             padding = n_devices - remainder
             padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
             padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_rho = jnp.pad(self.rho, ((0, 0), (0, padding)))
-            padded_nabla_rho = jnp.pad(self.nabla_rho, ((0, 0), (0, padding), (0, 0)))
+            padded_phi = jnp.pad(self.phi, ((0, 0), (0, padding)))
+            padded_grad_phi = jnp.pad(self.grad_phi, ((0, 0), (0, padding), (0, 0)))
         else:
             padded_grid_points = self.grid_points
             padded_weights = self.weights
-            padded_rho = self.rho
-            padded_nabla_rho = self.nabla_rho
+            padded_phi = self.phi
+            padded_grad_phi = self.grad_phi
             
         n_grid_padded = padded_grid_points.shape[0]
         n_per_device = n_grid_padded // n_devices
@@ -230,10 +230,10 @@ class TC:
         sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
         # weights: (N,) -> (n_dev, N_per)
         sharded_weights = padded_weights.reshape(n_devices, n_per_device)
-        # rho: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
-        sharded_rho = padded_rho.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
-        # nabla_rho: (Nb, N, 3) -> (Nb, n_dev, N_per, 3) -> (n_dev, Nb, N_per, 3)
-        sharded_nabla_rho = padded_nabla_rho.reshape(self.n_orb, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
+        # phi: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
+        sharded_phi = padded_phi.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
+        # grad_phi: (Nb, N, 3) -> (Nb, n_dev, N_per, 3) -> (n_dev, Nb, N_per, 3)
+        sharded_grad_phi = padded_grad_phi.reshape(self.n_orb, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
         
         # Execute pmap
         pmapped_compute = jax.pmap(
@@ -249,7 +249,7 @@ class TC:
             
         # Compute main block: 0.5 * (K1 - K2 + K3)
         result_sum = pmapped_compute(
-            sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,
+            sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
             jastrow_params, self.jastrow_factor, ranges, batch_size
         )
         result = result_sum[0]
@@ -265,7 +265,7 @@ class TC:
             ranges_T = (slice_q, slice_s, slice_p, slice_r)
             
             result_sum_T = pmapped_compute(
-                sharded_rho, sharded_nabla_rho, sharded_grid, sharded_weights,
+                sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
                 jastrow_params, self.jastrow_factor, ranges_T, batch_size
             )
             result_T = result_sum_T[0]
@@ -308,7 +308,7 @@ class TC:
         Returns:
             Fock matrix contribution (N, N)
         """
-        rho_g = jnp.einsum('mg,ng,mn->g', self.rho, self.rho, dm1)
+        density_g = jnp.einsum('mg,ng,mn->g', self.phi, self.phi, dm1)
         
         N_grid = self.grid_points.shape[0]
         batch_size = 1000
@@ -322,13 +322,13 @@ class TC:
                 slice_len = batch_size # Fixed size slice
                 r2_chunk = jax.lax.dynamic_slice(self.grid_points, (start, 0), (slice_len, 3))
                 w_chunk = jax.lax.dynamic_slice(self.weights, (start,), (slice_len,))
-                rho_chunk = jax.lax.dynamic_slice(rho_g, (start,), (slice_len,))
+                density_chunk = jax.lax.dynamic_slice(density_g, (start,), (slice_len,))
                 
                 # grad(r_batch, r2_chunk) -> (B, B_inner, 3)
                 grads = self.jastrow_factor.grad_r_batch(r_batch, r2_chunk, jastrow_params)
                 
-                # sum_j w_j rho_j grad_ij
-                weighted_grads = grads * (w_chunk * rho_chunk)[None, :, None]
+                # sum_j w_j density_j grad_ij
+                weighted_grads = grads * (w_chunk * density_chunk)[None, :, None]
                 chunk_sum = jnp.sum(weighted_grads, axis=1)
                 
                 return carry + chunk_sum, None
@@ -347,22 +347,22 @@ class TC:
         if padding > 0:
             grid_padded = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
             weights_padded = jnp.pad(self.weights, ((0, padding),))
-            rho_g_padded = jnp.pad(rho_g, ((0, padding),))
+            density_g_padded = jnp.pad(density_g, ((0, padding),))
         else:
             grid_padded = self.grid_points
             weights_padded = self.weights
-            rho_g_padded = rho_g
+            density_g_padded = density_g
             
-        def compute_W_batch_padded(r_batch, grid_p, weights_p, rho_p):
+        def compute_W_batch_padded(r_batch, grid_p, weights_p, density_p):
             def inner_scan_p(carry, chunk_idx):
                 start = chunk_idx * batch_size
                 # Fixed size slice on padded arrays
                 r2_chunk = jax.lax.dynamic_slice(grid_p, (start, 0), (batch_size, 3))
                 w_chunk = jax.lax.dynamic_slice(weights_p, (start,), (batch_size,))
-                rho_chunk = jax.lax.dynamic_slice(rho_p, (start,), (batch_size,))
+                density_chunk = jax.lax.dynamic_slice(density_p, (start,), (batch_size,))
                 
                 grads = self.jastrow_factor.grad_r_batch(r_batch, r2_chunk, jastrow_params)
-                weighted_grads = grads * (w_chunk * rho_chunk)[None, :, None]
+                weighted_grads = grads * (w_chunk * density_chunk)[None, :, None]
                 chunk_sum = jnp.sum(weighted_grads, axis=1)
                 return carry + chunk_sum, None
             
@@ -374,7 +374,7 @@ class TC:
             start = batch_idx * batch_size
             # Slice from padded grid
             r_batch = jax.lax.dynamic_slice(grid_padded, (start, 0), (batch_size, 3))
-            W_batch = compute_W_batch_padded(r_batch, grid_padded, weights_padded, rho_g_padded)
+            W_batch = compute_W_batch_padded(r_batch, grid_padded, weights_padded, density_g_padded)
             return carry, W_batch 
             
         _, W_all = jax.lax.scan(outer_scan, None, jnp.arange(n_batches))
@@ -388,8 +388,8 @@ class TC:
         #      = \sum_g w_g \phi_m(g) \phi_n(g) V_3b(g)
         
         # (N_orb, N_grid) * (N_grid,) -> (N_orb, N_grid)
-        weighted_phi = self.rho * (self.weights * V_3b_g)[None, :]
-        F_3b = jnp.dot(weighted_phi, self.rho.T)
+        weighted_phi = self.phi * (self.weights * V_3b_g)[None, :]
+        F_3b = jnp.dot(weighted_phi, self.phi.T)
         
         return F_3b
 
@@ -403,8 +403,8 @@ class TC:
         Returns:
             Fock matrix contribution (N, N)
         """
-        # 1. Compute rho on grid
-        rho_g = jnp.einsum('mg,ng,mn->g', self.rho, self.rho, dm1)
+        # 1. Compute density on grid
+        density_g = jnp.einsum('mg,ng,mn->g', self.phi, self.phi, dm1)
         
         # 2. Compute W(r) on grid using full broadcasting
         # W(r_i) = \sum_j w_j rho(r_j) \nabla_i u(r_i, r_j)
@@ -413,18 +413,18 @@ class TC:
         # This might be memory intensive for large grids!
         grads = self.jastrow_factor.grad_r_batch(self.grid_points, self.grid_points, jastrow_params)
         
-        # Weighted rho: (N_grid,)
-        w_rho = self.weights * rho_g
+        # Weighted density: (N_grid,)
+        w_density = self.weights * density_g
         
         # Contract: (N_i, N_j, 3) * (N_j,) -> (N_i, 3)
-        W_all = jnp.einsum('ijc,j->ic', grads, w_rho)
+        W_all = jnp.einsum('ijc,j->ic', grads, w_density)
         
         # 3. Compute V_3b_direct(r) = |W(r)|^2
         V_3b_g = jnp.sum(W_all**2, axis=1) # (N_grid,)
         
         # 4. Integrate to get Fock matrix elements
-        weighted_phi = self.rho * (self.weights * V_3b_g)[None, :]
-        F_3b = jnp.dot(weighted_phi, self.rho.T)
+        weighted_phi = self.phi * (self.weights * V_3b_g)[None, :]
+        F_3b = jnp.dot(weighted_phi, self.phi.T)
         
         return F_3b
 
@@ -436,17 +436,17 @@ class ISDFTC(TC):
     """JAX implementation of Transcorrelated method using ISDF.
     
     Attributes:
-        C_rho: ISDF basis for density (Nb^2, N_fused)
         xi_rho: ISDF coefficients for density (N_fused, N_grid)
-        C_grad: ISDF basis for gradients (Nb^2, N_fused, 3)
         xi_grad: ISDF coefficients for gradients (N_fused, N_grid, 3)
         pivots: ISDF pivot indices (N_fused,)
+        phi: ISDF basis for density (Nb, N_fused)
+        grad_phi: ISDF basis for gradients (Nb, N_fused, 3)
     """
-    C_rho: jnp.ndarray = struct.field(default=None)
     xi_rho: jnp.ndarray = struct.field(default=None)
-    C_grad: jnp.ndarray = struct.field(default=None)
     xi_grad: jnp.ndarray = struct.field(default=None)
     pivots: jnp.ndarray = struct.field(default=None)
+    phi_isdf: jnp.ndarray = struct.field(default=None)
+    grad_phi_isdf: jnp.ndarray = struct.field(default=None)
 
     @classmethod
     def from_tc(cls, tc_obj, n_rank=None):
@@ -465,26 +465,31 @@ class ISDFTC(TC):
             n_rank = tc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        # We use the same rank for both rho and grad for simplicity, 
+        # We use the same rank for both phi and grad for simplicity, 
         # matching the numpy implementation default behavior
-        C_rho, xi_rho, C_grad, xi_grad, pivots = df.isdf_decompose(
-            tc_obj.rho, tc_obj.nabla_rho, n_rank, n_rank, weights=tc_obj.weights
+        _, xi_rho, _, xi_grad, pivots = df.isdf_decompose(
+            tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights
         )
+        
+        # Extract phi_isdf and grad_phi_isdf using pivots
+        phi_isdf = tc_obj.phi[:, pivots]
+        grad_phi_isdf = tc_obj.grad_phi[:, pivots, :]
         
         return cls(
             grid_points=tc_obj.grid_points,
             weights=tc_obj.weights,
-            rho=tc_obj.rho,
-            nabla_rho=tc_obj.nabla_rho,
+            phi=tc_obj.phi,
+            grad_phi=tc_obj.grad_phi,
             n_orb=tc_obj.n_orb,
             grid_lvl=tc_obj.grid_lvl,
             jastrow_factor=tc_obj.jastrow_factor,
             mo_coeff=tc_obj.mo_coeff,
-            C_rho=C_rho,
+            nocc=tc_obj.nocc,
             xi_rho=xi_rho,
-            C_grad=C_grad,
             xi_grad=xi_grad,
-            pivots=pivots
+            pivots=pivots,
+            phi_isdf=phi_isdf,
+            grad_phi_isdf=grad_phi_isdf
         )
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
@@ -494,9 +499,9 @@ class ISDFTC(TC):
             
         # Use ISDF method
         k_nabla = kmat_jax.calc_K1_isdf(
-            self.C_rho,
+            self.phi_isdf,
             self.xi_rho,
-            self.C_grad,
+            self.grad_phi_isdf,
             self.xi_grad,
             self.jastrow_factor,
             jastrow_params,
@@ -505,12 +510,10 @@ class ISDFTC(TC):
             batch_size=batch_size
         )
         # k_laplacian = -(k_nabla + k_nabla^T)
-        # We reshape first to swap axes correctly
-        k_nabla = k_nabla.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
         
         k_square = kmat_jax.calc_K3_isdf(
-            self.C_rho,
+            self.phi_isdf,
             self.xi_rho,
             self.jastrow_factor,
             jastrow_params,
@@ -518,11 +521,6 @@ class ISDFTC(TC):
             self.weights,
             batch_size=batch_size
         )
-        
-        # Reshape results
-        # k_nabla is already reshaped
-        # k_laplacian is already reshaped
-        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
         
         # Combine results
         result = 0.5 * (k_laplacian + k_square)

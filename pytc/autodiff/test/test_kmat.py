@@ -34,17 +34,17 @@ class TestKmat(unittest.TestCase):
             config['grid_points'] = rng.randn(N_grid, 3)
             config['weights'] = rng.rand(N_grid)  # Random weights
             
-            # Generate orbitals (rho) and gradients (nabla_rho)
-            config['rho'] = rng.randn(Nb, N_grid)
-            config['nabla_rho'] = rng.randn(Nb, N_grid, 3)
+            # Generate orbitals (phi) and gradients (grad_phi)
+            config['phi'] = rng.randn(Nb, N_grid)
+            config['grad_phi'] = rng.randn(Nb, N_grid, 3)
             
             # Compute paired densities for NumPy reference (which expects pairs)
-            # rho_paired_ij = rho_i * rho_j
-            config['rho_paired'] = np.einsum('in,jn->ijn', config['rho'], config['rho']).reshape(Nb * Nb, N_grid)
+            # phi_paired_ij = phi_i * phi_j
+            config['phi_paired'] = np.einsum('in,jn->ijn', config['phi'], config['phi']).reshape(Nb * Nb, N_grid)
             
-            # nabla_rho_paired_ij = nabla_rho_i * rho_j
-            # Note: This matches JAX calc_K1 logic (nabla on first index)
-            config['nabla_rho_paired'] = np.einsum('ind,jn->ijnd', config['nabla_rho'], config['rho']).reshape(Nb * Nb, N_grid, 3)
+            # grad_phi_paired_ij = grad_phi_i * phi_j
+            # Note: This matches JAX calc_K1 logic (grad on first index)
+            config['grad_phi_paired'] = np.einsum('ind,jn->ijnd', config['grad_phi'], config['phi']).reshape(Nb * Nb, N_grid, 3)
         
         # Create Jastrow factors
         self.params = jnp.array([1.0])
@@ -81,8 +81,8 @@ class TestKmat(unittest.TestCase):
             with self.subTest(size=config['name']):
                 Nb = config['Nb']
                 result = calc_K1(
-                    jnp.asarray(config['rho']),
-                    jnp.asarray(config['nabla_rho']),
+                    jnp.asarray(config['phi']),
+                    jnp.asarray(config['grad_phi']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -95,8 +95,8 @@ class TestKmat(unittest.TestCase):
         for config in self.test_configs:
             with self.subTest(size=config['name']):
                 k1_jax_raw = calc_K1(
-                    jnp.asarray(config['rho']),
-                    jnp.asarray(config['nabla_rho']),
+                    jnp.asarray(config['phi']),
+                    jnp.asarray(config['grad_phi']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -107,8 +107,8 @@ class TestKmat(unittest.TestCase):
                 k1_jax = k1_jax_raw
                 
                 k1_numpy = calc_K1_numpy(
-                    config['rho_paired'],
-                    config['nabla_rho_paired'],
+                    config['phi_paired'],
+                    config['grad_phi_paired'],
                     self.jastrow_numpy,
                     config['grid_points'],
                     config['weights']
@@ -126,7 +126,7 @@ class TestKmat(unittest.TestCase):
             with self.subTest(size=config['name']):
                 Nb = config['Nb']
                 result = calc_K3(
-                    jnp.asarray(config['rho']),
+                    jnp.asarray(config['phi']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -139,7 +139,7 @@ class TestKmat(unittest.TestCase):
         for config in self.test_configs:
             with self.subTest(size=config['name']):
                 k3_jax = calc_K3(
-                    jnp.asarray(config['rho']),
+                    jnp.asarray(config['phi']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -147,7 +147,7 @@ class TestKmat(unittest.TestCase):
                 )
                 
                 k3_numpy = calc_K3_numpy(
-                    config['rho_paired'],
+                    config['phi_paired'],
                     self.jastrow_numpy,
                     config['grid_points'],
                     config['weights']
@@ -166,8 +166,8 @@ class TestKmat(unittest.TestCase):
         
         # Get reference result with default batch size
         ref_k1 = calc_K1(
-            jnp.asarray(config['rho']),
-            jnp.asarray(config['nabla_rho']),
+            jnp.asarray(config['phi']),
+            jnp.asarray(config['grad_phi']),
             self.jastrow_jax,
             self.params,  # Add params argument
             jnp.asarray(config['grid_points']),
@@ -175,7 +175,7 @@ class TestKmat(unittest.TestCase):
         )
         
         ref_k3 = calc_K3(
-            jnp.asarray(config['rho']),
+            jnp.asarray(config['phi']),
             self.jastrow_jax,
             self.params,  # Add params argument
             jnp.asarray(config['grid_points']),
@@ -186,8 +186,8 @@ class TestKmat(unittest.TestCase):
             with self.subTest(batch_size=batch_size):
                 # Test K1
                 k1 = calc_K1(
-                    jnp.asarray(config['rho']),
-                    jnp.asarray(config['nabla_rho']),
+                    jnp.asarray(config['phi']),
+                    jnp.asarray(config['grad_phi']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -198,7 +198,7 @@ class TestKmat(unittest.TestCase):
                 
                 # Test K3
                 k3 = calc_K3(
-                    jnp.asarray(config['rho']),
+                    jnp.asarray(config['phi']),
                     self.jastrow_jax,
                     self.params,  # Add params argument
                     jnp.asarray(config['grid_points']),
@@ -206,7 +206,7 @@ class TestKmat(unittest.TestCase):
                     batch_size=batch_size
                 )
                 np.testing.assert_allclose(k3, ref_k3, rtol=1e-5, atol=1e-5)
-
+    
     def test_single_point_gradient(self):
         """Test single point gradient computation matches between JAX and NumPy."""
         r1 = np.array([0., 0., 0.])
@@ -257,18 +257,18 @@ class TestISDF(unittest.TestCase):
         
         # Prepare basis functions on grid
         ao = dft.numint.eval_ao(cls.mol, cls.grid_points, deriv=1)
-        cls.rho = np.dot(ao[0], cls.mf.mo_coeff).T  # Shape: (N_orb, N_grid)
-        cls.nabla_rho = np.dot(ao[1:4].transpose(1,0,2), 
+        cls.phi = np.dot(ao[0], cls.mf.mo_coeff).T  # Shape: (N_orb, N_grid)
+        cls.grad_phi = np.dot(ao[1:4].transpose(1,0,2), 
                               cls.mf.mo_coeff).transpose(2,0,1)  # Shape: (N_orb, N_grid, 3)
         
         # Prepare paired indices for testing
-        cls.rho_paired = np.einsum('in,jn->ijn', 
-                                  cls.rho, 
-                                  cls.rho).reshape(-1, len(cls.weights))
+        cls.phi_paired = np.einsum('in,jn->ijn', 
+                                  cls.phi, 
+                                  cls.phi).reshape(-1, len(cls.weights))
         
-        cls.nabla_rho_paired = np.einsum('ind,jn->ijnd', 
-                                        cls.nabla_rho, 
-                                        cls.rho).reshape(-1, len(cls.weights), 3)
+        cls.grad_phi_paired = np.einsum('ind,jn->ijnd', 
+                                        cls.grad_phi, 
+                                        cls.phi).reshape(-1, len(cls.weights), 3)
     
     def test_isdf_shapes(self):
         """Test ISDF output shapes for different input sizes."""
@@ -277,37 +277,37 @@ class TestISDF(unittest.TestCase):
         
         # Test with a moderate rank
         rank = len(self.weights) // 100
-        C_rho, xi_rho, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-            self.rho_paired, 
-            self.nabla_rho_paired,
+        C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
+            self.phi_paired, 
+            self.grad_phi_paired,
             rank, rank
         )
         
         # Test K1_isdf
         result_k1 = calc_K1_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
             jnp.asarray(C_grad), jnp.asarray(xi_grad),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
-        self.assertEqual(result_k1.shape, (self.n_orb * self.n_orb, self.n_orb * self.n_orb))
+        self.assertEqual(result_k1.shape, (self.n_orb, self.n_orb, self.n_orb, self.n_orb))
         
         # Test K2_isdf
         result_k2 = calc_K2_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
             jnp.asarray(C_grad), jnp.asarray(xi_grad),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
-        self.assertEqual(result_k2.shape, (self.n_orb * self.n_orb, self.n_orb * self.n_orb))
+        self.assertEqual(result_k2.shape, (self.n_orb, self.n_orb, self.n_orb, self.n_orb))
         
         # Test K3_isdf
         result_k3 = calc_K3_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho),
+            jnp.asarray(C_phi), jnp.asarray(xi_phi),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
-        self.assertEqual(result_k3.shape, (self.n_orb * self.n_orb, self.n_orb * self.n_orb))
+        self.assertEqual(result_k3.shape, (self.n_orb, self.n_orb, self.n_orb, self.n_orb))
     
     def test_isdf_against_numpy(self):
         """Compare JAX ISDF implementation against numpy ISDF."""
@@ -319,64 +319,64 @@ class TestISDF(unittest.TestCase):
         
         # Test with a moderate rank
         rank = len(self.weights) // 100
-        C_rho, xi_rho, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-            self.rho_paired, 
-            self.nabla_rho_paired,
+        C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
+            self.phi_paired, 
+            self.grad_phi_paired,
             rank, rank
         )
         
         # Test K1_isdf
         k1_jax = calc_K1_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
             jnp.asarray(C_grad), jnp.asarray(xi_grad),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
         k1_numpy = calc_K1_isdf_numpy(
-            C_rho, xi_rho, C_grad, xi_grad,
+            C_phi, xi_phi, C_grad, xi_grad,
             self.jastrow_numpy, self.grid_points, self.weights
         )
         
         np.testing.assert_allclose(
-            np.asarray(k1_jax), k1_numpy,
+            np.asarray(k1_jax).reshape(-1, self.n_orb**2), k1_numpy,
             atol=1e-6,
             err_msg="JAX and numpy K1_isdf don't match"
         )
         
         # Test K2_isdf
         k2_jax = calc_K2_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
             jnp.asarray(C_grad), jnp.asarray(xi_grad),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
         k2_numpy = calc_K2_isdf_numpy(
-            C_rho, xi_rho, C_grad, xi_grad,
+            C_phi, xi_phi, C_grad, xi_grad,
             self.jastrow_numpy, self.grid_points, self.weights
         )
         
         np.testing.assert_allclose(
-            np.asarray(k2_jax), k2_numpy,
+            np.asarray(k2_jax).reshape(-1, self.n_orb**2), k2_numpy,
             atol=1e-6,
             err_msg="JAX and numpy K2_isdf don't match"
         )
         
         # Test K3_isdf
         k3_jax = calc_K3_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho),
+            jnp.asarray(C_phi), jnp.asarray(xi_phi),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
         k3_numpy = calc_K3_isdf_numpy(
-            C_rho, xi_rho,
+            C_phi, xi_phi,
             self.jastrow_numpy, self.grid_points, self.weights
         )
         
         np.testing.assert_allclose(
-            np.asarray(k3_jax), k3_numpy,
+            np.asarray(k3_jax).reshape(-1, self.n_orb**2), k3_numpy,
             atol=1e-6,
             err_msg="JAX and numpy K3_isdf don't match"
         )
@@ -395,53 +395,53 @@ class TestISDF(unittest.TestCase):
         
         for rank in ranks:
             # Perform ISDF decomposition
-            C_rho, xi_rho, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-                self.rho_paired, 
-                self.nabla_rho_paired,
+            C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
+                self.phi_paired, 
+                self.grad_phi_paired,
                 rank, rank
             )
             
             # Compute JAX ISDF functions
             k1_jax = calc_K1_isdf(
-                jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+                jnp.asarray(C_phi), jnp.asarray(xi_phi), 
                 jnp.asarray(C_grad), jnp.asarray(xi_grad),
                 self.jastrow_jax, self.params,
                 jnp.asarray(self.grid_points), jnp.asarray(self.weights)
             )
             
             k2_jax = calc_K2_isdf(
-                jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+                jnp.asarray(C_phi), jnp.asarray(xi_phi), 
                 jnp.asarray(C_grad), jnp.asarray(xi_grad),
                 self.jastrow_jax, self.params,
                 jnp.asarray(self.grid_points), jnp.asarray(self.weights)
             )
             
             k3_jax = calc_K3_isdf(
-                jnp.asarray(C_rho), jnp.asarray(xi_rho),
+                jnp.asarray(C_phi), jnp.asarray(xi_phi),
                 self.jastrow_jax, self.params,
                 jnp.asarray(self.grid_points), jnp.asarray(self.weights)
             )
             
             # Compute numpy ISDF functions as reference
             k1_numpy = calc_K1_isdf_numpy(
-                C_rho, xi_rho, C_grad, xi_grad,
+                C_phi, xi_phi, C_grad, xi_grad,
                 self.jastrow_numpy, self.grid_points, self.weights
             )
             
             k2_numpy = calc_K2_isdf_numpy(
-                C_rho, xi_rho, C_grad, xi_grad,
+                C_phi, xi_phi, C_grad, xi_grad,
                 self.jastrow_numpy, self.grid_points, self.weights
             )
             
             k3_numpy = calc_K3_isdf_numpy(
-                C_rho, xi_rho,
+                C_phi, xi_phi,
                 self.jastrow_numpy, self.grid_points, self.weights
             )
             
             # Calculate abs errors
-            error_k1 = np.linalg.norm(np.asarray(k1_jax) - k1_numpy)
-            error_k2 = np.linalg.norm(np.asarray(k2_jax) - k2_numpy)
-            error_k3 = np.linalg.norm(np.asarray(k3_jax) - k3_numpy)
+            error_k1 = np.linalg.norm(np.asarray(k1_jax).reshape(-1, self.n_orb**2) - k1_numpy)
+            error_k2 = np.linalg.norm(np.asarray(k2_jax).reshape(-1, self.n_orb**2) - k2_numpy)
+            error_k3 = np.linalg.norm(np.asarray(k3_jax).reshape(-1, self.n_orb**2) - k3_numpy)
             
             errors_k1.append(error_k1)
             errors_k2.append(error_k2)
@@ -461,9 +461,9 @@ class TestISDF(unittest.TestCase):
         
         # Use moderate rank
         rank = len(self.weights) // 10
-        C_rho, xi_rho, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-            self.rho_paired, 
-            self.nabla_rho_paired,
+        C_phi, xi_phi, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
+            self.phi_paired, 
+            self.grad_phi_paired,
             rank, rank
         )
         
@@ -471,14 +471,14 @@ class TestISDF(unittest.TestCase):
         
         # Get reference result with default batch size
         ref_k1 = calc_K1_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+            jnp.asarray(C_phi), jnp.asarray(xi_phi), 
             jnp.asarray(C_grad), jnp.asarray(xi_grad),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
         
         ref_k3 = calc_K3_isdf(
-            jnp.asarray(C_rho), jnp.asarray(xi_rho),
+            jnp.asarray(C_phi), jnp.asarray(xi_phi),
             self.jastrow_jax, self.params,
             jnp.asarray(self.grid_points), jnp.asarray(self.weights)
         )
@@ -487,7 +487,7 @@ class TestISDF(unittest.TestCase):
             with self.subTest(batch_size=batch_size):
                 # Test K1_isdf
                 k1 = calc_K1_isdf(
-                    jnp.asarray(C_rho), jnp.asarray(xi_rho), 
+                    jnp.asarray(C_phi), jnp.asarray(xi_phi), 
                     jnp.asarray(C_grad), jnp.asarray(xi_grad),
                     self.jastrow_jax, self.params,
                     jnp.asarray(self.grid_points), jnp.asarray(self.weights),
@@ -497,7 +497,7 @@ class TestISDF(unittest.TestCase):
                 
                 # Test K3_isdf
                 k3 = calc_K3_isdf(
-                    jnp.asarray(C_rho), jnp.asarray(xi_rho),
+                    jnp.asarray(C_phi), jnp.asarray(xi_phi),
                     self.jastrow_jax, self.params,
                     jnp.asarray(self.grid_points), jnp.asarray(self.weights),
                     batch_size=batch_size

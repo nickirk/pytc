@@ -76,55 +76,49 @@ def pivoted_cholesky_matrix_free(gram_diag_fn, gram_col_fn, n_grid, n_rank):
     
     return final_pivots
 
-def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
-    """Perform ISDF decomposition on orbitals and their gradients.
+def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None):
+    """Perform ISDF decomposition of orbitals and their gradients.
     
     Args:
-        mo_values: (N_orb, N_grid)
-        mo_grads: (N_orb, N_grid, 3)
-        n_rank_rho: Rank for density decomposition
+        phi: Orbitals on grid (Nb, N_grid)
+        grad_phi: Orbital gradients on grid (Nb, N_grid, 3)
+        n_rank_phi: Rank for phi decomposition
         n_rank_grad: Rank for gradient decomposition
         weights: Optional (N_grid,) array of integration weights. 
                  If provided, pivot selection is weighted by these weights.
         
     Returns:
-        C_rho: (N_orb^2, N_fused)
-        xi_rho: (N_fused, N_grid)
+        C_phi: (N_orb^2, N_fused)
+        xi_phi: (N_fused, N_grid)
         C_grad: (N_orb^2, N_fused, 3)
         xi_grad: (N_fused, N_grid, 3)
         pivots: (N_fused,)
     """
-    n_orb, n_grid = mo_values.shape
-    
+    n_orb, n_grid = phi.shape
     
     if weights is None:
         w_sqrt = jnp.ones(n_grid)
     else:
         w_sqrt = jnp.sqrt(jnp.abs(weights)) # Use abs to avoid NaN
         
-    
-    # Pre-compute diagonal for rho to calculate shift
-    orb_sq = jnp.sum(mo_values**2, axis=0)
-    diag_rho = orb_sq**2
-    shift_rho = 1e-12 * jnp.max(jnp.abs(diag_rho))
+    # Pre-compute diagonal for phi to calculate shift
+    orb_sq = jnp.sum(phi**2, axis=0)
+    diag_phi = orb_sq**2
+    shift_phi = 1e-12 * jnp.max(jnp.abs(diag_phi))
 
-    def gram_diag_rho():
-        # S_ii = (sum_p phi_p(i)^2)^2 + shift
-        return diag_rho + shift_rho
+    def gram_diag_phi():
+        return diag_phi + shift_phi
         
-    def gram_col_rho(idx):
-        # S_ij = (sum_p phi_p(i) phi_p(idx))^2
-        # dot = phi(i) @ phi(idx)
-        dot = jnp.dot(mo_values.T, mo_values[:, idx])
+    def gram_col_phi(idx):
+        dot = jnp.dot(phi.T, phi[:, idx])
         col = dot**2
-        return col.at[idx].add(shift_rho)
+        return col.at[idx].add(shift_phi)
         
-    pivots_rho = pivoted_cholesky_matrix_free(gram_diag_rho, gram_col_rho, n_grid, n_rank_rho)
-    
+    pivots_phi = pivoted_cholesky_matrix_free(gram_diag_phi, gram_col_phi, n_grid, n_rank_phi)
     
     # Pre-compute diagonal for grad to calculate shift
-    A_diag = jnp.sum(mo_values**2, axis=0)
-    B_diag = jnp.sum(jnp.sum(mo_grads**2, axis=2), axis=0)
+    A_diag = jnp.sum(phi**2, axis=0)
+    B_diag = jnp.sum(jnp.sum(grad_phi**2, axis=2), axis=0)
     diag_grad = A_diag * B_diag
     shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
 
@@ -132,29 +126,28 @@ def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
         return diag_grad + shift_grad
         
     def gram_col_grad(idx):
-        A_col = jnp.dot(mo_values.T, mo_values[:, idx])
-        # B_col: sum_c (nabla^c phi).T @ (nabla^c phi)[:, idx]
+        A_col = jnp.dot(phi.T, phi[:, idx])
         B_col = jnp.zeros(n_grid)
         for c in range(3):
-            B_col += jnp.dot(mo_grads[:, :, c].T, mo_grads[:, idx, c])
+            B_col += jnp.dot(grad_phi[:, :, c].T, grad_phi[:, idx, c])
         col = A_col * B_col
         return col.at[idx].add(shift_grad)
         
     pivots_grad = pivoted_cholesky_matrix_free(gram_diag_grad, gram_col_grad, n_grid, n_rank_grad)
     
     # --- 3. Fuse pivots ---
-    pivots_all = jnp.concatenate([pivots_rho, pivots_grad])
+    pivots_all = jnp.concatenate([pivots_phi, pivots_grad])
     pivots = jnp.unique(pivots_all)
     n_fused = pivots.shape[0]
     
     # --- 4. Construct C matrices ---
-    mo_vals_piv = mo_values[:, pivots]
-    C_rho = jnp.einsum('pm,qm->pqm', mo_vals_piv, mo_vals_piv).reshape(-1, n_fused)
+    phi_piv = phi[:, pivots]
+    C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, n_fused)
     
-    mo_grads_piv = mo_grads[:, pivots, :] # (N_orb, N_fused, 3)
-    C_grad = jnp.einsum('pmc,qm->pqmc', mo_grads_piv, mo_vals_piv).reshape(-1, n_fused, 3)
+    grad_phi_piv = grad_phi[:, pivots, :] # (N_orb, N_fused, 3)
+    C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, n_fused, 3)
     
-    # --- 5. Solve for xi_rho and xi_grad (Block-wise Least Squares) ---
+    # --- 5. Solve for xi_phi and xi_grad (Block-wise Least Squares) ---
     batch_size = 4096
     n_batches = (n_grid + batch_size - 1) // batch_size
     
@@ -163,41 +156,38 @@ def isdf_decompose(mo_values, mo_grads, n_rank_rho, n_rank_grad, weights=None):
         end = jnp.minimum(start + batch_size, n_grid)
         width = end - start
         
-        # 1. Solve xi_rho
-        mo_val_batch = jax.lax.dynamic_slice(mo_values, (0, start), (n_orb, width))
-        rho_batch = jnp.einsum('pi,qi->pqi', mo_val_batch, mo_val_batch).reshape(-1, width)
+        # 1. Solve xi_phi
+        phi_batch = jax.lax.dynamic_slice(phi, (0, start), (n_orb, width))
+        phi_paired_batch = jnp.einsum('pi,qi->pqi', phi_batch, phi_batch).reshape(-1, width)
         
-        # Solve C_rho * xi = rho_batch
-        # C_rho: (N^2, k), rho_batch: (N^2, width)
-        xi_rho_batch, _, _, _ = jnp.linalg.lstsq(C_rho, rho_batch, rcond=1e-14)
+        # Solve C_phi * xi = phi_paired_batch
+        xi_phi_batch, _, _, _ = jnp.linalg.lstsq(C_phi, phi_paired_batch, rcond=1e-14)
         
         # 2. Solve xi_grad
-        # nabla_rho_batch: (N_orb^2, width, 3)
-        mo_grad_batch = jax.lax.dynamic_slice(mo_grads, (0, start, 0), (n_orb, width, 3))
+        grad_phi_batch = jax.lax.dynamic_slice(grad_phi, (0, start, 0), (n_orb, width, 3))
         
         xi_grad_batch_list = []
         for c in range(3):
-            # Construct nabla_rho_batch for component c
-            # nabla^c rho_pq = nabla^c phi_p * phi_q
-            nabla_rho_c = jnp.einsum('pi,qi->pqi', mo_grad_batch[:, :, c], mo_val_batch).reshape(-1, width)
+            # Construct grad_phi_paired_batch for component c
+            grad_phi_paired_c = jnp.einsum('pi,qi->pqi', grad_phi_batch[:, :, c], phi_batch).reshape(-1, width)
             
-            # Solve C_grad[..., c] * xi = nabla_rho_c
-            xi_c, _, _, _ = jnp.linalg.lstsq(C_grad[:, :, c], nabla_rho_c, rcond=1e-14)
+            # Solve C_grad[..., c] * xi = grad_phi_paired_c
+            xi_c, _, _, _ = jnp.linalg.lstsq(C_grad[:, :, c], grad_phi_paired_c, rcond=1e-14)
             xi_grad_batch_list.append(xi_c)
             
         xi_grad_batch = jnp.stack(xi_grad_batch_list, axis=-1) # (k, width, 3)
         
-        return xi_rho_batch, xi_grad_batch, width
+        return xi_phi_batch, xi_grad_batch, width
 
-    xi_rho_list = []
+    xi_phi_list = []
     xi_grad_list = []
     
     for i in range(n_batches):
-        xi_r, xi_g, w = solve_batch(i)
-        xi_rho_list.append(xi_r)
+        xi_p, xi_g, w = solve_batch(i)
+        xi_phi_list.append(xi_p)
         xi_grad_list.append(xi_g)
         
-    xi_rho = jnp.concatenate(xi_rho_list, axis=1)
+    xi_phi = jnp.concatenate(xi_phi_list, axis=1)
     xi_grad = jnp.concatenate(xi_grad_list, axis=1)
     
-    return C_rho, xi_rho, C_grad, xi_grad, pivots
+    return C_phi, xi_phi, C_grad, xi_grad, pivots

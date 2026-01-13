@@ -58,11 +58,11 @@ class TestXTC(unittest.TestCase):
 
     def test_basis_evaluation(self):
         """Test basis function evaluation on grid."""
-        rho_jax = self.xtc_jax.rho
+        phi_jax = self.xtc_jax.phi
         rho_numpy, _ = self.xtc_numpy._eval_basis_on_grid()
         
         np.testing.assert_allclose(
-            np.asarray(rho_jax),
+            np.asarray(phi_jax),
             rho_numpy,
             rtol=1e-5, atol=1e-5
         )
@@ -70,25 +70,25 @@ class TestXTC(unittest.TestCase):
     def test_v_vector(self):
         """Test v_vector calculation."""
         # Get orbital values on grid
-        mo_values_jax = self.xtc_jax.rho
+        mo_values_jax = self.xtc_jax.phi
         mo_values_numpy, _ = self.xtc_numpy._eval_basis_on_grid()
         
         # Prepare paired indices
-        rho_paired_jax = jnp.einsum('in,jn->ijn', 
+        phi_paired_jax = jnp.einsum('in,jn->ijn', 
                                    mo_values_jax, 
                                    mo_values_jax).reshape(-1, len(self.xtc_jax.weights))
-        rho_paired_numpy = np.einsum('in,jn->ijn', 
+        phi_paired_numpy = np.einsum('in,jn->ijn', 
                                     mo_values_numpy, 
                                     mo_values_numpy).reshape(-1, len(self.xtc_numpy.weights))
         
         v_vector_jax = self.xtc_jax._calc_v_batch(
             self.xtc_jax.grid_points,
-            self.xtc_jax.rho,
+            self.xtc_jax.phi,
             self.xtc_jax.weights,
             self.params_jax,
             batch_size=len(self.xtc_jax.grid_points)
         )
-        v_vector_numpy = self.xtc_numpy._calc_v_vector(rho_paired_numpy)
+        v_vector_numpy = self.xtc_numpy._calc_v_vector(phi_paired_numpy)
         
         np.testing.assert_allclose(
             np.asarray(v_vector_jax),
