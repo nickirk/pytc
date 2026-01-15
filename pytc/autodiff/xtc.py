@@ -259,7 +259,7 @@ class XTC(TC):
                      Otherwise: (N, N, N, N)
         """
         start_time = time.perf_counter()
-        logging.info("Starting XTC.get_delta_U")
+        logging.debug("Starting XTC.get_delta_U")
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
@@ -492,7 +492,7 @@ class XTC(TC):
         total_delta_U = delta_U_replicated[0]
         
         total_time = time.perf_counter() - start_time
-        logging.info(f"XTC.get_delta_U completed in {total_time:.4f} s")
+        logging.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
         return -total_delta_U
 
     def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -541,7 +541,7 @@ class XTC(TC):
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
-        logging.info("Starting XTC.get_2b")
+        logging.debug("Starting XTC.get_2b")
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -553,7 +553,7 @@ class XTC(TC):
         delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         
         total_time = time.perf_counter() - start_time
-        logging.info(f"XTC.get_2b completed in {total_time:.4f} s")
+        logging.debug(f"XTC.get_2b completed in {total_time:.4f} s")
         return tc_correction + delta_U
 
     @jax.jit
@@ -697,7 +697,7 @@ class ISDFXTC(XTC, ISDFTC):
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
         start_time = time.perf_counter()
-        logging.info("Starting ISDFXTC.get_delta_U")
+        logging.debug("Starting ISDFXTC.get_delta_U")
         
         # Call the raw computation function
         result = self._get_delta_U_raw(jastrow_params, dm1, ranges, batch_size)
@@ -717,7 +717,7 @@ class ISDFXTC(XTC, ISDFTC):
             final_result = -(result + result_T.transpose(2, 3, 0, 1))
 
         total_time = time.perf_counter() - start_time
-        logging.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        logging.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
     def _get_delta_U_raw(self, jastrow_params, dm1, ranges, batch_size):
