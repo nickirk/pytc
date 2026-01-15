@@ -40,10 +40,10 @@ class TestISDFReconstruction(unittest.TestCase):
         # G_ij,c = sum_g w_g grad_phi_i,c(g) phi_j(g)
         G_exact = jnp.einsum('igc,g,jg->ijc', self.grad_phi, self.weights, self.phi)
         
-        ranks = [600, 800, 1000]
+        ranks = [400, 600, 800]
         
-        print(f"\n{'Rank':<10} {'S Rel Error':<15} {'G Rel Error':<15}")
-        print("-" * 45)
+        print(f"\n{'Rank':<10} {'S Rel Error':<15} {'S Max Abs':<15} {'G Rel Error':<15} {'G Max Abs':<15}")
+        print("-" * 75)
         
         prev_S_error = float('inf')
         prev_G_error = float('inf')
@@ -51,7 +51,7 @@ class TestISDFReconstruction(unittest.TestCase):
         for n_rank in ranks:
             # Perform ISDF decomposition
             phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots = isdf_decompose(
-                self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights
+                self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights, use_iterative=True, rcond=1e-16
             )
             
             # Reconstruct overlaps
@@ -73,7 +73,11 @@ class TestISDFReconstruction(unittest.TestCase):
             S_error = jnp.linalg.norm(S_reconst - S_exact) / jnp.linalg.norm(S_exact)
             G_error = jnp.linalg.norm(G_reconst - G_exact) / jnp.linalg.norm(G_exact)
             
-            print(f"{n_rank:<10} {S_error:<15.2e} {G_error:<15.2e}")
+            # Compute max absolute errors
+            S_max_abs = jnp.max(jnp.abs(S_reconst - S_exact))
+            G_max_abs = jnp.max(jnp.abs(G_reconst - G_exact))
+            
+            print(f"{n_rank:<10} {S_error:<15.2e} {S_max_abs:<15.2e} {G_error:<15.2e} {G_max_abs:<15.2e}")
             
             # Check for convergence
             if n_rank > ranks[0]:

@@ -40,10 +40,13 @@ class TestISDF(unittest.TestCase):
         """Compare JAX ISDF delta_U directly with JAX Exact delta_U using convergence test."""
         ranks = [100, 200, 300, 400]
         
-        # --- JAX Exact Delta U ---
+        # --- JAX Exact Delta U with timing ---
         print("\nRunning JAX Exact Delta U...")
-        delta_U_exact_jax = self.xtc_jax.get_delta_U(self.jastrow_params_jax)
+        start_exact = time.time()
+        delta_U_exact_jax = self.xtc_jax.get_delta_U(self.jastrow_params_jax).block_until_ready()
+        time_exact = time.time() - start_exact
         norm_exact_jax = np.linalg.norm(np.array(delta_U_exact_jax))
+        print(f"Exact JAX time: {time_exact:.4f} s")
         
         # --- NumPy Exact Delta U ---
         print("Running NumPy Exact Delta U...")
@@ -61,8 +64,8 @@ class TestISDF(unittest.TestCase):
         print(f"Exact Delta U Relative Error (JAX vs NumPy): {rel_err_exact:.2e}")
         self.assertTrue(rel_err_exact < 1e-10, f"Exact Delta U mismatch: {rel_err_exact}")
         
-        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Time (s)':<10}")
-        print("-" * 35)
+        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Max Abs Error':<15} {'Time (s)':<12} {'Speedup':<10}")
+        print("-" * 67)
         
         prev_error = float('inf')
         
@@ -70,12 +73,15 @@ class TestISDF(unittest.TestCase):
             start_time = time.time()
             isdf_xtc_jax = ISDFXTC.from_xtc(self.xtc_jax, n_rank=n_rank)
             delta_U_isdf = isdf_xtc_jax.get_delta_U(self.jastrow_params_jax).block_until_ready()
-            end_time = time.time()
+            isdf_time = time.time() - start_time
+            
+            speedup = time_exact / isdf_time
             
             diff_dU = np.linalg.norm(np.array(delta_U_exact_jax) - np.array(delta_U_isdf))
             rel_err_dU = diff_dU / norm_exact_jax
+            max_abs_dU = np.max(np.abs(np.array(delta_U_exact_jax) - np.array(delta_U_isdf)))
             
-            print(f"{n_rank:<10} {rel_err_dU:<15.2e} {end_time - start_time:<10.2f}")
+            print(f"{n_rank:<10} {rel_err_dU:<15.2e} {max_abs_dU:<15.2e} {isdf_time:<12.4f} {speedup:<10.2f}x")
             
             # Check for convergence or low error
             if n_rank > 100:
@@ -90,10 +96,13 @@ class TestISDF(unittest.TestCase):
 
     def test_isdf_kmat_accuracy(self):
         """Compare JAX ISDF K matrices directly with JAX Exact K matrices using convergence test."""
-        # --- JAX Exact 2-Body Correction ---
+        # --- JAX Exact 2-Body Correction with timing ---
         print("\nRunning JAX Exact 2-Body Correction...")
-        k2b_exact_jax = self.tc_jax.get_2b(self.jastrow_params_jax)
+        start_exact = time.time()
+        k2b_exact_jax = self.tc_jax.get_2b(self.jastrow_params_jax).block_until_ready()
+        time_exact = time.time() - start_exact
         norm_exact_jax = np.linalg.norm(np.array(k2b_exact_jax))
+        print(f"Exact JAX time: {time_exact:.4f} s")
         
         # --- NumPy Exact 2-Body Correction ---
         print("Running NumPy Exact 2-Body Correction...")
@@ -112,22 +121,23 @@ class TestISDF(unittest.TestCase):
         
         # --- JAX ISDF Convergence ---
         ranks = [100, 200, 300, 400]
-        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Time (s)':<10}")
-        print("-" * 35)
+        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Max Abs Error':<15} {'Time (s)':<12} {'Speedup':<10}")
+        print("-" * 67)
         
         prev_error = float('inf')
         for n_rank in ranks:
             start_time = time.time()
             isdf_tc_jax = ISDFTC.from_tc(self.tc_jax, n_rank=n_rank)
             k2b_isdf = isdf_tc_jax.get_2b(self.jastrow_params_jax).block_until_ready()
-            # block_until_ready()
+            isdf_time = time.time() - start_time
             
-            end_time = time.time()
+            speedup = time_exact / isdf_time
             
             diff_2b = np.linalg.norm(np.array(k2b_exact_jax) - np.array(k2b_isdf))
             rel_err_2b = diff_2b / norm_exact_jax
+            max_abs_2b = np.max(np.abs(np.array(k2b_exact_jax) - np.array(k2b_isdf)))
             
-            print(f"{n_rank:<10} {rel_err_2b:<15.2e} {end_time - start_time:<10.2f}")
+            print(f"{n_rank:<10} {rel_err_2b:<15.2e} {max_abs_2b:<15.2e} {isdf_time:<12.4f} {speedup:<10.2f}x")
             
             if n_rank > 100:
                 if rel_err_2b > 1e-4:
@@ -140,27 +150,33 @@ class TestISDF(unittest.TestCase):
     
     def test_get_2b_convergence(self):
         """Verify that get_2b (overall ISDFXTC) converges with rank."""
-        # --- JAX Exact 2-Body Correction (Overall) ---
+        # --- JAX Exact 2-Body Correction (Overall) with timing ---
         print("\nRunning JAX Exact Overall 2-Body Correction...")
-        k2b_exact_jax = self.xtc_jax.get_2b(self.jastrow_params_jax)
+        start_exact = time.time()
+        k2b_exact_jax = self.xtc_jax.get_2b(self.jastrow_params_jax).block_until_ready()
+        time_exact = time.time() - start_exact
         norm_exact_jax = np.linalg.norm(np.array(k2b_exact_jax))
+        print(f"Exact JAX time: {time_exact:.4f} s")
         
         ranks = [100, 200, 300, 400]
         
-        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Time (s)':<10}")
-        print("-" * 35)
+        print(f"\n{'Rank':<10} {'Rel Error':<15} {'Max Abs Error':<15} {'Time (s)':<12} {'Speedup':<10}")
+        print("-" * 67)
         
         prev_error = float('inf')
         for n_rank in ranks:
             start_time = time.time()
             isdf_xtc_jax = ISDFXTC.from_xtc(self.xtc_jax, n_rank=n_rank)
             k2b_isdf = isdf_xtc_jax.get_2b(self.jastrow_params_jax).block_until_ready()
-            end_time = time.time()
+            isdf_time = time.time() - start_time
+            
+            speedup = time_exact / isdf_time
             
             diff_2b = np.linalg.norm(np.array(k2b_exact_jax) - np.array(k2b_isdf))
             rel_err_2b = diff_2b / norm_exact_jax
+            max_abs_2b = np.max(np.abs(np.array(k2b_exact_jax) - np.array(k2b_isdf)))
             
-            print(f"{n_rank:<10} {rel_err_2b:<15.2e} {end_time - start_time:<10.2f}")
+            print(f"{n_rank:<10} {rel_err_2b:<15.2e} {max_abs_2b:<15.2e} {isdf_time:<12.4f} {speedup:<10.2f}x")
             
             if n_rank > 100:
                 if rel_err_2b > 1e-4:
