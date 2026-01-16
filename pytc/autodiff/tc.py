@@ -278,25 +278,24 @@ class TC:
         """Get one-body Fock matrix correction (AO basis)."""
         return jnp.zeros((self.n_orb, self.n_orb))
 
-    def get_2b_fock(self, jastrow_params, dm1):
+    def get_2b_fock(self, jastrow_params, dm1, T=None):
         """Get 2-body Fock matrix correction.
         
         Args:
             jastrow_params: Jastrow parameters
-            dm1: Density matrix (AO basis), shape (N, N)
-            
-        Returns:
-            Fock matrix contribution (N, N)
+            dm1: Density matrix
+            T: Optional cached 2-body tensor (N, N, N, N).
         """
-        k_2b = self.get_2b(jastrow_params) # (p, r, q, s) in chemists notation?
-        T = k_2b # (p, r, q, s)
-        
+        if T is None:
+            k_2b = self.get_2b(jastrow_params)
+            T = k_2b
+            
         # Coulomb-like contribution
-        # \sum_{q,s} T_{prqs} P_{qs}
         J_mat = jnp.einsum('prqs,qs->pr', T, dm1)
         K_mat = jnp.einsum('pqrs,qs->pr', T, dm1)
         
         return J_mat - 0.5 * K_mat
+
 
     def get_3b_fock(self, jastrow_params, dm1):
         """Get 3-body Fock matrix correction (on-the-fly).
@@ -447,6 +446,8 @@ class ISDFTC(TC):
     pivots: jnp.ndarray = struct.field(default=None)
     phi_isdf: jnp.ndarray = struct.field(default=None)
     grad_phi_isdf: jnp.ndarray = struct.field(default=None)
+    # Cache for auxiliary potentials
+    _L_aux: Optional[jnp.ndarray] = struct.field(default=None, pytree_node=True)
 
     @classmethod
     def from_tc(cls, tc_obj, n_rank=None):
@@ -492,6 +493,71 @@ class ISDFTC(TC):
             grad_phi_isdf=grad_phi_isdf
         )
 
+    def _compute_L_aux(self, jastrow_params, batch_size=1000):
+        """Compute potential of auxiliary functions.
+        
+        L_mu(r) = sum_g w_g xi_mu(g) grad u(r, r_g)
+        
+        Returns:
+            L_aux: (N_aux, N_grid, 3)
+        """
+        N_grid = self.grid_points.shape[0]
+        N_aux = self.xi_rho.shape[0]
+        
+        # Weighted xi: (N_aux, N_grid)
+        w_xi = self.xi_rho * self.weights[None, :]
+        
+        # We want to compute for each mu, r: sum_g w_xi[mu, g] * grad(r, r_g)
+        # This is equivalent to:
+        # For a fixed r, grad(r, :) is (N_grid, 3).
+        # Result(mu, r) = dot(w_xi[mu, :], grad(r, :))
+        
+        # We scan over r (batches of r)
+        n_batches = (N_grid + batch_size - 1) // batch_size
+        
+        padded_size = n_batches * batch_size
+        padding = padded_size - N_grid
+        if padding > 0:
+            grid_padded = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+        else:
+            grid_padded = self.grid_points
+            
+        def scan_fn(carry, batch_idx):
+            start = batch_idx * batch_size
+            r_batch = jax.lax.dynamic_slice(grid_padded, (start, 0), (batch_size, 3))
+            
+            # Compute grad(r_batch, all_grid)
+            # This is (B, N_grid, 3)
+            # To avoid O(N_grid) memory in inner loop, we might need to chunk the inner loop too.
+            # But let's try chunking inner loop to be safe.
+            
+            def inner_scan(carry_inner, chunk_idx_inner):
+                start_inner = chunk_idx_inner * batch_size
+                # Handle padding for inner loop implicitly by using dynamic_slice on padded grid
+                # We need to pad w_xi as well if we do this.
+                # Let's just use the full grid for inner loop if it fits in memory?
+                # 1000 * 20000 * 3 * 8 ~ 480 MB. It fits.
+                # So we can compute grad(r_batch, all_grid) directly.
+                return carry_inner, None
+
+            # grad_r_batch computes gradients for all pairs in (r_batch, grid_points)
+            # shape: (batch_size, N_grid, 3)
+            grads = self.jastrow_factor.grad_r_batch(r_batch, self.grid_points, jastrow_params)
+            
+            # Contract: (B, G, 3) * (M, G) -> (M, B, 3)
+            # einsum 'bgc,mg->mbc'
+            k_chunk = jnp.einsum('bgc,mg->mbc', grads, w_xi)
+            
+            return carry, k_chunk
+            
+        _, K_all = jax.lax.scan(scan_fn, None, jnp.arange(n_batches))
+        
+        # K_all is (n_batches, N_aux, batch_size, 3)
+        # Reshape to (N_aux, N_grid, 3)
+        L_aux = K_all.transpose(1, 0, 2, 3).reshape(N_aux, -1, 3)[:, :N_grid, :]
+        
+        return L_aux
+
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF."""
         if block_str is not None or ranges is not None:
@@ -528,3 +594,43 @@ class ISDFTC(TC):
         result += result.transpose(2, 3, 0, 1)
         
         return -result
+
+    def get_3b_fock(self, jastrow_params, dm1, L_aux=None):
+        """Get 3-body Fock matrix correction using ISDF.
+        
+        Scaling: O(N_aux * N_grid) per SCF step (after precomputation).
+        
+        Args:
+            jastrow_params: Jastrow parameters
+            dm1: Density matrix
+            L_aux: Optional precomputed auxiliary potential (N_aux, N_grid, 3).
+                   If None, it will be computed on the fly.
+        """
+        # 1. Check cache / Compute L_aux
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params)
+        
+        # 2. Compute density at pivots
+        # rho(mu) = sum_pq D_pq phi_p(mu) phi_q(mu)
+        # phi_pivots = self.phi_isdf (N_orb, N_aux)
+        rho_pivots = jnp.einsum('ma,na,mn->a', self.phi_isdf, self.phi_isdf, dm1)
+        
+        # 3. Compute W on full grid using L_aux
+        # W(r) = sum_mu rho(mu) L_mu(r)
+        # L_aux: (N_aux, N_grid, 3)
+        # rho_pivots: (N_aux,)
+        W_g = jnp.einsum('a,agc->gc', rho_pivots, L_aux)
+        
+        # 4. Compute V_3b
+        V_3b_g = jnp.sum(W_g**2, axis=1)
+        
+        # 5. Integrate Fock matrix using ISDF
+        # F_mn = sum_mu (sum_g w_g xi_mu(g) V_3b(g)) phi_m(mu) phi_n(mu)
+        weighted_V = self.weights * V_3b_g
+        V_proj = jnp.dot(self.xi_rho, weighted_V) # (N_aux,)
+        
+        phi_pivots = self.phi_isdf # (N_orb, N_aux)
+        weighted_phi = phi_pivots * V_proj[None, :]
+        F_3b = jnp.dot(weighted_phi, phi_pivots.T)
+        
+        return F_3b
