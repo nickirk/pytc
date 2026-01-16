@@ -59,10 +59,12 @@ class TestTCBlock(unittest.TestCase):
         range_r = slice(0, 7)
         range_s = slice(1, 10)
         
-        block_2b = self.tc.get_2b(self.jastrow_params, ranges=(range_p, range_r, range_q, range_s))
+        # ranges are (p, q, r, s)
+        block_2b = self.tc.get_2b(self.jastrow_params, ranges=(range_p, range_q, range_r, range_s))
         full_2b = self.tc.get_2b(self.jastrow_params)
         
-        expected = full_2b[range_p, range_r, range_q, range_s]
+        # full_2b indices are (p, q, r, s)
+        expected = full_2b[range_p, range_q, range_r, range_s]
         
         np.testing.assert_allclose(block_2b, expected, atol=1e-8)
 

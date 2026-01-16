@@ -3,6 +3,8 @@
 from functools import partial
 from typing import Any, Optional
 import numpy as np
+import logging
+import time
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -12,7 +14,7 @@ from . import kmat as kmat_jax
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
     # Unpack ranges (p, q, r, s)
-    slice_p, slice_r, slice_q, slice_s = ranges
+    slice_p, slice_q, slice_r, slice_s = ranges
     
     # Helper to get size
     def get_size(s, size):
@@ -33,24 +35,24 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
         ranges=ranges,
         batch_size=batch_size
     )
-    k1 = k1_raw.reshape(Np, Nr, Nq, Ns)
+    k1 = k1_raw.reshape(Np, Nq, Nr, Ns)
     
-    # Compute K2 (nabla on r)
-    if slice_p == slice_r:
-        # If p and r ranges are identical, K2 is just K1 with p,r swapped
-        k2 = k1.swapaxes(0, 1)
+    # Compute K2 (nabla on q)
+    if slice_p == slice_q:
+        # If p and q ranges are identical, K2 is just K1 with p,q swapped
+        k2 = k1.transpose(1, 0, 2, 3)
     else:
-        # Must compute explicitly: swap p and r in ranges
-        ranges_k2 = (slice_r, slice_p, slice_q, slice_s)
+        # Must compute explicitly: swap p and q in ranges
+        ranges_k2 = (slice_q, slice_p, slice_r, slice_s)
         k2_raw = kmat_jax.calc_K1(
-            rho, nabla_rho,
+            phi, grad_phi,
             jastrow_factor, jastrow_params,
             grid, weights,
             ranges=ranges_k2,
             batch_size=batch_size
         )
-        # Result is (Nr, Np, Nq, Ns), transpose to (Np, Nr, Nq, Ns)
-        k2 = k2_raw.reshape(Nr, Np, Nq, Ns).transpose(1, 0, 2, 3)
+        # Result is (Nq, Np, Nr, Ns), transpose to (Np, Nq, Nr, Ns)
+        k2 = k2_raw.reshape(Nq, Np, Nr, Ns).transpose(1, 0, 2, 3)
         
     # Compute K3
     k3_raw = kmat_jax.calc_K3(
@@ -59,15 +61,9 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
         ranges=ranges,
         batch_size=batch_size
     )
-    k3 = k3_raw.reshape(Np, Nr, Nq, Ns)
+    k3 = k3_raw.reshape(Np, Nq, Nr, Ns)
     
     # Combine: 0.5 * (K1 - K2 + K3)
-    # Note: get_2b (full) logic:
-    # k_nabla = K1
-    # k_laplacian = -(K1 + K2)
-    # result = 0.5 * (k_laplacian + k_square) + k_nabla
-    #        = 0.5 * (-K1 - K2 + K3) + K1
-    #        = 0.5 * (K1 - K2 + K3)
     result_local = 0.5 * (k1 - k2 + k3)
     
     # Sum results across devices
@@ -154,10 +150,10 @@ class TC:
     def _get_block_ranges(self, block_str):
         """Parse block string into slice ranges.
         
-        block_str is expected to be in chemists' notation (p, r, q, s),
-        where p, r share coordinate 1 and q, s share coordinate 2.
+        block_str is expected to be in chemists' notation (p, q, r, s),
+        where p, q share coordinate 1 and r, s share coordinate 2.
         
-        Returns ranges in the order (p, r, q, s) expected by calc_K1.
+        Returns ranges in the order (p, q, r, s) expected by calc_K1.
         """
         if self.nocc is None:
             raise ValueError("nocc must be set to use block_str")
@@ -173,22 +169,22 @@ class TC:
             else:
                 raise ValueError(f"Invalid block character: {char}")
         
-        # block_str indices: 0->p, 1->r, 2->q, 3->s
+        # block_str indices: 0->p, 1->q, 2->r, 3->s
         # calc_K1 expects: (p, q, r, s)
         if len(ranges_list) == 4:
             p = ranges_list[0]
-            r = ranges_list[1]
-            q = ranges_list[2]
+            q = ranges_list[1]
+            r = ranges_list[2]
             s = ranges_list[3]
         elif len(ranges_list) == 2:
             p = ranges_list[0]
-            r = ranges_list[1]
-            q = ranges_list[0]
+            q = ranges_list[1]
+            r = ranges_list[0]
             s = ranges_list[1]
         else:
             raise ValueError("block_str must have 2 or 4 characters")
         
-        return (p, r, q, s)
+        return (p, q, r, s)
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
@@ -203,6 +199,8 @@ class TC:
                          If block_str/ranges is provided, returns the raw block (Np, Nr, Nq, Ns).
                          Otherwise, returns the full symmetrized correction (N, N, N, N).
         """
+        start_time = time.perf_counter()
+        logging.debug("Starting TC.get_2b")
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         n_devices = jax.local_device_count()
@@ -254,15 +252,15 @@ class TC:
         )
         result = result_sum[0]
         
-        # Add transpose block: (q, s, p, r)
+        # Add transpose block: (r, s, p, q)
         # Check if ranges imply symmetry
-        slice_p, slice_r, slice_q, slice_s = ranges
+        slice_p, slice_q, slice_r, slice_s = ranges
         
-        if slice_p == slice_q and slice_r == slice_s:
+        if slice_p == slice_r and slice_q == slice_s:
             # Symmetric block (e.g. 'oooo'), just add transpose of result
             result += result.transpose(2, 3, 0, 1)
         else:
-            ranges_T = (slice_q, slice_s, slice_p, slice_r)
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
             
             result_sum_T = pmapped_compute(
                 sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
@@ -272,6 +270,8 @@ class TC:
             
             result += result_T.transpose(2, 3, 0, 1)
         
+        total_time = time.perf_counter() - start_time
+        logging.debug(f"TC.get_2b completed in {total_time:.4f} s")
         return -result
 
     def get_1b_fock(self, jastrow_params, dm1=None):
@@ -291,8 +291,11 @@ class TC:
             T = k_2b
             
         # Coulomb-like contribution
-        J_mat = jnp.einsum('prqs,qs->pr', T, dm1)
-        K_mat = jnp.einsum('pqrs,qs->pr', T, dm1)
+        # \sum_{r,s} T_{pqrs} P_{rs}
+        J_mat = jnp.einsum('pqrs,rs->pq', T, dm1)
+        # Exchange-like contribution
+        # \sum_{r,s} T_{psrq} P_{rs}
+        K_mat = jnp.einsum('psrq,rs->pq', T, dm1)
         
         return J_mat - 0.5 * K_mat
 
@@ -468,13 +471,9 @@ class ISDFTC(TC):
         # Perform ISDF decomposition
         # We use the same rank for both phi and grad for simplicity, 
         # matching the numpy implementation default behavior
-        _, xi_rho, _, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_rho, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights
         )
-        
-        # Extract phi_isdf and grad_phi_isdf using pivots
-        phi_isdf = tc_obj.phi[:, pivots]
-        grad_phi_isdf = tc_obj.grad_phi[:, pivots, :]
         
         return cls(
             grid_points=tc_obj.grid_points,
@@ -558,41 +557,172 @@ class ISDFTC(TC):
         
         return L_aux
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
-        """Calculate TC correction terms using ISDF."""
-        if block_str is not None or ranges is not None:
-            raise NotImplementedError("Block calculation not implemented for ISDFTC yet.")
-            
-        # Use ISDF method
-        k_nabla = kmat_jax.calc_K1_isdf(
-            self.phi_isdf,
-            self.xi_rho,
-            self.grad_phi_isdf,
-            self.xi_grad,
-            self.jastrow_factor,
-            jastrow_params,
-            self.grid_points,
-            self.weights,
-            batch_size=batch_size
-        )
-        # k_laplacian = -(k_nabla + k_nabla^T)
-        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
+    def _compute_2b_isdf_shard(self, phi, grad_phi, grid_shard, weights_shard, xi_phi_shard, 
+                               full_grid, full_weights, xi_grad_full, xi_phi_full, 
+                               jastrow_params, ranges, batch_size):
+        """Compute ISDF K terms for a grid shard (pmapped)."""
         
-        k_square = kmat_jax.calc_K3_isdf(
-            self.phi_isdf,
-            self.xi_rho,
+        # Compute K1 (nabla on p)
+        # r1 is full grid, r2 is shard
+        k_nabla = kmat_jax.calc_K1_isdf(
+            phi,
+            xi_phi_shard,
+            grad_phi,
+            xi_grad_full,
             self.jastrow_factor,
             jastrow_params,
-            self.grid_points,
-            self.weights,
+            full_grid,
+            full_weights,
+            grid_shard,
+            weights_shard,
+            ranges=ranges,
             batch_size=batch_size
         )
+        
+        # Compute K3
+        k_square = kmat_jax.calc_K3_isdf(
+            phi,
+            xi_phi_full,
+            xi_phi_shard,
+            self.jastrow_factor,
+            jastrow_params,
+            full_grid,
+            full_weights,
+            grid_shard,
+            weights_shard,
+            ranges=ranges,
+            batch_size=batch_size
+        )
+        
+        # k_laplacian = -(k_nabla + k_nabla^T)
+        # Check if ranges imply symmetry for K2
+        slice_p, slice_q, slice_r, slice_s = ranges
+        if slice_p == slice_q:
+            k_laplacian = -(k_nabla + k_nabla.transpose(1, 0, 2, 3))
+        else:
+            # Must compute explicitly: swap p and q in ranges
+            ranges_k2 = (slice_q, slice_p, slice_r, slice_s)
+            k_nabla_k2 = kmat_jax.calc_K1_isdf(
+                phi,
+                xi_phi_shard,
+                grad_phi,
+                xi_grad_full,
+                self.jastrow_factor,
+                jastrow_params,
+                full_grid,
+                full_weights,
+                grid_shard,
+                weights_shard,
+                ranges=ranges_k2,
+                batch_size=batch_size
+            )
+            # k_nabla_k2 is (Nq, Np, Nr, Ns), transpose to (Np, Nq, Nr, Ns)
+            k_laplacian = -(k_nabla + k_nabla_k2.transpose(1, 0, 2, 3))
         
         # Combine results
-        result = 0.5 * (k_laplacian + k_square)
-        result += k_nabla
-        result += result.transpose(2, 3, 0, 1)
+        result_local = 0.5 * (k_laplacian + k_square) + k_nabla
         
+        # Sum results across devices
+        result_sum = jax.lax.psum(result_local, axis_name='devices')
+        
+        return result_sum
+
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
+        """Calculate TC correction terms using ISDF with multi-GPU support."""
+        start_time = time.perf_counter()
+        logging.debug("Starting ISDFTC.get_2b")
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
+            
+        n_devices = jax.local_device_count()
+        n_grid = self.grid_points.shape[0]
+        
+        # Pad grid to be divisible by n_devices
+        remainder = n_grid % n_devices
+        if remainder != 0:
+            padding = n_devices - remainder
+            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+            padded_weights = jnp.pad(self.weights, ((0, padding),))
+            padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padding)))
+        else:
+            padded_grid_points = self.grid_points
+            padded_weights = self.weights
+            padded_xi_rho = self.xi_rho
+            
+        n_grid_padded = padded_grid_points.shape[0]
+        n_per_device = n_grid_padded // n_devices
+        
+        # Shard arrays: (n_devices, n_per_device, ...)
+        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
+        sharded_weights = padded_weights.reshape(n_devices, n_per_device)
+        # xi_rho: (N_rank, N) -> (N_rank, n_dev, N_per) -> (n_dev, N_rank, N_per)
+        sharded_xi_rho = padded_xi_rho.reshape(self.xi_rho.shape[0], n_devices, n_per_device).transpose(1, 0, 2)
+        
+        # Full arrays (replicated)
+        full_grid = self.grid_points
+        full_weights = self.weights
+        xi_grad_full = self.xi_grad
+        xi_phi_full = self.xi_rho
+        
+        # Execute pmap
+        pmapped_compute = jax.pmap(
+            self._compute_2b_isdf_shard, 
+            axis_name='devices',
+            in_axes=(None, None, 0, 0, 0, None, None, None, None, None, None, None),
+            static_broadcasted_argnums=(10, 11)
+        )
+        
+        if ranges is None:
+            full_slice = slice(None)
+            ranges = (full_slice, full_slice, full_slice, full_slice)
+
+        result_sum = pmapped_compute(
+            self.phi_isdf, 
+            self.grad_phi_isdf, 
+            sharded_grid, 
+            sharded_weights, 
+            sharded_xi_rho,
+            full_grid,
+            full_weights,
+            xi_grad_full,
+            xi_phi_full,
+            jastrow_params,
+            ranges,
+            batch_size
+        )
+        
+        result = result_sum[0]
+        
+        # Add transpose block: (r, s, p, q)
+        # Check if ranges imply symmetry
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+        if slice_p == slice_r and slice_q == slice_s:
+            # Symmetric block (e.g. 'oooo'), just add transpose of result
+            result += result.transpose(2, 3, 0, 1)
+        else:
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            
+            result_sum_T = pmapped_compute(
+                self.phi_isdf, 
+                self.grad_phi_isdf, 
+                sharded_grid, 
+                sharded_weights, 
+                sharded_xi_rho,
+                full_grid,
+                full_weights,
+                xi_grad_full,
+                xi_phi_full,
+                jastrow_params,
+                ranges_T,
+                batch_size
+            )
+            result_T = result_sum_T[0]
+            
+            result += result_T.transpose(2, 3, 0, 1)
+        
+        total_time = time.perf_counter() - start_time
+        logging.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
         return -result
 
     def get_3b_fock(self, jastrow_params, dm1, L_aux=None):

@@ -1,12 +1,13 @@
 """JAX implementation of X transcorrelated methods."""
 
 from functools import partial, reduce
-from typing import Any, Optional
 import numpy as np
+import logging
+import time
 import jax
 import jax.numpy as jnp
 from flax import struct
-from .tc import TC
+from .tc import TC, ISDFTC
 from . import tc_helper
 from . import kmat as kmat_jax
 
@@ -257,6 +258,8 @@ class XTC(TC):
                      If ranges provided: (Np, Nr, Nq, Ns)
                      Otherwise: (N, N, N, N)
         """
+        start_time = time.perf_counter()
+        logging.debug("Starting XTC.get_delta_U")
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
@@ -296,7 +299,7 @@ class XTC(TC):
             full_slice = slice(None)
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
-        slice_p, slice_r, slice_q, slice_s = ranges
+        slice_p, slice_q, slice_r, slice_s = ranges
         slice_occ = slice(0, self.nocc) if self.nocc is not None else slice(None)
         
         # Slice n_occ_vec to match slice_occ
@@ -353,23 +356,23 @@ class XTC(TC):
                 V_occ_occ = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                               slice_occ, slice_occ, batch_size)
                 
-                # 2. V_pr
-                V_pr = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
-                                         slice_p, slice_r, batch_size)
+                # 2. V_pq
+                V_pq = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
+                                         slice_p, slice_q, batch_size)
                 
-                # 3. V_qs
-                V_qs = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
-                                         slice_q, slice_s, batch_size)
+                # 3. V_rs
+                V_rs = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
+                                         slice_r, slice_s, batch_size)
                 
                 # 4. V_occ_blocks
-                # We need V_{k,p}, V_{k,r}, V_{k,q}, V_{k,s} where k in occ
+                # We need V_{k,p}, V_{k,q}, V_{k,r}, V_{k,s} where k in occ
                 # We can compute V_{occ, p} etc.
                 V_occ_p = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                             slice_occ, slice_p, batch_size)
-                V_occ_r = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
-                                            slice_occ, slice_r, batch_size)
                 V_occ_q = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                             slice_occ, slice_q, batch_size)
+                V_occ_r = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
+                                            slice_occ, slice_r, batch_size)
                 V_occ_s = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                             slice_occ, slice_s, batch_size)
                 
@@ -391,91 +394,89 @@ class XTC(TC):
                 # Wbar: (batch,)
                 Wbar = 2 * jnp.einsum('i,ib->b', n_occ_vec_active, phi_kk)
                 
-                # --- Block (q, s) Terms ---
+                # --- Block (p, q) Terms ---
+                # V_{pk} = V_{kp} = V_occ_p (Nocc, Np, batch, 3)
+                # V_{qk} = V_{kq} = V_occ_q (Nocc, Nq, batch, 3)
+                # Zbar_{pq}: (Np, Nq, batch)
+                Zbar_pq = jnp.einsum('i,ipbd,iqbd->pqb', n_occ_vec_active, V_occ_p, V_occ_q)
                 
-                # Zbar_{qs} = sum_k V_{kq} V_{sk} n_k
-                # V_{kq} = V_{qk} = V_occ_q (Nocc, Nq, batch, 3)
-                # V_{sk} = V_{ks} = V_occ_s (Nocc, Ns, batch, 3)
-                # Zbar_{qs}: (Nq, Ns, batch)
-                Zbar_qs = jnp.einsum('i,iqbd,isbd->qsb', n_occ_vec_active, V_occ_q, V_occ_s)
-                
-                # G_{qs} = sum_k (phi_{kq} V_{sk} + phi_{ks} V_{qk}) n_k
-                # phi_{kq} = phi_k * phi_q
+                # G_{pq} = sum_k (phi_{kp} V_{qk} + phi_{kq} V_{pk}) n_k
+                # phi_{kp} = phi_k * phi_p
+                phi_p = phi_batch[slice_p] # (Np, batch)
                 phi_q = phi_batch[slice_q] # (Nq, batch)
-                phi_s = phi_batch[slice_s] # (Ns, batch)
-                # phi_{kq}: (Nocc, Nq, batch)
+                # phi_{kp}: (Nocc, Np, batch)
+                phi_kp = jnp.einsum('ib,pb->ipb', phi_occ, phi_p)
                 phi_kq = jnp.einsum('ib,qb->iqb', phi_occ, phi_q)
+                
+                # G_{pq}: (Np, Nq, batch, 3)
+                G_pq = jnp.einsum('i,ipb,iqbd->pqbd', n_occ_vec_active, phi_kp, V_occ_q) + \
+                       jnp.einsum('i,iqb,ipbd->pqbd', n_occ_vec_active, phi_kq, V_occ_p)
+                       
+                # Vbar_{pq} = sum_d W_d * V_{pq,d}
+                Vbar_pq = jnp.einsum('bd,pqbd->pqb', W, V_pq)
+                A_pq = Vbar_pq - Zbar_pq # (Np, Nq, batch)
+                
+                # B_{pq} = 0.5 * Wbar * V_{pq} - G_{pq}
+                # B_{pq}: (Np, Nq, batch, 3)
+                B_pq = 0.5 * Wbar[None, None, :, None] * V_pq - G_pq
+                
+                # --- Block (r, s) Terms ---
+                # Symmetric to (p, q)
+                
+                # Zbar_{rs}
+                Zbar_rs = jnp.einsum('i,irbd,isbd->rsb', n_occ_vec_active, V_occ_r, V_occ_s)
+                
+                # G_{rs}
+                phi_r = phi_batch[slice_r]
+                phi_s = phi_batch[slice_s]
+                phi_kr = jnp.einsum('ib,rb->irb', phi_occ, phi_r)
                 phi_ks = jnp.einsum('ib,sb->isb', phi_occ, phi_s)
                 
-                # G_{qs}: (Nq, Ns, batch, 3)
-                G_qs = jnp.einsum('i,iqb,isbd->qsbd', n_occ_vec_active, phi_kq, V_occ_s) + \
-                       jnp.einsum('i,isb,iqbd->qsbd', n_occ_vec_active, phi_ks, V_occ_q)
+                G_rs = jnp.einsum('i,irb,isbd->rsbd', n_occ_vec_active, phi_kr, V_occ_s) + \
+                       jnp.einsum('i,isb,irbd->rsbd', n_occ_vec_active, phi_ks, V_occ_r)
                        
-                # Vbar_{qs} = sum_d W_d * V_{qs,d}
-                Vbar_qs = jnp.einsum('bd,qsbd->qsb', W, V_qs)
-                A_qs = Vbar_qs - Zbar_qs # (Nq, Ns, batch)
+                # A_{rs}
+                Vbar_rs = jnp.einsum('bd,rsbd->rsb', W, V_rs)
+                A_rs = Vbar_rs - Zbar_rs
                 
-                # B_{qs} = 0.5 * Wbar * V_{qs} - G_{qs}
-                # B_{qs}: (Nq, Ns, batch, 3)
-                B_qs = 0.5 * Wbar[None, None, :, None] * V_qs - G_qs
-                
-                # --- Block (p, r) Terms ---
-                # Symmetric to (q, s)
-                
-                # Zbar_{pr}
-                Zbar_pr = jnp.einsum('i,ipbd,irbd->prb', n_occ_vec_active, V_occ_p, V_occ_r)
-                
-                # G_{pr}
-                phi_p = phi_batch[slice_p]
-                phi_r = phi_batch[slice_r]
-                phi_kp = jnp.einsum('ib,pb->ipb', phi_occ, phi_p)
-                phi_kr = jnp.einsum('ib,rb->irb', phi_occ, phi_r)
-                
-                G_pr = jnp.einsum('i,ipb,irbd->prbd', n_occ_vec_active, phi_kp, V_occ_r) + \
-                       jnp.einsum('i,irb,ipbd->prbd', n_occ_vec_active, phi_kr, V_occ_p)
-                       
-                # A_{pr}
-                Vbar_pr = jnp.einsum('bd,prbd->prb', W, V_pr)
-                A_pr = Vbar_pr - Zbar_pr
-                
-                # B_{pr}
-                B_pr = 0.5 * Wbar[None, None, :, None] * V_pr - G_pr
+                # B_{rs}
+                B_rs = 0.5 * Wbar[None, None, :, None] * V_rs - G_rs
                 
                 # --- Combine Terms ---
                 
-                # term1 = phi_{pr} * A_{qs}
-                # phi_{pr} = phi_p * phi_r
-                phi_pr = jnp.einsum('pb,rb->prb', phi_p, phi_r)
-                # Weighted phi_pr for integration
-                phi_pr_w = phi_pr * w_batch[None, None, :]
+                # term1 = phi_{pq} * A_{rs}
+                # phi_{pq} = phi_p * phi_q
+                phi_pq = jnp.einsum('pb,qb->pqb', phi_p, phi_q)
+                # Weighted phi_pq for integration
+                phi_pq_w = phi_pq * w_batch[None, None, :]
                 
-                # term1: (Np, Nr, Nq, Ns)
-                # einsum: prb, qsb -> prqs (sum over b)
-                term1 = jnp.einsum('prb,qsb->prqs', phi_pr_w, A_qs)
+                # term1: (Np, Nq, Nr, Ns)
+                # einsum: pqb, rsb -> pqrs (sum over b)
+                term1 = jnp.einsum('pqb,rsb->pqrs', phi_pq_w, A_rs)
                 
-                # term2 = V_{pr} * B_{qs}
-                # V_{pr}: (Np, Nr, batch, 3)
-                # B_{qs}: (Nq, Ns, batch, 3)
-                # term2: (Np, Nr, Nq, Ns)
-                # We can weight V_pr
-                V_pr_w = V_pr * w_batch[None, None, :, None]
-                term2 = jnp.einsum('prbd,qsbd->prqs', V_pr_w, B_qs)
+                # term2 = V_{pq} * B_{rs}
+                # V_{pq}: (Np, Nq, batch, 3)
+                # B_{rs}: (Nr, Ns, batch, 3)
+                # term2: (Np, Nq, Nr, Ns)
+                # We can weight V_pq
+                V_pq_w = V_pq * w_batch[None, None, :, None]
+                term2 = jnp.einsum('pqbd,rsbd->pqrs', V_pq_w, B_rs)
                 
-                # term1_sym = phi_{qs} * A_{pr}
-                phi_qs = jnp.einsum('qb,sb->qsb', phi_q, phi_s)
-                phi_qs_w = phi_qs * w_batch[None, None, :]
-                term1_sym = jnp.einsum('qsb,prb->prqs', phi_qs_w, A_pr)
+                # term1_sym = phi_{rs} * A_{pq}
+                phi_rs = jnp.einsum('rb,sb->rsb', phi_r, phi_s)
+                phi_rs_w = phi_rs * w_batch[None, None, :]
+                term1_sym = jnp.einsum('rsb,pqb->pqrs', phi_rs_w, A_pq)
                 
-                # term2_sym = V_{qs} * B_{pr}
-                V_qs_w = V_qs * w_batch[None, None, :, None]
-                term2_sym = jnp.einsum('qsbd,prbd->prqs', V_qs_w, B_pr)
+                # term2_sym = V_{rs} * B_{pq}
+                V_rs_w = V_rs * w_batch[None, None, :, None]
+                term2_sym = jnp.einsum('rsbd,pqbd->pqrs', V_rs_w, B_pq)
                 
                 # Total for this batch
                 contrib = term1 + term2 + term1_sym + term2_sym
                 
                 return carry + contrib, None
 
-            init_val = jnp.zeros((Np, Nr, Nq, Ns))
+            init_val = jnp.zeros((Np, Nq, Nr, Ns))
             
             local_delta_U, _ = jax.lax.scan(scan_body, init_val, (r1_batches, weights_batches, phi_batches.transpose(1, 0, 2)))
             
@@ -490,6 +491,8 @@ class XTC(TC):
         
         total_delta_U = delta_U_replicated[0]
         
+        total_time = time.perf_counter() - start_time
+        logging.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
         return -total_delta_U
 
     def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -504,24 +507,27 @@ class XTC(TC):
             # Default to full matrix if no ranges specified
             ranges = (slice(None), slice(None), slice(None), slice(None))
             
-        slice_p, slice_r, slice_q, slice_s = ranges
+        slice_p, slice_q, slice_r, slice_s = ranges
         
         slice_occ = slice(0, self.nocc)
         
-        ranges_term1 = (slice_p, slice_r, slice_occ,  slice_occ)
-        delta_U_1 = self.get_delta_U(jastrow_params, dm1, ranges=ranges_term1, batch_size=batch_size)
-        # delta_U_1 shape: (Nq, Np, Nocc, Nocc)
+        # (pq|rs) term
+        ranges_pqrs = (slice_p, slice_q, slice_occ, slice_occ)
+        delta_U_pqrs = self.get_delta_U(jastrow_params, dm1, ranges=ranges_pqrs, batch_size=batch_size)
+        # delta_U_pqrs shape: (Np, Nq, Nocc, Nocc)
         
         dm1_diag = jnp.diagonal(dm1)[slice_occ] # (Nocc,)
         
-        # einsum: qprr, r -> qp
-        term1 = 2 * jnp.einsum('proo,o->pr', delta_U_1, dm1_diag)
+        # (pq|rs) * dm_rs -> (pq|oo) * dm_oo -> (pq)
+        term1 = 2 * jnp.einsum('pqoo,o->pq', delta_U_pqrs, dm1_diag)
         
-        ranges_term2 = (slice_occ, slice_p, slice_r, slice_occ)
-        delta_U_2 = self.get_delta_U(jastrow_params, dm1, ranges=ranges_term2, batch_size=batch_size)
-        # delta_U_2 shape: (Nocc, Np, Nq, Nocc)
+        # (ps|rq) term
+        ranges_psrq = (slice_p, slice_occ, slice_occ, slice_q)
+        delta_U_psrq = self.get_delta_U(jastrow_params, dm1, ranges=ranges_psrq, batch_size=batch_size)
+        # delta_U_psrq shape: (Np, Nocc, Nocc, Nq)
         
-        term2 = jnp.einsum('opro,o->pr', delta_U_2, dm1_diag)
+        # (ps|rq) * dm_sr -> (po|oq) * dm_oo -> (pq)
+        term2 = jnp.einsum('pooq,o->pq', delta_U_psrq, dm1_diag)
         
         delta_h = -0.5 * (term1 - term2)
         return delta_h
@@ -534,6 +540,8 @@ class XTC(TC):
     @partial(jax.jit, static_argnames=('block_str', 'ranges', 'batch_size'))
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
+        start_time = time.perf_counter()
+        logging.debug("Starting XTC.get_2b")
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -544,6 +552,8 @@ class XTC(TC):
         
         delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         
+        total_time = time.perf_counter() - start_time
+        logging.debug(f"XTC.get_2b completed in {total_time:.4f} s")
         return tc_correction + delta_U
 
     @jax.jit
@@ -633,21 +643,17 @@ class XTC(TC):
 
 
 @struct.dataclass
-class ISDFXTC(XTC):
+class ISDFXTC(XTC, ISDFTC):
     """JAX implementation of extended transcorrelated methods using ISDF.
     
     Attributes:
         xi_rho: ISDF coefficients for density (N_fused, N_grid)
         xi_grad: ISDF coefficients for gradients (N_fused, N_grid, 3)
         pivots: ISDF pivot indices (N_fused,)
-        phi: ISDF basis for density (Nb, N_fused)
-        grad_phi: ISDF basis for gradients (Nb, N_fused, 3)
+        phi_isdf: ISDF basis for density (Nb, N_fused)
+        grad_phi_isdf: ISDF basis for gradients (Nb, N_fused, 3)
     """
-    xi_rho: jnp.ndarray = struct.field(default=None)
-    xi_grad: jnp.ndarray = struct.field(default=None)
-    pivots: jnp.ndarray = struct.field(default=None)
-    phi_isdf: jnp.ndarray = struct.field(default=None)
-    grad_phi_isdf: jnp.ndarray = struct.field(default=None)
+    # Fields are inherited from ISDFTC
 
     @classmethod
     def from_xtc(cls, xtc_obj, n_rank=None):
@@ -658,13 +664,9 @@ class ISDFXTC(XTC):
             n_rank = xtc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        _, xi_rho, _, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_rho, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights
         )
-        
-        # Extract phi_isdf and grad_phi_isdf using pivots
-        phi_isdf = xtc_obj.phi[:, pivots]
-        grad_phi_isdf = xtc_obj.grad_phi[:, pivots, :]
         
         return cls(
             grid_points=xtc_obj.grid_points,
@@ -685,10 +687,43 @@ class ISDFXTC(XTC):
             grad_phi_isdf=grad_phi_isdf
         )
 
-    def get_delta_U(self, jastrow_params, dm1=None, batch_size=1000):
+    def get_delta_U(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Get delta_U matrix using ISDF with pmap support."""
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
+            
+        if ranges is None:
+            full_slice = slice(None)
+            ranges = (full_slice, full_slice, full_slice, full_slice)
+            
+        start_time = time.perf_counter()
+        logging.debug("Starting ISDFXTC.get_delta_U")
+        
+        # Call the raw computation function
+        result = self._get_delta_U_raw(jastrow_params, dm1, ranges, batch_size)
+        
+        # Symmetrize the result
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+        # If the block is (pq|rs) and (rs|pq) is the same block, then we just add the transpose.
+        # Otherwise, we need to compute the (rs|pq) block explicitly and add it.
+        if slice_p == slice_r and slice_q == slice_s:
+            # Symmetric block (e.g. 'oooo'), just add transpose of result
+            final_result = -(result + result.transpose(2, 3, 0, 1))
+        else:
+            # Non-symmetric block, need to compute the transpose block
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            result_T = self._get_delta_U_raw(jastrow_params, dm1, ranges_T, batch_size)
+            final_result = -(result + result_T.transpose(2, 3, 0, 1))
+
+        total_time = time.perf_counter() - start_time
+        logging.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        return final_result
+
+    def _get_delta_U_raw(self, jastrow_params, dm1, ranges, batch_size):
+        """Internal method to get raw delta_U before symmetrization."""
         n_devices = jax.local_device_count()
-        n_grid = self.n_grid
+        n_grid = self.grid_points.shape[0]
         
         if dm1 is None:
             dm1 = self._get_mf_dm()
@@ -726,7 +761,7 @@ class ISDFXTC(XTC):
         def compute_on_device(grid_shard, weights_shard, xi_shard, jastrow_params):
             return self._calc_delta_U_isdf_shard(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, 
-                full_grid, full_weights, full_xi_rho, Gb, self.phi_isdf, batch_size
+                full_grid, full_weights, full_xi_rho, Gb, self.phi_isdf, ranges, batch_size
             )
 
         # Execute pmap
@@ -742,39 +777,59 @@ class ISDFXTC(XTC):
         Q3 = jnp.sum(Q3_rep, axis=0)
         
         # Reconstruct Terms
+        slice_p, slice_q, slice_r, slice_s = ranges
+        phi_p = self.phi_isdf[slice_p]
+        phi_q = self.phi_isdf[slice_q]
+        phi_r = self.phi_isdf[slice_r]
+        phi_s = self.phi_isdf[slice_s]
+
         # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
-        c_phi = jnp.einsum('pa,qa->pqa', self.phi_isdf, self.phi_isdf)
+        c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
+        c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
         
-        term1 = 2 * jnp.einsum('pqa,ad,rsd->pqrs', c_phi, X1, c_phi)
-        term2 = -jnp.einsum('pqa,rsa->pqrs', c_phi, Q)
-        term3 = -jnp.einsum('pqa,rsa->pqrs', c_phi, Q3)
-        term4 = jnp.einsum('pqa,rsc,ac->pqrs', c_phi, c_phi, X)
+        term1 = 2 * jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, X1, c_phi_rs)
+        term2 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, Q)
+        term3 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, Q3)
+        term4 = jnp.einsum('pqa,rsc,ac->pqrs', c_phi_pq, c_phi_rs, X)
         
         result = term1 + term2 + term3 + term4
         
-        # Symmetrize
-        return -(result + result.transpose(2, 3, 0, 1))
+        return result
 
     def _calc_delta_U_isdf_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, 
-                                 full_grid, full_weights, full_xi_rho, Gb, phi, batch_size=1000):
+                                 full_grid, full_weights, full_xi_rho, Gb, phi, ranges, batch_size=1000):
         """Calculate ΔU contribution for a shard of grid points."""
         Nb = self.n_orb
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
         
+        slice_p, slice_q, slice_r, slice_s = ranges
+        phi_p = phi[slice_p]
+        phi_q = phi[slice_q]
+        phi_r = phi[slice_r]
+        phi_s = phi[slice_s]
+
+        Np = phi_p.shape[0]
+        Nq = phi_q.shape[0]
+        Nr = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+
         # Reconstruct C_phi from phi
         # C_{rub} = phi_{r,b} phi_{u,b}
-        c_phi = jnp.einsum('rb,ub->rub', phi, phi)
+        # For Term 2 & 3, we need C_phi for (r, u) where r is from slice_r and u is full
+        c_phi_ru = jnp.einsum('rb,ub->rub', phi_r, phi)
         
         # Pre-compute L for Terms 2 & 3
         # L_{usc} = sum_t dm1_{ut} C_{tsc}
-        L = jnp.einsum('tu,tsc->usc', dm1, c_phi)
+        # For Term 2 & 3, we need L for (u, s) where u is full and s is from slice_s
+        c_phi_us = jnp.einsum('ub,sb->usb', phi, phi_s)
+        L = jnp.einsum('tu,tsc->usc', dm1, c_phi_us)
         
         # Initialize accumulators
         X_acc = jnp.zeros((N_rank, N_rank))
         X1_acc = jnp.zeros((N_rank, N_rank))
-        Q_acc = jnp.zeros((Nb, Nb, N_rank))
-        Q3_acc = jnp.zeros((Nb, Nb, N_rank))
+        Q_acc = jnp.zeros((Nr, Ns, N_rank))
+        Q3_acc = jnp.zeros((Nr, Ns, N_rank))
         
         # Prepare batches for the SHARD
         padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
@@ -798,8 +853,21 @@ class ISDFXTC(XTC):
             
             # --- Term 4 (Easy Term) ---
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
-            P = jnp.einsum('aik,cik->aci', G, G)
-            X_update = jnp.einsum('i,aci->ac', w_tilde, P)
+            
+            # OPTIMIZATION: Avoid forming P = jnp.einsum('aik,cik->aci', G, G) which is (N_rank, N_rank, batch)
+            # P_{aci} = \sum_k G_{aik} G_{cik}
+            # X_update_{ac} = \sum_i w_tilde_i P_{aci}
+            #               = \sum_{i,k} w_tilde_i G_{aik} G_{cik}
+            #               = \sum_{i,k} (w_tilde_i * G_{aik}) * G_{cik}
+            
+            # Flatten G to (N_rank, batch * 3)
+            G_flat = G.reshape(N_rank, -1)
+            # Create weighted G: (N_rank, batch, 3)
+            G_weighted = G * w_tilde[None, :, None]
+            G_weighted_flat = G_weighted.reshape(N_rank, -1)
+            
+            # X_update = G_weighted_flat @ G_flat.T
+            X_update = jnp.dot(G_weighted_flat, G_flat.T)
             
             # --- Term 1 (Easy Term) ---
             H = jnp.einsum('b,bik->ik', Gb, G)
@@ -811,7 +879,7 @@ class ISDFXTC(XTC):
             Y = jnp.einsum('usc,cik->usik', L, G)
             
             # Z_{ruk}(i) = \sum_b C_{rub} G_{bk}(i)
-            Z = jnp.einsum('rub,bik->ruik', c_phi, G)
+            Z = jnp.einsum('rub,bik->ruik', c_phi_ru, G)
             
             # Q_{rsa} += \sum_i w_i \xi_a(i) \sum_{uk} Y_{usk}(i) Z_{ruk}(i)
             YZ = jnp.einsum('usik,ruik->rsi', Y, Z)
@@ -829,7 +897,7 @@ class ISDFXTC(XTC):
             
             # Part 2: Q3_2
             # C_tilde_{rui} = sum_b C_{rub} xi_b(i)
-            C_tilde = jnp.einsum('rub,bi->rui', c_phi, xi_batch)
+            C_tilde = jnp.einsum('rub,bi->rui', c_phi_ru, xi_batch)
             
             # N_{rski} = sum_u Y_{usik} C_tilde_{rui}
             N_tensor = jnp.einsum('usik,rui->rski', Y, C_tilde)
@@ -841,30 +909,4 @@ class ISDFXTC(XTC):
         final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches))
         
         return final_accumulators
-
-    def get_2b(self, jastrow_params, dm1=None):
-        """Compute two-body integrals correction using ISDF."""
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-            
-        k_nabla = kmat_jax.calc_K1_isdf(
-            self.phi_isdf, self.xi_rho, self.grad_phi_isdf, self.xi_grad,
-            self.jastrow_factor, jastrow_params, self.grid_points, self.weights
-        )
-        k_laplacian = -(k_nabla + k_nabla.swapaxes(0, 1))
-        
-        k_square = kmat_jax.calc_K3_isdf(
-            self.phi_isdf, self.xi_rho,
-            self.jastrow_factor, jastrow_params, self.grid_points, self.weights
-        )
-        
-        k_square = k_square.reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
-        tc_correction = 0.5 * (k_laplacian + k_square) + k_nabla
-        tc_correction += tc_correction.transpose(2, 3, 0, 1)
-        tc_correction = -tc_correction
-        
-        # Add delta_U
-        delta_U = self.get_delta_U(jastrow_params, dm1)
-        
-        return tc_correction + delta_U
+    
