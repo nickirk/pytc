@@ -585,7 +585,7 @@ class ISDFTC(TC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
         
-        def compute_on_device(grid_shard, jastrow_params):
+        def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_rho):
             # grid_shard: (N_shard, 3)
             N_shard = grid_shard.shape[0]
             
@@ -617,10 +617,10 @@ class ISDFTC(TC):
             G_shard = G_batches.transpose(1, 0, 2, 3).reshape(full_xi_rho.shape[0], -1, 3)
             return G_shard[:, :N_shard, :]
 
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None))
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
         
         # G_shards: (n_devices, N_rank, n_per_device, 3)
-        G_shards = pmapped_compute(sharded_grid, jastrow_params)
+        G_shards = pmapped_compute(sharded_grid, jastrow_params, full_grid, full_weights, full_xi_rho)
         
         # Combine shards: (N_rank, N_grid_padded, 3)
         G_padded = G_shards.transpose(1, 0, 2, 3).reshape(full_xi_rho.shape[0], -1, 3)

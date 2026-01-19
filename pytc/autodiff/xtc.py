@@ -773,16 +773,16 @@ class ISDFXTC(XTC, ISDFTC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
 
-        def compute_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params):
+        def compute_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb):
             return self._calc_delta_U_kernels_shard(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                full_grid, full_weights, full_xi_rho, Gb, self.phi_isdf, ranges, batch_size
+                Gb, self.phi_isdf, ranges, batch_size
             )
 
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None))
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None))
         
         # Returns tuple of accumulators: (D4, D1, X2, X3)
-        D4_rep, D1_rep, X2_rep, X3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params)
+        D4_rep, D1_rep, X2_rep, X3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params, Gb)
         
         D4 = jnp.sum(D4_rep, axis=0)
         D1 = jnp.sum(D1_rep, axis=0)
@@ -792,7 +792,7 @@ class ISDFXTC(XTC, ISDFTC):
         return {'D1': D1, 'D4': D4, 'X2': X2, 'X3': X3, 'L_aux': L_aux}
 
     def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, G_shard,
-                                 full_grid, full_weights, full_xi_rho, Gb, phi, ranges, batch_size=1000):
+                                 Gb, phi, ranges, batch_size=1000):
         """Calculate Delta U kernels for a shard."""
         Nb = self.n_orb
         N_rank = phi.shape[1]
