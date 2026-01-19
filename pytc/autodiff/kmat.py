@@ -213,49 +213,31 @@ def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=No
     return final_result
 
 
-def calc_K1_isdf(phi, xi_phi_r2, grad_phi, xi_grad_r1, jastrow_factor, jastrow_params, 
-                 grid_r1, weights_r1, grid_r2, weights_r2, ranges=None, batch_size=1000):
-    """JAX implementation of K1 term using ISDF intermediates with memory-efficient batching.
+def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor, jastrow_params, grid_r1, grid_r2, batch_size=1000):
+    r"""Calculate K1 kernel: K1_{kl} = \sum_{g,h} w_g w_h \xi_{grad}(k,g) \nabla u(g,h) \xi_\phi(l,h)
     
     Args:
-        phi: (Nb, n_fused) Selected columns for phi
-        xi_phi_r2: (n_fused, N_grid_r2) Interpolation coeffs for phi (r2)
-        grad_phi: (Nb, n_fused, 3) Selected columns for grad_phi
-        xi_grad_r1: (n_fused, N_grid_r1, 3) Interpolation coeffs for grad (r1)
+        xi_grad_r1: (N_fused, N_grid_r1, 3)
+        xi_phi_r2: (N_fused, N_grid_r2)
+        weights_r1: (N_grid_r1,)
+        weights_r2: (N_grid_r2,)
         jastrow_factor: JAX Jastrow factor instance
         jastrow_params: Parameters for the Jastrow factor
-        grid_r1: (N_grid_r1, 3) Grid points for r1
-        weights_r1: (N_grid_r1,) Grid weights for r1
-        grid_r2: (N_grid_r2, 3) Grid points for r2
-        weights_r2: (N_grid_r2,) Grid weights for r2
-        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s).
-        batch_size: Number of grid points to process at once
-    
+        grid_r1: (N_grid_r1, 3)
+        grid_r2: (N_grid_r2, 3)
+        batch_size: Batch size for grid integration
+        
     Returns:
-        (Np, Nq, Nr, Ns) array in chemists' notation (pq|rs)
+        K1_kernel: (N_fused, N_fused, 3)
     """
-    n_orb = phi.shape[0]
-    if ranges is None:
-        slice_p = slice_q = slice_r = slice_s = slice(None)
-    else:
-        slice_p, slice_q, slice_r, slice_s = ranges
-
-    # Slice phi and grad_phi
-    phi_p = phi[slice_p]
-    phi_q = phi[slice_q]
-    phi_r = phi[slice_r]
-    phi_s = phi[slice_s]
-    grad_phi_p = grad_phi[slice_p]
-
     N_grid_r2 = grid_r2.shape[0]
-    Nb = phi.shape[0]
     n_fused = xi_phi_r2.shape[0]
     
     weights_r1 = jnp.asarray(weights_r1)
     weights_r2 = jnp.asarray(weights_r2)
-    weighted_xi_grad_r1 = xi_grad_r1 * weights_r1[None, :, None]
+    weighted_xi_grad = xi_grad_r1 * weights_r1[None, :, None] # (N_fused, N_grid_r1, 3)
     
-    # Pad r2 inputs to be divisible by batch_size
+    # Pad r2 grid for scanning
     padded_size = ((N_grid_r2 + batch_size - 1) // batch_size) * batch_size
     padding = padded_size - N_grid_r2
     
@@ -278,111 +260,52 @@ def calc_K1_isdf(phi, xi_phi_r2, grad_phi, xi_grad_r1, jastrow_factor, jastrow_p
         r2_batch, w2_batch, xi_phi_batch = args
         
         # Calculate gradients: grad_r1 u(r1, r2)
-        # r1 is full grid, r2 is batch
+        # r1 is full grid (shard), r2 is batch
         # u_grad_batch: (N_grid_r1, batch, 3)
+        u_grad_batch = jastrow_factor.grad_r_batch(grid_r1, r2_batch, jastrow_params)
         
-        @partial(jax.vmap, in_axes=(None, 0))
-        def get_grads(r1, r2):
-            return jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]
+        # Contract r1:
+        # G1_{k,b,c} = sum_g weighted_xi_grad_{k,g,c} * u_grad_batch_{g,b,c}
+        # (N_fused, N_grid_r1, 3) * (N_grid_r1, batch, 3) -> (N_fused, batch, 3)
+        G1 = jnp.einsum('kgc,gbc->kbc', weighted_xi_grad, u_grad_batch)
         
-        u_grad_batch = jax.vmap(get_grads, in_axes=(0, None))(grid_r1, r2_batch)
+        # Contract r2:
+        # K1_batch_{k,l,c} = sum_b G1_{k,b,c} * xi_phi_batch_{l,b} * w2_batch_{b}
+        # (N_fused, batch, 3) * (N_fused, batch) * (batch,) -> (N_fused, N_fused, 3)
+        K1_batch = jnp.einsum('kbc,lb,b->klc', G1, xi_phi_batch, w2_batch)
         
-        # Process each spatial component
-        # G1_{k,b,c} = sum_g weighted_xi_grad_r1_{k,g,c} * u_grad_batch_{g,b,c}
-        # (n_fused, N_grid_r1, 3) * (N_grid_r1, batch, 3) -> (n_fused, batch, 3)
-        G1 = jnp.einsum('kgc,gbc->kbc', weighted_xi_grad_r1, u_grad_batch)
-        
-        # Factorized form: C_grad_{pq, k, c} = grad_phi_{p,k,c} phi_{q,k}
-        # (n_fused, batch, 3) * (Np, n_fused, 3) * (Nq, n_fused) -> (Np, Nq, batch)
-        G1_factorized = jnp.einsum('kmc,pkc,qk->pqm', G1, grad_phi_p, phi_q)
-        
-        # Contract with xi_phi_r2 and weights_r2 for this batch
-        # (Np, Nq, batch) * (n_fused, batch) * (batch,) -> (Np, Nq, n_fused)
-        G2 = jnp.einsum('pqm,lm,m->pql', G1_factorized, xi_phi_batch, w2_batch)
-        
-        # Accumulate result
-        # Factorized form: C_phi_{rs, l} = phi_{r,l} phi_{s,l}
-        # (Np, Nq, n_fused) * (Nr, n_fused) * (Ns, n_fused) -> (Np, Nq, Nr, Ns)
-        term = jnp.einsum('pql,rl,sl->pqrs', G2, phi_r, phi_s)
-        
-        return carry + term, None
+        return carry + K1_batch, None
 
-    Np = phi_p.shape[0]
-    Nq = phi_q.shape[0]
-    Nr = phi_r.shape[0]
-    Ns = phi_s.shape[0]
-    result_init = jnp.zeros((Np, Nq, Nr, Ns))
-    final_result, _ = jax.lax.scan(scan_body, result_init, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
+    init_val = jnp.zeros((n_fused, n_fused, 3))
+    K1_kernel, _ = jax.lax.scan(scan_body, init_val, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
     
-    return final_result
+    return K1_kernel
 
 
-def calc_K2_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params, grid_points, weights, batch_size=1000):
-    """JAX implementation of K2 term using ISDF intermediates.
+def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor, jastrow_params, grid_r1, grid_r2, batch_size=1000):
+    r"""Calculate K3 kernel: K3_{kl} = \sum_{g,h} w_g w_h \xi_\phi(k,g) |\nabla u(g,h)|^2 \xi_\phi(l,h)
     
     Args:
-        phi: (Nb, n_fused) Selected columns for phi
-        xi_phi: (n_fused, N_grid) Interpolation coeffs for phi
-        grad_phi: (Nb, n_fused, 3) Selected columns for grad_phi
-        xi_grad: (n_fused, N_grid, 3) Interpolation coeffs for grad
+        xi_phi_r1: (N_fused, N_grid_r1)
+        xi_phi_r2: (N_fused, N_grid_r2)
+        weights_r1: (N_grid_r1,)
+        weights_r2: (N_grid_r2,)
         jastrow_factor: JAX Jastrow factor instance
         jastrow_params: Parameters for the Jastrow factor
-        grid_points: (N_grid, 3) Grid points
-        weights: (N_grid,) Grid weights
-        batch_size: Number of grid points to process at once
-    
+        grid_r1: (N_grid_r1, 3)
+        grid_r2: (N_grid_r2, 3)
+        batch_size: Batch size for grid integration
+        
     Returns:
-        (Nb, Nb, Nb, Nb) array in chemists' notation (pq|rs)
+        K3_kernel: (N_fused, N_fused)
     """
-    # Pass grid_points and weights for both r1 and r2
-    res1 = calc_K1_isdf(phi, xi_phi, grad_phi, xi_grad, jastrow_factor, jastrow_params, 
-                        grid_points, weights, grid_points, weights, ranges=None, batch_size=batch_size)
-    # Transpose p and q for the second part of combined_C_grad
-    res2 = jnp.einsum('pqrs->qprs', res1)
-    
-    return -(res1 + res2)
-
-
-def calc_K3_isdf(phi, xi_phi_r1, xi_phi_r2, jastrow_factor, jastrow_params, 
-                 grid_r1, weights_r1, grid_r2, weights_r2, ranges=None, batch_size=1000):
-    """JAX implementation of K3 term using ISDF intermediates with memory-efficient batching.
-    
-    Args:
-        phi: (Nb, n_fused) Selected columns for phi
-        xi_phi_r1: (n_fused, N_grid_r1) Interpolation coeffs for phi (r1)
-        xi_phi_r2: (n_fused, N_grid_r2) Interpolation coeffs for phi (r2)
-        jastrow_factor: JAX Jastrow factor instance
-        jastrow_params: Parameters for the Jastrow factor
-        grid_r1: (N_grid_r1, 3) Grid points for r1
-        weights_r1: (N_grid_r1,) Grid weights for r1
-        grid_r2: (N_grid_r2, 3) Grid points for r2
-        weights_r2: (N_grid_r2,) Grid weights for r2
-        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s).
-        batch_size: Number of grid points to process at once
-    
-    Returns:
-        (Np, Nq, Nr, Ns) array in chemists' notation (pq|rs)
-    """
-    n_orb = phi.shape[0]
-    if ranges is None:
-        slice_p = slice_q = slice_r = slice_s = slice(None)
-    else:
-        slice_p, slice_q, slice_r, slice_s = ranges
-
-    # Slice phi
-    phi_p = phi[slice_p]
-    phi_q = phi[slice_q]
-    phi_r = phi[slice_r]
-    phi_s = phi[slice_s]
-
     N_grid_r2 = grid_r2.shape[0]
-    Nb = phi.shape[0]
-    n_fused = xi_phi_r1.shape[0]
+    n_fused = xi_phi_r2.shape[0]
     
     weights_r1 = jnp.asarray(weights_r1)
     weights_r2 = jnp.asarray(weights_r2)
     
-    # Pad r2 inputs
+    # Pad r2 grid for scanning
     padded_size = ((N_grid_r2 + batch_size - 1) // batch_size) * batch_size
     padding = padded_size - N_grid_r2
     
@@ -404,43 +327,99 @@ def calc_K3_isdf(phi, xi_phi_r1, xi_phi_r2, jastrow_factor, jastrow_params,
     def scan_body(carry, args):
         r2_batch, w2_batch, xi_phi_batch = args
         
-        @partial(jax.vmap, in_axes=(None, 0))
-        def get_grads(r1, r2):
-            return jastrow_factor.grad_r(r1[None], r2[None], jastrow_params)[0]
-        
-        u_grad_batch = jax.vmap(get_grads, in_axes=(0, None))(grid_r1, r2_batch)  # (N_grid_r1, batch, 3)
-        
-        # Compute squared magnitude of gradient
-        u_grad_squared = jnp.sum(u_grad_batch**2, axis=-1)  # (N_grid_r1, batch)
+        u_grad_batch = jastrow_factor.grad_r_batch(grid_r1, r2_batch, jastrow_params) # (N_grid_r1, batch, 3)
+        u_grad_squared = jnp.sum(u_grad_batch**2, axis=-1) # (N_grid_r1, batch)
         
         # Weight both coordinates
         # (N_grid_r1, batch) * (N_grid_r1, 1) * (1, batch)
         weighted_u_squared = u_grad_squared * weights_r1[:, None] * w2_batch[None, :]
         
-        # Contract with xi_phi for this batch
-        # G1 = xi_phi_r1 @ weighted_u_squared @ xi_phi_batch.T
-        # (n_fused, N_grid_r1) @ (N_grid_r1, batch) -> (n_fused, batch)
-        # (n_fused, batch) @ (batch, n_fused) -> (n_fused, n_fused)
-        
-        # First contract r1:
-        # temp = xi_phi_r1 @ weighted_u_squared  -> (n_fused, batch)
+        # Contract r1:
+        # temp = xi_phi_r1 @ weighted_u_squared -> (n_fused, batch)
         temp = jnp.dot(xi_phi_r1, weighted_u_squared)
         
-        # Then contract r2 (batch):
-        # G1 = temp @ xi_phi_batch.T -> (n_fused, n_fused)
-        G1 = jnp.dot(temp, xi_phi_batch.T)
+        # Contract r2:
+        # K3_batch = temp @ xi_phi_batch.T -> (n_fused, n_fused)
+        K3_batch = jnp.dot(temp, xi_phi_batch.T)
         
-        # Accumulate result
-        # Factorized form: C_phi_{pq, k} = phi_{p,k} phi_{q,k}
-        term = jnp.einsum('kl,pk,qk,rl,sl->pqrs', G1, phi_p, phi_q, phi_r, phi_s)
-        
-        return carry + term, None
+        return carry + K3_batch, None
 
-    Np = phi_p.shape[0]
-    Nq = phi_q.shape[0]
-    Nr = phi_r.shape[0]
-    Ns = phi_s.shape[0]
-    result_init = jnp.zeros((Np, Nq, Nr, Ns))
-    final_result, _ = jax.lax.scan(scan_body, result_init, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
+    init_val = jnp.zeros((n_fused, n_fused))
+    K3_kernel, _ = jax.lax.scan(scan_body, init_val, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
     
-    return final_result
+    return K3_kernel
+
+
+def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
+    r"""Contract K1 using precomputed kernel and pivot values.
+    
+    K1_{pqrs} \approx \sum_{k,l} (\nabla\phi_p(z_k) \phi_q(z_k)) U1_{kl} (\phi_r(z_l) \phi_s(z_l))
+    
+    Args:
+        phi_piv: (Nb, N_fused) Values of phi at pivot points
+        grad_phi_piv: (Nb, N_fused, 3) Values of grad_phi at pivot points
+        U1: (N_fused, N_fused, 3) Precomputed kernel
+        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s)
+        
+    Returns:
+        K1: (Np, Nq, Nr, Ns)
+    """
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+    phi_p = phi_piv[slice_p]
+    phi_q = phi_piv[slice_q]
+    phi_r = phi_piv[slice_r]
+    phi_s = phi_piv[slice_s]
+    grad_phi_p = grad_phi_piv[slice_p]
+    
+    # C_grad_{pq, k, c} = grad_phi_{p,k,c} phi_{q,k}
+    C_grad = jnp.einsum('pkc,qk->pqkc', grad_phi_p, phi_q)
+    
+    # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
+    C_phi = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
+    
+    # Contract with U1
+    # U1: (k, l, c)
+    # K1 = sum_{k,l,c} C_grad_{pq,k,c} * U1_{k,l,c} * C_phi_{rs,l}
+    K1 = jnp.einsum('pqkc,klc,rsl->pqrs', C_grad, U1, C_phi)
+    
+    return K1
+
+
+def contract_K3_isdf(phi_piv, U3, ranges=None):
+    r"""Contract K3 using precomputed U3 kernel and pivot values.
+    
+    K3_{pqrs} \approx \sum_{k,l} (\phi_p(z_k) \phi_q(z_k)) U3_{kl} (\phi_r(z_l) \phi_s(z_l))
+    
+    Args:
+        phi_piv: (Nb, N_fused) Values of phi at pivot points
+        U3: (N_fused, N_fused) Precomputed kernel
+        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s)
+        
+    Returns:
+        K3: (Np, Nq, Nr, Ns)
+    """
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+    phi_p = phi_piv[slice_p]
+    phi_q = phi_piv[slice_q]
+    phi_r = phi_piv[slice_r]
+    phi_s = phi_piv[slice_s]
+    
+    # C_phi_{pq, k} = phi_{p,k} phi_{q,k}
+    C_phi_pq = jnp.einsum('pk,qk->pqk', phi_p, phi_q)
+    
+    # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
+    C_phi_rs = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
+    
+    # Contract with U3
+    # K3 = sum_{k,l} C_phi_{pq,k} * U3_{k,l} * C_phi_{rs,l}
+    K3 = jnp.einsum('pqk,kl,rsl->pqrs', C_phi_pq, U3, C_phi_rs)
+    
+    return K3

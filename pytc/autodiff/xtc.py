@@ -687,48 +687,53 @@ class ISDFXTC(XTC, ISDFTC):
             grad_phi_isdf=grad_phi_isdf
         )
 
-    def get_delta_U(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
-        """Get delta_U matrix using ISDF with pmap support."""
-        if ranges is None and block_str is not None:
-            ranges = self._get_block_ranges(block_str)
-            
-        if ranges is None:
-            full_slice = slice(None)
-            ranges = (full_slice, full_slice, full_slice, full_slice)
-            
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000):
+        """Compute ISDF intermediates and store them.
+        
+        Computes K1_kernel, K3_kernel, D1, D4, X2, X3 kernels and stores them in self.isdf_kernels.
+        Also stores pivot values of phi and grad_phi.
+        
+        Args:
+            jastrow_params: Parameters for the Jastrow factor.
+            save_path: Optional path to save intermediates to HDF5.
+            batch_size: Batch size for computation.
+        """
+        logging.info("Computing ISDF intermediates...")
         start_time = time.perf_counter()
-        logging.debug("Starting ISDFXTC.get_delta_U")
         
-        # Call the raw computation function
-        result = self._get_delta_U_raw(jastrow_params, dm1, ranges, batch_size)
+        # 1. Compute K1_kernel and K3_kernel (inherited from ISDFTC)
+        kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
         
-        # Symmetrize the result
-        slice_p, slice_q, slice_r, slice_s = ranges
+        # 2. Compute Delta U kernels (D1, D4, X2, X3)
+        delta_u_kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
+        kernels.update(delta_u_kernels)
         
-        # If the block is (pq|rs) and (rs|pq) is the same block, then we just add the transpose.
-        # Otherwise, we need to compute the (rs|pq) block explicitly and add it.
-        if slice_p == slice_r and slice_q == slice_s:
-            # Symmetric block (e.g. 'oooo'), just add transpose of result
-            final_result = -(result + result.transpose(2, 3, 0, 1))
-        else:
-            # Non-symmetric block, need to compute the transpose block
-            ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            result_T = self._get_delta_U_raw(jastrow_params, dm1, ranges_T, batch_size)
-            final_result = -(result + result_T.transpose(2, 3, 0, 1))
+        if save_path:
+            import h5py
+            with h5py.File(save_path, 'w') as f:
+                for k, v in kernels.items():
+                    f.create_dataset(k, data=np.array(v))
+                f.create_dataset('phi_piv', data=np.array(self.phi_isdf))
+                f.create_dataset('grad_phi_piv', data=np.array(self.grad_phi_isdf))
+                f.create_dataset('pivots', data=np.array(self.pivots))
+                
+        logging.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
+        
+        return self.replace(isdf_kernels=kernels)
 
-        total_time = time.perf_counter() - start_time
-        logging.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
-        return final_result
+    def compute_delta_u_kernels(self, jastrow_params, batch_size=1000):
+        """Compute D1, D4, X2, X3 kernels for Delta U."""
+        full_slice = slice(None)
+        ranges = (full_slice, full_slice, full_slice, full_slice)
+        return self._compute_delta_u_kernels_raw(jastrow_params, ranges, batch_size)
 
-    def _get_delta_U_raw(self, jastrow_params, dm1, ranges, batch_size):
-        """Internal method to get raw delta_U before symmetrization."""
+    def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size):
+        """Compute raw kernels for Delta U."""
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
+        dm1 = self._get_mf_dm() # Use MF density
         
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-        
-        # Pad grid to be divisible by n_devices
+        # Pad grid
         remainder = n_grid % n_devices
         if remainder != 0:
             padding = n_devices - remainder
@@ -743,62 +748,37 @@ class ISDFXTC(XTC, ISDFTC):
         n_grid_padded = padded_grid_points.shape[0]
         n_per_device = n_grid_padded // n_devices
         
-        # Shard arrays
         sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
         sharded_weights = padded_weights.reshape(n_devices, n_per_device)
-        # xi_rho: (N_rank, N) -> (N_rank, n_dev, N_per) -> (n_dev, N_rank, N_per)
         sharded_xi_rho = padded_xi_rho.reshape(self.phi_isdf.shape[1], n_devices, n_per_device).transpose(1, 0, 2)
         
-        # Pre-compute device-independent quantities
-        # Gb_b = sum_{u,s} phi_{u,b} phi_{s,b} dm1_{u,s}
         Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         
-        # Full arrays for integration (replicated on each device)
         full_grid = self.grid_points
         full_weights = self.weights
         full_xi_rho = self.xi_rho
 
         def compute_on_device(grid_shard, weights_shard, xi_shard, jastrow_params):
-            return self._calc_delta_U_isdf_shard(
+            return self._calc_delta_U_kernels_shard(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, 
                 full_grid, full_weights, full_xi_rho, Gb, self.phi_isdf, ranges, batch_size
             )
 
-        # Execute pmap
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, None))
         
-        # Returns tuple of accumulators: (X, X1, Q, Q3)
-        X_rep, X1_rep, Q_rep, Q3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, jastrow_params)
+        # Returns tuple of accumulators: (D4, D1, X2, X3)
+        D4_rep, D1_rep, X2_rep, X3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, jastrow_params)
         
-        # Sum over devices
-        X = jnp.sum(X_rep, axis=0)
-        X1 = jnp.sum(X1_rep, axis=0)
-        Q = jnp.sum(Q_rep, axis=0)
-        Q3 = jnp.sum(Q3_rep, axis=0)
+        D4 = jnp.sum(D4_rep, axis=0)
+        D1 = jnp.sum(D1_rep, axis=0)
+        X2 = jnp.sum(X2_rep, axis=0)
+        X3 = jnp.sum(X3_rep, axis=0)
         
-        # Reconstruct Terms
-        slice_p, slice_q, slice_r, slice_s = ranges
-        phi_p = self.phi_isdf[slice_p]
-        phi_q = self.phi_isdf[slice_q]
-        phi_r = self.phi_isdf[slice_r]
-        phi_s = self.phi_isdf[slice_s]
+        return {'D1': D1, 'D4': D4, 'X2': X2, 'X3': X3}
 
-        # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
-        c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
-        c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
-        
-        term1 = 2 * jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, X1, c_phi_rs)
-        term2 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, Q)
-        term3 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, Q3)
-        term4 = jnp.einsum('pqa,rsc,ac->pqrs', c_phi_pq, c_phi_rs, X)
-        
-        result = term1 + term2 + term3 + term4
-        
-        return result
-
-    def _calc_delta_U_isdf_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, 
+    def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, 
                                  full_grid, full_weights, full_xi_rho, Gb, phi, ranges, batch_size=1000):
-        """Calculate ΔU contribution for a shard of grid points."""
+        """Calculate Delta U kernels for a shard."""
         Nb = self.n_orb
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
@@ -909,4 +889,83 @@ class ISDFXTC(XTC, ISDFTC):
         final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches))
         
         return final_accumulators
+
+    def get_delta_U(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+        """Get delta_U matrix using ISDF with pmap support."""
+        if ranges is None and block_str is not None:
+            ranges = self._get_block_ranges(block_str)
+            
+        if ranges is None:
+            full_slice = slice(None)
+            ranges = (full_slice, full_slice, full_slice, full_slice)
+            
+        start_time = time.perf_counter()
+        logging.debug("Starting ISDFXTC.get_delta_U")
+        
+        # Check if kernels are available
+        if self.isdf_kernels is None:
+             # Compute kernels on the fly if not available
+             # This aligns with kmat functions logic
+             kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
+        else:
+            kernels = self.isdf_kernels
+            
+        result = self._contract_delta_U_kernels(kernels, ranges)
+        
+        # Symmetrize the result
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+        if slice_p == slice_r and slice_q == slice_s:
+            final_result = -(result + result.transpose(2, 3, 0, 1))
+        else:
+            # Non-symmetric block
+            # We need the transpose block (rs|pq)
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            
+            # Reuse kernels for transpose block
+            result_T = self._contract_delta_U_kernels(kernels, ranges_T)
+                
+            final_result = -(result + result_T.transpose(2, 3, 0, 1))
+
+        total_time = time.perf_counter() - start_time
+        logging.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        return final_result
+
+    def _contract_delta_U_kernels(self, kernels, ranges):
+        """Contract precomputed kernels to get Delta U block."""
+        D1 = kernels['D1']
+        D4 = kernels['D4']
+        X2 = kernels['X2']
+        X3 = kernels['X3']
+        
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+        phi_p = self.phi_isdf[slice_p]
+        phi_q = self.phi_isdf[slice_q]
+        phi_r = self.phi_isdf[slice_r]
+        phi_s = self.phi_isdf[slice_s]
+        
+        # X2 and X3 are (N_orb, N_orb, N_rank)
+        # We need to slice them for r, s
+        X2_sliced = X2[slice_r, slice_s]
+        X3_sliced = X3[slice_r, slice_s]
+        
+        # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
+        c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
+        c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
+        
+        # Term 1: 2 * sum_{a,d} c_phi_pq[a] * D1[a,d] * c_phi_rs[d]
+        # (p,q,a) * (a,d) * (r,s,d) -> (p,q,r,s)
+        term1 = 2 * jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, D1, c_phi_rs)
+        
+        # Term 2: - sum_a c_phi_pq[a] * X2[r,s,a]
+        term2 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X2_sliced)
+        
+        # Term 3: - sum_a c_phi_pq[a] * X3[r,s,a]
+        term3 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X3_sliced)
+        
+        # Term 4: sum_{a,c} c_phi_pq[a] * c_phi_rs[c] * D4[a,c]
+        term4 = jnp.einsum('pqa,rsc,ac->pqrs', c_phi_pq, c_phi_rs, D4)
+        
+        return term1 + term2 + term3 + term4
     
