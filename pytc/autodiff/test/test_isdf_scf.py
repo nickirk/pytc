@@ -42,7 +42,7 @@ def run_benchmark():
     
     # --- ISDF TCSCF ---
     print("\n--- ISDF TCSCF (Rank 100) ---")
-    mf_isdf = TCSCF(mol, jastrow, params).isdf(n_rank=100)
+    mf_isdf = TCSCF(mol, jastrow, params).isdf(n_rank=400)
     
     start_time = time.time()
     mf_isdf.kernel()

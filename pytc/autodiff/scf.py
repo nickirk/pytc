@@ -34,14 +34,20 @@ class TCSCF(hf.RHF):
         else:
             self.tc_obj = tc_obj
             
-        self._isdf_kernel = None
-        self._tc_2b_tensor = None
 
     def isdf(self, n_rank=None):
         """Enable ISDF approximation."""
-        if not isinstance(self.tc_obj, ISDFTC):
-            self.tc_obj = ISDFTC.from_tc(self.tc_obj, n_rank=n_rank)
+        self.tc_obj = ISDFTC.from_tc(self.tc_obj, n_rank=n_rank)
+        # Precompute kernels and L_aux
+        self.tc_obj = self.tc_obj.isdf(self.jastrow_params)
         return self
+
+    def _get_init_occ(self, n_orb):
+        """Get initial occupation numbers."""
+        nocc = self.mol.nelectron // 2
+        mo_occ = np.zeros(n_orb)
+        mo_occ[:nocc] = 2
+        return mo_occ
 
     def get_hcore(self, mol=None):
         """Get core Hamiltonian including 1-body TC corrections."""
@@ -65,29 +71,8 @@ class TCSCF(hf.RHF):
         # Convert DM to JAX
         dm_jax = jnp.array(dm)
         
-        # TC 2-body correction
-        if self._tc_2b_tensor is None:
-             # Cache 2-body tensor (numpy array)
-             self._tc_2b_tensor = np.array(self.tc_obj.get_2b(self.jastrow_params))
-        
-        # Pass cached tensor to get_2b_fock
-        # get_2b_fock expects JAX array, but we can pass numpy array and JAX handles it.
-        # Or we can cast it.
-        T_jax = jnp.array(self._tc_2b_tensor)
-        v_tc_2b = np.array(self.tc_obj.get_2b_fock(self.jastrow_params, dm_jax, T=T_jax))
-        
-        # TC 3-body correction
-        if isinstance(self.tc_obj, ISDFTC):
-             if self._isdf_kernel is None:
-                 # Compute and cache kernel
-                 # Note: self.jastrow_params is used here. If params change, 
-                 # user must manually reset _isdf_kernel or we need a smarter check.
-                 # For standard SCF, params are fixed.
-                 self._isdf_kernel = self.tc_obj._compute_L_aux(self.jastrow_params)
-             
-             v_tc_3b = np.array(self.tc_obj.get_3b_fock(self.jastrow_params, dm_jax, L_aux=self._isdf_kernel))
-        else:
-             v_tc_3b = np.array(self.tc_obj.get_3b_fock(self.jastrow_params, dm_jax))
+        v_tc_2b = np.array(self.tc_obj.get_2b_fock(self.jastrow_params, dm_jax))
+        v_tc_3b = np.array(self.tc_obj.get_3b_fock(self.jastrow_params, dm_jax))
         
         return v_hf + v_tc_2b + v_tc_3b
 

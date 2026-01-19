@@ -28,8 +28,8 @@ class TestTCSCF(unittest.TestCase):
     def test_init(self):
         tc_scf = TCSCF(self.mol, self.jastrow, self.params)
         self.assertIsNotNone(tc_scf.tc_obj)
-        # Check if TC object is in AO basis (rho shape should match nao)
-        self.assertEqual(tc_scf.tc_obj.rho.shape[0], self.mol.nao_nr())
+        # Check if TC object is in AO basis (phi shape should match nao)
+        self.assertEqual(tc_scf.tc_obj.phi.shape[0], self.mol.nao_nr())
 
     def test_hcore(self):
         tc_scf = TCSCF(self.mol, self.jastrow, self.params)

@@ -687,10 +687,12 @@ class ISDFXTC(XTC, ISDFTC):
             grad_phi_isdf=grad_phi_isdf
         )
 
+        return self.replace(isdf_kernels=kernels)
+
     def isdf(self, jastrow_params, save_path=None, batch_size=1000):
         """Compute ISDF intermediates and store them.
         
-        Computes K1_kernel, K3_kernel, D1, D4, X2, X3 kernels and stores them in self.isdf_kernels.
+        Computes K1_kernel, K3_kernel, L_aux, D1, D4, X2, X3 kernels and stores them in self.isdf_kernels.
         Also stores pivot values of phi and grad_phi.
         
         Args:
@@ -698,11 +700,13 @@ class ISDFXTC(XTC, ISDFTC):
             save_path: Optional path to save intermediates to HDF5.
             batch_size: Batch size for computation.
         """
-        logging.info("Computing ISDF intermediates...")
-        start_time = time.perf_counter()
+        # 1. Compute K1_kernel, K3_kernel, L_aux (via ISDFTC)
+        # This returns a new ISDFTC object with kernels
+        isdf_tc = super().isdf(jastrow_params, save_path=None, batch_size=batch_size)
+        kernels = dict(isdf_tc.isdf_kernels)
         
-        # 1. Compute K1_kernel and K3_kernel (inherited from ISDFTC)
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
+        logging.info("Computing ISDF intermediates (Delta U)...")
+        start_time = time.perf_counter()
         
         # 2. Compute Delta U kernels (D1, D4, X2, X3)
         delta_u_kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
@@ -717,7 +721,7 @@ class ISDFXTC(XTC, ISDFTC):
                 f.create_dataset('grad_phi_piv', data=np.array(self.grad_phi_isdf))
                 f.create_dataset('pivots', data=np.array(self.pivots))
                 
-        logging.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
+        logging.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
         
         return self.replace(isdf_kernels=kernels)
 
@@ -727,8 +731,14 @@ class ISDFXTC(XTC, ISDFTC):
         ranges = (full_slice, full_slice, full_slice, full_slice)
         return self._compute_delta_u_kernels_raw(jastrow_params, ranges, batch_size)
 
+
+
     def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size):
         """Compute raw kernels for Delta U."""
+        # 1. Compute L_aux (G)
+        L_aux = self._compute_L_aux(jastrow_params, batch_size)
+        G_full = -L_aux # Recover G
+        
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
         dm1 = self._get_mf_dm() # Use MF density
@@ -740,10 +750,14 @@ class ISDFXTC(XTC, ISDFTC):
             padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
             padded_weights = jnp.pad(self.weights, ((0, padding),))
             padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padding)))
+            
+            # Pad G as well
+            padded_G = jnp.pad(G_full, ((0, 0), (0, padding), (0, 0)))
         else:
             padded_grid_points = self.grid_points
             padded_weights = self.weights
             padded_xi_rho = self.xi_rho
+            padded_G = G_full
             
         n_grid_padded = padded_grid_points.shape[0]
         n_per_device = n_grid_padded // n_devices
@@ -751,6 +765,7 @@ class ISDFXTC(XTC, ISDFTC):
         sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
         sharded_weights = padded_weights.reshape(n_devices, n_per_device)
         sharded_xi_rho = padded_xi_rho.reshape(self.phi_isdf.shape[1], n_devices, n_per_device).transpose(1, 0, 2)
+        sharded_G = padded_G.reshape(self.phi_isdf.shape[1], n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
         
         Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         
@@ -758,25 +773,25 @@ class ISDFXTC(XTC, ISDFTC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
 
-        def compute_on_device(grid_shard, weights_shard, xi_shard, jastrow_params):
+        def compute_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params):
             return self._calc_delta_U_kernels_shard(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, 
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
                 full_grid, full_weights, full_xi_rho, Gb, self.phi_isdf, ranges, batch_size
             )
 
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, None))
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None))
         
         # Returns tuple of accumulators: (D4, D1, X2, X3)
-        D4_rep, D1_rep, X2_rep, X3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, jastrow_params)
+        D4_rep, D1_rep, X2_rep, X3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params)
         
         D4 = jnp.sum(D4_rep, axis=0)
         D1 = jnp.sum(D1_rep, axis=0)
         X2 = jnp.sum(X2_rep, axis=0)
         X3 = jnp.sum(X3_rep, axis=0)
         
-        return {'D1': D1, 'D4': D4, 'X2': X2, 'X3': X3}
+        return {'D1': D1, 'D4': D4, 'X2': X2, 'X3': X3, 'L_aux': L_aux}
 
-    def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, 
+    def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, G_shard,
                                  full_grid, full_weights, full_xi_rho, Gb, phi, ranges, batch_size=1000):
         """Calculate Delta U kernels for a shard."""
         Nb = self.n_orb
@@ -816,20 +831,20 @@ class ISDFXTC(XTC, ISDFTC):
         padded_grid = jnp.pad(grid_points, ((0, padded_size - N_shard), (0, 0)))
         padded_weights = jnp.pad(weights, (0, padded_size - N_shard))
         padded_xi = jnp.pad(xi_rho, ((0, 0), (0, padded_size - N_shard)))
+        padded_G = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
         
         r_batches = padded_grid.reshape(-1, batch_size, 3)
         w_batches = padded_weights.reshape(-1, batch_size)
         xi_batches = padded_xi.reshape(N_rank, -1, batch_size).transpose(1, 0, 2)
+        G_batches = padded_G.reshape(N_rank, -1, batch_size, 3).transpose(1, 2, 0, 3) # (batch, N_rank, 3)
         
         def scan_body(carry, args):
-            r_batch, w_batch, xi_batch = args
+            r_batch, w_batch, xi_batch, G_batch = args
             X_curr, X1_curr, Q_curr, Q3_curr = carry
             
-            # Compute Gradients
-            grads = self.jastrow_factor.grad_r_batch(full_grid, r_batch, jastrow_params)
-            
-            # Compute G: (N_rank, batch, 3)
-            G = jnp.einsum('j,bj,jic->bic', full_weights, full_xi_rho, grads)
+            # G is now passed in as G_batch: (batch, N_rank, 3)
+            # Transpose to match previous usage: (N_rank, batch, 3)
+            G = G_batch.transpose(1, 0, 2)
             
             # --- Term 4 (Easy Term) ---
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
@@ -886,7 +901,9 @@ class ISDFXTC(XTC, ISDFTC):
             
             return (X_curr + X_update, X1_curr + X1_update, Q_curr + Q_update, Q3_curr + Q3_1_update + Q3_2_update), None
 
-        final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches))
+            return (X_curr + X_update, X1_curr + X1_update, Q_curr + Q_update, Q3_curr + Q3_1_update + Q3_2_update), None
+
+        final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches, G_batches))
         
         return final_accumulators
 

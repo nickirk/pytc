@@ -556,6 +556,115 @@ class ISDFTC(TC):
         
         return {'K1_kernel': K1_kernel, 'K3_kernel': K3_kernel}
 
+    def _compute_L_aux(self, jastrow_params, batch_size=1000):
+        """Compute L_aux (G) for the full grid.
+        
+        L_aux(r) = - sum_g w_g xi_rho(g) grad_g u(g, r)
+        
+        Returns:
+            L_aux: (N_rank, N_grid, 3)
+        """
+        n_devices = jax.local_device_count()
+        n_grid = self.grid_points.shape[0]
+        
+        # Pad grid to be divisible by n_devices
+        remainder = n_grid % n_devices
+        if remainder != 0:
+            padding = n_devices - remainder
+            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+        else:
+            padded_grid_points = self.grid_points
+            
+        n_grid_padded = padded_grid_points.shape[0]
+        n_per_device = n_grid_padded // n_devices
+        
+        # Shard r (where we evaluate L_aux)
+        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
+        
+        full_grid = self.grid_points
+        full_weights = self.weights
+        full_xi_rho = self.xi_rho
+        
+        def compute_on_device(grid_shard, jastrow_params):
+            # grid_shard: (N_shard, 3)
+            N_shard = grid_shard.shape[0]
+            
+            # Pad for batching
+            padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+            padded_shard = jnp.pad(grid_shard, ((0, padded_size - N_shard), (0, 0)))
+            
+            r_batches = padded_shard.reshape(-1, batch_size, 3)
+            
+            def scan_body(carry, r_batch):
+                # r_batch: (batch, 3)
+                # Compute Gradients: grad_g u(g, r_batch)
+                # jastrow_factor.grad_r_batch(r1, r2) -> grad w.r.t r1
+                # We want grad w.r.t g (integration variable)
+                # So first arg should be full_grid
+                grads = self.jastrow_factor.grad_r_batch(full_grid, r_batch, jastrow_params)
+                
+                # Compute G: (N_rank, batch, 3)
+                # G_{k,b,c} = sum_g w_g xi_rho_{k,g} grad_{g,b,c}
+                G = jnp.einsum('j,bj,jic->bic', full_weights, full_xi_rho, grads)
+                
+                return carry, G
+            
+            _, G_batches = jax.lax.scan(scan_body, None, r_batches)
+            
+            # Reshape and trim padding
+            # G_batches: (n_batches, N_rank, batch_size, 3)
+            # We want (N_rank, total_points, 3)
+            G_shard = G_batches.transpose(1, 0, 2, 3).reshape(full_xi_rho.shape[0], -1, 3)
+            return G_shard[:, :N_shard, :]
+
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None))
+        
+        # G_shards: (n_devices, N_rank, n_per_device, 3)
+        G_shards = pmapped_compute(sharded_grid, jastrow_params)
+        
+        # Combine shards: (N_rank, N_grid_padded, 3)
+        G_padded = G_shards.transpose(1, 0, 2, 3).reshape(full_xi_rho.shape[0], -1, 3)
+        
+        # Trim padding
+        G = G_padded[:, :n_grid, :]
+        
+        # L_aux = -G
+        return -G
+
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000):
+        """Compute ISDF intermediates and store them.
+        
+        Computes K1_kernel, K3_kernel, and L_aux.
+        
+        Args:
+            jastrow_params: Parameters for the Jastrow factor.
+            save_path: Optional path to save intermediates to HDF5.
+            batch_size: Batch size for computation.
+        """
+        logging.info("Computing ISDF intermediates (TC)...")
+        start_time = time.perf_counter()
+        
+        # 1. Compute K1_kernel and K3_kernel
+        kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
+        
+        # 2. Compute L_aux
+        L_aux = self._compute_L_aux(jastrow_params, batch_size)
+        kernels['L_aux'] = L_aux
+        
+        if save_path:
+            import h5py
+            with h5py.File(save_path, 'w') as f:
+                for k, v in kernels.items():
+                    f.create_dataset(k, data=np.array(v))
+                f.create_dataset('phi_piv', data=np.array(self.phi_isdf))
+                f.create_dataset('grad_phi_piv', data=np.array(self.grad_phi_isdf))
+                f.create_dataset('pivots', data=np.array(self.pivots))
+                
+        logging.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
+        
+        return self.replace(isdf_kernels=kernels)
+
+
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support."""
         start_time = time.perf_counter()
@@ -655,7 +764,10 @@ class ISDFTC(TC):
         """
         # 1. Check cache / Compute L_aux
         if L_aux is None:
-            L_aux = self._compute_L_aux(jastrow_params)
+            if self.isdf_kernels is not None and 'L_aux' in self.isdf_kernels:
+                L_aux = self.isdf_kernels['L_aux']
+            else:
+                L_aux = self._compute_L_aux(jastrow_params)
         
         # 2. Compute density at pivots
         # rho(mu) = sum_pq D_pq phi_p(mu) phi_q(mu)
@@ -681,3 +793,96 @@ class ISDFTC(TC):
         F_3b = jnp.dot(weighted_phi, phi_pivots.T)
         
         return F_3b
+
+    def get_2b_fock(self, jastrow_params, dm1, T=None):
+        """Get 2-body Fock matrix correction using ISDF kernels.
+        
+        This implementation avoids forming the full O(N^4) tensor by contracting
+        the density matrix directly with the ISDF kernels. It computes:
+        v_2b = Fock(result) = J(result) - 0.5 * K(result)
+        where result = 0.5 * (K1 - K2 + K3) + transpose(2,3,0,1)
+        
+        Args:
+            jastrow_params: Jastrow parameters
+            dm1: Density matrix (AO basis)
+            T: Optional precomputed 2-body tensor. If provided, uses base class implementation.
+            
+        Returns:
+            Fock matrix contribution (N, N)
+        """
+        if T is not None:
+            return super().get_2b_fock(jastrow_params, dm1, T)
+            
+        # Check if kernels are available
+        if self.isdf_kernels is None:
+             kernels = self.compute_kmat_kernels(jastrow_params)
+        else:
+            kernels = self.isdf_kernels
+            
+        U1 = kernels['K1_kernel'] # (k, l, c)
+        U3 = kernels['K3_kernel'] # (k, l)
+        
+        phi = self.phi_isdf # (n_orb, n_fused)
+        grad = self.grad_phi_isdf # (n_orb, n_fused, 3)
+        dm1 = jnp.array(dm1)
+        
+        # --- Direct Part Intermediates ---
+        # rho[l] = sum_rs D_rs phi_r(l) phi_s(l)
+        rho = jnp.einsum('rl,sl,rs->l', phi, phi, dm1)
+        # m[k,l] = sum_rs phi_s(k) D_rs phi_r(l)
+        m = jnp.einsum('sk,rl,rs->kl', phi, phi, dm1)
+        # m_grad[k,l,c] = sum_rs grad_s(k,c) D_rs phi_r(l)
+        m_grad = jnp.einsum('skc,rl,rs->klc', grad, phi, dm1)
+        
+        # --- Direct Part Terms ---
+        # K3: phi phi U3 phi phi
+        J3 = jnp.einsum('pk,qk,kl,l->pq', phi, phi, U3, rho)
+        K3 = jnp.einsum('pk,kl,ql,lk->pq', phi, U3, phi, m)
+        
+        # K1: grad phi U1 phi phi
+        U1_rho = jnp.einsum('klc,l->kc', U1, rho)
+        J1 = jnp.einsum('pkc,qk,kc->pq', grad, phi, U1_rho)
+        K1 = jnp.einsum('pkc,klc,ql,lk->pq', grad, U1, phi, m)
+        
+        # K2: phi grad U1 phi phi
+        J2 = jnp.einsum('pk,qkc,kc->pq', phi, grad, U1_rho)
+        K2 = jnp.einsum('pk,klc,ql,klc->pq', phi, U1, phi, m_grad)
+        
+        J_dir = 0.5 * (J1 - J2 + J3)
+        K_dir = 0.5 * (K1 - K2 + K3)
+        
+        # --- Transpose Part Intermediates ---
+        # rho_grad[k,c] = sum_rs D_rs grad_r(k,c) phi_s(k)
+        rho_grad = jnp.einsum('rkc,sk,rs->kc', grad, phi, dm1)
+        # rho_grad_rev[k,c] = sum_rs D_rs phi_r(k) grad_s(k,c)
+        rho_grad_rev = jnp.einsum('rk,skc,rs->kc', phi, grad, dm1)
+        # m_grad_rev[k,l,c] = sum_rs phi_s(k) D_rs grad_r(l,c)
+        m_grad_rev = jnp.einsum('sk,rlc,rs->klc', phi, grad, dm1)
+        
+        U1T = U1.transpose(1, 0, 2)
+        U3T = U3.T
+        
+        # --- Transpose Part Terms ---
+        # K3T: phi phi U3T phi phi
+        J3T = jnp.einsum('pk,qk,kl,l->pq', phi, phi, U3T, rho)
+        K3T = jnp.einsum('pk,kl,ql,lk->pq', phi, U3T, phi, m)
+        
+        # K1T: phi phi U1T grad phi
+        U1T_rho1 = jnp.einsum('klc,lc->k', U1T, rho_grad)
+        J1T = jnp.einsum('pk,qk,k->pq', phi, phi, U1T_rho1)
+        K1T = jnp.einsum('pk,klc,ql,klc->pq', phi, U1T, phi, m_grad_rev)
+        
+        # K2T: phi phi U1T phi grad
+        U1T_rho2 = jnp.einsum('klc,lc->k', U1T, rho_grad_rev)
+        J2T = jnp.einsum('pk,qk,k->pq', phi, phi, U1T_rho2)
+        K2T = jnp.einsum('pk,klc,qlc,lk->pq', phi, U1T, grad, m)
+        
+        J_trans = 0.5 * (J1T - J2T + J3T)
+        K_trans = 0.5 * (K1T - K2T + K3T)
+        
+        J_tot = J_dir + J_trans
+        K_tot = K_dir + K_trans
+        
+        return -(J_tot - 0.5 * K_tot)
+
+
