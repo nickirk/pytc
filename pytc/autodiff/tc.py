@@ -577,6 +577,13 @@ class ISDFTC(TC):
             )
             return K1_shard, K3_shard
             
+        # Convert sharded inputs to NumPy to avoid "incompatible devices" error in pmap.
+        # JAX will then shard and move them to GPUs automatically.
+        sharded_grid = np.asarray(sharded_grid)
+        sharded_weights = np.asarray(sharded_weights)
+        sharded_xi_phi = np.asarray(sharded_xi_phi)
+        sharded_xi_grad = np.asarray(sharded_xi_grad)
+
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
         
         K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, jastrow_params,
@@ -668,6 +675,9 @@ class ISDFTC(TC):
             G_shard = G_batches.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
             return G_shard[:, :N_shard, :]
 	
+        # Convert sharded inputs to NumPy to avoid "incompatible devices" error in pmap
+        sharded_grid = np.asarray(sharded_grid)
+        
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
         
         # G_shards: (n_devices, N_rank, n_per_device, 3)
