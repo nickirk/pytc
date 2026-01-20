@@ -116,9 +116,11 @@ class TC:
         
         # Initialize grid
         logging.info(f"TC: Initializing grid with level {grid_lvl}")
+        start_time = time.perf_counter()
         grids = dft.gen_grid.Grids(mol)
         grids.level = grid_lvl
         grids.build()
+        logging.info(f"TC: Grid initialized in {time.perf_counter() - start_time:.3f} seconds")
         
         grid_points = jnp.asarray(grids.coords)
         weights = jnp.asarray(grids.weights)
@@ -126,17 +128,35 @@ class TC:
         # Evaluate basis on grid
         # Use PySCF to evaluate AOs with numpy arrays
         logging.info(f"TC: Evaluating basis on grid")
+        start_time = time.perf_counter()
         ao = dft.numint.eval_ao(mol, grids.coords, deriv=1)
         ao_values = ao[0].T  # (N_ao, N_grid)
         ao_gradients = ao[1:4].transpose(2, 1, 0)  # (N_ao, N_grid, 3)
+        logging.info(f"TC: AO basis evaluated in {time.perf_counter() - start_time:.3f} seconds")
         
-        # Transform to MO basis
-        logging.info(f"TC: Transforming to MO basis")
-        mo_values = np.dot(mo_coeff.T, ao_values)
-        mo_gradients = np.einsum('ji,jnc->inc', mo_coeff, ao_gradients)
+        # Transform to MO basis using JAX/GPU for speed
+        logging.info(f"TC: Transforming to MO basis (GPU)")
+        start_time = time.perf_counter()
         
-        phi = jnp.asarray(mo_values)
-        grad_phi = jnp.asarray(mo_gradients)
+        # Move to GPU
+        mo_coeff_jax = jnp.asarray(mo_coeff)
+        ao_values_jax = jnp.asarray(ao_values)
+        ao_gradients_jax = jnp.asarray(ao_gradients)
+        
+        # phi = mo_coeff.T @ ao_values
+        phi = jnp.matmul(mo_coeff_jax.T, ao_values_jax)
+        
+        # grad_phi = mo_coeff.T @ ao_gradients (reshaped)
+        n_mo = mo_coeff.shape[1]
+        n_ao = mo_coeff.shape[0]
+        n_grid = grid_points.shape[0]
+        
+        # Reshape ao_gradients to (n_ao, n_grid * 3) for matmul
+        ao_grad_reshaped = ao_gradients_jax.reshape(n_ao, -1)
+        grad_phi_reshaped = jnp.matmul(mo_coeff_jax.T, ao_grad_reshaped)
+        grad_phi = grad_phi_reshaped.reshape(n_mo, n_grid, 3)
+        
+        logging.info(f"TC: MO basis transformed in {time.perf_counter() - start_time:.3f} seconds")
         
         return cls(
             grid_points=grid_points,
