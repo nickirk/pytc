@@ -656,7 +656,7 @@ class ISDFXTC(XTC, ISDFTC):
     # Fields are inherited from ISDFTC
 
     @classmethod
-    def from_xtc(cls, xtc_obj, n_rank=None):
+    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None):
         """Initialize ISDFXTC object from XTC object."""
         from . import df
         
@@ -665,7 +665,8 @@ class ISDFXTC(XTC, ISDFTC):
             
         # Perform ISDF decomposition
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
-            xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights
+            xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
+            is_incore=is_incore, save_path=save_path
         )
         
         return cls(
@@ -679,13 +680,14 @@ class ISDFXTC(XTC, ISDFTC):
             mo_coeff=xtc_obj.mo_coeff,
             mo_occ=xtc_obj.mo_occ,
             energy_nuc=xtc_obj.energy_nuc,
-            nocc=xtc_obj.nocc,
             xi_phi=xi_phi,
             xi_grad=xi_grad,
             pivots=pivots,
             phi_isdf=phi_isdf,
             grad_phi_isdf=grad_phi_isdf,
-            isdf_kernels=None
+            isdf_kernels=None,
+            is_incore=is_incore,
+            save_path=save_path
         )
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000):
@@ -801,6 +803,11 @@ class ISDFXTC(XTC, ISDFTC):
         
         D = jnp.sum(D_rep, axis=0)
         X = jnp.sum(X_rep, axis=0)
+        
+        # Move D and X to CPU RAM to avoid GPU OOM (X can be large)
+        cpu_device = jax.devices("cpu")[0]
+        D = jax.device_put(D, cpu_device)
+        X = jax.device_put(X, cpu_device)
         
         return {'D': D, 'X': X}
 

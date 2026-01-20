@@ -474,9 +474,11 @@ class ISDFTC(TC):
     phi_isdf: jnp.ndarray = struct.field(default=None)
     grad_phi_isdf: jnp.ndarray = struct.field(default=None)
     isdf_kernels: dict = struct.field(default=None, pytree_node=True)
+    is_incore: bool = struct.field(default=False)
+    save_path: str = struct.field(default=None)
 
     @classmethod
-    def from_tc(cls, tc_obj, n_rank=None):
+    def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None):
         """Initialize ISDFTC object from TC object.
         
         Args:
@@ -493,7 +495,8 @@ class ISDFTC(TC):
             
         # Perform ISDF decomposition
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
-            tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights
+            tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
+            is_incore=is_incore, save_path=save_path
         )
         
         return cls(
@@ -511,7 +514,9 @@ class ISDFTC(TC):
             pivots=pivots,
             phi_isdf=phi_isdf,
             grad_phi_isdf=grad_phi_isdf,
-            isdf_kernels=None
+            isdf_kernels=None,
+            is_incore=is_incore,
+            save_path=save_path
         )
 
     def compute_kmat_kernels(self, jastrow_params, batch_size=1024):
@@ -581,6 +586,11 @@ class ISDFTC(TC):
         K1_kernel = jnp.sum(K1_shards, axis=0)
         K3_kernel = jnp.sum(K3_shards, axis=0)
         
+        # Move to CPU RAM to avoid GPU OOM
+        cpu_device = jax.devices("cpu")[0]
+        K1_kernel = jax.device_put(K1_kernel, cpu_device)
+        K3_kernel = jax.device_put(K3_kernel, cpu_device)
+        
         return {'K1_kernel': K1_kernel, 'K3_kernel': K3_kernel}
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024):
@@ -612,11 +622,6 @@ class ISDFTC(TC):
         full_grid = self.grid_points
         full_weights = self.weights
         full_xi_phi = self.xi_phi
-        
-        logging.debug(f"DEBUG: _compute_L_aux array sizes:")
-        logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_xi_phi: {full_xi_phi.nbytes / 1e6:.2f} MB")
         
         def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_phi):
             # grid_shard: (N_shard, 3)
@@ -695,16 +700,25 @@ class ISDFTC(TC):
         
         # 2. Compute L_aux
         L_aux = self._compute_L_aux(jastrow_params, batch_size)
+        
+        # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
+        cpu_device = jax.devices("cpu")[0]
+        L_aux = jax.device_put(L_aux, cpu_device)
         kernels['L_aux'] = L_aux
         
-        if save_path:
+        # Use save_path if provided, otherwise use self.save_path
+        out_path = save_path if save_path else self.save_path
+        
+        if out_path and not self.is_incore:
             import h5py
-            with h5py.File(save_path, 'w') as f:
+            with h5py.File(out_path, 'a') as f:
                 for k, v in kernels.items():
+                    if k in f: del f[k]
                     f.create_dataset(k, data=np.array(v))
-                f.create_dataset('phi_piv', data=np.array(self.phi_isdf))
-                f.create_dataset('grad_phi_piv', data=np.array(self.grad_phi_isdf))
-                f.create_dataset('pivots', data=np.array(self.pivots))
+                # Basics are already saved by isdf_decompose, but let's ensure they are there
+                if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
+                if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
+                if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
                 
         logging.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
         

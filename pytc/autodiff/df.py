@@ -5,7 +5,9 @@ import numpy as np
 from functools import partial
 import logging
 import time
-from typing import Callable, Tuple
+import h5py
+import uuid
+import gc
 
 
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
@@ -173,7 +175,8 @@ def compute_rhs_phi(phi_p: jnp.ndarray, phi_q: jnp.ndarray,
 
 
 def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
-                   use_iterative=True, grid_batch_size=4096, rcond=1e-14):
+                   use_iterative=True, grid_batch_size=4096, rcond=1e-14,
+                   is_incore=False, save_path=None):
     """Perform ISDF decomposition of orbitals and their gradients.
     
     Memory-efficient implementation using SVD-based solver to avoid
@@ -268,71 +271,69 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         t0 = time.perf_counter()
         logging.info("Using fast normal equations solver")
         
-        # Solve for xi_phi in batches over grid points
-        # Pre-allocate on host as numpy array to avoid GPU OOM
-        xi_phi = np.zeros((n_fused, n_grid), dtype=phi.dtype)
+        # Solve for xi_phi and xi_grad
+        cpu_device = jax.devices("cpu")[0]
         n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size
         
-        logging.info(f"  Processing {n_batches} batches of size {grid_batch_size}")
-        t_batch_start = time.perf_counter()
-        
-        for batch_idx in range(n_batches):
-            g_start = batch_idx * grid_batch_size
-            g_end = min(g_start + grid_batch_size, n_grid)
+        # Setup storage
+        h5_file = None
+        if is_incore:
+            logging.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
+            xi_phi_storage = np.zeros((n_fused, n_grid), dtype=phi.dtype)
+            xi_grad_storage = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
+        else:
+            if save_path is None:
+                save_path = f"isdf_temp_{uuid.uuid4().hex[:8]}.h5"
+                logging.info(f"  No save_path provided, creating temporary HDF5: {save_path}")
             
-            # Compute RHS for this batch: phi[p,g] * phi[q,g]
-            rhs_batch = compute_rhs_phi(phi, phi, g_start, g_end)  # (n_orb², batch)
+            h5_file = h5py.File(save_path, 'a')
+            logging.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
             
-            # Solve using SVD-based pseudoinverse
-            # For phi: C[pq,m] = phi_piv[p,m] * phi_piv[q,m]
-            xi_batch = solve_normal_equations_batch(phi_piv, phi_piv, rhs_batch, rcond=rcond)
+            # Create/Reset datasets
+            for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
+                if name in h5_file: del h5_file[name]
+                h5_file.create_dataset(name, shape=shape, dtype=phi.dtype)
             
-            # Store in host array
-            xi_phi[:, g_start:g_end] = np.array(xi_batch)
+            # Store metadata
+            for name, data in [('pivots', pivots), ('phi_isdf', phi_piv), ('grad_phi_isdf', grad_phi_piv)]:
+                if name in h5_file: del h5_file[name]
+                h5_file.create_dataset(name, data=np.array(data))
             
-            if batch_idx % 20 == 0 and batch_idx > 0:
-                elapsed = time.perf_counter() - t_batch_start
-                rate = batch_idx / elapsed
-                eta = (n_batches - batch_idx) / rate if rate > 0 else 0
-                logging.info(f"    Xi_phi: batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
-        
-        cpu_device = jax.devices("cpu")[0]
-        xi_phi = jax.device_put(xi_phi, cpu_device)
-        t1 = time.perf_counter()
-        logging.info(f"Xi_phi solved in {t1 - t0:.4f} s ({n_batches/(t1-t0):.2f} batch/s)")
-        
-        # Solve for xi_grad (one component at a time)
-        t0 = time.perf_counter()
-        # Pre-allocate on host as numpy array
-        xi_grad = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
-        
-        for c in range(3):
-            t_comp_start = time.perf_counter()
-            
-            # Extract gradient component
-            grad_phi_piv_c = grad_phi_piv[:, :, c]  # (n_orb, n_fused)
-            grad_phi_c = grad_phi[:, :, c]  # (n_orb, n_grid)
-            
+            xi_phi_storage = h5_file['xi_phi']
+            xi_grad_storage = h5_file['xi_grad']
+
+        try:
+            t_batch_start = time.perf_counter()
             for batch_idx in range(n_batches):
                 g_start = batch_idx * grid_batch_size
                 g_end = min(g_start + grid_batch_size, n_grid)
                 
-                # RHS: grad_phi[p,g,c] * phi[q,g]
-                rhs_batch = compute_rhs_phi(grad_phi_c, phi, g_start, g_end)
+                # 1. Xi_phi
+                rhs_phi = compute_rhs_phi(phi, phi, g_start, g_end)
+                xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, rhs_phi, rcond=rcond)
+                xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
                 
-                # For grad: C[pq,m,c] = grad_phi_piv[p,m,c] * phi_piv[q,m]
-                xi_batch = solve_normal_equations_batch(grad_phi_piv_c, phi_piv,
-                                                        rhs_batch, rcond=rcond)
+                # 2. Xi_grad
+                for c in range(3):
+                    rhs_grad = compute_rhs_phi(grad_phi[:, :, c], phi, g_start, g_end)
+                    xi_grad_batch = solve_normal_equations_batch(grad_phi_piv[:, :, c], phi_piv,
+                                                                 rhs_grad, rcond=rcond)
+                    xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
                 
-                # Store in host array
-                xi_grad[:, g_start:g_end, c] = np.array(xi_batch)
+                if batch_idx % 20 == 0 and batch_idx > 0:
+                    elapsed = time.perf_counter() - t_batch_start
+                    rate = batch_idx / elapsed
+                    eta = (n_batches - batch_idx) / rate if rate > 0 else 0
+                    logging.info(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
             
-            t_comp = time.perf_counter() - t_comp_start
-            logging.info(f"  Xi_grad component {c} solved in {t_comp:.4f} s")
-        
-        xi_grad = jax.device_put(xi_grad, cpu_device)
-        t1 = time.perf_counter()
-        logging.info(f"Xi_grad solved in {t1 - t0:.4f} s")
+            # Load into JAX CPU RAM
+            xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
+            xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
+            
+        finally:
+            if h5_file is not None:
+                h5_file.close()
+            gc.collect()
         
     else:
         # --- OLD METHOD: Direct solve with materialized C matrices ---
