@@ -58,77 +58,88 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
     return X
 
 
-@partial(jax.jit, static_argnames=('gram_diag_fn', 'gram_col_fn', 'n_grid', 'n_rank'))
-def pivoted_cholesky_matrix_free(gram_diag_fn, gram_col_fn, n_grid, n_rank):
-    """Matrix-free pivoted Cholesky decomposition.
+@partial(jax.jit, static_argnames=('n_rank',))
+def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
+    """Specialized pivoted Cholesky for phi decomposition."""
+    n_grid = phi_weighted.shape[1]
     
-    Args:
-        gram_diag_fn: Function () -> (N_grid,) returning diagonal of Gram matrix
-        gram_col_fn: Function (pivot_idx) -> (N_grid,) returning a column of Gram matrix
-        n_grid: Number of grid points
-        n_rank: Rank of decomposition
-        
-    Returns:
-        pivots: (n_rank,) indices of selected pivots
-    """
     # Initialize diagonal
-    diag_err = gram_diag_fn()
+    diag_err = jnp.sum(phi_weighted**2, axis=0)**2 + shift
     
     # Storage for L factor (N_grid, n_rank)
-    # We build it column by column
     L = jnp.zeros((n_grid, n_rank))
     pivots = jnp.zeros(n_rank, dtype=int)
     
     def body_fn(step, state):
         diag_err, L, pivots = state
-        
-        # Select pivot
         pivot = jnp.argmax(diag_err)
         pivots = pivots.at[step].set(pivot)
         pivot_val = diag_err[pivot]
         
-        # Compute column of Gram matrix
-        S_col = gram_col_fn(pivot)
+        # gram_col_phi logic
+        dot = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
+        S_col = dot**2
+        S_col = S_col.at[pivot].add(shift)
         
-        # Compute column of L
-        # L[:, step] = (S[:, pivot] - sum(L[:, :step] * L[pivot, :step])) / sqrt(D[pivot])
-        
-        # Dot product of previous L rows with L[pivot] row
-        # L_prev = L[:, :step]  (N_grid, step)
-        # L_pivot = L[pivot, :step] (step,)
-        # dot = L_prev @ L_pivot
-        
-        # Since step is dynamic in scan (but bounded), we can mask or use dynamic slice
-        # Ideally we use the full L and mask out future columns, but they are 0 anyway.
-        
-        dot_prod = jnp.dot(L, L[pivot]) # (N_grid,)
-        
-        # Numerical stability: check for small pivot
+        dot_prod = jnp.dot(L, L[pivot])
         is_small = pivot_val < 1e-12
         safe_pivot = jnp.where(is_small, 1.0, pivot_val)
         inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
         
         l_col = (S_col - dot_prod) * inv_sqrt_pivot
-        # If pivot was small, set column to 0
         l_col = jnp.where(is_small, 0.0, l_col)
-        
         L = L.at[:, step].set(l_col)
-        
-        # Update diagonal error
-        # D_new = D_old - l_col^2
-        diag_err = diag_err - l_col**2
-        
-        # If pivot was small, force its error to 0 to avoid re-selection
+        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
         diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
-        
-        # Ensure non-negative (numerical noise)
-        diag_err = jnp.maximum(diag_err, 0.0)
         
         return diag_err, L, pivots
 
-    # Run scan
-    final_diag, final_L, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
+    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
+    return final_pivots
+
+
+@partial(jax.jit, static_argnames=('n_rank',))
+def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
+    """Specialized pivoted Cholesky for gradient decomposition."""
+    n_grid = phi_weighted.shape[1]
     
+    # Initialize diagonal
+    A_diag = jnp.sum(phi_weighted**2, axis=0)
+    B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
+    diag_err = A_diag * B_diag + shift
+    
+    # Storage for L factor (N_grid, n_rank)
+    L = jnp.zeros((n_grid, n_rank))
+    pivots = jnp.zeros(n_rank, dtype=int)
+    
+    def body_fn(step, state):
+        diag_err, L, pivots = state
+        pivot = jnp.argmax(diag_err)
+        pivots = pivots.at[step].set(pivot)
+        pivot_val = diag_err[pivot]
+        
+        # gram_col_grad logic
+        A_col = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
+        B_col = jnp.zeros(n_grid)
+        for c in range(3):
+            B_col += jnp.dot(grad_phi_weighted[:, :, c].T, grad_phi_weighted[:, pivot, c])
+        S_col = A_col * B_col
+        S_col = S_col.at[pivot].add(shift)
+        
+        dot_prod = jnp.dot(L, L[pivot])
+        is_small = pivot_val < 1e-12
+        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
+        inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
+        
+        l_col = (S_col - dot_prod) * inv_sqrt_pivot
+        l_col = jnp.where(is_small, 0.0, l_col)
+        L = L.at[:, step].set(l_col)
+        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
+        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        
+        return diag_err, L, pivots
+
+    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
     return final_pivots
 
 
@@ -213,16 +224,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     diag_phi = orb_sq**2
     shift_phi = 1e-12 * jnp.max(jnp.abs(diag_phi))
 
-    def gram_diag_phi():
-        return diag_phi + shift_phi
-        
-    def gram_col_phi(idx):
-        # Inner product weighted: (phi^T W phi_idx)
-        dot = jnp.dot(phi_weighted.T, phi_weighted[:, idx])
-        col = dot**2
-        return col.at[idx].add(shift_phi)
-        
-    pivots_phi = pivoted_cholesky_matrix_free(gram_diag_phi, gram_col_phi, n_grid, n_rank_phi)
+    pivots_phi = _pivoted_cholesky_phi(phi_weighted, n_rank_phi, shift_phi)
     t1 = time.perf_counter()
     logging.info(f"Phi decomposition completed in {t1 - t0:.4f} s")
 
@@ -238,18 +240,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     diag_grad = A_diag * B_diag
     shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
 
-    def gram_diag_grad():
-        return diag_grad + shift_grad
-        
-    def gram_col_grad(idx):
-        A_col = jnp.dot(phi_weighted.T, phi_weighted[:, idx])
-        B_col = jnp.zeros(n_grid)
-        for c in range(3):
-            B_col += jnp.dot(grad_phi_weighted[:, :, c].T, grad_phi_weighted[:, idx, c])
-        col = A_col * B_col
-        return col.at[idx].add(shift_grad)
-        
-    pivots_grad = pivoted_cholesky_matrix_free(gram_diag_grad, gram_col_grad, n_grid, n_rank_grad)
+    pivots_grad = _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad)
     t1 = time.perf_counter()
     logging.info(f"Grad decomposition completed in {t1 - t0:.4f} s")
     
