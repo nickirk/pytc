@@ -115,6 +115,7 @@ class TC:
         nocc = int(np.sum(mf.mo_occ > 0))
         
         # Initialize grid
+        logging.info(f"TC: Initializing grid with level {grid_lvl}")
         grids = dft.gen_grid.Grids(mol)
         grids.level = grid_lvl
         grids.build()
@@ -124,11 +125,13 @@ class TC:
         
         # Evaluate basis on grid
         # Use PySCF to evaluate AOs with numpy arrays
+        logging.info(f"TC: Evaluating basis on grid")
         ao = dft.numint.eval_ao(mol, grids.coords, deriv=1)
         ao_values = ao[0].T  # (N_ao, N_grid)
         ao_gradients = ao[1:4].transpose(2, 1, 0)  # (N_ao, N_grid, 3)
         
         # Transform to MO basis
+        logging.info(f"TC: Transforming to MO basis")
         mo_values = np.dot(mo_coeff.T, ao_values)
         mo_gradients = np.einsum('ji,jnc->inc', mo_coeff, ao_gradients)
         
@@ -472,11 +475,6 @@ class ISDFTC(TC):
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights
         )
-        
-        # Move large arrays to CPU to avoid OOM
-        cpu_device = jax.devices("cpu")[0]
-        xi_phi = jax.device_put(xi_phi, cpu_device)
-        xi_grad = jax.device_put(xi_grad, cpu_device)
         
         return cls(
             grid_points=tc_obj.grid_points,

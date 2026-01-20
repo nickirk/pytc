@@ -266,10 +266,11 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     # --- 5. Solve for xi_phi and xi_grad using fast normal equations solver ---
     if use_iterative:
         t0 = time.perf_counter()
-        logging.info("Using fast normal equations solver (memory-efficient, exploits structure)")
+        logging.info("Using fast normal equations solver")
         
         # Solve for xi_phi in batches over grid points
-        xi_phi_list = []
+        # Pre-allocate on host as numpy array to avoid GPU OOM
+        xi_phi = np.zeros((n_fused, n_grid), dtype=phi.dtype)
         n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size
         
         logging.info(f"  Processing {n_batches} batches of size {grid_batch_size}")
@@ -285,7 +286,9 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
             # Solve using SVD-based pseudoinverse
             # For phi: C[pq,m] = phi_piv[p,m] * phi_piv[q,m]
             xi_batch = solve_normal_equations_batch(phi_piv, phi_piv, rhs_batch, rcond=rcond)
-            xi_phi_list.append(xi_batch)
+            
+            # Store in host array
+            xi_phi[:, g_start:g_end] = np.array(xi_batch)
             
             if batch_idx % 20 == 0 and batch_idx > 0:
                 elapsed = time.perf_counter() - t_batch_start
@@ -293,17 +296,18 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                 eta = (n_batches - batch_idx) / rate if rate > 0 else 0
                 logging.info(f"    Xi_phi: batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
         
-        xi_phi = jnp.concatenate(xi_phi_list, axis=1)  # (n_fused, n_grid)
+        cpu_device = jax.devices("cpu")[0]
+        xi_phi = jax.device_put(xi_phi, cpu_device)
         t1 = time.perf_counter()
         logging.info(f"Xi_phi solved in {t1 - t0:.4f} s ({n_batches/(t1-t0):.2f} batch/s)")
         
         # Solve for xi_grad (one component at a time)
         t0 = time.perf_counter()
-        xi_grad_components = []
+        # Pre-allocate on host as numpy array
+        xi_grad = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
         
         for c in range(3):
             t_comp_start = time.perf_counter()
-            xi_grad_c_list = []
             
             # Extract gradient component
             grad_phi_piv_c = grad_phi_piv[:, :, c]  # (n_orb, n_fused)
@@ -319,14 +323,14 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                 # For grad: C[pq,m,c] = grad_phi_piv[p,m,c] * phi_piv[q,m]
                 xi_batch = solve_normal_equations_batch(grad_phi_piv_c, phi_piv,
                                                         rhs_batch, rcond=rcond)
-                xi_grad_c_list.append(xi_batch)
+                
+                # Store in host array
+                xi_grad[:, g_start:g_end, c] = np.array(xi_batch)
             
-            xi_grad_c = jnp.concatenate(xi_grad_c_list, axis=1)  # (n_fused, n_grid)
-            xi_grad_components.append(xi_grad_c)
             t_comp = time.perf_counter() - t_comp_start
             logging.info(f"  Xi_grad component {c} solved in {t_comp:.4f} s")
         
-        xi_grad = jnp.stack(xi_grad_components, axis=-1)  # (n_fused, n_grid, 3)
+        xi_grad = jax.device_put(xi_grad, cpu_device)
         t1 = time.perf_counter()
         logging.info(f"Xi_grad solved in {t1 - t0:.4f} s")
         

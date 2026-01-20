@@ -668,11 +668,6 @@ class ISDFXTC(XTC, ISDFTC):
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights
         )
         
-        # Move large arrays to CPU to avoid OOM
-        cpu_device = jax.devices("cpu")[0]
-        xi_phi = jax.device_put(xi_phi, cpu_device)
-        xi_grad = jax.device_put(xi_grad, cpu_device)
-        
         return cls(
             grid_points=xtc_obj.grid_points,
             weights=xtc_obj.weights,
