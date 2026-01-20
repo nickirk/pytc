@@ -599,11 +599,6 @@ class ISDFTC(TC):
         K1_kernel = jnp.sum(K1_shards, axis=0)
         K3_kernel = jnp.sum(K3_shards, axis=0)
         
-        # Move to CPU RAM to avoid GPU OOM
-        cpu_device = jax.devices("cpu")[0]
-        K1_kernel = jax.device_put(K1_kernel, cpu_device)
-        K3_kernel = jax.device_put(K3_kernel, cpu_device)
-        
         return {'K1_kernel': K1_kernel, 'K3_kernel': K3_kernel}
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024):

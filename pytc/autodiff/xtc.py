@@ -805,19 +805,13 @@ class ISDFXTC(XTC, ISDFTC):
         full_grid = np.asarray(full_grid)
         full_weights = np.asarray(full_weights)
         full_xi_phi = np.asarray(full_xi_phi)
-
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
         
         # Returns tuple of accumulators: (D, X)
         D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
-        
+        # Sum over devices
         D = jnp.sum(D_rep, axis=0)
         X = jnp.sum(X_rep, axis=0)
-        
-        # Move D and X to CPU RAM to avoid GPU OOM (X can be large)
-        cpu_device = jax.devices("cpu")[0]
-        D = jax.device_put(D, cpu_device)
-        X = jax.device_put(X, cpu_device)
         
         return {'D': D, 'X': X}
 
@@ -917,7 +911,7 @@ class ISDFXTC(XTC, ISDFTC):
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
         start_time = time.perf_counter()
-        logging.debug("Starting ISDFXTC.get_delta_U")
+        logging.info("Starting ISDFXTC.get_delta_U")
         
         # Check if kernels are available
         if self.isdf_kernels is None:
@@ -945,7 +939,7 @@ class ISDFXTC(XTC, ISDFTC):
             final_result = -(result + result_T.transpose(2, 3, 0, 1))
 
         total_time = time.perf_counter() - start_time
-        logging.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        logging.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
     @staticmethod
