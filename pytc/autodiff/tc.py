@@ -5,8 +5,10 @@ from typing import Any, Optional
 import numpy as np
 import logging
 import time
+import gc
 import jax
 import jax.numpy as jnp
+import h5py
 from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
@@ -530,34 +532,84 @@ class ISDFTC(TC):
         n_rank = self.phi_isdf.shape[1]
         
         # Pad grid to be divisible by n_devices
+        logging.info(f"     compute_kmat_kernels: Padding grid to be divisible by {n_devices} devices...")
         remainder = n_grid % n_devices
-        if remainder != 0:
-            padding = n_devices - remainder
-            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
-            padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
-            padded_xi_grad = jnp.pad(self.xi_grad, ((0, 0), (0, padding), (0, 0)))
-        else:
-            padded_grid_points = self.grid_points
-            padded_weights = self.weights
-            padded_xi_phi = self.xi_phi
-            padded_xi_grad = self.xi_grad
-            
-        n_grid_padded = padded_grid_points.shape[0]
+        padding = (n_devices - remainder) if remainder != 0 else 0
+        n_grid_padded = n_grid + padding
         n_per_device = n_grid_padded // n_devices
+        devices = jax.local_devices()
         
         # Shard arrays for r1 (bra side)
+        padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
+        padded_weights = jnp.pad(self.weights, ((0, padding),))
         sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
         sharded_weights = padded_weights.reshape(n_devices, n_per_device)
         
-        # Shard xi_phi and xi_grad for r1 on CPU
-        sharded_xi_phi = padded_xi_phi.reshape(n_rank, n_devices, n_per_device).transpose(1, 0, 2)
-        sharded_xi_grad = padded_xi_grad.reshape(n_rank, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
-        
+        # Shard xi_phi and xi_grad for r1
+        if self.xi_phi is not None:
+            # In-core: use existing arrays
+            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
+            padded_xi_grad = jnp.pad(self.xi_grad, ((0, 0), (0, padding), (0, 0)))
+            
+            sharded_xi_phi_list = [padded_xi_phi[:, d*n_per_device:(d+1)*n_per_device] for d in range(n_devices)]
+            sharded_xi_grad_list = [padded_xi_grad[:, d*n_per_device:(d+1)*n_per_device, :] for d in range(n_devices)]
+            
+            sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+            sharded_xi_grad = jax.device_put_sharded(sharded_xi_grad_list, devices)
+            
+            full_xi_phi = jax.device_put(self.xi_phi, devices[0])
+            
+            del padded_xi_phi, padded_xi_grad, sharded_xi_phi_list, sharded_xi_grad_list
+            gc.collect()
+        else:
+            # Out-of-core: read shards from HDF5 to avoid host RAM OOM
+            logging.info(f"  compute_kmat_kernels: Streaming ISDF coefficients from {self.save_path}")
+            sharded_xi_phi_list = []
+            sharded_xi_grad_list = []
+            
+            with h5py.File(self.save_path, 'r') as f:
+                xi_phi_ds = f['xi_phi']
+                xi_grad_ds = f['xi_grad']
+                
+                for d in range(n_devices):
+                    start = d * n_per_device
+                    end = min((d + 1) * n_per_device, n_grid)
+                    actual_len = end - start
+                    
+                    # Read xi_phi shard
+                    xi_phi_d = xi_phi_ds[:, start:end]
+                    if actual_len < n_per_device:
+                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
+                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
+                    del xi_phi_d
+                    
+                    # Read xi_grad shard
+                    xi_grad_d = xi_grad_ds[:, start:end, :]
+                    if actual_len < n_per_device:
+                        xi_grad_d = np.pad(xi_grad_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
+                    sharded_xi_grad_list.append(jax.device_put(xi_grad_d, devices[d]))
+                    del xi_grad_d
+                
+                # For the "ket" side, we still need the full xi_phi.
+                # We read it into host RAM once and put it on device immediately.
+                full_xi_phi = jax.device_put(xi_phi_ds[:], devices[0])
+                
+            # Use jax.device_put_sharded to create sharded arrays from the list of device-resident shards
+            sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+            sharded_xi_grad = jax.device_put_sharded(sharded_xi_grad_list, devices)
+            
+            del sharded_xi_phi_list, sharded_xi_grad_list
+            gc.collect()
+
         # Full arrays for r2 (ket side) - on CPU
-        full_grid = self.grid_points
-        full_weights = self.weights
-        full_xi_phi = self.xi_phi
+        full_grid = jax.device_put(np.asarray(self.grid_points), devices[0])
+        full_weights = jax.device_put(np.asarray(self.weights), devices[0])
+        # full_xi_phi is already device-resident
+        
+        # Convert sharded_grid and sharded_weights to NumPy for pmap
+        sharded_grid = np.asarray(sharded_grid)
+        sharded_weights = np.asarray(sharded_weights)
+        gc.collect()
         
         
         jastrow_factor = self.jastrow_factor
@@ -579,21 +631,14 @@ class ISDFTC(TC):
             
         # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap.
         # JAX will then handle broadcasting and streaming from Host RAM.
-        sharded_grid = np.asarray(sharded_grid)
-        sharded_weights = np.asarray(sharded_weights)
-        sharded_xi_phi = np.asarray(sharded_xi_phi)
-        sharded_xi_grad = np.asarray(sharded_xi_grad)
-        
-        full_grid = np.asarray(full_grid)
-        full_weights = np.asarray(full_weights)
-        full_xi_phi = np.asarray(full_xi_phi)
+        # Note: sharded_xi_phi and sharded_xi_grad are already device-resident or NumPy.
 
-        logging.info(f"  Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
+        logging.info(f"  compute_kmat_kernels: Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
         
         K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, jastrow_params,
                                                full_grid, full_weights, full_xi_phi)
-        logging.info("  K-kernels pmap completed.")
+        logging.info("  compute_kmat_kernels: K-kernels pmap completed.")
         
         # Sum over devices
         K1_kernel = jnp.sum(K1_shards, axis=0)
@@ -611,7 +656,14 @@ class ISDFTC(TC):
         """
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
-        n_rank = self.xi_phi.shape[0]
+        
+        if self.xi_phi is not None:
+            n_rank = self.xi_phi.shape[0]
+            full_xi_phi = jax.device_put(self.xi_phi, jax.devices()[0])
+        else:
+            with h5py.File(self.save_path, 'r') as f:
+                n_rank = f['xi_phi'].shape[0]
+                full_xi_phi = jax.device_put(f['xi_phi'][:], jax.devices()[0])
         
         # Pad grid to be divisible by n_devices
         remainder = n_grid % n_devices
@@ -629,7 +681,6 @@ class ISDFTC(TC):
         
         full_grid = self.grid_points
         full_weights = self.weights
-        full_xi_phi = self.xi_phi
         
         def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_phi):
             # grid_shard: (N_shard, 3)
@@ -676,10 +727,12 @@ class ISDFTC(TC):
             G_shard = G_batches.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
             return G_shard[:, :N_shard, :]
 	
-        # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap
+        # Convert inputs to NumPy for pmap
         sharded_grid = np.asarray(sharded_grid)
-        full_weights = np.asarray(full_weights)
-        full_xi_phi = np.asarray(full_xi_phi)
+        full_grid = jax.device_put(np.asarray(self.grid_points), jax.devices()[0])
+        full_weights = jax.device_put(np.asarray(self.weights), jax.devices()[0])
+        # full_xi_phi is already device-resident
+        gc.collect()
         
         logging.info(f"  Starting pmap for L_aux (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
@@ -711,12 +764,20 @@ class ISDFTC(TC):
         start_time = time.perf_counter()
         
         # 1. Compute K1_kernel and K3_kernel
+        logging.info("  Computing K1 and K3 kernels...")
+        
         kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
+        logging.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
+        logging.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
         
         # 2. Compute L_aux
+        logging.info("  Computing L_aux...")
         L_aux = self._compute_L_aux(jastrow_params, batch_size)
         
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
+        logging.info("  Moving L_aux to CPU")
+        logging.info(f"    L_aux shape: {L_aux.shape}")
+        logging.info(f"    L_aux size: {L_aux.size * 8 / 1024**3:.2f} GB")
         cpu_device = jax.devices("cpu")[0]
         L_aux = jax.device_put(L_aux, cpu_device)
         kernels['L_aux'] = L_aux
@@ -861,7 +922,13 @@ class ISDFTC(TC):
         # 5. Integrate Fock matrix using ISDF
         # F_mn = sum_mu (sum_g w_g xi_mu(g) V_3b(g)) phi_m(mu) phi_n(mu)
         weighted_V = self.weights * V_3b_g
-        V_proj = jnp.dot(self.xi_phi, weighted_V) # (N_aux,)
+        
+        if self.xi_phi is not None:
+            V_proj = jnp.dot(self.xi_phi, weighted_V) # (N_aux,)
+        else:
+            with h5py.File(self.save_path, 'r') as f:
+                xi_phi = f['xi_phi'][:]
+                V_proj = jnp.dot(xi_phi, weighted_V)
         
         phi_pivots = self.phi_isdf # (N_orb, N_aux)
         weighted_phi = phi_pivots * V_proj[None, :]

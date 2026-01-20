@@ -8,6 +8,7 @@ import time
 import h5py
 import uuid
 import gc
+import os
 
 
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
@@ -202,6 +203,27 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         xi_grad: (N_fused, N_grid, 3)
         pivots: (N_fused,)
     """
+    if save_path is not None and os.path.exists(save_path):
+        try:
+            with h5py.File(save_path, 'r') as f:
+                if all(k in f for k in ['xi_phi', 'xi_grad', 'pivots', 'phi_isdf', 'grad_phi_isdf']):
+                    logging.info(f"Loading ISDF decomposition from {save_path}")
+                    pivots = jnp.array(f['pivots'][:])
+                    phi_piv = jnp.array(f['phi_isdf'][:])
+                    grad_phi_piv = jnp.array(f['grad_phi_isdf'][:])
+                    
+                    if is_incore:
+                        cpu_device = jax.devices("cpu")[0]
+                        xi_phi = jax.device_put(f['xi_phi'][:], cpu_device)
+                        xi_grad = jax.device_put(f['xi_grad'][:], cpu_device)
+                    else:
+                        xi_phi = None
+                        xi_grad = None
+                        
+                    return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, save_path
+        except Exception as e:
+            logging.warning(f"Failed to load ISDF from {save_path}: {e}. Recomputing...")
+
     n_orb, n_grid = phi.shape
     
     if weights is None:
@@ -326,9 +348,13 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                     eta = (n_batches - batch_idx) / rate if rate > 0 else 0
                     logging.info(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
             
-            # Load into JAX CPU RAM
-            xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
-            xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
+            # Load into JAX CPU RAM if requested
+            if is_incore:
+                xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
+                xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
+            else:
+                xi_phi = None
+                xi_grad = None
             
             # Explicitly delete storage to save RAM
             if is_incore:

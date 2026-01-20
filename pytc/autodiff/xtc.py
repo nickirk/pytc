@@ -4,8 +4,10 @@ from functools import partial, reduce
 import numpy as np
 import logging
 import time
+import gc
 import jax
 import jax.numpy as jnp
+import h5py
 from flax import struct
 from .tc import TC, ISDFTC
 from . import tc_helper
@@ -748,7 +750,6 @@ class ISDFXTC(XTC, ISDFTC):
         # Ensure L_aux is on CPU
         cpu_device = jax.devices("cpu")[0]
         L_aux = jax.device_put(L_aux, cpu_device)
-        G_full = -L_aux # Recover G
         
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
@@ -757,112 +758,181 @@ class ISDFXTC(XTC, ISDFTC):
         
         # Pad grid
         remainder = n_grid % n_devices
-        if remainder != 0:
-            padding = n_devices - remainder
-            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
-            padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
-            padded_G = jnp.pad(G_full, ((0, 0), (0, padding), (0, 0)))
-        else:
-            padded_grid_points = self.grid_points
-            padded_weights = self.weights
-            padded_xi_phi = self.xi_phi
-            padded_G = G_full
-            
-        n_grid_padded = padded_grid_points.shape[0]
+        padding = (n_devices - remainder) if remainder != 0 else 0
+        n_grid_padded = n_grid + padding
         n_per_device = n_grid_padded // n_devices
+        devices = jax.local_devices()
         
-        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
-        sharded_weights = padded_weights.reshape(n_devices, n_per_device)
+        sharded_grid = jnp.pad(self.grid_points, ((0, padding), (0, 0))).reshape(n_devices, n_per_device, 3)
+        sharded_weights = jnp.pad(self.weights, ((0, padding),)).reshape(n_devices, n_per_device)
         
-        # Shard xi_phi and G for r1 on CPU
-        sharded_xi_phi = padded_xi_phi.reshape(n_rank, n_devices, n_per_device).transpose(1, 0, 2)
-        sharded_G = padded_G.reshape(n_rank, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
+        # Shard G (-L_aux) for r1 directly to avoid large copies
+        sharded_G_list = []
+        for d in range(n_devices):
+            start = d * n_per_device
+            end = min((d + 1) * n_per_device, n_grid)
+            actual_len = end - start
+            # G = -L_aux
+            G_d = -L_aux[:, start:end, :]
+            if actual_len < n_per_device:
+                G_d = jnp.pad(G_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
+            sharded_G_list.append(jax.device_put(G_d, devices[d]))
+            del G_d
+        sharded_G = jax.device_put_sharded(sharded_G_list, devices)
+        del sharded_G_list
+        gc.collect()
         
+        if self.xi_phi is not None:
+            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
+            sharded_xi_phi_list = [padded_xi_phi[:, d*n_per_device:(d+1)*n_per_device] for d in range(n_devices)]
+            sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+            full_xi_phi = jax.device_put(self.xi_phi, devices[0])
+            del padded_xi_phi, sharded_xi_phi_list
+            gc.collect()
+        else:
+            logging.info(f"  _compute_delta_u_kernels_raw: Streaming xi_phi from {self.save_path}")
+            sharded_xi_phi_list = []
+            with h5py.File(self.save_path, 'r') as f:
+                xi_phi_ds = f['xi_phi']
+                for d in range(n_devices):
+                    start = d * n_per_device
+                    end = min((d + 1) * n_per_device, n_grid)
+                    actual_len = end - start
+                    xi_phi_d = xi_phi_ds[:, start:end]
+                    if actual_len < n_per_device:
+                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
+                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
+                    del xi_phi_d
+                full_xi_phi = jax.device_put(xi_phi_ds[:], devices[0])
+            sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+            del sharded_xi_phi_list
+            gc.collect()
+            
         Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         
-        full_grid = self.grid_points
-        full_weights = self.weights
-        full_xi_phi = self.xi_phi
+        full_grid = jax.device_put(np.asarray(self.grid_points), devices[0])
+        full_weights = jax.device_put(np.asarray(self.weights), devices[0])
+        # full_xi_phi is already device-resident
+        gc.collect()
 
 
         phi_isdf = self.phi_isdf
         n_orb = self.n_orb
-        calc_shard_fn = self._calc_delta_U_kernels_shard
         
-        def compute_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
-            return calc_shard_fn(
+        # Debug output for array sizes
+        def get_gb(shape):
+            return np.prod(shape) * 8 / 1024**3
+            
+        logging.info(f"Delta U Kernel Sizes (GB):")
+        logging.info(f"  phi_isdf: {get_gb(phi_isdf.shape):.3f} GB {phi_isdf.shape}")
+        if self.xi_phi is not None:
+            logging.info(f"  xi_phi:   {get_gb(self.xi_phi.shape):.3f} GB {self.xi_phi.shape}")
+        else:
+            logging.info(f"  xi_phi:   None (Out-of-core)")
+        logging.info(f"  dm1:      {get_gb(dm1.shape):.3f} GB {dm1.shape}")
+        
+        # Estimated sizes in _calc_delta_U_kernels_shard
+        n_rank = phi_isdf.shape[1]
+        logging.info(f"Estimated GPU intermediates (per device):")
+        logging.info(f"  c_phi_ru: {get_gb((n_orb, n_orb, n_rank)):.3f} GB")
+        logging.info(f"  L:        {get_gb((n_orb, n_orb, n_rank)):.3f} GB")
+        logging.info(f"  Y/Z/M/N:  {get_gb((n_orb, n_orb, batch_size, 3)):.3f} GB each")
+        logging.info(f"  YZ/L_tilde/C_tilde: {get_gb((n_orb, n_orb, n_rank)):.3f} GB each")
+
+        dm1_diag = jnp.diagonal(dm1)
+        phi_dm = phi_isdf * dm1_diag[:, None]
+        Q = jnp.dot(phi_dm.T, phi_isdf) # (N_rank, N_rank)
+        
+        calc_D_fn = self._calc_D_shard
+        calc_X2_fn = self._calc_X2_shard
+        calc_X3_1_fn = self._calc_X3_1_shard
+        calc_X3_2_fn = self._calc_X3_2_shard
+        
+        # Convert remaining inputs to NumPy for pmap
+        sharded_grid = np.asarray(sharded_grid)
+        sharded_weights = np.asarray(sharded_weights)
+        
+        # Log estimated peak memory for the new loop-based approach
+        # Peak intermediate per batch: 2 * (batch * Nr * N_rank) + (Nr * Ns * N_rank)
+        # For 512, 800, 5000: 2 * 7.6 GB + 12 GB = 27.2 GB.
+        # This is much better than the 93 GB before.
+        logging.info(f"  Estimated peak intermediate per batch: {2 * get_gb((batch_size, n_orb, n_rank)) + get_gb((n_orb, n_orb, n_rank)):.3f} GB")
+        
+        gc.collect()
+
+        # Stage 1: D Term
+        def compute_D_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
+            return calc_D_fn(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
                 Gb, phi_isdf, ranges, n_orb, batch_size
             )
-
-        # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap
-        sharded_grid = np.asarray(sharded_grid)
-        sharded_weights = np.asarray(sharded_weights)
-        sharded_xi_phi = np.asarray(sharded_xi_phi)
-        sharded_G = np.asarray(sharded_G)
-        
-        full_grid = np.asarray(full_grid)
-        full_weights = np.asarray(full_weights)
-        full_xi_phi = np.asarray(full_xi_phi)
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
-        
-        # Returns tuple of accumulators: (D, X)
-        D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
-        # Sum over devices
+        pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
+        D_rep = pmapped_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
         D = jnp.sum(D_rep, axis=0)
-        X = jnp.sum(X_rep, axis=0)
+        del D_rep
+        gc.collect()
+
+        # Stage 2: X2 Term
+        def compute_X2_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
+            return calc_X2_fn(
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, phi_isdf, ranges, n_orb, batch_size, Q
+            )
+        pmapped_X2 = jax.pmap(compute_X2_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
+        X2_rep = pmapped_X2(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
+        X2 = jnp.sum(X2_rep, axis=0)
+        del X2_rep
+        gc.collect()
+
+        # Stage 3: X3_1 Term
+        def compute_X3_1_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
+            return calc_X3_1_fn(
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, phi_isdf, ranges, n_orb, batch_size, Q
+            )
+        pmapped_X3_1 = jax.pmap(compute_X3_1_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
+        X3_1_rep = pmapped_X3_1(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
+        X3_1 = jnp.sum(X3_1_rep, axis=0)
+        del X3_1_rep
+        gc.collect()
+
+        # Stage 4: X3_2 Term
+        def compute_X3_2_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
+            return calc_X3_2_fn(
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, phi_isdf, ranges, n_orb, batch_size, Q
+            )
+        pmapped_X3_2 = jax.pmap(compute_X3_2_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
+        X3_2_rep = pmapped_X3_2(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
+        X3_2 = jnp.sum(X3_2_rep, axis=0)
+        del X3_2_rep
+        gc.collect()
+
+        X = X2 + X3_1 + X3_2
         
         return {'D': D, 'X': X}
 
-    def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
-                                 Gb, phi, ranges, n_orb, batch_size=1024):
-        """Calculate Delta U kernels for a shard."""
-        Nb = n_orb
+    def _calc_D_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
+                      Gb, phi, ranges, n_orb, batch_size=1024):
+        """Calculate D kernel for a shard."""
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
         
-        slice_p, slice_q, slice_r, slice_s = ranges
-        phi_p = phi[slice_p]
-        phi_q = phi[slice_q]
-        phi_r = phi[slice_r]
-        phi_s = phi[slice_s]
-
-        Nr = phi_r.shape[0]
-        Ns = phi_s.shape[0]
-
-        # Reconstruct C_phi from phi
-        c_phi_ru = jnp.einsum('rb,ub->rub', phi_r, phi)
-        
-        # Pre-compute L for Terms 2 & 3
-        c_phi_us = jnp.einsum('ub,sb->usb', phi, phi_s)
-        L = jnp.einsum('tu,tsc->usc', dm1, c_phi_us)
-        
-        # Initialize accumulators
-        D_acc = jnp.zeros((N_rank, N_rank))
-        X_acc = jnp.zeros((Nr, Ns, N_rank))
-        
         # Pad grid for scanning
         padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
-        grid_padded = jnp.pad(grid_points, ((0, padded_size - N_shard), (0, 0)))
         weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
         xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
         G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
         
         n_batches = padded_size // batch_size
 
-        def scan_body(carry, i_batch):
-            D_acc_curr, X_acc_curr = carry
-            
-            # Slice batches from host
-            r_batch = jax.lax.dynamic_slice(grid_padded, (i_batch * batch_size, 0), (batch_size, 3))
+        def scan_D(D_acc, i_batch):
             w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
             xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
             G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
             
-            # G_batch is (N_rank, batch, 3)
+            G_flat = G_batch.reshape(N_rank, -1)
             
-            # --- Combined D Term (2*D1 + D4) ---
             # D1 part
             H = jnp.einsum('b,bik->ik', Gb, G_batch)
             V = jnp.einsum('ik,dik->di', H, G_batch)
@@ -870,36 +940,151 @@ class ISDFXTC(XTC, ISDFTC):
             
             # D4 part
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
-            G_flat = G_batch.reshape(N_rank, -1)
             G_weighted = G_batch * w_tilde[None, :, None]
             G_weighted_flat = G_weighted.reshape(N_rank, -1)
             D4_update = jnp.dot(G_weighted_flat, G_flat.T)
             
-            D_update = 2 * D1_update + D4_update
-            
-            # --- Combined X Term (X2 + X3) ---
-            # X2 part
-            Y = jnp.einsum('usc,cik->usik', L, G_batch)
-            Z = jnp.einsum('rub,bik->ruik', c_phi_ru, G_batch)
-            YZ = jnp.einsum('usik,ruik->rsi', Y, Z)
-            X2_update = jnp.einsum('i,ai,rsi->rsa', w_batch, xi_batch, YZ)
-            
-            # X3 part
-            L_tilde = jnp.einsum('usc,ci->usi', L, xi_batch)
-            M = jnp.einsum('usi,ruik->rsik', L_tilde, Z)
-            X3_1_update = jnp.einsum('i,aik,rsik->rsa', w_batch, G_batch, M)
-            
-            C_tilde = jnp.einsum('rub,bi->rui', c_phi_ru, xi_batch)
-            N_tensor = jnp.einsum('usik,rui->rski', Y, C_tilde)
-            X3_2_update = jnp.einsum('i,aik,rski->rsa', w_batch, G_batch, N_tensor)
-            
-            X_update = X2_update + X3_1_update + X3_2_update
-            
-            return (D_acc_curr + D_update, X_acc_curr + X_update), None
-
-        final_accumulators, _ = jax.lax.scan(scan_body, (D_acc, X_acc), jnp.arange(n_batches))
+            return D_acc + 2 * D1_update + D4_update, None
         
-        return final_accumulators
+        D_final, _ = jax.lax.scan(scan_D, jnp.zeros((N_rank, N_rank)), jnp.arange(n_batches))
+        return D_final
+
+    def _calc_X2_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
+                       Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
+        """Calculate X2 kernel for a shard using Q-matrix optimization."""
+        N_rank = phi.shape[1]
+        N_shard = grid_points.shape[0]
+        
+        slice_p, slice_q, slice_r, slice_s = ranges
+        phi_r = phi[slice_r]
+        phi_s = phi[slice_s]
+        Nr = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+        
+        # Pad grid for scanning
+        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
+        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
+        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
+        
+        n_batches = padded_size // batch_size
+
+        def scan_X2(X_acc, i_batch):
+            w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
+            xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
+            G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
+            
+            YZ = 0
+            for k in range(3):
+                G_k = G_batch[:, :, k] # (N_rank, batch)
+                
+                @jax.checkpoint
+                def compute_YZ_ki(G_ki):
+                    # G_ki: (N_rank,)
+                    phi_r_G = phi_r * G_ki[None, :]
+                    phi_s_G = phi_s * G_ki[None, :]
+                    return phi_r_G @ Q @ phi_s_G.T # (Nr, Ns)
+                
+                YZ += jax.vmap(compute_YZ_ki, in_axes=0)(G_k.T) # (batch, Nr, Ns)
+            # YZ is (batch, Nr, Ns). We need (Nr, Ns, batch) for X2_update.
+            YZ = YZ.transpose(1, 2, 0) # (Nr, Ns, batch)
+            
+            # Use matmul for better memory efficiency: (Nr, Ns, batch) @ (batch, N_rank)
+            X2_update = jnp.matmul(YZ * w_batch[None, None, :], xi_batch.T)
+            return X_acc + X2_update, None
+        
+        X2_final, _ = jax.lax.scan(scan_X2, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
+        return X2_final
+
+    def _calc_X3_1_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
+                         Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
+        """Calculate X3_1 kernel for a shard using Q-matrix optimization."""
+        N_rank = phi.shape[1]
+        N_shard = grid_points.shape[0]
+        
+        slice_p, slice_q, slice_r, slice_s = ranges
+        phi_r = phi[slice_r]
+        phi_s = phi[slice_s]
+        Nr = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+        
+        # Pad grid for scanning
+        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
+        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
+        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
+        
+        n_batches = padded_size // batch_size
+
+        def scan_X3_1(X_acc, i_batch):
+            w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
+            xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
+            G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
+            
+            X3_1_update = 0
+            for k in range(3):
+                G_k = G_batch[:, :, k] # (N_rank, batch)
+                
+                @jax.checkpoint
+                def compute_M_ki(G_ki, xi_i):
+                    # G_ki: (N_rank,), xi_i: (N_rank,)
+                    phi_r_G = phi_r * G_ki[None, :]
+                    phi_s_xi = phi_s * xi_i[None, :]
+                    return phi_r_G @ Q @ phi_s_xi.T # (Nr, Ns)
+                
+                M_k = jax.vmap(compute_M_ki, in_axes=(0, 0))(G_k.T, xi_batch.T) # (batch, Nr, Ns)
+                X3_1_update += jnp.matmul(M_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
+            
+            return X_acc + X3_1_update, None
+        
+        X3_1_final, _ = jax.lax.scan(scan_X3_1, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
+        return X3_1_final
+
+    def _calc_X3_2_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
+                         Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
+        """Calculate X3_2 kernel for a shard using Q-matrix optimization."""
+        N_rank = phi.shape[1]
+        N_shard = grid_points.shape[0]
+        
+        slice_p, slice_q, slice_r, slice_s = ranges
+        phi_r = phi[slice_r]
+        phi_s = phi[slice_s]
+        Nr = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+        
+        # Pad grid for scanning
+        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
+        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
+        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
+        
+        n_batches = padded_size // batch_size
+
+        def scan_X3_2(X_acc, i_batch):
+            w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
+            xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
+            G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
+            
+            X3_2_update = 0
+            for k in range(3):
+                G_k = G_batch[:, :, k] # (N_rank, batch)
+                
+                @jax.checkpoint
+                def compute_N_ki(G_ki, xi_i):
+                    # G_ki: (N_rank,), xi_i: (N_rank,)
+                    phi_r_xi = phi_r * xi_i[None, :]
+                    phi_s_G = phi_s * G_ki[None, :]
+                    return phi_r_xi @ Q @ phi_s_G.T # (Nr, Ns)
+                
+                N_k = jax.vmap(compute_N_ki, in_axes=(0, 0))(G_k.T, xi_batch.T) # (batch, Nr, Ns)
+                X3_2_update += jnp.matmul(N_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
+            
+            return X_acc + X3_2_update, None
+        
+        X3_2_final, _ = jax.lax.scan(scan_X3_2, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
+        return X3_2_final
+
+
 
     def get_delta_U(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Get delta_U matrix using ISDF with pmap support."""
