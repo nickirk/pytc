@@ -445,7 +445,7 @@ class ISDFTC(TC):
         grad_phi: ISDF basis for gradients (Nb, N_fused, 3)
         isdf_kernels: Dictionary storing precomputed kernels (U1, U3)
     """
-    xi_rho: jnp.ndarray = struct.field(default=None)
+    xi_phi: jnp.ndarray = struct.field(default=None)
     xi_grad: jnp.ndarray = struct.field(default=None)
     pivots: jnp.ndarray = struct.field(default=None)
     phi_isdf: jnp.ndarray = struct.field(default=None)
@@ -469,11 +469,14 @@ class ISDFTC(TC):
             n_rank = tc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        # We use the same rank for both phi and grad for simplicity, 
-        # matching the numpy implementation default behavior
-        phi_isdf, xi_rho, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights
         )
+        
+        # Move large arrays to CPU to avoid OOM
+        cpu_device = jax.devices("cpu")[0]
+        xi_phi = jax.device_put(xi_phi, cpu_device)
+        xi_grad = jax.device_put(xi_grad, cpu_device)
         
         return cls(
             grid_points=tc_obj.grid_points,
@@ -485,7 +488,7 @@ class ISDFTC(TC):
             jastrow_factor=tc_obj.jastrow_factor,
             mo_coeff=tc_obj.mo_coeff,
             nocc=tc_obj.nocc,
-            xi_rho=xi_rho,
+            xi_phi=xi_phi,
             xi_grad=xi_grad,
             pivots=pivots,
             phi_isdf=phi_isdf,
@@ -493,7 +496,7 @@ class ISDFTC(TC):
             isdf_kernels=None
         )
 
-    def compute_kmat_kernels(self, jastrow_params, batch_size=1000):
+    def compute_kmat_kernels(self, jastrow_params, batch_size=1024):
         """Compute K1 and K3 kernels with multi-GPU support.
         
         Returns:
@@ -501,6 +504,7 @@ class ISDFTC(TC):
         """
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
         
         # Pad grid to be divisible by n_devices
         remainder = n_grid % n_devices
@@ -508,12 +512,12 @@ class ISDFTC(TC):
             padding = n_devices - remainder
             padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
             padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padding)))
+            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
             padded_xi_grad = jnp.pad(self.xi_grad, ((0, 0), (0, padding), (0, 0)))
         else:
             padded_grid_points = self.grid_points
             padded_weights = self.weights
-            padded_xi_rho = self.xi_rho
+            padded_xi_phi = self.xi_phi
             padded_xi_grad = self.xi_grad
             
         n_grid_padded = padded_grid_points.shape[0]
@@ -522,34 +526,29 @@ class ISDFTC(TC):
         # Shard arrays for r1 (bra side)
         sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
         sharded_weights = padded_weights.reshape(n_devices, n_per_device)
-        # xi_rho: (N_rank, N) -> (N_rank, n_dev, N_per) -> (n_dev, N_rank, N_per)
-        sharded_xi_rho = padded_xi_rho.reshape(self.phi_isdf.shape[1], n_devices, n_per_device).transpose(1, 0, 2)
-        # xi_grad: (N_rank, N, 3) -> (N_rank, n_dev, N_per, 3) -> (n_dev, N_rank, N_per, 3)
-        sharded_xi_grad = padded_xi_grad.reshape(self.phi_isdf.shape[1], n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
         
-        # Full arrays for r2 (ket side) - broadcasted to all devices
+        # Shard xi_phi and xi_grad for r1 on CPU
+        sharded_xi_phi = padded_xi_phi.reshape(n_rank, n_devices, n_per_device).transpose(1, 0, 2)
+        sharded_xi_grad = padded_xi_grad.reshape(n_rank, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
+        
+        # Full arrays for r2 (ket side) - on CPU
         full_grid = self.grid_points
         full_weights = self.weights
-        full_xi_rho = self.xi_rho
+        full_xi_phi = self.xi_phi
         
-        logging.debug(f"DEBUG: compute_kmat_kernels array sizes:")
-        logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_xi_rho: {full_xi_rho.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  sharded_xi_rho: {sharded_xi_rho.nbytes / 1e6:.2f} MB")
         
         jastrow_factor = self.jastrow_factor
         
-        def compute_on_device(grid_shard, weights_shard, xi_rho_shard, xi_grad_shard, jastrow_params, 
-                              full_grid, full_weights, full_xi_rho):
+        def compute_on_device(grid_shard, weights_shard, xi_phi_shard, xi_grad_shard, jastrow_params, 
+                              full_grid, full_weights, full_xi_phi):
             K1_shard = kmat_jax.calc_K1_kernel(
-                xi_grad_shard, full_xi_rho, weights_shard, full_weights,
+                xi_grad_shard, full_xi_phi, weights_shard, full_weights,
                 jastrow_factor, jastrow_params,
                 grid_shard, full_grid, batch_size
             )
             
             K3_shard = kmat_jax.calc_K3_kernel(
-                xi_rho_shard, full_xi_rho, weights_shard, full_weights,
+                xi_phi_shard, full_xi_phi, weights_shard, full_weights,
                 jastrow_factor, jastrow_params,
                 grid_shard, full_grid, batch_size
             )
@@ -557,8 +556,8 @@ class ISDFTC(TC):
             
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
         
-        K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_xi_grad, jastrow_params,
-                                               full_grid, full_weights, full_xi_rho)
+        K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, jastrow_params,
+                                               full_grid, full_weights, full_xi_phi)
         
         # Sum over devices
         K1_kernel = jnp.sum(K1_shards, axis=0)
@@ -566,16 +565,17 @@ class ISDFTC(TC):
         
         return {'K1_kernel': K1_kernel, 'K3_kernel': K3_kernel}
 
-    def _compute_L_aux(self, jastrow_params, batch_size=1000):
+    def _compute_L_aux(self, jastrow_params, batch_size=1024):
         """Compute L_aux (G) for the full grid.
         
-        L_aux(r) = - sum_g w_g xi_rho(g) grad_g u(g, r)
+        L_aux(r) = - sum_g w_g xi_phi(g) grad_g u(g, r)
         
         Returns:
             L_aux: (N_rank, N_grid, 3)
         """
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
+        n_rank = self.xi_phi.shape[0]
         
         # Pad grid to be divisible by n_devices
         remainder = n_grid % n_devices
@@ -593,14 +593,14 @@ class ISDFTC(TC):
         
         full_grid = self.grid_points
         full_weights = self.weights
-        full_xi_rho = self.xi_rho
+        full_xi_phi = self.xi_phi
         
         logging.debug(f"DEBUG: _compute_L_aux array sizes:")
         logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
         logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_xi_rho: {full_xi_rho.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_xi_phi: {full_xi_phi.nbytes / 1e6:.2f} MB")
         
-        def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_rho):
+        def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_phi):
             # grid_shard: (N_shard, 3)
             N_shard = grid_shard.shape[0]
             
@@ -612,17 +612,28 @@ class ISDFTC(TC):
             
             jastrow_factor = self.jastrow_factor
             
+            # Nested batching for L_aux
+            n_batches_g = (full_grid.shape[0] + batch_size - 1) // batch_size
+            padded_size_g = n_batches_g * batch_size
+            full_grid_padded = jnp.pad(full_grid, ((0, padded_size_g - full_grid.shape[0]), (0, 0)))
+            full_weights_padded = jnp.pad(full_weights, (0, padded_size_g - full_weights.shape[0]))
+            full_xi_phi_padded = jnp.pad(full_xi_phi, ((0, 0), (0, padded_size_g - full_xi_phi.shape[1])))
+
             def scan_body(carry, r_batch):
                 # r_batch: (batch, 3)
-                # Compute Gradients: grad_g u(g, r_batch)
-                # jastrow_factor.grad_r_batch(r1, r2) -> grad w.r.t r1
-                # We want grad w.r.t g (integration variable)
-                # So first arg should be full_grid
-                grads = jastrow_factor.grad_r_batch(full_grid, r_batch, jastrow_params)
                 
-                # Compute G: (N_rank, batch, 3)
-                # G_{k,b,c} = sum_g w_g xi_rho_{k,g} grad_{g,b,c}
-                G = jnp.einsum('j,bj,jic->bic', full_weights, full_xi_rho, grads)
+                def g_scan(g_carry, i_batch_g):
+                    g_batch = jax.lax.dynamic_slice(full_grid_padded, (i_batch_g * batch_size, 0), (batch_size, 3))
+                    w_batch = jax.lax.dynamic_slice(full_weights_padded, (i_batch_g * batch_size,), (batch_size,))
+                    xi_batch = jax.lax.dynamic_slice(full_xi_phi_padded, (0, i_batch_g * batch_size), (n_rank, batch_size))
+                    
+                    grads = jastrow_factor.grad_r_batch(g_batch, r_batch, jastrow_params)
+                    # G_batch: (n_rank, batch_r, 3)
+                    G_batch = jnp.einsum('j,bj,jic->bic', w_batch, xi_batch, grads)
+                    return g_carry + G_batch, None
+
+                G_init = jnp.zeros((n_rank, batch_size, 3))
+                G, _ = jax.lax.scan(g_scan, G_init, jnp.arange(n_batches_g))
                 
                 return carry, G
             
@@ -631,16 +642,16 @@ class ISDFTC(TC):
             # Reshape and trim padding
             # G_batches: (n_batches, N_rank, batch_size, 3)
             # We want (N_rank, total_points, 3)
-            G_shard = G_batches.transpose(1, 0, 2, 3).reshape(full_xi_rho.shape[0], -1, 3)
+            G_shard = G_batches.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
             return G_shard[:, :N_shard, :]
-
+	
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
         
         # G_shards: (n_devices, N_rank, n_per_device, 3)
-        G_shards = pmapped_compute(sharded_grid, jastrow_params, full_grid, full_weights, full_xi_rho)
+        G_shards = pmapped_compute(sharded_grid, jastrow_params, full_grid, full_weights, full_xi_phi)
         
         # Combine shards: (N_rank, N_grid_padded, 3)
-        G_padded = G_shards.transpose(1, 0, 2, 3).reshape(full_xi_rho.shape[0], -1, 3)
+        G_padded = G_shards.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
         
         # Trim padding
         G = G_padded[:, :n_grid, :]
@@ -803,7 +814,7 @@ class ISDFTC(TC):
         # 5. Integrate Fock matrix using ISDF
         # F_mn = sum_mu (sum_g w_g xi_mu(g) V_3b(g)) phi_m(mu) phi_n(mu)
         weighted_V = self.weights * V_3b_g
-        V_proj = jnp.dot(self.xi_rho, weighted_V) # (N_aux,)
+        V_proj = jnp.dot(self.xi_phi, weighted_V) # (N_aux,)
         
         phi_pivots = self.phi_isdf # (N_orb, N_aux)
         weighted_phi = phi_pivots * V_proj[None, :]

@@ -213,12 +213,12 @@ def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=No
     return final_result
 
 
-def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor, jastrow_params, grid_r1, grid_r2, batch_size=1000):
+def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor, jastrow_params, grid_r1, grid_r2, batch_size=1024):
     r"""Calculate K1 kernel: K1_{kl} = \sum_{g,h} w_g w_h \xi_{grad}(k,g) \nabla u(g,h) \xi_\phi(l,h)
     
     Args:
-        xi_grad_r1: (N_fused, N_grid_r1, 3)
-        xi_phi_r2: (N_fused, N_grid_r2)
+        xi_grad_r1: (N_fused, N_grid_r1, 3) - Host resident
+        xi_phi_r2: (N_fused, N_grid_r2) - Host resident
         weights_r1: (N_grid_r1,)
         weights_r2: (N_grid_r2,)
         jastrow_factor: JAX Jastrow factor instance
@@ -230,44 +230,55 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
     Returns:
         K1_kernel: (N_fused, N_fused, 3)
     """
+    N_grid_r1 = grid_r1.shape[0]
     N_grid_r2 = grid_r2.shape[0]
     n_fused = xi_phi_r2.shape[0]
     
-    weights_r1 = jnp.asarray(weights_r1)
-    weights_r2 = jnp.asarray(weights_r2)
-    weighted_xi_grad = xi_grad_r1 * weights_r1[None, :, None] # (N_fused, N_grid_r1, 3)
+    # Pad grids for scanning
+    def get_padded_size(n):
+        return ((n + batch_size - 1) // batch_size) * batch_size
+
+    padded_size_r1 = get_padded_size(N_grid_r1)
+    padded_size_r2 = get_padded_size(N_grid_r2)
     
-    # Pad r2 grid for scanning
-    padded_size = ((N_grid_r2 + batch_size - 1) // batch_size) * batch_size
-    padding = padded_size - N_grid_r2
+    # Pad arrays (on host if they are large)
+    grid_r1_padded = jnp.pad(grid_r1, ((0, padded_size_r1 - N_grid_r1), (0, 0)))
+    weights_r1_padded = jnp.pad(weights_r1, ((0, padded_size_r1 - N_grid_r1),))
+    xi_grad_r1_padded = jnp.pad(xi_grad_r1, ((0, 0), (0, padded_size_r1 - N_grid_r1), (0, 0)))
     
-    if padding > 0:
-        grid_r2_padded = jnp.pad(grid_r2, ((0, padding), (0, 0)))
-        weights_r2_padded = jnp.pad(weights_r2, ((0, padding),))
-        xi_phi_r2_padded = jnp.pad(xi_phi_r2, ((0, 0), (0, padding)))
-    else:
-        grid_r2_padded = grid_r2
-        weights_r2_padded = weights_r2
-        xi_phi_r2_padded = xi_phi_r2
+    grid_r2_padded = jnp.pad(grid_r2, ((0, padded_size_r2 - N_grid_r2), (0, 0)))
+    weights_r2_padded = jnp.pad(weights_r2, ((0, padded_size_r2 - N_grid_r2),))
+    xi_phi_r2_padded = jnp.pad(xi_phi_r2, ((0, 0), (0, padded_size_r2 - N_grid_r2)))
+
+    n_batches_r1 = padded_size_r1 // batch_size
+    n_batches_r2 = padded_size_r2 // batch_size
+
+    def outer_scan(carry, i_batch_r2):
+        # Slice r2 batch from host
+        r2_batch = jax.lax.dynamic_slice(grid_r2_padded, (i_batch_r2 * batch_size, 0), (batch_size, 3))
+        w2_batch = jax.lax.dynamic_slice(weights_r2_padded, (i_batch_r2 * batch_size,), (batch_size,))
+        xi_phi_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused, batch_size))
         
-    # Reshape for scanning
-    n_batches = padded_size // batch_size
-    grid_r2_batches = grid_r2_padded.reshape(n_batches, batch_size, 3)
-    weights_r2_batches = weights_r2_padded.reshape(n_batches, batch_size)
-    xi_phi_r2_batches = xi_phi_r2_padded.reshape(n_fused, n_batches, batch_size).transpose(1, 0, 2)
-    
-    def scan_body(carry, args):
-        r2_batch, w2_batch, xi_phi_batch = args
-        
-        # Calculate gradients: grad_r1 u(r1, r2)
-        # r1 is full grid (shard), r2 is batch
-        # u_grad_batch: (N_grid_r1, batch, 3)
-        u_grad_batch = jastrow_factor.grad_r_batch(grid_r1, r2_batch, jastrow_params)
-        
-        # Contract r1:
-        # G1_{k,b,c} = sum_g weighted_xi_grad_{k,g,c} * u_grad_batch_{g,b,c}
-        # (N_fused, N_grid_r1, 3) * (N_grid_r1, batch, 3) -> (N_fused, batch, 3)
-        G1 = jnp.einsum('kgc,gbc->kbc', weighted_xi_grad, u_grad_batch)
+        def inner_scan(inner_carry, i_batch_r1):
+            # Slice r1 batch from host
+            r1_batch = jax.lax.dynamic_slice(grid_r1_padded, (i_batch_r1 * batch_size, 0), (batch_size, 3))
+            w1_batch = jax.lax.dynamic_slice(weights_r1_padded, (i_batch_r1 * batch_size,), (batch_size,))
+            xi_grad_batch = jax.lax.dynamic_slice(xi_grad_r1_padded, (0, i_batch_r1 * batch_size, 0), (n_fused, batch_size, 3))
+            
+            # Calculate gradients: grad_r1 u(r1, r2)
+            # u_grad_batch: (batch_r1, batch_r2, 3)
+            u_grad_batch = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
+            
+            # Contract r1:
+            # G1_{k,b,c} = sum_g (xi_grad_{k,g,c} * w1_g) * u_grad_batch_{g,b,c}
+            # (N_fused, batch_r1, 3) * (batch_r1, batch_r2, 3) -> (N_fused, batch_r2, 3)
+            G1_batch = jnp.einsum('kgc,g,gbc->kbc', xi_grad_batch, w1_batch, u_grad_batch)
+            
+            return inner_carry + G1_batch, None
+
+        # Inner scan over r1 batches
+        G1_init = jnp.zeros((n_fused, batch_size, 3))
+        G1, _ = jax.lax.scan(inner_scan, G1_init, jnp.arange(n_batches_r1))
         
         # Contract r2:
         # K1_batch_{k,l,c} = sum_b G1_{k,b,c} * xi_phi_batch_{l,b} * w2_batch_{b}
@@ -277,17 +288,17 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
         return carry + K1_batch, None
 
     init_val = jnp.zeros((n_fused, n_fused, 3))
-    K1_kernel, _ = jax.lax.scan(scan_body, init_val, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
+    K1_kernel, _ = jax.lax.scan(outer_scan, init_val, jnp.arange(n_batches_r2))
     
     return K1_kernel
 
 
-def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor, jastrow_params, grid_r1, grid_r2, batch_size=1000):
+def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor, jastrow_params, grid_r1, grid_r2, batch_size=1024):
     r"""Calculate K3 kernel: K3_{kl} = \sum_{g,h} w_g w_h \xi_\phi(k,g) |\nabla u(g,h)|^2 \xi_\phi(l,h)
     
     Args:
-        xi_phi_r1: (N_fused, N_grid_r1)
-        xi_phi_r2: (N_fused, N_grid_r2)
+        xi_phi_r1: (N_fused, N_grid_r1) - Host resident
+        xi_phi_r2: (N_fused, N_grid_r2) - Host resident
         weights_r1: (N_grid_r1,)
         weights_r2: (N_grid_r2,)
         jastrow_factor: JAX Jastrow factor instance
@@ -299,53 +310,68 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     Returns:
         K3_kernel: (N_fused, N_fused)
     """
+    N_grid_r1 = grid_r1.shape[0]
     N_grid_r2 = grid_r2.shape[0]
     n_fused = xi_phi_r2.shape[0]
     
-    weights_r1 = jnp.asarray(weights_r1)
-    weights_r2 = jnp.asarray(weights_r2)
+    # Pad grids for scanning
+    def get_padded_size(n):
+        return ((n + batch_size - 1) // batch_size) * batch_size
+
+    padded_size_r1 = get_padded_size(N_grid_r1)
+    padded_size_r2 = get_padded_size(N_grid_r2)
     
-    # Pad r2 grid for scanning
-    padded_size = ((N_grid_r2 + batch_size - 1) // batch_size) * batch_size
-    padding = padded_size - N_grid_r2
+    # Pad arrays
+    grid_r1_padded = jnp.pad(grid_r1, ((0, padded_size_r1 - N_grid_r1), (0, 0)))
+    weights_r1_padded = jnp.pad(weights_r1, ((0, padded_size_r1 - N_grid_r1),))
+    xi_phi_r1_padded = jnp.pad(xi_phi_r1, ((0, 0), (0, padded_size_r1 - N_grid_r1)))
     
-    if padding > 0:
-        grid_r2_padded = jnp.pad(grid_r2, ((0, padding), (0, 0)))
-        weights_r2_padded = jnp.pad(weights_r2, ((0, padding),))
-        xi_phi_r2_padded = jnp.pad(xi_phi_r2, ((0, 0), (0, padding)))
-    else:
-        grid_r2_padded = grid_r2
-        weights_r2_padded = weights_r2
-        xi_phi_r2_padded = xi_phi_r2
+    grid_r2_padded = jnp.pad(grid_r2, ((0, padded_size_r2 - N_grid_r2), (0, 0)))
+    weights_r2_padded = jnp.pad(weights_r2, ((0, padded_size_r2 - N_grid_r2),))
+    xi_phi_r2_padded = jnp.pad(xi_phi_r2, ((0, 0), (0, padded_size_r2 - N_grid_r2)))
+
+    n_batches_r1 = padded_size_r1 // batch_size
+    n_batches_r2 = padded_size_r2 // batch_size
+
+    def outer_scan(carry, i_batch_r2):
+        # Slice r2 batch from host
+        r2_batch = jax.lax.dynamic_slice(grid_r2_padded, (i_batch_r2 * batch_size, 0), (batch_size, 3))
+        w2_batch = jax.lax.dynamic_slice(weights_r2_padded, (i_batch_r2 * batch_size,), (batch_size,))
+        xi_phi_r2_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused, batch_size))
         
-    # Reshape for scanning
-    n_batches = padded_size // batch_size
-    grid_r2_batches = grid_r2_padded.reshape(n_batches, batch_size, 3)
-    weights_r2_batches = weights_r2_padded.reshape(n_batches, batch_size)
-    xi_phi_r2_batches = xi_phi_r2_padded.reshape(n_fused, n_batches, batch_size).transpose(1, 0, 2)
-    
-    def scan_body(carry, args):
-        r2_batch, w2_batch, xi_phi_batch = args
-        
-        u_grad_batch = jastrow_factor.grad_r_batch(grid_r1, r2_batch, jastrow_params) # (N_grid_r1, batch, 3)
-        u_grad_squared = jnp.sum(u_grad_batch**2, axis=-1) # (N_grid_r1, batch)
-        
-        # Weight both coordinates
-        # (N_grid_r1, batch) * (N_grid_r1, 1) * (1, batch)
-        weighted_u_squared = u_grad_squared * weights_r1[:, None] * w2_batch[None, :]
-        
-        # Contract r1:
-        # temp = xi_phi_r1 @ weighted_u_squared -> (n_fused, batch)
-        temp = jnp.dot(xi_phi_r1, weighted_u_squared)
+        def inner_scan(inner_carry, i_batch_r1):
+            # Slice r1 batch from host
+            r1_batch = jax.lax.dynamic_slice(grid_r1_padded, (i_batch_r1 * batch_size, 0), (batch_size, 3))
+            w1_batch = jax.lax.dynamic_slice(weights_r1_padded, (i_batch_r1 * batch_size,), (batch_size,))
+            xi_phi_r1_batch = jax.lax.dynamic_slice(xi_phi_r1_padded, (0, i_batch_r1 * batch_size), (n_fused, batch_size))
+            
+            # Calculate gradients: grad_r1 u(r1, r2)
+            # u_grad_batch: (batch_r1, batch_r2, 3)
+            u_grad_batch = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
+            
+            # Compute squared norm of gradients: (batch_r1, batch_r2)
+            u_grad_norm_sq = jnp.sum(u_grad_batch**2, axis=-1)
+            
+            # Contract r1:
+            # G3_{k,b} = sum_g (xi_phi_{k,g} * w1_g) * |grad u(g,b)|^2
+            # (N_fused, batch_r1) * (batch_r1) * (batch_r1, batch_r2) -> (N_fused, batch_r2)
+            G3_batch = jnp.einsum('kg,g,gb->kb', xi_phi_r1_batch, w1_batch, u_grad_norm_sq)
+            
+            return inner_carry + G3_batch, None
+
+        # Inner scan over r1 batches
+        G3_init = jnp.zeros((n_fused, batch_size))
+        G3, _ = jax.lax.scan(inner_scan, G3_init, jnp.arange(n_batches_r1))
         
         # Contract r2:
-        # K3_batch = temp @ xi_phi_batch.T -> (n_fused, n_fused)
-        K3_batch = jnp.dot(temp, xi_phi_batch.T)
+        # K3_batch_{k,l} = sum_b G3_{k,b} * xi_phi_r2_batch_{l,b} * w2_batch_{b}
+        # (N_fused, batch) * (N_fused, batch) * (batch,) -> (N_fused, N_fused)
+        K3_batch = jnp.einsum('kb,lb,b->kl', G3, xi_phi_r2_batch, w2_batch)
         
         return carry + K3_batch, None
 
     init_val = jnp.zeros((n_fused, n_fused))
-    K3_kernel, _ = jax.lax.scan(scan_body, init_val, (grid_r2_batches, weights_r2_batches, xi_phi_r2_batches))
+    K3_kernel, _ = jax.lax.scan(outer_scan, init_val, jnp.arange(n_batches_r2))
     
     return K3_kernel
 

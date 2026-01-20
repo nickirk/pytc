@@ -647,7 +647,7 @@ class ISDFXTC(XTC, ISDFTC):
     """JAX implementation of extended transcorrelated methods using ISDF.
     
     Attributes:
-        xi_rho: ISDF coefficients for density (N_fused, N_grid)
+        xi_phi: ISDF coefficients for density (N_fused, N_grid)
         xi_grad: ISDF coefficients for gradients (N_fused, N_grid, 3)
         pivots: ISDF pivot indices (N_fused,)
         phi_isdf: ISDF basis for density (Nb, N_fused)
@@ -664,9 +664,14 @@ class ISDFXTC(XTC, ISDFTC):
             n_rank = xtc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        phi_isdf, xi_rho, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights
         )
+        
+        # Move large arrays to CPU to avoid OOM
+        cpu_device = jax.devices("cpu")[0]
+        xi_phi = jax.device_put(xi_phi, cpu_device)
+        xi_grad = jax.device_put(xi_grad, cpu_device)
         
         return cls(
             grid_points=xtc_obj.grid_points,
@@ -680,14 +685,13 @@ class ISDFXTC(XTC, ISDFTC):
             mo_occ=xtc_obj.mo_occ,
             energy_nuc=xtc_obj.energy_nuc,
             nocc=xtc_obj.nocc,
-            xi_rho=xi_rho,
+            xi_phi=xi_phi,
             xi_grad=xi_grad,
             pivots=pivots,
             phi_isdf=phi_isdf,
-            grad_phi_isdf=grad_phi_isdf
+            grad_phi_isdf=grad_phi_isdf,
+            isdf_kernels=None
         )
-
-        return self.replace(isdf_kernels=kernels)
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000):
         """Compute ISDF intermediates and store them.
@@ -738,15 +742,20 @@ class ISDFXTC(XTC, ISDFTC):
 
 
 
-    def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size, L_aux=None):
+    def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size=1024, L_aux=None):
         """Compute raw kernels for Delta U."""
         # 1. Compute L_aux (G) if not provided
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
+        
+        # Ensure L_aux is on CPU
+        cpu_device = jax.devices("cpu")[0]
+        L_aux = jax.device_put(L_aux, cpu_device)
         G_full = -L_aux # Recover G
         
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
         dm1 = self._get_mf_dm() # Use MF density
         
         # Pad grid
@@ -755,14 +764,12 @@ class ISDFXTC(XTC, ISDFTC):
             padding = n_devices - remainder
             padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
             padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_xi_rho = jnp.pad(self.xi_rho, ((0, 0), (0, padding)))
-            
-            # Pad G as well
+            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
             padded_G = jnp.pad(G_full, ((0, 0), (0, padding), (0, 0)))
         else:
             padded_grid_points = self.grid_points
             padded_weights = self.weights
-            padded_xi_rho = self.xi_rho
+            padded_xi_phi = self.xi_phi
             padded_G = G_full
             
         n_grid_padded = padded_grid_points.shape[0]
@@ -770,21 +777,17 @@ class ISDFXTC(XTC, ISDFTC):
         
         sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
         sharded_weights = padded_weights.reshape(n_devices, n_per_device)
-        sharded_xi_rho = padded_xi_rho.reshape(self.phi_isdf.shape[1], n_devices, n_per_device).transpose(1, 0, 2)
-        sharded_G = padded_G.reshape(self.phi_isdf.shape[1], n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
+        
+        # Shard xi_phi and G for r1 on CPU
+        sharded_xi_phi = padded_xi_phi.reshape(n_rank, n_devices, n_per_device).transpose(1, 0, 2)
+        sharded_G = padded_G.reshape(n_rank, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
         
         Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         
         full_grid = self.grid_points
         full_weights = self.weights
-        full_xi_rho = self.xi_rho
+        full_xi_phi = self.xi_phi
 
-        logging.debug(f"DEBUG: _compute_delta_u_kernels_raw array sizes:")
-        logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  full_xi_rho: {full_xi_rho.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  dm1: {dm1.nbytes / 1e6:.2f} MB")
-        logging.debug(f"  phi_isdf: {self.phi_isdf.nbytes / 1e6:.2f} MB")
 
         phi_isdf = self.phi_isdf
         n_orb = self.n_orb
@@ -799,15 +802,15 @@ class ISDFXTC(XTC, ISDFTC):
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
         
         # Returns tuple of accumulators: (D, X)
-        D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
+        D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
         
         D = jnp.sum(D_rep, axis=0)
         X = jnp.sum(X_rep, axis=0)
         
         return {'D': D, 'X': X}
 
-    def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, G_shard,
-                                 Gb, phi, ranges, n_orb, batch_size=1000):
+    def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
+                                 Gb, phi, ranges, n_orb, batch_size=1024):
         """Calculate Delta U kernels for a shard."""
         Nb = n_orb
         N_rank = phi.shape[1]
@@ -819,19 +822,13 @@ class ISDFXTC(XTC, ISDFTC):
         phi_r = phi[slice_r]
         phi_s = phi[slice_s]
 
-        Np = phi_p.shape[0]
-        Nq = phi_q.shape[0]
         Nr = phi_r.shape[0]
         Ns = phi_s.shape[0]
 
         # Reconstruct C_phi from phi
-        # C_{rub} = phi_{r,b} phi_{u,b}
-        # For Term 2 & 3, we need C_phi for (r, u) where r is from slice_r and u is full
         c_phi_ru = jnp.einsum('rb,ub->rub', phi_r, phi)
         
         # Pre-compute L for Terms 2 & 3
-        # L_{usc} = sum_t dm1_{ut} C_{tsc}
-        # For Term 2 & 3, we need L for (u, s) where u is full and s is from slice_s
         c_phi_us = jnp.einsum('ub,sb->usb', phi, phi_s)
         L = jnp.einsum('tu,tsc->usc', dm1, c_phi_us)
         
@@ -839,36 +836,36 @@ class ISDFXTC(XTC, ISDFTC):
         D_acc = jnp.zeros((N_rank, N_rank))
         X_acc = jnp.zeros((Nr, Ns, N_rank))
         
-        # Prepare batches for the SHARD
+        # Pad grid for scanning
         padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
-        padded_grid = jnp.pad(grid_points, ((0, padded_size - N_shard), (0, 0)))
-        padded_weights = jnp.pad(weights, (0, padded_size - N_shard))
-        padded_xi = jnp.pad(xi_rho, ((0, 0), (0, padded_size - N_shard)))
-        padded_G = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
+        grid_padded = jnp.pad(grid_points, ((0, padded_size - N_shard), (0, 0)))
+        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
+        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
+        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
         
-        r_batches = padded_grid.reshape(-1, batch_size, 3)
-        w_batches = padded_weights.reshape(-1, batch_size)
-        xi_batches = padded_xi.reshape(N_rank, -1, batch_size).transpose(1, 0, 2)
-        G_batches = padded_G.reshape(N_rank, -1, batch_size, 3).transpose(1, 2, 0, 3) # (batch, N_rank, 3)
-        
-        def scan_body(carry, args):
-            r_batch, w_batch, xi_batch, G_batch = args
+        n_batches = padded_size // batch_size
+
+        def scan_body(carry, i_batch):
             D_acc_curr, X_acc_curr = carry
             
-            # G is now passed in as G_batch: (batch, N_rank, 3)
-            # Transpose to match previous usage: (N_rank, batch, 3)
-            G = G_batch.transpose(1, 0, 2)
+            # Slice batches from host
+            r_batch = jax.lax.dynamic_slice(grid_padded, (i_batch * batch_size, 0), (batch_size, 3))
+            w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
+            xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
+            G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
+            
+            # G_batch is (N_rank, batch, 3)
             
             # --- Combined D Term (2*D1 + D4) ---
             # D1 part
-            H = jnp.einsum('b,bik->ik', Gb, G)
-            V = jnp.einsum('ik,dik->di', H, G)
+            H = jnp.einsum('b,bik->ik', Gb, G_batch)
+            V = jnp.einsum('ik,dik->di', H, G_batch)
             D1_update = jnp.einsum('i,ai,di->ad', w_batch, xi_batch, V)
             
             # D4 part
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
-            G_flat = G.reshape(N_rank, -1)
-            G_weighted = G * w_tilde[None, :, None]
+            G_flat = G_batch.reshape(N_rank, -1)
+            G_weighted = G_batch * w_tilde[None, :, None]
             G_weighted_flat = G_weighted.reshape(N_rank, -1)
             D4_update = jnp.dot(G_weighted_flat, G_flat.T)
             
@@ -876,25 +873,25 @@ class ISDFXTC(XTC, ISDFTC):
             
             # --- Combined X Term (X2 + X3) ---
             # X2 part
-            Y = jnp.einsum('usc,cik->usik', L, G)
-            Z = jnp.einsum('rub,bik->ruik', c_phi_ru, G)
+            Y = jnp.einsum('usc,cik->usik', L, G_batch)
+            Z = jnp.einsum('rub,bik->ruik', c_phi_ru, G_batch)
             YZ = jnp.einsum('usik,ruik->rsi', Y, Z)
             X2_update = jnp.einsum('i,ai,rsi->rsa', w_batch, xi_batch, YZ)
             
             # X3 part
             L_tilde = jnp.einsum('usc,ci->usi', L, xi_batch)
             M = jnp.einsum('usi,ruik->rsik', L_tilde, Z)
-            X3_1_update = jnp.einsum('i,aik,rsik->rsa', w_batch, G, M)
+            X3_1_update = jnp.einsum('i,aik,rsik->rsa', w_batch, G_batch, M)
             
             C_tilde = jnp.einsum('rub,bi->rui', c_phi_ru, xi_batch)
             N_tensor = jnp.einsum('usik,rui->rski', Y, C_tilde)
-            X3_2_update = jnp.einsum('i,aik,rski->rsa', w_batch, G, N_tensor)
+            X3_2_update = jnp.einsum('i,aik,rski->rsa', w_batch, G_batch, N_tensor)
             
             X_update = X2_update + X3_1_update + X3_2_update
             
             return (D_acc_curr + D_update, X_acc_curr + X_update), None
 
-        final_accumulators, _ = jax.lax.scan(scan_body, (D_acc, X_acc), (r_batches, w_batches, xi_batches, G_batches))
+        final_accumulators, _ = jax.lax.scan(scan_body, (D_acc, X_acc), jnp.arange(n_batches))
         
         return final_accumulators
 
