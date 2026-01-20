@@ -409,7 +409,9 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
     # K1 = sum_{k,l,c} C_grad_{pq,k,c} * U1_{k,l,c} * C_phi_{rs,l}
-    return jnp.einsum('pqkc,klc,rsl->pqrs', C_grad, U1, C_phi)
+    # Break down to avoid O(N_orb^2 * N_rank^2) intermediate
+    tmp = jnp.einsum('pqkc,klc->pql', C_grad, U1)
+    return jnp.einsum('pql,rsl->pqrs', tmp, C_phi)
 
 def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
     if ranges is None:
@@ -457,7 +459,9 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3):
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi_rs = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
     # K3 = sum_{k,l} C_phi_{pq,k} * U3_{k,l} * C_phi_{rs,l}
-    return jnp.einsum('pqk,kl,rsl->pqrs', C_phi_pq, U3, C_phi_rs)
+    # Break down to avoid O(N_orb^2 * N_rank^2) intermediate
+    tmp = jnp.einsum('pqk,kl->pql', C_phi_pq, U3)
+    return jnp.einsum('pql,rsl->pqrs', tmp, C_phi_rs)
 
 def contract_K3_isdf(phi_piv, U3, ranges=None):
     if ranges is None:

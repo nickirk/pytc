@@ -948,10 +948,12 @@ class ISDFXTC(XTC, ISDFTC):
         """JITted version of Delta U contraction."""
         # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
         c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
-        c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
+        c_phi_rs = jnp.einsum('ra,sa->rsa', phi_r, phi_s)
         
         # Term 1 & 4: sum_{a,d} c_phi_pq[a] * D[a,d] * c_phi_rs[d]
-        term_d = jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, D, c_phi_rs)
+        # Break down to avoid O(N_orb^2 * N_rank^2) intermediate
+        tmp = jnp.einsum('pqa,ad->pqd', c_phi_pq, D)
+        term_d = jnp.einsum('pqd,rsd->pqrs', tmp, c_phi_rs)
         
         # Term 2 & 3: - sum_a c_phi_pq[a] * X[r,s,a]
         term_x = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X_sliced)
