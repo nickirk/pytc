@@ -796,11 +796,15 @@ class ISDFXTC(XTC, ISDFTC):
                 Gb, phi_isdf, ranges, n_orb, batch_size
             )
 
-        # Convert sharded inputs to NumPy to avoid "incompatible devices" error in pmap
+        # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap
         sharded_grid = np.asarray(sharded_grid)
         sharded_weights = np.asarray(sharded_weights)
         sharded_xi_phi = np.asarray(sharded_xi_phi)
         sharded_G = np.asarray(sharded_G)
+        
+        full_grid = np.asarray(full_grid)
+        full_weights = np.asarray(full_weights)
+        full_xi_phi = np.asarray(full_xi_phi)
 
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
         
