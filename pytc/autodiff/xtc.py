@@ -708,9 +708,14 @@ class ISDFXTC(XTC, ISDFTC):
         logging.info("Computing ISDF intermediates (Delta U)...")
         start_time = time.perf_counter()
         
-        # 2. Compute Delta U kernels (D1, D4, X2, X3)
-        delta_u_kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
+        # 2. Compute Delta U kernels (D, X)
+        # Pass L_aux to avoid redundant calculation
+        delta_u_kernels = self.compute_delta_u_kernels(jastrow_params, batch_size, L_aux=kernels.get('L_aux'))
         kernels.update(delta_u_kernels)
+        
+        # 3. Discard L_aux from ISDFXTC kernels to save RAM (it's still in ISDFTC if needed)
+        if 'L_aux' in kernels:
+            del kernels['L_aux']
         
         if save_path:
             import h5py
@@ -725,18 +730,19 @@ class ISDFXTC(XTC, ISDFTC):
         
         return self.replace(isdf_kernels=kernels)
 
-    def compute_delta_u_kernels(self, jastrow_params, batch_size=1000):
-        """Compute D1, D4, X2, X3 kernels for Delta U."""
+    def compute_delta_u_kernels(self, jastrow_params, batch_size=1000, L_aux=None):
+        """Compute D, X kernels for Delta U."""
         full_slice = slice(None)
         ranges = (full_slice, full_slice, full_slice, full_slice)
-        return self._compute_delta_u_kernels_raw(jastrow_params, ranges, batch_size)
+        return self._compute_delta_u_kernels_raw(jastrow_params, ranges, batch_size, L_aux=L_aux)
 
 
 
-    def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size):
+    def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size, L_aux=None):
         """Compute raw kernels for Delta U."""
-        # 1. Compute L_aux (G)
-        L_aux = self._compute_L_aux(jastrow_params, batch_size)
+        # 1. Compute L_aux (G) if not provided
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
         G_full = -L_aux # Recover G
         
         n_devices = jax.local_device_count()
@@ -781,15 +787,13 @@ class ISDFXTC(XTC, ISDFTC):
 
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None))
         
-        # Returns tuple of accumulators: (D4, D1, X2, X3)
-        D4_rep, D1_rep, X2_rep, X3_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params, Gb)
+        # Returns tuple of accumulators: (D, X)
+        D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params, Gb)
         
-        D4 = jnp.sum(D4_rep, axis=0)
-        D1 = jnp.sum(D1_rep, axis=0)
-        X2 = jnp.sum(X2_rep, axis=0)
-        X3 = jnp.sum(X3_rep, axis=0)
+        D = jnp.sum(D_rep, axis=0)
+        X = jnp.sum(X_rep, axis=0)
         
-        return {'D1': D1, 'D4': D4, 'X2': X2, 'X3': X3, 'L_aux': L_aux}
+        return {'D': D, 'X': X}
 
     def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, G_shard,
                                  Gb, phi, ranges, batch_size=1000):
@@ -821,10 +825,8 @@ class ISDFXTC(XTC, ISDFTC):
         L = jnp.einsum('tu,tsc->usc', dm1, c_phi_us)
         
         # Initialize accumulators
-        X_acc = jnp.zeros((N_rank, N_rank))
-        X1_acc = jnp.zeros((N_rank, N_rank))
-        Q_acc = jnp.zeros((Nr, Ns, N_rank))
-        Q3_acc = jnp.zeros((Nr, Ns, N_rank))
+        D_acc = jnp.zeros((N_rank, N_rank))
+        X_acc = jnp.zeros((Nr, Ns, N_rank))
         
         # Prepare batches for the SHARD
         padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
@@ -840,70 +842,48 @@ class ISDFXTC(XTC, ISDFTC):
         
         def scan_body(carry, args):
             r_batch, w_batch, xi_batch, G_batch = args
-            X_curr, X1_curr, Q_curr, Q3_curr = carry
+            D_acc_curr, X_acc_curr = carry
             
             # G is now passed in as G_batch: (batch, N_rank, 3)
             # Transpose to match previous usage: (N_rank, batch, 3)
             G = G_batch.transpose(1, 0, 2)
             
-            # --- Term 4 (Easy Term) ---
-            w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
-            
-            # OPTIMIZATION: Avoid forming P = jnp.einsum('aik,cik->aci', G, G) which is (N_rank, N_rank, batch)
-            # P_{aci} = \sum_k G_{aik} G_{cik}
-            # X_update_{ac} = \sum_i w_tilde_i P_{aci}
-            #               = \sum_{i,k} w_tilde_i G_{aik} G_{cik}
-            #               = \sum_{i,k} (w_tilde_i * G_{aik}) * G_{cik}
-            
-            # Flatten G to (N_rank, batch * 3)
-            G_flat = G.reshape(N_rank, -1)
-            # Create weighted G: (N_rank, batch, 3)
-            G_weighted = G * w_tilde[None, :, None]
-            G_weighted_flat = G_weighted.reshape(N_rank, -1)
-            
-            # X_update = G_weighted_flat @ G_flat.T
-            X_update = jnp.dot(G_weighted_flat, G_flat.T)
-            
-            # --- Term 1 (Easy Term) ---
+            # --- Combined D Term (2*D1 + D4) ---
+            # D1 part
             H = jnp.einsum('b,bik->ik', Gb, G)
             V = jnp.einsum('ik,dik->di', H, G)
-            X1_update = jnp.einsum('i,ai,di->ad', w_batch, xi_batch, V)
+            D1_update = jnp.einsum('i,ai,di->ad', w_batch, xi_batch, V)
             
-            # --- Term 2 (Hard Term) ---
-            # Y_{usk}(i) = \sum_c L_{usc} G_{ck}(i)
+            # D4 part
+            w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
+            G_flat = G.reshape(N_rank, -1)
+            G_weighted = G * w_tilde[None, :, None]
+            G_weighted_flat = G_weighted.reshape(N_rank, -1)
+            D4_update = jnp.dot(G_weighted_flat, G_flat.T)
+            
+            D_update = 2 * D1_update + D4_update
+            
+            # --- Combined X Term (X2 + X3) ---
+            # X2 part
             Y = jnp.einsum('usc,cik->usik', L, G)
-            
-            # Z_{ruk}(i) = \sum_b C_{rub} G_{bk}(i)
             Z = jnp.einsum('rub,bik->ruik', c_phi_ru, G)
-            
-            # Q_{rsa} += \sum_i w_i \xi_a(i) \sum_{uk} Y_{usk}(i) Z_{ruk}(i)
             YZ = jnp.einsum('usik,ruik->rsi', Y, Z)
-            Q_update = jnp.einsum('i,ai,rsi->rsa', w_batch, xi_batch, YZ)
+            X2_update = jnp.einsum('i,ai,rsi->rsa', w_batch, xi_batch, YZ)
             
-            # --- Term 3 (Hard Term) ---
-            # Part 1: Q3_1
-            # L_tilde_{usi} = sum_c L_{usc} xi_c(i)
+            # X3 part
             L_tilde = jnp.einsum('usc,ci->usi', L, xi_batch)
-            
-            # M_{rsik} = sum_u L_tilde_{usi} Z_{ruik}
             M = jnp.einsum('usi,ruik->rsik', L_tilde, Z)
-            # Q3_1_{rsa} = sum_{i,k} w_i G_{aik} M_{rsik}
-            Q3_1_update = jnp.einsum('i,aik,rsik->rsa', w_batch, G, M)
+            X3_1_update = jnp.einsum('i,aik,rsik->rsa', w_batch, G, M)
             
-            # Part 2: Q3_2
-            # C_tilde_{rui} = sum_b C_{rub} xi_b(i)
             C_tilde = jnp.einsum('rub,bi->rui', c_phi_ru, xi_batch)
-            
-            # N_{rski} = sum_u Y_{usik} C_tilde_{rui}
             N_tensor = jnp.einsum('usik,rui->rski', Y, C_tilde)
-            # Q3_2_{rsa} = sum_{i,k} w_i G_{aik} N_{rski}
-            Q3_2_update = jnp.einsum('i,aik,rski->rsa', w_batch, G, N_tensor)
+            X3_2_update = jnp.einsum('i,aik,rski->rsa', w_batch, G, N_tensor)
             
-            return (X_curr + X_update, X1_curr + X1_update, Q_curr + Q_update, Q3_curr + Q3_1_update + Q3_2_update), None
+            X_update = X2_update + X3_1_update + X3_2_update
+            
+            return (D_acc_curr + D_update, X_acc_curr + X_update), None
 
-            return (X_curr + X_update, X1_curr + X1_update, Q_curr + Q_update, Q3_curr + Q3_1_update + Q3_2_update), None
-
-        final_accumulators, _ = jax.lax.scan(scan_body, (X_acc, X1_acc, Q_acc, Q3_acc), (r_batches, w_batches, xi_batches, G_batches))
+        final_accumulators, _ = jax.lax.scan(scan_body, (D_acc, X_acc), (r_batches, w_batches, xi_batches, G_batches))
         
         return final_accumulators
 
@@ -950,10 +930,8 @@ class ISDFXTC(XTC, ISDFTC):
 
     def _contract_delta_U_kernels(self, kernels, ranges):
         """Contract precomputed kernels to get Delta U block."""
-        D1 = kernels['D1']
-        D4 = kernels['D4']
-        X2 = kernels['X2']
-        X3 = kernels['X3']
+        D = kernels['D']
+        X = kernels['X']
         
         slice_p, slice_q, slice_r, slice_s = ranges
         
@@ -962,27 +940,20 @@ class ISDFXTC(XTC, ISDFTC):
         phi_r = self.phi_isdf[slice_r]
         phi_s = self.phi_isdf[slice_s]
         
-        # X2 and X3 are (N_orb, N_orb, N_rank)
-        # We need to slice them for r, s
-        X2_sliced = X2[slice_r, slice_s]
-        X3_sliced = X3[slice_r, slice_s]
+        # X is (N_orb, N_orb, N_rank)
+        # We need to slice it for r, s
+        X_sliced = X[slice_r, slice_s]
         
         # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
         c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
         c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
         
-        # Term 1: 2 * sum_{a,d} c_phi_pq[a] * D1[a,d] * c_phi_rs[d]
+        # Term 1 & 4: sum_{a,d} c_phi_pq[a] * D[a,d] * c_phi_rs[d]
         # (p,q,a) * (a,d) * (r,s,d) -> (p,q,r,s)
-        term1 = 2 * jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, D1, c_phi_rs)
+        term_d = jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, D, c_phi_rs)
         
-        # Term 2: - sum_a c_phi_pq[a] * X2[r,s,a]
-        term2 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X2_sliced)
+        # Term 2 & 3: - sum_a c_phi_pq[a] * X[r,s,a]
+        term_x = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X_sliced)
         
-        # Term 3: - sum_a c_phi_pq[a] * X3[r,s,a]
-        term3 = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X3_sliced)
-        
-        # Term 4: sum_{a,c} c_phi_pq[a] * c_phi_rs[c] * D4[a,c]
-        term4 = jnp.einsum('pqa,rsc,ac->pqrs', c_phi_pq, c_phi_rs, D4)
-        
-        return term1 + term2 + term3 + term4
+        return term_d + term_x
     
