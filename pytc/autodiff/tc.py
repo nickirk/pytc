@@ -532,23 +532,33 @@ class ISDFTC(TC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
         
-        def compute_on_device(grid_shard, weights_shard, xi_rho_shard, xi_grad_shard, jastrow_params):
+        logging.debug(f"DEBUG: compute_kmat_kernels array sizes:")
+        logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_xi_rho: {full_xi_rho.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  sharded_xi_rho: {sharded_xi_rho.nbytes / 1e6:.2f} MB")
+        
+        jastrow_factor = self.jastrow_factor
+        
+        def compute_on_device(grid_shard, weights_shard, xi_rho_shard, xi_grad_shard, jastrow_params, 
+                              full_grid, full_weights, full_xi_rho):
             K1_shard = kmat_jax.calc_K1_kernel(
                 xi_grad_shard, full_xi_rho, weights_shard, full_weights,
-                self.jastrow_factor, jastrow_params,
+                jastrow_factor, jastrow_params,
                 grid_shard, full_grid, batch_size
             )
             
             K3_shard = kmat_jax.calc_K3_kernel(
                 xi_rho_shard, full_xi_rho, weights_shard, full_weights,
-                self.jastrow_factor, jastrow_params,
+                jastrow_factor, jastrow_params,
                 grid_shard, full_grid, batch_size
             )
             return K1_shard, K3_shard
             
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None))
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
         
-        K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_xi_grad, jastrow_params)
+        K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_xi_grad, jastrow_params,
+                                               full_grid, full_weights, full_xi_rho)
         
         # Sum over devices
         K1_kernel = jnp.sum(K1_shards, axis=0)
@@ -585,6 +595,11 @@ class ISDFTC(TC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
         
+        logging.debug(f"DEBUG: _compute_L_aux array sizes:")
+        logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_xi_rho: {full_xi_rho.nbytes / 1e6:.2f} MB")
+        
         def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_rho):
             # grid_shard: (N_shard, 3)
             N_shard = grid_shard.shape[0]
@@ -595,13 +610,15 @@ class ISDFTC(TC):
             
             r_batches = padded_shard.reshape(-1, batch_size, 3)
             
+            jastrow_factor = self.jastrow_factor
+            
             def scan_body(carry, r_batch):
                 # r_batch: (batch, 3)
                 # Compute Gradients: grad_g u(g, r_batch)
                 # jastrow_factor.grad_r_batch(r1, r2) -> grad w.r.t r1
                 # We want grad w.r.t g (integration variable)
                 # So first arg should be full_grid
-                grads = self.jastrow_factor.grad_r_batch(full_grid, r_batch, jastrow_params)
+                grads = jastrow_factor.grad_r_batch(full_grid, r_batch, jastrow_params)
                 
                 # Compute G: (N_rank, batch, 3)
                 # G_{k,b,c} = sum_g w_g xi_rho_{k,g} grad_{g,b,c}

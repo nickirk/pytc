@@ -779,16 +779,27 @@ class ISDFXTC(XTC, ISDFTC):
         full_weights = self.weights
         full_xi_rho = self.xi_rho
 
-        def compute_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb):
-            return self._calc_delta_U_kernels_shard(
+        logging.debug(f"DEBUG: _compute_delta_u_kernels_raw array sizes:")
+        logging.debug(f"  full_grid: {full_grid.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_weights: {full_weights.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  full_xi_rho: {full_xi_rho.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  dm1: {dm1.nbytes / 1e6:.2f} MB")
+        logging.debug(f"  phi_isdf: {self.phi_isdf.nbytes / 1e6:.2f} MB")
+
+        phi_isdf = self.phi_isdf
+        n_orb = self.n_orb
+        calc_shard_fn = self._calc_delta_U_kernels_shard
+        
+        def compute_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
+            return calc_shard_fn(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                Gb, self.phi_isdf, ranges, batch_size
+                Gb, phi_isdf, ranges, n_orb, batch_size
             )
 
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None))
+        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
         
         # Returns tuple of accumulators: (D, X)
-        D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params, Gb)
+        D_rep, X_rep = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_rho, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
         
         D = jnp.sum(D_rep, axis=0)
         X = jnp.sum(X_rep, axis=0)
@@ -796,9 +807,9 @@ class ISDFXTC(XTC, ISDFTC):
         return {'D': D, 'X': X}
 
     def _calc_delta_U_kernels_shard(self, jastrow_params, dm1, grid_points, weights, xi_rho, G_shard,
-                                 Gb, phi, ranges, batch_size=1000):
+                                 Gb, phi, ranges, n_orb, batch_size=1000):
         """Calculate Delta U kernels for a shard."""
-        Nb = self.n_orb
+        Nb = n_orb
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
         
