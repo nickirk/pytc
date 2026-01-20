@@ -664,7 +664,7 @@ class ISDFXTC(XTC, ISDFTC):
             n_rank = xtc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
             is_incore=is_incore, save_path=save_path
         )
@@ -687,7 +687,7 @@ class ISDFXTC(XTC, ISDFTC):
             grad_phi_isdf=grad_phi_isdf,
             isdf_kernels=None,
             is_incore=is_incore,
-            save_path=save_path
+            save_path=actual_save_path
         )
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000):

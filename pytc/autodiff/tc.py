@@ -474,8 +474,8 @@ class ISDFTC(TC):
     phi_isdf: jnp.ndarray = struct.field(default=None)
     grad_phi_isdf: jnp.ndarray = struct.field(default=None)
     isdf_kernels: dict = struct.field(default=None, pytree_node=True)
-    is_incore: bool = struct.field(default=False)
-    save_path: str = struct.field(default=None)
+    is_incore: bool = struct.field(default=False, pytree_node=False)
+    save_path: str = struct.field(default=None, pytree_node=False)
 
     @classmethod
     def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None):
@@ -494,7 +494,7 @@ class ISDFTC(TC):
             n_rank = tc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
-        phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots = df.isdf_decompose(
+        phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
             is_incore=is_incore, save_path=save_path
         )
@@ -516,7 +516,7 @@ class ISDFTC(TC):
             grad_phi_isdf=grad_phi_isdf,
             isdf_kernels=None,
             is_incore=is_incore,
-            save_path=save_path
+            save_path=actual_save_path
         )
 
     def compute_kmat_kernels(self, jastrow_params, batch_size=1024):

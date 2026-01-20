@@ -320,7 +320,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                                                                  rhs_grad, rcond=rcond)
                     xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
                 
-                if batch_idx % 20 == 0 and batch_idx > 0:
+                if batch_idx % 4 == 0 and batch_idx > 0:
                     elapsed = time.perf_counter() - t_batch_start
                     rate = batch_idx / elapsed
                     eta = (n_batches - batch_idx) / rate if rate > 0 else 0
@@ -402,4 +402,4 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     logging.debug(f"Total fused ranks = {n_fused}")
     logging.info(f"ISDF decomposition total time: {total_time:.4f} s")
     
-    return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots
+    return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, save_path
