@@ -401,18 +401,29 @@ def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
     phi_s = phi_piv[slice_s]
     grad_phi_p = grad_phi_piv[slice_p]
     
+@jax.jit
+def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
+    """JITted version of K1 contraction."""
     # C_grad_{pq, k, c} = grad_phi_{p,k,c} phi_{q,k}
     C_grad = jnp.einsum('pkc,qk->pqkc', grad_phi_p, phi_q)
-    
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
-    
-    # Contract with U1
-    # U1: (k, l, c)
     # K1 = sum_{k,l,c} C_grad_{pq,k,c} * U1_{k,l,c} * C_phi_{rs,l}
-    K1 = jnp.einsum('pqkc,klc,rsl->pqrs', C_grad, U1, C_phi)
+    return jnp.einsum('pqkc,klc,rsl->pqrs', C_grad, U1, C_phi)
+
+def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+    phi_p = phi_piv[slice_p]
+    phi_q = phi_piv[slice_q]
+    phi_r = phi_piv[slice_r]
+    phi_s = phi_piv[slice_s]
+    grad_phi_p = grad_phi_piv[slice_p]
     
-    return K1
+    return contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1)
 
 
 def contract_K3_isdf(phi_piv, U3, ranges=None):
@@ -438,14 +449,25 @@ def contract_K3_isdf(phi_piv, U3, ranges=None):
     phi_r = phi_piv[slice_r]
     phi_s = phi_piv[slice_s]
     
+@jax.jit
+def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3):
+    """JITted version of K3 contraction."""
     # C_phi_{pq, k} = phi_{p,k} phi_{q,k}
     C_phi_pq = jnp.einsum('pk,qk->pqk', phi_p, phi_q)
-    
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi_rs = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
-    
-    # Contract with U3
     # K3 = sum_{k,l} C_phi_{pq,k} * U3_{k,l} * C_phi_{rs,l}
-    K3 = jnp.einsum('pqk,kl,rsl->pqrs', C_phi_pq, U3, C_phi_rs)
+    return jnp.einsum('pqk,kl,rsl->pqrs', C_phi_pq, U3, C_phi_rs)
+
+def contract_K3_isdf(phi_piv, U3, ranges=None):
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+        
+    phi_p = phi_piv[slice_p]
+    phi_q = phi_piv[slice_q]
+    phi_r = phi_piv[slice_r]
+    phi_s = phi_piv[slice_s]
     
-    return K3
+    return contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3)

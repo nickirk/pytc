@@ -703,7 +703,7 @@ class ISDFXTC(XTC, ISDFTC):
         """
         # 1. Compute K1_kernel, K3_kernel, L_aux (via ISDFTC)
         # This returns a new ISDFTC object with kernels
-        isdf_tc = super().isdf(jastrow_params, save_path=None, batch_size=batch_size)
+        isdf_tc = super().isdf(jastrow_params, save_path=self.save_path, batch_size=batch_size)
         kernels = dict(isdf_tc.isdf_kernels)
         
         logging.info("Computing ISDF intermediates (Delta U)...")
@@ -948,6 +948,22 @@ class ISDFXTC(XTC, ISDFTC):
         logging.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
+    @staticmethod
+    @jax.jit
+    def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
+        """JITted version of Delta U contraction."""
+        # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
+        c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
+        c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
+        
+        # Term 1 & 4: sum_{a,d} c_phi_pq[a] * D[a,d] * c_phi_rs[d]
+        term_d = jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, D, c_phi_rs)
+        
+        # Term 2 & 3: - sum_a c_phi_pq[a] * X[r,s,a]
+        term_x = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X_sliced)
+        
+        return term_d + term_x
+
     def _contract_delta_U_kernels(self, kernels, ranges):
         """Contract precomputed kernels to get Delta U block."""
         D = kernels['D']
@@ -964,16 +980,5 @@ class ISDFXTC(XTC, ISDFTC):
         # We need to slice it for r, s
         X_sliced = X[slice_r, slice_s]
         
-        # C_phi_{pq, a} = phi_{p,a} phi_{q,a}
-        c_phi_pq = jnp.einsum('pa,qa->pqa', phi_p, phi_q)
-        c_phi_rs = jnp.einsum('pa,qa->pqa', phi_r, phi_s)
-        
-        # Term 1 & 4: sum_{a,d} c_phi_pq[a] * D[a,d] * c_phi_rs[d]
-        # (p,q,a) * (a,d) * (r,s,d) -> (p,q,r,s)
-        term_d = jnp.einsum('pqa,ad,rsd->pqrs', c_phi_pq, D, c_phi_rs)
-        
-        # Term 2 & 3: - sum_a c_phi_pq[a] * X[r,s,a]
-        term_x = -jnp.einsum('pqa,rsa->pqrs', c_phi_pq, X_sliced)
-        
-        return term_d + term_x
+        return self._contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s)
     

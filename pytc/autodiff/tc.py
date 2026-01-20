@@ -588,10 +588,12 @@ class ISDFTC(TC):
         full_weights = np.asarray(full_weights)
         full_xi_phi = np.asarray(full_xi_phi)
 
+        logging.info(f"  Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
         
         K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, jastrow_params,
                                                full_grid, full_weights, full_xi_phi)
+        logging.info("  K-kernels pmap completed.")
         
         # Sum over devices
         K1_kernel = jnp.sum(K1_shards, axis=0)
@@ -681,14 +683,15 @@ class ISDFTC(TC):
 	
         # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap
         sharded_grid = np.asarray(sharded_grid)
-        full_grid = np.asarray(full_grid)
         full_weights = np.asarray(full_weights)
         full_xi_phi = np.asarray(full_xi_phi)
         
+        logging.info(f"  Starting pmap for L_aux (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
         
         # G_shards: (n_devices, N_rank, n_per_device, 3)
         G_shards = pmapped_compute(sharded_grid, jastrow_params, full_grid, full_weights, full_xi_phi)
+        logging.info("  L_aux pmap completed.")
         
         # Combine shards: (N_rank, N_grid_padded, 3)
         G_padded = G_shards.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)

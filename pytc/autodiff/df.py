@@ -330,6 +330,11 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
             xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
             xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
             
+            # Explicitly delete storage to save RAM
+            if is_incore:
+                del xi_phi_storage, xi_grad_storage
+                gc.collect()
+            
         finally:
             if h5_file is not None:
                 h5_file.close()
