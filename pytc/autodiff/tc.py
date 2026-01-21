@@ -9,6 +9,7 @@ import gc
 import jax
 import jax.numpy as jnp
 import h5py
+import os
 from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
@@ -646,91 +647,108 @@ class ISDFTC(TC):
         
         return {'K1_kernel': K1_kernel, 'K3_kernel': K3_kernel}
 
-    def _compute_L_aux(self, jastrow_params, batch_size=1024):
-        """Compute L_aux (G) for the full grid.
-        
-        L_aux(r) = - sum_g w_g xi_phi(g) grad_g u(g, r)
-        
-        Returns:
-            L_aux: (N_rank, N_grid, 3)
-        """
+    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None, host_grid_block_size=None):
+        """Compute L_aux (G) for the full grid with grid-blocking to save host RAM."""
         n_devices = jax.local_device_count()
+        devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
         
-        if self.xi_phi is not None:
-            n_rank = self.xi_phi.shape[0]
-            full_xi_phi = jax.device_put(self.xi_phi, jax.devices()[0])
+        # If host_grid_block_size is None, process the whole grid in one block
+        if host_grid_block_size is None:
+            host_grid_block_size = n_grid
+            
+        # Initialize L_aux on host or HDF5
+        L_aux_out = None
+        f_out = None
+        if save_path:
+            f_out = h5py.File(save_path, 'a')
+            if 'L_aux' in f_out: del f_out['L_aux']
+            L_aux_out = f_out.create_dataset('L_aux', (n_rank, n_grid, 3), dtype='f8')
         else:
-            with h5py.File(self.save_path, 'r') as f:
-                n_rank = f['xi_phi'].shape[0]
-                full_xi_phi = jax.device_put(f['xi_phi'][:], jax.devices()[0])
-        
-        # Pad grid to be divisible by n_devices
-        remainder = n_grid % n_devices
-        if remainder != 0:
-            padding = n_devices - remainder
-            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
-        else:
-            padded_grid_points = self.grid_points
+            L_aux_out = np.zeros((n_rank, n_grid, 3))
             
-        n_grid_padded = padded_grid_points.shape[0]
-        n_per_device = n_grid_padded // n_devices
-        
-        # Shard r (where we evaluate L_aux)
-        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
-        
-        full_grid = self.grid_points
-        full_weights = self.weights
-        
-        def compute_on_device(grid_shard, jastrow_params, full_grid, full_weights, full_xi_phi):
-            # grid_shard: (N_shard, 3)
-            N_shard = grid_shard.shape[0]
+        # Open xi_phi dataset if needed
+        xi_phi_ds = None
+        f_xi = None
+        if self.xi_phi is None and self.save_path:
+            f_xi = h5py.File(self.save_path, 'r')
+            xi_phi_ds = f_xi['xi_phi']
             
-            # Pad for batching
-            padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
-            padded_shard = jnp.pad(grid_shard, ((0, padded_size - N_shard), (0, 0)))
-            
-            r_batches = padded_shard.reshape(-1, batch_size, 3)
-            
-            jastrow_factor = self.jastrow_factor
-            
-            # Nested batching for L_aux
-            n_batches_g = (full_grid.shape[0] + batch_size - 1) // batch_size
-            padded_size_g = n_batches_g * batch_size
-            full_grid_padded = jnp.pad(full_grid, ((0, padded_size_g - full_grid.shape[0]), (0, 0)))
-            full_weights_padded = jnp.pad(full_weights, (0, padded_size_g - full_weights.shape[0]))
-            full_xi_phi_padded = jnp.pad(full_xi_phi, ((0, 0), (0, padded_size_g - full_xi_phi.shape[1])))
-
-            def scan_body(carry, r_batch):
-                # r_batch: (batch, 3)
+        try:
+            # Single loop over evaluation blocks (r)
+            for r0 in range(0, n_grid, host_grid_block_size):
+                r1 = min(r0 + host_grid_block_size, n_grid)
+                n_eval = r1 - r0
+                logging.info(f"    _compute_L_aux: Processing evaluation block [{r0}:{r1}]...")
                 
-                def g_scan(g_carry, i_batch_g):
-                    g_batch = jax.lax.dynamic_slice(full_grid_padded, (i_batch_g * batch_size, 0), (batch_size, 3))
-                    w_batch = jax.lax.dynamic_slice(full_weights_padded, (i_batch_g * batch_size,), (batch_size,))
-                    xi_batch = jax.lax.dynamic_slice(full_xi_phi_padded, (0, i_batch_g * batch_size), (n_rank, batch_size))
+                remainder = n_eval % n_devices
+                padding = (n_devices - remainder) if remainder != 0 else 0
+                n_eval_padded = n_eval + padding
+                n_per_device = n_eval_padded // n_devices
+                
+                grid_eval_block = self.grid_points[r0:r1]
+                if padding > 0:
+                    grid_eval_block = jnp.pad(grid_eval_block, ((0, padding), (0, 0)))
+                sharded_grid_eval = grid_eval_block.reshape(n_devices, n_per_device, 3)
+                
+                # Integration over the FULL grid (g) is handled inside the pmap/scan
+                # We still need to handle large integration grids to avoid GPU OOM.
+                # We'll use a scan over the full integration grid inside the device function.
+                
+                grid_int_full = jax.device_put(self.grid_points)
+                weights_int_full = jax.device_put(self.weights)
+                if self.xi_phi is not None:
+                    xi_phi_int_full = jax.device_put(self.xi_phi)
+                else:
+                    xi_phi_int_full = jax.device_put(xi_phi_ds[:]) # Load full xi once for this r-block
+                        
+                def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
+                    def scan_body(carry, i):
+                        r_eval = grid_eval_shard
+                        g_batch = jax.lax.dynamic_slice(grid_int, (i * batch_size, 0), (batch_size, 3))
+                        w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
+                        xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
+                        
+                        u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
+                        xi_weighted = xi_batch * w_batch[None, :]
+                        update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
+                        return carry + update, None
+
+                    n_int = grid_int.shape[0]
+                    n_batches = (n_int + batch_size - 1) // batch_size
                     
-                    grads = jastrow_factor.grad_r_batch(g_batch, r_batch, jastrow_params)
-                    # G_batch: (n_rank, batch_r, 3)
-                    G_batch = jnp.einsum('j,bj,jic->bic', w_batch, xi_batch, grads)
-                    return g_carry + G_batch, None
+                    # Pad integration grid for scan
+                    pad_int = n_batches * batch_size - n_int
+                    if pad_int > 0:
+                        grid_int = jnp.pad(grid_int, ((0, pad_int), (0, 0)))
+                        weights_int = jnp.pad(weights_int, (0, pad_int))
+                        xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
+                        
+                    init_val = jnp.zeros((n_rank, n_per_device, 3))
+                    res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
+                    return res
 
-                G_init = jnp.zeros((n_rank, batch_size, 3))
-                G, _ = jax.lax.scan(g_scan, G_init, jnp.arange(n_batches_g))
+                pmapped_compute = jax.pmap(compute_block_on_device, in_axes=(0, None, None, None, None))
+                res_rep = pmapped_compute(sharded_grid_eval, jastrow_params, grid_int_full, weights_int_full, xi_phi_int_full)
                 
-                return carry, G
+                res_block = res_rep.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
+                L_aux_out[:, r0:r1, :] = np.array(res_block[:, :n_eval, :])
+                
+                del grid_int_full, weights_int_full, xi_phi_int_full, res_rep, sharded_grid_eval
+                gc.collect()
+                
+        finally:
+            if f_xi: f_xi.close()
+            # If we are returning a dataset, we MUST NOT close f_out here.
+            # The caller or the dataset object itself will manage the lifecycle.
+            # However, h5py datasets require the file to remain open.
+            # To be safe and consistent with other parts, we'll close it if we're not returning it.
+            if f_out and not isinstance(L_aux_out, h5py.Dataset):
+                f_out.close()
             
-            _, G_batches = jax.lax.scan(scan_body, None, r_batches)
-            
-            # Reshape and trim padding
-            # G_batches: (n_batches, N_rank, batch_size, 3)
-            # We want (N_rank, total_points, 3)
-            G_shard = G_batches.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
-            return G_shard[:, :N_shard, :]
+        return L_aux_out
 	
-        # Convert inputs to NumPy for pmap
-        sharded_grid = np.asarray(sharded_grid)
-        full_grid = jax.device_put(np.asarray(self.grid_points), jax.devices()[0])
-        full_weights = jax.device_put(np.asarray(self.weights), jax.devices()[0])
         # full_xi_phi is already device-resident
         gc.collect()
         
@@ -750,7 +768,7 @@ class ISDFTC(TC):
         # L_aux = -G
         return -G
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000):
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -759,10 +777,35 @@ class ISDFTC(TC):
             jastrow_params: Parameters for the Jastrow factor.
             save_path: Optional path to save intermediates to HDF5.
             batch_size: Batch size for computation.
+            host_grid_block_size: Block size for grid batching on host.
         """
         logging.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
+        # Use save_path if provided, otherwise use self.save_path
+        out_path = save_path if save_path else self.save_path
+        
+        # Check if kernels already exist in HDF5
+        kernels = {}
+        if out_path and os.path.exists(out_path):
+            try:
+                f = h5py.File(out_path, 'r')
+                if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
+                    logging.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
+                    kernels['K1_kernel'] = f['K1_kernel'][:]
+                    kernels['K3_kernel'] = f['K3_kernel'][:]
+                    if self.is_incore:
+                        kernels['L_aux'] = f['L_aux'][:]
+                        f.close()
+                    else:
+                        kernels['L_aux'] = f['L_aux'][:] # Load into RAM if we want to close 'f'
+                        f.close()
+                    logging.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
+                    return self.replace(isdf_kernels=kernels)
+                f.close()
+            except (IOError, KeyError) as e:
+                logging.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
+
         # 1. Compute K1_kernel and K3_kernel
         logging.info("  Computing K1 and K3 kernels...")
         
@@ -772,23 +815,25 @@ class ISDFTC(TC):
         
         # 2. Compute L_aux
         logging.info("  Computing L_aux...")
-        L_aux = self._compute_L_aux(jastrow_params, batch_size)
+        L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
         
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
-        logging.info("  Moving L_aux to CPU")
-        logging.info(f"    L_aux shape: {L_aux.shape}")
-        logging.info(f"    L_aux size: {L_aux.size * 8 / 1024**3:.2f} GB")
-        cpu_device = jax.devices("cpu")[0]
-        L_aux = jax.device_put(L_aux, cpu_device)
-        kernels['L_aux'] = L_aux
-        
-        # Use save_path if provided, otherwise use self.save_path
-        out_path = save_path if save_path else self.save_path
+        # If it's an HDF5 dataset, we keep it as is.
+        if not isinstance(L_aux, (np.ndarray, jnp.ndarray)):
+             logging.info("  L_aux is streaming from HDF5")
+             kernels['L_aux'] = L_aux
+        else:
+            logging.info("  Moving L_aux to CPU")
+            logging.info(f"    L_aux shape: {L_aux.shape}")
+            logging.info(f"    L_aux size: {L_aux.size * 8 / 1024**3:.2f} GB")
+            cpu_device = jax.devices("cpu")[0]
+            L_aux = jax.device_put(L_aux, cpu_device)
+            kernels['L_aux'] = L_aux
         
         if out_path and not self.is_incore:
-            import h5py
             with h5py.File(out_path, 'a') as f:
                 for k, v in kernels.items():
+                    if k == 'L_aux': continue # Already saved
                     if k in f: del f[k]
                     f.create_dataset(k, data=np.array(v))
                 # Basics are already saved by isdf_decompose, but let's ensure they are there
@@ -810,10 +855,6 @@ class ISDFTC(TC):
             
         # Check if kernels are available, if not compute them
         if self.isdf_kernels is None:
-            # We can't update self in a jitted/frozen dataclass easily if it's not designed for it.
-            # But here we are just computing them for this call if they don't exist.
-            # Ideally, the user should call isdf() first to populate them.
-            # For now, let's compute them on the fly if missing.
             kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
         else:
             kernels = self.isdf_kernels
@@ -849,15 +890,6 @@ class ISDFTC(TC):
         if slice_p == slice_r and slice_q == slice_s:
             result += result.transpose(2, 3, 0, 1)
         else:
-            # For non-symmetric blocks, we would need to compute the transpose block explicitly
-            # But ISDFTC.get_2b currently assumes we want the full result or a specific block.
-            # If ranges are provided, we compute that block.
-            # TC.get_2b computes the transpose block if ranges are not symmetric.
-            # Here we should probably do the same if we want to match TC.get_2b behavior exactly.
-            
-            # However, ISDF allows computing arbitrary blocks efficiently.
-            # If the user asks for a block, they might expect just that block.
-            # But TC.get_2b returns the symmetrized contribution.
             
             # Let's match TC.get_2b logic:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)

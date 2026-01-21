@@ -8,6 +8,8 @@ import gc
 import jax
 import jax.numpy as jnp
 import h5py
+import os
+import gc
 from flax import struct
 from .tc import TC, ISDFTC
 from . import tc_helper
@@ -692,225 +694,332 @@ class ISDFXTC(XTC, ISDFTC):
             save_path=actual_save_path
         )
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000):
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000, orb_block_size=128, host_grid_block_size=None):
         """Compute ISDF intermediates and store them.
-        
-        Computes K1_kernel, K3_kernel, L_aux, D1, D4, X2, X3 kernels and stores them in self.isdf_kernels.
-        Also stores pivot values of phi and grad_phi.
         
         Args:
             jastrow_params: Parameters for the Jastrow factor.
             save_path: Optional path to save intermediates to HDF5.
             batch_size: Batch size for computation.
+            orb_block_size: Block size for orbital batching of X kernel.
+            host_grid_block_size: Block size for grid batching on host.
         """
-        # 1. Compute K1_kernel, K3_kernel, L_aux (via ISDFTC)
-        # This returns a new ISDFTC object with kernels
-        isdf_tc = super().isdf(jastrow_params, save_path=self.save_path, batch_size=batch_size)
-        kernels = dict(isdf_tc.isdf_kernels)
-        
-        logging.info("Computing ISDF intermediates (Delta U)...")
+        logging.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
-        # 2. Compute Delta U kernels (D, X)
+        # 1. Compute TC kernels (K1, K3, L_aux) using base class
+        isdf_tc = super().isdf(jastrow_params, save_path=self.save_path, batch_size=batch_size, host_grid_block_size=host_grid_block_size)
+        kernels = isdf_tc.isdf_kernels
+        
+        # 2. Compute Delta U kernels (D, X) with orbital batching
+        # Check if D and X already exist in HDF5
+        if self.save_path and os.path.exists(self.save_path):
+            try:
+                f = h5py.File(self.save_path, 'r')
+                if 'D' in f and 'X' in f:
+                    logging.info(f"  Found existing D and X in {self.save_path}. Reading from file...")
+                    kernels['D'] = f['D'][:]
+                    if self.is_incore:
+                        kernels['X'] = f['X'][:]
+                        f.close()
+                    else:
+                        # Stream X from file. 
+                        # To avoid OSError: "file is already open for read-only", we load into RAM for now.
+                        # In the future, we could use a single 'a' handle for the whole session.
+                        kernels['X'] = f['X'][:]
+                        f.close()
+                    logging.info(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
+                    return self.replace(isdf_kernels=kernels)
+                f.close()
+            except (IOError, KeyError) as e:
+                logging.warning(f"  Error reading Delta U kernels from {self.save_path}: {e}. Recomputing...")
+
         # Pass L_aux to avoid redundant calculation
-        delta_u_kernels = self.compute_delta_u_kernels(jastrow_params, batch_size, L_aux=kernels.get('L_aux'))
+        delta_u_kernels = self.compute_delta_u_kernels(
+            jastrow_params, batch_size, L_aux=kernels.get('L_aux'),
+            orb_block_size=orb_block_size,
+            save_path=self.save_path,
+            host_grid_block_size=host_grid_block_size
+        )
         kernels.update(delta_u_kernels)
         
-        # 3. Discard L_aux from ISDFXTC kernels to save RAM (it's still in ISDFTC if needed)
-        if 'L_aux' in kernels:
+        # 3. Discard L_aux from ISDFXTC kernels to save RAM (only if incore)
+        if self.is_incore and 'L_aux' in kernels:
             del kernels['L_aux']
         
+        # Persistence for other kernels (phi_isdf, etc.) if save_path provided
         if save_path:
-            import h5py
-            with h5py.File(save_path, 'w') as f:
-                for k, v in kernels.items():
-                    f.create_dataset(k, data=np.array(v))
-                f.create_dataset('phi_piv', data=np.array(self.phi_isdf))
-                f.create_dataset('grad_phi_piv', data=np.array(self.grad_phi_isdf))
-                f.create_dataset('pivots', data=np.array(self.pivots))
+            with h5py.File(save_path, 'a') as f:
+                if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
+                if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
+                if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
                 
         logging.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
         
         return self.replace(isdf_kernels=kernels)
 
-    def compute_delta_u_kernels(self, jastrow_params, batch_size=1000, L_aux=None):
-        """Compute D, X kernels for Delta U."""
-        full_slice = slice(None)
-        ranges = (full_slice, full_slice, full_slice, full_slice)
-        return self._compute_delta_u_kernels_raw(jastrow_params, ranges, batch_size, L_aux=L_aux)
-
-
-
-    def _compute_delta_u_kernels_raw(self, jastrow_params, ranges, batch_size=1024, L_aux=None):
-        """Compute raw kernels for Delta U."""
-        # 1. Compute L_aux (G) if not provided
+    def compute_delta_u_kernels(self, jastrow_params, batch_size=1000, L_aux=None, orb_block_size=128, save_path=None, host_grid_block_size=None):
+        """Compute D, X kernels for Delta U with orbital and grid batching."""
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
-        
-        # Ensure L_aux is on CPU
-        cpu_device = jax.devices("cpu")[0]
-        L_aux = jax.device_put(L_aux, cpu_device)
-        
-        n_devices = jax.local_device_count()
-        n_grid = self.grid_points.shape[0]
-        n_rank = self.phi_isdf.shape[1]
-        dm1 = self._get_mf_dm() # Use MF density
-        
-        # Pad grid
-        remainder = n_grid % n_devices
-        padding = (n_devices - remainder) if remainder != 0 else 0
-        n_grid_padded = n_grid + padding
-        n_per_device = n_grid_padded // n_devices
-        devices = jax.local_devices()
-        
-        sharded_grid = jnp.pad(self.grid_points, ((0, padding), (0, 0))).reshape(n_devices, n_per_device, 3)
-        sharded_weights = jnp.pad(self.weights, ((0, padding),)).reshape(n_devices, n_per_device)
-        
-        # Shard G (-L_aux) for r1 directly to avoid large copies
-        sharded_G_list = []
-        for d in range(n_devices):
-            start = d * n_per_device
-            end = min((d + 1) * n_per_device, n_grid)
-            actual_len = end - start
-            # G = -L_aux
-            G_d = -L_aux[:, start:end, :]
-            if actual_len < n_per_device:
-                G_d = jnp.pad(G_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
-            sharded_G_list.append(jax.device_put(G_d, devices[d]))
-            del G_d
-        sharded_G = jax.device_put_sharded(sharded_G_list, devices)
-        del sharded_G_list
-        gc.collect()
-        
-        if self.xi_phi is not None:
-            padded_xi_phi = jnp.pad(self.xi_phi, ((0, 0), (0, padding)))
-            sharded_xi_phi_list = [padded_xi_phi[:, d*n_per_device:(d+1)*n_per_device] for d in range(n_devices)]
-            sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
-            full_xi_phi = jax.device_put(self.xi_phi, devices[0])
-            del padded_xi_phi, sharded_xi_phi_list
-            gc.collect()
-        else:
-            logging.info(f"  _compute_delta_u_kernels_raw: Streaming xi_phi from {self.save_path}")
-            sharded_xi_phi_list = []
-            with h5py.File(self.save_path, 'r') as f:
-                xi_phi_ds = f['xi_phi']
-                for d in range(n_devices):
-                    start = d * n_per_device
-                    end = min((d + 1) * n_per_device, n_grid)
-                    actual_len = end - start
-                    xi_phi_d = xi_phi_ds[:, start:end]
-                    if actual_len < n_per_device:
-                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
-                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
-                    del xi_phi_d
-                full_xi_phi = jax.device_put(xi_phi_ds[:], devices[0])
-            sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
-            del sharded_xi_phi_list
-            gc.collect()
             
+        n_orb = self.n_orb
+        n_rank = self.phi_isdf.shape[1]
+        dm1 = self._get_mf_dm()
+        
+        # Precompute Gb and Q to avoid redundant work in grid blocks
         Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         
-        full_grid = jax.device_put(np.asarray(self.grid_points), devices[0])
-        full_weights = jax.device_put(np.asarray(self.weights), devices[0])
-        # full_xi_phi is already device-resident
-        gc.collect()
+        dm1_diag = jnp.diagonal(dm1)
+        phi_dm = self.phi_isdf * dm1_diag[:, None]
+        Q = jnp.dot(phi_dm.T, self.phi_isdf)
+        
+        # 1. Compute D kernel
+        logging.info("Computing D kernel...")
+        D = self._compute_D_kernel(jastrow_params, batch_size, L_aux, Gb=Gb, host_grid_block_size=host_grid_block_size)
+        
+        # 2. Compute X kernel with orbital batching
+        logging.info("Computing X kernel...")
+        
+        if save_path:
+            # If L_aux is a dataset from the same file, we must load it or close it.
+            if isinstance(L_aux, h5py.Dataset):
+                if L_aux.file.filename == os.path.abspath(save_path):
+                    logging.info("  L_aux is a dataset from the target file. Loading into RAM to allow reopening in 'a' mode.")
+                    L_aux = L_aux[:]
+            
+            f = h5py.File(save_path, 'a')
+            if 'D' in f: del f['D']
+            f.create_dataset('D', data=np.array(D))
+            if 'X' in f: del f['X']
+            X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
+        else:
+            X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
+            
+        for r0 in range(0, n_orb, orb_block_size):
+            r1 = min(r0 + orb_block_size, n_orb)
+            logging.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
+            for s0 in range(0, n_orb, orb_block_size):
+                s1 = min(s0 + orb_block_size, n_orb)
+            
+                ranges = (slice(None), slice(None), slice(r0, r1), slice(s0, s1))
+                X_block = self._compute_X_kernel(jastrow_params, ranges, batch_size, L_aux, Gb=Gb, Q=Q, host_grid_block_size=host_grid_block_size)
+                X[r0:r1, s0:s1, :] = np.array(X_block)
+                
+        if save_path:
+            # Return dataset object for X to allow streaming
+            return {'D': f['D'][:], 'X': X}
+        else:
+            return {'D': D, 'X': X}
 
-
+    def _compute_D_kernel(self, jastrow_params, batch_size=1024, L_aux=None, Gb=None, host_grid_block_size=None):
+        """Compute D kernel for Delta U with grid-blocking to save host RAM."""
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+            
+        n_devices = jax.local_device_count()
+        devices = jax.local_devices()
+        n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
+        dm1 = self._get_mf_dm()
+        
+        if host_grid_block_size is None:
+            host_grid_block_size = n_grid
+            
+        if Gb is None:
+            Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         phi_isdf = self.phi_isdf
         n_orb = self.n_orb
         
-        # Debug output for array sizes
-        def get_gb(shape):
-            return np.prod(shape) * 8 / 1024**3
+        # Initialize D on host
+        D = np.zeros((n_rank, n_rank))
+        
+        # Open xi_phi dataset if needed
+        xi_phi_ds = None
+        f_xi = None
+        if self.xi_phi is None and self.save_path:
+            f_xi = h5py.File(self.save_path, 'r')
+            xi_phi_ds = f_xi['xi_phi']
             
-        logging.info(f"Delta U Kernel Sizes (GB):")
-        logging.info(f"  phi_isdf: {get_gb(phi_isdf.shape):.3f} GB {phi_isdf.shape}")
-        if self.xi_phi is not None:
-            logging.info(f"  xi_phi:   {get_gb(self.xi_phi.shape):.3f} GB {self.xi_phi.shape}")
-        else:
-            logging.info(f"  xi_phi:   None (Out-of-core)")
-        logging.info(f"  dm1:      {get_gb(dm1.shape):.3f} GB {dm1.shape}")
-        
-        # Estimated sizes in _calc_delta_U_kernels_shard
-        n_rank = phi_isdf.shape[1]
-        logging.info(f"Estimated GPU intermediates (per device):")
-        logging.info(f"  c_phi_ru: {get_gb((n_orb, n_orb, n_rank)):.3f} GB")
-        logging.info(f"  L:        {get_gb((n_orb, n_orb, n_rank)):.3f} GB")
-        logging.info(f"  Y/Z/M/N:  {get_gb((n_orb, n_orb, batch_size, 3)):.3f} GB each")
-        logging.info(f"  YZ/L_tilde/C_tilde: {get_gb((n_orb, n_orb, n_rank)):.3f} GB each")
+        try:
+            for g0 in range(0, n_grid, host_grid_block_size):
+                g1 = min(g0 + host_grid_block_size, n_grid)
+                n_block = g1 - g0
+                logging.info(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
+                
+                remainder = n_block % n_devices
+                padding = (n_devices - remainder) if remainder != 0 else 0
+                n_block_padded = n_block + padding
+                n_per_device = n_block_padded // n_devices
+                
+                # 1. Shard Grid and Weights
+                grid_block = self.grid_points[g0:g1]
+                weights_block = self.weights[g0:g1]
+                if padding > 0:
+                    grid_block = jnp.pad(grid_block, ((0, padding), (0, 0)))
+                    weights_block = jnp.pad(weights_block, ((0, padding),))
+                
+                sharded_grid = grid_block.reshape(n_devices, n_per_device, 3)
+                sharded_weights = weights_block.reshape(n_devices, n_per_device)
+                
+                # 2. Shard G (L_aux)
+                sharded_G_list = []
+                for d in range(n_devices):
+                    start = g0 + d * n_per_device
+                    end = min(g0 + (d + 1) * n_per_device, g1)
+                    actual_len = end - start
+                    
+                    # Slice L_aux (could be HDF5 dataset or JAX array)
+                    G_d = -L_aux[:, start:end, :]
+                    if actual_len < n_per_device:
+                        G_d = jnp.pad(G_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
+                    sharded_G_list.append(jax.device_put(G_d, devices[d]))
+                sharded_G = jax.device_put_sharded(sharded_G_list, devices)
+                
+                # 3. Shard xi_phi
+                sharded_xi_phi_list = []
+                for d in range(n_devices):
+                    start = g0 + d * n_per_device
+                    end = min(g0 + (d + 1) * n_per_device, g1)
+                    actual_len = end - start
+                    
+                    if self.xi_phi is not None:
+                        xi_phi_d = self.xi_phi[:, start:end]
+                    else:
+                        xi_phi_d = xi_phi_ds[:, start:end]
+                        
+                    if actual_len < n_per_device:
+                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
+                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
+                sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+                
+                # 4. Run pmap
+                def compute_D_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
+                    return self._calc_D_shard(
+                        jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                        Gb, phi_isdf, None, n_orb, batch_size
+                    )
+                    
+                pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
+                D_rep = pmapped_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
+                D += np.array(jnp.sum(D_rep, axis=0))
+                
+                # Explicitly clear memory
+                del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, D_rep
+                gc.collect()
+                
+        finally:
+            if f_xi: f_xi.close()
+            
+        return D
 
-        dm1_diag = jnp.diagonal(dm1)
-        phi_dm = phi_isdf * dm1_diag[:, None]
-        Q = jnp.dot(phi_dm.T, phi_isdf) # (N_rank, N_rank)
+    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024, L_aux=None, Gb=None, Q=None, host_grid_block_size=None):
+        """Compute X kernel for Delta U for a specific orbital range with grid-blocking."""
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+            
+        n_devices = jax.local_device_count()
+        devices = jax.local_devices()
+        n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
+        dm1 = self._get_mf_dm()
         
-        calc_D_fn = self._calc_D_shard
-        calc_X2_fn = self._calc_X2_shard
-        calc_X3_1_fn = self._calc_X3_1_shard
-        calc_X3_2_fn = self._calc_X3_2_shard
+        if host_grid_block_size is None:
+            host_grid_block_size = n_grid
+            
+        if Gb is None:
+            Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        if Q is None:
+            dm1_diag = jnp.diagonal(dm1)
+            phi_dm = self.phi_isdf * dm1_diag[:, None]
+            Q = jnp.dot(phi_dm.T, self.phi_isdf)
+            
+        phi_isdf = self.phi_isdf
+        n_orb = self.n_orb
         
-        # Convert remaining inputs to NumPy for pmap
-        sharded_grid = np.asarray(sharded_grid)
-        sharded_weights = np.asarray(sharded_weights)
+        # Initialize X block on host
+        slice_p, slice_q, slice_r, slice_s = ranges
+        Nr = self.phi_isdf[slice_r].shape[0]
+        Ns = self.phi_isdf[slice_s].shape[0]
+        X = np.zeros((Nr, Ns, n_rank))
         
-        # Log estimated peak memory for the new loop-based approach
-        # Peak intermediate per batch: 2 * (batch * Nr * N_rank) + (Nr * Ns * N_rank)
-        # For 512, 800, 5000: 2 * 7.6 GB + 12 GB = 27.2 GB.
-        # This is much better than the 93 GB before.
-        logging.info(f"  Estimated peak intermediate per batch: {2 * get_gb((batch_size, n_orb, n_rank)) + get_gb((n_orb, n_orb, n_rank)):.3f} GB")
-        
-        gc.collect()
+        # Open xi_phi dataset if needed
+        xi_phi_ds = None
+        f_xi = None
+        if self.xi_phi is None and self.save_path:
+            f_xi = h5py.File(self.save_path, 'r')
+            xi_phi_ds = f_xi['xi_phi']
+            
+        try:
+            for g0 in range(0, n_grid, host_grid_block_size):
+                g1 = min(g0 + host_grid_block_size, n_grid)
+                logging.info(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
+                n_block = g1 - g0
+                
+                remainder = n_block % n_devices
+                padding = (n_devices - remainder) if remainder != 0 else 0
+                n_block_padded = n_block + padding
+                n_per_device = n_block_padded // n_devices
+                
+                # 1. Shard Grid and Weights
+                grid_block = self.grid_points[g0:g1]
+                weights_block = self.weights[g0:g1]
+                if padding > 0:
+                    grid_block = jnp.pad(grid_block, ((0, padding), (0, 0)))
+                    weights_block = jnp.pad(weights_block, ((0, padding),))
+                
+                sharded_grid = grid_block.reshape(n_devices, n_per_device, 3)
+                sharded_weights = weights_block.reshape(n_devices, n_per_device)
+                
+                # 2. Shard G (L_aux)
+                sharded_G_list = []
+                for d in range(n_devices):
+                    start = g0 + d * n_per_device
+                    end = min(g0 + (d + 1) * n_per_device, g1)
+                    actual_len = end - start
+                    G_d = -L_aux[:, start:end, :]
+                    if actual_len < n_per_device:
+                        G_d = jnp.pad(G_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
+                    sharded_G_list.append(jax.device_put(G_d, devices[d]))
+                sharded_G = jax.device_put_sharded(sharded_G_list, devices)
+                
+                # 3. Shard xi_phi
+                sharded_xi_phi_list = []
+                for d in range(n_devices):
+                    start = g0 + d * n_per_device
+                    end = min(g0 + (d + 1) * n_per_device, g1)
+                    actual_len = end - start
+                    
+                    if self.xi_phi is not None:
+                        xi_phi_d = self.xi_phi[:, start:end]
+                    else:
+                        xi_phi_d = xi_phi_ds[:, start:end]
+                        
+                    if actual_len < n_per_device:
+                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
+                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
+                sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+                
+                # 4. Run pmap
+                def compute_X_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
+                    return self._calc_X_shard(
+                        jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                        Gb, phi_isdf, ranges, n_orb, batch_size, Q
+                    )
+                    
+                pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
+                X_rep = pmapped_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
+                X += np.array(jnp.sum(X_rep, axis=0))
+                
+                # Explicitly clear memory
+                del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, X_rep
+                gc.collect()
+                
+        finally:
+            if f_xi: f_xi.close()
+            
+        return X
 
-        # Stage 1: D Term
-        def compute_D_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
-            return calc_D_fn(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                Gb, phi_isdf, ranges, n_orb, batch_size
-            )
-        pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
-        D_rep = pmapped_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
-        D = jnp.sum(D_rep, axis=0)
-        del D_rep
-        gc.collect()
-
-        # Stage 2: X2 Term
-        def compute_X2_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
-            return calc_X2_fn(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                Gb, phi_isdf, ranges, n_orb, batch_size, Q
-            )
-        pmapped_X2 = jax.pmap(compute_X2_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
-        X2_rep = pmapped_X2(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
-        X2 = jnp.sum(X2_rep, axis=0)
-        del X2_rep
-        gc.collect()
-
-        # Stage 3: X3_1 Term
-        def compute_X3_1_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
-            return calc_X3_1_fn(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                Gb, phi_isdf, ranges, n_orb, batch_size, Q
-            )
-        pmapped_X3_1 = jax.pmap(compute_X3_1_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
-        X3_1_rep = pmapped_X3_1(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
-        X3_1 = jnp.sum(X3_1_rep, axis=0)
-        del X3_1_rep
-        gc.collect()
-
-        # Stage 4: X3_2 Term
-        def compute_X3_2_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
-            return calc_X3_2_fn(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                Gb, phi_isdf, ranges, n_orb, batch_size, Q
-            )
-        pmapped_X3_2 = jax.pmap(compute_X3_2_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
-        X3_2_rep = pmapped_X3_2(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
-        X3_2 = jnp.sum(X3_2_rep, axis=0)
-        del X3_2_rep
-        gc.collect()
-
-        X = X2 + X3_1 + X3_2
-        
-        return {'D': D, 'X': X}
 
     def _calc_D_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
                       Gb, phi, ranges, n_orb, batch_size=1024):
@@ -949,9 +1058,9 @@ class ISDFXTC(XTC, ISDFTC):
         D_final, _ = jax.lax.scan(scan_D, jnp.zeros((N_rank, N_rank)), jnp.arange(n_batches))
         return D_final
 
-    def _calc_X2_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
-                       Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
-        """Calculate X2 kernel for a shard using Q-matrix optimization."""
+    def _calc_X_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
+                      Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
+        """Calculate X kernel for a shard (merged X2, X3_1, X3_2)."""
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
         
@@ -969,120 +1078,43 @@ class ISDFXTC(XTC, ISDFTC):
         
         n_batches = padded_size // batch_size
 
-        def scan_X2(X_acc, i_batch):
+        def scan_X(X_acc, i_batch):
             w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
             xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
             G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
             
-            YZ = 0
+            X_update = 0
             for k in range(3):
                 G_k = G_batch[:, :, k] # (N_rank, batch)
                 
                 @jax.checkpoint
-                def compute_YZ_ki(G_ki):
-                    # G_ki: (N_rank,)
+                def compute_terms_ki(G_ki, xi_i):
+                    # X2 part: phi_r_G @ Q @ phi_s_G.T
                     phi_r_G = phi_r * G_ki[None, :]
                     phi_s_G = phi_s * G_ki[None, :]
-                    return phi_r_G @ Q @ phi_s_G.T # (Nr, Ns)
-                
-                YZ += jax.vmap(compute_YZ_ki, in_axes=0)(G_k.T) # (batch, Nr, Ns)
-            # YZ is (batch, Nr, Ns). We need (Nr, Ns, batch) for X2_update.
-            YZ = YZ.transpose(1, 2, 0) # (Nr, Ns, batch)
-            
-            # Use matmul for better memory efficiency: (Nr, Ns, batch) @ (batch, N_rank)
-            X2_update = jnp.matmul(YZ * w_batch[None, None, :], xi_batch.T)
-            return X_acc + X2_update, None
-        
-        X2_final, _ = jax.lax.scan(scan_X2, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
-        return X2_final
-
-    def _calc_X3_1_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
-                         Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
-        """Calculate X3_1 kernel for a shard using Q-matrix optimization."""
-        N_rank = phi.shape[1]
-        N_shard = grid_points.shape[0]
-        
-        slice_p, slice_q, slice_r, slice_s = ranges
-        phi_r = phi[slice_r]
-        phi_s = phi[slice_s]
-        Nr = phi_r.shape[0]
-        Ns = phi_s.shape[0]
-        
-        # Pad grid for scanning
-        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
-        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
-        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
-        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
-        
-        n_batches = padded_size // batch_size
-
-        def scan_X3_1(X_acc, i_batch):
-            w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
-            xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
-            G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
-            
-            X3_1_update = 0
-            for k in range(3):
-                G_k = G_batch[:, :, k] # (N_rank, batch)
-                
-                @jax.checkpoint
-                def compute_M_ki(G_ki, xi_i):
-                    # G_ki: (N_rank,), xi_i: (N_rank,)
-                    phi_r_G = phi_r * G_ki[None, :]
+                    YZ_ki = phi_r_G @ Q @ phi_s_G.T
+                    
+                    # X3_1 part: phi_r_G @ Q @ phi_s_xi.T
                     phi_s_xi = phi_s * xi_i[None, :]
-                    return phi_r_G @ Q @ phi_s_xi.T # (Nr, Ns)
-                
-                M_k = jax.vmap(compute_M_ki, in_axes=(0, 0))(G_k.T, xi_batch.T) # (batch, Nr, Ns)
-                X3_1_update += jnp.matmul(M_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
-            
-            return X_acc + X3_1_update, None
-        
-        X3_1_final, _ = jax.lax.scan(scan_X3_1, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
-        return X3_1_final
-
-    def _calc_X3_2_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
-                         Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
-        """Calculate X3_2 kernel for a shard using Q-matrix optimization."""
-        N_rank = phi.shape[1]
-        N_shard = grid_points.shape[0]
-        
-        slice_p, slice_q, slice_r, slice_s = ranges
-        phi_r = phi[slice_r]
-        phi_s = phi[slice_s]
-        Nr = phi_r.shape[0]
-        Ns = phi_s.shape[0]
-        
-        # Pad grid for scanning
-        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
-        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
-        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
-        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
-        
-        n_batches = padded_size // batch_size
-
-        def scan_X3_2(X_acc, i_batch):
-            w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
-            xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
-            G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
-            
-            X3_2_update = 0
-            for k in range(3):
-                G_k = G_batch[:, :, k] # (N_rank, batch)
-                
-                @jax.checkpoint
-                def compute_N_ki(G_ki, xi_i):
-                    # G_ki: (N_rank,), xi_i: (N_rank,)
+                    M_ki = phi_r_G @ Q @ phi_s_xi.T
+                    
+                    # X3_2 part: phi_r_xi @ Q @ phi_s_G.T
                     phi_r_xi = phi_r * xi_i[None, :]
-                    phi_s_G = phi_s * G_ki[None, :]
-                    return phi_r_xi @ Q @ phi_s_G.T # (Nr, Ns)
+                    N_ki = phi_r_xi @ Q @ phi_s_G.T
+                    
+                    return YZ_ki, M_ki, N_ki
                 
-                N_k = jax.vmap(compute_N_ki, in_axes=(0, 0))(G_k.T, xi_batch.T) # (batch, Nr, Ns)
-                X3_2_update += jnp.matmul(N_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
+                YZ_k, M_k, N_k = jax.vmap(compute_terms_ki, in_axes=(0, 0))(G_k.T, xi_batch.T)
+                
+                # Contract with xi and G
+                X_update += jnp.matmul(YZ_k.transpose(1, 2, 0) * w_batch[None, None, :], xi_batch.T)
+                X_update += jnp.matmul(M_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
+                X_update += jnp.matmul(N_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
             
-            return X_acc + X3_2_update, None
+            return X_acc + X_update, None
         
-        X3_2_final, _ = jax.lax.scan(scan_X3_2, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
-        return X3_2_final
+        X_final, _ = jax.lax.scan(scan_X, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
+        return X_final
 
 
 
@@ -1101,7 +1133,8 @@ class ISDFXTC(XTC, ISDFTC):
         # Check if kernels are available
         if self.isdf_kernels is None:
              # Compute kernels on the fly if not available
-             # This aligns with kmat functions logic
+             logging.warning("ISDF kernels missing in get_delta_U. Computing on-the-fly with orbital batching. "
+                             "This might be slow. Consider calling .isdf() first.")
              kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
         else:
             kernels = self.isdf_kernels
