@@ -295,7 +295,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         
         # Solve for xi_phi and xi_grad
         cpu_device = jax.devices("cpu")[0]
-        n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size
+        grid_batch_size = min(grid_batch_size, n_grid)
+        n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size if grid_batch_size > 0 else 0
         
         # Setup storage
         h5_file = None

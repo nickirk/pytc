@@ -481,12 +481,15 @@ class ISDFTC(TC):
     save_path: str = struct.field(default=None, pytree_node=False)
 
     @classmethod
-    def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None):
+    def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
         """Initialize ISDFTC object from TC object.
         
         Args:
             tc_obj: TC object
             n_rank: Rank for ISDF decomposition (default: N_grid // 4)
+            is_incore: Whether to perform in-core decomposition
+            save_path: Path to save ISDF kernels
+            ls_grid_batch_size: Batch size for grid decomposition in isdf_decompose
             
         Returns:
             ISDFTC: Initialized ISDFTC object
@@ -499,7 +502,7 @@ class ISDFTC(TC):
         # Perform ISDF decomposition
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
-            is_incore=is_incore, save_path=save_path
+            is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
         )
         
         return cls(

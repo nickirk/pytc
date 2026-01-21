@@ -656,8 +656,16 @@ class ISDFXTC(XTC, ISDFTC):
     # Fields are inherited from ISDFTC
 
     @classmethod
-    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None):
-        """Initialize ISDFXTC object from XTC object."""
+    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
+        """Initialize ISDFXTC object from XTC object.
+        
+        Args:
+            xtc_obj: XTC object
+            n_rank: Number of ISDF ranks
+            is_incore: Whether to perform in-core decomposition
+            save_path: Path to save ISDF kernels
+            ls_grid_batch_size: Batch size for grid evaluation in linear solver in ISDF decomposition (default: 16384)
+        """
         from . import df
         
         if n_rank is None:
@@ -666,7 +674,7 @@ class ISDFXTC(XTC, ISDFTC):
         # Perform ISDF decomposition
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
-            is_incore=is_incore, save_path=save_path
+            is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
         )
         
         return cls(
