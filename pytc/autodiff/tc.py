@@ -675,6 +675,34 @@ class ISDFTC(TC):
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
             
+        def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
+            def scan_body(carry, i):
+                r_eval = grid_eval_shard
+                g_batch = jax.lax.dynamic_slice(grid_int, (i * batch_size, 0), (batch_size, 3))
+                w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
+                xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
+                
+                u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
+                xi_weighted = xi_batch * w_batch[None, :]
+                update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
+                return carry + update, None
+
+            n_int = grid_int.shape[0]
+            n_batches = (n_int + batch_size - 1) // batch_size
+            
+            # Pad integration grid for scan
+            pad_int = n_batches * batch_size - n_int
+            if pad_int > 0:
+                grid_int = jnp.pad(grid_int, ((0, pad_int), (0, 0)))
+                weights_int = jnp.pad(weights_int, (0, pad_int))
+                xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
+                
+            init_val = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
+            res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
+            return res
+
+        pmapped_compute = jax.pmap(compute_block_on_device, in_axes=(0, None, None, None, None))
+
         try:
             # Single loop over evaluation blocks (r)
             for r0 in range(0, n_grid, host_grid_block_size):
@@ -685,51 +713,21 @@ class ISDFTC(TC):
                 remainder = n_eval % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
                 n_eval_padded = n_eval + padding
-                n_per_device = n_eval_padded // n_devices
+                n_per_device_local = n_eval_padded // n_devices
                 
                 grid_eval_block = self.grid_points[r0:r1]
                 if padding > 0:
                     grid_eval_block = jnp.pad(grid_eval_block, ((0, padding), (0, 0)))
-                sharded_grid_eval = grid_eval_block.reshape(n_devices, n_per_device, 3)
+                sharded_grid_eval = grid_eval_block.reshape(n_devices, n_per_device_local, 3)
                 
                 # Integration over the FULL grid (g) is handled inside the pmap/scan
-                # We still need to handle large integration grids to avoid GPU OOM.
-                # We'll use a scan over the full integration grid inside the device function.
-                
                 grid_int_full = jax.device_put(self.grid_points)
                 weights_int_full = jax.device_put(self.weights)
                 if self.xi_phi is not None:
                     xi_phi_int_full = jax.device_put(self.xi_phi)
                 else:
-                    xi_phi_int_full = jax.device_put(xi_phi_ds[:]) # Load full xi once for this r-block
+                    xi_phi_int_full = jax.device_put(xi_phi_ds[:])
                         
-                def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
-                    def scan_body(carry, i):
-                        r_eval = grid_eval_shard
-                        g_batch = jax.lax.dynamic_slice(grid_int, (i * batch_size, 0), (batch_size, 3))
-                        w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
-                        xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
-                        
-                        u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
-                        xi_weighted = xi_batch * w_batch[None, :]
-                        update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
-                        return carry + update, None
-
-                    n_int = grid_int.shape[0]
-                    n_batches = (n_int + batch_size - 1) // batch_size
-                    
-                    # Pad integration grid for scan
-                    pad_int = n_batches * batch_size - n_int
-                    if pad_int > 0:
-                        grid_int = jnp.pad(grid_int, ((0, pad_int), (0, 0)))
-                        weights_int = jnp.pad(weights_int, (0, pad_int))
-                        xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
-                        
-                    init_val = jnp.zeros((n_rank, n_per_device, 3))
-                    res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
-                    return res
-
-                pmapped_compute = jax.pmap(compute_block_on_device, in_axes=(0, None, None, None, None))
                 res_rep = pmapped_compute(sharded_grid_eval, jastrow_params, grid_int_full, weights_int_full, xi_phi_int_full)
                 
                 res_block = res_rep.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)

@@ -841,6 +841,15 @@ class ISDFXTC(XTC, ISDFTC):
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
             
+        # 4. Run pmap
+        def compute_D_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
+            return self._calc_D_shard(
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, phi_isdf, None, n_orb, batch_size
+            )
+            
+        pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
+
         try:
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
@@ -893,14 +902,6 @@ class ISDFXTC(XTC, ISDFTC):
                     sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
                 sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
                 
-                # 4. Run pmap
-                def compute_D_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
-                    return self._calc_D_shard(
-                        jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                        Gb, phi_isdf, None, n_orb, batch_size
-                    )
-                    
-                pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
                 D_rep = pmapped_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
                 D += np.array(jnp.sum(D_rep, axis=0))
                 
@@ -950,6 +951,15 @@ class ISDFXTC(XTC, ISDFTC):
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
             
+        # 4. Run pmap
+        def compute_X_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
+            return self._calc_X_shard(
+                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, phi_isdf, ranges, n_orb, batch_size, Q
+            )
+            
+        pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
+
         try:
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
@@ -1000,14 +1010,6 @@ class ISDFXTC(XTC, ISDFTC):
                     sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
                 sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
                 
-                # 4. Run pmap
-                def compute_X_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
-                    return self._calc_X_shard(
-                        jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                        Gb, phi_isdf, ranges, n_orb, batch_size, Q
-                    )
-                    
-                pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
                 X_rep = pmapped_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
                 X += np.array(jnp.sum(X_rep, axis=0))
                 
@@ -1085,31 +1087,34 @@ class ISDFXTC(XTC, ISDFTC):
             
             X_update = 0
             for k in range(3):
-                G_k = G_batch[:, :, k] # (N_rank, batch)
+                G_k_T = G_batch[:, :, k].T # (batch, N_rank)
+                xi_T = xi_batch.T # (batch, N_rank)
                 
-                @jax.checkpoint
-                def compute_terms_ki(G_ki, xi_i):
-                    # X2 part: phi_r_G @ Q @ phi_s_G.T
-                    phi_r_G = phi_r * G_ki[None, :]
-                    phi_s_G = phi_s * G_ki[None, :]
-                    YZ_ki = phi_r_G @ Q @ phi_s_G.T
-                    
-                    # X3_1 part: phi_r_G @ Q @ phi_s_xi.T
-                    phi_s_xi = phi_s * xi_i[None, :]
-                    M_ki = phi_r_G @ Q @ phi_s_xi.T
-                    
-                    # X3_2 part: phi_r_xi @ Q @ phi_s_G.T
-                    phi_r_xi = phi_r * xi_i[None, :]
-                    N_ki = phi_r_xi @ Q @ phi_s_G.T
-                    
-                    return YZ_ki, M_ki, N_ki
+                # Batched computation to avoid (batch, n_rank, n_rank) materialization in vmap
+                # phi_r_G: (batch, Nr, N_rank)
+                phi_r_G = phi_r[None, :, :] * G_k_T[:, None, :]
+                tmp_r_G_Q = jnp.matmul(phi_r_G, Q)
+                del phi_r_G
                 
-                YZ_k, M_k, N_k = jax.vmap(compute_terms_ki, in_axes=(0, 0))(G_k.T, xi_batch.T)
+                # X2
+                phi_s_G = phi_s[None, :, :] * G_k_T[:, None, :]
+                YZ_k = jnp.matmul(tmp_r_G_Q, phi_s_G.transpose(0, 2, 1)) # (batch, Nr, Ns)
+                # Contract with xi using einsum to avoid large intermediates
+                X_update += jnp.einsum('bij,b,bm->ijm', YZ_k, w_batch, xi_T)
                 
-                # Contract with xi and G
-                X_update += jnp.matmul(YZ_k.transpose(1, 2, 0) * w_batch[None, None, :], xi_batch.T)
-                X_update += jnp.matmul(M_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
-                X_update += jnp.matmul(N_k.transpose(1, 2, 0) * w_batch[None, None, :], G_k.T)
+                # X3_1
+                phi_s_xi = phi_s[None, :, :] * xi_T[:, None, :]
+                M_k = jnp.matmul(tmp_r_G_Q, phi_s_xi.transpose(0, 2, 1)) # (batch, Nr, Ns)
+                X_update += jnp.einsum('bij,b,bm->ijm', M_k, w_batch, G_k_T)
+                del M_k, phi_s_xi, tmp_r_G_Q
+                
+                # X3_2
+                phi_r_xi = phi_r[None, :, :] * xi_T[:, None, :]
+                tmp_r_xi_Q = jnp.matmul(phi_r_xi, Q)
+                del phi_r_xi
+                N_k = jnp.matmul(tmp_r_xi_Q, phi_s_G.transpose(0, 2, 1)) # (batch, Nr, Ns)
+                X_update += jnp.einsum('bij,b,bm->ijm', N_k, w_batch, G_k_T)
+                del N_k, phi_s_G, tmp_r_xi_Q
             
             return X_acc + X_update, None
         
