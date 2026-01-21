@@ -536,12 +536,10 @@ class XTC(TC):
         delta_h = -0.5 * (term1 - term2)
         return delta_h
 
-    @partial(jax.jit, static_argnames=('block_str', 'ranges', 'batch_size'))
     def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Get one-body operator correction."""
         return self.get_delta_h(jastrow_params, dm1, block_str, ranges, batch_size)
 
-    @partial(jax.jit, static_argnames=('block_str', 'ranges', 'batch_size'))
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
@@ -560,7 +558,6 @@ class XTC(TC):
         logging.debug(f"XTC.get_2b completed in {total_time:.4f} s")
         return tc_correction + delta_U
 
-    @jax.jit
     def get_const(self, jastrow_params, dm1=None):
         """Compute constant contribution."""
         if dm1 is None:
@@ -571,7 +568,6 @@ class XTC(TC):
         const += self.energy_nuc
         return const
     
-    @jax.jit
     def _calc_delta_h(self, delta_U, dm1=None):
         """Calculate δh using δU and density matrix."""
         if dm1 is None:
@@ -743,8 +739,9 @@ class ISDFXTC(XTC, ISDFTC):
         )
         kernels.update(delta_u_kernels)
         
-        # 3. Discard L_aux from ISDFXTC kernels to save RAM (only if incore)
-        if self.is_incore and 'L_aux' in kernels:
+        # 3. Discard L_aux from ISDFXTC kernels to save RAM and avoid JAX types error
+        # L_aux is used to compute D and X, but not needed for get_2b or get_delta_U
+        if 'L_aux' in kernels:
             del kernels['L_aux']
         
         # Persistence for other kernels (phi_isdf, etc.) if save_path provided
