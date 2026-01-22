@@ -817,6 +817,8 @@ class ISDFXTC(XTC, ISDFTC):
                 # Fill symmetric block (only if not diagonal)
                 if r0 != s0:
                     X[s0:s1, r0:r1, :] = X_block_np.transpose(1, 0, 2)
+                del X_block, X_block_np
+                gc.collect()
                 
         if save_path:
             # Return dataset object for X to allow streaming
@@ -1065,7 +1067,10 @@ class ISDFXTC(XTC, ISDFTC):
             # D1 part
             H = jnp.einsum('b,bik->ik', Gb, G_batch)
             V = jnp.einsum('ik,dik->di', H, G_batch)
-            D1_update = jnp.einsum('i,ai,di->ad', w_batch, xi_batch, V)
+            # D1_update = einsum('i,ai,di->ad') but use matmul to avoid large intermediate
+            # (xi * w).T @ V.T = (N_rank, batch) @ (batch, N_rank) -> (N_rank, N_rank)
+            xi_w = xi_batch * w_batch[None, :]  # (N_rank, batch)
+            D1_update = jnp.matmul(xi_w, V.T)
             
             # D4 part
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
@@ -1122,7 +1127,7 @@ class ISDFXTC(XTC, ISDFTC):
             # Precompute k-independent terms ONCE per batch (these don't depend on G_k)
             phi_s_xi = phi_s[None, :, :] * xi_T[:, None, :]  # (batch, Ns, N_rank)
             phi_r_xi = phi_r[None, :, :] * xi_T[:, None, :]  # (batch, Nr, N_rank)
-            tmp_r_xi_Q = apply_Q(phi_r_xi)  # O(batch × Nr × N_rank × n_orb) instead of O(batch × Nr × N_rank²)
+            tmp_r_xi_Q = apply_Q(phi_r_xi)  # O(batch × Nr × N_rank × n_orb)
             
             # Loop over k to avoid 4D tensor materialization (saves 3x VRAM)
             for k in range(3):
@@ -1135,17 +1140,17 @@ class ISDFXTC(XTC, ISDFTC):
                 # phi_s_G: (batch, Ns, N_rank)
                 phi_s_G = phi_s[None, :, :] * G_k_T[:, None, :]
                 
-                # X2: sum_a tmp_r_G_Q[b,r,a] * phi_s_G[b,s,a] -> (batch, Nr, Ns)
+                # X2: (brs * w).T @ xi_T -> (Nr, Ns, N_rank)
                 YZ_k = jnp.einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_G)
-                X_acc = X_acc + jnp.einsum('brs,b,bm->rsm', YZ_k, w_batch, xi_T)
+                X_acc = X_acc + jnp.matmul((YZ_k * w_batch[:, None, None]).transpose(1, 2, 0), xi_T)
                 
-                # X3_1: uses precomputed phi_s_xi
+                # X3_1
                 M_k = jnp.einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_xi)
-                X_acc = X_acc + jnp.einsum('brs,b,bm->rsm', M_k, w_batch, G_k_T)
+                X_acc = X_acc + jnp.matmul((M_k * w_batch[:, None, None]).transpose(1, 2, 0), G_k_T)
                 
-                # X3_2: uses precomputed tmp_r_xi_Q
+                # X3_2
                 N_k = jnp.einsum('bra,bsa->brs', tmp_r_xi_Q, phi_s_G)
-                X_acc = X_acc + jnp.einsum('brs,b,bm->rsm', N_k, w_batch, G_k_T)
+                X_acc = X_acc + jnp.matmul((N_k * w_batch[:, None, None]).transpose(1, 2, 0), G_k_T)
             
             return X_acc, None
         

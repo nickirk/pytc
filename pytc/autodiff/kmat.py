@@ -288,8 +288,12 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
         
         # Contract r2:
         # K1_batch_{k,l,c} = sum_b G1_{k,b,c} * xi_phi_batch_{l,b} * w2_batch_{b}
-        # (N_fused, batch, 3) * (N_fused, batch) * (batch,) -> (N_fused, N_fused, 3)
-        K1_batch = jnp.einsum('kbc,lb,b->klc', G1, xi_phi_batch, w2_batch)
+        # Use matmul per component and stack to avoid copies
+        K1_slices = []
+        for c in range(3):
+            G1_w = G1[:, :, c] * w2_batch[None, :]  # (N_fused, batch)
+            K1_slices.append(jnp.matmul(G1_w, xi_phi_batch.T))
+        K1_batch = jnp.stack(K1_slices, axis=-1)
         
         return carry + K1_batch, None
 
@@ -377,8 +381,9 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
         
         # Contract r2:
         # K3_batch_{k,l} = sum_b G3_{k,b} * xi_phi_r2_batch_{l,b} * w2_batch_{b}
-        # (N_fused, batch) * (N_fused, batch) * (batch,) -> (N_fused, N_fused)
-        K3_batch = jnp.einsum('kb,lb,b->kl', G3, xi_phi_r2_batch, w2_batch)
+        # Use matmul: (G3 * w) @ xi_phi.T to avoid large intermediate
+        G3_w = G3 * w2_batch[None, :]  # (N_fused, batch)
+        K3_batch = jnp.matmul(G3_w, xi_phi_r2_batch.T)
         
         return carry + K3_batch, None
 
