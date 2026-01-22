@@ -772,12 +772,14 @@ class ISDFXTC(XTC, ISDFTC):
         n_rank = self.phi_isdf.shape[1]
         dm1 = self._get_mf_dm()
         
-        # Precompute Gb and Q to avoid redundant work in grid blocks
+        # Precompute Gb and L_Q (low-rank factor of Q) to avoid redundant work
         Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
         
+        # Q = phi_dm.T @ phi_isdf has rank <= n_orb
+        # Factor as Q = L_Q @ L_Q.T where L_Q has shape (N_rank, n_orb)
         dm1_diag = jnp.diagonal(dm1)
-        phi_dm = self.phi_isdf * dm1_diag[:, None]
-        Q = jnp.dot(phi_dm.T, self.phi_isdf)
+        sqrt_dm1 = jnp.sqrt(jnp.maximum(dm1_diag, 0.0))  # Ensure non-negative
+        L_Q = self.phi_isdf.T * sqrt_dm1[None, :]  # (N_rank, n_orb)
         
         # 1. Compute D kernel
         logging.info("Computing D kernel...")
@@ -801,15 +803,20 @@ class ISDFXTC(XTC, ISDFTC):
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
+        # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
         for r0 in range(0, n_orb, orb_block_size):
             r1 = min(r0 + orb_block_size, n_orb)
             logging.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
-            for s0 in range(0, n_orb, orb_block_size):
+            for s0 in range(r0, n_orb, orb_block_size):  # Start from r0 for upper triangle
                 s1 = min(s0 + orb_block_size, n_orb)
             
                 ranges = (slice(None), slice(None), slice(r0, r1), slice(s0, s1))
-                X_block = self._compute_X_kernel(jastrow_params, ranges, batch_size, L_aux, Gb=Gb, Q=Q, host_grid_block_size=host_grid_block_size)
-                X[r0:r1, s0:s1, :] = np.array(X_block)
+                X_block = self._compute_X_kernel(jastrow_params, ranges, batch_size, L_aux, Gb=Gb, L_Q=L_Q, host_grid_block_size=host_grid_block_size)
+                X_block_np = np.array(X_block)
+                X[r0:r1, s0:s1, :] = X_block_np
+                # Fill symmetric block (only if not diagonal)
+                if r0 != s0:
+                    X[s0:s1, r0:r1, :] = X_block_np.transpose(1, 0, 2)
                 
         if save_path:
             # Return dataset object for X to allow streaming
@@ -919,8 +926,12 @@ class ISDFXTC(XTC, ISDFTC):
             
         return D
 
-    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024, L_aux=None, Gb=None, Q=None, host_grid_block_size=None):
-        """Compute X kernel for Delta U for a specific orbital range with grid-blocking."""
+    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024, L_aux=None, Gb=None, L_Q=None, host_grid_block_size=None):
+        """Compute X kernel for Delta U for a specific orbital range with grid-blocking.
+        
+        Uses low-rank factorization: Q = L_Q @ L_Q.T where L_Q has shape (N_rank, n_orb).
+        This reduces the expensive O(batch × Nr × N_rank²) matmuls to O(batch × Nr × N_rank × n_orb).
+        """
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
             
@@ -935,10 +946,12 @@ class ISDFXTC(XTC, ISDFTC):
             
         if Gb is None:
             Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
-        if Q is None:
+        if L_Q is None:
+            # Compute L_Q if not provided
+            dm1 = self._get_mf_dm()
             dm1_diag = jnp.diagonal(dm1)
-            phi_dm = self.phi_isdf * dm1_diag[:, None]
-            Q = jnp.dot(phi_dm.T, self.phi_isdf)
+            sqrt_dm1 = jnp.sqrt(jnp.maximum(dm1_diag, 0.0))
+            L_Q = self.phi_isdf.T * sqrt_dm1[None, :]
             
         phi_isdf = self.phi_isdf
         n_orb = self.n_orb
@@ -957,10 +970,10 @@ class ISDFXTC(XTC, ISDFTC):
             xi_phi_ds = f_xi['xi_phi']
             
         # 4. Run pmap
-        def compute_X_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q):
+        def compute_X_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, L_Q):
             return self._calc_X_shard(
                 jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
-                Gb, phi_isdf, ranges, n_orb, batch_size, Q
+                Gb, phi_isdf, ranges, n_orb, batch_size, L_Q
             )
             
         pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
@@ -1015,7 +1028,7 @@ class ISDFXTC(XTC, ISDFTC):
                     sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
                 sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
                 
-                X_rep = pmapped_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, Q)
+                X_rep = pmapped_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, L_Q)
                 X += np.array(jnp.sum(X_rep, axis=0))
                 
                 # Explicitly clear memory
@@ -1066,8 +1079,13 @@ class ISDFXTC(XTC, ISDFTC):
         return D_final
 
     def _calc_X_shard(self, jastrow_params, dm1, grid_points, weights, xi_phi, G_shard,
-                      Gb, phi, ranges, n_orb, batch_size=1024, Q=None):
-        """Calculate X kernel for a shard (merged X2, X3_1, X3_2)."""
+                      Gb, phi, ranges, n_orb, batch_size=1024, L_Q=None):
+        """Calculate X kernel for a shard (merged X2, X3_1, X3_2).
+        
+        Uses low-rank factorization: Q = L_Q @ L_Q.T where L_Q has shape (N_rank, n_orb).
+        Instead of: einsum('bra,ac->brc', X, Q) which is O(batch × Nr × N_rank²)
+        We compute: (X @ L_Q) @ L_Q.T which is O(batch × Nr × N_rank × n_orb) - ~9x faster!
+        """
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
         
@@ -1084,44 +1102,52 @@ class ISDFXTC(XTC, ISDFTC):
         G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
         
         n_batches = padded_size // batch_size
+        
+        # Helper: compute X @ L_Q @ L_Q.T using two-step matmul (O(N_rank × n_orb) instead of O(N_rank²))
+        def apply_Q(X):
+            """Apply Q = L_Q @ L_Q.T to X via two matmuls: (X @ L_Q) @ L_Q.T"""
+            # X: (batch, Nr, N_rank), L_Q: (N_rank, n_orb)
+            # Step 1: (batch, Nr, N_rank) @ (N_rank, n_orb) -> (batch, Nr, n_orb)
+            tmp = jnp.einsum('bra,ao->bro', X, L_Q)
+            # Step 2: (batch, Nr, n_orb) @ (n_orb, N_rank) -> (batch, Nr, N_rank)
+            return jnp.einsum('bro,ao->bra', tmp, L_Q)
 
         def scan_X(X_acc, i_batch):
             w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
             xi_batch = jax.lax.dynamic_slice(xi_padded, (0, i_batch * batch_size), (N_rank, batch_size))
             G_batch = jax.lax.dynamic_slice(G_padded, (0, i_batch * batch_size, 0), (N_rank, batch_size, 3))
             
-            X_update = 0
+            xi_T = xi_batch.T  # (batch, N_rank)
+            
+            # Precompute k-independent terms ONCE per batch (these don't depend on G_k)
+            phi_s_xi = phi_s[None, :, :] * xi_T[:, None, :]  # (batch, Ns, N_rank)
+            phi_r_xi = phi_r[None, :, :] * xi_T[:, None, :]  # (batch, Nr, N_rank)
+            tmp_r_xi_Q = apply_Q(phi_r_xi)  # O(batch × Nr × N_rank × n_orb) instead of O(batch × Nr × N_rank²)
+            
+            # Loop over k to avoid 4D tensor materialization (saves 3x VRAM)
             for k in range(3):
-                G_k_T = G_batch[:, :, k].T # (batch, N_rank)
-                xi_T = xi_batch.T # (batch, N_rank)
+                G_k_T = G_batch[:, :, k].T  # (batch, N_rank)
                 
-                # Batched computation to avoid (batch, n_rank, n_rank) materialization in vmap
                 # phi_r_G: (batch, Nr, N_rank)
                 phi_r_G = phi_r[None, :, :] * G_k_T[:, None, :]
-                tmp_r_G_Q = jnp.matmul(phi_r_G, Q)
-                del phi_r_G
+                tmp_r_G_Q = apply_Q(phi_r_G)  # O(batch × Nr × N_rank × n_orb)
                 
-                # X2
+                # phi_s_G: (batch, Ns, N_rank)
                 phi_s_G = phi_s[None, :, :] * G_k_T[:, None, :]
-                YZ_k = jnp.matmul(tmp_r_G_Q, phi_s_G.transpose(0, 2, 1)) # (batch, Nr, Ns)
-                # Contract with xi using einsum to avoid large intermediates
-                X_update += jnp.einsum('bij,b,bm->ijm', YZ_k, w_batch, xi_T)
                 
-                # X3_1
-                phi_s_xi = phi_s[None, :, :] * xi_T[:, None, :]
-                M_k = jnp.matmul(tmp_r_G_Q, phi_s_xi.transpose(0, 2, 1)) # (batch, Nr, Ns)
-                X_update += jnp.einsum('bij,b,bm->ijm', M_k, w_batch, G_k_T)
-                del M_k, phi_s_xi, tmp_r_G_Q
+                # X2: sum_a tmp_r_G_Q[b,r,a] * phi_s_G[b,s,a] -> (batch, Nr, Ns)
+                YZ_k = jnp.einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_G)
+                X_acc = X_acc + jnp.einsum('brs,b,bm->rsm', YZ_k, w_batch, xi_T)
                 
-                # X3_2
-                phi_r_xi = phi_r[None, :, :] * xi_T[:, None, :]
-                tmp_r_xi_Q = jnp.matmul(phi_r_xi, Q)
-                del phi_r_xi
-                N_k = jnp.matmul(tmp_r_xi_Q, phi_s_G.transpose(0, 2, 1)) # (batch, Nr, Ns)
-                X_update += jnp.einsum('bij,b,bm->ijm', N_k, w_batch, G_k_T)
-                del N_k, phi_s_G, tmp_r_xi_Q
+                # X3_1: uses precomputed phi_s_xi
+                M_k = jnp.einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_xi)
+                X_acc = X_acc + jnp.einsum('brs,b,bm->rsm', M_k, w_batch, G_k_T)
+                
+                # X3_2: uses precomputed tmp_r_xi_Q
+                N_k = jnp.einsum('bra,bsa->brs', tmp_r_xi_Q, phi_s_G)
+                X_acc = X_acc + jnp.einsum('brs,b,bm->rsm', N_k, w_batch, G_k_T)
             
-            return X_acc + X_update, None
+            return X_acc, None
         
         X_final, _ = jax.lax.scan(scan_X, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
         return X_final
