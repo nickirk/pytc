@@ -420,14 +420,32 @@ def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
     
 @jax.jit
 def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
-    """JITted version of K1 contraction."""
-    # C_grad_{pq, k, c} = grad_phi_{p,k,c} phi_{q,k}
-    C_grad = jnp.einsum('pkc,qk->pqkc', grad_phi_p, phi_q)
+    """JITted version of K1 contraction.
+    
+    Memory-optimized: processes each spatial component (x, y, z) sequentially
+    to avoid creating the full C_grad tensor of shape (Np, Nq, N_fused, 3).
+    Peak memory is reduced from O(Np*Nq*N_fused*3) to O(Np*Nq*N_fused).
+    """
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
-    # K1 = sum_{k,l,c} C_grad_{pq,k,c} * U1_{k,l,c} * C_phi_{rs,l}
-    # Break down to avoid O(N_orb^2 * N_rank^2) intermediate
-    tmp = jnp.einsum('pqkc,klc->pql', C_grad, U1)
+    
+    # Process each spatial component sequentially to avoid large C_grad
+    # For each c: C_grad_c_{pq, k} = grad_phi_{p,k,c} * phi_{q,k}
+    #             tmp_c_{pq, l} = sum_k C_grad_c_{pq, k} * U1_{k, l, c}
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_fused = U1.shape[0]
+    
+    def process_component(tmp_accum, c):
+        # C_grad_c: (Np, Nq, N_fused) - only one component at a time
+        C_grad_c = jnp.einsum('pk,qk->pqk', grad_phi_p[:, :, c], phi_q)
+        # Contract with U1[:, :, c]: (Np, Nq, N_fused) @ (N_fused, N_fused) -> (Np, Nq, N_fused)
+        tmp_c = jnp.einsum('pqk,kl->pql', C_grad_c, U1[:, :, c])
+        return tmp_accum + tmp_c, None
+    
+    tmp_init = jnp.zeros((Np, Nq, N_fused))
+    tmp, _ = jax.lax.scan(process_component, tmp_init, jnp.arange(3))
+    
     return jnp.einsum('pql,rsl->pqrs', tmp, C_phi)
 
 def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
