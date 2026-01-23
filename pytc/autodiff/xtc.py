@@ -687,6 +687,7 @@ class ISDFXTC(XTC, ISDFTC):
             jastrow_factor=xtc_obj.jastrow_factor,
             mo_coeff=xtc_obj.mo_coeff,
             mo_occ=xtc_obj.mo_occ,
+            nocc=xtc_obj.nocc,
             energy_nuc=xtc_obj.energy_nuc,
             xi_phi=xi_phi,
             xi_grad=xi_grad,
@@ -1237,3 +1238,4 @@ class ISDFXTC(XTC, ISDFTC):
         
         return self._contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s)
     
+
