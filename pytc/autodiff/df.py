@@ -45,16 +45,8 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
     gram_q = phi_piv_q.T @ phi_piv_q  # (n_fused, n_fused)
     ATA = gram_p * gram_q  # Element-wise product
     
-    # Compute A^T B using matmul to avoid large intermediates
     B_reshaped = B.reshape(n_orb, n_orb, n_rhs)
-    # Step 1: (m, p) @ (p, q*g) -> (m, q*g) -> reshape to (q, g, m)
-    B_flat = B_reshaped.reshape(n_orb, -1)  # (p, q*g)
-    tmp_flat = jnp.matmul(phi_piv_p.T, B_flat)  # (m, q*g)
-    tmp = tmp_flat.reshape(n_fused, n_orb, n_rhs).transpose(1, 2, 0)  # (q, g, m)
-    # Step 2: batched matmul (m, g, q) @ (m, q, 1) -> (m, g)
-    tmp_t = tmp.transpose(2, 1, 0)  # (m, g, q)
-    ATB = jnp.matmul(tmp_t, phi_piv_q.T[:, :, None]).squeeze(-1)  # (m, g)
-    
+    ATB = jnp.einsum('pqg,pm,qm->mg', B_reshaped, phi_piv_p, phi_piv_q)  # (n_fused, n_rhs) 
     # Use SVD for numerically stable pseudoinverse
     U, s, Vt = jnp.linalg.svd(ATA, full_matrices=False)
     
