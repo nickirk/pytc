@@ -12,41 +12,41 @@ import os
 
 
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
-                                   B: jnp.ndarray, rcond: float = 1e-10) -> jnp.ndarray:
+                                   phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray,
+                                   rcond: float = 1e-10) -> jnp.ndarray:
     """Fast solver using SVD-based pseudoinverse for structured least-squares.
     
-    Solves min ||C*X - B||² where C[pq, m] = phi_piv_p[p, m] * phi_piv_q[q, m]
+    Solves min ||C*X - B||² where:
+      C[pq, m] = phi_piv_p[p, m] * phi_piv_q[q, m]
+      B[pq, g] = phi_p_batch[p, g] * phi_q_batch[q, g]
     
-    Note: Integration weights are applied during pivot selection, not here.
-    The fitting is done at discrete grid points using the selected pivots.
-    
-    This exploits the Kronecker-like structure:
-    (C^T C)[m, m'] = (phi_piv_p^T @ phi_piv_p)[m,m'] * (phi_piv_q^T @ phi_piv_q)[m,m']
-    (C^T B)[m, g] = einsum('pq,pm,qm->m', B[pq,g], phi_piv_p, phi_piv_q)
-    
-    Uses SVD-based pseudoinverse which is stable and accurate. Since n_fused is 
-    typically < 10000, SVD is fast enough and provides better numerical accuracy
-    than Cholesky with regularization.
+    This exploits the separable structure to avoid O(N^2) intermediates:
+    (C^T B)[m, g] = (sum_p phi_piv_p[p,m]*phi_p_batch[p,g]) * (sum_q phi_piv_q[q,m]*phi_q_batch[q,g])
     
     Args:
-        phi_piv_p: (n_orb, n_fused) first factor (e.g., phi_piv or grad_phi_piv[:,:,c])
-        phi_piv_q: (n_orb, n_fused) second factor (usually phi_piv)
-        B: (n_orb^2, n_rhs) right-hand sides
+        phi_piv_p: (n_orb, n_fused) first factor of pivots
+        phi_piv_q: (n_orb, n_fused) second factor of pivots
+        phi_p_batch: (n_orb, batch_size) first factor of target
+        phi_q_batch: (n_orb, batch_size) second factor of target
         rcond: Relative condition number cutoff for SVD (default 1e-10)
         
     Returns:
-        X: (n_fused, n_rhs) solutions
+        X: (n_fused, batch_size) solutions
     """
-    n_orb, n_fused = phi_piv_p.shape
-    n_rhs = B.shape[1]
-    
     # Compute A^T A efficiently using the Kronecker-like structure
     gram_p = phi_piv_p.T @ phi_piv_p  # (n_fused, n_fused)
     gram_q = phi_piv_q.T @ phi_piv_q  # (n_fused, n_fused)
     ATA = gram_p * gram_q  # Element-wise product
     
-    B_reshaped = B.reshape(n_orb, n_orb, n_rhs)
-    ATB = jnp.einsum('pqg,pm,qm->mg', B_reshaped, phi_piv_p, phi_piv_q)  # (n_fused, n_rhs) 
+    # Compute A^T B efficiently using separable structure
+    # term_p[m, g] = sum_p phi_piv_p[p, m] * phi_p_batch[p, g]
+    term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)  # (n_fused, batch_size)
+    
+    # term_q[m, g] = sum_q phi_piv_q[q, m] * phi_q_batch[q, g]
+    term_q = jnp.matmul(phi_piv_q.T, phi_q_batch)  # (n_fused, batch_size)
+    
+    ATB = term_p * term_q  # (n_fused, batch_size)
+    
     # Use SVD for numerically stable pseudoinverse
     U, s, Vt = jnp.linalg.svd(ATA, full_matrices=False)
     
@@ -144,32 +144,7 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
     return final_pivots
 
 
-def compute_rhs_phi(phi_p: jnp.ndarray, phi_q: jnp.ndarray, 
-                    grid_start: int, grid_end: int) -> jnp.ndarray:
-    """Compute RHS for least-squares problem for a grid batch.
-    
-    RHS[pq, g] = phi_p[p, g] * phi_q[q, g]
-    
-    This handles both phi decomposition (phi_p = phi_q = phi) and 
-    gradient decomposition (phi_p = grad_phi[:,:,c], phi_q = phi).
-    
-    Args:
-        phi_p: (n_orb, n_grid) first factor (phi or grad_phi[:,:,c])
-        phi_q: (n_orb, n_grid) second factor (usually phi)
-        grid_start: Start index for grid batch
-        grid_end: End index for grid batch
-        
-    Returns:
-        rhs: (n_orb², batch_size) flattened RHS
-    """
-    phi_p_batch = phi_p[:, grid_start:grid_end]  # (n_orb, batch_size)
-    phi_q_batch = phi_q[:, grid_start:grid_end]  # (n_orb, batch_size)
-    n_orb, batch_size = phi_p_batch.shape
-    
-    # Compute outer products for all grid points in batch
-    # rhs[p,q,g] = phi_p[p,g] * phi_q[q,g]
-    rhs = jnp.einsum('pi,qi->pqi', phi_p_batch, phi_q_batch)  # (n_orb, n_orb, batch)
-    return rhs.reshape(-1, batch_size)  # (n_orb², batch)
+
 
 
 
@@ -330,15 +305,16 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                 g_end = min(g_start + grid_batch_size, n_grid)
                 
                 # 1. Xi_phi
-                rhs_phi = compute_rhs_phi(phi, phi, g_start, g_end)
-                xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, rhs_phi, rcond=rcond)
+                phi_batch = phi[:, g_start:g_end]
+                xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, 
+                                                          phi_batch, phi_batch, rcond=rcond)
                 xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
                 
                 # 2. Xi_grad
                 for c in range(3):
-                    rhs_grad = compute_rhs_phi(grad_phi[:, :, c], phi, g_start, g_end)
+                    grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
                     xi_grad_batch = solve_normal_equations_batch(grad_phi_piv[:, :, c], phi_piv,
-                                                                 rhs_grad, rcond=rcond)
+                                                                 grad_phi_batch_c, phi_batch, rcond=rcond)
                     xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
                 
                 if batch_idx % 4 == 0 and batch_idx > 0:

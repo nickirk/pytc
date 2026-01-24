@@ -50,8 +50,8 @@ class TestISDFReconstruction(unittest.TestCase):
         
         for n_rank in ranks:
             # Perform ISDF decomposition
-            phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots = isdf_decompose(
-                self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights, use_iterative=True, rcond=1e-16
+            phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose(
+                self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights, use_iterative=True, rcond=1e-16, is_incore=True
             )
             
             # Reconstruct overlaps
