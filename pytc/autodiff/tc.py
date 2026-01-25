@@ -698,7 +698,7 @@ class ISDFTC(TC):
         pmapped_compute = jax.pmap(compute_block_on_device, in_axes=(0, None, None, None, None))
 
         try:
-            # Single loop over evaluation blocks (r)
+            # Outer loop: Evaluation blocks (r)
             for r0 in range(0, n_grid, host_grid_block_size):
                 r1 = min(r0 + host_grid_block_size, n_grid)
                 n_eval = r1 - r0
@@ -714,20 +714,42 @@ class ISDFTC(TC):
                     grid_eval_block = jnp.pad(grid_eval_block, ((0, padding), (0, 0)))
                 sharded_grid_eval = grid_eval_block.reshape(n_devices, n_per_device_local, 3)
                 
-                # Integration over the FULL grid (g) is handled inside the pmap/scan
-                grid_int_full = jax.device_put(self.grid_points)
-                weights_int_full = jax.device_put(self.weights)
-                if self.xi_phi is not None:
-                    xi_phi_int_full = jax.device_put(self.xi_phi)
-                else:
-                    xi_phi_int_full = jax.device_put(xi_phi_ds[:])
-                        
-                res_rep = pmapped_compute(sharded_grid_eval, jastrow_params, grid_int_full, weights_int_full, xi_phi_int_full)
+                # Initialize accumulator on device
+                # We can use the first result to initialize, or create zeros
+                res_rep_accum = None
                 
-                res_block = res_rep.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
+                # Inner loop: Integration blocks (g)
+                # Also controlled by host_grid_block_size to limit peak memory of inputs
+                for g0 in range(0, n_grid, host_grid_block_size):
+                    g1 = min(g0 + host_grid_block_size, n_grid)
+                    
+                    # Load chunks to device
+                    grid_int_chunk = jax.device_put(self.grid_points[g0:g1])
+                    weights_int_chunk = jax.device_put(self.weights[g0:g1])
+                    
+                    if self.xi_phi is not None:
+                        xi_phi_chunk = jax.device_put(self.xi_phi[:, g0:g1])
+                    else:
+                        xi_phi_chunk = jax.device_put(xi_phi_ds[:, g0:g1])
+                            
+                    # Compute partial update
+                    # The pmapped function uses scan internally with batch_size=1024
+                    res_partial = pmapped_compute(sharded_grid_eval, jastrow_params, grid_int_chunk, weights_int_chunk, xi_phi_chunk)
+                    
+                    if res_rep_accum is None:
+                        res_rep_accum = res_partial
+                    else:
+                        res_rep_accum += res_partial
+                    
+                    # Explicitly free memory
+                    del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
+                    # gc.collect() # Optional, might be too slow to call every time
+                
+                # Store result for this evaluation block
+                res_block = res_rep_accum.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
                 L_aux_out[:, r0:r1, :] = np.array(res_block[:, :n_eval, :])
                 
-                del grid_int_full, weights_int_full, xi_phi_int_full, res_rep, sharded_grid_eval
+                del sharded_grid_eval, res_rep_accum, res_block
                 gc.collect()
                 
         finally:
