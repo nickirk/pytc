@@ -393,31 +393,6 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     return K3_kernel
 
 
-def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
-    r"""Contract K1 using precomputed kernel and pivot values.
-    
-    K1_{pqrs} \approx \sum_{k,l} (\nabla\phi_p(z_k) \phi_q(z_k)) U1_{kl} (\phi_r(z_l) \phi_s(z_l))
-    
-    Args:
-        phi_piv: (Nb, N_fused) Values of phi at pivot points
-        grad_phi_piv: (Nb, N_fused, 3) Values of grad_phi at pivot points
-        U1: (N_fused, N_fused, 3) Precomputed kernel
-        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s)
-        
-    Returns:
-        K1: (Np, Nq, Nr, Ns)
-    """
-    if ranges is None:
-        slice_p = slice_q = slice_r = slice_s = slice(None)
-    else:
-        slice_p, slice_q, slice_r, slice_s = ranges
-        
-    phi_p = phi_piv[slice_p]
-    phi_q = phi_piv[slice_q]
-    phi_r = phi_piv[slice_r]
-    phi_s = phi_piv[slice_s]
-    grad_phi_p = grad_phi_piv[slice_p]
-    
 @jax.jit
 def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
     """JITted version of K1 contraction.

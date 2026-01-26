@@ -81,10 +81,8 @@ class TestXTC(unittest.TestCase):
                                     mo_values_numpy, 
                                     mo_values_numpy).reshape(-1, len(self.xtc_numpy.weights))
         
-        v_vector_jax = self.xtc_jax._calc_v_batch(
-            self.xtc_jax.grid_points,
-            self.xtc_jax.phi,
-            self.xtc_jax.weights,
+        v_vector_jax = self.xtc_jax._calc_v_vector(
+            phi_paired_jax,
             self.params_jax,
             batch_size=len(self.xtc_jax.grid_points)
         )

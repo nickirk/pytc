@@ -2,6 +2,7 @@ import unittest
 import numpy as np
 import jax
 import jax.numpy as jnp
+import time
 from pyscf import gto, scf
 from pytc.autodiff.tc import TC, ISDFTC
 from pytc.autodiff.jastrow import REXP

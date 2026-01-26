@@ -22,7 +22,7 @@ def profile_h4():
     print("Setting up H4 chain...")
     # H4 chain with 1.0 Bohr spacing
     atom = []
-    for i in range(10):
+    for i in range(4):
         atom.append(f'H 0 0 {i*1.0}')
     mol = gto.M(atom=atom, basis='cc-pvtz', unit='Bohr', verbose=3)
     mf = scf.RHF(mol)

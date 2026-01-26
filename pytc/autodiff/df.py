@@ -13,7 +13,7 @@ import os
 
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
                                    phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray,
-                                   rcond: float = 1e-10) -> jnp.ndarray:
+                                   rcond: float = 1e-14) -> jnp.ndarray:
     """Fast solver using SVD-based pseudoinverse for structured least-squares.
     
     Solves min ||C*X - B||² where:
@@ -28,7 +28,7 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
         phi_piv_q: (n_orb, n_fused) second factor of pivots
         phi_p_batch: (n_orb, batch_size) first factor of target
         phi_q_batch: (n_orb, batch_size) second factor of target
-        rcond: Relative condition number cutoff for SVD (default 1e-10)
+        rcond: Relative condition number cutoff for SVD (default 1e-14)
         
     Returns:
         X: (n_fused, batch_size) solutions
@@ -166,7 +166,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         use_iterative: If True, use memory-efficient solver (recommended).
                       If False, use direct solve with materialized C matrices (HIGH MEMORY).
         grid_batch_size: Number of grid points to process in each batch
-        rcond: Relative condition number cutoff for SVD pseudoinverse (default 1e-10).
+        rcond: Relative condition number cutoff for SVD pseudoinverse (default 1e-14).
                Smaller values retain more singular values (more accurate but less stable).
         
     Returns:

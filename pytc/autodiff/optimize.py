@@ -21,13 +21,13 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     params = init_params.copy()
     
     # Precompute standard integrals
+    nocc = int(sum(mf.mo_occ == 2))
     h1e_std = jnp.asarray(tc_helper.get_hcore(mf, xtc_obj.mo_coeff))
     # on host RAM store eri full block, and slice it for each block for GPU
     eri = tc_helper.get_eri(mf, xtc_obj.mo_coeff)
     eri_ovov = jnp.asarray(eri[:nocc, nocc:, :nocc, nocc:])
     eri_ovoo = jnp.asarray(eri[:nocc, nocc:, :nocc, :nocc])
     eri_ooov = jnp.asarray(eri[:nocc, :nocc, :nocc, nocc:])
-    nocc = int(sum(mf.mo_occ == 2))
 
     # Add learning rate schedule parameters
     current_lr = learning_rate

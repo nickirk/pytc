@@ -39,8 +39,6 @@ class TestXTCBlock(unittest.TestCase):
         
     def test_full_vs_block_oooo(self):
         """Test if 'oooo' block matches full tensor slice."""
-        with open("nocc_value.txt", "w") as f:
-            f.write(f"nocc={self.nocc}\n")
         print(f"\nTesting XTC oooo block... nocc={self.nocc}")
         
         # Compute full tensor

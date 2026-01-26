@@ -4,8 +4,8 @@ from pyscf import gto, scf, cc
 from pytc.xtc import XTC
 from pytc.jastrow import SM7, SM17
 
-def get_he_ccpvtz():
-    """Return a He atom with cc-pVTZ basis for testing."""
+def get_be_ccpvtz():
+    """Return a Be atom with cc-pVTZ basis for testing."""
     mol = gto.M(atom='Be 0 0 0', basis='ccpvtz', unit='Bohr')
     mf = scf.RHF(mol)
     mf.kernel()
@@ -16,7 +16,7 @@ class TestSM(unittest.TestCase):
 
     def test_sm7(self):
         """Test SM7 Jastrow factor."""
-        mol, mf = get_he_ccpvtz()
+        mol, mf = get_be_ccpvtz()
         jastrow = SM7(atom='Be')
         xtc = XTC(mf, jastrow, grid_lvl=2)
         
@@ -44,7 +44,7 @@ class TestSM(unittest.TestCase):
 
     def test_sm17(self):
         """Test SM17 Jastrow factor."""
-        mol, mf = get_he_ccpvtz()
+        mol, mf = get_be_ccpvtz()
         jastrow = SM17(atom='Be')
         xtc = XTC(mf, jastrow, grid_lvl=2)
         
