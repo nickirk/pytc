@@ -25,7 +25,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         # Pin jax/jaxlib and other deps to ensure compatibility
-        pip install jax==0.4.30 jaxlib==0.4.30 chex==0.1.85 optax==0.1.9 psutil scipy==1.13.1 flax kfac-jax folx tqdm pyscf
+        pip install jax==0.4.30 jaxlib==0.4.30 chex==0.1.85 optax==0.1.9 psutil scipy==1.13.1 flax kfac-jax folx tqdm git+https://github.com/nickirk/pyscf.git@tc-ccsd
         
         # Patch kfac-jax to fix register_dataclass error
         SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
