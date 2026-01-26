@@ -1,12 +1,17 @@
 # pytc
 **Py**thon **T**rans**C**orrelation package
 
+## Requirements
+- **Python**: 3.10 to 3.13
+- **JAX**: 0.4.30+ (Note: JAX 0.7.0+ requires Python 3.11+)
+
 ## Dependencies
 - numpy
 - numba (optional: JIT compilation for heavy numerical functions on CPU)
 - scipy
 - unittest
 - jax (autodiff and GPU acceleration)
+  - **Important**: For GPU support, please follow the [official JAX installation guide](https://github.com/google/jax#installation) to install the version matching your CUDA environment (e.g., `pip install "jax[cuda12]"`).
 - flax (neural network)
 - folx 
 - optax (machine learning optimizers)
