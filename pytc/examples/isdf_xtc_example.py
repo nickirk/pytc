@@ -1,7 +1,8 @@
 import numpy as np
-from pyscf import gto, scf, lib
+from pyscf import gto, scf
 from pytc import xtc, jastrow
 import time
+import sys
 
 def run_isdf_example():
     """
@@ -14,29 +15,33 @@ def run_isdf_example():
     TC integrals while maintaining high accuracy.
     """
     # 1. Setup Molecule
-    # We use a simple N2 molecule for this example to ensure quick execution.
-    # A larger basis set and higher grid level will show more significant speedup with ISDF.
+    # We use H2O with a small basis for a quick but representative demonstration.
     mol = gto.M(
-        atom='N 0 0 0; N 0 0 2.07', 
-        basis='cc-pVDZ', 
-        unit='Bohr',
+        atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587', 
+        basis='sto-3g', 
         verbose=0
     )
     mf = scf.RHF(mol)
     print("Running reference RHF...")
+    sys.stdout.flush()
     mf.kernel()
     print(f"RHF energy: {mf.e_tot:.8f} Hartree")
 
     # 2. Define Jastrow factor
     # We use a simple REXP (Reduced Exponential) Jastrow factor.
+    # The parameter [1.0] is a typical starting value.
     my_jastrow = jastrow.REXP([1.0])
     
     # 3. Standard XTC calculation (Numerical Integration)
     print("\n--- Standard XTC (Numerical Integration) ---")
     start_time = time.time()
-    # Use grid_lvl=2 for a balance between speed and accuracy.
-    my_xtc = xtc.XTC(mf, my_jastrow, grid_lvl=2)
+    # Use grid_lvl=1 for speed in this example. 
+    # In production, grid_lvl=2 or 3 is recommended.
+    my_xtc = xtc.XTC(mf, my_jastrow, grid_lvl=1)
+    
     print("Computing standard XTC ERIs...")
+    print("(This involves full numerical integration over the grid)")
+    sys.stdout.flush()
     eris_standard = my_xtc.make_eris()
     standard_time = time.time() - start_time
     print(f"Standard XTC ERI computation took: {standard_time:.2f} seconds")
@@ -44,28 +49,27 @@ def run_isdf_example():
     # 4. ISDF XTC calculation
     print("\n--- ISDF-accelerated XTC ---")
     start_time = time.time()
-    my_xtc_isdf = xtc.XTC(mf, my_jastrow, grid_lvl=2)
+    my_xtc_isdf = xtc.XTC(mf, my_jastrow, grid_lvl=1)
     
     print("Performing ISDF decomposition...")
+    sys.stdout.flush()
     # n_rank controls the number of interpolation points.
-    # Setting it to 200 for this small system provides high accuracy.
-    # For larger systems, a common choice is 4-10 times the number of MOs.
-    my_xtc_isdf.isdf(n_rank=200) 
+    # A common choice is 4-10 times the number of molecular orbitals.
+    n_mo = mf.mo_coeff.shape[1]
+    n_rank = 8 * n_mo
+    my_xtc_isdf.isdf(n_rank=n_rank) 
     
-    print("Computing ISDF XTC ERIs...")
+    print(f"Computing ISDF XTC ERIs (Rank={n_rank})...")
+    sys.stdout.flush()
     eris_isdf = my_xtc_isdf.make_eris()
     isdf_time = time.time() - start_time
     print(f"ISDF XTC ERI computation took: {isdf_time:.2f} seconds")
 
     # 5. Accuracy and Performance Comparison
     speedup = standard_time / isdf_time
-    print(f"\n--- Comparison ---")
+    print(f"\n--- Results ---")
     print(f"Speedup factor: {speedup:.2f}x")
 
-    # Compare (oo|oo) block (occupied-occupied integrals)
-    diff_oooo = np.linalg.norm(eris_standard.oooo - eris_isdf.oooo)
-    print(f"Frobenius norm of difference in (oo|oo) integrals: {diff_oooo:.2e}")
-    
     # Helper to calculate TC-HF energy from ERIs
     def get_tc_hf_energy(eris, nocc):
         # E_HF = 2 * sum(h_ii) + sum(2*(ii|jj) - (ij|ji)) + E_nuc
@@ -83,6 +87,12 @@ def run_isdf_example():
     print(f"Standard TC-HF energy: {e_tc_hf_standard:.8f}")
     print(f"ISDF-TC-HF energy:     {e_tc_hf_isdf:.8f}")
     print(f"Energy difference:      {abs(e_tc_hf_standard - e_tc_hf_isdf):.2e} Hartree")
+    
+    # Verification
+    if abs(e_tc_hf_standard - e_tc_hf_isdf) < 1e-6:
+        print("\nVerification SUCCESS: ISDF energy matches standard integration.")
+    else:
+        print("\nVerification WARNING: Significant energy difference detected.")
 
 if __name__ == "__main__":
     run_isdf_example()
