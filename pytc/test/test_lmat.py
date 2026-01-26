@@ -17,17 +17,19 @@ def get_h2_sto3g():
 
 class SimpleJastrow(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
-    def __call__(self, r1, r2, atomic_positions=None):
-        delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        return np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+    def __call__(self, r1, r2, r_nuc=None):
+        r1 = np.atleast_2d(r1)
+        r2 = np.atleast_2d(r2)
+        delta_r = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
+        return np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
     
-    def grad(self, r1, r2=None, atomic_positions=None):
-        if r2 is None:
-            r2 = r1
-        delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
+    def _process_grad_batch(self, r1_batch, r2):
+        r1_batch = np.atleast_2d(r1_batch)
+        r2 = np.atleast_2d(r2)
+        delta_r = r1_batch[:, np.newaxis, :] - r2[np.newaxis, :, :]
         norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
-        return -self.parameters[0] * delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
+        return -self.params[0] * delta_r / norm * self.__call__(r1_batch, r2)[..., np.newaxis]
 
 
 class TestLmat(unittest.TestCase):

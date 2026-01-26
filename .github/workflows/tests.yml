@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
@@ -24,7 +24,15 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install jax jaxlib==0.4.30 scipy==1.13.1 flax optax kfac-jax folx tqdm pyscf pytest pytest-anyio
+        # Pin jax/jaxlib and other deps to ensure compatibility
+        pip install jax==0.4.30 jaxlib==0.4.30 chex==0.1.85 optax==0.1.9 psutil scipy==1.13.1 flax kfac-jax folx tqdm pyscf
+        
+        # Patch kfac-jax to fix register_dataclass error
+        SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+        TRACER_FILE="$SITE_PACKAGES/kfac_jax/_src/tracer.py"
+        sed -i 's/import jax/import chex\nimport jax/' "$TRACER_FILE"
+        sed -i 's/@jax.tree_util.register_dataclass/@chex.dataclass(frozen=True)/' "$TRACER_FILE"
+        sed -i '/@dataclasses.dataclass(frozen=True)/d' "$TRACER_FILE"
         
     - name: Install pytc
       run: |
@@ -32,4 +40,4 @@ jobs:
         
     - name: Run tests
       run: |
-        pytest
+        python -m unittest discover -v

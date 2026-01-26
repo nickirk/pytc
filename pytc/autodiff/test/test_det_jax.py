@@ -35,7 +35,7 @@ class TestDetJax(unittest.TestCase):
         mf.kernel()
         
         # Create SlaterDet with RHF orbitals
-        self.det = SlaterDet(self.mol, mo_coeff=mf.mo_coeff)
+        self.det = SlaterDet.create(self.mol, mo_coeff=mf.mo_coeff)
     
     def test_value_single(self):
         """Test the JAX wrapper for value with a single walker"""

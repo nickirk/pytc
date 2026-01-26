@@ -8,6 +8,17 @@ from . import Jastrow
 class CASINO(Jastrow):
     """Jastrow factor based on CASINO format parameters."""
     
+    def __init__(self, params, mol=None):
+        """Initialize the Jastrow factor with parameters.
+        
+        Args:
+            params: Dictionary of Jastrow parameters
+            mol: Molecule object
+        """
+        super().__init__(params, mol)
+        self.nuc_groups = None
+        self.nuc_coords = None
+
     def _get_nuc_groups(self, is_symm=False):
         """Generate nucleus labels and groups based on atomic charges.
         
@@ -84,14 +95,19 @@ class CASINO(Jastrow):
 
         
         total = 0.0
-        for term in self.params:
-            if term['rank'] == [2, 0]:
+        # self.params may be a dictionary from parse_casl or a list of terms
+        terms = self.params.get('JASTROW', {}).values() if isinstance(self.params, dict) and 'JASTROW' in self.params else self.params
+        if isinstance(terms, dict):
+            terms = terms.values()
+            
+        for term in terms:
+            if term['Rank'] == [2, 0]:
                 total += self.compute_term_2e0n(term, r1, r2)
-            elif term['rank'] == [1, 1]:
+            elif term['Rank'] == [1, 1]:
                 total += self.compute_term_1e1n(term, r1, r_nuc, nuc_groups)
-            elif term['rank'] == [2, 1]:
+            elif term['Rank'] == [2, 1]:
                 total += self.compute_term_2e1n(term, r1, r2, r_nuc, nuc_groups)
-            elif term['rank'] == [1, 2]:
+            elif term['Rank'] == [1, 2]:
                 total += self.compute_term_1e2n(term, r1, r_nuc, nuc_groups)
         return total
 
@@ -104,7 +120,7 @@ class CASINO(Jastrow):
         # Get cutoff parameters
         L = term['e-e cutoff']['Parameters']['Channel 1-2']['L'][0]
         C = term['e-e cutoff']['Constants']['C']
-        order = term['e-e basis']['order']
+        order = term['e-e basis']['Order']
         
         # Compute all distances
         diff = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]  # shape: (n_grid, n_grid, 3)
@@ -219,7 +235,7 @@ class CASINO(Jastrow):
         
         # Get cutoff parameters
         if 'e-n basis' in term and term['e-n basis']['Type'] != 'none':
-            order = term['e-n basis']['order']
+            order = term['e-n basis']['Order']
         else:
             order = 0  # For orbital cusp terms
         
@@ -299,8 +315,8 @@ class CASINO(Jastrow):
         # Get cutoff parameters
         L = term['e-n cutoff']['Constants']['C']
         C = term['e-n cutoff']['Constants']['C']
-        order_ee = term['e-e basis']['order']
-        order_en = term['e-n basis']['order']
+        order_ee = term['e-e basis']['Order']
+        order_en = term['e-n basis']['Order']
         
         # Compute all required distances at once
         r12 = np.sqrt(np.sum((r1[:, np.newaxis] - r2[np.newaxis])**2, axis=-1))  # (N1, N2)
