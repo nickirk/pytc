@@ -7,6 +7,7 @@ from typing import Optional
 import folx
 from flax import struct
 from functools import partial
+
 @struct.dataclass
 class Jastrow:
     """Abstract base class for JAX-based Jastrow factors.
@@ -93,9 +94,6 @@ class Jastrow:
         Returns:
             Laplacian value (scalar)
         """
-        def scalar_fn(x):
-            return self._compute(x, r2, params).reshape(-1)[0]
-            
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
             
