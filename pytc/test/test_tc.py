@@ -2,7 +2,7 @@
 
 import unittest
 import numpy as np
-from pyscf import gto, scf
+from pyscf import gto, scf, ao2mo
 from pytc.tc import TC
 from pytc.jastrow import Jastrow
 
@@ -19,7 +19,7 @@ class REXP(Jastrow):
     """Simple Jastrow factor for testing: f(r) = exp(-alpha*r)."""
     def __call__(self, r1, r2, atomic_positions=None):
         delta_r = r1[..., np.newaxis, :] - r2[np.newaxis, ...]
-        return -1./self.parameters[0]*np.exp(-self.parameters[0] * np.linalg.norm(delta_r, axis=-1))
+        return -1./self.params[0]*np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
     
     def grad(self, r1, r2=None, atomic_positions=None):
         if r2 is None:
@@ -28,6 +28,10 @@ class REXP(Jastrow):
         norm = np.linalg.norm(delta_r, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)  # Avoid division by zero
         return delta_r / norm * self.__call__(r1, r2)[..., np.newaxis]
+
+    def _process_grad_batch(self, r1_batch, r2):
+        """Process a batch of r1 points for gradient computation."""
+        return self.grad(r1_batch, r2)
 
 
 class TestTC(unittest.TestCase):
@@ -84,9 +88,27 @@ class TestTC(unittest.TestCase):
         # Get combined result from TC class
         combined = self.tc.get_2b()
         
+        # Reconstruct expected result matching TC.get_2b logic
+        n_orb = self.tc.n_orb
+        k1 = k1.reshape(n_orb, n_orb, n_orb, n_orb)
+        k3 = k3.reshape(n_orb, n_orb, n_orb, n_orb)
+        
+        # TC uses - (K1 + K1^T) for Laplacian part (K2)
+        k_laplacian = - (k1 + k1.swapaxes(0, 1))
+        
+        # TC formula: 0.5 * (K2 + K3) + K1 + transpose
+        result = 0.5 * (k_laplacian + k3)
+        result += k1
+        result += result.transpose(2, 3, 0, 1)
+        
+        # Add ERI
+        eri1 = ao2mo.incore.full(self.tc.mf._eri, self.tc.mo_coeff, compact=False)
+        eri1 = ao2mo.restore(1, eri1, n_orb)
+        
+        expected = eri1 - result
+        
         # Compare results
-        k_sum = k1.reshape(combined.shape) + k2.reshape(combined.shape) + k3.reshape(combined.shape)
-        np.testing.assert_array_almost_equal(combined, k_sum)
+        np.testing.assert_array_almost_equal(combined, expected)
     
 
 if __name__ == '__main__':

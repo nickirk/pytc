@@ -10,6 +10,7 @@ class REXP(Jastrow):
         r1 = np.atleast_2d(r1)
         r2 = np.atleast_2d(r2)
         r12 = np.linalg.norm(r1[:, None, :] - r2[None, :], axis=-1)
+        r12 += 1e-8  # Regularization to avoid division by zero
         return 0.5 * r12 * np.exp(-self.params[0] * r12)
     
 
@@ -31,7 +32,8 @@ class REXP(Jastrow):
         r12 = np.sqrt(r12_squared)  # Shape: (n_r1, n_r2)
         
         # Regularization to avoid division by zero
-        safe_r12 = np.maximum(r12, 1e-10)
+        #safe_r12 = np.maximum(r12, 1e-8)
+        safe_r12 = r12 + 1e-8
         
         # Calculate derivative of 1/2*r*exp(-param*r) with respect to r
         # df/dr = 1/2 * exp(-param*r) * (1 - param*r)
@@ -44,8 +46,8 @@ class REXP(Jastrow):
         gradients = df_dr[..., None] * direction
         
         # Zero out gradients where r12 is near zero
-        mask = (r12 > 1e-10)[..., None]
-        gradients = np.where(mask, gradients, np.zeros_like(gradients))
+        #mask = (r12 > 1e-10)[..., None]
+        #gradients = np.where(mask, gradients, np.zeros_like(gradients))
         
         # Sum over r2 dimension to get net gradient at each r1
         return gradients

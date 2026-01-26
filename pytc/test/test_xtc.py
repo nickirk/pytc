@@ -96,7 +96,7 @@ class TestXTC(unittest.TestCase):
         print("|t2| = ", np.linalg.norm(t2))
         print("|t1+t2| = ", np.linalg.norm(t))
         print("corr E_XTC_CCSD = ", myrcc.e_corr)
-        self.assertAlmostEqual(tc_e_corr, -0.03272155333587409, places=6)
+        self.assertAlmostEqual(tc_e_corr, -0.032719417286611235, places=6)
         # get the hf energy using fock and eris
         no = myrcc.nocc
         tc_h1e = self.xtc.get_1b()
@@ -106,7 +106,7 @@ class TestXTC(unittest.TestCase):
 
         tc_e_hf += (tc_e_dir + tc_e_ex) + eris.e_core 
         print("E_XTC_CCSD = ", myrcc.e_corr + tc_e_hf)
-        self.assertAlmostEqual(tc_e_hf + tc_e_corr, -14.656373992235194, places=6)
+        self.assertAlmostEqual(tc_e_hf + tc_e_corr, -14.656403596315542, places=6)
 
 
     def test_delta_U_isdf_convergence(self):

@@ -6,7 +6,7 @@ import time
 
 from pyscf import gto, scf
 
-from pytc.autodiff.mcmc import sample, optimize_ref_var
+from pytc.autodiff.vmc import sample, optimize_ref_var
 from pytc.autodiff.ansatz.sj import SlaterJastrow
 from pytc.autodiff.ansatz.det import SlaterDet
 from pytc.autodiff.jastrow import CompositeJastrow, NuclearCusp, NeuralEE, NeuralEN, NeuralEEN, REXP 
@@ -34,7 +34,7 @@ def main():
   
 
     # Create determinant from HF solution
-    det = SlaterDet(mol, mf.mo_coeff)
+    det = SlaterDet.create(mol, mf.mo_coeff)
 
     # Create jastrow factors with names
 
@@ -46,13 +46,13 @@ def main():
     #jeen = NeuralEEN(mol, layer_widths=layer_widths, name="jeen")
 
     # orbital nuclear cusp jastrow is important for noise reduction
-    jncusp = NuclearCusp(mol, name="ncusp")
+    jncusp = NuclearCusp.create(mol, name="ncusp")
 
     # Boys-Handy jastrow
-    jbh = BoysHandy(mol, terms_per_nucleus=None, name="bh")
+    jbh = BoysHandy.create(mol, terms_per_nucleus=None, name="bh")
 
     # Use composite jastrow to glue together the jastrow factors
-    jastrow_phase1 = CompositeJastrow([jncusp, jbh])
+    jastrow_phase1 = CompositeJastrow.create([jncusp, jbh])
     jastrow_params_phase1 = jastrow_phase1.init_params()
 
     # Create SlaterJastrow ansatz for phase 1
@@ -60,15 +60,15 @@ def main():
 
     
     # Phase 1: Optimize jastrow factors
-    print("\nPhase 1: Optimizing neural Jastrows with frozen nuclear cusp...")
+    print("\nPhase 1: Optimizing jastrow factors...")
     
     # Create Slater-Jastrow ansatz for phase 1
-    sj_ansatz_phase1 = SlaterJastrow(mol, jastrow_phase1, [det])
+    sj_ansatz_phase1 = SlaterJastrow.create(mol, jastrow_phase1, [det])
     params_phase1 = [jastrow_params_phase1, linear_coeffs]
     
     # Settings for phase 1
     n_walkers = 5000  
-    n_opt_steps_phase2 = 500 # total optimization steps
+    n_opt_steps_phase2 = 10 # total optimization steps
     burn_in_steps = 2000 # burn-in steps
     n_steps = 50 # resampling wavefunction every n_steps
     step_size = 0.02 # step size for the random walk
