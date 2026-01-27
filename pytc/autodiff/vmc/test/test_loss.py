@@ -12,8 +12,7 @@ from pytc.autodiff.jastrow import REXP
 from pytc.autodiff.vmc.walker import initialize_walkers
 from pytc.autodiff.vmc.loss import (
     make_energy_loss,
-    make_variance_loss,
-    make_combined_loss
+    make_variance_loss
 )
 
 
@@ -30,9 +29,9 @@ def test_energy_loss():
     mf.kernel()
     
     # Create ansatz
-    det = SlaterDet(mol, mf.mo_coeff)
+    det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
-    ansatz = SlaterJastrow([det], jastrow)
+    ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
     # Initialize parameters
     jastrow_params = jastrow.init_params()
@@ -80,9 +79,9 @@ def test_variance_loss():
     mf.kernel()
     
     # Create ansatz
-    det = SlaterDet(mol, mf.mo_coeff)
+    det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
-    ansatz = SlaterJastrow([det], jastrow)
+    ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
     # Initialize parameters
     jastrow_params = jastrow.init_params()
@@ -128,9 +127,9 @@ def test_combined_loss():
     mf.kernel()
     
     # Create ansatz
-    det = SlaterDet(mol, mf.mo_coeff)
+    det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
-    ansatz = SlaterJastrow([det], jastrow)
+    ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
     # Initialize parameters
     jastrow_params = jastrow.init_params()
@@ -141,16 +140,19 @@ def test_combined_loss():
     key = random.PRNGKey(42)
     walkers = initialize_walkers(ansatz, n_walkers=10, key=key)
     
-    # Create combined loss
-    loss_fn = make_combined_loss(
-        ansatz,
-        optimizer_type="adam",
-        energy_weight=1.0,
-        variance_weight=0.1
-    )
+    # Create combined loss manually in test
+    energy_loss_fn = make_energy_loss(ansatz, optimizer_type="adam")
+    variance_loss_fn = make_variance_loss(ansatz, optimizer_type="adam", use_custom_jvp=False)
+    
+    def loss_fn(params, batch_data):
+        e_loss, aux = energy_loss_fn(params, batch_data)
+        v_loss, _ = variance_loss_fn(params, batch_data)
+        return e_loss + 0.1 * v_loss, aux
     
     # Compute loss
-    loss, (mean_e, std_e) = loss_fn(params, walkers)
+    loss, aux = loss_fn(params, walkers)
+    mean_e = aux[0] if isinstance(aux, tuple) else aux.mean_energy
+    std_e = aux[1] if isinstance(aux, tuple) else aux.energy_std
     
     print(f"Combined loss test:")
     print(f"  Combined loss: {loss:.6f}")
@@ -181,9 +183,9 @@ def test_batched_energy_loss():
     mf.kernel()
     
     # Create ansatz
-    det = SlaterDet(mol, mf.mo_coeff)
+    det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
-    ansatz = SlaterJastrow([det], jastrow)
+    ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
     # Initialize parameters
     jastrow_params = jastrow.init_params()

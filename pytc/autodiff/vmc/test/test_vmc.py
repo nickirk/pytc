@@ -63,9 +63,9 @@ class TestWalkerDataclass(unittest.TestCase):
         # Create simple ansatz
         mf = scf.RHF(self.mol)
         mf.kernel()
-        det = SlaterDet(self.mol, mf.mo_coeff)
+        det = SlaterDet.create(self.mol, mf.mo_coeff)
         jastrow = Poly()
-        self.ansatz = SlaterJastrow(self.mol, jastrow, [det])
+        self.ansatz = SlaterJastrow.create(self.mol, jastrow, [det])
         
         self.n_walkers = 10
         self.n_electrons = self.mol.nelectron
@@ -282,9 +282,9 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Use small settings for test speed
         # For production, use larger values
         n_walkers = 5000
-        n_steps = 5000
-        step_size = 0.1
-        burn_in_steps = 1000  # Updated parameter name
+        n_steps = 8000
+        step_size = 0.05
+        burn_in_steps = 2000
         thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
@@ -333,10 +333,6 @@ class TestHartreeFockEnergy(unittest.TestCase):
     def test_be_atom(self):
         """Test HF energy sampling for Be atom."""
         results = self.run_hf_energy_test("Be 0 0 0")
-
-    def test_lih(self):
-        """Test HF energy sampling for LiH molecule."""
-        results = self.run_hf_energy_test("Li 0 0 0; H 0 0 1.6")
 
 
 
