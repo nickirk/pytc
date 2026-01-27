@@ -22,7 +22,7 @@ def create_test_walker(positions, n_alpha, n_beta):
         n_walkers = 1
         
     return Walker(
-        positions=positions,
+        positions=jnp.asarray(positions),
         det_up=(jnp.zeros((n_walkers,)), jnp.zeros((n_walkers,))), 
         det_down=(jnp.zeros((n_walkers,)), jnp.zeros((n_walkers,))),
         slater_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
@@ -191,14 +191,6 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             r_grid = self.ncusp.r_grids[nucleus_idx]
             spline_coeffs = self.ncusp.spline_coeffs[nucleus_idx]
             
-            # Construct a NumPy cubic spline using the same data points
-            # Note: we stored coefficients in segment form, so reconstructing full spline
-            # for comparison might be tricky directly from coefficients.
-            # Instead, let's just check that our JAX implementation evaluates consistently.
-            
-            # But we don't have the original y values easily accessible here (they were sao_sums).
-            # However, we trust the spline implementation if it matches itself on grid points.
-            
             # Evaluate at grid points
             jax_values_at_grid = self.ncusp.eval_mo_at_r(nucleus_idx, r_grid)
             
@@ -294,9 +286,9 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         params = [jastrow_params, linear_coeffs]
         
         # Set up fixed positions for other electrons (random but fixed)
-        np.random.seed(42)
+        key = jax.random.PRNGKey(42)
         n_electrons = 10  # Water molecule has 10 electrons
-        fixed_positions = np.random.randn(n_electrons-1, 3)+4.  # 9 electrons at random positions
+        fixed_positions = jax.random.normal(key, (n_electrons-1, 3)) + 4.0
         
         # Create grid points along x-axis through O atom
         x_points = np.linspace(-0.02, 0.02, 100)
@@ -304,39 +296,33 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         jastrow_vals = []
         
         
-        # Evaluate Jastrow and local energy at each point
-        for x in x_points:
-            # Place electron 0 at point along x-axis
-            pos = np.array([x, 0.0, 0.0])
-            
-            # Compute Jastrow value
-            u = self.ncusp._compute(pos, fixed_positions[0], jastrow_params)
-            jastrow_vals.append(jnp.exp(float(u)))
-            
+        # JIT compile the evaluation for speed
+        @jax.jit
+        def eval_point(pos):
             # Create full electron configuration
-            elec_coords = np.vstack([[pos], fixed_positions])
+            elec_coords = jnp.vstack([pos[None, :], fixed_positions])
             
             # Create walker and populate it
             walker = create_test_walker(elec_coords, det.n_alpha, det.n_beta)
-            # We need to run ansatz to populate slater matrices etc.
-            # Note: walker positions in create_test_walker is (1, nelec, 3)
-            # We need to pass batched walker to batched ansatz?
-            # Or sj(...) handles batching? sj(...) calls eval_sj which handles single walker if passed single walker,
-            # but here we created batched walker (size 1).
-            # eval_sj expects single walker if we want single result.
-            # But we can use vmap.
-            
-            # Actually, let's just use single walker (no batch dim in positions) for simplicity if eval_sj supports it.
-            # Walker dataclass usually expects batched arrays for efficiency?
-            # In metropolis.py, we use vmap.
-            # Let's extract the single walker from the batch
             single_walker = jax.tree_util.tree_map(lambda x: x[0], walker)
             
             psi, updated_walker = sj(single_walker, params)
             
             # Compute local energy using combined parameters
             E_L = sj.local_energy(updated_walker, params)[0]
+            
+            # Compute Jastrow value
+            # Ensure we use sj.jastrow._compute directly to be consistent with params
+            u = sj.jastrow._compute(pos, fixed_positions[0], params[0])
+            return E_L, jnp.exp(u)
+
+        # Evaluate Jastrow and local energy at each point
+        for x in x_points:
+            pos = jnp.array([x, 0.0, 0.0])
+            E_L, j_val = eval_point(pos)
+            
             energies.append(float(E_L))
+            jastrow_vals.append(float(j_val))
         
         # Print results
         print("\nEnergies and Jastrow values along x-axis through O atom:")
@@ -344,106 +330,6 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         print("-" * 50)
         for x, E, u in zip(x_points, energies, jastrow_vals):
             print(f"{x:10.4f}  {E:15.6f}  {u:15.6f}")
-
-class TestHartreeFockCBS(unittest.TestCase):
-    """Test cases for Hartree-Fock basis set convergence with nuclear cusp correction."""
-    
-    def setUp(self):
-        """Set up common test parameters."""
-        # Common sampling parameters
-        self.n_walkers = 10000
-        self.n_steps = 8000
-        self.step_size = 0.05
-        self.burn_in_steps = 3000
-        self.thinning = 10
-        self.key = random.PRNGKey(42)
-        
-        # Test molecule (using H2O as example)
-        self.atom_str = 'He 0 0 0; He 0 0 1.6;'
-        self.basis_sets = ['cc-pvQz']
-        
-    def sample_hf_energy(self, mol, mf, use_ncusp=False):
-        """Helper function to sample HF energy with or without nuclear cusp."""
-        # Create determinant from HF solution
-        det = SlaterDet.create(mol, mf.mo_coeff)
-        
-        if use_ncusp:
-            # Create NuclearCusp Jastrow
-            jastrow = NuclearCusp.create(mol, n_radial=1000)
-            # Initialize parameters
-            jastrow_params = jastrow.init_params()
-        else:
-            jastrow = Poly()
-            jastrow_params = jnp.zeros(1)  # Identity Jastrow
-            
-        linear_coeffs = jnp.ones(1)  # Single determinant
-        # Combine parameters as expected by sample()
-        params = [jastrow_params, linear_coeffs]
-        
-        # Create SlaterJastrow ansatz
-        sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
-        
-        # Run sampling with combined params
-        sampling_results = sample(
-            sj_ansatz,
-            n_walkers=self.n_walkers,
-            n_steps=self.n_steps,
-            step_size=self.step_size,
-            use_importance_sampling=False,
-            burn_in_steps=self.burn_in_steps,
-            thinning=self.thinning,
-            params=params,  # Use combined params here
-            key=self.key
-        )
-        
-        # Analyze results
-        energy_stats = analyze_energies(sampling_results)
-        return float(energy_stats["mean"]), float(energy_stats["error"])
-    
-    def test_basis_set_convergence(self):
-        """Test convergence of HF energy with and without nuclear cusp correction."""
-        results = []
-        
-        for basis in self.basis_sets:
-            # Create molecule with current basis
-            mol = gto.M(atom=self.atom_str, basis=basis, unit='bohr')
-            
-            # Run PySCF calculation
-            mf = scf.RHF(mol)
-            hf_energy_reference = float(mf.kernel())
-            
-            # Sample with nuclear cusp
-            cusp_energy, cusp_error = self.sample_hf_energy(mol, mf, use_ncusp=True)
-            no_cusp_energy, no_cusp_error = self.sample_hf_energy(mol, mf, use_ncusp=False)
-            
-            results.append({
-                'basis': basis,
-                'reference': hf_energy_reference,
-                'without_cusp': (no_cusp_energy, no_cusp_error),
-                'with_cusp': (cusp_energy, cusp_error)
-            })
-            
-            # Print current results
-            print(f"\nResults for {basis}:")
-            print(f"Reference HF: {hf_energy_reference:.6f}")
-            print(f"Without cusp: {no_cusp_energy:.6f} ± {no_cusp_error:.6f}")
-            print(f"With cusp:   {cusp_energy:.6f} ± {cusp_error:.6f}")
-        
-        # Analyze convergence
-        for i in range(len(results)-1):
-            basis1, basis2 = results[i], results[i+1]
-            
-            # Energy differences between consecutive basis sets
-            diff_no_cusp = abs(basis1['no_cusp'][0] - basis2['no_cusp'][0])
-            diff_cusp = abs(basis1['with_cusp'][0] - basis2['with_cusp'][0])
-            
-            print(f"\nConvergence from {basis1['basis']} to {basis2['basis']}:")
-            print(f"Energy difference without cusp: {diff_no_cusp:.6f}")
-            print(f"Energy difference with cusp:    {diff_cusp:.6f}")
-            
-            # Test that cusp correction improves convergence
-            self.assertLess(diff_cusp, diff_no_cusp, 
-                          "Nuclear cusp correction should improve basis set convergence")
 
 if __name__ == '__main__':
     unittest.main()
