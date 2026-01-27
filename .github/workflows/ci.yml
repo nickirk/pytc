@@ -39,5 +39,6 @@ jobs:
         python -m unittest discover -v -s pytc/autodiff/ansatz/test -t pytc/autodiff/ansatz/test
         python -m unittest discover -v -s pytc/autodiff/vmc/test -t pytc/autodiff/vmc/test
         python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
+        python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
         python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
         python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
