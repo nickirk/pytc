@@ -40,13 +40,15 @@ See the test directory for examples of how to use the package.
 
 To run the tests:
 ```bash
+# General tests
 python -m unittest discover pytc/test
+
+# Autodiff/JAX tests
 python -m unittest discover pytc/autodiff/test
 python -m unittest discover pytc/autodiff/ansatz/test
-python -m unittest discover pytc/autodiff/jastrow/test
 python -m unittest discover pytc/autodiff/vmc/test
-python -m unittest discover pytc/jastrow/test
-python -m unittest discover pytc/utils/test
-```
+python -m unittest discover pytc/autodiff/jastrow/test
 
+# Utility tests
+python -m unittest discover pytc/utils/test
 

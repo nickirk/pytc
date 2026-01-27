@@ -389,7 +389,7 @@ class TestHartreeFockCBS(unittest.TestCase):
             n_walkers=self.n_walkers,
             n_steps=self.n_steps,
             step_size=self.step_size,
-            use_importance_sampling=True,
+            use_importance_sampling=False,
             burn_in_steps=self.burn_in_steps,
             thinning=self.thinning,
             params=params,  # Use combined params here

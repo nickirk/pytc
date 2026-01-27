@@ -34,10 +34,10 @@ jobs:
 
     - name: Run tests
       run: |
-        python -m unittest discover pytc/test
-        python -m unittest discover pytc/autodiff/test
-        python -m unittest discover pytc/autodiff/ansatz/test
-        python -m unittest discover pytc/autodiff/jastrow/test
-        python -m unittest discover pytc/autodiff/vmc/test
-        python -m unittest discover pytc/jastrow/test
-        python -m unittest discover pytc/utils/test
+        python -m unittest discover -s pytc/test -t .
+        python -m unittest discover -s pytc/autodiff/test -t .
+        python -m unittest discover -s pytc/autodiff/ansatz/test -t .
+        python -m unittest discover -s pytc/autodiff/vmc/test -t .
+        python -m unittest discover -s pytc/autodiff/jastrow/test -t .
+        python -m unittest discover -s pytc/utils/test -t .
+        python -m unittest discover -s pytc/jastrow/test -t .

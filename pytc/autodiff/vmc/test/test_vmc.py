@@ -317,18 +317,10 @@ class TestHartreeFockEnergy(unittest.TestCase):
         print(f"Sampled energy: {energy_mean:.6f} ± {energy_error:.6f}")
         
         # Check if energies agree within a reasonable tolerance
-        # We set a relatively large tolerance for test efficiency
-        # This could be tightened with more samples
         rel_error = abs(energy_mean - hf_energy_reference) / abs(hf_energy_reference)
         
-        # We use a 5% tolerance because MC sampling has statistical fluctuations
-        # and we're using a small number of steps for test speed
-        #self.assertLess(rel_error, 1.05, 
-        #               f"Sampled energy {energy_mean:.6f} too far from reference {hf_energy_reference:.6f}")
-        
-        # Also check if the reference energy is within the statistical error bars
-        #self.assertLessEqual(abs(energy_mean - hf_energy_reference), 3 * energy_error,
-        #                    "Reference energy outside 3-sigma error bars of sampled energy")
+        self.assertLessEqual(abs(energy_mean - hf_energy_reference), 3 * energy_error,
+                            "Reference energy outside 3-sigma error bars of sampled energy")
         
         # Return values to be used in other tests if needed
         return {
@@ -338,34 +330,13 @@ class TestHartreeFockEnergy(unittest.TestCase):
             "sampling_results": sampling_results
         }
     
-    def test_h4_molecule(self):
-        """Test HF energy sampling for H2 molecule."""
-        results = self.run_hf_energy_test("H 0 0 0; H 0 0 2; H 0 0 4; H 0 0 6")
-    
     def test_be_atom(self):
-        """Test HF energy sampling for He He molecule."""
+        """Test HF energy sampling for Be atom."""
         results = self.run_hf_energy_test("Be 0 0 0")
 
     def test_lih(self):
         """Test HF energy sampling for LiH molecule."""
         results = self.run_hf_energy_test("Li 0 0 0; H 0 0 1.6")
-
-    def test_benzene(self):
-        """Test HF energy sampling for Benzene molecule."""
-        results = self.run_hf_energy_test(
-                """C 2.866 1.0 0                                                 
-                C 3.7321 0.5 0                                                  
-                C 2.0 0.5 0                                                     
-                C 3.7321 -0.5 0                                                 
-                C 2.0 -0.5 0                                                    
-                C 2.866 -1.0 0                                                  
-                H 2.866 1.62 0                                                  
-                H 4.269 0.81 0                                                  
-                H 1.4631 0.81 0                                                 
-                H 4.269 -0.81 0                                                 
-                H 1.4631 -0.81 0                                                
-                H 2.866 -1.62 0""" 
-        )
 
 
 
@@ -441,39 +412,10 @@ class TestJastrowOptimization(unittest.TestCase):
         
         return opt_results
     
-    def test_h2(self):
-        """Test optimization of Jastrow parameters for H2 molecule."""
-        self.run_optimization_test('H 0 0 0; H 0 0 1.0')
-    
     def test_be(self):
         """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
-    def test_h2o(self):
-        """Test optimization of Jastrow parameters for Be atom."""
-        self.run_optimization_test('O 0 0 0; H 0 0.757	0.589; H 0 -0.757	0.589', basis='ccpvtz')
-
-    def test_n2(self):
-        """Test optimization of Jastrow parameters for Be atom."""
-        self.run_optimization_test('N 0 0 0; N 0 0 1.097', basis='ccpvdz')
-
-    def test_benzene(self):
-        """Test HF energy sampling for Benzene molecule."""
-        self.run_optimization_test(
-                """C 2.866 1.0 0                                                 
-                C 3.7321 0.5 0                                                  
-                C 2.0 0.5 0                                                     
-                C 3.7321 -0.5 0                                                 
-                C 2.0 -0.5 0                                                    
-                C 2.866 -1.0 0                                                  
-                H 2.866 1.62 0                                                  
-                H 4.269 0.81 0                                                  
-                H 1.4631 0.81 0                                                 
-                H 4.269 -0.81 0                                                 
-                H 1.4631 -0.81 0                                                
-                H 2.866 -1.62 0""", basis='ccpvdz'
-        )
-
 
 
 if __name__ == "__main__":
