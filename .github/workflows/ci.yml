@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # Install CPU version of JAX for CI
+        pip install -U "jax[cpu]"
+        # Install other dependencies
+        pip install numpy scipy optax kfac_jax flax folx pyscf
+        # Install the package itself if needed, or just dependencies
+        # Assuming dev install or just running tests against source
+        pip install -e .
+
+    - name: Run tests
+      run: |
+        python -m unittest discover pytc/test
+        python -m unittest discover pytc/autodiff/test
+        python -m unittest discover pytc/autodiff/ansatz/test
+        python -m unittest discover pytc/autodiff/jastrow/test
+        python -m unittest discover pytc/autodiff/vmc/test
+        python -m unittest discover pytc/jastrow/test
+        python -m unittest discover pytc/utils/test
