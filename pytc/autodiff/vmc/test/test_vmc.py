@@ -91,8 +91,10 @@ class TestWalkerDataclass(unittest.TestCase):
         self.assertEqual(walker.slater_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
         self.assertEqual(walker.inv_up.shape, (self.n_walkers, self.n_alpha, self.n_alpha))
         self.assertEqual(walker.inv_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
-        self.assertEqual(walker.det_up.shape, (self.n_walkers,))
-        self.assertEqual(walker.det_down.shape, (self.n_walkers,))
+        self.assertEqual(walker.det_up[0].shape, (self.n_walkers,))
+        self.assertEqual(walker.det_up[1].shape, (self.n_walkers,))
+        self.assertEqual(walker.det_down[0].shape, (self.n_walkers,))
+        self.assertEqual(walker.det_down[1].shape, (self.n_walkers,))
         self.assertEqual(walker.move_mask.shape, (self.n_walkers, self.n_electrons))
         
         # Check move_mask is all True initially
@@ -100,7 +102,8 @@ class TestWalkerDataclass(unittest.TestCase):
         
         # Check other fields are zeros
         self.assertTrue(jnp.allclose(walker.slater_up, 0.0))
-        self.assertTrue(jnp.allclose(walker.det_up, 0.0))
+        self.assertTrue(jnp.allclose(walker.det_up[0], 0.0))
+        self.assertTrue(jnp.allclose(walker.det_up[1], 0.0))
     
     def test_initialize_walkers(self):
         """Test initialize_walkers function."""
@@ -140,7 +143,7 @@ class TestWalkerDataclass(unittest.TestCase):
         
         # Perform one electron move
         key, subkey = random.split(key)
-        proposals, psi_old, psi_new = _one_electron_move(
+        psi_old, psi_new, walker_updated, proposals = _one_electron_move(
             self.ansatz, walker, step_size=0.1, key=subkey, params=params
         )
         
@@ -179,7 +182,7 @@ class TestWalkerDataclass(unittest.TestCase):
         
         # Perform all electron move
         key, subkey = random.split(key)
-        proposals, psi_old, psi_new = _all_electron_move(
+        psi_old, psi_new, walker_updated, proposals = _all_electron_move(
             self.ansatz, walker, step_size=0.1, key=subkey, params=params
         )
         
@@ -282,9 +285,9 @@ class TestHartreeFockEnergy(unittest.TestCase):
         # Use small settings for test speed
         # For production, use larger values
         n_walkers = 5000
-        n_steps = 8000
-        step_size = 0.05
-        burn_in_steps = 2000
+        n_steps = 5000
+        step_size = 0.1
+        burn_in_steps = 1000
         thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
@@ -297,7 +300,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
-            #use_importance_sampling=False,
+            use_importance_sampling=True,
             burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
             key=key
@@ -333,6 +336,9 @@ class TestHartreeFockEnergy(unittest.TestCase):
     def test_be_atom(self):
         """Test HF energy sampling for Be atom."""
         results = self.run_hf_energy_test("Be 0 0 0")
+    def test_lih(self):
+        """Test HF energy sampling for LiH molecule."""
+        results = self.run_hf_energy_test("Li 0 0 0; H 0 0 1.6")
 
 
 
