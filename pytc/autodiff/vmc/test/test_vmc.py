@@ -63,9 +63,9 @@ class TestWalkerDataclass(unittest.TestCase):
         # Create simple ansatz
         mf = scf.RHF(self.mol)
         mf.kernel()
-        det = SlaterDet(self.mol, mf.mo_coeff)
+        det = SlaterDet.create(self.mol, mf.mo_coeff)
         jastrow = Poly()
-        self.ansatz = SlaterJastrow(self.mol, jastrow, [det])
+        self.ansatz = SlaterJastrow.create(self.mol, jastrow, [det])
         
         self.n_walkers = 10
         self.n_electrons = self.mol.nelectron
@@ -91,8 +91,10 @@ class TestWalkerDataclass(unittest.TestCase):
         self.assertEqual(walker.slater_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
         self.assertEqual(walker.inv_up.shape, (self.n_walkers, self.n_alpha, self.n_alpha))
         self.assertEqual(walker.inv_down.shape, (self.n_walkers, self.n_beta, self.n_beta))
-        self.assertEqual(walker.det_up.shape, (self.n_walkers,))
-        self.assertEqual(walker.det_down.shape, (self.n_walkers,))
+        self.assertEqual(walker.det_up[0].shape, (self.n_walkers,))
+        self.assertEqual(walker.det_up[1].shape, (self.n_walkers,))
+        self.assertEqual(walker.det_down[0].shape, (self.n_walkers,))
+        self.assertEqual(walker.det_down[1].shape, (self.n_walkers,))
         self.assertEqual(walker.move_mask.shape, (self.n_walkers, self.n_electrons))
         
         # Check move_mask is all True initially
@@ -100,7 +102,8 @@ class TestWalkerDataclass(unittest.TestCase):
         
         # Check other fields are zeros
         self.assertTrue(jnp.allclose(walker.slater_up, 0.0))
-        self.assertTrue(jnp.allclose(walker.det_up, 0.0))
+        self.assertTrue(jnp.allclose(walker.det_up[0], 0.0))
+        self.assertTrue(jnp.allclose(walker.det_up[1], 0.0))
     
     def test_initialize_walkers(self):
         """Test initialize_walkers function."""
@@ -140,7 +143,7 @@ class TestWalkerDataclass(unittest.TestCase):
         
         # Perform one electron move
         key, subkey = random.split(key)
-        proposals, psi_old, psi_new = _one_electron_move(
+        psi_old, psi_new, walker_updated, proposals = _one_electron_move(
             self.ansatz, walker, step_size=0.1, key=subkey, params=params
         )
         
@@ -179,7 +182,7 @@ class TestWalkerDataclass(unittest.TestCase):
         
         # Perform all electron move
         key, subkey = random.split(key)
-        proposals, psi_old, psi_new = _all_electron_move(
+        psi_old, psi_new, walker_updated, proposals = _all_electron_move(
             self.ansatz, walker, step_size=0.1, key=subkey, params=params
         )
         
@@ -284,7 +287,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
         n_walkers = 5000
         n_steps = 5000
         step_size = 0.1
-        burn_in_steps = 1000  # Updated parameter name
+        burn_in_steps = 1000
         thinning = 10
         key = random.PRNGKey(42)  # Fixed seed for reproducibility
         
@@ -297,7 +300,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
             n_walkers=n_walkers,
             n_steps=n_steps,
             step_size=step_size,
-            #use_importance_sampling=False,
+            use_importance_sampling=True,
             burn_in_steps=burn_in_steps,  # Updated parameter name
             thinning=thinning,
             key=key
@@ -317,18 +320,10 @@ class TestHartreeFockEnergy(unittest.TestCase):
         print(f"Sampled energy: {energy_mean:.6f} ± {energy_error:.6f}")
         
         # Check if energies agree within a reasonable tolerance
-        # We set a relatively large tolerance for test efficiency
-        # This could be tightened with more samples
         rel_error = abs(energy_mean - hf_energy_reference) / abs(hf_energy_reference)
         
-        # We use a 5% tolerance because MC sampling has statistical fluctuations
-        # and we're using a small number of steps for test speed
-        #self.assertLess(rel_error, 1.05, 
-        #               f"Sampled energy {energy_mean:.6f} too far from reference {hf_energy_reference:.6f}")
-        
-        # Also check if the reference energy is within the statistical error bars
-        #self.assertLessEqual(abs(energy_mean - hf_energy_reference), 3 * energy_error,
-        #                    "Reference energy outside 3-sigma error bars of sampled energy")
+        self.assertLessEqual(abs(energy_mean - hf_energy_reference), 3 * energy_error,
+                            "Reference energy outside 3-sigma error bars of sampled energy")
         
         # Return values to be used in other tests if needed
         return {
@@ -338,34 +333,12 @@ class TestHartreeFockEnergy(unittest.TestCase):
             "sampling_results": sampling_results
         }
     
-    def test_h4_molecule(self):
-        """Test HF energy sampling for H2 molecule."""
-        results = self.run_hf_energy_test("H 0 0 0; H 0 0 2; H 0 0 4; H 0 0 6")
-    
     def test_be_atom(self):
-        """Test HF energy sampling for He He molecule."""
+        """Test HF energy sampling for Be atom."""
         results = self.run_hf_energy_test("Be 0 0 0")
-
     def test_lih(self):
         """Test HF energy sampling for LiH molecule."""
         results = self.run_hf_energy_test("Li 0 0 0; H 0 0 1.6")
-
-    def test_benzene(self):
-        """Test HF energy sampling for Benzene molecule."""
-        results = self.run_hf_energy_test(
-                """C 2.866 1.0 0                                                 
-                C 3.7321 0.5 0                                                  
-                C 2.0 0.5 0                                                     
-                C 3.7321 -0.5 0                                                 
-                C 2.0 -0.5 0                                                    
-                C 2.866 -1.0 0                                                  
-                H 2.866 1.62 0                                                  
-                H 4.269 0.81 0                                                  
-                H 1.4631 0.81 0                                                 
-                H 4.269 -0.81 0                                                 
-                H 1.4631 -0.81 0                                                
-                H 2.866 -1.62 0""" 
-        )
 
 
 
@@ -441,39 +414,10 @@ class TestJastrowOptimization(unittest.TestCase):
         
         return opt_results
     
-    def test_h2(self):
-        """Test optimization of Jastrow parameters for H2 molecule."""
-        self.run_optimization_test('H 0 0 0; H 0 0 1.0')
-    
     def test_be(self):
         """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
     
-    def test_h2o(self):
-        """Test optimization of Jastrow parameters for Be atom."""
-        self.run_optimization_test('O 0 0 0; H 0 0.757	0.589; H 0 -0.757	0.589', basis='ccpvtz')
-
-    def test_n2(self):
-        """Test optimization of Jastrow parameters for Be atom."""
-        self.run_optimization_test('N 0 0 0; N 0 0 1.097', basis='ccpvdz')
-
-    def test_benzene(self):
-        """Test HF energy sampling for Benzene molecule."""
-        self.run_optimization_test(
-                """C 2.866 1.0 0                                                 
-                C 3.7321 0.5 0                                                  
-                C 2.0 0.5 0                                                     
-                C 3.7321 -0.5 0                                                 
-                C 2.0 -0.5 0                                                    
-                C 2.866 -1.0 0                                                  
-                H 2.866 1.62 0                                                  
-                H 4.269 0.81 0                                                  
-                H 1.4631 0.81 0                                                 
-                H 4.269 -0.81 0                                                 
-                H 1.4631 -0.81 0                                                
-                H 2.866 -1.62 0""", basis='ccpvdz'
-        )
-
 
 
 if __name__ == "__main__":

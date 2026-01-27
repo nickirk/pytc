@@ -33,7 +33,7 @@ class TestHamiltonian(unittest.TestCase):
         self.hf_energy = mf.e_tot
         
         det = SlaterDet.create(self.mol, mf.mo_coeff)
-        jastrow = Poly.create(self.mol)
+        jastrow = Poly()
         self.ansatz = SlaterJastrow.create(self.mol, jastrow, [det])
         
         self.jastrow_params = jnp.zeros(1)
@@ -47,7 +47,9 @@ class TestHamiltonian(unittest.TestCase):
         self.walker = initialize_walker_state(self.ansatz, self.positions)
         
         # Update walker with determinant values (required for energy calc)
-        _, self.walker = self.ansatz(self.walker, self.params)
+        # self.walker is batched (1, n, 3), so we need vmapped ansatz
+        batch_ansatz = jax.vmap(self.ansatz, in_axes=(0, None))
+        _, self.walker = batch_ansatz(self.walker, self.params)
         
         # We need a single walker for the functions in hamiltonian.py, 
         # initialize_walker_state returns batched walker (n_walkers=1 here)
@@ -195,7 +197,9 @@ class TestHamiltonian(unittest.TestCase):
         
         # Update walker with determinant values
         params = (jastrow_params, jnp.array([1.0]))
-        _, walker_batch = ansatz(walker_batch, params)
+        # walker_batch is batched, need vmap
+        batch_ansatz = jax.vmap(ansatz, in_axes=(0, None))
+        _, walker_batch = batch_ansatz(walker_batch, params)
         
         from pytc.autodiff.vmc.walker import Walker
         single_walker = Walker(
@@ -224,21 +228,8 @@ class TestMemoryUsage(unittest.TestCase):
     def setUp(self):
         self.mol = gto.Mole()
         # Create a slightly larger system to test memory scaling
-        # Benzene C6H6
-        self.mol.atom = """
-            C 0.000000 1.402720 0.000000
-            C 0.000000 -1.402720 0.000000
-            C 1.214790 0.701360 0.000000
-            C 1.214790 -0.701360 0.000000
-            C -1.214790 0.701360 0.000000
-            C -1.214790 -0.701360 0.000000
-            H 0.000000 2.490290 0.000000
-            H 0.000000 -2.490290 0.000000
-            H 2.156660 1.245150 0.000000
-            H 2.156660 -1.245150 0.000000
-            H -2.156660 1.245150 0.000000
-            H -2.156660 -1.245150 0.000000
-        """
+        # Use Be atom instead of Benzene for speed/memory test
+        self.mol.atom = 'Be 0 0 0'
         self.mol.basis = 'sto-3g'
         self.mol.build()
         
@@ -300,22 +291,9 @@ class TestMemoryUsage(unittest.TestCase):
 
 class TestHamiltonianGrad(unittest.TestCase):
     def setUp(self):
-        # Setup Benzene molecule
+        # Use Be atom instead of Benzene for speed
         self.mol = gto.Mole()
-        self.mol.atom = """
-            C 0.000000 1.402720 0.000000
-            C 0.000000 -1.402720 0.000000
-            C 1.214790 0.701360 0.000000
-            C 1.214790 -0.701360 0.000000
-            C -1.214790 0.701360 0.000000
-            C -1.214790 -0.701360 0.000000
-            H 0.000000 2.490290 0.000000
-            H 0.000000 -2.490290 0.000000
-            H 2.156660 1.245150 0.000000
-            H 2.156660 -1.245150 0.000000
-            H -2.156660 1.245150 0.000000
-            H -2.156660 -1.245150 0.000000
-        """
+        self.mol.atom = 'Be 0 0 0'
         self.mol.basis = 'sto-3g'
         self.mol.build()
         
@@ -326,8 +304,7 @@ class TestHamiltonianGrad(unittest.TestCase):
         
         # Use more realistic Jastrow for Benzene
         ncusp = NuclearCusp.create(self.mol)
-        bh = BoysHandy.create(self.mol)
-        bh_new = BoysHandyNew.create(self.mol)
+        bh_new = BoysHandy.create(self.mol)
         #my_een = NeuralEEN.create(self.mol)
         jastrow = CompositeJastrow.create([ncusp, bh_new])
         

@@ -77,6 +77,7 @@ def compute_jastrow_log_value(sj: SlaterJastrow, elec_coords, jastrow_params):
     Assumes unbatched elec_coords with shape (n_electrons, 3).
     Use vmap for batched processing.
     """
+    elec_coords = jnp.asarray(elec_coords)
     n_electrons = elec_coords.shape[0]
     
     # Create indices for unique pairs (i < j)
