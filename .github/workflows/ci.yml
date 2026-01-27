@@ -34,10 +34,10 @@ jobs:
 
     - name: Run tests
       run: |
-        python -m unittest discover -s pytc/test -t .
-        python -m unittest discover -s pytc/autodiff/test -t .
-        python -m unittest discover -s pytc/autodiff/ansatz/test -t .
-        python -m unittest discover -s pytc/autodiff/vmc/test -t .
-        python -m unittest discover -s pytc/autodiff/jastrow/test -t .
-        python -m unittest discover -s pytc/utils/test -t .
-        python -m unittest discover -s pytc/jastrow/test -t .
+        # Use explicit directory discovery to avoid requiring __init__.py files in tests
+        python -m unittest discover -v -s pytc/test -t pytc/test
+        python -m unittest discover -v -s pytc/autodiff/ansatz/test -t pytc/autodiff/ansatz/test
+        python -m unittest discover -v -s pytc/autodiff/vmc/test -t pytc/autodiff/vmc/test
+        python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
+        python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+        python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
