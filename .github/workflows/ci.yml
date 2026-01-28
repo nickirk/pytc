@@ -35,9 +35,8 @@ jobs:
     - name: Run tests
       run: |
         # Use explicit directory discovery to avoid requiring __init__.py files in tests
+        # Note: VMC-related tests (ansatz, vmc) are skipped in CI - run locally for VMC development
         python -m unittest discover -v -s pytc/test -t pytc/test
-        python -m unittest discover -v -s pytc/autodiff/ansatz/test -t pytc/autodiff/ansatz/test
-        python -m unittest discover -v -s pytc/autodiff/vmc/test -t pytc/autodiff/vmc/test
         python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
         python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
         python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test

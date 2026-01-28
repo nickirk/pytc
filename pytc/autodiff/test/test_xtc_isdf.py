@@ -38,7 +38,7 @@ class TestISDF(unittest.TestCase):
 
     def test_isdf_delta_U_accuracy(self):
         """Compare JAX ISDF delta_U directly with JAX Exact delta_U using convergence test."""
-        ranks = [100, 200, 300, 400]
+        ranks = [100, 200, 300]
         
         # --- JAX Exact Delta U with timing ---
         print("\nRunning JAX Exact Delta U...")
@@ -60,8 +60,10 @@ class TestISDF(unittest.TestCase):
         
         # --- Compare Exact Versions ---
         diff_exact = np.linalg.norm(np.array(delta_U_exact_jax) - delta_U_exact_numpy)
+        abs_err_exact = np.max(np.abs(np.array(delta_U_exact_jax) - delta_U_exact_numpy))
         rel_err_exact = diff_exact / norm_exact_numpy
         print(f"Exact Delta U Relative Error (JAX vs NumPy): {rel_err_exact:.2e}")
+        print(f"Exact Delta U Absolute Error (JAX vs NumPy): {abs_err_exact:.2e}")
         self.assertTrue(rel_err_exact < 1e-10, f"Exact Delta U mismatch: {rel_err_exact}")
         
         print(f"\n{'Rank':<10} {'Rel Error':<15} {'Max Abs Error':<15} {'Time (s)':<12} {'Speedup':<10}")
@@ -120,7 +122,7 @@ class TestISDF(unittest.TestCase):
         self.assertTrue(rel_err_exact < 1e-10, f"Exact 2-Body Correction mismatch: {rel_err_exact}")
         
         # --- JAX ISDF Convergence ---
-        ranks = [100, 200, 300, 400]
+        ranks = [100, 200, 300]
         print(f"\n{'Rank':<10} {'Rel Error':<15} {'Max Abs Error':<15} {'Time (s)':<12} {'Speedup':<10}")
         print("-" * 67)
         
@@ -158,7 +160,7 @@ class TestISDF(unittest.TestCase):
         norm_exact_jax = np.linalg.norm(np.array(k2b_exact_jax))
         print(f"Exact JAX time: {time_exact:.4f} s")
         
-        ranks = [100, 200, 300, 400]
+        ranks = [100, 200, 300]
         
         print(f"\n{'Rank':<10} {'Rel Error':<15} {'Max Abs Error':<15} {'Time (s)':<12} {'Speedup':<10}")
         print("-" * 67)

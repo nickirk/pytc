@@ -4,10 +4,9 @@ import jax.numpy as jnp
 from flax import struct
 
 def _safe_norm_np(x, epsilon):
-    # Use standard JAX ops which folx supports
-    # Behave like sqrt(r^2 + eps^2) to avoid gradient issues at r=0
-    # This is slightly different from r + eps but robust and supported by folx
-    return jnp.sqrt(jnp.sum(x*x, axis=-1) + epsilon**2)
+    # Match NumPy behavior: r + eps (not sqrt(r^2 + eps^2))
+    # This ensures JAX and NumPy implementations give identical results
+    return jnp.sqrt(jnp.sum(x*x, axis=-1)) + epsilon
 
 @struct.dataclass
 class REXP(jastrow.Jastrow):
