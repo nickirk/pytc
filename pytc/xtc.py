@@ -413,7 +413,7 @@ def _parallel_over_i(process_i_func, output_shape, n_i, desc=None):
                 raise ValueError("Invalid output shape")
             
             completed_count += 1
-            if completed_count % 100 == 0 or completed_count == total_tasks:
+            if completed_count % 1000 == 0 or completed_count == total_tasks:
                 progress = completed_count / total_tasks * 100
                 if desc:
                      logging.info(f"{desc}: {progress:.1f}%")

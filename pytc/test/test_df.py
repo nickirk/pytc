@@ -43,7 +43,7 @@ class TestDF(unittest.TestCase):
 
     def test_tensor_decomposition(self):
         """Test ISDF decomposition with tensor input."""
-        n_rank = 20
+        n_rank = 40
         # Input has shape (Nb, N_grid, 3)
         C, xi = isdf_decompose_cholesky(self.rho_grad, n_rank=n_rank)
 
