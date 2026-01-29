@@ -13,7 +13,7 @@ class TestTCBlock(unittest.TestCase):
     def setUp(self):
         self.mol = gto.Mole()
         self.mol.atom = 'H 0 0 0; O 0 0 1; H 0 0 2'
-        self.mol.basis = 'ccpvdz'
+        self.mol.basis = 'sto6g'
         self.mol.build()
         
         self.mf = scf.RHF(self.mol)
