@@ -497,7 +497,7 @@ class XTC(TC):
         total_delta_U = delta_U_replicated[0]
         
         total_time = time.perf_counter() - start_time
-        logger.debug(f"XTC.get_delta_U completed in {time.perf_counter() - start_time:.4f} s")
+        logger.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
         return -total_delta_U
 
     def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
