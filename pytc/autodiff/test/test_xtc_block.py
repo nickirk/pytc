@@ -11,11 +11,11 @@ from pytc.autodiff.jastrow import REXP
 # Enable float64
 jax.config.update("jax_enable_x64", True)
 
-def get_h2o_ccpvdz():
-    """Return H2O molecule with cc-pVDZ basis."""
+def get_h2o_sto6g():
+    """Return H2O molecule with STO-6G basis."""
     mol = gto.M(
         atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
-        basis='cc-pvdz',
+        basis='sto6g',
         unit='Angstrom',
         verbose=0
     )
@@ -28,7 +28,7 @@ class TestXTCBlock(unittest.TestCase):
     
     @classmethod
     def setUpClass(cls):
-        cls.mol, cls.mf = get_h2o_ccpvdz()
+        cls.mol, cls.mf = get_h2o_sto6g()
         # Use coarse grid for speed
         cls.jastrow = REXP(epsilon=1e-8)
         cls.xtc = XTC.from_pyscf(cls.mf, cls.jastrow, grid_lvl=1)

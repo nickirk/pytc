@@ -5,6 +5,8 @@ import logging
 import time  # Add this import at the top
 
 
+logger = logging.getLogger(__name__)
+
 einsum = partial(np.einsum, optimize='optimal')
 
 def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
@@ -36,7 +38,7 @@ def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
     
     batch_size = max(1, min(left, 5000))  
     #batch_size = max(1, left)
-    logging.info(f"Selected batch_size: {batch_size} based on available memory: {mem.available / 1e9:.2f} GB")
+    logger.info(f"Selected batch_size: {batch_size} based on available memory: {mem.available / 1e9:.2f} GB")
     return batch_size
 
 def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
@@ -50,7 +52,8 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     if batch_size is None:
         batch_size = _get_safe_batch_size(N_grid, Nb2)
     
-    logging.info(f"Starting K1 calculation with {N_grid} grid points in batches of {batch_size}")
+    logger.info(f"Starting K1 calculation with {N_grid} grid points in batches of {batch_size}")
+    
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
         progress = i_end / N_grid * 100
@@ -74,7 +77,7 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
 
     result = result.swapaxes(0, 1)
     elapsed_time = time.perf_counter() - start_time
-    logging.info(f"calc_K1 completed in {elapsed_time:.2f} seconds")
+    logger.info(f"calc_K1 completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
@@ -100,7 +103,7 @@ def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     combined_nabla = nabla_rho_paired + nabla_rho_transposed
     result = -calc_K1(rho_paired, combined_nabla, jastrow_factor, grid_points, weights, batch_size)
     elapsed_time = time.perf_counter() - start_time
-    logging.info(f"calc_K2 completed in {elapsed_time:.2f} seconds")
+    logger.info(f"calc_K2 completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
@@ -122,7 +125,8 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
     if batch_size is None:
         batch_size = _get_safe_batch_size(N_grid, rho_paired.shape[0])
     
-    logging.info(f"Starting K3 calculation with {N_grid} grid points in batches of {batch_size}")
+    logger.info(f"Starting K3 calculation with {N_grid} grid points in batches of {batch_size}")
+
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
         progress = i_end / N_grid * 100
@@ -142,7 +146,7 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
     
     result = result
     elapsed_time = time.perf_counter() - start_time
-    logging.info(f"calc_K3 completed in {elapsed_time:.2f} seconds")
+    logger.info(f"calc_K3 completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, weights, batch_size=None):
@@ -199,7 +203,7 @@ def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
         result += einsum('pl,ql->pq', G2, C_rho)
     
     elapsed_time = time.perf_counter() - start_time
-    logging.info(f"calc_K1_isdf completed in {elapsed_time:.2f} seconds")
+    logger.info(f"calc_K1_isdf completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, weights, batch_size=None):
@@ -231,7 +235,7 @@ def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
                           jastrow_factor, grid_points, weights, batch_size)
 
     elapsed_time = time.perf_counter() - start_time
-    logging.info(f"calc_K2_isdf completed in {elapsed_time:.2f} seconds")
+    logger.info(f"calc_K2_isdf completed in {elapsed_time:.2f} seconds")
     return result
 
 def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size=None):
@@ -279,5 +283,5 @@ def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size
         result += einsum('kl,pk,ql->pq', G1, C_rho, C_rho)
     
     elapsed_time = time.perf_counter() - start_time
-    logging.info(f"calc_K3_isdf completed in {elapsed_time:.2f} seconds")
+    logger.info(f"calc_K3_isdf completed in {elapsed_time:.2f} seconds")
     return result

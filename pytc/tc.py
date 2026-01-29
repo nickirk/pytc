@@ -5,6 +5,9 @@ from functools import partial
 from pyscf import dft, ao2mo
 from pytc import lmat
 from pytc.df import isdf_decompose_multi, test_accuracy
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Create an optimized einsum that always uses the 'optimal' path
 einsum = partial(np.einsum, optimize='optimal')
@@ -134,8 +137,7 @@ class TC:
                 f"  Rho Paired: Relative Error = {rel_error_rho:.2e}, Absolute Error = {abs_error_rho:.2e}\n"
                 f"  Grad Paired: Relative Error = {rel_error_grad:.2e}, Absolute Error = {abs_error_grad:.2e}"
             )
-            print(log_message)  # Print to screen
-            self.log.info(log_message)  # Log to file (assuming self.log is a logger instance)
+            logger.info(log_message)  # Log to file
 
         result = {
             'C_rho': C_rho,

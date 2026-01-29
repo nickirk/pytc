@@ -4,6 +4,9 @@ This module implements the density-fitting for transcorrelated integrals.
 import numpy as np
 from typing import Tuple 
 import time  
+import logging
+
+logger = logging.getLogger(__name__)
 
 def calculate_norm(rho: np.ndarray) -> np.ndarray:
     """Calculate the norm of the input tensor along trailing dimensions.
@@ -52,9 +55,9 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
         
         # Check for numerical stability
         if max_val < tol:
-            print(f"Warning: Small pivot encountered at step {k}: {max_val:.2e}")
+            logger.warning(f"Small pivot encountered at step {k}: {max_val:.2e}")
             end_time = time.time()
-            print(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
+            logger.info(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
             return L[:, :k], perm[:k]
         
         pivot = k + np.argmax(d[perm[k:]])
@@ -76,13 +79,13 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
         
         # Early termination if accuracy is reached
         if rel_err < tol:
-            print(f"Converged at step {k} with relative error {rel_err:.2e}")
+            logger.info(f"Converged at step {k} with relative error {rel_err:.2e}")
             end_time = time.time()
-            print(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
+            logger.info(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
             return L[:, :k+1], perm[:k+1]
     
     end_time = time.time()
-    print(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
+    logger.info(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
     return L[:, :n_rank], perm[:n_rank]
 
 def solve_least_squares(C: np.ndarray, rho: np.ndarray) -> np.ndarray:
@@ -123,7 +126,7 @@ def isdf_decompose_cholesky(rho: np.ndarray, n_rank: int) -> Tuple[np.ndarray, n
     xi = solve_least_squares(C, rho)
 
     end_time = time.time()
-    print(f"ISDF decomposition took {end_time - start_time:.2f} seconds")
+    logger.info(f"ISDF decomposition took {end_time - start_time:.2f} seconds")
     return C, xi
 
 def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank2: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

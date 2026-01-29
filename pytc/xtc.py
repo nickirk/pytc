@@ -2,12 +2,13 @@ import numpy as np
 from functools import partial, reduce
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import logging
 
 from pytc.tc import TC
 
+logger = logging.getLogger(__name__)
 einsum = partial(np.einsum, optimize='optimal')
+
 class XTC(TC):
     """Extended Transcorrelated class that handles density matrices."""
     
@@ -222,7 +223,7 @@ class XTC(TC):
         final = result + result.transpose(2,3,0,1)
         
         end_time = time.time()
-        print(f"Delta U calculation took {end_time - start_time:.2f} seconds")
+        logger.info(f"Delta U calculation took {end_time - start_time:.2f} seconds")
         return final
     
     def _calc_delta_U_isdf(self, C_rho, xi_rho, jastrow_factor, grid_points, weights, dm1=None, batch_size=None):

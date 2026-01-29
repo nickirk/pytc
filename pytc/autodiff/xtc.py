@@ -2,18 +2,19 @@
 
 from functools import partial, reduce
 import numpy as np
+import os
+import gc
 import logging
 import time
-import gc
 import jax
 import jax.numpy as jnp
 import h5py
-import os
-import gc
 from flax import struct
 from .tc import TC, ISDFTC
 from . import tc_helper
 from . import kmat as kmat_jax
+
+logger = logging.getLogger(__name__)
 
 @struct.dataclass
 class XTC(TC):
@@ -120,133 +121,7 @@ class XTC(TC):
         
         return final_val
 
-    @partial(jax.jit, static_argnames=('batch_size',))
-    def _calc_v_vector(self, phi_paired, jastrow_params, batch_size=1000):
-        """Calculate V_qt(r₁) for all r₁ points.
-        
-        Args:
-            phi_paired: (Nb^2, N_grid)
-            jastrow_params: Jastrow parameters
-            batch_size: Batch size for r1
-            
-        Returns:
-            V: (Nb^2, N_grid, 3)
-        """
-        n_grid = self.n_grid
-        Nb2 = phi_paired.shape[0]
-        
-        # Pad grid for r1 scan
-        padded_size = ((n_grid + batch_size - 1) // batch_size) * batch_size
-        padded_grid = jnp.pad(self.grid_points, ((0, padded_size - n_grid), (0, 0)))
-        padded_phi_paired = jnp.pad(phi_paired, ((0, 0), (0, padded_size - n_grid)))
-        padded_weights = jnp.pad(self.weights, (0, padded_size - n_grid))
-        
-        # Reshape for scanning
-        r1_batches = padded_grid.reshape(-1, batch_size, 3)
-        phi_paired_batches = padded_phi_paired.reshape(Nb2, -1, batch_size)
-        weights_batches = padded_weights.reshape(-1, batch_size)
-        
-        def scan_body(carry, args):
-            r1_batch, phi_paired_batch, w_batch = args
-            
-            # Use _calc_v_block with full grid
-            # We need to reshape phi_paired_batch back to (Nb, Nb, batch)
-            Nb = self.n_orb
-            
-            # V_batch: (Nb, Nb, batch_r1, 3)
-            # We can use a simplified version of _calc_v_block here
-            def inner_scan(carry_inner, args_inner):
-                r2_batch, w2_batch, phi_paired_r2 = args_inner
-                
-                # grads: (batch_r1, batch_r2, 3)
-                grads = self.jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
-                
-                # sum_j w_j phi_q(r2_j) phi_t(r2_j) grad_i u(r1_i, r2_j)
-                # (Nb, Nb, batch_r2) * (batch_r1, batch_r2, 3) -> (Nb, Nb, batch_r1, 3)
-                V_up = jnp.einsum('ijb,abk->ijak', phi_paired_r2 * w2_batch[None, None, :], grads)
-                return carry_inner + V_up, None
 
-            # Prepare r2 batches (full grid)
-            n_grid_full = self.n_grid
-            padded_size_r2 = ((n_grid_full + batch_size - 1) // batch_size) * batch_size
-            padded_grid_r2 = jnp.pad(self.grid_points, ((0, padded_size_r2 - n_grid_full), (0, 0)))
-            padded_weights_r2 = jnp.pad(self.weights, (0, padded_size_r2 - n_grid_full))
-            padded_phi_paired_r2 = jnp.pad(phi_paired, ((0, 0), (0, padded_size_r2 - n_grid_full)))
-            
-            r2_batches_full = padded_grid_r2.reshape(-1, batch_size, 3)
-            weights_batches_full = padded_weights_r2.reshape(-1, batch_size)
-            phi_paired_batches_full = padded_phi_paired_r2.reshape(Nb, Nb, -1, batch_size).transpose(2, 0, 1, 3)
-            
-            V_acc, _ = jax.lax.scan(inner_scan, jnp.zeros((Nb, Nb, r1_batch.shape[0], 3)), 
-                                    (r2_batches_full, weights_batches_full, phi_paired_batches_full))
-            
-            return carry, V_acc.reshape(Nb2, -1, 3)
-        
-        _, V = jax.lax.scan(scan_body, None, (r1_batches, phi_paired_batches, weights_batches))
-        return V.reshape(-1, Nb2, 3).transpose(1, 0, 2)[:, :n_grid, :]
-
-    def _calc_delta_U(self, v_vector=None, phi_paired=None, dm1=None):
-        """Calculate ΔU matrix.
-        
-        Args:
-            v_vector: (Nb^2, N_grid, 3)
-            phi_paired: (Nb^2, N_grid)
-            dm1: Density matrix (Nb, Nb)
-            
-        Returns:
-            delta_U: (Nb, Nb, Nb, Nb)
-        """
-        Nb = self.n_orb
-        if dm1 is None:
-            dm1 = self._get_mf_dm()
-            
-        # Reshape v_vector to (Nb, Nb, N_grid, 3)
-        V_reshaped = v_vector.reshape(Nb, Nb, -1, 3)
-        
-        # Reshape phi_paired to (Nb, Nb, N_grid)
-        phi_paired_reshaped = phi_paired.reshape(Nb, Nb, -1)
-        
-        # W_k(r) = sum_{rs} V_{rs,k}(r) dm1_{rs}
-        # (Nb, Nb, N_grid, 3) * (Nb, Nb) -> (N_grid, 3)
-        W = jnp.einsum('rskc,rs->kc', V_reshaped, dm1)
-        
-        # Wbar(r) = |W(r)|^2
-        Wbar = jnp.sum(W**2, axis=1) # (N_grid,)
-        
-        # Vbar_{qt,k}(r) = sum_{rs} V_{rs,k}(r) dm1_{rq} dm1_{st}
-        # (Nb, Nb, N_grid, 3) * (Nb, Nb) * (Nb, Nb) -> (Nb, Nb, N_grid, 3)
-        Vbar = jnp.einsum('rskc,rq,st->qtkc', V_reshaped, dm1, dm1)
-        
-        # Zbar_{qt}(r) = sum_k W_k(r) V_{qt,k}(r)
-        # (N_grid, 3) * (Nb, Nb, N_grid, 3) -> (Nb, Nb, N_grid)
-        Zbar = jnp.einsum('kc,qtkc->qtc', W, V_reshaped)
-        
-        # G_{qt,k}(r) = sum_l W_l(r) Vbar_{qt,l}(r)
-        # (N_grid, 3) * (Nb, Nb, N_grid, 3) -> (Nb, Nb, N_grid)
-        G = jnp.einsum('lc,qtlc->qtc', W, Vbar)
-        
-        # Term 1: sum_c w_c phi_p(c) phi_q(c) (Vbar_{rs}(c) - Zbar_{rs}(c))
-        # A_{rs,c} = Vbar_{rs,c} - Zbar_{rs,c}
-        A = Vbar - Zbar[:, :, None, :] # (Nb, Nb, N_grid, 3) - (Nb, Nb, 1, N_grid) -> (Nb, Nb, N_grid, 3)
-        
-        # term1 = sum_c w_c phi_p(c) phi_q(c) A_{rs,c}
-        # (Nb, N_grid) * (Nb, N_grid) * (Nb, Nb, N_grid, 3) * (N_grid,) -> (Nb, Nb, Nb, Nb, 3)
-        term1 = jnp.einsum('pc,qc,rscd,c->pqrsd', self.phi, self.phi, A, self.weights)
-        
-        # Term 2: sum_c w_c V_{pq}(c) (0.5 Wbar(c) V_{rs}(c) - G_{rs}(c))
-        # B_{rs,c} = 0.5 Wbar(c) V_{rs}(c) - G_{rs}(c)
-        B = 0.5 * Wbar[None, None, :, None] * V_reshaped - G[:, :, None, :] # (Nb, Nb, N_grid, 3)
-        
-        # term2 = sum_c w_c V_{pq}(c) B_{rs}(c)
-        # (Nb, Nb, N_grid, 3) * (Nb, Nb, N_grid, 3) * (N_grid,) -> (Nb, Nb, Nb, Nb, 3)
-        term2 = jnp.einsum('pqcd,rscd,c->pqrsd', V_reshaped, B, self.weights)
-        
-        # Sum over the gradient components (d)
-        result = -(jnp.sum(term1, axis=-1) + jnp.sum(term2, axis=-1))
-        
-        # Symmetrize
-        final = result + result.transpose(2, 3, 0, 1)
-        return final
 
     def get_delta_U(self, jastrow_params, dm1=None, ranges=None, batch_size=1000):
         """Get delta_U matrix with memory-efficient batching and multi-GPU support.
@@ -263,7 +138,7 @@ class XTC(TC):
                      Otherwise: (N, N, N, N)
         """
         start_time = time.perf_counter()
-        logging.debug("Starting XTC.get_delta_U")
+        logger.debug("Starting XTC.get_delta_U")
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
@@ -496,7 +371,7 @@ class XTC(TC):
         total_delta_U = delta_U_replicated[0]
         
         total_time = time.perf_counter() - start_time
-        logging.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
+        logger.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
         return -total_delta_U
 
     def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -543,7 +418,7 @@ class XTC(TC):
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
-        logging.debug("Starting XTC.get_2b")
+        logger.debug("Starting XTC.get_2b")
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -555,7 +430,7 @@ class XTC(TC):
         delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         
         total_time = time.perf_counter() - start_time
-        logging.debug(f"XTC.get_2b completed in {total_time:.4f} s")
+        logger.debug(f"XTC.get_2b completed in {time.perf_counter() - start_time:.4f} s")
         return tc_correction + delta_U
 
     def get_const(self, jastrow_params, dm1=None):
@@ -709,7 +584,7 @@ class ISDFXTC(XTC, ISDFTC):
             orb_block_size: Block size for orbital batching of X kernel.
             host_grid_block_size: Block size for grid batching on host.
         """
-        logging.info("Computing ISDF intermediates (XTC)...")
+        logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
         # 1. Compute TC kernels (K1, K3, L_aux) using base class
@@ -722,7 +597,7 @@ class ISDFXTC(XTC, ISDFTC):
             try:
                 f = h5py.File(self.save_path, 'r')
                 if 'D' in f and 'X' in f:
-                    logging.info(f"  Found existing D and X in {self.save_path}. Reading from file...")
+                    logger.info(f"  Found existing D and X in {self.save_path}. Reading from file...")
                     kernels['D'] = f['D'][:]
                     if self.is_incore:
                         kernels['X'] = f['X'][:]
@@ -733,11 +608,11 @@ class ISDFXTC(XTC, ISDFTC):
                         # In the future, we could use a single 'a' handle for the whole session.
                         kernels['X'] = f['X'][:]
                         f.close()
-                    logging.info(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
+                    logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
                 f.close()
             except (IOError, KeyError) as e:
-                logging.warning(f"  Error reading Delta U kernels from {self.save_path}: {e}. Recomputing...")
+                logger.warning(f"  Error reading Delta U kernels from {self.save_path}: {e}. Recomputing...")
 
         # Pass L_aux to avoid redundant calculation
         delta_u_kernels = self.compute_delta_u_kernels(
@@ -760,7 +635,7 @@ class ISDFXTC(XTC, ISDFTC):
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
                 
-        logging.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
+        logger.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
         
         return self.replace(isdf_kernels=kernels)
 
@@ -783,17 +658,17 @@ class ISDFXTC(XTC, ISDFTC):
         L_Q = self.phi_isdf.T * sqrt_dm1[None, :]  # (N_rank, n_orb)
         
         # 1. Compute D kernel
-        logging.info("Computing D kernel...")
+        logger.info("Computing D kernel...")
         D = self._compute_D_kernel(jastrow_params, batch_size, L_aux, Gb=Gb, host_grid_block_size=host_grid_block_size)
         
         # 2. Compute X kernel with orbital batching
-        logging.info("Computing X kernel...")
+        logger.info("Computing X kernel...")
         
         if save_path:
             # If L_aux is a dataset from the same file, we must load it or close it.
             if isinstance(L_aux, h5py.Dataset):
                 if L_aux.file.filename == os.path.abspath(save_path):
-                    logging.info("  L_aux is a dataset from the target file. Loading into RAM to allow reopening in 'a' mode.")
+                    logger.info("  L_aux is a dataset from the target file. Loading into RAM to allow reopening in 'a' mode.")
                     L_aux = L_aux[:]
             
             f = h5py.File(save_path, 'a')
@@ -807,7 +682,7 @@ class ISDFXTC(XTC, ISDFTC):
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
         for r0 in range(0, n_orb, orb_block_size):
             r1 = min(r0 + orb_block_size, n_orb)
-            logging.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
+            logger.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
             for s0 in range(r0, n_orb, orb_block_size):  # Start from r0 for upper triangle
                 s1 = min(s0 + orb_block_size, n_orb)
             
@@ -869,7 +744,7 @@ class ISDFXTC(XTC, ISDFTC):
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 n_block = g1 - g0
-                logging.info(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
+                logger.debug(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
                 
                 remainder = n_block % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
@@ -984,7 +859,7 @@ class ISDFXTC(XTC, ISDFTC):
         try:
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
-                logging.info(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
+                logger.debug(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
                 n_block = g1 - g0
                 
                 remainder = n_block % n_devices
@@ -1170,12 +1045,12 @@ class ISDFXTC(XTC, ISDFTC):
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
         start_time = time.perf_counter()
-        logging.info("Starting ISDFXTC.get_delta_U")
+        logger.info("Starting ISDFXTC.get_delta_U")
         
         # Check if kernels are available
         if self.isdf_kernels is None:
              # Compute kernels on the fly if not available
-             logging.warning("ISDF kernels missing in get_delta_U. Computing on-the-fly with orbital batching. "
+             logger.warning("ISDF kernels missing in get_delta_U. Computing on-the-fly with orbital batching. "
                              "This might be slow. Consider calling .isdf() first.")
              kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
         else:
@@ -1199,7 +1074,7 @@ class ISDFXTC(XTC, ISDFTC):
             final_result = -(result + result_T.transpose(2, 3, 0, 1))
 
         total_time = time.perf_counter() - start_time
-        logging.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        logger.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
     @staticmethod

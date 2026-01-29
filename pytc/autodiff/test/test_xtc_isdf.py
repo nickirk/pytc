@@ -13,7 +13,7 @@ from pytc.autodiff.jastrow.rexp import REXP
 class TestISDF(unittest.TestCase):
     def setUp(self):
         # System: H2O molecule
-        self.mol = gto.M(atom='O 0 0 0; H 0 1 0; H 0 0 1', basis='ccpvdz', verbose=0)
+        self.mol = gto.M(atom='O 0 0 0; H 0 1 0; H 0 0 1', basis='321g', verbose=0)
         self.mf = scf.RHF(self.mol).run()
         
         # Jastrow factor

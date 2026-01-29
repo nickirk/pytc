@@ -3,12 +3,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
+import os
 import logging
 import time
 import h5py
 import uuid
 import gc
-import os
+
+logger = logging.getLogger(__name__)
 
 
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
@@ -180,7 +182,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         try:
             with h5py.File(save_path, 'r') as f:
                 if all(k in f for k in ['xi_phi', 'xi_grad', 'pivots', 'phi_isdf', 'grad_phi_isdf']):
-                    logging.info(f"Loading ISDF decomposition from {save_path}")
+                    logger.info(f"Loading ISDF decomposition from {save_path}")
                     pivots = jnp.array(f['pivots'][:])
                     phi_piv = jnp.array(f['phi_isdf'][:])
                     grad_phi_piv = jnp.array(f['grad_phi_isdf'][:])
@@ -195,7 +197,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                         
                     return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, save_path
         except Exception as e:
-            logging.warning(f"Failed to load ISDF from {save_path}: {e}. Recomputing...")
+            logger.warning(f"Failed to load ISDF from {save_path}: {e}. Recomputing...")
 
     n_orb, n_grid = phi.shape
     
@@ -205,9 +207,9 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         w_sqrt = jnp.sqrt(jnp.abs(weights))  # Use abs to avoid NaN
         
     start_time = time.perf_counter()
-    logging.info(f"Starting ISDF decomposition with n_orb={n_orb}, n_grid={n_grid}, n_rank_phi={n_rank_phi}, n_rank_grad={n_rank_grad}")
+    logger.info(f"Starting ISDF decomposition with n_orb={n_orb}, n_grid={n_grid}, n_rank_phi={n_rank_phi}, n_rank_grad={n_rank_grad}")
     if weights is not None:
-        logging.info(f"  Using integration weights (min={jnp.min(weights):.3e}, max={jnp.max(weights):.3e})")
+        logger.info(f"  Using integration weights (min={jnp.min(weights):.3e}, max={jnp.max(weights):.3e})")
 
     # --- 1. Phi Decomposition ---
     t0 = time.perf_counter()
@@ -224,7 +226,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
 
     pivots_phi = _pivoted_cholesky_phi(phi_weighted, n_rank_phi, shift_phi)
     t1 = time.perf_counter()
-    logging.info(f"Phi decomposition completed in {t1 - t0:.4f} s")
+    logger.debug(f"Phi decomposition completed in {t1 - t0:.4f} s")
 
     # --- 2. Gradient Decomposition ---
     t0 = time.perf_counter()
@@ -240,7 +242,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
 
     pivots_grad = _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad)
     t1 = time.perf_counter()
-    logging.info(f"Grad decomposition completed in {t1 - t0:.4f} s")
+    logger.debug(f"Grad decomposition completed in {t1 - t0:.4f} s")
     
     # --- 3. Fuse pivots ---
     t0 = time.perf_counter()
@@ -250,7 +252,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     pivots = jnp.array(np.unique(pivots_all))
     n_fused = pivots.shape[0]
     t1 = time.perf_counter()
-    logging.info(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
+    logger.info(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
     
     # --- 4. Extract pivot values ---
     t0 = time.perf_counter()
@@ -259,12 +261,12 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     grad_phi_piv = grad_phi[:, pivots, :]  # (n_orb, n_fused, 3)
     
     t1 = time.perf_counter()
-    logging.info(f"Pivot values extracted in {t1 - t0:.4f} s")
+    logger.debug(f"Pivot values extracted in {t1 - t0:.4f} s")
     
     # --- 5. Solve for xi_phi and xi_grad using fast normal equations solver ---
     if use_iterative:
         t0 = time.perf_counter()
-        logging.info("Using fast normal equations solver")
+        logger.info("Using fast normal equations solver")
         
         # Solve for xi_phi and xi_grad
         cpu_device = jax.devices("cpu")[0]
@@ -274,16 +276,16 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         # Setup storage
         h5_file = None
         if is_incore:
-            logging.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
+            logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
             xi_phi_storage = np.zeros((n_fused, n_grid), dtype=phi.dtype)
             xi_grad_storage = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
         else:
             if save_path is None:
                 save_path = f"isdf_temp_{uuid.uuid4().hex[:8]}.h5"
-                logging.info(f"  No save_path provided, creating temporary HDF5: {save_path}")
+                logger.info(f"  No save_path provided, creating temporary HDF5: {save_path}")
             
             h5_file = h5py.File(save_path, 'a')
-            logging.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
+            logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
             
             # Create/Reset datasets
             for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
@@ -321,7 +323,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                     elapsed = time.perf_counter() - t_batch_start
                     rate = batch_idx / elapsed
                     eta = (n_batches - batch_idx) / rate if rate > 0 else 0
-                    logging.info(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
+                    logger.debug(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
             
             # Load into JAX CPU RAM if requested
             if is_incore:
@@ -344,7 +346,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     else:
         # --- OLD METHOD: Direct solve with materialized C matrices ---
         t0 = time.perf_counter()
-        logging.warning("Using direct solver (HIGH MEMORY!)")
+        logger.warning("Using direct solver (HIGH MEMORY!)")
         
         # Construct C matrices (MEMORY INTENSIVE!)
         C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, n_fused)
@@ -355,7 +357,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         C_grad_pinv = jnp.stack([jnp.linalg.pinv(C_grad[:, :, c]) for c in range(3)], axis=0)
         
         t1 = time.perf_counter()
-        logging.info(f"C matrices and pinv constructed in {t1 - t0:.4f} s")
+        logger.debug(f"C matrices and pinv constructed in {t1 - t0:.4f} s")
         
         # Solve for xi_phi and xi_grad (Block-wise Least Squares)
         t0 = time.perf_counter()
@@ -402,10 +404,10 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         xi_phi = jnp.concatenate(xi_phi_list, axis=1)
         xi_grad = jnp.concatenate(xi_grad_list, axis=1)
         t1 = time.perf_counter()
-        logging.info(f"Xi solved in {t1 - t0:.4f} s")
+        logger.debug(f"Xi solved in {t1 - t0:.4f} s")
     
     total_time = time.perf_counter() - start_time
-    logging.debug(f"Total fused ranks = {n_fused}")
-    logging.info(f"ISDF decomposition total time: {total_time:.4f} s")
+    logger.debug(f"Total fused ranks = {n_fused}")
+    logger.info(f"ISDF decomposition total time: {total_time:.4f} s")
     
     return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, save_path

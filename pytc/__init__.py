@@ -8,7 +8,7 @@ log_dir.mkdir(exist_ok=True)
 log_file = log_dir / 'pytc.log'
 
 # Configure logging
-def setup_logging():
+def setup_logging(level=logging.INFO):
     # Create formatter
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -22,9 +22,9 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
 
-    # Get root logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    # Get 'pytc' logger
+    logger = logging.getLogger('pytc')
+    logger.setLevel(level)
     
     # Remove any existing handlers
     for handler in logger.handlers[:]:
@@ -33,6 +33,9 @@ def setup_logging():
     # Add handlers
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+    
+    # Prevent propagation to root logger to avoid double logging if root is also configured
+    logger.propagate = False
 
 # Initialize logging when package is imported
 setup_logging()
