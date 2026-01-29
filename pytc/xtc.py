@@ -3,6 +3,9 @@ from functools import partial, reduce
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
 
 from pytc.tc import TC
 
@@ -221,7 +224,7 @@ class XTC(TC):
         final = result + result.transpose(2,3,0,1)
         
         end_time = time.time()
-        print(f"Delta U calculation took {end_time - start_time:.2f} seconds")
+        logger.info(f"Delta U calculation took {end_time - start_time:.2f} seconds")
         return final
     
     def _calc_delta_U_isdf(self, C_rho, xi_rho, jastrow_factor, grid_points, weights, dm1=None, batch_size=None):

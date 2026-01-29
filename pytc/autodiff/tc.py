@@ -3,16 +3,18 @@
 from functools import partial
 from typing import Any, Optional
 import numpy as np
+import os
 import logging
 import time
 import gc
 import jax
 import jax.numpy as jnp
 import h5py
-import os
 from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
+
+logger = logging.getLogger(__name__)
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
@@ -118,27 +120,27 @@ class TC:
         nocc = int(np.sum(mf.mo_occ > 0))
         
         # Initialize grid
-        logging.info(f"TC: Initializing grid with level {grid_lvl}")
+        logger.info(f"TC: Initializing grid with level {grid_lvl}")
         start_time = time.perf_counter()
         grids = dft.gen_grid.Grids(mol)
         grids.level = grid_lvl
         grids.build()
-        logging.info(f"TC: Grid initialized in {time.perf_counter() - start_time:.3f} seconds")
+        logger.debug(f"TC: Grid initialized in {time.perf_counter() - start_time:.3f} seconds")
         
         grid_points = jnp.asarray(grids.coords)
         weights = jnp.asarray(grids.weights)
         
         # Evaluate basis on grid
         # Use PySCF to evaluate AOs with numpy arrays
-        logging.info(f"TC: Evaluating basis on grid")
+        logger.info(f"TC: Evaluating basis on grid")
         start_time = time.perf_counter()
         ao = dft.numint.eval_ao(mol, grids.coords, deriv=1)
         ao_values = ao[0].T  # (N_ao, N_grid)
         ao_gradients = ao[1:4].transpose(2, 1, 0)  # (N_ao, N_grid, 3)
-        logging.info(f"TC: AO basis evaluated in {time.perf_counter() - start_time:.3f} seconds")
+        logger.debug(f"TC: AO basis evaluated in {time.perf_counter() - start_time:.3f} seconds")
         
         # Transform to MO basis using JAX/GPU for speed
-        logging.info(f"TC: Transforming to MO basis (GPU)")
+        logger.info(f"TC: Transforming to MO basis (GPU)")
         start_time = time.perf_counter()
         
         # Move to GPU
@@ -159,7 +161,7 @@ class TC:
         grad_phi_reshaped = jnp.matmul(mo_coeff_jax.T, ao_grad_reshaped)
         grad_phi = grad_phi_reshaped.reshape(n_mo, n_grid, 3)
         
-        logging.info(f"TC: MO basis transformed in {time.perf_counter() - start_time:.3f} seconds")
+        logger.debug(f"TC: MO basis transformed in {time.perf_counter() - start_time:.3f} seconds")
         
         return cls(
             grid_points=grid_points,
@@ -226,7 +228,7 @@ class TC:
                          Otherwise, returns the full symmetrized correction (N, N, N, N).
         """
         start_time = time.perf_counter()
-        logging.debug("Starting TC.get_2b")
+        logger.debug("Starting TC.get_2b")
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         n_devices = jax.local_device_count()
@@ -297,7 +299,7 @@ class TC:
             result += result_T.transpose(2, 3, 0, 1)
         
         total_time = time.perf_counter() - start_time
-        logging.debug(f"TC.get_2b completed in {total_time:.4f} s")
+        logger.debug(f"TC.get_2b completed in {total_time:.4f} s")
         return -result
 
     def get_1b_fock(self, jastrow_params, dm1=None):
@@ -534,6 +536,9 @@ class ISDFTC(TC):
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
         n_rank = self.phi_isdf.shape[1]
+        
+        # Pad grid to be divisible by n_devices
+        logger.debug(f"     compute_kmat_kernels: Padding grid to be divisible by {n_devices} devices...")
         devices = jax.local_devices()
         
         if host_grid_block_size is None:
@@ -578,13 +583,18 @@ class ISDFTC(TC):
             )
             return K1_shard, K3_shard
             
+        # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap.
+        # JAX will then handle broadcasting and streaming from Host RAM.
+        # Note: sharded_xi_phi and sharded_xi_grad are already device-resident or NumPy.
+
+        logger.info(f"  compute_kmat_kernels: Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
 
         try:
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 n_block = g1 - g0
-                logging.info(f"    compute_kmat_kernels: Processing grid block [{g0}:{g1}]...")
+                logger.info(f"    compute_kmat_kernels: Processing grid block [{g0}:{g1}]...")
                 
                 remainder = n_block % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
@@ -702,7 +712,7 @@ class ISDFTC(TC):
             for r0 in range(0, n_grid, host_grid_block_size):
                 r1 = min(r0 + host_grid_block_size, n_grid)
                 n_eval = r1 - r0
-                logging.info(f"    _compute_L_aux: Processing evaluation block [{r0}:{r1}]...")
+                logger.debug(f"    _compute_L_aux: Processing evaluation block [{r0}:{r1}]...")
                 
                 remainder = n_eval % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
@@ -766,12 +776,12 @@ class ISDFTC(TC):
         # full_xi_phi is already device-resident
         gc.collect()
         
-        logging.info(f"  Starting pmap for L_aux (n_fused={n_rank}, n_grid={n_grid})...")
+        logger.info(f"  Starting pmap for L_aux (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
         
         # G_shards: (n_devices, N_rank, n_per_device, 3)
         G_shards = pmapped_compute(sharded_grid, jastrow_params, full_grid, full_weights, full_xi_phi)
-        logging.info("  L_aux pmap completed.")
+        logger.debug("  L_aux pmap completed.")
         
         # Combine shards: (N_rank, N_grid_padded, 3)
         G_padded = G_shards.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
@@ -793,7 +803,7 @@ class ISDFTC(TC):
             batch_size: Batch size for computation.
             host_grid_block_size: Block size for grid batching on host.
         """
-        logging.info("Computing ISDF intermediates (TC)...")
+        logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
         # Use save_path if provided, otherwise use self.save_path
@@ -805,7 +815,7 @@ class ISDFTC(TC):
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
-                    logging.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
+                    logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
                     kernels['K1_kernel'] = f['K1_kernel'][:]
                     kernels['K3_kernel'] = f['K3_kernel'][:]
                     if self.is_incore:

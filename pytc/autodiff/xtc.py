@@ -2,18 +2,19 @@
 
 from functools import partial, reduce
 import numpy as np
+import os
+import gc
 import logging
 import time
-import gc
 import jax
 import jax.numpy as jnp
 import h5py
-import os
-import gc
 from flax import struct
 from .tc import TC, ISDFTC
 from . import tc_helper
 from . import kmat as kmat_jax
+
+logger = logging.getLogger(__name__)
 
 @struct.dataclass
 class XTC(TC):
@@ -263,7 +264,7 @@ class XTC(TC):
                      Otherwise: (N, N, N, N)
         """
         start_time = time.perf_counter()
-        logging.debug("Starting XTC.get_delta_U")
+        logger.debug("Starting XTC.get_delta_U")
         n_devices = jax.local_device_count()
         n_grid = self.n_grid
         
@@ -496,7 +497,7 @@ class XTC(TC):
         total_delta_U = delta_U_replicated[0]
         
         total_time = time.perf_counter() - start_time
-        logging.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
+        logger.debug(f"XTC.get_delta_U completed in {time.perf_counter() - start_time:.4f} s")
         return -total_delta_U
 
     def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -543,7 +544,7 @@ class XTC(TC):
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
-        logging.debug("Starting XTC.get_2b")
+        logger.debug("Starting XTC.get_2b")
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
@@ -555,7 +556,7 @@ class XTC(TC):
         delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         
         total_time = time.perf_counter() - start_time
-        logging.debug(f"XTC.get_2b completed in {total_time:.4f} s")
+        logger.debug(f"XTC.get_2b completed in {time.perf_counter() - start_time:.4f} s")
         return tc_correction + delta_U
 
     def get_const(self, jastrow_params, dm1=None):
@@ -709,7 +710,7 @@ class ISDFXTC(XTC, ISDFTC):
             orb_block_size: Block size for orbital batching of X kernel.
             host_grid_block_size: Block size for grid batching on host.
         """
-        logging.info("Computing ISDF intermediates (XTC)...")
+        logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
         # 1. Compute TC kernels (K1, K3, L_aux) using base class
@@ -722,7 +723,7 @@ class ISDFXTC(XTC, ISDFTC):
             try:
                 f = h5py.File(self.save_path, 'r')
                 if 'D' in f and 'X' in f:
-                    logging.info(f"  Found existing D and X in {self.save_path}. Reading from file...")
+                    logger.info(f"  Found existing D and X in {self.save_path}. Reading from file...")
                     kernels['D'] = f['D'][:]
                     if self.is_incore:
                         kernels['X'] = f['X'][:]
@@ -733,11 +734,11 @@ class ISDFXTC(XTC, ISDFTC):
                         # In the future, we could use a single 'a' handle for the whole session.
                         kernels['X'] = f['X'][:]
                         f.close()
-                    logging.info(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
+                    logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
                 f.close()
             except (IOError, KeyError) as e:
-                logging.warning(f"  Error reading Delta U kernels from {self.save_path}: {e}. Recomputing...")
+                logger.warning(f"  Error reading Delta U kernels from {self.save_path}: {e}. Recomputing...")
 
         # Pass L_aux to avoid redundant calculation
         delta_u_kernels = self.compute_delta_u_kernels(
@@ -760,7 +761,7 @@ class ISDFXTC(XTC, ISDFTC):
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
                 
-        logging.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
+        logger.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
         
         return self.replace(isdf_kernels=kernels)
 
@@ -783,17 +784,17 @@ class ISDFXTC(XTC, ISDFTC):
         L_Q = self.phi_isdf.T * sqrt_dm1[None, :]  # (N_rank, n_orb)
         
         # 1. Compute D kernel
-        logging.info("Computing D kernel...")
+        logger.info("Computing D kernel...")
         D = self._compute_D_kernel(jastrow_params, batch_size, L_aux, Gb=Gb, host_grid_block_size=host_grid_block_size)
         
         # 2. Compute X kernel with orbital batching
-        logging.info("Computing X kernel...")
+        logger.info("Computing X kernel...")
         
         if save_path:
             # If L_aux is a dataset from the same file, we must load it or close it.
             if isinstance(L_aux, h5py.Dataset):
                 if L_aux.file.filename == os.path.abspath(save_path):
-                    logging.info("  L_aux is a dataset from the target file. Loading into RAM to allow reopening in 'a' mode.")
+                    logger.info("  L_aux is a dataset from the target file. Loading into RAM to allow reopening in 'a' mode.")
                     L_aux = L_aux[:]
             
             f = h5py.File(save_path, 'a')
@@ -807,7 +808,7 @@ class ISDFXTC(XTC, ISDFTC):
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
         for r0 in range(0, n_orb, orb_block_size):
             r1 = min(r0 + orb_block_size, n_orb)
-            logging.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
+            logger.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
             for s0 in range(r0, n_orb, orb_block_size):  # Start from r0 for upper triangle
                 s1 = min(s0 + orb_block_size, n_orb)
             
@@ -869,7 +870,7 @@ class ISDFXTC(XTC, ISDFTC):
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 n_block = g1 - g0
-                logging.info(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
+                logger.debug(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
                 
                 remainder = n_block % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
@@ -984,7 +985,7 @@ class ISDFXTC(XTC, ISDFTC):
         try:
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
-                logging.info(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
+                logger.debug(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
                 n_block = g1 - g0
                 
                 remainder = n_block % n_devices
@@ -1170,12 +1171,12 @@ class ISDFXTC(XTC, ISDFTC):
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
         start_time = time.perf_counter()
-        logging.info("Starting ISDFXTC.get_delta_U")
+        logger.info("Starting ISDFXTC.get_delta_U")
         
         # Check if kernels are available
         if self.isdf_kernels is None:
              # Compute kernels on the fly if not available
-             logging.warning("ISDF kernels missing in get_delta_U. Computing on-the-fly with orbital batching. "
+             logger.warning("ISDF kernels missing in get_delta_U. Computing on-the-fly with orbital batching. "
                              "This might be slow. Consider calling .isdf() first.")
              kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
         else:
@@ -1199,7 +1200,7 @@ class ISDFXTC(XTC, ISDFTC):
             final_result = -(result + result_T.transpose(2, 3, 0, 1))
 
         total_time = time.perf_counter() - start_time
-        logging.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        logger.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
     @staticmethod
