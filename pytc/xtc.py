@@ -2,14 +2,13 @@ import numpy as np
 from functools import partial, reduce
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 import logging
-
-logger = logging.getLogger(__name__)
 
 from pytc.tc import TC
 
+logger = logging.getLogger(__name__)
 einsum = partial(np.einsum, optimize='optimal')
+
 class XTC(TC):
     """Extended Transcorrelated class that handles density matrices."""
     
@@ -402,17 +401,23 @@ def _parallel_over_i(process_i_func, output_shape, n_i, desc=None):
             for i in range(n_i)
         }
         
-        # Process results as they complete with progress bar
-        with tqdm(total=n_i, desc=desc or "Processing") as pbar:
-            for future in as_completed(futures):
-                i, slice_result = future.result()
-                if len(output_shape) == 3:
-                    result[..., i] = slice_result
-                elif len(output_shape) == 4:
-                    result[..., i, :] = slice_result
-                else:
-                    raise ValueError("Invalid output shape")
-                pbar.update(1)
+        # Process results as they complete with logging
+        completed_count = 0
+        total_tasks = len(futures)
+        for future in as_completed(futures):
+            i, slice_result = future.result()
+            if len(output_shape) == 3:
+                result[..., i] = slice_result
+            elif len(output_shape) == 4:
+                result[..., i, :] = slice_result
+            else:
+                raise ValueError("Invalid output shape")
+            
+            completed_count += 1
+            if completed_count % 1000 == 0 or completed_count == total_tasks:
+                progress = completed_count / total_tasks * 100
+                if desc:
+                     logging.info(f"{desc}: {progress:.1f}%")
     
     return result
 

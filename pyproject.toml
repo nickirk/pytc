@@ -25,7 +25,7 @@ dependencies = [
     "kfac_jax",
     "flax",
     "folx",
-    "tqdm",
+
     "pyscf",
 ]
 classifiers = [

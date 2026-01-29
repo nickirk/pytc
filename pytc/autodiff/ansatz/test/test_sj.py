@@ -21,20 +21,38 @@ def create_test_walker(positions, det):
     n_beta = det.n_beta
     n_electrons = n_alpha + n_beta
     
-    return Walker(
-        positions=positions,
-        det_up=(jnp.array(1.0), jnp.array(0.0)),  # Single values, not batched
-        det_down=(jnp.array(1.0), jnp.array(0.0)),
-        slater_up=jnp.zeros((n_alpha, n_alpha)),
-        slater_down=jnp.zeros((n_beta, n_beta)),
-        inv_up=jnp.zeros((n_alpha, n_alpha)),
-        inv_down=jnp.zeros((n_beta, n_beta)),
-        grad_up=jnp.zeros((n_alpha, n_alpha, 3)),
-        grad_down=jnp.zeros((n_beta, n_beta, 3)),
-        lap_up=jnp.zeros((n_alpha, n_alpha)),
-        lap_down=jnp.zeros((n_beta, n_beta)),
-        move_mask=jnp.ones(n_electrons, dtype=bool)
-    )
+    is_batched = positions.ndim == 3
+    if is_batched:
+        batch_size = positions.shape[0]
+        return Walker(
+            positions=positions,
+            det_up=(jnp.ones(batch_size), jnp.zeros(batch_size)),
+            det_down=(jnp.ones(batch_size), jnp.zeros(batch_size)),
+            slater_up=jnp.zeros((batch_size, n_alpha, n_alpha)),
+            slater_down=jnp.zeros((batch_size, n_beta, n_beta)),
+            inv_up=jnp.zeros((batch_size, n_alpha, n_alpha)),
+            inv_down=jnp.zeros((batch_size, n_beta, n_beta)),
+            grad_up=jnp.zeros((batch_size, n_alpha, n_alpha, 3)),
+            grad_down=jnp.zeros((batch_size, n_beta, n_beta, 3)),
+            lap_up=jnp.zeros((batch_size, n_alpha, n_alpha)),
+            lap_down=jnp.zeros((batch_size, n_beta, n_beta)),
+            move_mask=jnp.ones((batch_size, n_electrons), dtype=bool)
+        )
+    else:
+        return Walker(
+            positions=positions,
+            det_up=(jnp.array(1.0), jnp.array(0.0)),
+            det_down=(jnp.array(1.0), jnp.array(0.0)),
+            slater_up=jnp.zeros((n_alpha, n_alpha)),
+            slater_down=jnp.zeros((n_beta, n_beta)),
+            inv_up=jnp.zeros((n_alpha, n_alpha)),
+            inv_down=jnp.zeros((n_beta, n_beta)),
+            grad_up=jnp.zeros((n_alpha, n_alpha, 3)),
+            grad_down=jnp.zeros((n_beta, n_beta, 3)),
+            lap_up=jnp.zeros((n_alpha, n_alpha)),
+            lap_down=jnp.zeros((n_beta, n_beta)),
+            move_mask=jnp.ones(n_electrons, dtype=bool)
+        )
 
 
 
@@ -140,13 +158,14 @@ class TestAnsatzH2(unittest.TestCase):
         ]])  # Shape: (1, 2, 3)
         
         walker1 = create_test_walker(spin_up_pos, self.det)
-        psi_values1, _ = self.ansatz(walker1, self.params)
+        batch_ansatz = jax.vmap(self.ansatz, in_axes=(0, None))
+        psi_values1, _ = batch_ansatz(walker1, self.params)
         psi_sign1, psi_logabs1 = psi_values1
         value1 = psi_sign1 * jnp.exp(psi_logabs1)
         
         swapped_pos = spin_up_pos[:, ::-1, :]  # Swap along electron dimension
         walker2 = create_test_walker(swapped_pos, self.det)
-        psi_values2, _ = self.ansatz(walker2, self.params)
+        psi_values2, _ = batch_ansatz(walker2, self.params)
         psi_sign2, psi_logabs2 = psi_values2
         value2 = psi_sign2 * jnp.exp(psi_logabs2)
         
@@ -508,7 +527,9 @@ class TestLocalEnergyWithWalker(unittest.TestCase):
         )
         
         # First call ansatz to populate walker with Slater matrices and gradients
-        psi_values, walker = self.ansatz(walker, self.params)
+        # The ansatz method is written for single walkers, so we need to vmap it
+        batch_ansatz = jax.vmap(self.ansatz, in_axes=(0, None))
+        psi_values, walker = batch_ansatz(walker, self.params)
         print(f"Wavefunction log values: {psi_values[1]}")
         
         # Now call local_energy with populated walker

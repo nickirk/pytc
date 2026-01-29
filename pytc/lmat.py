@@ -4,7 +4,7 @@ import numpy as np
 from functools import partial
 import logging
 import time
-from tqdm import tqdm
+
 import warnings
 
 # Create an optimized einsum that always uses the 'optimal' path
@@ -31,11 +31,10 @@ def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=3
     weighted_rho = rho_paired * weights[None, :]  # (Nb^2, N_grid)
     
     logging.info(f"Starting v_vector calculation with {N_grid} grid points in batches of {batch_size}")
-    # Process grid points in batches with progress bar
-    pbar = tqdm(range(0, N_grid, batch_size), desc="Computing v_vector")
-    for i in pbar:
+    # Process grid points in batches
+    for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
-        progress = (i + batch_size) / N_grid * 100
+        progress = i_end / N_grid * 100
         logging.info(f"v_vector progress: {progress:.1f}% (points {i} to {i_end})")
         
         batch_points = grid_points[i:i_end]

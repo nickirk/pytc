@@ -7,11 +7,16 @@
 - scipy
 - unittest
 - jax (autodiff and GPU acceleration)
+  > **Note**: To run on GPUs, you must install the correct version of JAX. See the [JAX installation guide](https://github.com/google/jax#installation).
+  > For example, for CUDA 12:
+  > ```bash
+  > pip install -U "jax[cuda12]"
+  > ```
 - flax (neural network)
 - folx 
 - optax (machine learning optimizers)
 - kfac_jax (2nd order optimizer)
-- tqdm (visual progress tracking)
+
 - pyscf (![modified version](https://github.com/nickirk/pyscf/tree/tc-ccsd) for tc-ccsd only. Otherwise, official pyscf also works)
 
 ## Features
@@ -33,4 +38,17 @@
 ## Usage
 See the test directory for examples of how to use the package.
 
+To run the tests:
+```bash
+# General tests
+python -m unittest discover pytc/test
+
+# Autodiff/JAX tests
+python -m unittest discover pytc/autodiff/test
+python -m unittest discover pytc/autodiff/ansatz/test
+python -m unittest discover pytc/autodiff/vmc/test
+python -m unittest discover pytc/autodiff/jastrow/test
+
+# Utility tests
+python -m unittest discover pytc/utils/test
 

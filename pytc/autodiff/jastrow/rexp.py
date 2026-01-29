@@ -3,29 +3,10 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
-@jax.custom_jvp
 def _safe_norm_np(x, epsilon):
-    r = jnp.sqrt(jnp.sum(x*x, axis=-1))
-    return r + epsilon
-
-@_safe_norm_np.defjvp
-def _safe_norm_np_jvp(primals, tangents):
-    x, epsilon = primals
-    x_dot, _ = tangents # epsilon is constant
-    r = jnp.sqrt(jnp.sum(x*x, axis=-1))
-    safe_r = r + epsilon
-    primal_out = safe_r
-    
-    # Gradient of (r + eps) w.r.t x is x / (r + eps) in NumPy's logic
-    # (Note: true gradient of r+eps is x/r, but NumPy uses x/(r+eps) for direction)
-    # tangent = dot(grad, x_dot)
-    
-    # We need to handle r=0 case safely for the division
-    # If r=0, x=0, so numerator is 0. safe_r = eps. Result is 0.
-    # But x/safe_r is well defined everywhere since safe_r >= eps > 0.
-    
-    tangent_out = jnp.sum(x * x_dot, axis=-1) / safe_r
-    return primal_out, tangent_out
+    # Match NumPy behavior: r + eps (not sqrt(r^2 + eps^2))
+    # This ensures JAX and NumPy implementations give identical results
+    return jnp.sqrt(jnp.sum(x*x, axis=-1)) + epsilon
 
 @struct.dataclass
 class REXP(jastrow.Jastrow):
@@ -37,7 +18,7 @@ class REXP(jastrow.Jastrow):
     def _compute(self, r1, r2, params):
         r12 = r1-r2
         # Use custom norm to match NumPy behavior
-        r12_norm = _safe_norm_np(r12, self.epsilon)
+        r12_norm = _safe_norm_np(r12, jnp.array(self.epsilon))
         return 0.5*jnp.exp(-params['alpha'] * r12_norm) * r12_norm
 
     def __call__(self, r1, r2, params):
@@ -65,7 +46,7 @@ class REXP(jastrow.Jastrow):
         diff = r1_batch[:, None, :] - r2_batch[None, :, :]
         
         # dist: (N_out, N_in)
-        dist = _safe_norm_np(diff, self.epsilon)
+        dist = _safe_norm_np(diff, jnp.array(self.epsilon))
         
         alpha = params['alpha'][0]
         

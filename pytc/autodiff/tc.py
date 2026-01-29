@@ -18,37 +18,40 @@ logger = logging.getLogger(__name__)
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
-    # Unpack ranges (p, q, r, s)
-    slice_p, slice_q, slice_r, slice_s = ranges
-    
-    # Helper to get size
-    def get_size(s, size):
-        start, stop, step = s.indices(size)
+    # Helper to calculate size from tuple (start, stop, step)
+    def get_size(r, size):
+        start, stop, step = slice(*r).indices(size)
         return (stop - start + (step - 1)) // step
     
     n_orb = phi.shape[0]
-    Np = get_size(slice_p, n_orb)
-    Nq = get_size(slice_q, n_orb)
-    Nr = get_size(slice_r, n_orb)
-    Ns = get_size(slice_s, n_orb)
+    # Unpack ranges (p, q, r, s) tuples
+    t_p, t_q, t_r, t_s = ranges
+    
+    Np = get_size(t_p, n_orb)
+    Nq = get_size(t_q, n_orb)
+    Nr = get_size(t_r, n_orb)
+    Ns = get_size(t_s, n_orb)
     
     # Compute K1 (nabla on p)
+    # Convert tuples back to slices for kmat functions
+    slices = tuple(slice(*r) for r in ranges)
+    
     k1_raw = kmat_jax.calc_K1(
         phi, grad_phi,
         jastrow_factor, jastrow_params,
         grid, weights,
-        ranges=ranges,
+        ranges=slices,
         batch_size=batch_size
     )
     k1 = k1_raw.reshape(Np, Nq, Nr, Ns)
     
     # Compute K2 (nabla on q)
-    if slice_p == slice_q:
+    if t_p == t_q:
         # If p and q ranges are identical, K2 is just K1 with p,q swapped
         k2 = k1.transpose(1, 0, 2, 3)
     else:
-        # Must compute explicitly: swap p and q in ranges
-        ranges_k2 = (slice_q, slice_p, slice_r, slice_s)
+        # Must compute explicitly: swap p and q
+        ranges_k2 = (slices[1], slices[0], slices[2], slices[3])
         k2_raw = kmat_jax.calc_K1(
             phi, grad_phi,
             jastrow_factor, jastrow_params,
@@ -63,7 +66,7 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
     k3_raw = kmat_jax.calc_K3(
         phi, jastrow_factor, jastrow_params,
         grid, weights,
-        ranges=ranges,
+        ranges=slices,
         batch_size=batch_size
     )
     k3 = k3_raw.reshape(Np, Nq, Nr, Ns)
@@ -273,10 +276,13 @@ class TC:
             full_slice = slice(None)
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
+        # Convert slices to hashable tuples for JAX static args
+        ranges_tuple = tuple((s.start, s.stop, s.step) for s in ranges)
+            
         # Compute main block: 0.5 * (K1 - K2 + K3)
         result_sum = pmapped_compute(
             sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
-            jastrow_params, self.jastrow_factor, ranges, batch_size
+            jastrow_params, self.jastrow_factor, ranges_tuple, batch_size
         )
         result = result_sum[0]
         
@@ -289,10 +295,11 @@ class TC:
             result += result.transpose(2, 3, 0, 1)
         else:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            ranges_T_tuple = tuple((s.start, s.stop, s.step) for s in ranges_T)
             
             result_sum_T = pmapped_compute(
                 sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
-                jastrow_params, self.jastrow_factor, ranges_T, batch_size
+                jastrow_params, self.jastrow_factor, ranges_T_tuple, batch_size
             )
             result_T = result_sum_T[0]
             

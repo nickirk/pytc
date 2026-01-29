@@ -3,7 +3,7 @@ from functools import partial, reduce
 import psutil
 import logging
 import time  # Add this import at the top
-from tqdm import tqdm
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +53,11 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         batch_size = _get_safe_batch_size(N_grid, Nb2)
     
     logger.info(f"Starting K1 calculation with {N_grid} grid points in batches of {batch_size}")
-    pbar = tqdm(range(0, N_grid, batch_size), desc="Computing K1")
-    for i in pbar:
+    
+    for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
-        progress = (i + batch_size) / N_grid * 100
-        logger.debug(f"K1 progress: {progress:.1f}% (points {i} to {i_end})")
+        progress = i_end / N_grid * 100
+        logging.info(f"K1 progress: {progress:.1f}% (points {i} to {i_end})")
         
         # Get Jastrow gradients for this batch against all r1
         u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
@@ -126,11 +126,11 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
         batch_size = _get_safe_batch_size(N_grid, rho_paired.shape[0])
     
     logger.info(f"Starting K3 calculation with {N_grid} grid points in batches of {batch_size}")
-    pbar = tqdm(range(0, N_grid, batch_size), desc="Computing K3")
-    for i in pbar:
+
+    for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
-        progress = (i + batch_size) / N_grid * 100
-        logger.debug(f"K3 progress: {progress:.1f}% (points {i} to {i_end})")
+        progress = i_end / N_grid * 100
+        logging.info(f"K3 progress: {progress:.1f}% (points {i} to {i_end})")
         batch_points = grid_points[i:i_end]
         
         # Get Jastrow gradients for this batch
