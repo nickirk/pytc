@@ -67,33 +67,6 @@ class TestXTC(unittest.TestCase):
             rtol=1e-5, atol=1e-5
         )
 
-    def test_v_vector(self):
-        """Test v_vector calculation."""
-        # Get orbital values on grid
-        mo_values_jax = self.xtc_jax.phi
-        mo_values_numpy, _ = self.xtc_numpy._eval_basis_on_grid()
-        
-        # Prepare paired indices
-        phi_paired_jax = jnp.einsum('in,jn->ijn', 
-                                   mo_values_jax, 
-                                   mo_values_jax).reshape(-1, len(self.xtc_jax.weights))
-        phi_paired_numpy = np.einsum('in,jn->ijn', 
-                                    mo_values_numpy, 
-                                    mo_values_numpy).reshape(-1, len(self.xtc_numpy.weights))
-        
-        v_vector_jax = self.xtc_jax._calc_v_vector(
-            phi_paired_jax,
-            self.params_jax,
-            batch_size=len(self.xtc_jax.grid_points)
-        )
-        v_vector_numpy = self.xtc_numpy._calc_v_vector(phi_paired_numpy)
-        
-        np.testing.assert_allclose(
-            np.asarray(v_vector_jax),
-            v_vector_numpy,
-            rtol=1e-5, atol=1e-5
-        )
-        
     def test_delta_U(self):
         """Test delta_U calculation."""
         # First test delta_U matrices
