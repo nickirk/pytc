@@ -22,7 +22,7 @@ def setup_logging(level=logging.INFO):
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
 
-    # Get root logger
+    # Get 'pytc' logger
     logger = logging.getLogger('pytc')
     logger.setLevel(level)
     
