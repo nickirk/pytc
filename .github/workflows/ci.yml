@@ -20,6 +20,9 @@ jobs:
       run: |
         echo "Using system Python ${{ matrix.python-version }}"
         python${{ matrix.python-version }} --version
+        # Upgrade CMake to meet dm-tree requirements
+        brew upgrade cmake || brew install cmake
+        cmake --version
         python${{ matrix.python-version }} -m venv venv
         source venv/bin/activate
         python -m pip install --upgrade pip
