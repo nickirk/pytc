@@ -19,30 +19,26 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: conda-incubator/setup-miniconda@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-        auto-activate-base: true
-        activate-environment: ci-env
-        channels: conda-forge,defaults
+    - name: Create or update Conda environment
+      run: |
+        conda create -y -n py${{ matrix.python-version }} python=${{ matrix.python-version }} || conda install -y -n py${{ matrix.python-version }} python=${{ matrix.python-version }}
 
     - name: Install dependencies
       run: |
         # Install CPU version of JAX for CI
-        python -m pip install -U "jax[cpu]"
+        conda run -n py${{ matrix.python-version }} python -m pip install -U "jax[cpu]"
         # Install other dependencies
-        python -m pip install numpy scipy optax flax pyscf folx
+        conda run -n py${{ matrix.python-version }} python -m pip install numpy scipy optax flax pyscf folx
         # Install the package itself
-        python -m pip install -e .
+        conda run -n py${{ matrix.python-version }} python -m pip install -e .
 
     - name: Run tests
       run: |
         # Use explicit directory discovery to avoid requiring __init__.py files in tests
-        python -m unittest discover -v -s pytc/test -t pytc/test
-        python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
-        python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
-        python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
-        python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
-        python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
-        python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/test -t pytc/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
+        conda run -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
