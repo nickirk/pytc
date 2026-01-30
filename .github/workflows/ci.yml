@@ -6,20 +6,14 @@ on:
   pull_request:
     branches: [ "main" ]
 
-env:
-  RUNNER_TOOL_CACHE: /Users/keliao/actions-runner/_work/_tool
-  AGENT_TOOLSDIRECTORY: /Users/keliao/actions-runner/_work/_tool
-
 jobs:
   test:
     runs-on: self-hosted
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.14"]
 
     steps:
-    - name: Print Env
-      run: env | sort
     - uses: actions/checkout@v4
     
     - name: Set up Python ${{ matrix.python-version }}
