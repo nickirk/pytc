@@ -40,6 +40,12 @@ jobs:
         conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
         #conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
 
+    - name: Cleanup workspace
+      if: always()
+      run: |
+        echo "Cleaning up workspace..."
+        find . -maxdepth 1 ! -name '.' ! -name '.git' -exec rm -rf {} +
+
   # Smoke tests on intermediate Python versions (quick import + basic tests)
   smoke-test:
     runs-on: self-hosted
@@ -71,3 +77,9 @@ jobs:
         conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.ansatz.sj import SlaterJastrow"
         # Run a subset of quick tests
         conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+
+    - name: Cleanup workspace
+      if: always()
+      run: |
+        echo "Cleaning up workspace..."
+        find . -maxdepth 1 ! -name '.' ! -name '.git' -exec rm -rf {} +
