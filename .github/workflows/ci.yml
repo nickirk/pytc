@@ -17,34 +17,22 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python-version }}
-      run: |
-        echo "Using system Python ${{ matrix.python-version }}"
-        python${{ matrix.python-version }} --version
-        # Install CMake via Homebrew with correct architecture
-        arch -arm64 brew install cmake || true
-        cmake --version
-        python${{ matrix.python-version }} -m venv venv
-        source venv/bin/activate
-        python -m pip install --upgrade pip
-        # Set CMAKE_ARGS to fix pybind11 compatibility issue
-        export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-    
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
     - name: Install dependencies
       run: |
-        source venv/bin/activate
         # Install CPU version of JAX for CI
         python -m pip install -U "jax[cpu]"
         # Install other dependencies
         python -m pip install numpy scipy optax flax pyscf folx
-        # Install the package itself if needed, or just dependencies
-        # Assuming dev install or just running tests against source
+        # Install the package itself
         python -m pip install -e .
 
     - name: Run tests
       run: |
-        source venv/bin/activate
         # Use explicit directory discovery to avoid requiring __init__.py files in tests
-        # Note: VMC-related tests (ansatz, vmc) are skipped in CI - run locally for VMC development
         python -m unittest discover -v -s pytc/test -t pytc/test
         python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
         python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
