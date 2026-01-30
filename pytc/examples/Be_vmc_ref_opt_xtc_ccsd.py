@@ -84,7 +84,7 @@ def main():
         step_size=step_size,
         burn_in_steps=burn_in_steps,
         n_opt_steps=n_opt_steps_phase2,
-        optimizer_type='kfac',
+        optimizer_type='newton',
         learning_rate=learning_rate,
         key=key,
     )

@@ -39,9 +39,6 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-kfac = [
-    "kfac_jax",
-]
 gpu = [
     "jaxlib[cuda]",
 ]

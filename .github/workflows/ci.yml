@@ -11,7 +11,7 @@ jobs:
     runs-on: self-hosted
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
     - uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
         source venv/bin/activate
         # Install CPU version of JAX for CI
         python -m pip install -U "jax[cpu]"
-        # Install other dependencies (skip kfac_jax due to dm-tree build issues)
+        # Install other dependencies
         python -m pip install numpy scipy optax flax pyscf folx
         # Install the package itself if needed, or just dependencies
         # Assuming dev install or just running tests against source
@@ -50,3 +50,5 @@ jobs:
         python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
         python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
         python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
+        python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test

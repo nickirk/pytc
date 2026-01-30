@@ -4,11 +4,6 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.sparse.linalg as spla
 import optax
-try:
-    import kfac_jax
-    _HAS_KFAC = True
-except ImportError:
-    _HAS_KFAC = False
 import folx
 from typing import Dict, Any, Optional
 from jax.tree_util import tree_map
@@ -241,29 +236,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
     def schedule_lr(step):
         return learning_rate / (1.0 + step/100)
     
-    if optimizer_type.lower() == "kfac":
-        if not _HAS_KFAC:
-            raise ImportError("kfac_jax is required for the KFAC optimizer. "
-                            "Please install it with `pip install \".[kfac]\"`.")
-        # K-FAC requires a value_and_grad_func, which should be provided in opt_kwargs
-        if "value_and_grad_func" not in merged_kwargs:
-            raise ValueError("KFAC optimizer requires value_and_grad_func in opt_kwargs")
-        
-        return kfac_jax.Optimizer(
-            value_and_grad_func=merged_kwargs["value_and_grad_func"],
-            l2_reg=merged_kwargs.get("l2_reg", 0.0),
-            value_func_has_aux=merged_kwargs.get("value_func_has_aux", False),
-            value_func_has_state=merged_kwargs.get("value_func_has_state", False),
-            value_func_has_rng=merged_kwargs.get("value_func_has_rng", False),
-            learning_rate_schedule=merged_kwargs.get("learning_rate_schedule", None),
-            use_adaptive_learning_rate=merged_kwargs.get("use_adaptive_learning_rate", True),
-            use_adaptive_momentum=merged_kwargs.get("use_adaptive_momentum", True),
-            use_adaptive_damping=merged_kwargs.get("use_adaptive_damping", True),
-            initial_damping=merged_kwargs.get("initial_damping", 1.0),
-            num_burnin_steps=merged_kwargs.get("num_burnin_steps", 0),  # Set to 0 by default to avoid requiring data_iterator
-            multi_device=merged_kwargs.get("multi_device", False),
-        )
-    elif optimizer_type.lower() == "adam":
+    if optimizer_type.lower() == "adam":
         #return optax.adamw(learning_rate=schedule_lr)
         return optax.chain(
             optax.scale_by_adam(),
@@ -346,7 +319,6 @@ def create_gradient_mask(ansatz, params, frozen_params):
             # Apply stop_gradient to all leaves in the frozen parameter PyTree
             param_pytree = tree_map(stop_gradient, param_pytree)
             print(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
-            print("Warning: Freezing parameters does not work for KFAC yet.")
         masked_jastrow_params.append(param_pytree)
 
     # Return the masked parameters

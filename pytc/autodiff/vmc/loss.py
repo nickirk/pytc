@@ -10,11 +10,6 @@ import jax.numpy as jnp
 from jax import tree_util
 from typing import Callable, Optional, Tuple
 import folx
-try:
-    import kfac_jax
-    _HAS_KFAC = True
-except ImportError:
-    _HAS_KFAC = False
 
 
 def make_energy_loss(
@@ -43,6 +38,7 @@ def make_energy_loss(
         Loss function with signature (params, batch_data) -> (loss, AuxData)
         where AuxData is a namedtuple with (mean_energy, energy_std, clipped_energies, diff)
     """
+    
     # Default cost function: mean energy
     if cost_fn is None:
         cost_fn = jnp.mean
@@ -173,9 +169,6 @@ def make_energy_loss(
             n_walkers = diff.shape[0]
             cost_tangent = jnp.dot(diff, log_psi_tangent) / n_walkers
             
-            # For KFAC compatibility - register distributions
-            if _HAS_KFAC and optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(log_psi_primal[:, None])
             
             # Return primal cost and tangent
             # Tangent aux_data: use zeros for cached values (they're not differentiated)
@@ -229,10 +222,6 @@ def make_energy_loss(
             # Compute cost
             cost = cost_fn(clipped_energies)
             
-            # For KFAC, register predictive distribution
-            if _HAS_KFAC and optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(energies[:, None])
-            
             return cost, (mean_energy, energy_std)
         
         return loss_fn
@@ -265,6 +254,7 @@ def make_variance_loss(
     Returns:
         Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_std))
     """
+    
     # Choose vmap implementation based on max_vmap_batch_size
     if max_vmap_batch_size == 0:
         vmap_impl = jax.vmap
@@ -362,9 +352,6 @@ def make_variance_loss(
             )
             # Single JVP call - now only differentiating wrt params
             #log_psi_primal = batch_network(walkers, params)
-            # For KFAC compatibility
-            if _HAS_KFAC and optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(energies[:, None])
             # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
             energy_diff = energies - e_mean
             if n_walkers > 1:
@@ -412,10 +399,6 @@ def make_variance_loss(
             # Sample variance: sum((E - <E>)^2) / (n - 1)
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
-            
-            # For KFAC, register predictive distribution
-            if _HAS_KFAC and optimizer_type.lower() == "kfac":
-                kfac_jax.register_normal_predictive_distribution(energies[:, None])
             
             return variance, (e_mean, e_std)
         
