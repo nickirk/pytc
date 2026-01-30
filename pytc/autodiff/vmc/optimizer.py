@@ -4,7 +4,11 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.sparse.linalg as spla
 import optax
-import kfac_jax
+try:
+    import kfac_jax
+    _HAS_KFAC = True
+except ImportError:
+    _HAS_KFAC = False
 import folx
 from typing import Dict, Any, Optional
 from jax.tree_util import tree_map
@@ -238,6 +242,9 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
         return learning_rate / (1.0 + step/100)
     
     if optimizer_type.lower() == "kfac":
+        if not _HAS_KFAC:
+            raise ImportError("kfac_jax is required for the KFAC optimizer. "
+                            "Please install it with `pip install \".[kfac]\"`.")
         # K-FAC requires a value_and_grad_func, which should be provided in opt_kwargs
         if "value_and_grad_func" not in merged_kwargs:
             raise ValueError("KFAC optimizer requires value_and_grad_func in opt_kwargs")

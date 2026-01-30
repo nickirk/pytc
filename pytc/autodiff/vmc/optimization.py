@@ -34,7 +34,11 @@ import jax.scipy.sparse.linalg as spla
 from jax import random, value_and_grad
 from jax.tree_util import tree_map
 import optax
-import kfac_jax
+try:
+    import kfac_jax
+    _HAS_KFAC = True
+except ImportError:
+    _HAS_KFAC = False
 from typing import Dict, Any, Optional
 
 from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling, make_mcmc_step, make_mcmc_step_importance
@@ -434,6 +438,9 @@ def optimize(
 
     # Create optimizer and training step using factory functions
     if optimizer_type.lower() == "kfac":
+        if not _HAS_KFAC:
+            raise ImportError("kfac_jax is required for the KFAC optimizer. "
+                            "Please install it with `pip install \".[kfac]\"`.")
         # KFAC specific setup
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["value_func_has_aux"] = True
@@ -669,6 +676,9 @@ def optimize_ref_var(
     loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
 
     if optimizer_type.lower() == "kfac":
+        if not _HAS_KFAC:
+            raise ImportError("kfac_jax is required for the KFAC optimizer. "
+                            "Please install it with `pip install \".[kfac]\"`.")
         # KFAC setup
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["value_func_has_aux"] = True

@@ -10,7 +10,11 @@ import jax.numpy as jnp
 from jax import tree_util
 from typing import Callable, Optional, Tuple
 import folx
-import kfac_jax
+try:
+    import kfac_jax
+    _HAS_KFAC = True
+except ImportError:
+    _HAS_KFAC = False
 
 
 def make_energy_loss(
@@ -170,7 +174,7 @@ def make_energy_loss(
             cost_tangent = jnp.dot(diff, log_psi_tangent) / n_walkers
             
             # For KFAC compatibility - register distributions
-            if optimizer_type.lower() == "kfac":
+            if _HAS_KFAC and optimizer_type.lower() == "kfac":
                 kfac_jax.register_normal_predictive_distribution(log_psi_primal[:, None])
             
             # Return primal cost and tangent
@@ -226,7 +230,7 @@ def make_energy_loss(
             cost = cost_fn(clipped_energies)
             
             # For KFAC, register predictive distribution
-            if optimizer_type.lower() == "kfac":
+            if _HAS_KFAC and optimizer_type.lower() == "kfac":
                 kfac_jax.register_normal_predictive_distribution(energies[:, None])
             
             return cost, (mean_energy, energy_std)
@@ -359,7 +363,7 @@ def make_variance_loss(
             # Single JVP call - now only differentiating wrt params
             #log_psi_primal = batch_network(walkers, params)
             # For KFAC compatibility
-            if optimizer_type.lower() == "kfac":
+            if _HAS_KFAC and optimizer_type.lower() == "kfac":
                 kfac_jax.register_normal_predictive_distribution(energies[:, None])
             # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
             energy_diff = energies - e_mean
@@ -410,7 +414,7 @@ def make_variance_loss(
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             
             # For KFAC, register predictive distribution
-            if optimizer_type.lower() == "kfac":
+            if _HAS_KFAC and optimizer_type.lower() == "kfac":
                 kfac_jax.register_normal_predictive_distribution(energies[:, None])
             
             return variance, (e_mean, e_std)

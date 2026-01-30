@@ -2,7 +2,12 @@ import jax.numpy as jnp
 from jax import random
 import flax.linen as nn
 from typing import Sequence, List
-import kfac_jax
+try:
+    import kfac_jax
+    _HAS_KFAC = True
+except ImportError:
+    _HAS_KFAC = False
+
 from pytc.autodiff.jastrow import Jastrow 
 from flax import struct
 import jax
@@ -39,7 +44,8 @@ class KFACDense(nn.Module):
             y += bias
             
         # Register with KFAC using raw parameters
-        kfac_jax.register_dense(x, y, kernel, bias)
+        if _HAS_KFAC:
+            kfac_jax.register_dense(x, y, kernel, bias)
         return y
 
 class MLP(nn.Module):
