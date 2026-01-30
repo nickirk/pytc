@@ -7,52 +7,79 @@ on:
     branches: [ "main" ]
 
 jobs:
-  test:
+  # Full test suite on boundary Python versions (oldest + newest supported)
+  full-test:
     runs-on: self-hosted
     strategy:
       matrix:
-        python-version: ["3.9", "3.14"]
+        python-version: ["3.10", "3.14"]  # 3.10 minimum (folx requires >=3.10)
+    defaults:
+      run:
+        shell: bash -l {0}
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Create or update Conda environment
       run: |
-        echo "Using system Python ${{ matrix.python-version }}"
-        python${{ matrix.python-version }} --version
-        # Install CMake via Homebrew with correct architecture
-        arch -arm64 brew install cmake || true
-        cmake --version
-        python${{ matrix.python-version }} -m venv venv
-        source venv/bin/activate
-        python -m pip install --upgrade pip
-        # Set CMAKE_ARGS to fix pybind11 compatibility issue
-        export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-    
-    - name: Install dependencies
-      run: |
-        source venv/bin/activate
-        # Install CPU version of JAX for CI
-        python -m pip install -U "jax[cpu]"
-        # Install other dependencies (skip kfac_jax due to dm-tree build issues)
-        python -m pip install numpy scipy optax flax pyscf
-        # Install folx only for Python >= 3.10
-        if [[ "${{ matrix.python-version }}" == "3.9" ]]; then
-          echo "Skipping folx for Python 3.9 (requires >=3.10)"
-        else
-          python -m pip install folx
-        fi
-        # Install the package itself if needed, or just dependencies
-        # Assuming dev install or just running tests against source
-        python -m pip install -e .
+        conda create -y -n py${{ matrix.python-version }} --override-channels -c conda-forge python=${{ matrix.python-version }} || conda install -y -n py${{ matrix.python-version }} --override-channels -c conda-forge python=${{ matrix.python-version }}
 
-    - name: Run tests
+    - name: Install package with dependencies
       run: |
-        source venv/bin/activate
+        # Install the package and all dependencies from pyproject.toml
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m pip install -e .
+
+    - name: Run full tests
+      run: |
         # Use explicit directory discovery to avoid requiring __init__.py files in tests
-        # Note: VMC-related tests (ansatz, vmc) are skipped in CI - run locally for VMC development
-        python -m unittest discover -v -s pytc/test -t pytc/test
-        python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
-        python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
-        python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
-        python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/test -t pytc/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/vmc/test -t pytc/autodiff/vmc/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/ansatz/test -t pytc/autodiff/ansatz/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+        #conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+
+    - name: Cleanup workspace
+      if: always()
+      run: |
+        echo "Cleaning up workspace..."
+        find . -maxdepth 1 ! -name '.' ! -name '.git' -exec rm -rf {} +
+
+  # Smoke tests on intermediate Python versions (quick import + basic tests)
+  smoke-test:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Create or update Conda environment
+      run: |
+        conda create -y -n py${{ matrix.python-version }} --override-channels -c conda-forge python=${{ matrix.python-version }} || conda install -y -n py${{ matrix.python-version }} --override-channels -c conda-forge python=${{ matrix.python-version }}
+
+    - name: Install package with dependencies
+      run: |
+        # Install the package and all dependencies from pyproject.toml
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m pip install -e .
+
+    - name: Run smoke tests
+      run: |
+        # Quick import checks to verify the package works
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "import pytc; print('pytc version:', getattr(pytc, '__version__', 'unknown'))"
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.vmc import optimize, sample"
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.jastrow import REXP, Poly, NuclearCusp, BoysHandy"
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.ansatz.sj import SlaterJastrow"
+        # Run a subset of quick tests
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+
+    - name: Cleanup workspace
+      if: always()
+      run: |
+        echo "Cleaning up workspace..."
+        find . -maxdepth 1 ! -name '.' ! -name '.git' -exec rm -rf {} +

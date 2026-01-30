@@ -22,8 +22,7 @@ The optimization module supports two complementary training patterns:
    - Use case: Reducing variance for fixed reference determinant
    - Example: n_opt_per_mcmc=20 means 20 parameter updates, then 1 MCMC step
 
-The factory functions make_training_step() and make_kfac_training_step() support
-both patterns through their n_mcmc_per_opt and n_opt_per_mcmc parameters.
+The factory function make_training_step() supports both patterns.
 """
 
 import time
@@ -34,7 +33,6 @@ import jax.scipy.sparse.linalg as spla
 from jax import random, value_and_grad
 from jax.tree_util import tree_map
 import optax
-import kfac_jax
 from typing import Dict, Any, Optional
 
 from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling, make_mcmc_step, make_mcmc_step_importance
@@ -205,45 +203,13 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
     return jax.jit(training_step)
 
 
-def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=1):
-    """Factory to create unified training step for KFAC optimizer.
+def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=1):
+    """Factory to create unified training step for optimizers with a .step() method.
     
-    KFAC optimizer handles gradient computation internally via its step() method,
-    so this is slightly different from the standard Optax version.
-    
-    Args:
-        mcmc_step: JIT-compiled MCMC step function from make_mcmc_step()
-                   Signature: (ansatz, walkers, key, params) -> (walkers, pmove)
-        optimizer: KFAC optimizer instance
-        n_mcmc_per_opt: Number of MCMC steps before each optimization update (default: 1)
-        n_opt_per_mcmc: Number of optimization steps per MCMC update (default: 1)
-    
-    Returns:
-        A function (not JIT-compiled yet) with signature:
-            training_step(ansatz, walkers, params, opt_state, key, global_step) ->
-                (walkers, params, opt_state, loss, aux_data, pmove)
+    This supports Newton-style optimizers which handle gradient computation 
+    internally via their step() method.
     """
     def training_step(ansatz, walkers, params, opt_state, key, global_step):
-        """One full training iteration: MCMC + optimization.
-        
-        Note: This is NOT JIT-compiled because KFAC handles JIT internally.
-        
-        Args:
-            ansatz: Wavefunction object
-            walkers: Walker dataclass with current MCMC configurations
-            params: Current parameters [jastrow_params, linear_coeffs]
-            opt_state: KFAC optimizer internal state
-            key: PRNG key for random number generation
-            global_step: Current optimization step (required by KFAC)
-        
-        Returns:
-            walkers: Updated walker configurations
-            params: Updated parameters
-            opt_state: Updated optimizer state
-            loss: Scalar loss value from last optimization step
-            aux_data: Auxiliary data from loss function
-            pmove: Acceptance probability from last MCMC step
-        """
         # Pattern 1: Multiple MCMC steps before optimization (energy minimization)
         if n_mcmc_per_opt > 1:
             pmove_list = []
@@ -251,7 +217,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                 key, subkey = random.split(key)
                 walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
                 pmove_list.append(pmove)
-            pmove = pmove_list[-1]  # Use last acceptance rate
+            pmove = pmove_list[-1]
             
             # Single optimization step
             key, subkey = random.split(key)
@@ -259,7 +225,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                 params=params,
                 state=opt_state,
                 rng=subkey,
-                batch=(walkers, ansatz), # Pass ansatz in batch
+                batch=(walkers, ansatz),
                 global_step_int=global_step
             )
             loss = stats['loss']
@@ -267,7 +233,6 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
         
         # Pattern 2: Multiple optimization steps per MCMC (variance minimization)
         elif n_opt_per_mcmc > 1:
-            # Use jax.lax.scan for the optimization loop to avoid unrolling overhead
             def opt_scan_body(carry, _):
                 p, s, k = carry
                 k, sk = random.split(k)
@@ -275,7 +240,7 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                     params=p,
                     state=s,
                     rng=sk,
-                    batch=(walkers, ansatz), # Pass ansatz in batch
+                    batch=(walkers, ansatz),
                     global_step_int=global_step
                 )
                 return (new_p, new_s, k), stats
@@ -287,9 +252,6 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
                 length=n_opt_per_mcmc
             )
             
-            # Use the last loss and aux_data from the optimization loop
-            # stats_history contains stacked results from all steps
-            # We take the last element (index -1)
             loss = jax.tree_util.tree_map(lambda x: x[-1], stats_history['loss'])
             aux_data = jax.tree_util.tree_map(lambda x: x[-1], stats_history['aux'])
             
@@ -297,19 +259,17 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
             key, subkey = random.split(key)
             walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
         
-        # Pattern 3: Balanced (1 MCMC, 1 opt)
+        # Pattern 3: Balanced
         else:
-            # Single MCMC step
             key, subkey = random.split(key)
             walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
             
-            # Single optimization step
             key, subkey = random.split(key)
             params, opt_state, stats = optimizer.step(
                 params=params,
                 state=opt_state,
                 rng=subkey,
-                batch=(walkers, ansatz), # Pass ansatz in batch
+                batch=(walkers, ansatz),
                 global_step_int=global_step
             )
             loss = stats['loss']
@@ -317,8 +277,9 @@ def make_kfac_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mc
         
         return walkers, params, opt_state, loss, aux_data, pmove
     
-    # KFAC handles JIT internally, so we don't JIT compile here
     return training_step
+
+
 
 
 
@@ -433,33 +394,21 @@ def optimize(
     loss_fn_jvp = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
 
     # Create optimizer and training step using factory functions
-    if optimizer_type.lower() == "kfac":
-        # KFAC specific setup
+    if optimizer_type.lower() == "newton":
+        # Newton setup
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
-        opt_kwargs["value_func_has_aux"] = True
-        optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
-        
-        key, subkey = random.split(key)
-        opt_state = optimizer.init(params, subkey, (walkers, ansatz))
-        
-        training_step = make_kfac_training_step(
-            mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
-        )
-    elif optimizer_type.lower() == "mfgn":
-        # MFGN setup
-        opt_kwargs["value_and_grad_func"] = loss_fn_jvp
-        opt_kwargs["curvature"] = "fisher" # Variance minimization uses Fisher
+        opt_kwargs["curvature"] = "fisher" # Energy minimization uses Fisher
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
         opt_state = optimizer.init(params, subkey, (walkers, ansatz))
         
-        # Use KFAC training step factory as it supports the step() interface
-        training_step = make_kfac_training_step(
+        # Use second order training step factory as it supports the step() interface
+        training_step = make_second_order_training_step(
             mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
         )
-        # MFGN needs explicit JIT since it doesn't handle it internally like KFAC
+        # Newton needs explicit JIT since it doesn't handle it internally
         training_step = jax.jit(training_step)
     else:
         # Optax setup
@@ -498,7 +447,7 @@ def optimize(
     for opt_step in range(n_opt_steps):
         key, subkey = random.split(key)
         
-        if optimizer_type.lower() in ["kfac", "mfgn"]:
+        if optimizer_type.lower() in ["newton"]:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
                 ansatz, walkers, params, opt_state, subkey, opt_step
             )
@@ -544,11 +493,11 @@ def optimize(
                 mcmc_step = make_mcmc_step(ansatz, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
             
             # Recreate training_step with new mcmc_step
-            if optimizer_type.lower() in ["kfac", "mfgn"]:
-                training_step = make_kfac_training_step(
+            if optimizer_type.lower() in ["newton"]:
+                training_step = make_second_order_training_step(
                     mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
                 )
-                if optimizer_type.lower() == "mfgn":
+                if optimizer_type.lower() == "newton":
                     training_step = jax.jit(training_step)
             else:
                 training_step = make_training_step(
@@ -615,7 +564,7 @@ def optimize_ref_var(
         max_vmap_batch_size: If 0, use standard vmap. If >0, use folx.batched_vmap with
                             the given batch size for memory efficiency. Recommended: 10-50
         learning_rate: Learning rate for optimizer
-        optimizer_type: Type of optimizer ("adam", "sgd", "kfac", etc.)
+        optimizer_type: Type of optimizer ("adam", "sgd", etc.)
         move_type: "one" or "all" for MCMC electron moves
         opt_kwargs: Additional optimizer parameters
         params: Initial combined parameters [jastrow_params, linear_coeffs].
@@ -668,20 +617,7 @@ def optimize_ref_var(
     # Define loss function JVP for KFAC and Newton
     loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
 
-    if optimizer_type.lower() == "kfac":
-        # KFAC setup
-        opt_kwargs["value_and_grad_func"] = loss_fn_jvp
-        opt_kwargs["value_func_has_aux"] = True
-        optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
-        
-        key, subkey = random.split(key)
-        opt_state = optimizer.init(params, subkey, (walkers, ansatz))
-        
-        # Create KFAC training step with n_opt_per_mcmc pattern
-        training_step = make_kfac_training_step(
-            mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
-        )
-    elif optimizer_type.lower() == "newton":
+    if optimizer_type.lower() == "newton":
         # Newton setup
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
@@ -691,10 +627,10 @@ def optimize_ref_var(
         key, subkey = random.split(key)
         opt_state = optimizer.init(params, subkey, (walkers, ansatz))
         
-        training_step = make_kfac_training_step(
+        training_step = make_second_order_training_step(
             mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
         )
-        # MFGN needs explicit JIT since it doesn't handle it internally like KFAC
+        # Newton needs explicit JIT
         training_step = jax.jit(training_step)
     else:
         # Optax setup
@@ -723,7 +659,7 @@ def optimize_ref_var(
     compilation_start = time.time()
     
     key, subkey = random.split(key)
-    if optimizer_type.lower() in ["kfac", "newton"]:
+    if optimizer_type.lower() in ["newton"]:
         walkers, params, opt_state, loss, aux_data, pmove = training_step(
             ansatz, walkers, params, opt_state, subkey, 0
         )
@@ -759,7 +695,7 @@ def optimize_ref_var(
     for opt_step in range(1, n_opt_steps):
         key, subkey = random.split(key)
         
-        if optimizer_type.lower() in ["kfac", "newton"]:
+        if optimizer_type.lower() in ["newton"]:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
                 ansatz, walkers, params, opt_state, subkey, opt_step
             )

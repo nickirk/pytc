@@ -2,13 +2,13 @@ import jax.numpy as jnp
 from jax import random
 import flax.linen as nn
 from typing import Sequence, List
-import kfac_jax
+
 from pytc.autodiff.jastrow import Jastrow 
 from flax import struct
 import jax
 
-class KFACDense(nn.Module):
-    """Dense layer that registers with KFAC."""
+class JastrowDense(nn.Module):
+    """Dense layer for Jastrow factors."""
     features: int
     use_bias: bool = True
     is_een_first_layer: bool = False  # Flag for EEN first layer
@@ -38,8 +38,6 @@ class KFACDense(nn.Module):
         if bias is not None:
             y += bias
             
-        # Register with KFAC using raw parameters
-        kfac_jax.register_dense(x, y, kernel, bias)
         return y
 
 class MLP(nn.Module):
@@ -50,14 +48,14 @@ class MLP(nn.Module):
     def __call__(self, x):
         for i, feat in enumerate(self.features[:-1]):
             layer_input = x
-            # Use KFAC-aware Dense layer
-            x = KFACDense(feat)(x)
+            # Use Dense layer
+            x = JastrowDense(feat)(x)
             x = nn.tanh(x)
             if layer_input.shape[-1] == feat:
                 x = x + layer_input
         
-        # Final layer using KFAC-aware Dense
-        x = KFACDense(self.features[-1])(x)
+        # Final layer using Dense
+        x = JastrowDense(self.features[-1])(x)
         return x
 
 @struct.dataclass
@@ -207,7 +205,7 @@ class EENMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         # First layer is equivariant
-        x = KFACDense(
+        x = JastrowDense(
             self.features[0], 
             is_een_first_layer=True, 
             num_nuclei=self.num_nuclei
@@ -217,12 +215,12 @@ class EENMLP(nn.Module):
         # Remaining layers are standard
         for feat in self.features[1:-1]:
             layer_input = x
-            x = KFACDense(feat)(x)
+            x = JastrowDense(feat)(x)
             x = nn.tanh(x)
             if layer_input.shape[-1] == feat:
                 x = x + layer_input
         
-        x = KFACDense(self.features[-1])(x)
+        x = JastrowDense(self.features[-1])(x)
         return x
 
 @struct.dataclass

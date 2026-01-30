@@ -22,6 +22,7 @@ __pycache__/
 
 calcs
 *.hdf5
+*.h5
 
 *.vscode/
 *.venv/
