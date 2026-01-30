@@ -15,9 +15,20 @@
 - flax (neural network)
 - folx 
 - optax (machine learning optimizers)
-- kfac_jax (2nd order optimizer)
+- kfac_jax (2nd order optimizer - **optional**, required for `kfac` optimizer in VMC)
 
 - pyscf (![modified version](https://github.com/nickirk/pyscf/tree/tc-ccsd) for tc-ccsd only. Otherwise, official pyscf also works)
+
+## Installation
+To install the package in editable mode:
+```bash
+pip install -e .
+```
+
+To include optional dependencies for K-FAC optimization:
+```bash
+pip install -e ".[kfac]"
+```
 
 ## Features
 - Takes in user defined Jastrow factors (Neural Jastrow under test)
