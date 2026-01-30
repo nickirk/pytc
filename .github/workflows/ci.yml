@@ -20,12 +20,11 @@ jobs:
       run: |
         echo "Using system Python ${{ matrix.python-version }}"
         python${{ matrix.python-version }} --version
-        # Install CMake via pip to avoid Homebrew architecture issues
-        python${{ matrix.python-version }} -m pip install --upgrade pip
-        python${{ matrix.python-version }} -m pip install cmake
         python${{ matrix.python-version }} -m venv venv
         source venv/bin/activate
         python -m pip install --upgrade pip
+        # Install CMake via pip to avoid Homebrew architecture issues
+        python -m pip install cmake
     
     - name: Install dependencies
       run: |
