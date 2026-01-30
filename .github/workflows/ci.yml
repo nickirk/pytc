@@ -30,7 +30,13 @@ jobs:
         # Install CPU version of JAX for CI
         python -m pip install -U "jax[cpu]"
         # Install other dependencies
-        python -m pip install numpy scipy optax kfac_jax flax folx pyscf
+        python -m pip install numpy scipy optax kfac_jax flax pyscf
+        # Install folx only for Python >= 3.10
+        if [[ "${{ matrix.python-version }}" == "3.9" ]]; then
+          echo "Skipping folx for Python 3.9 (requires >=3.10)"
+        else
+          python -m pip install folx
+        fi
         # Install the package itself if needed, or just dependencies
         # Assuming dev install or just running tests against source
         python -m pip install -e .
