@@ -15,29 +15,33 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       run: |
         echo "Using system Python ${{ matrix.python-version }}"
         python${{ matrix.python-version }} --version
-        
+        python${{ matrix.python-version }} -m venv venv
+        source venv/bin/activate
+        python -m pip install --upgrade pip
+    
     - name: Install dependencies
       run: |
-        python${{ matrix.python-version }} -m pip install --upgrade pip
+        source venv/bin/activate
         # Install CPU version of JAX for CI
-        python${{ matrix.python-version }} -m pip install -U "jax[cpu]"
+        python -m pip install -U "jax[cpu]"
         # Install other dependencies
-        python${{ matrix.python-version }} -m pip install numpy scipy optax kfac_jax flax folx pyscf
+        python -m pip install numpy scipy optax kfac_jax flax folx pyscf
         # Install the package itself if needed, or just dependencies
         # Assuming dev install or just running tests against source
-        python${{ matrix.python-version }} -m pip install -e .
+        python -m pip install -e .
 
     - name: Run tests
       run: |
+        source venv/bin/activate
         # Use explicit directory discovery to avoid requiring __init__.py files in tests
         # Note: VMC-related tests (ansatz, vmc) are skipped in CI - run locally for VMC development
-        python${{ matrix.python-version }} -m unittest discover -v -s pytc/test -t pytc/test
-        python${{ matrix.python-version }} -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
-        python${{ matrix.python-version }} -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
-        python${{ matrix.python-version }} -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
-        python${{ matrix.python-version }} -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        python -m unittest discover -v -s pytc/test -t pytc/test
+        python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
+        python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
+        python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+        python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
