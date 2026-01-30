@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
+env:
+  RUNNER_TOOL_CACHE: /Users/keliao/actions-runner/_work/_tool
+  AGENT_TOOLSDIRECTORY: /Users/keliao/actions-runner/_work/_tool
+
 jobs:
   test:
     runs-on: self-hosted
