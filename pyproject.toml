@@ -22,12 +22,12 @@ dependencies = [
     "scipy",
     "jax",
     "optax",
-    "kfac_jax",
     "flax",
     "folx",
 
     "pyscf",
 ]
+
 classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Physics",
@@ -39,6 +39,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+kfac = [
+    "kfac_jax",
+]
 gpu = [
     "jaxlib[cuda]",
 ]

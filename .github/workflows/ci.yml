@@ -20,19 +20,22 @@ jobs:
       run: |
         echo "Using system Python ${{ matrix.python-version }}"
         python${{ matrix.python-version }} --version
+        # Install CMake via Homebrew with correct architecture
+        arch -arm64 brew install cmake || true
+        cmake --version
         python${{ matrix.python-version }} -m venv venv
         source venv/bin/activate
         python -m pip install --upgrade pip
-        # Install CMake via pip to avoid Homebrew architecture issues
-        python -m pip install cmake
+        # Set CMAKE_ARGS to fix pybind11 compatibility issue
+        export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
     
     - name: Install dependencies
       run: |
         source venv/bin/activate
         # Install CPU version of JAX for CI
         python -m pip install -U "jax[cpu]"
-        # Install other dependencies
-        python -m pip install numpy scipy optax kfac_jax flax pyscf
+        # Install other dependencies (skip kfac_jax due to dm-tree build issues)
+        python -m pip install numpy scipy optax flax pyscf
         # Install folx only for Python >= 3.10
         if [[ "${{ matrix.python-version }}" == "3.9" ]]; then
           echo "Skipping folx for Python 3.9 (requires >=3.10)"
