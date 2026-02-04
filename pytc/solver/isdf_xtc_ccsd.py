@@ -83,6 +83,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
     eris.oovv = get_block('oovv')
     eris.ovvv = get_block('ovvv')
     eris.vvvv = None
+
+
     
     return eris
 
@@ -96,7 +98,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     nvir = nmo - nocc
     xtc_obj = cc.xtc_obj
     jastrow_params = cc.jastrow_params
-    
+
     # Memory-efficient block size
     blksize = max(1, int(1e8 / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
@@ -199,10 +201,13 @@ def _update_amps(cc, t1, t2, eris):
     
     # Efficient Wvvvv contraction
     t2new += _contract_vvvv_t2(cc, tau, eris)
+    # Corrected contractions to match PySCF rccsd index ordering
+    # Uses (kd|ac) and (kc|bd) as in rintermediates.cc_Wvvvv
     tmp_a = lib.einsum('kdac,ijcd->kaij', eris_ovvv, tau)
     t2new -= lib.einsum('kb,kaij->ijab', t1, tmp_a)
-    tmp_b = lib.einsum('kdbc,ijcd->kbij', eris_ovvv, tau)
+    tmp_b = lib.einsum('kcbd,ijcd->kbij', eris_ovvv, tau)
     t2new -= lib.einsum('ka,kbij->ijab', t1, tmp_b)
+
 
     tmp = lib.einsum('ac,ijcb->ijab', Lvv, t2)
     t2new += (tmp + tmp.transpose(1,0,3,2))
