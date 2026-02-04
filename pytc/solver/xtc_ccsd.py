@@ -5,6 +5,7 @@ from pyscf import lib
 from pyscf.cc import rccsd
 from pyscf.cc import rintermediates as imd
 from pyscf import ao2mo
+from pyscf.ao2mo import _ao2mo
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,54 @@ class RCCSD(rccsd.RCCSD):
     def energy(self, t1=None, t2=None, eris=None):
         return _energy(self, t1, t2, eris)
 
+    def density_fit(self, auxbasis=None, with_df=None, n_rank_xtc=None, with_isdf_xtc=None, **kwargs):
+        '''
+        Update local RCCSD object to use density fitting for standard Coulomb integrals
+        and/or ISDF for XTC integrals.
+
+        Args:
+            auxbasis (str): Auxiliary basis for standard Coulomb DF.
+            with_df (pyscf.df.DF): Existing DF object for standard integrals.
+            n_rank_xtc (int): Rank for ISDF-XTC decomposition. used if with_isdf_xtc is None.
+            with_isdf_xtc (ISDFXTC): Existing ISDF-XTC object to use.
+            **kwargs: Additional arguments for ISDFXTC conversion (e.g., save_path) if creating new ISDFXTC.
+        
+        Returns:
+            A new RCCSD object with DF enabled.
+        '''
+        new_cc = self.copy()
+        
+        # 1. Setup Standard Coulomb DF
+        if with_df is not None:
+             new_cc.with_df = with_df
+        elif getattr(self._scf, 'with_df', None):
+             new_cc.with_df = self._scf.with_df.copy()
+        else:
+             from pyscf import df
+             new_cc.with_df = df.DF(self.mol)
+             new_cc.with_df.auxbasis = auxbasis or 'weigend'
+        
+        if auxbasis is not None and new_cc.with_df.auxbasis != auxbasis:
+             new_cc.with_df = new_cc.with_df.copy()
+             new_cc.with_df.auxbasis = auxbasis
+             
+        # 2. Setup ISDF-XTC
+        from pytc.autodiff.xtc import ISDFXTC
+        if with_isdf_xtc is not None:
+            new_cc.xtc_obj = with_isdf_xtc
+        elif n_rank_xtc is not None:
+            if not isinstance(self.xtc_obj, ISDFXTC):
+                 # Convert to ISDFXTC
+                 new_cc.xtc_obj = ISDFXTC.from_xtc(self.xtc_obj, n_rank=n_rank_xtc, **kwargs)
+                 # Ensure ISDF kernels are computed
+                 if self.jastrow_params is not None:
+                     new_cc.xtc_obj = new_cc.xtc_obj.isdf(self.jastrow_params)
+            else:
+                 logger.warn("xtc_obj is already ISDFXTC, but n_rank_xtc provided. Ignoring n_rank_xtc re-decomposition for now to avoid complexity.")
+        
+        return new_cc
+
+
 
 class _ChemistsERIs(rccsd._ChemistsERIs):
     """Custom ERIs holding XTC data."""
@@ -40,8 +89,14 @@ def _make_xtc_eris(cc, mo_coeff=None):
     jastrow_params = cc.jastrow_params
     
     # Use standard make_eris if it's not an ISDF object to avoid recomputation
+    # BUT if density fitting is requested (with_df), we must use the DF path 
+    # even for standard XTC objects (to use DF for standard integrals).
+    with_df = getattr(cc, 'with_df', None)
+    if with_df is None and getattr(cc._scf, 'with_df', None):
+        with_df = cc._scf.with_df
+
     from pytc.autodiff.xtc import XTC, ISDFXTC
-    if isinstance(xtc_obj, XTC) and not isinstance(xtc_obj, ISDFXTC):
+    if isinstance(xtc_obj, XTC) and not isinstance(xtc_obj, ISDFXTC) and with_df is None:
         logger.info("Using XTC.make_eris for standard XTC object")
         return xtc_obj.make_eris(cc._scf, jastrow_params)
 
@@ -74,30 +129,198 @@ def _make_xtc_eris(cc, mo_coeff=None):
     eris.mo_energy = np.diag(eris.fock)
 
     # 2. Materialize required blocks (except vvvv) using ISDF efficiently
-    eri_std_full = ao2mo.kernel(cc.mol, mo_coeff, compact=False, aosym='s1', intor='int2e')
-    eri_std_full = eri_std_full.reshape(nmo, nmo, nmo, nmo)
     
-    def get_block(block_str):
-        tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
-        slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
-        return eri_std_full[tuple(slices)] + tc_part
+    # Check for density fitting
+    with_df = getattr(cc, 'with_df', None)
+    if with_df is None and getattr(cc._scf, 'with_df', None):
+        with_df = cc._scf.with_df
 
-    eris.oooo = get_block('oooo')
-    eris.ovoo = get_block('ovoo')
-    eris.ooov = get_block('ooov')
-    eris.vooo = get_block('vooo')
-    eris.ovov = get_block('ovov')
-    eris.vovo = get_block('vovo')
-    eris.ovvo = get_block('ovvo')
-    eris.voov = get_block('voov')
-    eris.oovv = get_block('oovv')
-    eris.vvoo = get_block('vvoo')
-    eris.ovvv = get_block('ovvv')
-    eris.vvov = get_block('vvov')
-    eris.vovv = get_block('vovv')
-    eris.vvvv = None
+    if with_df is not None:
+        # --- Density Fitting Path ---
+        logger.info("Using Density Fitting for standard Coulomb integrals in XTC-CCSD")
+        
+        # Prepare 3-index tensors L_pq = (L|pq)
+        # We need Loo, Lov, Lvv (Lvv stored as vvL for efficiency)
+        naux = with_df.get_naoaux()
+        
+        # Use HDF5 for large tensors if needed, typically Lvv is large
+        # We follow pyscf.cc.dfccsd pattern
+        if isinstance(with_df._cderi, str):
+            import h5py
+            eris.feri = h5py.File(with_df._cderi, 'a')
+        elif isinstance(getattr(with_df, '_cderi_to_save', None), str):
+            import h5py
+            eris.feri = h5py.File(with_df._cderi_to_save, 'a')
+        else:
+            eris.feri = lib.H5TmpFile()
+            
+        nvir_pair = nvir * (nvir+1) // 2
+        
+        # Loo and Lov are usually small enough for memory
+        Loo = np.empty((naux, nocc, nocc))
+        Lov = np.empty((naux, nocc, nvir))
+        
+        # vvL stored on disk: (nvir_pair, naux)
+        # chunks strategy from dfccsd
+        chunks = (min(nvir_pair, int(4e8/with_df.blockdim)), min(naux, with_df.blockdim))
+        eris.vvL = eris.feri.create_dataset('vvL', (nvir_pair, naux), 'f8', chunks=chunks)
+        
+        mo = np.asarray(mo_coeff, order='F')
+        ijslice = (0, nmo, 0, nmo)
+        p1 = 0
+        Lpq = None
+        
+        # Determine max_memory for the loop
+        # max_memory = cc.max_memory - lib.current_memory()[0]
+        
+        for k, eri1 in enumerate(with_df.loop()):
+            Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1', out=Lpq)
+            p0, p1 = p1, p1 + Lpq.shape[0]
+            Lpq = Lpq.reshape(p1-p0, nmo, nmo)
+            
+            # Extract blocks
+            Loo[p0:p1] = Lpq[:, :nocc, :nocc]
+            Lov[p0:p1] = Lpq[:, :nocc, nocc:]
+            
+            # Pack vv part
+            Lvv_tril = lib.pack_tril(Lpq[:, nocc:, nocc:])
+            eris.vvL[:, p0:p1] = Lvv_tril.T
+            
+        Lpq = None
+        
+        # Reshape Loo, Lov
+        Loo = Loo.reshape(naux, nocc*nocc)
+        Lov = Lov.reshape(naux, nocc*nvir)
+        
+        def get_block_df(block_str):
+            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
+            
+            # Construct standard part from L tensors
+            # Note: lib.ddot(A.T, B) computes A^T . B
+            
+            if block_str == 'oooo':
+                std = lib.ddot(Loo.T, Loo).reshape(nocc, nocc, nocc, nocc)
+            
+            elif block_str == 'ovoo':
+                std = lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc)
+                
+            elif block_str == 'ovov':
+                std = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir)
+                
+            elif block_str == 'ovvo':
+                # ovov constructed as Lov.T @ Lov is (ia|jb)
+                # ovvo is (ia|jb).transpose(0, 1, 3, 2)
+                tmp = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir)
+                std = tmp.transpose(0, 1, 3, 2)
+                
+            elif block_str == 'oovv':
+                oovv_tril = np.empty((nocc*nocc, nvir_pair))
+                blksize = max(4, int(1e8/naux)) 
+                for p0, p1 in lib.prange(0, nvir_pair, blksize):
+                     vvL_slice = eris.vvL[p0:p1] # (blk, naux)
+                     oovv_tril[:, p0:p1] = lib.ddot(Loo.T, vvL_slice.T)
+                
+                std = lib.unpack_tril(oovv_tril).reshape(nocc, nocc, nvir, nvir)
+                
+            elif block_str == 'vvoo':
+                oovv_tril = np.empty((nocc*nocc, nvir_pair))
+                blksize = max(4, int(1e8/naux)) 
+                for p0, p1 in lib.prange(0, nvir_pair, blksize):
+                     vvL_slice = eris.vvL[p0:p1]
+                     oovv_tril[:, p0:p1] = lib.ddot(Loo.T, vvL_slice.T)
+                std_oovv = lib.unpack_tril(oovv_tril).reshape(nocc, nocc, nvir, nvir)
+                std = std_oovv.transpose(2,3,0,1)
+
+            elif block_str == 'ovvv':
+                 ovvv_tril = np.empty((nocc*nvir, nvir_pair))
+                 blksize = max(4, int(1e8/naux))
+                 for p0, p1 in lib.prange(0, nvir_pair, blksize):
+                     vvL_slice = eris.vvL[p0:p1]
+                     ovvv_tril[:, p0:p1] = lib.ddot(Lov.T, vvL_slice.T)
+                     
+                 std = lib.unpack_tril(ovvv_tril).reshape(nocc, nvir, nvir, nvir)
+                 
+            elif block_str == 'vvov':
+                ovvv_tril = np.empty((nocc*nvir, nvir_pair))
+                blksize = max(4, int(1e8/naux))
+                for p0, p1 in lib.prange(0, nvir_pair, blksize):
+                    vvL_slice = eris.vvL[p0:p1]
+                    ovvv_tril[:, p0:p1] = lib.ddot(Lov.T, vvL_slice.T)
+                std_ovvv = lib.unpack_tril(ovvv_tril).reshape(nocc, nvir, nvir, nvir)
+                std = std_ovvv.transpose(2,3,0,1)
+                
+            elif block_str == 'vovv':
+                ovvv_tril = np.empty((nocc*nvir, nvir_pair))
+                blksize = max(4, int(1e8/naux))
+                for p0, p1 in lib.prange(0, nvir_pair, blksize):
+                    vvL_slice = eris.vvL[p0:p1]
+                    ovvv_tril[:, p0:p1] = lib.ddot(Lov.T, vvL_slice.T)
+                std_ovvv = lib.unpack_tril(ovvv_tril).reshape(nocc, nvir, nvir, nvir)
+                std = std_ovvv.transpose(1,0,2,3)
+
+            elif block_str == 'ooov':
+                 std = lib.ddot(Loo.T, Lov).reshape(nocc, nocc, nocc, nvir)
+
+            else:
+                 if block_str == 'vooo':
+                     std = lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc).transpose(1, 0, 2, 3)
+                 elif block_str == 'voov':
+                     std = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir).transpose(1, 0, 2, 3)
+                 elif block_str == 'vovo':
+                     # (ai|bj) from (ia|jb)
+                     std = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir).transpose(1, 0, 3, 2)
+                 else:
+                     raise NotImplementedError(f"DF block {block_str} not implemented")
+
+            return std + tc_part
+
+        eris.oooo = get_block_df('oooo')
+        eris.ovoo = get_block_df('ovoo')
+        eris.ooov = get_block_df('ooov')
+        eris.vooo = get_block_df('vooo')
+        eris.ovov = get_block_df('ovov')
+        eris.vovo = get_block_df('vovo')
+        eris.ovvo = get_block_df('ovvo')
+        eris.voov = get_block_df('voov')
+        eris.oovv = get_block_df('oovv')
+        eris.vvoo = get_block_df('vvoo')
+        eris.ovvv = get_block_df('ovvv')
+        eris.vvov = get_block_df('vvov')
+        eris.vovv = get_block_df('vovv')
+        eris.vvvv = None
+        
+        # Cleanup
+        del Loo, Lov, Lpq, mo
+        # Keep eris.vvL for vvvv contraction
+        
+        return eris
+
+    else:
+        # --- Standard Path (ao2mo) --- 
+        eri_std_full = ao2mo.kernel(cc.mol, mo_coeff, compact=False, aosym='s1', intor='int2e')
+        eri_std_full = eri_std_full.reshape(nmo, nmo, nmo, nmo)
+        
+        def get_block(block_str):
+            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
+            slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
+            return eri_std_full[tuple(slices)] + tc_part
     
-    return eris
+        eris.oooo = get_block('oooo')
+        eris.ovoo = get_block('ovoo')
+        eris.ooov = get_block('ooov')
+        eris.vooo = get_block('vooo')
+        eris.ovov = get_block('ovov')
+        eris.vovo = get_block('vovo')
+        eris.ovvo = get_block('ovvo')
+        eris.voov = get_block('voov')
+        eris.oovv = get_block('oovv')
+        eris.vvoo = get_block('vvoo')
+        eris.ovvv = get_block('ovvv')
+        eris.vvov = get_block('vvov')
+        eris.vovv = get_block('vovv')
+        eris.vvvv = None
+        
+        return eris
 
 
 
@@ -134,10 +357,24 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         
         vvvv_block = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
         
-        # Add Standard Integrals if not handled by with_df
-        mo_v = cc.mo_coeff[:, nocc:]
-        std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-        vvvv_block = vvvv_block + std_block.reshape(p1-p0, nvir, nvir, nvir)
+        with_df = getattr(cc, 'with_df', None)
+        if with_df is None and getattr(cc._scf, 'with_df', None):
+             with_df = cc._scf.with_df
+
+        if with_df is not None:
+             naux = eris.vvL.shape[1]
+             L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
+             
+             L_ab_sub = L_vv_full[p0:p1]
+             std_block = np.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
+             # std_block shape is (blk, nvir, nvir, nvir)
+             
+             vvvv_block = vvvv_block + std_block
+             
+        else:
+             mo_v = cc.mo_coeff[:, nocc:]
+             std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
+             vvvv_block = vvvv_block + std_block.reshape(p1-p0, nvir, nvir, nvir)
         
         # Transpose to (a, c, b, d) and contract
         vvvv_trans = vvvv_block.transpose(0, 2, 1, 3)
