@@ -1045,7 +1045,7 @@ class ISDFXTC(XTC, ISDFTC):
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
         start_time = time.perf_counter()
-        logger.info("Starting ISDFXTC.get_delta_U")
+        logger.debug("Starting ISDFXTC.get_delta_U")
         
         # Check if kernels are available
         if self.isdf_kernels is None:
@@ -1074,7 +1074,7 @@ class ISDFXTC(XTC, ISDFTC):
             final_result = -(result + result_T.transpose(2, 3, 0, 1))
 
         total_time = time.perf_counter() - start_time
-        logger.info(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
+        logger.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
     @staticmethod

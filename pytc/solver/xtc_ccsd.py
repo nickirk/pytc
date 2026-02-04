@@ -21,6 +21,10 @@ class RCCSD(rccsd.RCCSD):
     def update_amps(self, t1, t2, eris):
         return _update_amps(self, t1, t2, eris)
 
+    def energy(self, t1=None, t2=None, eris=None):
+        return _energy(self, t1, t2, eris)
+
+
 class _ChemistsERIs(rccsd._ChemistsERIs):
     """Custom ERIs holding XTC data."""
     def __init__(self, mol=None):
@@ -35,6 +39,12 @@ def _make_xtc_eris(cc, mo_coeff=None):
     xtc_obj = cc.xtc_obj
     jastrow_params = cc.jastrow_params
     
+    # Use standard make_eris if it's not an ISDF object to avoid recomputation
+    from pytc.autodiff.xtc import XTC, ISDFXTC
+    if isinstance(xtc_obj, XTC) and not isinstance(xtc_obj, ISDFXTC):
+        logger.info("Using XTC.make_eris for standard XTC object")
+        return xtc_obj.make_eris(cc._scf, jastrow_params)
+
     eris = _ChemistsERIs(cc.mol)
     eris._common_init_(cc, mo_coeff)
     eris.xtc_obj = xtc_obj
@@ -45,24 +55,25 @@ def _make_xtc_eris(cc, mo_coeff=None):
     nvir = nmo - nocc
     mo_o = mo_coeff[:, :nocc]
     
-    # 1. Fock matrix construction (Elegant strip-based approach)
-    h1e_std = cc._scf.get_hcore()
-    h1e_std = reduce(np.dot, (mo_coeff.T, h1e_std, mo_coeff))
+    # 1. Fock matrix construction 
+    # Start from MF Fock matrix (diagonal in MO basis if mo_coeff are mf.mo_coeff)
+    # We use get_fock to ensure standard ERI part is exactly consistent with mf
+    dm_std = cc._scf.make_rdm1(mo_coeff=mo_coeff, mo_occ=cc._scf.mo_occ)
+    fock_std = cc._scf.get_fock(dm=dm_std)
+    fock_std = reduce(np.dot, (mo_coeff.T, fock_std, mo_coeff))
+
+    
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
-    eris.fock = (h1e_std + h1e_corr).copy()
+    # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections only
+    h2e_pqii_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(None), slice(0, nocc), slice(0, nocc))))
+    h2e_piiq_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(0, nocc), slice(0, nocc), slice(None))))
     
-    # Get 2-body strips for Fock modification: (pq|ii) and (pi|iq)
-    # Includes both Standard and TC parts
-    h2e_pqii = ao2mo.general(cc.mol, (mo_coeff, mo_coeff, mo_o, mo_o), compact=False).reshape(nmo, nmo, nocc, nocc)
-    h2e_pqii += np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(None), slice(0, nocc), slice(0, nocc))))
-    
-    h2e_piiq = ao2mo.general(cc.mol, (mo_coeff, mo_o, mo_o, mo_coeff), compact=False).reshape(nmo, nocc, nocc, nmo)
-    h2e_piiq += np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(0, nocc), slice(0, nocc), slice(None))))
-    
-    eris.fock += 2 * np.einsum('pqii->pq', h2e_pqii) - np.einsum('piiq->pq', h2e_piiq)
+    fock_corr = h1e_corr + 2 * np.einsum('pqii->pq', h2e_pqii_corr) - np.einsum('piiq->pq', h2e_piiq_corr)
+    eris.fock = fock_std + fock_corr
+    eris.fvo = eris.fock[nocc:, :nocc].copy()
     eris.mo_energy = np.diag(eris.fock)
-    
-    # 2. Materialize required blocks for CCSD (except vvvv)
+
+    # 2. Materialize required blocks (except vvvv) using ISDF efficiently
     eri_std_full = ao2mo.kernel(cc.mol, mo_coeff, compact=False, aosym='s1', intor='int2e')
     eri_std_full = eri_std_full.reshape(nmo, nmo, nmo, nmo)
     
@@ -75,23 +86,37 @@ def _make_xtc_eris(cc, mo_coeff=None):
     eris.ovoo = get_block('ovoo')
     eris.ooov = get_block('ooov')
     eris.vooo = get_block('vooo')
-    eris.vvoo = get_block('vvoo')
-    eris.vovo = get_block('vovo')
     eris.ovov = get_block('ovov')
+    eris.vovo = get_block('vovo')
     eris.ovvo = get_block('ovvo')
     eris.voov = get_block('voov')
     eris.oovv = get_block('oovv')
+    eris.vvoo = get_block('vvoo')
     eris.ovvv = get_block('ovvv')
+    eris.vvov = get_block('vvov')
+    eris.vovv = get_block('vovv')
     eris.vvvv = None
+    
+    return eris
+
+
 
 
     
     return eris
 
 def _contract_vvvv_t2(cc, t2, eris, out=None):
-    """Contraction of (vv|vv) with t2 using block-wise retrieval from XTC object."""
+    """Contraction of (vv|vv) with t2. Handles both materialized and block-wise cases."""
+    if eris.vvvv is not None:
+        # Materialized case: Transpose to (a, c, b, d) and contract
+        # Standard PySCF index for Wvvvv is (ab|cd) contracted with t2(ij|cd) gives (ij|ab)
+        # Here we follow PySCF's rintermediates.cc_Wvvvv logic if materialized
+        vvvv = np.asarray(eris.vvvv)
+        return lib.einsum('abcd,ijcd->ijab', vvvv.transpose(0, 2, 1, 3), t2)
+
     if out is None:
         out = np.zeros_like(t2)
+
     
     nocc = cc.nocc
     nmo = cc.nmo
@@ -159,7 +184,8 @@ def _update_amps(cc, t1, t2, eris):
     t1new += 2*np.einsum('kc,kica->ia', Fov, t2)
     t1new +=  -np.einsum('kc,ikca->ia', Fov, t2)
     t1new +=   np.einsum('kc,ic,ka->ia', Fov, t1, t1)
-    t1new += fov.conj()
+    t1new += eris.fock[nocc:, :nocc].T
+    
     t1new += 2*np.einsum('kcai,kc->ia', eris.ovvo, t1)
     t1new +=  -np.einsum('kiac,kc->ia', eris.oovv, t1)
     eris_ovvv = np.asarray(eris.ovvv)
@@ -167,22 +193,29 @@ def _update_amps(cc, t1, t2, eris):
     t1new +=  -lib.einsum('kcad,ikcd->ia', eris_ovvv, t2)
     t1new += 2*lib.einsum('kdac,kd,ic->ia', eris_ovvv, t1, t1)
     t1new +=  -lib.einsum('kcad,kd,ic->ia', eris_ovvv, t1, t1)
+
     eris_ovoo = np.asarray(eris.ovoo)
     t1new +=-2*lib.einsum('lcki,klac->ia', eris_ovoo, t2)
     t1new +=   lib.einsum('kcli,klac->ia', eris_ovoo, t2)
     t1new +=-2*lib.einsum('lcki,lc,ka->ia', eris_ovoo, t1, t1)
     t1new +=   lib.einsum('kcli,lc,ka->ia', eris_ovoo, t1, t1)
 
-    # T2 equation
     tmp2  = lib.einsum('kibc,ka->abic', eris.oovv, -t1)
-    tmp2 += np.asarray(eris_ovvv).conj().transpose(1,3,0,2)
+    tmp2 += np.asarray(eris.vovv).transpose(0, 2, 1, 3)
+
     tmp = lib.einsum('abic,jc->ijab', tmp2, t1)
     t2new = tmp + tmp.transpose(1,0,3,2)
     tmp2  = lib.einsum('kcai,jc->akij', eris.ovvo, t1)
-    tmp2 += eris_ovoo.transpose(1,3,0,2).conj()
+    tmp2 += np.asarray(eris.vooo).transpose(0, 3, 1, 2) 
+    # eris.vooo is (a, i, j, k) as (ai|jk). 
+    # Transpose (a:0, k:3, i:1, j:2) gives (ak|ij).
     tmp = lib.einsum('akij,kb->ijab', tmp2, t1)
+
+
     t2new -= tmp + tmp.transpose(1,0,3,2)
-    t2new += np.asarray(eris.ovov).conj().transpose(0,2,1,3)
+    
+    t2new += np.asarray(eris.ovov).transpose(0, 2, 1, 3)
+
     
     if cc.cc2:
         raise NotImplementedError("CC2 not supported")
@@ -201,12 +234,14 @@ def _update_amps(cc, t1, t2, eris):
     
     # Efficient Wvvvv contraction
     t2new += _contract_vvvv_t2(cc, tau, eris)
-    # Corrected contractions to match PySCF rccsd index ordering
-    # Uses (kd|ac) and (kc|bd) as in rintermediates.cc_Wvvvv
+    
+    # Substituted ovvv with appropriate non-hermitian counterparts if necessary?
+    # PySCF uses eris_ovvv which is (ia|bc).
     tmp_a = lib.einsum('kdac,ijcd->kaij', eris_ovvv, tau)
     t2new -= lib.einsum('kb,kaij->ijab', t1, tmp_a)
     tmp_b = lib.einsum('kcbd,ijcd->kbij', eris_ovvv, tau)
     t2new -= lib.einsum('ka,kbij->ijab', t1, tmp_b)
+
 
 
     tmp = lib.einsum('ac,ijcb->ijab', Lvv, t2)
@@ -227,3 +262,19 @@ def _update_amps(cc, t1, t2, eris):
     t2new /= eijab
 
     return t1new, t2new
+
+def _energy(cc, t1, t2, eris):
+    """CCSD correlation energy for non-Hermitian case."""
+    nocc, nvir = t1.shape
+    fock = eris.fock
+    # e = 2*np.einsum('ia,ia', fock[:nocc,nocc:], t1)
+    # Non-Hermitian: uses fov?
+    fov = fock[:nocc, nocc:]
+    e = 2*np.einsum('ia,ia', fov, t1)
+    tau = np.einsum('ia,jb->ijab',t1,t1)
+    tau += t2
+    eris_ovov = np.asarray(eris.ovov)
+    e += 2*np.einsum('ijab,iajb', tau, eris_ovov)
+    e +=  -np.einsum('ijab,ibja', tau, eris_ovov)
+    return e.real
+

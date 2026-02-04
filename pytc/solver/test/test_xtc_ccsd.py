@@ -7,13 +7,15 @@ from pyscf import gto, scf, lib, cc
 
 from pytc.autodiff import xtc
 from pytc.autodiff.jastrow import rexp
-from pytc.solver import isdf_xtc_ccsd
+from pytc.solver import xtc_ccsd
+
 
 # Enable float64 for JAX
 jax.config.update("jax_enable_x64", True)
 
-class TestISDFXTCCCSD(unittest.TestCase):
+class TestXTCCCSD(unittest.TestCase):
     def setUp(self):
+
         # H2O System
         self.mol = gto.M(
             atom='O 0 0 0; H 0 1 0; H 0 0 1',
@@ -24,7 +26,7 @@ class TestISDFXTCCCSD(unittest.TestCase):
         
         # Jastrow (Standard parameters)
         self.jastrow = rexp.REXP()
-        self.jastrow_params = {'alpha': jnp.array([1.0])}
+        self.jastrow_params = {'alpha': jnp.array([0.5])}
         
         # XTC Object (Low grid level for speed)
         self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=2)
@@ -37,10 +39,12 @@ class TestISDFXTCCCSD(unittest.TestCase):
     def test_rccsd_energy(self):
         print("\nRunning Reference Exact XTC CCSD...")
         eris_exact = self.xtc_obj.make_eris(self.mf, self.jastrow_params)
+        cc_exact = xtc_ccsd.RCCSD(self.mf, self.xtc_obj, self.jastrow_params)
         
         print("\nBuilding New ISDF-XTC-RCCSD ERIs...")
-        cc_new = isdf_xtc_ccsd.RCCSD(self.mf, self.isdf_xtc, self.jastrow_params)
+        cc_new = xtc_ccsd.RCCSD(self.mf, self.isdf_xtc, self.jastrow_params)
         eris_new = cc_new.ao2mo()
+
         
         # Compare blocks BEFORE zeroing vvvv
         # Compare Fock
@@ -121,14 +125,13 @@ class TestISDFXTCCCSD(unittest.TestCase):
                 print(f"VVVV Ref max: {np.max(np.abs(vvvv_ref_saved))}")
                 print(f"VVVV New max: {np.max(np.abs(vvvv_new_saved))}")
 
-        # Now run both CCSD calculations
-        print("\nRunning Reference CCSD...")
-        cc_ref = cc.rccsd.RCCSD(self.mf)
-        e_ref, t1_ref, t2_ref = cc_ref.kernel(eris=eris_exact)
+        print("\nRunning Reference CCSD (Exact XTC)...")
+        e_ref, t1_ref, t2_ref = cc_exact.kernel(eris=eris_exact)
         print(f"Reference Correlation Energy: {e_ref}")
         
         print("\nRunning New ISDF-XTC-CCSD...")
         e_new, t1_new, t2_new = cc_new.kernel(eris=eris_new)
+
         
         print(f"New Correlation Energy: {e_new}")
         
@@ -139,6 +142,36 @@ class TestISDFXTCCCSD(unittest.TestCase):
         
         t1_diff = np.linalg.norm(t1_new - t1_ref)
         self.assertLess(t1_diff, 1e-2, "T1 amplitude mismatch")
+
+    def test_hermitian_limit(self):
+        print("\nTesting Hermitian Limit (Large Alpha)...")
+        # Use large alpha to make Jastrow negligible
+        large_alpha_params = {'alpha': jnp.array([1000.0])}
+        
+        # Exact XTC with large alpha should match PySCF standard
+        cc_xtc = xtc_ccsd.RCCSD(self.mf, self.xtc_obj, large_alpha_params)
+        eris_xtc = self.xtc_obj.make_eris(self.mf, large_alpha_params)
+        e_xtc, _, _ = cc_xtc.kernel(eris=eris_xtc)
+        
+        # PySCF Standard
+        cc_std = cc.rccsd.RCCSD(self.mf)
+        e_std, _, _ = cc_std.kernel()
+        
+        print(f"XTC (Large Alpha) Energy: {e_xtc}")
+        print(f"PySCF Standard Energy: {e_std}")
+        
+        # Diagnostics
+        print("\nComparing mo_energy:")
+        print(f"XTC mo_energy: {eris_xtc.mo_energy}")
+        print(f"STD mo_energy: {self.mf.mo_energy}")
+
+        
+        error = abs(e_xtc - e_std)
+
+        print(f"Energy Difference (Hermitian Limit): {error}")
+        
+        self.assertLess(error, 1e-6, "Hermitian limit agreement failed")
+
 
     def tearDown(self):
         import os
