@@ -24,7 +24,7 @@ class RCCSD(rccsd.RCCSD):
 
     def energy(self, t1=None, t2=None, eris=None):
         return _energy(self, t1, t2, eris)
-
+    
     def density_fit(self, auxbasis=None, with_df=None, n_rank_xtc=None, with_isdf_xtc=None, **kwargs):
         '''
         Update local RCCSD object to use density fitting for standard Coulomb integrals
@@ -144,6 +144,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         Loo, Lov = _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff)
         
         def get_block_df(block_str):
+            logger.debug(f"    Computing block {block_str}")
             tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
             
             if block_str == 'oooo':
@@ -189,6 +190,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
                 del eris.feri[name]
             setattr(eris, name, eris.feri.create_dataset(name, shape, 'f8'))
 
+        logger.info("Computing large blocks...")
         _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full, nocc, nvir, nmo)
         
         # Medium blocks (keep in memory as per user request < 3 virtuals)
@@ -356,15 +358,6 @@ def _update_amps(cc, t1, t2, eris):
     t1new +=-2*lib.einsum('lcki,lc,ka->ia', eris_ovoo, t1, t1)
     t1new +=   lib.einsum('kcli,lc,ka->ia', eris_ovoo, t1, t1)
 
-    # Prepare for Single Pass over ovvv
-    # We need to compute:
-    # 1. t1new terms involving ovvv
-    # 2. Lvv (blockwise)
-    # 3. Wvoov (blockwise)
-    # 4. Wvovo (blockwise)
-    # 5. tmp_a (for t2new)
-    # 6. tmp_b (for t2new)
-    
     # Pre-allocate large intermediates that fit in RAM (11GB)
     # Wvoov: (a, k, i, c) -> (nvir, nocc, nocc, nvir)
     Wvoov = np.zeros((nvir, nocc, nocc, nvir))
@@ -581,7 +574,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
         ds = getattr(eris, name)
         
         if name == 'ovvv': # (k, c, a, d) - iterate 'a' (idx 2)
-             blksize = min(nvir, max(4, int(1.5e9/((nocc*nvir)*8)))) # ~200MB blocks
+             blksize = min(nvir, max(4, int(1.5e9/((nocc*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
                  # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
