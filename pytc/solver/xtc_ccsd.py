@@ -36,11 +36,19 @@ class RCCSD(rccsd.RCCSD):
     def energy(self, t1=None, t2=None, eris=None):
         return _energy(self, t1, t2, eris)
 
+    def ccsd(self, t1=None, t2=None, eris=None, mbpt2=None):
+        if eris is None:
+            eris = self.ao2mo()
+        self.e_hf = self.get_e_hf(eris)
+        return super().ccsd(t1, t2, eris, mbpt2)
+
     def energy_tot(self, t1=None, t2=None, eris=None):
         return self.get_e_hf(eris) + self.energy(t1, t2, eris)
 
     def get_e_hf(self, eris=None):
         if eris is None:
+             if getattr(self, 'e_hf', None) is not None:
+                 return self.e_hf
              return self._scf.e_tot
         
         no = self.nocc
