@@ -13,9 +13,16 @@ logger = logging.getLogger(__name__)
 class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""
     def __init__(self, mf, xtc_obj, jastrow_params, **kwargs):
+        self.gpu_max_memory = kwargs.pop('gpu_max_memory', 4000)
+        max_memory = kwargs.pop('max_memory', None)
         rccsd.RCCSD.__init__(self, mf, **kwargs)
         self.xtc_obj = xtc_obj
         self.jastrow_params = jastrow_params
+        
+        if max_memory is not None:
+            self.max_memory = max_memory
+        if getattr(self, 'max_memory', None) is None:
+            self.max_memory = getattr(mf, 'max_memory', 4000)
 
     def ao2mo(self, mo_coeff=None):
         return _make_xtc_eris(self, mo_coeff)
@@ -81,6 +88,8 @@ class _ChemistsERIs(rccsd._ChemistsERIs):
         rccsd._ChemistsERIs.__init__(self, mol)
         self.xtc_obj = None
         self.jastrow_params = None
+        self.max_memory = 4000
+        self.gpu_max_memory = 4000
 
 def _make_xtc_eris(cc, mo_coeff=None):
     if mo_coeff is None:
@@ -105,6 +114,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
     eris._common_init_(cc, mo_coeff)
     eris.xtc_obj = xtc_obj
     eris.jastrow_params = jastrow_params
+    eris.max_memory = cc.max_memory
+    eris.gpu_max_memory = cc.gpu_max_memory
     
     nocc = eris.nocc
     nmo = eris.fock.shape[0]
@@ -271,7 +282,10 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     jastrow_params = cc.jastrow_params
 
     # Memory-efficient block size
-    blksize = max(1, int(1.5e9 / (nvir**3 * 8)))
+    mem_host = cc.max_memory * 1e6
+    mem_gpu = cc.gpu_max_memory * 1e6
+    # vvvv_block shape: (blksize, nvir, nvir, nvir)
+    blksize = max(1, int(min(mem_host, mem_gpu) / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
     
     for p0 in range(0, nvir, blksize):
@@ -406,7 +420,8 @@ def _update_amps(cc, t1, t2, eris):
 
 
 
-    blksize = max(4, int(1.5e9 / (nocc*nvir*nvir*8)))
+    mem_host = cc.max_memory * 1e6
+    blksize = max(4, int(mem_host / (nocc*nvir*nvir*8)))
     blksize = min(nvir, blksize)
 
     logger.debug("    Starting ovvv loop (blksize=%d)", blksize)
@@ -420,7 +435,8 @@ def _update_amps(cc, t1, t2, eris):
     t2new = np.zeros_like(t2)
     
     # Blocked tmp2 calculation (for vovv)
-    blksize_t2 = max(4, int(1.5e9 / (nvir*nocc*nvir*8)))
+    mem_host = cc.max_memory * 1e6
+    blksize_t2 = max(4, int(mem_host / (nvir*nocc*nvir*8)))
     blksize_t2 = min(nvir, blksize_t2)
     
     logger.debug("    Starting vovv loop (blksize=%d)", blksize_t2)
@@ -600,7 +616,8 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
         ds = getattr(eris, name)
         
         if name == 'ovvv': # (k, c, a, d) - iterate 'a' (idx 2)
-             blksize = min(nvir, max(4, int(1.5e9/((nocc*nvir)*8))))
+             mem_host = eris.max_memory * 1e6
+             blksize = min(nvir, max(4, int(mem_host/((nocc*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
                  # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
@@ -611,8 +628,9 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                  tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
                  ds[:, :, p0:p1, :] = std_blk + tc_blk
 
-        elif name == 'vovv': # (c, k, a, d) -> iterate 'c' (idx 0)
-             blksize = min(nvir, max(4, int(1.5e9/((nocc*nvir)*8))))
+        elif name == 'vovv': # (c, k, a, d) - iterate 'c' (idx 0)
+             mem_host = eris.max_memory * 1e6
+             blksize = min(nvir, max(4, int(mem_host/((nocc*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
                  Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)
                  std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
