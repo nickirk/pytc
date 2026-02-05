@@ -831,32 +831,32 @@ class ISDFTC(TC):
                     else:
                         kernels['L_aux'] = f['L_aux'][:] # Load into RAM if we want to close 'f'
                         f.close()
-                    logging.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
+                    logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
                 f.close()
             except (IOError, KeyError) as e:
-                logging.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
+                logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 
         # 1. Compute K1_kernel and K3_kernel
-        logging.info("  Computing K1 and K3 kernels...")
+        logger.info("  Computing K1 and K3 kernels...")
         
         kernels = self.compute_kmat_kernels(jastrow_params, batch_size, host_grid_block_size=host_grid_block_size)
-        logging.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
-        logging.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
+        logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
+        logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
         
         # 2. Compute L_aux
-        logging.info("  Computing L_aux...")
+        logger.info("  Computing L_aux...")
         L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
         
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
         # If it's an HDF5 dataset, we keep it as is.
         if not isinstance(L_aux, (np.ndarray, jnp.ndarray)):
-             logging.info("  L_aux is streaming from HDF5")
+             logger.info("  L_aux is streaming from HDF5")
              kernels['L_aux'] = L_aux
         else:
-            logging.info("  Moving L_aux to CPU")
-            logging.info(f"    L_aux shape: {L_aux.shape}")
-            logging.info(f"    L_aux size: {L_aux.size * 8 / 1024**3:.2f} GB")
+            logger.info("  Moving L_aux to CPU")
+            logger.info(f"    L_aux shape: {L_aux.shape}")
+            logger.info(f"    L_aux size: {L_aux.size * 8 / 1024**3:.2f} GB")
             cpu_device = jax.devices("cpu")[0]
             L_aux = jax.device_put(L_aux, cpu_device)
             kernels['L_aux'] = L_aux
@@ -872,7 +872,7 @@ class ISDFTC(TC):
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
                 
-        logging.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
+        logger.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
         
         return self.replace(isdf_kernels=kernels)
 
@@ -880,7 +880,7 @@ class ISDFTC(TC):
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support."""
         start_time = time.perf_counter()
-        logging.debug("Starting ISDFTC.get_2b")
+        logger.debug("Starting ISDFTC.get_2b")
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
             
@@ -947,7 +947,7 @@ class ISDFTC(TC):
             result += result_T.transpose(2, 3, 0, 1)
         
         total_time = time.perf_counter() - start_time
-        logging.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
+        logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
         return -result
 
     def get_3b_fock(self, jastrow_params, dm1, L_aux=None):

@@ -1,4 +1,5 @@
 import logging
+import time
 import numpy as np
 from functools import reduce
 from pyscf import lib
@@ -283,6 +284,8 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         if with_df is None and getattr(cc._scf, 'with_df', None):
              with_df = cc._scf.with_df
 
+        logger.debug("    Contraction block %d:%d", p0, p1)
+        t0 = time.perf_counter()
         if with_df is not None:
              naux = eris.vvL.shape[1]
              L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
@@ -301,6 +304,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         # Transpose to (a, c, b, d) and contract
         vvvv_trans = vvvv_block.transpose(0, 2, 1, 3)
         out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_trans, t2)
+        logger.debug("    Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
         
     return out
 
@@ -320,6 +324,8 @@ def _update_amps(cc, t1, t2, eris):
     See the License for the specific language governing permissions and
     limitations under the License.
     """
+    logger.debug("Starting _update_amps")
+    t_start = time.perf_counter()
     nocc, nvir = t1.shape
     fock = eris.fock
     mo_e_o = eris.mo_energy[:nocc]
@@ -330,9 +336,11 @@ def _update_amps(cc, t1, t2, eris):
     fvv = fock[nocc:,nocc:].copy()
 
     # Small intermediates using PySCF logic (safe for RAM)
+    t0 = time.perf_counter()
     Foo = imd.cc_Foo(t1,t2,eris)
     Fvv = imd.cc_Fvv(t1,t2,eris)
     Fov = imd.cc_Fov(t1,t2,eris)
+    logger.debug("    imd Foo, Fvv, Fov done in %.3f s", time.perf_counter()-t0)
 
     Foo[np.diag_indices(nocc)] -= mo_e_o
     Fvv[np.diag_indices(nvir)] -= mo_e_v
@@ -345,6 +353,7 @@ def _update_amps(cc, t1, t2, eris):
     t1new +=  -np.einsum('kc,ikca->ia', Fov, t2)
     t1new +=   np.einsum('kc,ic,ka->ia', Fov, t1, t1)
     t1new += eris.fock[nocc:, :nocc].T
+    logger.debug("    T1 initial terms done in %.3f s", time.perf_counter()-t_start)
     
     eris_ovvo = np.asarray(eris.ovvo)
     eris_oovv = np.asarray(eris.oovv)
@@ -393,15 +402,19 @@ def _update_amps(cc, t1, t2, eris):
     Wvovo -= lib.einsum('lcki,la->akci', eris_ovoo, t1)
     Wvovo -= 0.5*lib.einsum('lckd,ilda->akci', eris_ovov, t2)
     Wvovo -= lib.einsum('lckd,id,la->akci', eris_ovov, t1, t1)
+    logger.debug("    Wvoov, Wvovo basic terms done in %.3f s", time.perf_counter()-t_start)
 
 
 
     blksize = max(4, int(1.5e9 / (nocc*nvir*nvir*8)))
     blksize = min(nvir, blksize)
 
+    logger.debug("    Starting ovvv loop (blksize=%d)", blksize)
+    t_loop = time.perf_counter()
     for p0 in range(0, nvir, blksize):
         p1 = min(p0 + blksize, nvir)
         _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
+    logger.debug("    ovvv loop done in %.3f s", time.perf_counter()-t_loop)
 
     
     t2new = np.zeros_like(t2)
@@ -410,9 +423,12 @@ def _update_amps(cc, t1, t2, eris):
     blksize_t2 = max(4, int(1.5e9 / (nvir*nocc*nvir*8)))
     blksize_t2 = min(nvir, blksize_t2)
     
+    logger.debug("    Starting vovv loop (blksize=%d)", blksize_t2)
+    t_loop = time.perf_counter()
     for p0 in range(0, nvir, blksize_t2):
         p1 = min(p0 + blksize_t2, nvir)
         _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1)
+    logger.debug("    vovv loop done in %.3f s", time.perf_counter()-t_loop)
 
 
     tmp2  = lib.einsum('kcai,jc->akij', eris_ovvo, t1)
@@ -421,6 +437,7 @@ def _update_amps(cc, t1, t2, eris):
 
     t2new -= tmp + tmp.transpose(1,0,3,2)
     t2new += np.asarray(eris.ovov).transpose(0, 2, 1, 3)
+    logger.debug("    t2new basic terms done in %.3f s", time.perf_counter()-t_start)
 
     # Add W loops
     Loo = imd.Loo(t1, t2, eris)
@@ -431,7 +448,9 @@ def _update_amps(cc, t1, t2, eris):
     # Wvoov, Wvovo computed in loop
 
     t2new += lib.einsum('klij,klab->ijab', Woooo, tau)
+    t_vvvv = time.perf_counter()
     t2new += _contract_vvvv_t2(cc, tau, eris)
+    logger.debug("    _contract_vvvv_t2 done in %.3f s", time.perf_counter()-t_vvvv)
 
     # Use precomputed tmp_a, tmp_b
     t2new -= lib.einsum('kb,kaij->ijab', t1, tmp_a)
@@ -448,6 +467,7 @@ def _update_amps(cc, t1, t2, eris):
     t2new -= (tmp + tmp.transpose(1,0,3,2))
     tmp = lib.einsum('bkci,kjac->ijab', Wvovo, t2)
     t2new -= (tmp + tmp.transpose(1,0,3,2))
+    logger.debug("    Final t1/t2 processing done in %.3f s", time.perf_counter()-t_start)
 
     eia = mo_e_o[:,None] - mo_e_v
     eijab = lib.direct_sum('ia,jb->ijab',eia,eia)
@@ -483,6 +503,8 @@ def _get_slice(dset, sl, axis=0):
 def _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b, p0, p1):
     """Process a chunk of ovvv block for amplitude updates."""
     # ovvv_blk: (k, c, a_blk, d) - sliced along 'a' (axis 2)
+    logger.debug("    _process_ovvv_block chunk %d:%d", p0, p1)
+    t0 = time.perf_counter()
     ovvv_blk = _get_slice(eris.ovvv, slice(p0, p1), axis=2)
     
     # 1. Update t1new (ia)
@@ -513,10 +535,13 @@ def _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_
     
     # 6. Update tmp_b (kbij) for t2new
     tmp_b[:, p0:p1, :, :] += lib.einsum('kcad,ijcd->kaij', ovvv_blk, tau)
+    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1):
     """Process a chunk of vovv block for t2 updates."""
     # (c_blk, k, a, d)
+    logger.debug("    _process_vovv_block chunk %d:%d", p0, p1)
+    t0 = time.perf_counter()
     vovv_slice = _get_slice(eris.vovv, slice(p0, p1), axis=0) 
     
     t1_slice = t1[:, p0:p1] # (k, a_blk)
@@ -528,6 +553,7 @@ def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1):
     term = lib.einsum('abic,jc->ijab', tmp2_blk, t1)
     t2new[:, :, p0:p1, :] = term
     t2new[:, :, :, p0:p1] += term.transpose(1, 0, 3, 2)
+    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     """Initialize DF tensors and HDF5 file."""
