@@ -183,6 +183,10 @@ def _make_xtc_eris(cc, mo_coeff=None):
                 # (ck|li). Lvo? Lov is (L, kc).
                 tmp = lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc)
                 std = tmp.transpose(1, 0, 2, 3)
+            elif block_str == 'vovo':
+                # (ak|cl) -> (a, k, c, l). From ovov (kacl) transpose to (a, k, c, l)
+                tmp = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir)
+                std = tmp.transpose(1, 0, 3, 2)
             else:
                 raise NotImplementedError(f"Block {block_str} not supported in get_block_df")
                 
@@ -222,7 +226,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vooo = get_block_df('vooo')
         
         # Handle vovo, voov if needed. Removing if unused. 
-        # eris.vovo = get_block_df('vovo') # Unused
+        eris.vovo = get_block_df('vovo') # Unused
         # eris.voov = get_block_df('voov') # Unused?
         
         eris.vvvv = None
@@ -421,30 +425,52 @@ def _update_amps(cc, t1, t2, eris):
 
 
     mem_host = cc.max_memory * 1e6
-    blksize = max(4, int(mem_host / (nocc*nvir*nvir*8)))
-    blksize = min(nvir, blksize)
+    # Handle ovvv contributions - branch based on array type
+    if isinstance(eris.ovvv, np.ndarray):
+        # In-memory path: compute t1new ovvv terms and tmp_a/tmp_b
+        # Lvv, Wvoov, Wvovo are computed by imd.* calls later
+        eris_ovvv = np.asarray(eris.ovvv)
+        t1new += 2*lib.einsum('kdac,ikcd->ia', eris_ovvv, t2)
+        t1new +=  -lib.einsum('kcad,ikcd->ia', eris_ovvv, t2)
+        t1new += 2*lib.einsum('kdac,kd,ic->ia', eris_ovvv, t1, t1)
+        t1new +=  -lib.einsum('kcad,kd,ic->ia', eris_ovvv, t1, t1)
+        
+        # tmp_a, tmp_b for t2new (still needed, not in imd)
+        tmp_a = lib.einsum('kdac,ijcd->kaij', eris_ovvv, tau)
+        tmp_b = lib.einsum('kcbd,ijcd->kbij', eris_ovvv, tau)
+    else:
+        # HDF5 blocked loop path
+        blksize = max(4, int(mem_host / (nocc*nvir*nvir*8)))
+        blksize = min(nvir, blksize)
+        logger.debug("    Starting ovvv loop (blksize=%d)", blksize)
+        t_loop = time.perf_counter()
+        for p0 in range(0, nvir, blksize):
+            p1 = min(p0 + blksize, nvir)
+            _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
+        logger.debug("    ovvv loop done in %.3f s", time.perf_counter()-t_loop)
 
-    logger.debug("    Starting ovvv loop (blksize=%d)", blksize)
-    t_loop = time.perf_counter()
-    for p0 in range(0, nvir, blksize):
-        p1 = min(p0 + blksize, nvir)
-        _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
-    logger.debug("    ovvv loop done in %.3f s", time.perf_counter()-t_loop)
-
-    
     t2new = np.zeros_like(t2)
     
-    # Blocked tmp2 calculation (for vovv)
-    mem_host = cc.max_memory * 1e6
-    blksize_t2 = max(4, int(mem_host / (nvir*nocc*nvir*8)))
-    blksize_t2 = min(nvir, blksize_t2)
-    
-    logger.debug("    Starting vovv loop (blksize=%d)", blksize_t2)
-    t_loop = time.perf_counter()
-    for p0 in range(0, nvir, blksize_t2):
-        p1 = min(p0 + blksize_t2, nvir)
-        _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1)
-    logger.debug("    vovv loop done in %.3f s", time.perf_counter()-t_loop)
+    # Handle vovv contributions - branch based on array type
+    if isinstance(eris.vovv, np.ndarray):
+        # In-memory path (matches working code)
+        tmp2  = lib.einsum('kibc,ka->abic', eris_oovv, -t1)
+        tmp2 += np.asarray(eris.vovv).transpose(0, 2, 1, 3)
+        tmp = lib.einsum('abic,jc->ijab', tmp2, t1)
+        t2new = tmp + tmp.transpose(1,0,3,2)
+    else:
+        # HDF5 blocked loop path
+        mem_host = cc.max_memory * 1e6
+        blksize_t2 = max(4, int(mem_host / (nvir*nocc*nvir*8)))
+        blksize_t2 = min(nvir, blksize_t2)
+        logger.debug("    Starting vovv loop (blksize=%d)", blksize_t2)
+        t_loop = time.perf_counter()
+        for p0 in range(0, nvir, blksize_t2):
+            p1 = min(p0 + blksize_t2, nvir)
+            _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1)
+        # Symmetrize the accumulated t2new from vovv blocks
+        t2new = t2new + t2new.transpose(1, 0, 3, 2)    
+        logger.debug("    vovv loop done in %.3f s", time.perf_counter()-t_loop)
 
 
     tmp2  = lib.einsum('kcai,jc->akij', eris_ovvo, t1)
@@ -452,16 +478,23 @@ def _update_amps(cc, t1, t2, eris):
     tmp = lib.einsum('akij,kb->ijab', tmp2, t1)
 
     t2new -= tmp + tmp.transpose(1,0,3,2)
-    t2new += np.asarray(eris.ovov).transpose(0, 2, 1, 3)
+    t2new += np.asarray(eris.vovo).transpose(1,3,0,2)
     logger.debug("    t2new basic terms done in %.3f s", time.perf_counter()-t_start)
 
     # Add W loops
     Loo = imd.Loo(t1, t2, eris)
     Loo[np.diag_indices(nocc)] -= mo_e_o
-    Lvv[np.diag_indices(nvir)] -= mo_e_v # Lvv computed in loop
-
+    
+    # Lvv, Wvoov, Wvovo depend on ovvv - use imd for in-memory, or already-computed for blocked
+    if isinstance(eris.ovvv, np.ndarray):
+        # In-memory: use imd functions (which internally handle ovvv)
+        Lvv = imd.Lvv(t1, t2, eris)
+        Wvoov = imd.cc_Wvoov(t1, t2, eris)
+        Wvovo = imd.cc_Wvovo(t1, t2, eris)
+    # else: Lvv, Wvoov, Wvovo were already computed incrementally in the blocked loop
+    
+    Lvv[np.diag_indices(nvir)] -= mo_e_v
     Woooo = imd.cc_Woooo(t1, t2, eris)
-    # Wvoov, Wvovo computed in loop
 
     t2new += lib.einsum('klij,klab->ijab', Woooo, tau)
     t_vvvv = time.perf_counter()
@@ -517,58 +550,82 @@ def _get_slice(dset, sl, axis=0):
     return dset
 
 def _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b, p0, p1):
-    """Process a chunk of ovvv block for amplitude updates."""
-    # ovvv_blk: (k, c, a_blk, d) - sliced along 'a' (axis 2)
+    """Process a chunk of ovvv block for amplitude updates.
+    
+    ovvv indexing: (k, d, a, c) with shape (nocc, nvir, nvir, nvir).
+    We slice along axis 2 ('a') to get ovvv_blk with shape (nocc, nvir, blk, nvir).
+    
+    Key PySCF formulas from rintermediates.py:
+    - t1new: 2*einsum('kdac,ikcd->ia') - einsum('kcad,ikcd->ia')
+    - Lvv:   2*einsum('kdac,kd->ac') - einsum('kcad,kd->ac')  
+    - Wvoov: einsum('kcad,id->akic')
+    - Wvovo: einsum('kdac,id->akci')
+    - tmp_a: einsum('kdac,ijcd->kaij')  
+    - tmp_b: einsum('kcbd,ijcd->kbij')
+    """
+    # ovvv_blk: (k, d, a_blk, c) - sliced along 'a' (axis 2)
     logger.debug("    _process_ovvv_block chunk %d:%d", p0, p1)
     t0 = time.perf_counter()
-    ovvv_blk = _get_slice(eris.ovvv, slice(p0, p1), axis=2)
+    ovvv_blk = _get_slice(eris.ovvv, slice(p0, p1), axis=2)  # (nocc, nvir, blk, nvir)
     
     # 1. Update t1new (ia)
+    # PySCF: 2*einsum('kdac,ikcd->ia') - einsum('kcad,ikcd->ia')
+    # First term: contract k,d (axes 0,1) with t2's i,k,c,d -> output (i, a_blk)
     t1new[:, p0:p1] += 2*lib.einsum('kdac,ikcd->ia', ovvv_blk, t2)
+    # Second term: 'kcad' means axis1='c', axis3='d', contract k,d with t2's k,d 
     t1new[:, p0:p1] +=  -lib.einsum('kcad,ikcd->ia', ovvv_blk, t2)
+
     t1new[:, p0:p1] += 2*lib.einsum('kdac,kd,ic->ia', ovvv_blk, t1, t1)
     t1new[:, p0:p1] +=  -lib.einsum('kcad,kd,ic->ia', ovvv_blk, t1, t1)
 
     # 2. Update Lvv (ac)
-    term1 = lib.einsum('kcad,kd->ca', ovvv_blk, t1)
-    Lvv[p0:p1, :] += 2 * term1.T
-    
-    term2 = lib.einsum('kcad,kd->ca', ovvv_blk, t1)
-    Lvv[p0:p1, :] -= term2.T
+    # PySCF: 2*einsum('kdac,kd->ac') - einsum('kcad,kd->ac')
+    Lvv[p0:p1, :] += 2*lib.einsum('kdac,kd->ac', ovvv_blk, t1)
+    Lvv[p0:p1, :] -=   lib.einsum('kcad,kd->ac', ovvv_blk, t1)
 
     # 3. Update Wvoov (akic)
-    # (k, c, a, d) with id -> (k, c, a, i). Transpose to (a, k, i, c)
-    w_term = lib.einsum('kcad,id->kcai', ovvv_blk, t1)
-    Wvoov[p0:p1, :, :, :] += w_term.transpose(2, 0, 3, 1)
+    # PySCF: einsum('kcad,id->akic')
+    Wvoov[p0:p1, :, :, :] += lib.einsum('kcad,id->akic', ovvv_blk, t1)
 
     # 4. Update Wvovo (akci)
-    # (k, c, a, d) with ic -> (k, a, d, i). Transpose to (a, k, c, i) block-wise
-    w_term2 = lib.einsum('kcad,ic->kadi', ovvv_blk, t1) 
-    Wvovo[p0:p1, :, :, :] += w_term2.transpose(1, 0, 2, 3) 
+    # PySCF: einsum('kdac,id->akci')
+    Wvovo[p0:p1, :, :, :] += lib.einsum('kdac,id->akci', ovvv_blk, t1)
     
     # 5. Update tmp_a (kaij) for t2new
-    tmp_a[:, p0:p1, :, :] += lib.einsum('kcad,ijdc->kaij', ovvv_blk, tau) 
+    # PySCF: einsum('kdac,ijcd->kaij')
+    tmp_a[:, p0:p1, :, :] += lib.einsum('kdac,ijcd->kaij', ovvv_blk, tau) 
     
     # 6. Update tmp_b (kbij) for t2new
-    tmp_b[:, p0:p1, :, :] += lib.einsum('kcad,ijcd->kaij', ovvv_blk, tau)
+    # PySCF: einsum('kcbd,ijcd->kbij') - iterates over 'b', not 'a'
+    # When we slice ovvv along 'a', we get contributions to tmp_b[:, a_blk, :, :]
+    # But tmp_b is indexed by 'b'. The mapping is: 'kcbd' with ovvv (k,d,a,c) means
+    # k=axis0, c=axis1, b=axis2 (which is our 'a'), d=axis3 (which is our 'c')
+    # So we're computing contributions to tmp_b[:, p0:p1, :, :] 
+    tmp_b[:, p0:p1, :, :] += lib.einsum('kcbd,ijcd->kbij', ovvv_blk, tau)
     logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1):
     """Process a chunk of vovv block for t2 updates."""
-    # (c_blk, k, a, d)
+    # vovv shape is (a, i, b, c) - slice along axis 0 (a)
     logger.debug("    _process_vovv_block chunk %d:%d", p0, p1)
     t0 = time.perf_counter()
-    vovv_slice = _get_slice(eris.vovv, slice(p0, p1), axis=0) 
+    vovv_slice = _get_slice(eris.vovv, slice(p0, p1), axis=0)  # (a_blk, i, b, c)
     
-    t1_slice = t1[:, p0:p1] # (k, a_blk)
+    # For tmp2 = -oovv.ka + vovv, we need the contribution for a in [p0:p1]
+    # oovv is (k, i, b, c), t1 is (k, a)
+    # einsum('kibc,ka->abic') with t1[:, p0:p1] gives (a_blk, b, i, c)
+    t1_slice = t1[:, p0:p1]  # (k, a_blk)
     tmp2_blk = lib.einsum('kibc,ka->abic', eris_oovv, -t1_slice)
     
-    # Transpose logic: (c, a, k, d) -> (a_blk, b, i, c)
-    tmp2_blk += vovv_slice.transpose(0, 2, 1, 3) 
+    # vovv_slice is (a_blk, i, b, c), transpose to (a_blk, b, i, c)
+    tmp2_blk += vovv_slice.transpose(0, 2, 1, 3)
     
+    # Contract: tmp2(a_blk, b, i, c) * t1(j, c) -> (a_blk, b, i, j) -> transpose to (i, j, a_blk, b)
     term = lib.einsum('abic,jc->ijab', tmp2_blk, t1)
-    t2new[:, :, p0:p1, :] = term
-    t2new[:, :, :, p0:p1] += term.transpose(1, 0, 3, 2)
+    
+    # Only add to the a_blk slice, symmetrization will be handled by the caller
+    t2new[:, :, p0:p1, :] += term
+
     logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
@@ -632,9 +689,9 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
              mem_host = eris.max_memory * 1e6
              blksize = min(nvir, max(4, int(mem_host/((nocc*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
-                 Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)
-                 std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
-                 std_blk = std_blk.transpose(1, 0, 2, 3)
+                 Lvo_slice = Lvo_reshaped[:, p0:p1, :]  # (L, a_blk, k)
+                 # tensordot contracts L: (L, a_blk, k) x (b, c, L) -> (a_blk, k, b, c)
+                 std_blk = np.tensordot(Lvo_slice, L_vv_full, axes=((0), (2)))
                  
                  ranges = (slice(nocc+p0, nocc+p1), slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
                  tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
