@@ -27,7 +27,7 @@ class TestXTCCCSD_DF(unittest.TestCase):
         
         # DF-HF
         # Use matching auxbasis
-        self.mf_df = scf.RHF(self.mol).density_fit(auxbasis='cc-pvdz-jkfit').run()
+        self.mf_df = scf.RHF(self.mol).density_fit(auxbasis='cc-pvtz-jkfit').run()
         
         # Jastrow 
         self.jastrow = rexp.REXP()
@@ -105,7 +105,7 @@ class TestXTCCCSD_DF(unittest.TestCase):
         cc_ref = xtc_ccsd.RCCSD(self.mf_std, self.xtc_obj, self.jastrow_params)
         e_ref = cc_ref.kernel()[0]
         
-        self.assertLess(abs(e_df - e_ref), 1e-4)
+        self.assertLess(abs(e_df - e_ref), 1e-5)
 
     def test_df_hermitian_limit(self):
         """Test that DF-CCSD with large alpha (Hermitian limit) matches standard RCCSD.
@@ -120,7 +120,7 @@ class TestXTCCCSD_DF(unittest.TestCase):
         # Create ISDF-XTC with large alpha
         # Note: We must regenerate isdf for new jastrow params? 
         # isdf() method handles this. But we need base ISDFXTC object.
-        isdf_alpha = self.isdf_xtc.isdf(large_alpha_params)
+        isdf_alpha = self.isdf_xtc.isdf(large_alpha_params, save_path="isdf_df_xtc_ccsd_test_large_alpha.h5")
         
         # Run DF-CCSD (uses blocked path for ovvv/vovv)
         print("Running DF XTC-CCSD with large alpha...")
@@ -148,13 +148,15 @@ class TestXTCCCSD_DF(unittest.TestCase):
         print(f"Energy Difference (Hermitian Limit): {error}")
         
         # The error will include DF approximation error if DF is used
-        self.assertLess(error, 3e-3, "Hermitian limit agreement failed for DF path")
+        self.assertLess(error, 1e-5, "Hermitian limit agreement failed for DF path")
 
     def tearDown(self):
         if os.path.exists("isdf_df_xtc_ccsd_test.h5"):
             os.remove("isdf_df_xtc_ccsd_test.h5")
         if os.path.exists("isdf_api_test.h5"):
             os.remove("isdf_api_test.h5")
+        if os.path.exists("isdf_df_xtc_ccsd_test_large_alpha.h5"):
+            os.remove("isdf_df_xtc_ccsd_test_large_alpha.h5")
 
 
 

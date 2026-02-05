@@ -361,6 +361,8 @@ def _update_amps(cc, t1, t2, eris):
     logger.debug("    imd Foo, Fvv, Fov done in %.3f s", time.perf_counter()-t0)
 
     Foo[np.diag_indices(nocc)] -= mo_e_o
+    # Keep an unshifted copy of Fvv for Lvv initialization
+    Fvv_unshifted = Fvv.copy()
     Fvv[np.diag_indices(nvir)] -= mo_e_v
 
     # T1 equation - terms not involving ovvv
@@ -392,8 +394,8 @@ def _update_amps(cc, t1, t2, eris):
     Wvovo = np.zeros((nvir, nocc, nvir, nocc))
     
     # Lvv: (a, c) -> (nvir, nvir)
-    # Initialize with non-ovvv terms
-    Lvv = Fvv - np.einsum('kc,ka->ac', fov, t1)
+    # Initialize with non-ovvv terms (using unshifted Fvv)
+    Lvv = Fvv_unshifted - np.einsum('kc,ka->ac', fov, t1)
     
     # tmp_a: (k, a, i, j) -> (nocc, nvir, nocc, nocc)
     tmp_a = np.zeros((nocc, nvir, nocc, nocc))
@@ -474,7 +476,7 @@ def _update_amps(cc, t1, t2, eris):
 
 
     tmp2  = lib.einsum('kcai,jc->akij', eris_ovvo, t1)
-    tmp2 += np.asarray(eris.vooo).transpose(0, 3, 1, 2) 
+    tmp2 += np.asarray(eris.vooo).transpose(0, 2, 1, 3)
     tmp = lib.einsum('akij,kb->ijab', tmp2, t1)
 
     t2new -= tmp + tmp.transpose(1,0,3,2)
@@ -689,10 +691,9 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
              mem_host = eris.max_memory * 1e6
              blksize = min(nvir, max(4, int(mem_host/((nocc*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
-                 Lvo_slice = Lvo_reshaped[:, p0:p1, :]  # (L, a_blk, k)
-                 # tensordot contracts L: (L, a_blk, k) x (b, c, L) -> (a_blk, k, b, c)
-                 std_blk = np.tensordot(Lvo_slice, L_vv_full, axes=((0), (2)))
-                 
-                 ranges = (slice(nocc+p0, nocc+p1), slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
-                 tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
-                 ds[p0:p1, :, :, :] = std_blk + tc_blk
+                Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)
+                std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
+                std_blk = std_blk.transpose(1, 0, 2, 3) 
+                ranges = (slice(nocc+p0, nocc+p1), slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
+                tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+                ds[p0:p1, :, :, :] = std_blk + tc_blk

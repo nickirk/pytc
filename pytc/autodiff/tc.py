@@ -874,7 +874,7 @@ class ISDFTC(TC):
                 
         logger.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
         
-        return self.replace(isdf_kernels=kernels)
+        return self.replace(isdf_kernels=kernels, save_path=out_path)
 
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):

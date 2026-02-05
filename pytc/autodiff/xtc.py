@@ -587,17 +587,20 @@ class ISDFXTC(XTC, ISDFTC):
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
+        # Use save_path if provided, otherwise use self.save_path
+        out_path = save_path if save_path else self.save_path
+        
         # 1. Compute TC kernels (K1, K3, L_aux) using base class
-        isdf_tc = super().isdf(jastrow_params, save_path=self.save_path, batch_size=batch_size, host_grid_block_size=host_grid_block_size)
+        isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size, host_grid_block_size=host_grid_block_size)
         kernels = isdf_tc.isdf_kernels
         
         # 2. Compute Delta U kernels (D, X) with orbital batching
         # Check if D and X already exist in HDF5
-        if self.save_path and os.path.exists(self.save_path):
+        if out_path and os.path.exists(out_path):
             try:
-                f = h5py.File(self.save_path, 'r')
+                f = h5py.File(out_path, 'r')
                 if 'D' in f and 'X' in f:
-                    logger.info(f"  Found existing D and X in {self.save_path}. Reading from file...")
+                    logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
                     kernels['D'] = f['D'][:]
                     if self.is_incore:
                         kernels['X'] = f['X'][:]
@@ -609,16 +612,16 @@ class ISDFXTC(XTC, ISDFTC):
                         kernels['X'] = f['X'][:]
                         f.close()
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    return self.replace(isdf_kernels=kernels)
+                    return self.replace(isdf_kernels=kernels, save_path=out_path)
                 f.close()
             except (IOError, KeyError) as e:
-                logger.warning(f"  Error reading Delta U kernels from {self.save_path}: {e}. Recomputing...")
+                logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
 
         # Pass L_aux to avoid redundant calculation
         delta_u_kernels = self.compute_delta_u_kernels(
             jastrow_params, batch_size, L_aux=kernels.get('L_aux'),
             orb_block_size=orb_block_size,
-            save_path=self.save_path,
+            save_path=out_path,
             host_grid_block_size=host_grid_block_size
         )
         kernels.update(delta_u_kernels)
@@ -628,16 +631,16 @@ class ISDFXTC(XTC, ISDFTC):
         if 'L_aux' in kernels:
             del kernels['L_aux']
         
-        # Persistence for other kernels (phi_isdf, etc.) if save_path provided
-        if save_path:
-            with h5py.File(save_path, 'a') as f:
+        # Persistence for other kernels (phi_isdf, etc.) if out_path provided
+        if out_path:
+            with h5py.File(out_path, 'a') as f:
                 if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
                 
         logger.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
         
-        return self.replace(isdf_kernels=kernels)
+        return self.replace(isdf_kernels=kernels, save_path=out_path)
 
     def compute_delta_u_kernels(self, jastrow_params, batch_size=1000, L_aux=None, orb_block_size=128, save_path=None, host_grid_block_size=None):
         """Compute D, X kernels for Delta U with orbital and grid batching."""
