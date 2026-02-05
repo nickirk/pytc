@@ -25,13 +25,50 @@ class RCCSD(rccsd.RCCSD):
             self.max_memory = getattr(mf, 'max_memory', 4000)
 
     def ao2mo(self, mo_coeff=None):
-        return _make_xtc_eris(self, mo_coeff)
+        mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
+        eris = _make_xtc_eris(self, mo_coeff)
+        self.e_hf = self.get_e_hf(eris)
+        return eris
         
     def update_amps(self, t1, t2, eris):
         return _update_amps(self, t1, t2, eris)
 
     def energy(self, t1=None, t2=None, eris=None):
         return _energy(self, t1, t2, eris)
+
+    def energy_tot(self, t1=None, t2=None, eris=None):
+        return self.get_e_hf(eris) + self.energy(t1, t2, eris)
+
+    def get_e_hf(self, eris=None):
+        if eris is None:
+             return self._scf.e_tot
+        
+        no = self.nocc
+        fock = eris.fock
+        # E_hf = 2*sum_i F_ii - 2*sum_ij (ii|jj) + sum_ij (ij|ji) + E_core
+        e_hf = 2*np.einsum('ii->', fock[:no,:no])
+        if hasattr(eris, 'oooo'):
+            oooo = np.asarray(eris.oooo)
+            e_hf -= 2*np.einsum('iijj ->', oooo)
+            e_hf += np.einsum('ijji ->', oooo)
+        
+        e_hf += getattr(eris, 'e_core', 0)
+        
+        return e_hf.real
+
+    def _finalize(self):
+        if self.converged:
+            lib.logger.info(self, '%s converged', self.__class__.__name__)
+        else:
+            lib.logger.note(self, '%s not converged', self.__class__.__name__)
+        
+        lib.logger.note(self, 'E(%s) = %.16g  E_corr = %.16g',
+                    self.__class__.__name__, self.e_tot, self.e_corr)
+        return self
+
+    @property
+    def e_tot(self):
+        return self.e_hf + self.e_corr
     
     def density_fit(self, auxbasis=None, with_df=None, n_rank_xtc=None, with_isdf_xtc=None, **kwargs):
         '''
@@ -131,6 +168,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
 
     
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
+    eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections only
     h2e_pqii_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(None), slice(0, nocc), slice(0, nocc))))
     h2e_piiq_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(0, nocc), slice(0, nocc), slice(None))))
