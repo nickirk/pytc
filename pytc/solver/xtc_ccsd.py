@@ -123,7 +123,7 @@ class RCCSD(rccsd.RCCSD):
                  if self.jastrow_params is not None:
                      new_cc.xtc_obj = new_cc.xtc_obj.isdf(self.jastrow_params)
             else:
-                 logger.warn("xtc_obj is already ISDFXTC, but n_rank_xtc provided. Ignoring n_rank_xtc re-decomposition for now to avoid complexity.")
+                 logger.warning("xtc_obj is already ISDFXTC, but n_rank_xtc provided. Ignoring n_rank_xtc re-decomposition for now to avoid complexity.")
         
         return new_cc
 
@@ -137,6 +137,8 @@ class _ChemistsERIs(rccsd._ChemistsERIs):
         self.jastrow_params = None
         self.max_memory = 4000
         self.gpu_max_memory = 4000
+        if not hasattr(self, '_keys'):
+            self._keys = set()
         self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'max_memory', 'gpu_max_memory'])
 
 def _make_xtc_eris(cc, mo_coeff=None):
@@ -168,7 +170,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
     nocc = eris.nocc
     nmo = eris.fock.shape[0]
     nvir = nmo - nocc
-    mo_o = mo_coeff[:, :nocc]
+    # mo_o removed as unused
     
     # 1. Fock matrix construction 
     # Start from MF Fock matrix (diagonal in MO basis if mo_coeff are mf.mo_coeff)
@@ -274,8 +276,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.ooov = get_block_df('ooov')
         eris.vooo = get_block_df('vooo')
         
-        # Handle vovo, voov if needed. Removing if unused. 
-        eris.vovo = get_block_df('vovo') # Unused
+        # Handle vovo, voov if needed.
+        eris.vovo = get_block_df('vovo') 
         # eris.voov = get_block_df('voov') # Unused?
         
         eris.vvvv = None
@@ -313,7 +315,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         
         return eris
 
-    return eris
+
 
 def _contract_vvvv_t2(cc, t2, eris, out=None):
     """Contraction of (vv|vv) with t2. Handles both materialized and block-wise cases."""
@@ -341,25 +343,33 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     blksize = max(1, int(min(mem_host, mem_gpu) / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
     
+    # Pre-unpack L_vv_full if using density fitting to avoid repeated IO/unpacking
+    with_df = getattr(cc, 'with_df', None)
+    if with_df is None and getattr(cc._scf, 'with_df', None):
+         with_df = cc._scf.with_df
+    
+    L_vv_full = None
+    if with_df is not None:
+         naux = eris.vvL.shape[1]
+         # This might be large (approx 5-10GB for 800 orbitals) but necessary for performance
+         L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
+
     for p0 in range(0, nvir, blksize):
         p1 = min(p0 + blksize, nvir)
         ranges = (slice(nocc + p0, nocc + p1), slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
         
         vvvv_block = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
         
-        with_df = getattr(cc, 'with_df', None)
-        if with_df is None and getattr(cc._scf, 'with_df', None):
-             with_df = cc._scf.with_df
-
         logger.debug("    Contraction block %d:%d", p0, p1)
         t0 = time.perf_counter()
         if with_df is not None:
-             naux = eris.vvL.shape[1]
-             L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
-             
+             # L_vv_full is (nvir, nvir, naux)
+             # Slicing along axis 0 corresponds to 'a' index in L_ab (L|ab) -> unpacked to (a, b, L)
              L_ab_sub = L_vv_full[p0:p1]
-             std_block = np.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
+             
+             # Contract (a_blk, d, L) with (c, d, L) on L (axis 2) -> (a_blk, d, c, d)
              # std_block shape is (blk, nvir, nvir, nvir)
+             std_block = np.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
              
              vvvv_block = vvvv_block + std_block
              
@@ -372,6 +382,9 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         vvvv_trans = vvvv_block.transpose(0, 2, 1, 3)
         out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_trans, t2)
         logger.debug("    Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    
+    if L_vv_full is not None:
+        del L_vv_full
         
     return out
 
@@ -399,8 +412,6 @@ def _update_amps(cc, t1, t2, eris):
     mo_e_v = eris.mo_energy[nocc:] + cc.level_shift
 
     fov = fock[:nocc,nocc:].copy()
-    foo = fock[:nocc,:nocc].copy()
-    fvv = fock[nocc:,nocc:].copy()
 
     # Small intermediates using PySCF logic (safe for RAM)
     t0 = time.perf_counter()
@@ -729,8 +740,9 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
              for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
                  # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
+                 # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
                  std_blk = np.tensordot(Lov_reshaped, L_vv_slice, axes=((0), (2)))
-                 std_blk = std_blk.transpose(0, 1, 2, 3) 
+                 # std_blk already (k, c, a, d)
                  
                  ranges = (slice(0, nocc), slice(nocc, nmo), slice(nocc+p0, nocc+p1), slice(nocc, nmo))
                  tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
