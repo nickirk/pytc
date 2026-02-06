@@ -4,7 +4,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import os
-from pyscf import gto, scf, lib, cc
+from pyscf import gto, scf, cc
 
 from pytc.autodiff import xtc
 from pytc.autodiff.jastrow import rexp
@@ -15,6 +15,14 @@ jax.config.update("jax_enable_x64", True)
 
 class TestXTCCCSD_DF(unittest.TestCase):
     def setUp(self):
+        # Clean up old files before running tests, since save_path does not overwrite
+        if os.path.exists("isdf_df_xtc_ccsd_test.h5"):
+            os.remove("isdf_df_xtc_ccsd_test.h5")
+        if os.path.exists("isdf_api_test.h5"):
+            os.remove("isdf_api_test.h5")
+        if os.path.exists("isdf_df_xtc_ccsd_test_large_alpha.h5"):
+            os.remove("isdf_df_xtc_ccsd_test_large_alpha.h5")
+        
         # H2O System (Same as test_xtc_ccsd.py)
         self.mol = gto.M(
             atom='O 0 0 0; H 0 1 0; H 0 0 1',

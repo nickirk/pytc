@@ -49,9 +49,9 @@ class RCCSD(rccsd.RCCSD):
 
     def get_e_hf(self, eris=None):
         if eris is None:
-             if getattr(self, 'e_hf', None) is not None:
-                 return self.e_hf
-             return self._scf.e_tot
+            if getattr(self, 'e_hf', None) is not None:
+                return self.e_hf
+            return self._scf.e_tot
         
         no = self.nocc
         fock = eris.fock
