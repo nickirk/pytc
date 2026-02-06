@@ -706,7 +706,11 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     Loo = np.empty((naux, nocc, nocc))
     Lov = np.empty((naux, nocc, nvir))
     
-    chunks = (min(nvir_pair, int(4e8/with_df.blockdim)), min(naux, with_df.blockdim))
+    # Use max_memory to estimate chunk size (approximate)
+    mem_elements = int(eris.max_memory * 1e6 / 8)
+    # Ensure reasonable lower bound for chunking (e.g. 1% of memory or at least some blocks)
+    # 4e8 in original code likely meant ~3GB. We replace it with mem_elements.
+    chunks = (min(nvir_pair, int(mem_elements/with_df.blockdim)), min(naux, with_df.blockdim))
     eris.vvL = eris.feri.create_dataset('vvL', (nvir_pair, naux), 'f8', chunks=chunks)
     
     mo = np.asarray(mo_coeff, order='F')

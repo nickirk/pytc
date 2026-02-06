@@ -77,6 +77,10 @@ class TestXTCCCSD_DF(unittest.TestCase):
         # DF error should be reasonable (e.g. < 1e-4 Ha for cc-pvdz/jkfit)
         # Note: we are only DF-ing the standard part. The XTC part is exact (grid based).
         self.assertLess(error, 1e-4, "DF-CCSD energy deviates too much from Exact-CCSD")
+        
+        # Cleanup
+        if hasattr(eris_df, 'feri'):
+            eris_df.feri.close()
 
     def test_density_fit_method(self):
         print("\n--- Testing .density_fit() API ---")
@@ -106,6 +110,10 @@ class TestXTCCCSD_DF(unittest.TestCase):
         e_ref = cc_ref.kernel()[0]
         
         self.assertLess(abs(e_df - e_ref), 1e-5)
+        
+        # Cleanup
+        if hasattr(eris, 'feri'):
+            eris.feri.close()
 
     def test_df_hermitian_limit(self):
         """Test that DF-CCSD with large alpha (Hermitian limit) matches standard RCCSD.
@@ -149,6 +157,10 @@ class TestXTCCCSD_DF(unittest.TestCase):
         
         # The error will include DF approximation error if DF is used
         self.assertLess(error, 1e-5, "Hermitian limit agreement failed for DF path")
+        
+        # Cleanup
+        if hasattr(eris_df, 'feri'):
+            eris_df.feri.close()
 
     def tearDown(self):
         if os.path.exists("isdf_df_xtc_ccsd_test.h5"):
