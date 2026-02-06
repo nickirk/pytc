@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""
-    def __init__(self, mf, xtc_obj, jastrow_params, **kwargs):
+    def __init__(self, mf, xtc_obj=None, jastrow_params=None, **kwargs):
         self.gpu_max_memory = kwargs.pop('gpu_max_memory', 4000)
         max_memory = kwargs.pop('max_memory', None)
         rccsd.RCCSD.__init__(self, mf, **kwargs)
@@ -23,6 +23,8 @@ class RCCSD(rccsd.RCCSD):
             self.max_memory = max_memory
         if getattr(self, 'max_memory', None) is None:
             self.max_memory = getattr(mf, 'max_memory', 4000)
+            
+        self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'gpu_max_memory'])
 
     def ao2mo(self, mo_coeff=None):
         mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
@@ -135,6 +137,7 @@ class _ChemistsERIs(rccsd._ChemistsERIs):
         self.jastrow_params = None
         self.max_memory = 4000
         self.gpu_max_memory = 4000
+        self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'max_memory', 'gpu_max_memory'])
 
 def _make_xtc_eris(cc, mo_coeff=None):
     if mo_coeff is None:
