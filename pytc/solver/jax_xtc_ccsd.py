@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from pyscf import lib
 from pyscf import ao2mo
-from pyscf.ao2mo import _ao2mo
 
 from pytc.solver import xtc_ccsd
 from pytc.autodiff.xtc import XTC, ISDFXTC
