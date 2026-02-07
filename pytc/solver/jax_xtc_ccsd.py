@@ -197,17 +197,22 @@ def _update_amps(cc, t1, t2, eris):
     eris_oooo = jnp.asarray(eris.oooo)
     eris_vooo = jnp.asarray(eris.vooo)
     eris_vovo = jnp.asarray(eris.vovo)
+    logger.debug(f"    Data transfer to GPU took {time.perf_counter()-t_start:.4f} s")
+    t_kernels = time.perf_counter()
     
     # 2. Compute intermediates (Micro-Kernels)
     # These return JAX arrays on GPU
     Fov = _jax_cc_Fov(t1_jax, fock_jax, eris_ovov)
     Foo = _jax_cc_Foo(t1_jax, t2_jax, fock_jax, eris_ovov)
     Fvv = _jax_cc_Fvv(t1_jax, t2_jax, fock_jax, eris_ovov)
+    logger.debug(f"    Micro-kernels (Foo/Fov/Fvv) took {time.perf_counter()-t_kernels:.4f} s")
     
     Foo_shifted = Foo.at[jnp.diag_indices(nocc)].add(-mo_e_o)
     Fvv_shifted = Fvv.at[jnp.diag_indices(nvir)].add(-mo_e_v)
     # Keep unshifted Fvv for Lvv
     Fvv_unshifted = Fvv
+    jax.block_until_ready([Foo_shifted, Fvv_shifted])
+    logger.debug(f"    Micro-kernels (Foo/Fov/Fvv) and shift took {time.perf_counter()-t_kernels:.4f} s")
     
     size_W = nvir * nocc * nocc * nvir * 8
     size_tmp = nocc * nvir * nocc * nocc * 8
@@ -218,6 +223,7 @@ def _update_amps(cc, t1, t2, eris):
     available_mem = 0
     try:
         stats = jax.devices()[0].memory_stats()
+        logger.debug(f"    Raw GPU stats: {stats}")
         # available = limit - in_use. Leave 20% buffer.
         available_mem = stats['bytes_reservable_limit'] - stats['bytes_in_use']
         use_gpu_acc = (available_mem * 0.8) > total_acc_mem
@@ -295,8 +301,18 @@ def _update_amps(cc, t1, t2, eris):
     t1new_jax -=  2 * jnp.einsum('lcki,lc,ka->ia', eris_ovoo, t1_jax, t1_jax)
     t1new_jax +=      jnp.einsum('kcli,lc,ka->ia', eris_ovoo, t1_jax, t1_jax)
     
+    t_comp = time.perf_counter()
+    t1new_jax.block_until_ready()
+    t_comp_dur = time.perf_counter() - t_comp
+    
+    t_trans = time.perf_counter()
     t1new_host += np.asarray(t1new_jax) # Move T1 partial to host
+    t_trans_dur = time.perf_counter() - t_trans
+    
     del t1new_jax # Free GPU memory
+    logger.debug(f"    T1 core updates: Comp {t_comp_dur:.4f}s, Host accum {t_trans_dur:.4f}s")
+    
+    t_ovvv = time.perf_counter()
     
     # Tau: (O, O, V, V) needs to be on GPU for optimal contraction
     tau_jax = t2_jax + jnp.einsum('ia,jb->ijab', t1_jax, t1_jax)
@@ -345,15 +361,26 @@ def _update_amps(cc, t1, t2, eris):
                 Wvovo_acc = Wvovo_acc.at[p0:p1].add(Wvovo_blk)
                 tmp_a_acc = tmp_a_acc.at[:, p0:p1].add(tmp_a_blk)
                 tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
+                tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
+                
             else:
+                t0_comp = time.perf_counter()
+                # Ensure JAX arrays are ready
+                jax.block_until_ready([t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk])
+                t_comp_blk = time.perf_counter() - t0_comp
+                
+                t0_trans = time.perf_counter()
                 # Accumulate on Host
                 Lvv_acc[p0:p1, :] += np.asarray(Lvv_blk)
                 Wvoov_acc[p0:p1] += np.asarray(Wvoov_blk)
                 Wvovo_acc[p0:p1] += np.asarray(Wvovo_blk)
                 tmp_a_acc[:, p0:p1] += np.asarray(tmp_a_blk)
                 tmp_b_acc[:, p0:p1] += np.asarray(tmp_b_blk)
+                t_trans_blk = time.perf_counter() - t0_trans
+                logger.debug(f"      OVVV block {p0}:{p1}: Comp {t_comp_blk:.4f}s, Host accum {t_trans_blk:.4f}s")
             
             del ovvv_blk_jax, t1_upd, Lvv_blk
+    t_t2 = time.perf_counter()
             
     # --- T2 Updates ---
     t2new_jax = jnp.zeros_like(t2_jax) 
@@ -375,13 +402,21 @@ def _update_amps(cc, t1, t2, eris):
             vovv_slice_jax = jnp.asarray(vovv_slice)
             t1_slice_jax = t1_jax[:, p0:p1]
             
+            t0_comp = time.perf_counter()
             term = kernel_process_vovv_block(vovv_slice_jax, eris_oovv, t1_slice_jax, t1_jax)
+            term.block_until_ready()
+            t_comp = time.perf_counter() - t0_comp
+            
+            t0_trans = time.perf_counter()
             t2new_host[:, :, p0:p1, :] += np.asarray(term)
+            t_trans = time.perf_counter() - t0_trans
+            logger.debug(f"      VOVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
         
         t2new_host = t2new_host + t2new_host.transpose(1, 0, 3, 2)
         
     t2new_host += np.asarray(t2new_jax)
     del t2new_jax
+    logger.debug(f"    T2 core updates (VOVV) took {time.perf_counter()-t_t2:.4f} s")
     
     # --- Output Preparation ---
     
@@ -473,7 +508,9 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
 
     mem_host = cc.max_memory * 1e6
     try:
-        mem_gpu = jax.devices()[0].memory_stats()['bytes_reservable_limit']
+        stats = jax.devices()[0].memory_stats()
+        logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
+        mem_gpu = stats['bytes_reservable_limit']
     except:
         mem_gpu = cc.gpu_max_memory * 1e6
         
@@ -486,6 +523,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     # Let's say we can use 40% of GPU memory for the block
     blksize = max(1, int((avail_gpu * 0.4) / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
+    logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
 
     with_df = getattr(cc, 'with_df', None)
     if with_df is None and getattr(cc._scf, 'with_df', None):
@@ -507,7 +545,9 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         p1 = min(p0 + blksize, nvir)
         ranges = (slice(nocc + p0, nocc + p1), slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
         
+        t_get_2b = time.perf_counter()
         vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
+        logger.debug(f"      get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
         L_ab_sub_jax = L_vv_full_jax[p0:p1] if with_df is not None else None
         
         if with_df is None:
@@ -515,8 +555,15 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
              std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
              vvvv_block_jax = vvvv_block_jax + jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
              
+        t0_comp = time.perf_counter()
         term = contract_block_kernel(t2_jax, vvvv_block_jax, L_ab_sub_jax, L_vv_full_jax)
+        term.block_until_ready()
+        t_comp = time.perf_counter() - t0_comp
+        
+        t0_trans = time.perf_counter()
         t2new_host[:, :, p0:p1, :] += np.asarray(term)
+        t_trans = time.perf_counter() - t0_trans
+        logger.debug(f"      VVVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
     
     if L_vv_full_jax is not None:
         del L_vv_full_jax
