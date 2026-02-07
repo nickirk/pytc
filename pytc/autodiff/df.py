@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
                                    phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray,
                                    rcond: float = 1e-14) -> jnp.ndarray:
-    """Fast solver using SVD-based pseudoinverse for structured least-squares.
+    """Fast solver using LU decomposition for structured least-squares.
     
     Solves min ||C*X - B||² where:
       C[pq, m] = phi_piv_p[p, m] * phi_piv_q[q, m]
@@ -30,7 +30,7 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
         phi_piv_q: (n_orb, n_fused) second factor of pivots
         phi_p_batch: (n_orb, batch_size) first factor of target
         phi_q_batch: (n_orb, batch_size) second factor of target
-        rcond: Relative condition number cutoff for SVD (default 1e-14)
+        rcond: Relative regularization strength (default 1e-14)
         
     Returns:
         X: (n_fused, batch_size) solutions
@@ -41,24 +41,20 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
     ATA = gram_p * gram_q  # Element-wise product
     
     # Compute A^T B efficiently using separable structure
-    # term_p[m, g] = sum_p phi_piv_p[p, m] * phi_p_batch[p, g]
     term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)  # (n_fused, batch_size)
-    
-    # term_q[m, g] = sum_q phi_piv_q[q, m] * phi_q_batch[q, g]
     term_q = jnp.matmul(phi_piv_q.T, phi_q_batch)  # (n_fused, batch_size)
-    
     ATB = term_p * term_q  # (n_fused, batch_size)
     
-    # Use SVD for numerically stable pseudoinverse
-    U, s, Vt = jnp.linalg.svd(ATA, full_matrices=False)
-    
-    # Compute inverse singular values with cutoff
-    s_inv = jnp.where(s > rcond * s[0], 1.0 / s, 0.0)
-    
-    # Solve: X = V @ diag(s_inv) @ U.T @ ATB
-    X = Vt.T @ (s_inv[:, None] * (U.T @ ATB))
+    # Use LU solve (jnp.linalg.solve) with Tikhonov regularization
+    diag_mean = jnp.mean(jnp.diag(ATA))
+    jitter = diag_mean * rcond
+    ATA_reg = ATA + jitter * jnp.eye(ATA.shape[0])
+    X = jnp.linalg.solve(ATA_reg, ATB)
     
     return X
+
+
+solve_normal_equations_batch = jax.jit(solve_normal_equations_batch, static_argnames=['rcond'])
 
 
 @partial(jax.jit, static_argnames=('n_rank',))
@@ -151,7 +147,7 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
 
 
 def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
-                   use_iterative=True, grid_batch_size=4096, rcond=1e-14,
+                   grid_batch_size=4096, rcond=1e-14,
                    is_incore=False, save_path=None):
     """Perform ISDF decomposition of orbitals and their gradients.
     
@@ -165,8 +161,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         n_rank_grad: Rank for gradient decomposition
         weights: Optional (n_grid,) array of integration weights. 
                  If provided, pivot selection is weighted by these weights.
-        use_iterative: If True, use memory-efficient solver (recommended).
-                      If False, use direct solve with materialized C matrices (HIGH MEMORY).
         grid_batch_size: Number of grid points to process in each batch
         rcond: Relative condition number cutoff for SVD pseudoinverse (default 1e-14).
                Smaller values retain more singular values (more accurate but less stable).
@@ -264,147 +258,83 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     logger.debug(f"Pivot values extracted in {t1 - t0:.4f} s")
     
     # --- 5. Solve for xi_phi and xi_grad using fast normal equations solver ---
-    if use_iterative:
-        t0 = time.perf_counter()
-        logger.info("Using fast normal equations solver")
-        
-        # Solve for xi_phi and xi_grad
-        cpu_device = jax.devices("cpu")[0]
-        grid_batch_size = min(grid_batch_size, n_grid)
-        n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size if grid_batch_size > 0 else 0
-        
-        # Setup storage
-        h5_file = None
-        if is_incore:
-            logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
-            xi_phi_storage = np.zeros((n_fused, n_grid), dtype=phi.dtype)
-            xi_grad_storage = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
-        else:
-            if save_path is None:
-                save_path = f"isdf_temp_{uuid.uuid4().hex[:8]}.h5"
-                logger.info(f"  No save_path provided, creating temporary HDF5: {save_path}")
-            
-            h5_file = h5py.File(save_path, 'a')
-            logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
-            
-            # Create/Reset datasets
-            for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
-                if name in h5_file: del h5_file[name]
-                h5_file.create_dataset(name, shape=shape, dtype=phi.dtype)
-            
-            # Store metadata
-            for name, data in [('pivots', pivots), ('phi_isdf', phi_piv), ('grad_phi_isdf', grad_phi_piv)]:
-                if name in h5_file: del h5_file[name]
-                h5_file.create_dataset(name, data=np.array(data))
-            
-            xi_phi_storage = h5_file['xi_phi']
-            xi_grad_storage = h5_file['xi_grad']
+    t0 = time.perf_counter()
+    logger.info("Using fast normal equations solver")
 
-        try:
-            t_batch_start = time.perf_counter()
-            for batch_idx in range(n_batches):
-                g_start = batch_idx * grid_batch_size
-                g_end = min(g_start + grid_batch_size, n_grid)
-                
-                # 1. Xi_phi
-                phi_batch = phi[:, g_start:g_end]
-                xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, 
-                                                          phi_batch, phi_batch, rcond=rcond)
-                xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
-                
-                # 2. Xi_grad
-                for c in range(3):
-                    grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
-                    xi_grad_batch = solve_normal_equations_batch(grad_phi_piv[:, :, c], phi_piv,
-                                                                 grad_phi_batch_c, phi_batch, rcond=rcond)
-                    xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
-                
-                if batch_idx % 4 == 0 and batch_idx > 0:
-                    elapsed = time.perf_counter() - t_batch_start
-                    rate = batch_idx / elapsed
-                    eta = (n_batches - batch_idx) / rate if rate > 0 else 0
-                    logger.debug(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
+    # Solve for xi_phi and xi_grad
+    cpu_device = jax.devices("cpu")[0]
+    grid_batch_size = min(grid_batch_size, n_grid)
+    n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size if grid_batch_size > 0 else 0
+    
+    # Setup storage
+    h5_file = None
+    if is_incore:
+        logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
+        xi_phi_storage = np.zeros((n_fused, n_grid), dtype=phi.dtype)
+        xi_grad_storage = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
+    else:
+        if save_path is None:
+            save_path = f"isdf_temp_{uuid.uuid4().hex[:8]}.h5"
+            logger.info(f"  No save_path provided, creating temporary HDF5: {save_path}")
+        
+        h5_file = h5py.File(save_path, 'a')
+        logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
+        
+        # Create/Reset datasets
+        for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
+            if name in h5_file: del h5_file[name]
+            h5_file.create_dataset(name, shape=shape, dtype=phi.dtype)
+        
+        # Store metadata
+        for name, data in [('pivots', pivots), ('phi_isdf', phi_piv), ('grad_phi_isdf', grad_phi_piv)]:
+            if name in h5_file: del h5_file[name]
+            h5_file.create_dataset(name, data=np.array(data))
+        
+        xi_phi_storage = h5_file['xi_phi']
+        xi_grad_storage = h5_file['xi_grad']
+
+    try:
+        t_batch_start = time.perf_counter()
+        for batch_idx in range(n_batches):
+            g_start = batch_idx * grid_batch_size
+            g_end = min(g_start + grid_batch_size, n_grid)
             
-            # Load into JAX CPU RAM if requested
-            if is_incore:
-                xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
-                xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
-            else:
-                xi_phi = None
-                xi_grad = None
+            # 1. Xi_phi
+            phi_batch = phi[:, g_start:g_end]
+            xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, 
+                                    phi_batch, phi_batch, rcond=rcond)
+            xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
             
-            # Explicitly delete storage to save RAM
-            if is_incore:
-                del xi_phi_storage, xi_grad_storage
-                gc.collect()
+            # 2. Xi_grad
+            for c in range(3):
+                grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
+                xi_grad_batch = solve_normal_equations_batch(grad_phi_piv[:, :, c], phi_piv,
+                                         grad_phi_batch_c, phi_batch, rcond=rcond)
+                xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
             
-        finally:
-            if h5_file is not None:
-                h5_file.close()
+            if batch_idx % 4 == 0 and batch_idx > 0:
+                elapsed = time.perf_counter() - t_batch_start
+                rate = batch_idx / elapsed
+                eta = (n_batches - batch_idx) / rate if rate > 0 else 0
+                logger.debug(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
+        
+        # Load into JAX CPU RAM if requested
+        if is_incore:
+            xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
+            xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
+        else:
+            xi_phi = None
+            xi_grad = None
+        
+        # Explicitly delete storage to save RAM
+        if is_incore:
+            del xi_phi_storage, xi_grad_storage
             gc.collect()
         
-    else:
-        # --- OLD METHOD: Direct solve with materialized C matrices ---
-        t0 = time.perf_counter()
-        logger.warning("Using direct solver (HIGH MEMORY!)")
-        
-        # Construct C matrices (MEMORY INTENSIVE!)
-        C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, n_fused)
-        C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, n_fused, 3)
-        
-        # Pre-compute pseudo-inverses for least squares
-        C_phi_pinv = jnp.linalg.pinv(C_phi)
-        C_grad_pinv = jnp.stack([jnp.linalg.pinv(C_grad[:, :, c]) for c in range(3)], axis=0)
-        
-        t1 = time.perf_counter()
-        logger.debug(f"C matrices and pinv constructed in {t1 - t0:.4f} s")
-        
-        # Solve for xi_phi and xi_grad (Block-wise Least Squares)
-        t0 = time.perf_counter()
-        
-        batch_size = grid_batch_size
-        n_batches = (n_grid + batch_size - 1) // batch_size
-        
-        def solve_batch(batch_idx):
-            start = batch_idx * batch_size
-            end = jnp.minimum(start + batch_size, n_grid)
-            width = end - start
-            
-            # 1. Solve xi_phi
-            phi_batch = jax.lax.dynamic_slice(phi, (0, start), (n_orb, width))
-            phi_paired_batch = jnp.einsum('pi,qi->pqi', phi_batch, phi_batch).reshape(-1, width)
-            
-            # Solve C_phi * xi = phi_paired_batch using pre-computed pinv
-            xi_phi_batch = C_phi_pinv @ phi_paired_batch
-            
-            # 2. Solve xi_grad
-            grad_phi_batch = jax.lax.dynamic_slice(grad_phi, (0, start, 0), (n_orb, width, 3))
-            
-            xi_grad_batch_list = []
-            for c in range(3):
-                # Construct grad_phi_paired_batch for component c
-                grad_phi_paired_c = jnp.einsum('pi,qi->pqi', grad_phi_batch[:, :, c], phi_batch).reshape(-1, width)
-                
-                # Solve C_grad[..., c] * xi = grad_phi_paired_c using pre-computed pinv
-                xi_c = C_grad_pinv[c] @ grad_phi_paired_c
-                xi_grad_batch_list.append(xi_c)
-                
-            xi_grad_batch = jnp.stack(xi_grad_batch_list, axis=-1) # (k, width, 3)
-            
-            return xi_phi_batch, xi_grad_batch, width
-
-        xi_phi_list = []
-        xi_grad_list = []
-        
-        for i in range(n_batches):
-            xi_p, xi_g, w = solve_batch(i)
-            xi_phi_list.append(xi_p)
-            xi_grad_list.append(xi_g)
-            
-        xi_phi = jnp.concatenate(xi_phi_list, axis=1)
-        xi_grad = jnp.concatenate(xi_grad_list, axis=1)
-        t1 = time.perf_counter()
-        logger.debug(f"Xi solved in {t1 - t0:.4f} s")
+    finally:
+        if h5_file is not None:
+            h5_file.close()
+        gc.collect()
     
     total_time = time.perf_counter() - start_time
     logger.debug(f"Total fused ranks = {n_fused}")
