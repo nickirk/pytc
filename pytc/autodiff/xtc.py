@@ -987,14 +987,40 @@ class ISDFXTC(XTC, ISDFTC):
         
         n_batches = padded_size // batch_size
         
-        # Helper: compute X @ L_Q @ L_Q.T using two-step matmul (O(N_rank × n_orb) instead of O(N_rank²))
-        def apply_Q(X):
-            """Apply Q = L_Q @ L_Q.T to X via two matmuls: (X @ L_Q) @ L_Q.T"""
-            # X: (batch, Nr, N_rank), L_Q: (N_rank, n_orb)
-            # Step 1: (batch, Nr, N_rank) @ (N_rank, n_orb) -> (batch, Nr, n_orb)
-            tmp = jnp.einsum('bra,ao->bro', X, L_Q)
-            # Step 2: (batch, Nr, n_orb) @ (n_orb, N_rank) -> (batch, Nr, N_rank)
-            return jnp.einsum('bro,ao->bra', tmp, L_Q)
+        # Helper: compute P = (phi * vec_T) @ L_Q using chunking over Rank to avoid OOM
+        def compute_proj(phi, vec_T, L_Q, chunk_size=2048):
+            """Compute P[b,r,o] = sum_a phi[r,a] * vec_T[b,a] * L_Q[a,o]"""
+            Ns = phi.shape[0]
+            Nb = vec_T.shape[0]
+            No = L_Q.shape[1]
+            Na = L_Q.shape[0]
+            
+            num_chunks = (Na + chunk_size - 1) // chunk_size
+            
+            # Pad dimensions to be multiples of chunk_size
+            pad_len = num_chunks * chunk_size - Na
+            if pad_len > 0:
+                phi_p = jnp.pad(phi, ((0,0), (0, pad_len)))
+                vec_p = jnp.pad(vec_T, ((0,0), (0, pad_len)))
+                lq_p = jnp.pad(L_Q, ((0, pad_len), (0,0)))
+            else:
+                phi_p, vec_p, lq_p = phi, vec_T, L_Q
+                
+            def body_fn(carry, i):
+                start = i * chunk_size
+                p_c = jax.lax.dynamic_slice(phi_p, (0, start), (Ns, chunk_size))
+                v_c = jax.lax.dynamic_slice(vec_p, (0, start), (Nb, chunk_size))
+                l_c = jax.lax.dynamic_slice(lq_p, (start, 0), (chunk_size, No))
+                
+                # (batch, Nr, chunk) * (chunk, n_orb) -> (batch, Nr, n_orb)
+                # v_c[:, None, :] broadcasts to (batch, 1, chunk)
+                # p_c[None, :, :] broadcasts to (1, Nr, chunk)
+                # product is (batch, Nr, chunk)
+                term = jnp.matmul(p_c[None, :, :] * v_c[:, None, :], l_c)
+                return carry + term, None
+            
+            res, _ = jax.lax.scan(body_fn, jnp.zeros((Nb, Ns, No)), jnp.arange(num_chunks))
+            return res
 
         def scan_X(X_acc, i_batch):
             w_batch = jax.lax.dynamic_slice(weights_padded, (i_batch * batch_size,), (batch_size,))
@@ -1003,32 +1029,41 @@ class ISDFXTC(XTC, ISDFTC):
             
             xi_T = xi_batch.T  # (batch, N_rank)
             
-            # Precompute k-independent terms ONCE per batch (these don't depend on G_k)
-            phi_s_xi = phi_s[None, :, :] * xi_T[:, None, :]  # (batch, Ns, N_rank)
-            phi_r_xi = phi_r[None, :, :] * xi_T[:, None, :]  # (batch, Nr, N_rank)
-            tmp_r_xi_Q = apply_Q(phi_r_xi)  # O(batch × Nr × N_rank × n_orb)
+            # Precompute projections for xi (phi_s_xi and phi_r_xi terms)
+            # P_s_xi = (phi_s * xi) @ L_Q -> (batch, Ns, N_orb)
+            P_s_xi = compute_proj(phi_s, xi_T, L_Q)
+            P_r_xi = compute_proj(phi_r, xi_T, L_Q)
             
-            # Loop over k to avoid 4D tensor materialization (saves 3x VRAM)
+            # Loop over k (x,y,z components)
             for k in range(3):
                 G_k_T = G_batch[:, :, k].T  # (batch, N_rank)
                 
-                # phi_r_G: (batch, Nr, N_rank)
-                phi_r_G = phi_r[None, :, :] * G_k_T[:, None, :]
-                tmp_r_G_Q = apply_Q(phi_r_G)  # O(batch × Nr × N_rank × n_orb)
+                # Projections for G_k
+                P_r_G = compute_proj(phi_r, G_k_T, L_Q)
+                P_s_G = compute_proj(phi_s, G_k_T, L_Q)
                 
-                # phi_s_G: (batch, Ns, N_rank)
-                phi_s_G = phi_s[None, :, :] * G_k_T[:, None, :]
+                # Reconstruct X contributions using low-rank outer products
+                # Original: YZ_k = (phi_r_G_Q) @ (phi_s_G).T = (P_r_G @ L_Q.T) @ (P_s_G @ L_Q.T).T
+                # Wait, original was: YZ_k = einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_G)
+                # where tmp_r_G_Q = (phi_r * G) @ L_Q @ L_Q.T = P_r_G @ L_Q.T
+                # and phi_s_G = phi_s * G
+                # So YZ_k = (P_r_G @ L_Q.T) @ (phi_s * G).T
+                #         = P_r_G @ ( (phi_s * G) @ L_Q ).T
+                #         = P_r_G @ P_s_G.T
                 
-                # X2: (brs * w).T @ xi_T -> (Nr, Ns, N_rank)
-                YZ_k = jnp.einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_G)
+                # X2: YZ_k = P_r_G @ P_s_G.T
+                # einsum('bro,bso->brs', P_r_G, P_s_G)
+                YZ_k = jnp.matmul(P_r_G, P_s_G.transpose(0, 2, 1))
                 X_acc = X_acc + jnp.matmul((YZ_k * w_batch[:, None, None]).transpose(1, 2, 0), xi_T)
                 
-                # X3_1
-                M_k = jnp.einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_xi)
+                # X3_1: M_k = (P_r_G @ L_Q.T) @ (phi_s * xi).T
+                #           = P_r_G @ P_s_xi.T
+                M_k = jnp.matmul(P_r_G, P_s_xi.transpose(0, 2, 1))
                 X_acc = X_acc + jnp.matmul((M_k * w_batch[:, None, None]).transpose(1, 2, 0), G_k_T)
                 
-                # X3_2
-                N_k = jnp.einsum('bra,bsa->brs', tmp_r_xi_Q, phi_s_G)
+                # X3_2: N_k = (P_r_xi @ L_Q.T) @ (phi_s * G).T
+                #           = P_r_xi @ P_s_G.T
+                N_k = jnp.matmul(P_r_xi, P_s_G.transpose(0, 2, 1))
                 X_acc = X_acc + jnp.matmul((N_k * w_batch[:, None, None]).transpose(1, 2, 0), G_k_T)
             
             return X_acc, None
