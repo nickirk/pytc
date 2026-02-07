@@ -410,15 +410,19 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
     N_fused = U1.shape[0]
     
-    def process_component(tmp_accum, c):
-        # C_grad_c: (Np, Nq, N_fused) - only one component at a time
-        C_grad_c = jnp.einsum('pk,qk->pqk', grad_phi_p[:, :, c], phi_q)
-        # Contract with U1[:, :, c]: (Np, Nq, N_fused) @ (N_fused, N_fused) -> (Np, Nq, N_fused)
-        tmp_c = jnp.einsum('pqk,kl->pql', C_grad_c, U1[:, :, c])
-        return tmp_accum + tmp_c, None
     
-    tmp_init = jnp.zeros((Np, Nq, N_fused))
-    tmp, _ = jax.lax.scan(process_component, tmp_init, jnp.arange(3))
+    # Unroll the loop over 3 components to help XLA fusion
+    # Component 0 (x)
+    C_grad_0 = jnp.einsum('pk,qk->pqk', grad_phi_p[:, :, 0], phi_q)
+    tmp = jnp.einsum('pqk,kl->pql', C_grad_0, U1[:, :, 0])
+    
+    # Component 1 (y)
+    C_grad_1 = jnp.einsum('pk,qk->pqk', grad_phi_p[:, :, 1], phi_q)
+    tmp = tmp + jnp.einsum('pqk,kl->pql', C_grad_1, U1[:, :, 1])
+    
+    # Component 2 (z)
+    C_grad_2 = jnp.einsum('pk,qk->pqk', grad_phi_p[:, :, 2], phi_q)
+    tmp = tmp + jnp.einsum('pqk,kl->pql', C_grad_2, U1[:, :, 2])
     
     return jnp.einsum('pql,rsl->pqrs', tmp, C_phi)
 
