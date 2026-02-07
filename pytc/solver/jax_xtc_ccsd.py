@@ -547,13 +547,32 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         
         t_get_2b = time.perf_counter()
         vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
+        # Force block to see true computation time if it returns JAX array
+        if hasattr(vvvv_block_jax, 'block_until_ready'):
+            vvvv_block_jax.block_until_ready()
         logger.debug(f"      get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
+        
         L_ab_sub_jax = L_vv_full_jax[p0:p1] if with_df is not None else None
         
         if with_df is None:
+             t_ao2mo = time.perf_counter()
              mo_v = cc.mo_coeff[:, nocc:]
+             # CPU-bound standard integral calculation
              std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-             vvvv_block_jax = vvvv_block_jax + jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
+             logger.debug(f"      ao2mo (std integrals) took {time.perf_counter()-t_ao2mo:.4f} s")
+             
+             t_transfer = time.perf_counter()
+             std_jax = jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
+             # Ensure transfer is complete before proceeding
+             if hasattr(std_jax, 'block_until_ready'):
+                 std_jax.block_until_ready()
+             logger.debug(f"      Host->Device transfer of std integrals took {time.perf_counter()-t_transfer:.4f} s")
+             
+             t_add = time.perf_counter()
+             vvvv_block_jax = vvvv_block_jax + std_jax
+             if hasattr(vvvv_block_jax, 'block_until_ready'):
+                 vvvv_block_jax.block_until_ready()
+             logger.debug(f"      Element-wise addition (vvvv + std) took {time.perf_counter()-t_add:.4f} s")
              
         t0_comp = time.perf_counter()
         term = contract_block_kernel(t2_jax, vvvv_block_jax, L_ab_sub_jax, L_vv_full_jax)
