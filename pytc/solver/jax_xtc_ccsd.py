@@ -510,7 +510,9 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     try:
         stats = jax.devices()[0].memory_stats()
         logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
-        mem_gpu = stats['bytes_reservable_limit']
+        # Use (limit - in_use) to get actual free space, 
+        # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
+        mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
     except:
         mem_gpu = cc.gpu_max_memory * 1e6
         
@@ -519,9 +521,8 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     # Approx: blk * nvir^3 * 8
     # Reserve 20%
     avail_gpu = mem_gpu * 0.8
-    # Approximate current usage (t2, etc.) - simple heuristic
-    # Let's say we can use 40% of GPU memory for the block
-    blksize = max(1, int((avail_gpu * 0.4) / (nvir**3 * 8)))
+    # Use 80% of available free memory for the block (since we already subtracted usage)
+    blksize = max(1, int((avail_gpu * 0.8) / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
     logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
 
