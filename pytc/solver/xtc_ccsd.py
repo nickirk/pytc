@@ -742,7 +742,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
         
         if name == 'ovvv': # (k, c, a, d) - iterate 'a' (idx 2)
              mem_host = eris.max_memory * 1e6
-             blksize = min(nvir, max(4, int(mem_host/((nocc*nvir)*8))))
+             blksize = min(nvir, max(4, int(mem_host/((nocc*nvir*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
                  # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
@@ -756,7 +756,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
 
         elif name == 'vovv': # (c, k, a, d) - iterate 'c' (idx 0)
              mem_host = eris.max_memory * 1e6
-             blksize = min(nvir, max(4, int(mem_host/((nocc*nvir)*8))))
+             blksize = min(nvir, max(4, int(mem_host/((nocc*nvir*nvir)*8))))
              for p0, p1 in lib.prange(0, nvir, blksize):
                 Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)
                 std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
