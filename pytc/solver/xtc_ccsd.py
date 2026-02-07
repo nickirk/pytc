@@ -290,10 +290,12 @@ def _make_xtc_eris(cc, mo_coeff=None):
 
     else:
         # --- Standard Path (ao2mo) --- 
+        logger.info("Using standard ao2mo for Coulomb integrals")
         eri_std_full = ao2mo.kernel(cc.mol, mo_coeff, compact=False, aosym='s1', intor='int2e')
         eri_std_full = eri_std_full.reshape(nmo, nmo, nmo, nmo)
         
         def get_block(block_str):
+            logger.debug(f"    Computing block {block_str} for xtc")
             tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
             slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
             return eri_std_full[tuple(slices)] + tc_part
