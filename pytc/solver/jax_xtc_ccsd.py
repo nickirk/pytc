@@ -1,14 +1,12 @@
 import logging
 import time
 import numpy as np
-from functools import reduce
 import jax
 import jax.numpy as jnp
 from pyscf import lib
 from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
-from pytc.autodiff.xtc import XTC, ISDFXTC
 
 # JAX config
 jax.config.update("jax_enable_x64", True)
@@ -226,7 +224,7 @@ def _update_amps(cc, t1, t2, eris):
         # available = limit - in_use. Leave 20% buffer.
         available_mem = stats['bytes_reservable_limit'] - stats['bytes_in_use']
         use_gpu_acc = (available_mem * 0.8) > total_acc_mem
-    except:
+    except Exception:
         # Fallback if stats not available (e.g. CPU or some backends)
         use_gpu_acc = False
         
@@ -359,7 +357,6 @@ def _update_amps(cc, t1, t2, eris):
                 Wvoov_acc = Wvoov_acc.at[p0:p1].add(Wvoov_blk)
                 Wvovo_acc = Wvovo_acc.at[p0:p1].add(Wvovo_blk)
                 tmp_a_acc = tmp_a_acc.at[:, p0:p1].add(tmp_a_blk)
-                tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
                 tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
                 
             else:
@@ -512,7 +509,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         # Use (limit - in_use) to get actual free space, 
         # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
         mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-    except:
+    except Exception:
         mem_gpu = cc.gpu_max_memory * 1e6
         
     # Adaptive block size based on VRAM
@@ -521,7 +518,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     # Reserve 20%
     avail_gpu = mem_gpu * 0.8
     # Use 80% of available free memory for the block (since we already subtracted usage)
-    blksize = max(1, int((avail_gpu * 0.8) / (nvir**3 * 8)))
+    blksize = max(1, int((avail_gpu * 0.4) / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
     logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
 

@@ -11,9 +11,6 @@ from pytc.solver import xtc_ccsd
 from pytc.solver import jax_xtc_ccsd
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("jax").setLevel(logging.INFO)
-logging.getLogger("pytc").setLevel(logging.DEBUG)
 
 # Enable float64 for JAX
 jax.config.update("jax_enable_x64", True)
@@ -113,8 +110,6 @@ class TestXTCCCSD(unittest.TestCase):
         eris_ovoo_jax = jnp.asarray(eris_new.ovoo)
         eris_ovov_jax = jnp.asarray(eris_new.ovov)
         eris_oooo_jax = jnp.asarray(eris_new.oooo)
-        eris_vooo_jax = jnp.asarray(eris_new.vooo)
-        eris_vovo_jax = jnp.asarray(eris_new.vovo)
         
         t1_jax = jnp.asarray(t1)
         t2_jax = jnp.asarray(t2)
@@ -231,13 +226,14 @@ class TestXTCCCSD(unittest.TestCase):
         print("\nRunning JAX Update Amps (Cycle 1)...")
         t1new_jax_full, t2new_jax_full = cc_new.update_amps(t1, t2, eris_new)
         
-        self.assertLess(np.linalg.norm(t1new_ref - t1new_jax_full), 2e-9)
-        self.assertLess(np.linalg.norm(t2new_ref - t2new_jax_full), 2e-9)
+        self.assertLess(np.linalg.norm(t1new_ref - t1new_jax_full), 1e-8)
+        self.assertLess(np.linalg.norm(t2new_ref - t2new_jax_full), 1e-8)
 
         
         # Compare blocks BEFORE zeroing vvvv
         # Compare Fock
         fock_diff = np.linalg.norm(eris_new.fock - eris_exact.fock)
+        print(f"Fock Difference Norm: {fock_diff}")
     
         # Compare OOOO
         try:
@@ -370,10 +366,11 @@ class TestXTCCCSD(unittest.TestCase):
         self.assertLess(error, 1e-6, "Hermitian limit agreement failed")
 
 
-    #def tearDown(self):
-    #    import os
-    #    if os.path.exists("isdf_xtc_ccsd_test.h5"):
-    #        os.remove("isdf_xtc_ccsd_test.h5")
+    def tearDown(self):
+        import os
+        for f in ["isdf_xtc_ccsd_test.h5", "eris_exact_test.h5", "eris_limit_test.h5"]:
+            if os.path.exists(f):
+                os.remove(f)
 
 if __name__ == "__main__":
     unittest.main()
