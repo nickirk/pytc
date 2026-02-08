@@ -1098,6 +1098,145 @@ class ISDFXTC(XTC, ISDFTC):
         
         return term_d + term_x
 
+    def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=256,batch_size=1000):
+        """Get or compute delta_h using ISDF kernels efficiently.
+        
+        Evaluates $\delta h_{pq} = \sum_{rs} (2 \Delta U_{pqrs} - \Delta U_{psrq}) \gamma_{rs}$
+        directly from ISDF kernels D and X.
+        
+        Note on Symmetry:
+        $\Delta U_{pqrs} = - (R_{pqrs} + R_{rspq})$ where $R_{pqrs} = (\phi_p \phi_q | \text{kernel} | \phi_r \phi_s)$.
+        Term 1 (J-like): $2 \sum \Delta U_{pqrs} \gamma_{rs} = -2 (J + J_{sym})$.
+        Term 2 (K-like): $\sum \Delta U_{psrq} \gamma_{rs} = - (K + K_{sym})$.
+        $\delta h = -0.5 * (Term 1 - Term 2) = (J + J_{sym}) - 0.5 (K + K_{sym})$.
+        
+        $J$ involves $R_{pqrs}$, $J_{sym}$ involves $R_{rspq}$.
+        $K$ involves $R_{psrq}$, $K_{sym}$ involves $R_{rqps}$.
+        """
+        logger.debug("Starting ISDFXTC.get_delta_h")
+        start_time = time.perf_counter()
+        
+        if dm1 is None:
+            dm1 = self._get_mf_dm()
+            
+        # Ensure kernels are available
+        if self.isdf_kernels is None:
+             logger.warning("ISDF kernels missing in get_delta_h. Computing on-the-fly.")
+             kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
+        else:
+             kernels = self.isdf_kernels
+             
+        D = kernels['D']
+        X = kernels['X']
+        phi = self.phi_isdf
+        
+        slice_p = slice(None)
+        slice_q = slice(None)
+        if ranges is not None:
+             slice_p, slice_q = ranges[0], ranges[1]
+             
+        # Precompute common intermediates
+        # Gb = sum_{rs} phi_rb phi_sb dm_rs
+        Gb = jnp.einsum('rb,sb,rs->b', phi, phi, dm1)
+        
+        # P_phi = sum_{rs} phi_sa dm_rs phi_rb = (phi.T @ dm1 @ phi)
+        P_phi = jnp.linalg.multi_dot([phi.T, dm1, phi])
+        
+        # phi_tilde = dm1 @ phi
+        phi_tilde = jnp.dot(dm1, phi)
+        
+        # wc = sum_{rs} X_rsc dm_rs
+        # Y_all = sum_r X_rqc phi_tilde_rc
+        
+        # Check if X is HDF5 dataset
+        is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File)) # or checking attribute?
+        # A file object wouldn't be passed, but let's be safe.
+        # Actually kernels['X'] is dataset or array.
+        
+        wc = jnp.zeros((phi.shape[1],)) # (N_rank,)
+        Y_all = jnp.zeros((self.n_orb, phi.shape[1])) # (N_orb, N_rank)
+        
+        if is_hdf5:
+            # Process strictly in chunks to respect memory
+            # For J_X_sym, we need X[p,q] which is a slice. If slice is small, h5py handles it.
+            # But for Y_all and wc, we need full contraction.
+            logger.debug("  Streaming X in chunks from HDF5")
+            chunk_size = orb_block_size # Adjust based on memory
+            for i in range(0, self.n_orb, chunk_size):
+                logger.debug(f"  Processing chunk {i}/{self.n_orb}")
+                sl = slice(i, min(i+chunk_size, self.n_orb))
+                X_chunk = X[sl] # (chunk, N, N_rank) -> Numpy array
+                
+                # Update wc
+                # wc += sum_{r_chunk, s} X[r,s,c] * dm1[r,s]
+                # dm1 slice: dm1[sl, :]
+                wc += jnp.einsum('rsc,rs->c', X_chunk, dm1[sl])
+                
+                # Update Y_all
+                # Y_all[q, c] += sum_{r_chunk} X[r,q,c] * phi_tilde[r,c]
+                # phi_tilde slice: phi_tilde[sl]
+                Y_all += jnp.einsum('rqc,rc->qc', X_chunk, phi_tilde[sl])
+                
+        else:
+            # In-memory array
+            wc = jnp.einsum('rsc,rs->c', X, dm1)
+            Y_all = jnp.einsum('rqc,rc->qc', X, phi_tilde)
+        
+        # Sliced inputs
+        phi_p = phi[slice_p]
+        phi_q = phi[slice_q]
+        Y_p = Y_all[slice_p]
+        Y_q = Y_all[slice_q]
+        
+        # J terms
+        # J_D from R_{pqrs}: sum_{ad} phi_pa phi_qa D_{ad} G_d
+        # J_D_sym from R_{rspq}: sum_{ad} phi_pa phi_qa D_{da} G_d = sum_{ad} phi_pa phi_qa D.T_{ad} G_d
+        # Total J_D contrib: phi_p * ((D + D.T) @ G) * phi_q
+        D_sym = D + D.T
+        tmp_a = jnp.dot(D_sym, Gb)
+        J_D_total = jnp.dot(phi_p * tmp_a[None, :], phi_q.T)
+        
+        # J_X: - sum phi_p phi_q w_c
+        J_X = - jnp.dot(phi_p * wc[None, :], phi_q.T)
+        
+        # J_X_sym: - sum X_pq G_c
+        # Need X[p, q]
+        if is_hdf5:
+            # If slices are full, this might be big. But usually p,q are ranges (blocks).
+            # H5py slicing returns numpy array.
+            X_pq = X[slice_p, slice_q] 
+        else:
+            X_pq = X[slice_p, slice_q]
+            
+        J_X_sym = - jnp.einsum('pqc,c->pq', X_pq, Gb)
+        
+        # J_total = J_D_total + J_X + J_X_sym
+        J_total = J_D_total + J_X + J_X_sym
+        
+        # K terms
+        # K_D from R_{psrq}: sum (D * P)_{ad} phi_pa phi_qd
+        # K_D_sym from R_{rqps}: sum (D * P)_{da} phi_pa phi_qd = sum (D * P).T_{ad} phi_pa phi_qd
+        # Total K_D contrib: phi_p @ (DP + DP.T) @ phi_q.T
+        DP = D * P_phi
+        DP_sym = DP + DP.T
+        K_D_total = jnp.linalg.multi_dot([phi_p, DP_sym, phi_q.T])
+        
+        # K_X_1: - sum phi_p Y_q
+        K_X_1 = - jnp.dot(phi_p, Y_q.T)
+        
+        # K_X_2: - sum Y_p phi_q
+        K_X_2 = - jnp.dot(Y_p, phi_q.T)
+        
+        # K_total = K_D_total + K_X_1 + K_X_2
+        K_total = K_D_total + K_X_1 + K_X_2
+        
+        # delta_h = J_total - 0.5 * K_total
+        delta_h = J_total - 0.5 * K_total
+        
+        total_time = time.perf_counter() - start_time
+        logger.debug(f"ISDFXTC.get_delta_h completed in {total_time:.4f} s")
+        return delta_h
+
     def _contract_delta_U_kernels(self, kernels, ranges):
         """Contract precomputed kernels to get Delta U block."""
         D = kernels['D']
