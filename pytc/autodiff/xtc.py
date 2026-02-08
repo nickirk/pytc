@@ -1098,7 +1098,10 @@ class ISDFXTC(XTC, ISDFTC):
         
         return term_d + term_x
 
-    def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=256,batch_size=1000):
+    def get_delta_h(self, jastrow_params, dm1=None, 
+                    block_str=None, ranges=None, 
+                    orb_block_size=256,
+                    batch_size=1000):
         """Get or compute delta_h using ISDF kernels efficiently.
         
         Evaluates $\delta h_{pq} = \sum_{rs} (2 \Delta U_{pqrs} - \Delta U_{psrq}) \gamma_{rs}$
@@ -1163,7 +1166,7 @@ class ISDFXTC(XTC, ISDFTC):
             logger.debug("  Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
             for i in range(0, self.n_orb, chunk_size):
-                logger.debug(f"  Processing chunk {i}/{int(self.n_orb/chunk_size)}")
+                logger.debug(f"  Processing chunk {i}, {i*chunk_size}-{i*chunk_size+chunk_size} out of {self.n_orb}")
                 sl = slice(i, min(i+chunk_size, self.n_orb))
                 X_chunk = X[sl] # (chunk, N, N_rank) -> Numpy array
                 
