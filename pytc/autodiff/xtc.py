@@ -603,12 +603,14 @@ class ISDFXTC(XTC, ISDFTC):
                     logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
                     kernels['D'] = f['D'][:]
                     if self.is_incore:
+                        logger.debug("  incore mode: Loading X into RAM")
                         kernels['X'] = f['X'][:]
                         f.close()
                     else:
                         # Stream X from file. 
                         # Return the dataset object directly. 
                         # Do NOT close 'f' here; the dataset object keeps the file open.
+                        logger.debug("  out-of-core mode: Streaming X from file")
                         kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
@@ -1161,7 +1163,7 @@ class ISDFXTC(XTC, ISDFTC):
             logger.debug("  Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
             for i in range(0, self.n_orb, chunk_size):
-                logger.debug(f"  Processing chunk {i}/{self.n_orb}")
+                logger.debug(f"  Processing chunk {i}/{int(self.n_orb/chunk_size)}")
                 sl = slice(i, min(i+chunk_size, self.n_orb))
                 X_chunk = X[sl] # (chunk, N, N_rank) -> Numpy array
                 

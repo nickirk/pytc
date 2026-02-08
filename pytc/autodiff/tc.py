@@ -826,10 +826,12 @@ class ISDFTC(TC):
                     kernels['K1_kernel'] = f['K1_kernel'][:]
                     kernels['K3_kernel'] = f['K3_kernel'][:]
                     if self.is_incore:
+                        logger.debug("  incore mode: Loading L_aux into RAM")
                         kernels['L_aux'] = f['L_aux'][:]
                         f.close()
                     else:
-                        kernels['L_aux'] = f['L_aux'][:] # Load into RAM if we want to close 'f'
+                        logger.debug("  out-of-core mode: Streaming L_aux from file")
+                        kernels['L_aux'] = f['L_aux'] 
 
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
