@@ -607,10 +607,9 @@ class ISDFXTC(XTC, ISDFTC):
                         f.close()
                     else:
                         # Stream X from file. 
-                        # To avoid OSError: "file is already open for read-only", we load into RAM for now.
-                        # In the future, we could use a single 'a' handle for the whole session.
-                        kernels['X'] = f['X'][:]
-                        f.close()
+                        # Return the dataset object directly. 
+                        # Do NOT close 'f' here; the dataset object keeps the file open.
+                        kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
                 f.close()

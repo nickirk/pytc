@@ -830,7 +830,7 @@ class ISDFTC(TC):
                         f.close()
                     else:
                         kernels['L_aux'] = f['L_aux'][:] # Load into RAM if we want to close 'f'
-                        f.close()
+
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
                 f.close()
