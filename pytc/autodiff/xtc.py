@@ -411,9 +411,9 @@ class XTC(TC):
         delta_h = -0.5 * (term1 - term2)
         return delta_h
 
-    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=256, batch_size=1000):
         """Get one-body operator correction."""
-        return self.get_delta_h(jastrow_params, dm1, block_str, ranges, batch_size)
+        return self.get_delta_h(jastrow_params, dm1, block_str, ranges, orb_block_size, batch_size)
 
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
