@@ -612,7 +612,6 @@ class ISDFXTC(XTC, ISDFTC):
                         kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
-                f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
 
