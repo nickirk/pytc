@@ -905,23 +905,22 @@ class ISDFTC(TC):
         # self.grad_phi_isdf is (Nb, N_fused, 3).
         
         # K1 term (nabla on p)
-        K1 = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
-        
-        # K3 term
-        K3 = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges)
+        result = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
         
         # K2 term (nabla on q) - transpose of K1 if symmetric
         slice_p, slice_q, slice_r, slice_s = ranges if ranges else (slice(None), slice(None), slice(None), slice(None))
         
         if slice_p == slice_q:
-            K2 = K1.transpose(1, 0, 2, 3)
+            result -= result.transpose(1, 0, 2, 3)
         else:
             # Compute K2 explicitly
             ranges_k2 = (slice_q, slice_p, slice_r, slice_s)
             K2_transposed = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_k2)
-            K2 = jax.lax.transpose(K2_transposed, (1, 0, 2, 3))
+            result -= jax.lax.transpose(K2_transposed, (1, 0, 2, 3))
             
-        result = 0.5 * (K1 - K2 + K3)
+        # K3 term
+        result += kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges)
+        result *= 0.5
         
         # Symmetrize result (add transpose block) to match TC.get_2b
         if slice_p == slice_r and slice_q == slice_s:
@@ -931,25 +930,21 @@ class ISDFTC(TC):
             # Let's match TC.get_2b logic:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             
-            # We need to compute result for ranges_T
-            # This requires re-computing K1, K2, K3 for ranges_T
-            
             # K1_T
-            K1_T = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
-            
-            # K3_T
-            K3_T = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges_T)
+            result_T = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
             
             # K2_T
             slice_p_T, slice_q_T, slice_r_T, slice_s_T = ranges_T
             if slice_p_T == slice_q_T:
-                K2_T = jax.lax.transpose(K1_T, (1, 0, 2, 3))
+                result_T -= jax.lax.transpose(result_T, (1, 0, 2, 3))
             else:
                 ranges_k2_T = (slice_q_T, slice_p_T, slice_r_T, slice_s_T)
                 K2_transposed_T = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_k2_T)
-                K2_T = jax.lax.transpose(K2_transposed_T, (1, 0, 2, 3))
+                result_T -= jax.lax.transpose(K2_transposed_T, (1, 0, 2, 3))
                 
-            result_T = 0.5 * (K1_T - K2_T + K3_T)
+            # K3_T
+            result_T += kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges_T)
+            result_T *= 0.5
             result += jax.lax.transpose(result_T, (2, 3, 0, 1))
         
         total_time = time.perf_counter() - start_time
