@@ -437,10 +437,12 @@ class XTC(TC):
         """Compute constant contribution."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
-        
+        logger.debug("Starting XTC.get_const")
+        start_time = time.perf_counter()
         delta_h = self.get_delta_h(jastrow_params, dm1)
         const = -2/3 * jnp.einsum('qp,pq->', delta_h, dm1)
         const += self.energy_nuc
+        logger.debug(f"XTC.get_const completed in {time.perf_counter() - start_time:.4f} s")
         return const
     
     def _calc_delta_h(self, delta_U, dm1=None):
@@ -1113,7 +1115,7 @@ class ISDFXTC(XTC, ISDFTC):
 
     def get_delta_h(self, jastrow_params, dm1=None, 
                     block_str=None, ranges=None, 
-                    orb_block_size=128,
+                    orb_block_size=256,
                     batch_size=1000):
         """Get or compute delta_h using ISDF kernels efficiently.
         
