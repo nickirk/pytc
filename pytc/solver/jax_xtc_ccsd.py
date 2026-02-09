@@ -319,8 +319,12 @@ def _update_amps(cc, t1, t2, eris):
 
     # --- OVVV Processing (Hybrid) ---
     mem_host = cc.max_memory * 1e6
-    gpu_mem = cc.gpu_max_memory * 1e6
-    max_mem = min(mem_host, gpu_mem) * 0.8
+    stats = jax.devices()[0].memory_stats()
+    logger.debug(f"    Raw GPU stats (contract_ovvv): {stats}")
+    # Use (limit - in_use) to get actual free space, 
+    # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
+    mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
+    max_mem = min(mem_host, mem_gpu) * 0.5
     blksize = max(4, int(max_mem / (nocc*nvir*nvir*8)))
     blksize = min(nvir, blksize)
     
@@ -349,6 +353,7 @@ def _update_amps(cc, t1, t2, eris):
             ovvv_blk = xtc_ccsd._get_slice(eris.ovvv, slice(p0, p1), axis=2)
             ovvv_blk_jax = jnp.asarray(ovvv_blk)
             
+            t0_comp = time.perf_counter()
             t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk = kernel_process_ovvv_block(
                 ovvv_blk_jax, t1_jax, t2_jax, tau_jax
             )
@@ -363,10 +368,8 @@ def _update_amps(cc, t1, t2, eris):
                 Wvovo_acc = Wvovo_acc.at[p0:p1].add(Wvovo_blk)
                 tmp_a_acc = tmp_a_acc.at[:, p0:p1].add(tmp_a_blk)
                 tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
-                tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
                 
             else:
-                t0_comp = time.perf_counter()
                 # Ensure JAX arrays are ready
                 jax.block_until_ready([t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk])
                 t_comp_blk = time.perf_counter() - t0_comp
@@ -395,7 +398,13 @@ def _update_amps(cc, t1, t2, eris):
         t2new_jax += (tmp + tmp.transpose(1, 0, 3, 2))
     else:
         mem_host = cc.max_memory * 1e6
-        blksize_t2 = max(4, int(mem_host / (nvir*nocc*nvir*8)))
+        stats = jax.devices()[0].memory_stats()
+        logger.debug(f"    Raw GPU stats (contract_vovv): {stats}")
+        # Use (limit - in_use) to get actual free space, 
+        # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
+        mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
+        max_mem = min(mem_host, mem_gpu) * 0.5
+        blksize_t2 = max(4, int(max_mem / (nvir*nocc*nvir*8)))
         blksize_t2 = min(nvir, blksize_t2)
         
         for p0 in range(0, nvir, blksize_t2):
@@ -521,10 +530,9 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     # Adaptive block size based on VRAM
     # Need to fit vvvv_block (blk*nvir^3), t2 (O^2 V^2), output (O^2 blk V).
     # Approx: blk * nvir^3 * 8
-    # Reserve 20%
-    avail_gpu = mem_gpu * 0.8
+    avail_gpu = mem_gpu * 0.5
     # Use 80% of available free memory for the block (since we already subtracted usage)
-    blksize = max(1, int((avail_gpu * 0.8) / (nvir**3 * 8)))
+    blksize = max(1, int(avail_gpu / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
     logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
 
