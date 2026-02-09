@@ -823,14 +823,16 @@ class ISDFTC(TC):
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
                     logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
+                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM")
                     kernels['K1_kernel'] = f['K1_kernel'][:]
+                    logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
                     kernels['K3_kernel'] = f['K3_kernel'][:]
                     if self.is_incore:
-                        logger.debug("  incore mode: Loading L_aux into RAM")
+                        logger.debug(f"  incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
                         kernels['L_aux'] = f['L_aux'][:]
                         f.close()
                     else:
-                        logger.debug("  out-of-core mode: Streaming L_aux from file")
+                        logger.debug(f"  out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
                         kernels['L_aux'] = f['L_aux'] 
 
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")

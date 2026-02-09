@@ -601,16 +601,17 @@ class ISDFXTC(XTC, ISDFTC):
                 f = h5py.File(out_path, 'r')
                 if 'D' in f and 'X' in f:
                     logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
+                    logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
                     kernels['D'] = f['D'][:]
                     if self.is_incore:
-                        logger.debug("  incore mode: Loading X into RAM")
+                        logger.debug("  incore mode: Loading X with shape: {f['X'].shape} on host RAM")
                         kernels['X'] = f['X'][:]
                         f.close()
                     else:
                         # Stream X from file. 
                         # Return the dataset object directly. 
                         # Do NOT close 'f' here; the dataset object keeps the file open.
-                        logger.debug("  out-of-core mode: Streaming X from file")
+                        logger.debug(f"  out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
                         kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
@@ -1100,7 +1101,7 @@ class ISDFXTC(XTC, ISDFTC):
 
     def get_delta_h(self, jastrow_params, dm1=None, 
                     block_str=None, ranges=None, 
-                    orb_block_size=256,
+                    orb_block_size=128,
                     batch_size=1000):
         """Get or compute delta_h using ISDF kernels efficiently.
         
@@ -1166,8 +1167,8 @@ class ISDFXTC(XTC, ISDFTC):
             logger.debug("  Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
             for i in range(0, self.n_orb, chunk_size):
-                logger.debug(f"  Processing chunk {i}, {i*chunk_size}-{i*chunk_size+chunk_size} out of {self.n_orb}")
                 sl = slice(i, min(i+chunk_size, self.n_orb))
+                logger.debug(f"  Processing slice {sl}")
                 X_chunk = X[sl] # (chunk, N, N_rank) -> Numpy array
                 
                 # Update wc
