@@ -319,7 +319,9 @@ def _update_amps(cc, t1, t2, eris):
 
     # --- OVVV Processing (Hybrid) ---
     mem_host = cc.max_memory * 1e6
-    blksize = max(4, int(mem_host / (nocc*nvir*nvir*8)))
+    gpu_mem = cc.gpu_max_memory * 1e6
+    max_mem = min(mem_host, gpu_mem) * 0.8
+    blksize = max(4, int(max_mem / (nocc*nvir*nvir*8)))
     blksize = min(nvir, blksize)
     
     if isinstance(eris.ovvv, np.ndarray):
