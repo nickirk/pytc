@@ -1350,7 +1350,7 @@ class ISDFXTC(XTC, ISDFTC):
         # Check size of X_sliced in GB
         try:
             stats = jax.devices()[0].memory_stats()
-            logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
+            logger.debug(f"    Raw GPU stats (_contract_delta_U_kernels): {stats}")
             # Use (limit - in_use) to get actual free space, 
             # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
             mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']

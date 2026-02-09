@@ -324,7 +324,7 @@ def _update_amps(cc, t1, t2, eris):
     mem_host = cc.max_memory * 1e6
     try:
         stats = jax.devices()[0].memory_stats()
-        logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
+        logger.debug(f"    Raw GPU stats (_update_amps, process_ovvv_block): {stats}")
         # Use (limit - in_use) to get actual free space, 
         # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
         mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
@@ -407,7 +407,7 @@ def _update_amps(cc, t1, t2, eris):
         mem_host = cc.max_memory * 1e6
         try:
             stats = jax.devices()[0].memory_stats()
-            logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
+            logger.debug(f"    Raw GPU stats (_update_amps, process_vovv_block): {stats}")
             # Use (limit - in_use) to get actual free space, 
             # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
             mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
