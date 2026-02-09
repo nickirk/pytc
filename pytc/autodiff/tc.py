@@ -303,7 +303,7 @@ class TC:
             )
             result_T = result_sum_T[0]
             
-            result += result_T.transpose(2, 3, 0, 1)
+            result += jax.lax.transpose(result_T, (2, 3, 0, 1))
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"TC.get_2b completed in {total_time:.4f} s")
@@ -919,7 +919,7 @@ class ISDFTC(TC):
             # Compute K2 explicitly
             ranges_k2 = (slice_q, slice_p, slice_r, slice_s)
             K2_transposed = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_k2)
-            K2 = K2_transposed.transpose(1, 0, 2, 3)
+            K2 = jax.lax.transpose(K2_transposed, (1, 0, 2, 3))
             
         result = 0.5 * (K1 - K2 + K3)
         
@@ -943,14 +943,14 @@ class ISDFTC(TC):
             # K2_T
             slice_p_T, slice_q_T, slice_r_T, slice_s_T = ranges_T
             if slice_p_T == slice_q_T:
-                K2_T = K1_T.transpose(1, 0, 2, 3)
+                K2_T = jax.lax.transpose(K1_T, (1, 0, 2, 3))
             else:
                 ranges_k2_T = (slice_q_T, slice_p_T, slice_r_T, slice_s_T)
                 K2_transposed_T = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_k2_T)
-                K2_T = K2_transposed_T.transpose(1, 0, 2, 3)
+                K2_T = jax.lax.transpose(K2_transposed_T, (1, 0, 2, 3))
                 
             result_T = 0.5 * (K1_T - K2_T + K3_T)
-            result += result_T.transpose(2, 3, 0, 1)
+            result += jax.lax.transpose(result_T, (2, 3, 0, 1))
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
