@@ -324,7 +324,7 @@ def _update_amps(cc, t1, t2, eris):
     # Use (limit - in_use) to get actual free space, 
     # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
     mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-    max_mem = min(mem_host, mem_gpu) * 0.5
+    max_mem = min(mem_host, mem_gpu) * 0.3
     blksize = max(4, int(max_mem / (nocc*nvir*nvir*8)))
     blksize = min(nvir, blksize)
     
@@ -403,7 +403,7 @@ def _update_amps(cc, t1, t2, eris):
         # Use (limit - in_use) to get actual free space, 
         # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
         mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-        max_mem = min(mem_host, mem_gpu) * 0.5
+        max_mem = min(mem_host, mem_gpu) * 0.3
         blksize_t2 = max(4, int(max_mem / (nvir*nocc*nvir*8)))
         blksize_t2 = min(nvir, blksize_t2)
         
@@ -530,7 +530,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     # Adaptive block size based on VRAM
     # Need to fit vvvv_block (blk*nvir^3), t2 (O^2 V^2), output (O^2 blk V).
     # Approx: blk * nvir^3 * 8
-    avail_gpu = mem_gpu * 0.5
+    avail_gpu = mem_gpu * 0.3
     # Use 80% of available free memory for the block (since we already subtracted usage)
     blksize = max(1, int(avail_gpu / (nvir**3 * 8)))
     blksize = min(nvir, blksize)
