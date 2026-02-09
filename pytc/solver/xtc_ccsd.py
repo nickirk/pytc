@@ -181,7 +181,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
 
     
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
-    eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params))
+    eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections only
     h2e_pqii_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(None), slice(0, nocc), slice(0, nocc))))
     h2e_piiq_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(0, nocc), slice(0, nocc), slice(None))))
