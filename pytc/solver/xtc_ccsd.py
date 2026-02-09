@@ -741,11 +741,18 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
         ds = getattr(eris, name)
         
         if name == 'ovvv': # (k, c, a, d) - iterate 'a' (idx 2)
-             mem_host = eris.max_memory * 1e6
-             gpu_mem = eris.gpu_max_memory * 1e6
-             max_mem = min(mem_host, gpu_mem) * 0.8
-             blksize = min(nvir, max(4, int(max_mem/((nocc*nvir*nvir)*8))))
-             for p0, p1 in lib.prange(0, nvir, blksize):
+            mem_host = eris.max_memory * 1024**2
+            try:
+                stats = jax.devices()[0].memory_stats()
+                logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
+                # Use (limit - in_use) to get actual free space, 
+                # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
+                mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
+            except:
+                mem_gpu = eris.gpu_max_memory * 1024**2
+            max_mem = min(mem_host, mem_gpu) * 0.3
+            blksize = min(nvir, max(4, int(max_mem/((nocc*nvir*nvir)*8))))
+            for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
                  # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
                  # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
@@ -757,11 +764,18 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                  ds[:, :, p0:p1, :] = std_blk + tc_blk
 
         elif name == 'vovv': # (c, k, a, d) - iterate 'c' (idx 0)
-             mem_host = eris.max_memory * 1e6
-             gpu_mem = eris.gpu_max_memory * 1e6
-             max_mem = min(mem_host, gpu_mem) * 0.8
-             blksize = min(nvir, max(4, int(max_mem/((nocc*nvir*nvir)*8))))
-             for p0, p1 in lib.prange(0, nvir, blksize):
+            mem_host = eris.max_memory * 1024**2
+            try:
+                stats = jax.devices()[0].memory_stats()
+                logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
+                # Use (limit - in_use) to get actual free space, 
+                # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
+                mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
+            except:
+                mem_gpu = eris.gpu_max_memory * 1024**2
+            max_mem = min(mem_host, mem_gpu) * 0.3
+            blksize = min(nvir, max(4, int(max_mem/((nocc*nvir*nvir)*8))))
+            for p0, p1 in lib.prange(0, nvir, blksize):
                 Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)
                 std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
                 std_blk = std_blk.transpose(1, 0, 2, 3) 
