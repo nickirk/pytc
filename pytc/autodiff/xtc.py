@@ -520,6 +520,100 @@ class XTC(TC):
         return eris
 
 
+@jax.jit
+def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
+    """JITted version of Delta U contraction."""
+    
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_rank_D = D.shape[0] 
+    N_rank_X = X_sliced.shape[2]
+    
+    rank_block_size = 128
+    
+    # Term 1 & 4: T_D = sum_{a,d} (phi_p*phi_q)_a * D[a,d] * (phi_r*phi_s)_d
+    # Scan over blocks of d (second index of D)
+    
+    # Pad D
+    padded_rank_D = ((N_rank_D + rank_block_size - 1) // rank_block_size) * rank_block_size
+    pad_width_D = padded_rank_D - N_rank_D
+    D_padded = jnp.pad(D, ((0, 0), (0, pad_width_D)))
+    
+    # Pad phi_r and phi_s (associated with index d)
+    phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width_D)))
+    phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width_D)))
+    
+    n_blocks_D = padded_rank_D // rank_block_size
+    
+    # Reshape for scan
+    # D: (N_rank, n_blocks, block) -> (n_blocks, N_rank, block)
+    D_scannable = D_padded.reshape(N_rank_D, n_blocks_D, rank_block_size).transpose(1, 0, 2)
+    # phi_r/s: (N, n_blocks, block) -> (n_blocks, N, block)
+    phi_r_scannable = phi_r_padded.reshape(Nr, n_blocks_D, rank_block_size).transpose(1, 0, 2)
+    phi_s_scannable = phi_s_padded.reshape(Ns, n_blocks_D, rank_block_size).transpose(1, 0, 2)
+
+    def scan_d_block(carry, args):
+        D_block, phi_r_block, phi_s_block = args
+        # D_block: (N_rank_D, block)
+        
+        # intermediate V[p,q,d_local] = sum_a (phi_p[p,a] * phi_q[q,a]) * D_block[a, d_local]
+        # V[p,q,d'] = sum_a phi_p[p,a] * W[a, d', q]
+        # W[a, d', q] = phi_q[q,a] * D_block[a, d']
+        W = D_block[:, :, None] * phi_q.T[:, None, :] # (a, d', 1) * (a, 1, q) -> (a, d', q)
+        W_flat = W.reshape(N_rank_D, rank_block_size * Nq)
+        
+        V_flat = jnp.matmul(phi_p, W_flat) # (p, a) @ (a, d'q) -> (p, d'q)
+        V_block = V_flat.reshape(Np, rank_block_size, Nq)
+        V_block = jnp.transpose(V_block, (0, 2, 1)) # (p, q, d')
+        
+        # C_rs[r, s, d_local]
+        C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :]
+        
+        # Contract
+        contribution = jnp.einsum('pqd,rsd->pqrs', V_block, C_rs)
+        return carry + contribution, None
+
+    term_d_init = jnp.zeros((Np, Nq, Nr, Ns))
+    term_d, _ = jax.lax.scan(scan_d_block, term_d_init, (D_scannable, phi_r_scannable, phi_s_scannable))
+    
+    # Term 2 & 3: T_X = - sum_c (phi_p*phi_q)_c * X[r,s,c]
+    # Scan over blocks of c (rank index of X)
+    
+    # Pad X
+    padded_rank_X = ((N_rank_X + rank_block_size - 1) // rank_block_size) * rank_block_size
+    pad_width_X = padded_rank_X - N_rank_X
+    # X is (Nr, Ns, c)
+    X_padded = jnp.pad(X_sliced, ((0,0), (0,0), (0, pad_width_X)))
+    
+    # Pad phi_p and phi_q (associated with index c/a)
+    phi_p_padded = jnp.pad(phi_p, ((0, 0), (0, pad_width_X)))
+    phi_q_padded = jnp.pad(phi_q, ((0, 0), (0, pad_width_X)))
+    
+    n_blocks_X = padded_rank_X // rank_block_size
+    
+    # Reshape
+    # X: (Nr, Ns, n_blocks, block) -> (n_blocks, Nr, Ns, block)
+    X_scannable = X_padded.reshape(Nr, Ns, n_blocks_X, rank_block_size).transpose(2, 0, 1, 3)
+    phi_p_scannable = phi_p_padded.reshape(Np, n_blocks_X, rank_block_size).transpose(1, 0, 2)
+    phi_q_scannable = phi_q_padded.reshape(Nq, n_blocks_X, rank_block_size).transpose(1, 0, 2)
+    
+    def scan_c_block(carry, args):
+        X_block, phi_p_block, phi_q_block = args
+        # X_block: (Nr, Ns, block)
+        
+        # C_pq[p, q, c_local]
+        C_pq = phi_p_block[:, None, :] * phi_q_block[None, :, :] # (Np, Nq, block)
+        
+        # Contract: - sum_c C_pq * X_block
+        contribution = -jnp.einsum('pqc,rsc->pqrs', C_pq, X_block)
+        return carry + contribution, None
+
+    term_x_init = jnp.zeros((Np, Nq, Nr, Ns))
+    term_x, _ = jax.lax.scan(scan_c_block, term_x_init, (X_scannable, phi_p_scannable, phi_q_scannable))
+
+    return term_d + term_x
+
+
 @struct.dataclass
 class ISDFXTC(XTC, ISDFTC):
     """JAX implementation of extended transcorrelated methods using ISDF.
@@ -1096,99 +1190,6 @@ class ISDFXTC(XTC, ISDFTC):
         logger.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
         return final_result
 
-    @staticmethod
-    @jax.jit
-    def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
-        """JITted version of Delta U contraction."""
-        
-        Np, Nq = phi_p.shape[0], phi_q.shape[0]
-        Nr, Ns = phi_r.shape[0], phi_s.shape[0]
-        N_rank_D = D.shape[0] 
-        N_rank_X = X_sliced.shape[2]
-        
-        rank_block_size = 128
-        
-        # Term 1 & 4: T_D = sum_{a,d} (phi_p*phi_q)_a * D[a,d] * (phi_r*phi_s)_d
-        # Scan over blocks of d (second index of D)
-        
-        # Pad D
-        padded_rank_D = ((N_rank_D + rank_block_size - 1) // rank_block_size) * rank_block_size
-        pad_width_D = padded_rank_D - N_rank_D
-        D_padded = jnp.pad(D, ((0, 0), (0, pad_width_D)))
-        
-        # Pad phi_r and phi_s (associated with index d)
-        phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width_D)))
-        phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width_D)))
-        
-        n_blocks_D = padded_rank_D // rank_block_size
-        
-        # Reshape for scan
-        # D: (N_rank, n_blocks, block) -> (n_blocks, N_rank, block)
-        D_scannable = D_padded.reshape(N_rank_D, n_blocks_D, rank_block_size).transpose(1, 0, 2)
-        # phi_r/s: (N, n_blocks, block) -> (n_blocks, N, block)
-        phi_r_scannable = phi_r_padded.reshape(Nr, n_blocks_D, rank_block_size).transpose(1, 0, 2)
-        phi_s_scannable = phi_s_padded.reshape(Ns, n_blocks_D, rank_block_size).transpose(1, 0, 2)
-
-        def scan_d_block(carry, args):
-            D_block, phi_r_block, phi_s_block = args
-            # D_block: (N_rank_D, block)
-            
-            # intermediate V[p,q,d_local] = sum_a (phi_p[p,a] * phi_q[q,a]) * D_block[a, d_local]
-            # V[p,q,d'] = sum_a phi_p[p,a] * W[a, d', q]
-            # W[a, d', q] = phi_q[q,a] * D_block[a, d']
-            W = D_block[:, :, None] * phi_q.T[:, None, :] # (a, d', 1) * (a, 1, q) -> (a, d', q)
-            W_flat = W.reshape(N_rank_D, rank_block_size * Nq)
-            
-            V_flat = jnp.matmul(phi_p, W_flat) # (p, a) @ (a, d'q) -> (p, d'q)
-            V_block = V_flat.reshape(Np, rank_block_size, Nq)
-            V_block = jnp.transpose(V_block, (0, 2, 1)) # (p, q, d')
-            
-            # C_rs[r, s, d_local]
-            C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :]
-            
-            # Contract
-            contribution = jnp.einsum('pqd,rsd->pqrs', V_block, C_rs)
-            return carry + contribution, None
-
-        term_d_init = jnp.zeros((Np, Nq, Nr, Ns))
-        term_d, _ = jax.lax.scan(scan_d_block, term_d_init, (D_scannable, phi_r_scannable, phi_s_scannable))
-        
-        # Term 2 & 3: T_X = - sum_c (phi_p*phi_q)_c * X[r,s,c]
-        # Scan over blocks of c (rank index of X)
-        
-        # Pad X
-        padded_rank_X = ((N_rank_X + rank_block_size - 1) // rank_block_size) * rank_block_size
-        pad_width_X = padded_rank_X - N_rank_X
-        # X is (Nr, Ns, c)
-        X_padded = jnp.pad(X_sliced, ((0,0), (0,0), (0, pad_width_X)))
-        
-        # Pad phi_p and phi_q (associated with index c/a)
-        phi_p_padded = jnp.pad(phi_p, ((0, 0), (0, pad_width_X)))
-        phi_q_padded = jnp.pad(phi_q, ((0, 0), (0, pad_width_X)))
-        
-        n_blocks_X = padded_rank_X // rank_block_size
-        
-        # Reshape
-        # X: (Nr, Ns, n_blocks, block) -> (n_blocks, Nr, Ns, block)
-        X_scannable = X_padded.reshape(Nr, Ns, n_blocks_X, rank_block_size).transpose(2, 0, 1, 3)
-        phi_p_scannable = phi_p_padded.reshape(Np, n_blocks_X, rank_block_size).transpose(1, 0, 2)
-        phi_q_scannable = phi_q_padded.reshape(Nq, n_blocks_X, rank_block_size).transpose(1, 0, 2)
-        
-        def scan_c_block(carry, args):
-            X_block, phi_p_block, phi_q_block = args
-            # X_block: (Nr, Ns, block)
-            
-            # C_pq[p, q, c_local]
-            C_pq = phi_p_block[:, None, :] * phi_q_block[None, :, :] # (Np, Nq, block)
-            
-            # Contract: - sum_c C_pq * X_block
-            contribution = -jnp.einsum('pqc,rsc->pqrs', C_pq, X_block)
-            return carry + contribution, None
-
-        term_x_init = jnp.zeros((Np, Nq, Nr, Ns))
-        term_x, _ = jax.lax.scan(scan_c_block, term_x_init, (X_scannable, phi_p_scannable, phi_q_scannable))
-
-        return term_d + term_x
 
     def get_delta_h(self, jastrow_params, dm1=None, 
                     block_str=None, ranges=None, 
@@ -1332,15 +1333,80 @@ class ISDFXTC(XTC, ISDFTC):
         
         slice_p, slice_q, slice_r, slice_s = ranges
         
+        # Helper to get length and indices
+        def get_info(sl, total):
+            if isinstance(sl, slice):
+                idx = np.arange(*sl.indices(total))
+            else:
+                idx = np.array(sl)
+            return len(idx), idx
+
+        Np, _ = get_info(slice_p, self.n_orb)
+        Nq, _ = get_info(slice_q, self.n_orb)
+        Nr, r_idx = get_info(slice_r, self.n_orb)
+        Ns, s_idx = get_info(slice_s, self.n_orb)
+        N_rank = X.shape[2]
+        
+        # Check size of X_sliced in GB
+        # Nr * Ns * N_rank * 8 bytes
+        x_sliced_size_gb = (float(Nr) * float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
+        logger.debug(f"  X_sliced dimensions: ({Nr}, {Ns}, {N_rank}) -> {x_sliced_size_gb:.2f} GB (Threshold: 10 GB)")
+        
         phi_p = self.phi_isdf[slice_p]
         phi_q = self.phi_isdf[slice_q]
-        phi_r = self.phi_isdf[slice_r]
-        phi_s = self.phi_isdf[slice_s]
         
-        # X is (N_orb, N_orb, N_rank)
-        # We need to slice it for r, s
-        X_sliced = X[slice_r, slice_s]
+        if x_sliced_size_gb < 10.0:
+            phi_r = self.phi_isdf[slice_r]
+            phi_s = self.phi_isdf[slice_s]
+            X_sliced = X[slice_r, slice_s]
+            return _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s)
         
-        return self._contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s)
+        # Chunking strategy to avoid VRAM exhaustion
+        logger.warning(f"  X_sliced ({x_sliced_size_gb:.2f} GB) exceeds 10 GB limit. Chunking orbital indices.")
+        
+        # Pre-allocate result on host memory
+        result = np.zeros((Np, Nq, Nr, Ns), dtype=np.float64)
+        
+        if Nr >= Ns:
+            # Chunk over r
+            r_slice_size_gb = (float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
+            # Target ~2GB per chunk
+            orb_chunk_size = max(1, int(2.0 / r_slice_size_gb))
+            logger.debug(f"  Chunking over 'r' index. Chunk size: {orb_chunk_size}")
+            
+            phi_s = self.phi_isdf[slice_s]
+            for i in range(0, Nr, orb_chunk_size):
+                i_end = min(i + orb_chunk_size, Nr)
+                curr_r_idx = r_idx[i:i_end]
+                
+                # Slice kernels
+                phi_r_chunk = self.phi_isdf[curr_r_idx]
+                # Advanced indexing for chunking
+                X_chunk = X[curr_r_idx, slice_s]
+                
+                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r_chunk, phi_s)
+                result[:, :, i:i_end, :] = np.asarray(res_chunk)
+                del res_chunk
+                gc.collect()
+        else:
+            # Chunk over s
+            s_slice_size_gb = (float(Nr) * float(N_rank) * 8.0) / (1024.0**3)
+            orb_chunk_size = max(1, int(2.0 / s_slice_size_gb))
+            logger.debug(f"  Chunking over 's' index. Chunk size: {orb_chunk_size}")
+
+            phi_r = self.phi_isdf[slice_r]
+            for i in range(0, Ns, orb_chunk_size):
+                i_end = min(i + orb_chunk_size, Ns)
+                curr_s_idx = s_idx[i:i_end]
+                
+                phi_s_chunk = self.phi_isdf[curr_s_idx]
+                X_chunk = X[slice_r, curr_s_idx]
+                
+                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r, phi_s_chunk)
+                result[:, :, :, i:i_end] = np.asarray(res_chunk)
+                del res_chunk
+                gc.collect()
+                
+        return jnp.asarray(result)
     
 
