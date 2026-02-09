@@ -823,7 +823,7 @@ class ISDFTC(TC):
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
                     logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
-                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM")
+                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
                     kernels['K1_kernel'] = f['K1_kernel'][:]
                     logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
                     kernels['K3_kernel'] = f['K3_kernel'][:]
@@ -837,6 +837,9 @@ class ISDFTC(TC):
 
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
+                
+                # If we are here, keys are missing. Close the file!
+                f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 

@@ -374,7 +374,7 @@ class XTC(TC):
         logger.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
         return -total_delta_U
 
-    def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+    def get_delta_h(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=None, batch_size=1000):
         """Get or compute delta_h with memory optimization."""
         if dm1 is None:
             dm1 = self._get_mf_dm()
@@ -669,13 +669,25 @@ class ISDFXTC(XTC, ISDFTC):
         logger.info("Computing X kernel...")
         
         if save_path:
-            # If L_aux is a dataset from the same file, we must load it or close it.
+            # If L_aux is a dataset from the same file, we must close the read-only handle 
+            # and reopen in 'a' mode to write D and X, while keeping L_aux streaming.
+            f = None
             if isinstance(L_aux, h5py.Dataset):
-                if L_aux.file.filename == os.path.abspath(save_path):
-                    logger.info("  L_aux is a dataset from the target file. Loading into RAM to allow reopening in 'a' mode.")
-                    L_aux = L_aux[:]
+                # Check if it's the same file. Use realpath to be safe.
+                try:
+                    l_aux_path = os.path.abspath(L_aux.file.filename)
+                    target_path = os.path.abspath(save_path)
+                    if l_aux_path == target_path:
+                        logger.info("  L_aux is from target file. Switching handle to read-write for streaming...")
+                        ds_name = L_aux.name
+                        if L_aux.file: L_aux.file.close()
+                        f = h5py.File(save_path, 'a')
+                        L_aux = f[ds_name] # Re-bind L_aux
+                except Exception as e:
+                    logger.warning(f"  Could not check L_aux file path: {e}")
             
-            f = h5py.File(save_path, 'a')
+            if f is None:
+                f = h5py.File(save_path, 'a')
             if 'D' in f: del f['D']
             f.create_dataset('D', data=np.array(D))
             if 'X' in f: del f['X']
@@ -1139,46 +1151,28 @@ class ISDFXTC(XTC, ISDFTC):
         if ranges is not None:
              slice_p, slice_q = ranges[0], ranges[1]
              
-        # Precompute common intermediates
-        # Gb = sum_{rs} phi_rb phi_sb dm_rs
         Gb = jnp.einsum('rb,sb,rs->b', phi, phi, dm1)
-        
-        # P_phi = sum_{rs} phi_sa dm_rs phi_rb = (phi.T @ dm1 @ phi)
         P_phi = jnp.linalg.multi_dot([phi.T, dm1, phi])
-        
-        # phi_tilde = dm1 @ phi
         phi_tilde = jnp.dot(dm1, phi)
         
-        # wc = sum_{rs} X_rsc dm_rs
-        # Y_all = sum_r X_rqc phi_tilde_rc
-        
         # Check if X is HDF5 dataset
-        is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File)) # or checking attribute?
-        # A file object wouldn't be passed, but let's be safe.
-        # Actually kernels['X'] is dataset or array.
+        is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File))
         
         wc = jnp.zeros((phi.shape[1],)) # (N_rank,)
         Y_all = jnp.zeros((self.n_orb, phi.shape[1])) # (N_orb, N_rank)
         
         if is_hdf5:
             # Process strictly in chunks to respect memory
-            # For J_X_sym, we need X[p,q] which is a slice. If slice is small, h5py handles it.
-            # But for Y_all and wc, we need full contraction.
             logger.debug("  Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
             for i in range(0, self.n_orb, chunk_size):
-                sl = slice(i, min(i+chunk_size, self.n_orb))
-                logger.debug(f"  Processing slice {sl}")
-                X_chunk = X[sl] # (chunk, N, N_rank) -> Numpy array
+                start = i
+                stop = min(i + chunk_size, self.n_orb)
+                sl = slice(start, stop)
+                logger.debug(f"  Processing slice {start}-{stop}")
+                X_chunk = X[sl] 
                 
-                # Update wc
-                # wc += sum_{r_chunk, s} X[r,s,c] * dm1[r,s]
-                # dm1 slice: dm1[sl, :]
                 wc += jnp.einsum('rsc,rs->c', X_chunk, dm1[sl])
-                
-                # Update Y_all
-                # Y_all[q, c] += sum_{r_chunk} X[r,q,c] * phi_tilde[r,c]
-                # phi_tilde slice: phi_tilde[sl]
                 Y_all += jnp.einsum('rqc,rc->qc', X_chunk, phi_tilde[sl])
                 
         else:
@@ -1193,9 +1187,6 @@ class ISDFXTC(XTC, ISDFTC):
         Y_q = Y_all[slice_q]
         
         # J terms
-        # J_D from R_{pqrs}: sum_{ad} phi_pa phi_qa D_{ad} G_d
-        # J_D_sym from R_{rspq}: sum_{ad} phi_pa phi_qa D_{da} G_d = sum_{ad} phi_pa phi_qa D.T_{ad} G_d
-        # Total J_D contrib: phi_p * ((D + D.T) @ G) * phi_q
         D_sym = D + D.T
         tmp_a = jnp.dot(D_sym, Gb)
         J_D_total = jnp.dot(phi_p * tmp_a[None, :], phi_q.T)
@@ -1204,23 +1195,37 @@ class ISDFXTC(XTC, ISDFTC):
         J_X = - jnp.dot(phi_p * wc[None, :], phi_q.T)
         
         # J_X_sym: - sum X_pq G_c
-        # Need X[p, q]
         if is_hdf5:
-            # If slices are full, this might be big. But usually p,q are ranges (blocks).
-            # H5py slicing returns numpy array.
-            X_pq = X[slice_p, slice_q] 
+            start_p, stop_p, step_p = slice_p.indices(self.n_orb)
+            start_q, stop_q, step_q = slice_q.indices(self.n_orb)
+            
+            Np = (stop_p - start_p + step_p - 1) // step_p
+            Nq = (stop_q - start_q + step_q - 1) // step_q
+            
+            J_X_sym_blocks = []
+            
+            # Iterate p in chunks relative to result
+            for i in range(0, Np, orb_block_size):
+                i_end = min(i + orb_block_size, Np)
+                p_abs_start = start_p + i * step_p
+                p_abs_stop = start_p + i_end * step_p
+                p_abs_slice = slice(p_abs_start, p_abs_stop, step_p)
+                
+                # Load X block and contract
+                X_chunk = X[p_abs_slice, slice_q]
+                block_res = - jnp.einsum('pqc,c->pq', X_chunk, Gb)
+                J_X_sym_blocks.append(block_res)
+                
+            J_X_sym = jnp.concatenate(J_X_sym_blocks, axis=0)
+
         else:
             X_pq = X[slice_p, slice_q]
-            
-        J_X_sym = - jnp.einsum('pqc,c->pq', X_pq, Gb)
+            J_X_sym = - jnp.einsum('pqc,c->pq', X_pq, Gb)
         
         # J_total = J_D_total + J_X + J_X_sym
         J_total = J_D_total + J_X + J_X_sym
         
         # K terms
-        # K_D from R_{psrq}: sum (D * P)_{ad} phi_pa phi_qd
-        # K_D_sym from R_{rqps}: sum (D * P)_{da} phi_pa phi_qd = sum (D * P).T_{ad} phi_pa phi_qd
-        # Total K_D contrib: phi_p @ (DP + DP.T) @ phi_q.T
         DP = D * P_phi
         DP_sym = DP + DP.T
         K_D_total = jnp.linalg.multi_dot([phi_p, DP_sym, phi_q.T])
