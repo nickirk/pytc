@@ -225,13 +225,13 @@ def _update_amps(cc, t1, t2, eris):
         stats = jax.devices()[0].memory_stats()
         logger.debug(f"    Raw GPU stats: {stats}")
         # available = limit - in_use. Leave 20% buffer.
-        available_mem = stats['bytes_reservable_limit'] - stats['bytes_in_use']
+        available_mem = stats['bytes_limit'] - stats['bytes_in_use']
         use_gpu_acc = (available_mem * 0.8) > total_acc_mem
     except:
         # Fallback if stats not available (e.g. CPU or some backends)
         use_gpu_acc = False
         
-    logger.debug(f"    Accumulators need {total_acc_mem/1e9:.2f} GB. GPU available: {available_mem/1e9:.2f} GB. Using GPU acc: {use_gpu_acc}")
+    logger.debug(f"    Accumulators need {total_acc_mem/1024**3:.2f} GB. GPU available: {available_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
 
     # Initialize accumulators with non-ovvv terms
     if use_gpu_acc:

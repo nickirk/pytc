@@ -1354,9 +1354,11 @@ class ISDFXTC(XTC, ISDFTC):
         # Use (limit - in_use) to get actual free space, 
         # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
         mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-        threshold = mem_gpu * 0.3
+        # convert to GB
+        mem_gpu_gb = mem_gpu / (1024.0**3)
+        threshold = mem_gpu_gb * 0.3
         x_sliced_size_gb = (float(Nr) * float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
-        logger.debug(f"  X_sliced dimensions: ({Nr}, {Ns}, {N_rank}) -> {x_sliced_size_gb:.2f} GB (Threshold: {threshold/1e9:.2f} GB)")
+        logger.debug(f"  X_sliced dimensions: ({Nr}, {Ns}, {N_rank}) -> {x_sliced_size_gb:.2f} GB (Threshold: {threshold:.2f} GB)")
         
         phi_p = self.phi_isdf[slice_p]
         phi_q = self.phi_isdf[slice_q]
@@ -1368,7 +1370,7 @@ class ISDFXTC(XTC, ISDFTC):
             return _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s)
         
         # Chunking strategy to avoid VRAM exhaustion
-        logger.warning(f"  X_sliced ({x_sliced_size_gb:.2f} GB) exceeds {threshold/1e9:.2f} GB limit. Chunking orbital indices.")
+        logger.warning(f"  X_sliced ({x_sliced_size_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
         
         # Pre-allocate result on host memory
         result = np.zeros((Np, Nq, Nr, Ns), dtype=np.float64)
