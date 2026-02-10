@@ -107,6 +107,21 @@ def get_gpu_budget_bytes(gpu_max_memory_mb=None):
         return 16 * 1024 ** 3  # 16 GiB fallback
 
 
+def _get_gpu_physical_bytes():
+    """Return the physical GPU memory capacity in bytes (ignoring user overrides).
+
+    Used for phases where we need to know the actual hardware limit
+    (e.g. how large an output tensor get_2b can produce) rather than
+    a user-imposed CCSD workspace budget.
+    """
+    try:
+        import jax
+        stats = jax.devices()[0].memory_stats()
+        return int(stats['bytes_limit'])
+    except Exception:
+        return 80 * 1024 ** 3  # 80 GiB fallback (A100)
+
+
 def estimate_blksize(nocc, nvir, phase, *,
                      gpu_max_memory_mb=None,
                      host_max_memory_mb=None,
@@ -128,7 +143,9 @@ def estimate_blksize(nocc, nvir, phase, *,
     include_accumulators : bool
         Whether the 4 accumulator tensors are present on GPU at this point.
     naux : int | None
-        DF auxiliary basis size (needed for ``'vvvv'`` phase with DF).
+        DF auxiliary basis size (for ``'vvvv'`` phase) or ISDF N_fused rank
+        (for ``'ovvv_eri_build'``/``'vovv_eri_build'`` phases).  Used to
+        estimate persistent GPU residents.
 
     Returns
     -------
@@ -192,14 +209,45 @@ def estimate_blksize(nocc, nvir, phase, *,
         return int(can_fit), budget
 
     elif phase in ('ovvv_eri_build', 'vovv_eri_build'):
-        # Use host budget for this phase (GPU is self-managing).
+        # Host side: std_blk + tc_blk per iteration.
+        # L_vv_full / Lov_reshaped are already allocated — not subtracted.
         if host_max_memory_mb is not None and host_max_memory_mb > 0:
             host_budget = int(host_max_memory_mb * 1e6)
         else:
             host_budget = budget  # fall back to GPU budget as proxy
-        available = host_budget
         persistent_build = 0  # already allocated, not subtracted
-        per_blk = O * V * V * B * 2  # std_blk + tc_blk
+        host_per_blk = O * V * V * B * 2  # std_blk + tc_blk
+
+        # GPU side: get_2b internally holds ~3 output-sized arrays
+        # simultaneously (result accumulator + scan carry + contribution),
+        # plus ISDF kernel data that stays resident on GPU.
+        # Use physical GPU capacity here (not the user's CCSD workspace
+        # budget) because the build phase runs before CCSD data is loaded.
+        N_fused = naux if naux is not None else 0
+        gpu_physical = _get_gpu_physical_bytes()
+        kernel_resident = 0
+        if N_fused > 0:
+            nmo = O + V
+            kernel_resident = (N_fused * N_fused * 3      # U1 kernel
+                               + N_fused * N_fused         # U3 kernel
+                               + nmo * N_fused             # phi_isdf
+                               + nmo * N_fused * 3) * B    # grad_phi_isdf
+        gpu_available = max(gpu_physical - kernel_resident, 0)
+        gpu_per_blk = O * V * V * B * 3  # ~3 copies of output on GPU
+
+        # Blksize is the min of host-derived and GPU-derived limits
+        host_blk = max(1, int(host_budget * 0.8 / host_per_blk))
+        gpu_blk = max(1, int(gpu_available * 0.8 / gpu_per_blk))
+        blksize = min(host_blk, gpu_blk, nvir)
+        per_blk = host_per_blk  # for logging
+        available = min(host_budget, gpu_available)  # for logging
+
+        logger.debug(
+            "estimate_blksize(phase=%s): host_budget=%.2f GB, gpu_physical=%.2f GB, "
+            "kernel_resident=%.2f GB, host_blk=%d, gpu_blk=%d → blksize=%d",
+            phase, host_budget / 1e9, gpu_physical / 1e9,
+            kernel_resident / 1e9, host_blk, gpu_blk, blksize)
+        return blksize, budget
 
     else:
         raise ValueError(f"Unknown phase: {phase!r}")
@@ -209,17 +257,10 @@ def estimate_blksize(nocc, nvir, phase, *,
     blksize = max(1, int(usable / per_blk))
     blksize = min(nvir, blksize)
 
-    # For build phases, show the actual budget/persistent used
-    _log_budget = budget
-    _log_persistent = persistent
-    if phase in ('ovvv_eri_build', 'vovv_eri_build'):
-        _log_budget = host_budget
-        _log_persistent = persistent_build
-
     logger.debug(
         "estimate_blksize(phase=%s): budget=%.2f GB, persistent=%.2f GB, "
         "available=%.2f GB, per_blk=%.2f MB → blksize=%d",
-        phase, _log_budget / 1e9, _log_persistent / 1e9,
+        phase, budget / 1e9, persistent / 1e9,
         available / 1e9, per_blk / 1e6, blksize)
 
     return blksize, budget

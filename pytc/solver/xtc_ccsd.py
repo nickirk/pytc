@@ -774,7 +774,10 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
 
 def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full, nocc, nvir, nmo):
     """Compute and write ovvv and vovv blocks to HDF5."""
-    _naux = L_vv_full.shape[2] if L_vv_full is not None else None
+    # N_fused = ISDF rank, needed for GPU memory estimation in estimate_blksize
+    _n_fused = None
+    if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
+        _n_fused = xtc_obj.phi_isdf.shape[1]
     for name, shape in eris_blocks.items():
         ds = getattr(eris, name)
         
@@ -783,7 +786,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 nocc, nvir, 'ovvv_eri_build',
                 gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
                 host_max_memory_mb=getattr(eris, 'max_memory', None),
-                naux=_naux)
+                naux=_n_fused)
             blksize = max(4, blksize)
             logger.debug(f"    Blksize for ovvv: {blksize}")
             for p0, p1 in lib.prange(0, nvir, blksize):
@@ -802,7 +805,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 nocc, nvir, 'vovv_eri_build',
                 gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
                 host_max_memory_mb=getattr(eris, 'max_memory', None),
-                naux=_naux)
+                naux=_n_fused)
             blksize = max(4, blksize)
             logger.debug(f"    Blksize for vovv: {blksize}")
             for p0, p1 in lib.prange(0, nvir, blksize):
