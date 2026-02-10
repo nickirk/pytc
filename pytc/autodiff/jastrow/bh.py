@@ -64,22 +64,22 @@ class BoysHandy(Jastrow):
             d_cusp = 0.5
             default_terms_for_one_nucleus = [
                 BHTerm(0, 0, 1, d_cusp),
-                BHTerm(0, 0, 2, 0.01),  
-                BHTerm(0, 0, 3, 0.001),  
-                BHTerm(0, 0, 4, -0.001),  
-                BHTerm(2, 0, 0, 0.001),
-                BHTerm(3, 0, 0, 0.0001),
-                BHTerm(4, 0, 0, 0.0001),
-                BHTerm(2, 2, 0, -0.001),
-                BHTerm(2, 0, 2, 0.01),
-                BHTerm(2, 2, 2, 0.01),
-                BHTerm(4, 0, 2, 0.01),
-                BHTerm(2, 0, 4, 0.01),
-                BHTerm(4, 2, 2, 0.01),
-                BHTerm(6, 0, 2, 0.01),
-                BHTerm(4, 0, 4, 0.01),
-                BHTerm(2, 2, 4, 0.01),
-                BHTerm(2, 0, 6, 0.01),
+                BHTerm(0, 0, 2, 1e-5),  
+                BHTerm(0, 0, 3, 1e-5),  
+                BHTerm(0, 0, 4, 1e-5),  
+                BHTerm(2, 0, 0, 1e-5),
+                BHTerm(3, 0, 0, 1e-5),
+                BHTerm(4, 0, 0, 1e-5),
+                BHTerm(2, 2, 0, 1e-5),
+                BHTerm(2, 0, 2, 1e-5),
+                BHTerm(2, 2, 2, 1e-5),
+                BHTerm(4, 0, 2, 1e-5),
+                BHTerm(2, 0, 4, 1e-5),
+                BHTerm(4, 2, 2, 1e-5),
+                BHTerm(6, 0, 2, 1e-5),
+                BHTerm(4, 0, 4, 1e-5),
+                BHTerm(2, 2, 4, 1e-5),
+                BHTerm(2, 0, 6, 1e-5),
             ]
             terms_per_atom_type = [default_terms_for_one_nucleus for _ in range(n_types)]
         else:
@@ -227,11 +227,11 @@ class BoysHandy(Jastrow):
             total_val = jnp.sum(delta_vals * c_I * term_vals)
             return total_val
 
-        u_total = 0.0
-        for i in range(self.natom):
-            u_total += compute_term(i)
-            
-        return u_total
+        # Vectorize over all atoms instead of sequential Python loop.
+        # Each compute_term call is independent, so vmap parallelises them
+        # and produces a single fused XLA op (important for backprop efficiency).
+        atom_contributions = jax.vmap(compute_term)(jnp.arange(self.natom))
+        return jnp.sum(atom_contributions)
 
     def _compute(self, r1, r2, params):
         return self._compute_forward(r1, r2, params)

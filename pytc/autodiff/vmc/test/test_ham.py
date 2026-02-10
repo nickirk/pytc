@@ -69,7 +69,10 @@ class TestHamiltonian(unittest.TestCase):
             lap_down=self.walker.lap_down[0],
             det_up=self.walker.det_up[0],
             det_down=self.walker.det_down[0],
-            move_mask=self.walker.move_mask[0]
+            move_mask=self.walker.move_mask[0],
+            log_psi=self.walker.log_psi[0],
+            psi_sign=self.walker.psi_sign[0],
+            log_jastrow=self.walker.log_jastrow[0],
         )
 
     def test_compute_jastrow_terms_shape(self):
@@ -214,7 +217,10 @@ class TestHamiltonian(unittest.TestCase):
             lap_down=walker_batch.lap_down[0],
             det_up=walker_batch.det_up[0],
             det_down=walker_batch.det_down[0],
-            move_mask=walker_batch.move_mask[0]
+            move_mask=walker_batch.move_mask[0],
+            log_psi=walker_batch.log_psi[0],
+            psi_sign=walker_batch.psi_sign[0],
+            log_jastrow=walker_batch.log_jastrow[0],
         )
         
         energy = compute_single_walker_energy(ansatz, single_walker, jastrow_params)

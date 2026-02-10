@@ -49,6 +49,18 @@ def burn_in(ansatz,
         
     print(f"Starting burn-in with {n_steps} steps...")
     
+    # Warm up walker cache (populate log_psi, psi_sign) so that
+    # _one_electron_move can reuse cached values instead of recomputing.
+    if max_vmap_batch_size > 0:
+        _warmup_ansatz = folx.batched_vmap(
+            lambda w, p: ansatz(w, p),
+            in_axes=(0, None),
+            max_batch_size=max_vmap_batch_size
+        )
+    else:
+        _warmup_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+    _, walkers = _warmup_ansatz(walkers, params)
+
     # JIT-compile the MCMC step function to speed up the loop
     # We partial out move_type since it's a static string argument
     # step_size is passed as argument so it can vary without recompilation

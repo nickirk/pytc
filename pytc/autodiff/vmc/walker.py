@@ -22,8 +22,8 @@ class Walker:
     - Without grad/lap: ~1.5 GB
     - With grad/lap: ~4.3 GB (acceptable for modern systems)
     
-    Note: psi_values are not stored in walker as they can be recomputed from
-    det_up, det_down, and Jastrow when needed. This avoids redundant storage.
+    log_psi and log_jastrow cache the most recent wavefunction values so
+    that the current ψ(R) does not need to be recomputed each MCMC step.
     """
     positions: jnp.ndarray      # (n_walkers, n_electrons, 3)
     det_up: jnp.ndarray         # (n_walkers,) or tuple of (sign, log|det|)
@@ -37,6 +37,9 @@ class Walker:
     lap_up: jnp.ndarray         # (n_walkers, n_alpha, n_alpha)
     lap_down: jnp.ndarray       # (n_walkers, n_beta, n_beta)
     move_mask: jnp.ndarray      # (n_walkers, n_electrons) boolean - tracks which electrons moved
+    log_psi: jnp.ndarray        # (n_walkers,) cached log|ψ| value (sign stored in psi_sign)
+    psi_sign: jnp.ndarray       # (n_walkers,) cached sign(ψ)
+    log_jastrow: jnp.ndarray    # (n_walkers,) cached log(J) (Jastrow is always positive)
     
     @property
     def elec_coords(self):
@@ -78,7 +81,10 @@ def initialize_walker_state(ansatz, positions):
         grad_down=jnp.zeros((n_walkers, n_beta, n_beta, 3)),
         lap_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
         lap_down=jnp.zeros((n_walkers, n_beta, n_beta)),
-        move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool)
+        move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool),
+        log_psi=jnp.zeros((n_walkers,)),
+        psi_sign=jnp.zeros((n_walkers,)),
+        log_jastrow=jnp.zeros((n_walkers,)),
     )
 
 

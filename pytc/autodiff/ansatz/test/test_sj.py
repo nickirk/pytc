@@ -36,7 +36,10 @@ def create_test_walker(positions, det):
             grad_down=jnp.zeros((batch_size, n_beta, n_beta, 3)),
             lap_up=jnp.zeros((batch_size, n_alpha, n_alpha)),
             lap_down=jnp.zeros((batch_size, n_beta, n_beta)),
-            move_mask=jnp.ones((batch_size, n_electrons), dtype=bool)
+            move_mask=jnp.ones((batch_size, n_electrons), dtype=bool),
+            log_psi=jnp.zeros((batch_size,)),
+            psi_sign=jnp.zeros((batch_size,)),
+            log_jastrow=jnp.zeros((batch_size,)),
         )
     else:
         return Walker(
@@ -51,7 +54,10 @@ def create_test_walker(positions, det):
             grad_down=jnp.zeros((n_beta, n_beta, 3)),
             lap_up=jnp.zeros((n_alpha, n_alpha)),
             lap_down=jnp.zeros((n_beta, n_beta)),
-            move_mask=jnp.ones(n_electrons, dtype=bool)
+            move_mask=jnp.ones(n_electrons, dtype=bool),
+            log_psi=jnp.array(0.0),
+            psi_sign=jnp.array(0.0),
+            log_jastrow=jnp.array(0.0),
         )
 
 
@@ -523,7 +529,10 @@ class TestLocalEnergyWithWalker(unittest.TestCase):
             grad_down=jnp.zeros((n_walkers, 1, 1, 3)),
             lap_up=jnp.zeros((n_walkers, 1, 1)),
             lap_down=jnp.zeros((n_walkers, 1, 1)),
-            move_mask=jnp.ones((n_walkers, 2), dtype=bool)
+            move_mask=jnp.ones((n_walkers, 2), dtype=bool),
+            log_psi=jnp.zeros((n_walkers,)),
+            psi_sign=jnp.zeros((n_walkers,)),
+            log_jastrow=jnp.zeros((n_walkers,)),
         )
         
         # First call ansatz to populate walker with Slater matrices and gradients

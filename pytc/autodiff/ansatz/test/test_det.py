@@ -375,7 +375,10 @@ class TestSlaterDet(unittest.TestCase):
             grad_down=jnp.zeros((n_walkers, det.n_beta, det.n_beta, 3)),
             lap_up=jnp.zeros((n_walkers, det.n_alpha, det.n_alpha)),
             lap_down=jnp.zeros((n_walkers, det.n_beta, det.n_beta)),
-            move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool)
+            move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool),
+            log_psi=jnp.zeros((n_walkers,)),
+            psi_sign=jnp.zeros((n_walkers,)),
+            log_jastrow=jnp.zeros((n_walkers,)),
         )
         
         # First call should trigger full recomputation (grad/lap uninitialized)

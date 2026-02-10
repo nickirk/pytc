@@ -23,7 +23,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, multi_gpu=False, clip_multiplier=5.0):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -32,6 +32,24 @@ class NewtonOptimizer:
         self.max_vmap_batch_size = max_vmap_batch_size
         self.solver = solver
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
+        self.jacobian_sample_size = jacobian_sample_size
+        self.multi_gpu = multi_gpu
+        self.clip_multiplier = clip_multiplier
+
+    def _get_vmap(self):
+        """Return the appropriate vmap implementation.
+
+        When ``multi_gpu=True`` always use ``jax.vmap`` so that sharding
+        is preserved across devices.  ``folx.batched_vmap`` gathers results
+        to all devices, defeating multi-GPU parallelism.
+        """
+        if self.multi_gpu:
+            return jax.vmap
+        if self.max_vmap_batch_size > 0:
+            return lambda fn, **kw: folx.batched_vmap(
+                fn, max_batch_size=self.max_vmap_batch_size, **kw
+            )
+        return jax.vmap
 
     def init(self, params, rng, batch):
         return 0  # step count
@@ -39,34 +57,25 @@ class NewtonOptimizer:
     def step(self, params, state, rng, batch, global_step_int=None):
         walkers, ansatz = batch
         
-        # 1. Compute Gradients
-        # We pass batch directly to value_and_grad_func.
-        # It should handle (walkers, ansatz) or walkers.
-        (loss, aux_data), grads = self.value_and_grad_func(params, batch)
-        
         # 2. Define MVP or Solve Exact
         if self.solver == "exact" or self.solver == "cholesky":
             # Exact inversion: (M + lambda I) delta = -g
             
             if self.curvature_type == "fisher":
                 # SR: S = Cov(grad_log_psi)
-                # J_i = d(log_psi(w_i))/dp
+                # Need loss + grads from value_and_grad_func, plus Jacobian separately.
+                (loss, aux_data), grads = self.value_and_grad_func(params, batch)
                 
+                # J_i = d(log_psi(w_i))/dp
                 def single_log_psi_grad(w, p):
                     return jax.grad(lambda pp: ansatz(w, pp)[0][1])(p)
                 
                 # Compute Jacobian for all walkers: Shape (N, P)
-                # Use batched_vmap if requested to avoid OOM
-                if self.max_vmap_batch_size > 0:
-                    jac = folx.batched_vmap(single_log_psi_grad, max_batch_size=self.max_vmap_batch_size, in_axes=(0, None))(walkers, params)
-                else:
-                    jac = jax.vmap(single_log_psi_grad, in_axes=(0, None))(walkers, params)
+                vmap_fn = self._get_vmap()
+                jac = vmap_fn(single_log_psi_grad, in_axes=(0, None))(walkers, params)
                 
                 # Flatten params structure for linear algebra
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
-                # Concatenate all parameter gradients into a single matrix (N, P_total)
-                # Note: This assumes all leaves are arrays. We need to handle this carefully.
-                # A safer way is to flatten each leaf and concatenate.
                 jac_mat = jnp.concatenate([jnp.reshape(leaf, (walkers.shape[0], -1)) for leaf in jac_flat], axis=1)
                 
                 # Center the Jacobian (Covariance)
@@ -77,28 +86,74 @@ class NewtonOptimizer:
                 curvature_mat = (jac_centered.T @ jac_centered) / n_walkers
                 
             elif self.curvature_type == "gauss_newton":
-                # GN: G = 2/N * J.T @ J
+                # GN: G = 2/M * J_centered.T @ J_centered
                 # J_i = d(E_L(w_i))/dp
+                #
+                # Optimization: compute Jacobian and local energies in one pass,
+                # then derive the variance loss and gradient analytically:
+                #   variance = sum((E - mean(E))^2) / (M - 1)
+                #   grad_variance = 2/(M-1) * J^T @ (E - mean(E))
+                #
+                # When jacobian_sample_size > 0, a random subset of walkers is
+                # used for the Jacobian (gradient + curvature), reducing cost
+                # from O(N) to O(M) local-energy differentiations per step.
                 
-                def single_local_energy_grad(w, p):
-                    return jax.grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
+                def single_local_energy_and_grad(w, p):
+                    """Compute both E_L(w) and grad_p E_L(w) in one pass."""
+                    return jax.value_and_grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
                 
-                # Compute Jacobian for all walkers: Shape (N, P)
-                if self.max_vmap_batch_size > 0:
-                    jac = folx.batched_vmap(single_local_energy_grad, max_batch_size=self.max_vmap_batch_size, in_axes=(0, None))(walkers, params)
+                n_walkers_total = walkers.shape[0]
+                
+                # Sub-sample walkers for the Jacobian if requested
+                if self.jacobian_sample_size > 0 and self.jacobian_sample_size < n_walkers_total:
+                    sample_size = self.jacobian_sample_size
+                    # Use rng to select a random subset of walker indices
+                    indices = jax.random.choice(rng, n_walkers_total,
+                                                shape=(sample_size,), replace=False)
+                    indices = jnp.sort(indices)  # sort for deterministic gather
+                    sub_walkers = jax.tree_util.tree_map(lambda x: x[indices], walkers)
                 else:
-                    jac = jax.vmap(single_local_energy_grad, in_axes=(0, None))(walkers, params)
+                    sample_size = n_walkers_total
+                    sub_walkers = walkers
                 
-                # Flatten params structure
+                # Compute energies and Jacobian for (sub-sampled) walkers
+                vmap_fn = self._get_vmap()
+                energies, jac = vmap_fn(
+                    single_local_energy_and_grad, 
+                    in_axes=(0, None)
+                )(sub_walkers, params)
+                
+                n_walkers = sample_size
+                
+                # Clip energies to suppress outliers.  The gradient is
+                # 2/(M-1) * J^T @ (E - mean(E)), so clipping energies
+                # naturally limits the influence of extreme walkers.
+                if self.clip_multiplier > 0:
+                    e_mean_raw = jnp.mean(energies)
+                    e_std_raw = jnp.mean(jnp.abs(energies - e_mean_raw))
+                    energies = jnp.clip(
+                        energies,
+                        e_mean_raw - self.clip_multiplier * e_std_raw,
+                        e_mean_raw + self.clip_multiplier * e_std_raw,
+                    )
+                
+                # Flatten Jacobian params structure to (M, P_total) matrix
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
-                jac_mat = jnp.concatenate([jnp.reshape(leaf, (walkers.shape[0], -1)) for leaf in jac_flat], axis=1)
+                jac_mat = jnp.concatenate([jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat], axis=1)
                 
-                # Center the Jacobian to match the iterative solver and correctly minimize variance
-                # The iterative solver centers the JVP output w = Jv - mean(Jv), which is equivalent
-                # to using a centered Jacobian matrix in the quadratic form.
+                # Compute variance loss and auxiliary data analytically from energies
+                e_mean = jnp.mean(energies)
+                e_std = jnp.std(energies)
+                energy_diff = energies - e_mean
+                loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
+                aux_data = (e_mean, e_std)
+                
+                # Compute variance gradient analytically: 
+                # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
+                grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
+                
+                # Center the Jacobian for curvature matrix
                 jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
-                
-                n_walkers = walkers.shape[0]
                 curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
             
             else:
@@ -107,8 +162,12 @@ class NewtonOptimizer:
             # Add damping
             curvature_mat = curvature_mat + self.damping * jnp.eye(curvature_mat.shape[0])
             
-            # Flatten gradients to match matrix
-            grads_vec, unravel_fn = jax.flatten_util.ravel_pytree(grads)
+            # Flatten gradients to match matrix (for fisher, grads are pytree; for gauss_newton, already flat)
+            if self.curvature_type == "fisher":
+                grads_vec, unravel_fn = jax.flatten_util.ravel_pytree(grads)
+            else:
+                # gauss_newton: grads_vec is already flat, need unravel_fn
+                _, unravel_fn = jax.flatten_util.ravel_pytree(params)
             
             # Solve linear system
             # (M + lambda I) delta = -g
@@ -127,7 +186,9 @@ class NewtonOptimizer:
             
             return new_params, state + 1, {"loss": loss, "aux": aux_data}
 
-        # 2. Define MVP (CG Solver)
+        # CG Solver: need loss + grads from value_and_grad_func
+        (loss, aux_data), grads = self.value_and_grad_func(params, batch)
+        
         if self.curvature_type == "fisher":
             # SR: S = Cov(grad_log_psi)
             
@@ -142,10 +203,8 @@ class NewtonOptimizer:
                     _, tangent = jax.jvp(lambda p: single_log_psi(w, p), (params,), (v,))
                     return tangent
 
-                if self.max_vmap_batch_size > 0:
-                    w = folx.batched_vmap(compute_jvp, max_batch_size=self.max_vmap_batch_size)(walkers)
-                else:
-                    w = jax.vmap(compute_jvp)(walkers)
+                vmap_fn = self._get_vmap()
+                w = vmap_fn(compute_jvp)(walkers)
                 
                 w_centered = w - jnp.mean(w)
                 
@@ -155,10 +214,7 @@ class NewtonOptimizer:
                     _, vjp_fun = jax.vjp(lambda p: single_log_psi(w_el, p), params)
                     return vjp_fun(w_val)[0]
                 
-                if self.max_vmap_batch_size > 0:
-                    per_walker_grads = folx.batched_vmap(compute_vjp, max_batch_size=self.max_vmap_batch_size)(walkers, w_centered)
-                else:
-                    per_walker_grads = jax.vmap(compute_vjp)(walkers, w_centered)
+                per_walker_grads = vmap_fn(compute_vjp)(walkers, w_centered)
                 
                 # Sum over walkers
                 u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
@@ -180,10 +236,8 @@ class NewtonOptimizer:
                     _, tangent = jax.jvp(lambda p: single_local_energy(w, p), (params,), (v,))
                     return tangent
 
-                if self.max_vmap_batch_size > 0:
-                    w = folx.batched_vmap(compute_jvp, max_batch_size=self.max_vmap_batch_size)(walkers)
-                else:
-                    w = jax.vmap(compute_jvp)(walkers)
+                vmap_fn = self._get_vmap()
+                w = vmap_fn(compute_jvp)(walkers)
                 
                 w_centered = w - jnp.mean(w)
                 
@@ -192,10 +246,7 @@ class NewtonOptimizer:
                     _, vjp_fun = jax.vjp(lambda p: single_local_energy(w_el, p), params)
                     return vjp_fun(w_val)[0]
                 
-                if self.max_vmap_batch_size > 0:
-                    per_walker_grads = folx.batched_vmap(compute_vjp, max_batch_size=self.max_vmap_batch_size)(walkers, w_centered)
-                else:
-                    per_walker_grads = jax.vmap(compute_vjp)(walkers, w_centered)
+                per_walker_grads = vmap_fn(compute_vjp)(walkers, w_centered)
                 
                 # Sum over walkers
                 u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
@@ -266,7 +317,10 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             curvature_type=merged_kwargs.get("curvature", "fisher"),
             max_vmap_batch_size=merged_kwargs.get("max_vmap_batch_size", 0),
             solver=merged_kwargs.get("solver", "exact"),
-            solve_kwargs=merged_kwargs.get("solve_kwargs", None)
+            solve_kwargs=merged_kwargs.get("solve_kwargs", None),
+            jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
+            multi_gpu=merged_kwargs.get("multi_gpu", False),
+            clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
