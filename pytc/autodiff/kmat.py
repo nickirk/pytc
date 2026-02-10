@@ -392,25 +392,21 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     return K3_kernel
 
 
-@jax.jit
-def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
+@partial(jax.jit, static_argnums=(6,))
+def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_size=128):
     """JITted version of K1 contraction.
     
     Memory-optimized: processes each spatial component (x, y, z) sequentially
     to avoid creating the full C_grad tensor of shape (Np, Nq, N_fused, 3).
     Peak memory is reduced from O(Np*Nq*N_fused*3) to O(Np*Nq*N_fused).
+    
+    Args:
+        rank_block_size: Block size for scanning the ISDF rank dimension.
+            Larger values = fewer scan iterations but more VRAM per step.
+            This is a static argument — JAX recompiles if it changes.
     """
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
-    
-    # Process K1 in chunks of l (rank index) to avoid O(N^2 * N_rank) memory usage.
-    
-    # Define dimensions first
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
-    N_fused = U1.shape[0]
-    
-    # Process K1 in chunks of l (rank index) to avoid O(N^2 * N_rank) memory usage.
     
     # Define dimensions first
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
@@ -419,7 +415,6 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
     
     # We iterate over blocks of l.
     n_rank = U1.shape[1]
-    rank_block_size = 128
     
     # Pad rank dimension to multiple of block size
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
@@ -485,7 +480,16 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1):
     
     return K1_final
 
-def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
+def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None, rank_block_size=None,
+                     gpu_max_memory_mb=None):
+    """Contract K1 using ISDF decomposition.
+    
+    Args:
+        rank_block_size: Override for the ISDF rank scan block size.
+            If None, an adaptive size is computed based on the orbital
+            slice dimensions and available GPU memory.
+        gpu_max_memory_mb: GPU memory budget for adaptive block sizing.
+    """
     if ranges is None:
         slice_p = slice_q = slice_r = slice_s = slice(None)
     else:
@@ -497,7 +501,14 @@ def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None):
     phi_s = phi_piv[slice_s]
     grad_phi_p = grad_phi_piv[slice_p]
     
-    return contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1)
+    if rank_block_size is None:
+        from pytc.solver.gpu_memory import adaptive_rank_block_size
+        rank_block_size = adaptive_rank_block_size(
+            phi_p.shape[0], phi_q.shape[0], U1.shape[0],
+            gpu_max_memory_mb=gpu_max_memory_mb)
+    
+    return contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1,
+                                rank_block_size)
 
 
 def contract_K3_isdf(phi_piv, U3, ranges=None):
@@ -523,9 +534,14 @@ def contract_K3_isdf(phi_piv, U3, ranges=None):
     phi_r = phi_piv[slice_r]
     phi_s = phi_piv[slice_s]
     
-@jax.jit
-def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3):
-    """JITted version of K3 contraction."""
+@partial(jax.jit, static_argnums=(5,))
+def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
+    """JITted version of K3 contraction.
+    
+    Args:
+        rank_block_size: Block size for scanning the ISDF rank dimension.
+            This is a static argument — JAX recompiles if it changes.
+    """
     
     # Process K3 in chunks of l (rank index) to avoid O(N^2 * N_rank) memory usage.
     
@@ -534,7 +550,6 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3):
     N_fused = U3.shape[0]
     
     n_rank = N_fused
-    rank_block_size = 128
     
     # Pad rank dimension
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
@@ -583,7 +598,15 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3):
     
     return K3_final
 
-def contract_K3_isdf(phi_piv, U3, ranges=None):
+def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
+                     gpu_max_memory_mb=None):
+    """Contract K3 using ISDF decomposition.
+    
+    Args:
+        rank_block_size: Override for the ISDF rank scan block size.
+            If None, an adaptive size is computed.
+        gpu_max_memory_mb: GPU memory budget for adaptive block sizing.
+    """
     if ranges is None:
         slice_p = slice_q = slice_r = slice_s = slice(None)
     else:
@@ -594,4 +617,10 @@ def contract_K3_isdf(phi_piv, U3, ranges=None):
     phi_r = phi_piv[slice_r]
     phi_s = phi_piv[slice_s]
     
-    return contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3)
+    if rank_block_size is None:
+        from pytc.solver.gpu_memory import adaptive_rank_block_size
+        rank_block_size = adaptive_rank_block_size(
+            phi_p.shape[0], phi_q.shape[0], U3.shape[0],
+            gpu_max_memory_mb=gpu_max_memory_mb)
+    
+    return contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size)

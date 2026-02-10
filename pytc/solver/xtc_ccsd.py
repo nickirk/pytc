@@ -9,6 +9,8 @@ from pyscf.cc import rintermediates as imd
 from pyscf import ao2mo
 from pyscf.ao2mo import _ao2mo
 
+from pytc.solver.gpu_memory import estimate_blksize
+
 logger = logging.getLogger(__name__)
 
 class RCCSD(rccsd.RCCSD):
@@ -281,7 +283,24 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vovo = get_block_df('vovo') 
         # eris.voov = get_block_df('voov') # Unused?
         
-        eris.vvvv = None
+        # Tiered VVVV: materialize only if V^4 fits in a fraction of memory budget
+        from pytc.solver.gpu_memory import get_gpu_budget_bytes
+        vvvv_bytes = float(nvir)**4 * 8
+        gpu_budget = get_gpu_budget_bytes(getattr(cc, 'gpu_max_memory', None))
+        host_budget = getattr(cc, 'max_memory', 4000) * 1e6
+        # Use 30% of the smaller budget as threshold for incore VVVV
+        vvvv_budget = min(gpu_budget, host_budget) * 0.3
+        if vvvv_bytes < vvvv_budget:
+            logger.info(f"Materializing VVVV incore ({vvvv_bytes/1e9:.2f} GB < budget {vvvv_budget/1e9:.2f} GB)")
+            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str='vvvv'))
+            L_vv_local = lib.unpack_tril(eris.vvL[:], axis=0)
+            std_part = np.tensordot(L_vv_local, L_vv_local, axes=((2,), (2,)))
+            del L_vv_local
+            eris.vvvv = tc_part + std_part
+            del tc_part, std_part
+        else:
+            logger.info(f"VVVV too large for incore ({vvvv_bytes/1e9:.2f} GB > budget {vvvv_budget/1e9:.2f} GB), using on-the-fly")
+            eris.vvvv = None
         
         del Loo, Lov, Lov_reshaped
 
@@ -314,7 +333,19 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.ovvv = get_block('ovvv')
         eris.vvov = get_block('vvov')
         eris.vovv = get_block('vovv')
-        eris.vvvv = None
+        
+        # Tiered VVVV: materialize only if V^4 fits in memory budget
+        from pytc.solver.gpu_memory import get_gpu_budget_bytes
+        vvvv_bytes = float(nvir)**4 * 8
+        gpu_budget = get_gpu_budget_bytes(getattr(cc, 'gpu_max_memory', None))
+        host_budget = getattr(cc, 'max_memory', 4000) * 1e6
+        vvvv_budget = min(gpu_budget, host_budget) * 0.3
+        if vvvv_bytes < vvvv_budget:
+            logger.info(f"Materializing VVVV incore ({vvvv_bytes/1e9:.2f} GB < budget {vvvv_budget/1e9:.2f} GB)")
+            eris.vvvv = get_block('vvvv')
+        else:
+            logger.info(f"VVVV too large for incore ({vvvv_bytes/1e9:.2f} GB > budget {vvvv_budget/1e9:.2f} GB), using on-the-fly")
+            eris.vvvv = None
         
         return eris
 
@@ -339,17 +370,22 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     xtc_obj = cc.xtc_obj
     jastrow_params = cc.jastrow_params
 
-    # Memory-efficient block size
-    mem_host = cc.max_memory * 1e6
-    mem_gpu = cc.gpu_max_memory * 1e6
-    # vvvv_block shape: (blksize, nvir, nvir, nvir)
-    blksize = max(1, int(min(mem_host, mem_gpu) / (nvir**3 * 8)))
-    blksize = min(nvir, blksize)
-    
-    # Pre-unpack L_vv_full if using density fitting to avoid repeated IO/unpacking
+    # Resolve with_df early — needed by both blksize estimation and the loop
     with_df = getattr(cc, 'with_df', None)
     if with_df is None and getattr(cc._scf, 'with_df', None):
          with_df = cc._scf.with_df
+
+    # Memory-efficient block size using centralized utility
+    _naux = None
+    if with_df is not None and hasattr(eris, 'vvL'):
+        _naux = eris.vvL.shape[1]
+    blksize, _ = estimate_blksize(
+        nocc, nvir, 'vvvv',
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        naux=_naux)
+    
+    # Pre-unpack L_vv_full if using density fitting to avoid repeated IO/unpacking
     
     L_vv_full = None
     if with_df is not None:
@@ -742,18 +778,11 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
         ds = getattr(eris, name)
         
         if name == 'ovvv': # (k, c, a, d) - iterate 'a' (idx 2)
-            mem_host = eris.max_memory * 1024**2
-            try:
-                stats = jax.devices()[0].memory_stats()
-                logger.debug(f"    Raw GPU stats (_compute_large_blocks, ovvv): {stats}")
-                # Use (limit - in_use) to get actual free space, 
-                # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
-                mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-            except:
-                mem_gpu = eris.gpu_max_memory * 1024**2
-            max_mem = min(mem_host, mem_gpu) * 0.3
-            logger.debug(f"    Max memory for ovvv: {max_mem/1024**3:.2f} GB")
-            blksize = min(nvir, max(4, int(max_mem/((nocc*nvir*nvir)*8))))
+            blksize, _ = estimate_blksize(
+                nocc, nvir, 'ovvv_eri_build',
+                gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
+                host_max_memory_mb=getattr(eris, 'max_memory', None))
+            blksize = max(4, blksize)
             logger.debug(f"    Blksize for ovvv: {blksize}")
             for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
@@ -767,18 +796,11 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                  ds[:, :, p0:p1, :] = std_blk + tc_blk
 
         elif name == 'vovv': # (c, k, a, d) - iterate 'c' (idx 0)
-            mem_host = eris.max_memory * 1024**2
-            try:
-                stats = jax.devices()[0].memory_stats()
-                logger.debug(f"    Raw GPU stats (_compute_large_blocks, vovv): {stats}")
-                # Use (limit - in_use) to get actual free space, 
-                # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
-                mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-            except:
-                mem_gpu = eris.gpu_max_memory * 1024**2
-            max_mem = min(mem_host, mem_gpu) * 0.3
-            logger.debug(f"    Max memory for vovv: {max_mem/1024**3:.2f} GB")
-            blksize = min(nvir, max(4, int(max_mem/((nocc*nvir*nvir)*8))))
+            blksize, _ = estimate_blksize(
+                nocc, nvir, 'vovv_eri_build',
+                gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
+                host_max_memory_mb=getattr(eris, 'max_memory', None))
+            blksize = max(4, blksize)
             logger.debug(f"    Blksize for vovv: {blksize}")
             for p0, p1 in lib.prange(0, nvir, blksize):
                 Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)

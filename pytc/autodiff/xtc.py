@@ -520,16 +520,20 @@ class XTC(TC):
         return eris
 
 
-@jax.jit
-def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
-    """JITted version of Delta U contraction."""
+@partial(jax.jit, static_argnums=(6,))
+def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
+                                   rank_block_size=128):
+    """JITted version of Delta U contraction.
+    
+    Args:
+        rank_block_size: Block size for scanning the ISDF rank dimension.
+            This is a static argument — JAX recompiles if it changes.
+    """
     
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
     N_rank_D = D.shape[0] 
     N_rank_X = X_sliced.shape[2]
-    
-    rank_block_size = 128
     
     # Term 1 & 4: T_D = sum_{a,d} (phi_p*phi_q)_a * D[a,d] * (phi_r*phi_s)_d
     # Scan over blocks of d (second index of D)
@@ -1347,29 +1351,29 @@ class ISDFXTC(XTC, ISDFTC):
         Ns, s_idx = get_info(slice_s, self.n_orb)
         N_rank = X.shape[2]
         
-        # Check size of X_sliced in GB
-        try:
-            stats = jax.devices()[0].memory_stats()
-            logger.debug(f"    Raw GPU stats (_contract_delta_U_kernels): {stats}")
-            # Use (limit - in_use) to get actual free space, 
-            # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
-            mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-        except:
-            mem_gpu = 1000 * 1024**2
-        # convert to GB
-        mem_gpu_gb = mem_gpu / (1024.0**3)
-        threshold = mem_gpu_gb * 0.3
+        # Check size of X_sliced vs available GPU memory
+        from pytc.solver.gpu_memory import get_gpu_budget_bytes, adaptive_rank_block_size
+        gpu_budget = get_gpu_budget_bytes(getattr(self, 'gpu_max_memory', None))
+        available_gb = gpu_budget / (1024.0**3)
+        # Use 30% of total budget as threshold for X_sliced loading
+        threshold = available_gb * 0.3
         x_sliced_size_gb = (float(Nr) * float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
         logger.debug(f"  X_sliced dimensions: ({Nr}, {Ns}, {N_rank}) -> {x_sliced_size_gb:.2f} GB (Threshold: {threshold:.2f} GB)")
         
         phi_p = self.phi_isdf[slice_p]
         phi_q = self.phi_isdf[slice_q]
         
+        # Compute adaptive rank block size for this orbital slice
+        _rbs = adaptive_rank_block_size(
+            Np, Nq, N_rank,
+            gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
+        
         if x_sliced_size_gb < threshold:
             phi_r = self.phi_isdf[slice_r]
             phi_s = self.phi_isdf[slice_s]
             X_sliced = X[slice_r, slice_s]
-            return _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s)
+            return _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
+                                                  _rbs)
         
         # Chunking strategy to avoid VRAM exhaustion
         logger.warning(f"  X_sliced ({x_sliced_size_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
@@ -1394,7 +1398,8 @@ class ISDFXTC(XTC, ISDFTC):
                 # Advanced indexing for chunking
                 X_chunk = X[curr_r_idx, slice_s]
                 
-                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r_chunk, phi_s)
+                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r_chunk, phi_s,
+                                                          _rbs)
                 result[:, :, i:i_end, :] = np.asarray(res_chunk)
                 del res_chunk
                 gc.collect()
@@ -1412,7 +1417,8 @@ class ISDFXTC(XTC, ISDFTC):
                 phi_s_chunk = self.phi_isdf[curr_s_idx]
                 X_chunk = X[slice_r, curr_s_idx]
                 
-                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r, phi_s_chunk)
+                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r, phi_s_chunk,
+                                                          _rbs)
                 result[:, :, :, i:i_end] = np.asarray(res_chunk)
                 del res_chunk
                 gc.collect()

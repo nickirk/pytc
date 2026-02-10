@@ -9,6 +9,7 @@ from pyscf import ao2mo
 from pyscf.ao2mo import _ao2mo
 
 from pytc.solver import xtc_ccsd
+from pytc.solver.gpu_memory import estimate_blksize, get_gpu_budget_bytes
 from pytc.autodiff.xtc import XTC, ISDFXTC
 
 # JAX config
@@ -192,15 +193,17 @@ def _update_amps(cc, t1, t2, eris):
     mo_e_v = jnp.diag(fock_jax)[nocc:] + cc.level_shift
     fov = fock_jax[:nocc, nocc:]
     
-    # ERIs (Small blocks) -> GPU
+    # === Phase 1: Load ERIs needed for F-intermediates, accumulator base, T1 core ===
+    # ovov is used heavily throughout (F-intermediates, Wvoov/Wvovo base, T1 core)
     eris_ovov = jnp.asarray(eris.ovov)
+    # ovvo needed for Wvoov base and T1 core
     eris_ovvo = jnp.asarray(eris.ovvo)
+    # oovv needed for Wvovo base, T1 core, and VOVV loop
     eris_oovv = jnp.asarray(eris.oovv)
+    # ovoo needed for accumulator base, T1 core, and Loo
     eris_ovoo = jnp.asarray(eris.ovoo)
-    eris_oooo = jnp.asarray(eris.oooo)
-    eris_vooo = jnp.asarray(eris.vooo)
-    eris_vovo = jnp.asarray(eris.vovo)
-    logger.debug(f"    Data transfer to GPU took {time.perf_counter()-t_start:.4f} s")
+    # oooo, vooo, vovo deferred to Phase 6 (basic T2 terms)
+    logger.debug(f"    Phase 1 data transfer to GPU took {time.perf_counter()-t_start:.4f} s")
     t_kernels = time.perf_counter()
     
     # 2. Compute intermediates (Micro-Kernels)
@@ -222,19 +225,13 @@ def _update_amps(cc, t1, t2, eris):
     # Total needed for full GPU accumulators: 2*size_W + 2*size_tmp + Lvv (negligible)
     total_acc_mem = 2 * size_W + 2 * size_tmp
     
-    # Query available GPU memory
-    available_mem = 0
-    try:
-        stats = jax.devices()[0].memory_stats()
-        logger.debug(f"    Raw GPU stats: {stats}")
-        # available = limit - in_use. Leave 20% buffer.
-        available_mem = stats['bytes_limit'] - stats['bytes_in_use']
-        use_gpu_acc = (available_mem * 0.8) > total_acc_mem
-    except:
-        # Fallback if stats not available (e.g. CPU or some backends)
-        use_gpu_acc = False
+    # Use centralized GPU budget utility for accumulator decision
+    _gpu_max = getattr(cc, 'gpu_max_memory', None)
+    use_gpu_acc_flag, _ = estimate_blksize(
+        nocc, nvir, 'acc_decision', gpu_max_memory_mb=_gpu_max)
+    use_gpu_acc = bool(use_gpu_acc_flag)
         
-    logger.debug(f"    Accumulators need {total_acc_mem/1024**3:.2f} GB. GPU available: {available_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
+    logger.debug(f"    Accumulators need {total_acc_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
 
     # Initialize accumulators with non-ovvv terms
     if use_gpu_acc:
@@ -321,19 +318,13 @@ def _update_amps(cc, t1, t2, eris):
     tau_jax = t2_jax + jnp.einsum('ia,jb->ijab', t1_jax, t1_jax)
 
     # --- OVVV Processing (Hybrid) ---
-    mem_host = cc.max_memory * 1e6
-    try:
-        stats = jax.devices()[0].memory_stats()
-        logger.debug(f"    Raw GPU stats (_update_amps, process_ovvv_block): {stats}")
-        # Use (limit - in_use) to get actual free space, 
-        # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
-        mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-    except:
-        mem_gpu = cc.gpu_max_memory * 1024**2
-
-    max_mem = min(mem_host, mem_gpu) * 0.3
-    blksize = max(4, int(max_mem / (nocc*nvir*nvir*8)))
-    blksize = min(nvir, blksize)
+    _gpu_max = getattr(cc, 'gpu_max_memory', None)
+    _host_max = getattr(cc, 'max_memory', None)
+    blksize, _ = estimate_blksize(
+        nocc, nvir, 'ovvv',
+        gpu_max_memory_mb=_gpu_max,
+        host_max_memory_mb=_host_max,
+        include_accumulators=use_gpu_acc)
     
     if isinstance(eris.ovvv, np.ndarray):
         ovvv_jax = jnp.asarray(eris.ovvv)
@@ -355,15 +346,27 @@ def _update_amps(cc, t1, t2, eris):
              tmp_a_acc += np.asarray(tmp_a_p)
              tmp_b_acc += np.asarray(tmp_b_p)
     else:
+        # Double-buffered: prefetch next block while GPU computes current block
+        # Pre-load first block
+        p0 = 0
+        p1 = min(blksize, nvir)
+        ovvv_blk_jax = jnp.asarray(xtc_ccsd._get_slice(eris.ovvv, slice(p0, p1), axis=2))
+        
         for p0 in range(0, nvir, blksize):
             p1 = min(p0 + blksize, nvir)
-            ovvv_blk = xtc_ccsd._get_slice(eris.ovvv, slice(p0, p1), axis=2)
-            ovvv_blk_jax = jnp.asarray(ovvv_blk)
+            # Current block is already on GPU (prefetched)
+            cur_blk_jax = ovvv_blk_jax
             
             t0_comp = time.perf_counter()
             t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk = kernel_process_ovvv_block(
-                ovvv_blk_jax, t1_jax, t2_jax, tau_jax
+                cur_blk_jax, t1_jax, t2_jax, tau_jax
             )
+            
+            # Prefetch next block while GPU computes (async H2D transfer)
+            next_p0 = p0 + blksize
+            if next_p0 < nvir:
+                next_p1 = min(next_p0 + blksize, nvir)
+                ovvv_blk_jax = jnp.asarray(xtc_ccsd._get_slice(eris.ovvv, slice(next_p0, next_p1), axis=2))
             
             # Accumulate on Host
             t1new_host[:, p0:p1] += np.asarray(t1_upd)
@@ -391,7 +394,7 @@ def _update_amps(cc, t1, t2, eris):
                 t_trans_blk = time.perf_counter() - t0_trans
                 logger.debug(f"      OVVV block {p0}:{p1}: Comp {t_comp_blk:.4f}s, Host accum {t_trans_blk:.4f}s")
             
-            del ovvv_blk_jax, t1_upd, Lvv_blk
+            del cur_blk_jax, t1_upd, Lvv_blk
     t_t2 = time.perf_counter()
             
     # --- T2 Updates ---
@@ -405,26 +408,32 @@ def _update_amps(cc, t1, t2, eris):
         t2new_jax += (tmp + tmp.transpose(1, 0, 3, 2))
     else:
         mem_host = cc.max_memory * 1e6
-        try:
-            stats = jax.devices()[0].memory_stats()
-            logger.debug(f"    Raw GPU stats (_update_amps, process_vovv_block): {stats}")
-            # Use (limit - in_use) to get actual free space, 
-            # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
-            mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-        except:
-            mem_gpu = cc.gpu_max_memory * 1024**2
-        max_mem = min(mem_host, mem_gpu) * 0.3
-        blksize_t2 = max(4, int(max_mem / (nvir*nocc*nvir*8)))
-        blksize_t2 = min(nvir, blksize_t2)
+        blksize_t2, _ = estimate_blksize(
+            nocc, nvir, 'vovv',
+            gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+            host_max_memory_mb=getattr(cc, 'max_memory', None),
+            include_accumulators=use_gpu_acc)
+        
+        # Double-buffered: prefetch next block while GPU computes current block
+        # Pre-load first block
+        p0_first = 0
+        p1_first = min(blksize_t2, nvir)
+        vovv_slice_jax = jnp.asarray(xtc_ccsd._get_slice(eris.vovv, slice(p0_first, p1_first), axis=0))
         
         for p0 in range(0, nvir, blksize_t2):
             p1 = min(p0 + blksize_t2, nvir)
-            vovv_slice = xtc_ccsd._get_slice(eris.vovv, slice(p0, p1), axis=0)
-            vovv_slice_jax = jnp.asarray(vovv_slice)
+            cur_vovv_jax = vovv_slice_jax
             t1_slice_jax = t1_jax[:, p0:p1]
             
             t0_comp = time.perf_counter()
-            term = kernel_process_vovv_block(vovv_slice_jax, eris_oovv, t1_slice_jax, t1_jax)
+            term = kernel_process_vovv_block(cur_vovv_jax, eris_oovv, t1_slice_jax, t1_jax)
+            
+            # Prefetch next block while GPU computes (async H2D transfer)
+            next_p0 = p0 + blksize_t2
+            if next_p0 < nvir:
+                next_p1 = min(next_p0 + blksize_t2, nvir)
+                vovv_slice_jax = jnp.asarray(xtc_ccsd._get_slice(eris.vovv, slice(next_p0, next_p1), axis=0))
+            
             term.block_until_ready()
             t_comp = time.perf_counter() - t0_comp
             
@@ -432,12 +441,16 @@ def _update_amps(cc, t1, t2, eris):
             t2new_host[:, :, p0:p1, :] += np.asarray(term)
             t_trans = time.perf_counter() - t0_trans
             logger.debug(f"      VOVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
+            del cur_vovv_jax
         
         t2new_host = t2new_host + t2new_host.transpose(1, 0, 3, 2)
         
     t2new_host += np.asarray(t2new_jax)
     del t2new_jax
     logger.debug(f"    T2 core updates (VOVV) took {time.perf_counter()-t_t2:.4f} s")
+    
+    # === Phase 5: Free eris_oovv (no longer needed after VOVV) ===
+    del eris_oovv
     
     # --- Output Preparation ---
     
@@ -448,6 +461,14 @@ def _update_amps(cc, t1, t2, eris):
         Wvovo_acc = jnp.asarray(Wvovo_acc)
         tmp_a_acc = jnp.asarray(tmp_a_acc)
         tmp_b_acc = jnp.asarray(tmp_b_acc)
+    
+    # === Phase 6: Load deferred ERIs for basic T2 terms ===
+    eris_oooo = jnp.asarray(eris.oooo)   # ~3 MB (tiny)
+    eris_vooo = jnp.asarray(eris.vooo)   # ~77 MB
+    eris_vovo = jnp.asarray(eris.vovo)   # ~2 GB
+    # Reload eris_ovvo (needed for tmp2 below; was freed implicitly or still live)
+    # It was loaded in Phase 1 and not freed, so it's still available.
+    logger.debug(f"    Phase 6 deferred ERI load done")
         
     # Basic T2 terms
     t2new_basic = jnp.zeros_like(t2_jax)
@@ -492,6 +513,13 @@ def _update_amps(cc, t1, t2, eris):
     t2new_host += np.asarray(tmp)
     del tmp, tmp2, tmp3, tmp4, tmp5
 
+    # === Phase 7: Free all ERIs before VVVV to maximize headroom ===
+    del eris_ovov, eris_ovvo, eris_ovoo
+    del eris_oooo, eris_vooo, eris_vovo
+    del Wvoov_acc, Wvovo_acc, tmp_a_acc, tmp_b_acc, Lvv_acc
+    del Loo_jax, Woooo_jax
+    logger.debug(f"    Phase 7: freed ERIs/accumulators before VVVV")
+
     # --- VVVV Contraction ---
     _contract_vvvv_t2(cc, tau_jax, eris, t2new_host)
     
@@ -527,28 +555,20 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         t2new_host += np.asarray(term)
         return
 
-    mem_host = cc.max_memory * 1e6
-    try:
-        stats = jax.devices()[0].memory_stats()
-        logger.debug(f"    Raw GPU stats (contract_vvvv): {stats}")
-        # Use (limit - in_use) to get actual free space, 
-        # because bytes_reservable_limit might be equal to limit if JAX pre-allocated everything.
-        mem_gpu = stats['bytes_limit'] - stats['bytes_in_use']
-    except:
-        mem_gpu = cc.gpu_max_memory * 1024**2
-        
-    # Adaptive block size based on VRAM
-    # Need to fit vvvv_block (blk*nvir^3), t2 (O^2 V^2), output (O^2 blk V).
-    # Approx: blk * nvir^3 * 8
-    avail_gpu = mem_gpu * 0.3
-    # Use 80% of available free memory for the block (since we already subtracted usage)
-    blksize = max(1, int(avail_gpu / (nvir**3 * 8)))
-    blksize = min(nvir, blksize)
-    logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
-
+    # Determine naux for DF overhead estimation
     with_df = getattr(cc, 'with_df', None)
     if with_df is None and getattr(cc._scf, 'with_df', None):
          with_df = cc._scf.with_df
+    _naux = None
+    if with_df is not None and hasattr(eris, 'vvL'):
+        _naux = eris.vvL.shape[1]
+
+    blksize, _ = estimate_blksize(
+        nocc, nvir, 'vvvv',
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        naux=_naux)
+    logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
     
     L_vv_full_jax = None
     if with_df is not None:
