@@ -23,7 +23,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, multi_gpu=False):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, multi_gpu=False, clip_multiplier=5.0):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -34,6 +34,7 @@ class NewtonOptimizer:
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
         self.jacobian_sample_size = jacobian_sample_size
         self.multi_gpu = multi_gpu
+        self.clip_multiplier = clip_multiplier
 
     def _get_vmap(self):
         """Return the appropriate vmap implementation.
@@ -123,6 +124,18 @@ class NewtonOptimizer:
                 )(sub_walkers, params)
                 
                 n_walkers = sample_size
+                
+                # Clip energies to suppress outliers.  The gradient is
+                # 2/(M-1) * J^T @ (E - mean(E)), so clipping energies
+                # naturally limits the influence of extreme walkers.
+                if self.clip_multiplier > 0:
+                    e_mean_raw = jnp.mean(energies)
+                    e_std_raw = jnp.mean(jnp.abs(energies - e_mean_raw))
+                    energies = jnp.clip(
+                        energies,
+                        e_mean_raw - self.clip_multiplier * e_std_raw,
+                        e_mean_raw + self.clip_multiplier * e_std_raw,
+                    )
                 
                 # Flatten Jacobian params structure to (M, P_total) matrix
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
@@ -307,6 +320,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             solve_kwargs=merged_kwargs.get("solve_kwargs", None),
             jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
             multi_gpu=merged_kwargs.get("multi_gpu", False),
+            clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
