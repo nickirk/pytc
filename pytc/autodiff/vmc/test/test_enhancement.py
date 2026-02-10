@@ -23,7 +23,7 @@ from pytc.autodiff.ansatz.det import (
 )
 from pytc.autodiff.ansatz.sj import SlaterJastrow, update_jastrow_one_electron, compute_jastrow_log_value
 from pytc.autodiff.jastrow import CompositeJastrow, NuclearCusp, BoysHandy
-from pytc.autodiff.vmc.walker import Walker, initialize_walker_state, initialize_walkers
+from pytc.autodiff.vmc.walker import initialize_walkers
 from pytc.autodiff.vmc.loss import make_variance_loss
 from pytc.autodiff.vmc.optimizer import NewtonOptimizer
 from pytc.autodiff.vmc.metropolis import metropolis_hastings
