@@ -247,21 +247,52 @@ def estimate_blksize(nocc, nvir, phase, *,
         # This already accounts for the pre-allocation fraction (default 75%)
         # AND any resident tensors (ISDF kernels, phi_isdf, etc.).
         gpu_free = _get_gpu_free_bytes()
+
+        # ----- Scan workspace overhead (constant, independent of blk) -----
+        # Inside each ISDF scan JIT (contract_K1_minus_K2_isdf_jit, etc.)
+        # the dominant intermediate is:
+        #   W: (N_fused, rank_block_size, max(Np,Nq)) × 8 bytes
+        # This must be subtracted from the GPU budget *before* we divide
+        # by the per-blk cost.
+        #
+        # Compute rank_block_size the same way adaptive_rank_block_size does:
+        N_fused = naux if naux is not None else 0
+        if N_fused > 0:
+            _Np = O  # bra dimension (nocc for ovvv/vovv)
+            _Nq = V  # ket dimension
+            _peak_per_rank = max(_Np * N_fused + _Np * _Nq,
+                                 N_fused * _Nq + _Np * _Nq, 1) * B
+            import math
+            _rank_blk = max(64, int(gpu_free * 0.5 / _peak_per_rank))
+            _rank_blk = 2 ** int(math.log2(max(_rank_blk, 1)))
+            _rank_blk = min(_rank_blk, 2048, N_fused)
+            _rank_blk = max(_rank_blk, 64)
+            # W intermediate: (N_fused, rank_blk, max(Np,Nq))
+            scan_workspace = N_fused * _rank_blk * max(_Np, _Nq) * B
+        else:
+            scan_workspace = 0
+
         # With host-side accumulation in get_2b / get_delta_U, the GPU only
-        # ever holds ONE contraction output (1S) at a time — each piece is
-        # transferred to host via np.asarray() before computing the next.
-        # Use 2× to cover scan carry buffers and XLA scratch.
+        # ever holds ONE contraction output at a time.  Inside the scan:
+        #   carry: (Np, Nq, blk, Ns)   — 1S per unit blk
+        #   contribution: same          — 1S per unit blk
+        # Total per-blk = 2 × O × V × V × B.
         gpu_per_blk = O * V * V * B * 2
+
+        # Available GPU after subtracting scan workspace overhead
+        gpu_available = max(gpu_free - scan_workspace, 0)
 
         # Blksize is the min of host-derived and GPU-derived limits
         host_blk = max(1, int(host_budget * 0.8 / host_per_blk))
-        gpu_blk = max(1, int(gpu_free * 0.8 / gpu_per_blk))
+        gpu_blk = max(1, int(gpu_available * 0.8 / gpu_per_blk))
         blksize = min(host_blk, gpu_blk, nvir)
 
         logger.debug(
             "estimate_blksize(phase=%s): host_budget=%.2f GB, gpu_free=%.2f GB, "
+            "scan_workspace=%.2f GB, gpu_available=%.2f GB, "
             "host_blk=%d, gpu_blk=%d → blksize=%d",
             phase, host_budget / 1e9, gpu_free / 1e9,
+            scan_workspace / 1e9, gpu_available / 1e9,
             host_blk, gpu_blk, blksize)
         return blksize, budget
 
