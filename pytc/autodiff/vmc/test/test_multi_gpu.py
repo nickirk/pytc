@@ -35,7 +35,6 @@ from pytc.autodiff.vmc.optimizer import NewtonOptimizer
 from pytc.autodiff.vmc.sharding import (
     create_mesh, shard_walker, replicate,
     pad_n_walkers, pad_walker,
-    get_walker_sharding, get_replicated_sharding,
     get_vmap_fn, is_multi_gpu, n_devices,
 )
 
