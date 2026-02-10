@@ -247,11 +247,12 @@ def make_variance_loss(
         use_custom_jvp: Whether to use custom JVP for memory-efficient gradients
         max_vmap_batch_size: If 0, use standard vmap. If >0, use folx.batched_vmap 
                             for memory efficiency. Recommended batch size: 10-50.
-        clip_multiplier: Multiplier for energy clipping range (clips to mean ± multiplier * std).
-                        Set to 0 to disable clipping.  Default 5.0, matching make_energy_loss.
+        clip_multiplier: Multiplier for energy clipping range (clips to mean ± multiplier
+                         * mean absolute deviation (MAD) of the local energy). Set to 0 to
+                         disable clipping. Default 5.0, matching make_energy_loss.
     
     Returns:
-        Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_std))
+        Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_mad))
     """
     
     # Choose vmap implementation based on max_vmap_batch_size
