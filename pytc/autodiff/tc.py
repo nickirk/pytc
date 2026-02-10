@@ -882,17 +882,62 @@ class ISDFTC(TC):
         
         return self.replace(isdf_kernels=kernels, save_path=out_path)
 
-    @staticmethod
-    @jax.jit
-    def _add_transposed_scaled(result, tmp, scale):
-        """Fused transpose(2,3,0,1) + scale + add — one XLA kernel, no intermediates."""
-        return result + jnp.transpose(tmp, (2, 3, 0, 1)) * scale
+    def _accumulate_transpose_block(self, result_np, U1, U3, ranges_T,
+                                    scale, n_sub=2):
+        """Compute transpose block in sub-chunks on GPU, accumulate on host.
+
+        Each sub-chunk is computed on GPU, transferred to host via np.asarray(),
+        and accumulated into the NumPy array ``result_np``.  GPU only ever holds
+        one sub-chunk at a time → peak GPU ≈ S/n_sub (not S).
+
+        Parameters
+        ----------
+        result_np : numpy array (Np, Nq, Nr, Ns) — host-side accumulator.
+        U1, U3 : ISDF kernels (on GPU).
+        ranges_T : (slice_r, slice_s, slice_p, slice_q) for the transpose block.
+        scale : float multiplier.
+        n_sub : int — number of sub-chunks (default 2).
+        """
+        slice_r_T, slice_s_T, slice_p_T, slice_q_T = ranges_T
+
+        # Determine start/stop for the first axis of the transpose block
+        nmo = self.phi_isdf.shape[0]
+        r_start = slice_r_T.start if slice_r_T.start is not None else 0
+        r_stop = slice_r_T.stop if slice_r_T.stop is not None else nmo
+        r_len = r_stop - r_start
+
+        # Determine chunk boundaries
+        chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+        for i0 in range(0, r_len, chunk_size):
+            i1 = min(i0 + chunk_size, r_len)
+            sub_slice_r = slice(r_start + i0, r_start + i1)
+            sub_ranges = (sub_slice_r, slice_s_T, slice_p_T, slice_q_T)
+
+            # K1-K2 sub-chunk on GPU
+            if sub_slice_r == slice_s_T:
+                tmp = kmat_jax.contract_K1_isdf(
+                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges)
+                tmp = tmp - tmp.transpose(1, 0, 2, 3)
+            else:
+                tmp = kmat_jax.contract_K1_minus_K2_isdf(
+                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges)
+
+            # K3 sub-chunk on GPU
+            tmp = tmp + kmat_jax.contract_K3_isdf(self.phi_isdf, U3, sub_ranges)
+
+            # Transfer to host and accumulate — frees GPU memory for next chunk
+            chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
+            del tmp
+            result_np[:, :, i0:i1, :] += chunk_np * scale
+            del chunk_np
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support.
 
-        Memory-optimized: uses fused K1-K2 contraction and sequential
-        accumulation to reduce GPU peak from ~5-6× to ~3× output size.
+        Memory-optimized: computes each piece on GPU, immediately transfers
+        to host, and accumulates on host (NumPy).  GPU only ever holds one
+        contraction output at a time → peak GPU ≈ 1S (one output block).
+        Returns a JAX array.
         """
         start_time = time.perf_counter()
         logger.debug("Starting ISDFTC.get_2b")
@@ -911,45 +956,36 @@ class ISDFTC(TC):
         slice_p, slice_q, slice_r, slice_s = ranges if ranges else (slice(None), slice(None), slice(None), slice(None))
         
         # --- Direct block: (K1 - K2 + K3)[pqrs] * 0.5 ---
+        # Compute K1-K2, transfer to host, then K3, transfer to host.
+        # Never hold two output-sized tensors on GPU simultaneously.
         if slice_p == slice_q:
-            # K1 - K2 = K1 - K1^T(pq), use the symmetry shortcut
-            result = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
-            result -= result.transpose(1, 0, 2, 3)
+            k12 = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
+            k12 = k12 - k12.transpose(1, 0, 2, 3)
         else:
-            # Fused K1 - K2 in a single scan pass (saves 1 full output array)
-            result = kmat_jax.contract_K1_minus_K2_isdf(
+            k12 = kmat_jax.contract_K1_minus_K2_isdf(
                 self.phi_isdf, self.grad_phi_isdf, U1, ranges)
         
-        result += kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges)
-        result *= 0.5
+        result_np = np.array(k12)  # writable host copy
+        del k12
+
+        k3 = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges)
+        result_np += np.asarray(k3)
+        del k3
+        result_np *= 0.5
         
         # --- Transpose block: (K1 - K2 + K3)[rspq] * 0.5, transposed to (pqrs) ---
         if slice_p == slice_r and slice_q == slice_s:
-            result += result.transpose(2, 3, 0, 1)
+            result_np += result_np.transpose(2, 3, 0, 1)
         else:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            slice_p_T, slice_q_T = slice_r, slice_s
-            
-            # Compute K1-K2 for transpose block and add to result directly
-            if slice_p_T == slice_q_T:
-                tmp = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
-                tmp -= tmp.transpose(1, 0, 2, 3)
-            else:
-                tmp = kmat_jax.contract_K1_minus_K2_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
-            # Fuse transpose+scale+add into one XLA kernel to avoid
-            # materializing separate transpose and scaled intermediates.
-            result = self._add_transposed_scaled(result, tmp, 0.5)
-            del tmp
-            
-            # K3 transpose block
-            tmp_k3 = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges_T)
-            result = self._add_transposed_scaled(result, tmp_k3, 0.5)
-            del tmp_k3
+            # Sub-chunk the transpose block on GPU, accumulate on host.
+            # GPU only holds one sub-chunk at a time.
+            self._accumulate_transpose_block(
+                result_np, U1, U3, ranges_T, scale=0.5, n_sub=2)
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
-        return -result
+        return jnp.asarray(-result_np)
 
     def get_3b_fock(self, jastrow_params, dm1, L_aux=None):
         """Get 3-body Fock matrix correction using ISDF.

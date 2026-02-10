@@ -17,12 +17,6 @@ from . import kmat as kmat_jax
 logger = logging.getLogger(__name__)
 
 
-@jax.jit
-def _neg_sum_transposed(a, b):
-    """Fused -(a + transpose(b, (2,3,0,1))) — one XLA kernel, no intermediates."""
-    return -(a + jnp.transpose(b, (2, 3, 0, 1)))
-
-
 @struct.dataclass
 class XTC(TC):
     """JAX implementation of extended transcorrelated methods using flax dataclass.
@@ -432,14 +426,19 @@ class XTC(TC):
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         
-        # Accumulate delta_U directly into tc_correction to avoid
-        # holding two output-sized arrays simultaneously.
-        result = super().get_2b(jastrow_params, ranges=ranges)
-        result = result + self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
+        # Accumulate on host to avoid holding two output-sized GPU tensors.
+        # ISDFTC.get_2b already returns via host internally.
+        tc_result = super().get_2b(jastrow_params, ranges=ranges)
+        result_np = np.array(tc_result)  # writable host copy
+        del tc_result
+        
+        delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
+        result_np += np.asarray(delta_U)
+        del delta_U
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"XTC.get_2b completed in {time.perf_counter() - start_time:.4f} s")
-        return result
+        return jnp.asarray(result_np)
 
     def get_const(self, jastrow_params, dm1=None, delta_h=None):
         """Compute constant contribution."""
@@ -1183,18 +1182,33 @@ class ISDFXTC(XTC, ISDFTC):
             
         result = self._contract_delta_U_kernels(kernels, ranges)
         
-        # Symmetrize the result
+        # Symmetrize the result: final = -(result + T_full.transpose(2,3,0,1))
         slice_p, slice_q, slice_r, slice_s = ranges
         
         if slice_p == slice_r and slice_q == slice_s:
             result = -(result + result.transpose(2, 3, 0, 1))
         else:
-            # Non-symmetric block: fuse transpose+add+negate to avoid
-            # materializing separate transpose and addition intermediates.
-            ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            tmp = self._contract_delta_U_kernels(kernels, ranges_T)
-            result = _neg_sum_transposed(result, tmp)
-            del tmp
+            # Transfer direct block to host, then sub-chunk the transpose
+            # block on GPU → accumulate on host.  Avoids holding two full
+            # output-sized tensors on GPU simultaneously.
+            result_np = -np.asarray(result)
+            del result
+            nmo = self.phi_isdf.shape[0]
+            r_start = slice_r.start if slice_r.start is not None else 0
+            r_stop = slice_r.stop if slice_r.stop is not None else nmo
+            r_len = r_stop - r_start
+            n_sub = 2
+            chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+            for i0 in range(0, r_len, chunk_size):
+                i1 = min(i0 + chunk_size, r_len)
+                sub_ranges = (slice(r_start + i0, r_start + i1),
+                              slice_s, slice_p, slice_q)
+                tmp = self._contract_delta_U_kernels(kernels, sub_ranges)
+                chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
+                del tmp
+                result_np[:, :, i0:i1, :] -= chunk_np
+                del chunk_np
+            result = jnp.asarray(result_np)
 
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
