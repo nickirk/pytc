@@ -23,7 +23,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -32,6 +32,7 @@ class NewtonOptimizer:
         self.max_vmap_batch_size = max_vmap_batch_size
         self.solver = solver
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
+        self.jacobian_sample_size = jacobian_sample_size
 
     def init(self, params, rng, batch):
         return 0  # step count
@@ -71,36 +72,52 @@ class NewtonOptimizer:
                 curvature_mat = (jac_centered.T @ jac_centered) / n_walkers
                 
             elif self.curvature_type == "gauss_newton":
-                # GN: G = 2/N * J_centered.T @ J_centered
+                # GN: G = 2/M * J_centered.T @ J_centered
                 # J_i = d(E_L(w_i))/dp
                 #
                 # Optimization: compute Jacobian and local energies in one pass,
                 # then derive the variance loss and gradient analytically:
-                #   variance = sum((E - mean(E))^2) / (N - 1)
-                #   grad_variance = 2/(N-1) * J^T @ (E - mean(E))
-                # This avoids the separate value_and_grad_func call which would
-                # redundantly compute local energies 2 more times.
+                #   variance = sum((E - mean(E))^2) / (M - 1)
+                #   grad_variance = 2/(M-1) * J^T @ (E - mean(E))
+                #
+                # When jacobian_sample_size > 0, a random subset of walkers is
+                # used for the Jacobian (gradient + curvature), reducing cost
+                # from O(N) to O(M) local-energy differentiations per step.
                 
                 def single_local_energy_and_grad(w, p):
                     """Compute both E_L(w) and grad_p E_L(w) in one pass."""
                     return jax.value_and_grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
                 
-                # Compute energies and Jacobian for all walkers simultaneously
+                n_walkers_total = walkers.shape[0]
+                
+                # Sub-sample walkers for the Jacobian if requested
+                if self.jacobian_sample_size > 0 and self.jacobian_sample_size < n_walkers_total:
+                    sample_size = self.jacobian_sample_size
+                    # Use rng to select a random subset of walker indices
+                    indices = jax.random.choice(rng, n_walkers_total,
+                                                shape=(sample_size,), replace=False)
+                    indices = jnp.sort(indices)  # sort for deterministic gather
+                    sub_walkers = jax.tree_util.tree_map(lambda x: x[indices], walkers)
+                else:
+                    sample_size = n_walkers_total
+                    sub_walkers = walkers
+                
+                # Compute energies and Jacobian for (sub-sampled) walkers
                 if self.max_vmap_batch_size > 0:
                     energies, jac = folx.batched_vmap(
                         single_local_energy_and_grad, 
                         max_batch_size=self.max_vmap_batch_size, 
                         in_axes=(0, None)
-                    )(walkers, params)
+                    )(sub_walkers, params)
                 else:
                     energies, jac = jax.vmap(
                         single_local_energy_and_grad, 
                         in_axes=(0, None)
-                    )(walkers, params)
+                    )(sub_walkers, params)
                 
-                n_walkers = walkers.shape[0]
+                n_walkers = sample_size
                 
-                # Flatten Jacobian params structure to (N, P_total) matrix
+                # Flatten Jacobian params structure to (M, P_total) matrix
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
                 jac_mat = jnp.concatenate([jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat], axis=1)
                 
@@ -112,7 +129,7 @@ class NewtonOptimizer:
                 aux_data = (e_mean, e_std)
                 
                 # Compute variance gradient analytically: 
-                # grad_variance = 2/(N-1) * J^T @ (E - mean(E))
+                # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
                 grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
                 
                 # Center the Jacobian for curvature matrix
@@ -290,7 +307,8 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             curvature_type=merged_kwargs.get("curvature", "fisher"),
             max_vmap_batch_size=merged_kwargs.get("max_vmap_batch_size", 0),
             solver=merged_kwargs.get("solver", "exact"),
-            solve_kwargs=merged_kwargs.get("solve_kwargs", None)
+            solve_kwargs=merged_kwargs.get("solve_kwargs", None),
+            jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")

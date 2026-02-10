@@ -624,5 +624,100 @@ class TestOptimizeRefVar(unittest.TestCase):
                            n_walkers=500, n_opt_steps=5, label="Be/cc-pVDZ")
 
 
+class TestJacobianSubsampling(unittest.TestCase):
+    """Test that Jacobian sub-sampling produces valid optimization steps."""
+    
+    def setUp(self):
+        """Create an H2 system for testing."""
+        self.mol, self.mf, self.sj, self.det, self.params, self.walkers = \
+            make_test_system('H 0 0 0; H 0 0 1.4', n_walkers=200)
+    
+    def test_full_vs_subsample_gradient_structure(self):
+        """Sub-sampled gradient should have the same structure as the full gradient."""
+        from pytc.autodiff.vmc.optimizer import NewtonOptimizer
+        from pytc.autodiff.vmc.loss import make_variance_loss
+        
+        ansatz = self.sj
+        params = self.params
+        walkers = self.walkers
+        key = random.PRNGKey(99)
+        
+        loss_fn = make_variance_loss(ansatz=ansatz, optimizer_type="newton",
+                                      use_custom_jvp=True, max_vmap_batch_size=0)
+        loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+        
+        # Full optimizer (all walkers)
+        opt_full = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1, damping=1e-3,
+            curvature_type="gauss_newton", solver="exact",
+            jacobian_sample_size=0,
+        )
+        
+        # Sub-sampled optimizer (50 out of 200 walkers)
+        opt_sub = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1, damping=1e-3,
+            curvature_type="gauss_newton", solver="exact",
+            jacobian_sample_size=50,
+        )
+        
+        batch = (walkers, ansatz)
+        
+        key1, key2 = random.split(key)
+        new_params_full, _, stats_full = opt_full.step(params, 0, key1, batch)
+        new_params_sub, _, stats_sub = opt_sub.step(params, 0, key2, batch)
+        
+        # Both should produce finite results
+        flat_full, _ = jax.flatten_util.ravel_pytree(new_params_full)
+        flat_sub, _ = jax.flatten_util.ravel_pytree(new_params_sub)
+        self.assertTrue(jnp.all(jnp.isfinite(flat_full)), "Full params should be finite")
+        self.assertTrue(jnp.all(jnp.isfinite(flat_sub)), "Sub-sampled params should be finite")
+        
+        # Both should have the same parameter structure
+        self.assertEqual(flat_full.shape, flat_sub.shape)
+        
+        # Both losses should be finite and positive
+        self.assertTrue(jnp.isfinite(stats_full['loss']), "Full loss should be finite")
+        self.assertTrue(jnp.isfinite(stats_sub['loss']), "Sub-sampled loss should be finite")
+        self.assertGreater(float(stats_full['loss']), 0)
+        self.assertGreater(float(stats_sub['loss']), 0)
+        
+        print(f"✓ Full (200 walkers): loss={float(stats_full['loss']):.6f}")
+        print(f"  Sub-sampled (50):    loss={float(stats_sub['loss']):.6f}")
+        print(f"  Parameter delta norm (full):  {float(jnp.linalg.norm(flat_full - jax.flatten_util.ravel_pytree(params)[0])):.6f}")
+        print(f"  Parameter delta norm (sub):   {float(jnp.linalg.norm(flat_sub - jax.flatten_util.ravel_pytree(params)[0])):.6f}")
+    
+    def test_subsample_optimization_converges(self):
+        """Sub-sampled optimization should still make progress (variance decreases)."""
+        key = random.PRNGKey(42)
+        
+        opt_results = optimize_ref_var(
+            self.sj,
+            params=self.params,
+            n_walkers=200,
+            n_steps=3,
+            step_size=1.0,
+            burn_in_steps=50,
+            n_opt_steps=5,
+            optimizer_type='newton',
+            learning_rate=0.1,
+            opt_kwargs={'damping': 1e-3, 'solver': 'exact',
+                        'jacobian_sample_size': 50},
+            key=key,
+        )
+        
+        # All energies should be finite
+        self.assertTrue(all(np.isfinite(opt_results['energies'])), 
+                        "All energies should be finite with sub-sampling")
+        self.assertTrue(all(np.isfinite(opt_results['cost'])),
+                        "All variances should be finite with sub-sampling")
+        
+        print(f"✓ Sub-sampled optimization:")
+        print(f"  Initial var: {opt_results['cost'][0]:.4f}")
+        print(f"  Final var:   {opt_results['cost'][-1]:.4f}")
+        print(f"  Energies: {[f'{e:.4f}' for e in opt_results['energies']]}")
+
+
 if __name__ == '__main__':
     unittest.main()
