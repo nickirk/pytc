@@ -227,11 +227,11 @@ class BoysHandy(Jastrow):
             total_val = jnp.sum(delta_vals * c_I * term_vals)
             return total_val
 
-        u_total = 0.0
-        for i in range(self.natom):
-            u_total += compute_term(i)
-            
-        return u_total
+        # Vectorize over all atoms instead of sequential Python loop.
+        # Each compute_term call is independent, so vmap parallelises them
+        # and produces a single fused XLA op (important for backprop efficiency).
+        atom_contributions = jax.vmap(compute_term)(jnp.arange(self.natom))
+        return jnp.sum(atom_contributions)
 
     def _compute(self, r1, r2, params):
         return self._compute_forward(r1, r2, params)
