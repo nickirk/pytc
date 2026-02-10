@@ -780,24 +780,6 @@ class ISDFTC(TC):
             
         return L_aux_out
 	
-        # full_xi_phi is already device-resident
-        gc.collect()
-        
-        logger.info(f"  Starting pmap for L_aux (n_fused={n_rank}, n_grid={n_grid})...")
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, None, None, None, None))
-        
-        # G_shards: (n_devices, N_rank, n_per_device, 3)
-        G_shards = pmapped_compute(sharded_grid, jastrow_params, full_grid, full_weights, full_xi_phi)
-        logger.debug("  L_aux pmap completed.")
-        
-        # Combine shards: (N_rank, N_grid_padded, 3)
-        G_padded = G_shards.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
-        
-        # Trim padding
-        G = G_padded[:, :n_grid, :]
-        
-        # L_aux = -G
-        return -G
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None):
         """Compute ISDF intermediates and store them.
