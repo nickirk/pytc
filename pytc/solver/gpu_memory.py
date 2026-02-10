@@ -247,11 +247,13 @@ def estimate_blksize(nocc, nvir, phase, *,
         # This already accounts for the pre-allocation fraction (default 75%)
         # AND any resident tensors (ISDF kernels, phi_isdf, etc.).
         gpu_free = _get_gpu_free_bytes()
-        # Peak in ISDFTC.get_2b (transpose-block addition):
-        #   result (1S) + tmp from K1-K2 (1S) + transpose+scale+add output (1S)
-        # = 3S, plus XLA BFC allocator fragmentation / scratch.
-        # Use 4× as a safe factor.
-        gpu_per_blk = O * V * V * B * 4
+        # Peak memory in XTC.get_2b (the caller of ISDFTC.get_2b + delta_U):
+        #   ISDFTC.get_2b needs up to 3S (result + tmp + output at transpose add)
+        #   XTC.get_2b holds the ISDFTC result (1S) while get_delta_U runs (3S)
+        #   → total peak = 1S + 3S = 4S
+        # Plus XLA BFC allocator fragmentation and scan carry buffers.
+        # Use 5× as a safe factor.
+        gpu_per_blk = O * V * V * B * 5
 
         # Blksize is the min of host-derived and GPU-derived limits
         host_blk = max(1, int(host_budget * 0.8 / host_per_blk))
