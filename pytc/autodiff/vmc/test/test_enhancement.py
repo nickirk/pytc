@@ -536,6 +536,10 @@ class TestShermanMorrison(unittest.TestCase):
 class TestOptimizeRefVar(unittest.TestCase):
     """Test full optimize_ref_var with different system sizes."""
     
+    def setUp(self):
+        """Clear JAX caches to avoid stale JIT artifacts from prior test classes."""
+        jax.clear_caches()
+    
     def _run_opt_test(self, atom_spec, basis='sto-3g', n_walkers=200, n_opt_steps=10, 
                       n_steps=3, label=""):
         """Helper to run optimize_ref_var and check basic sanity."""

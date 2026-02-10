@@ -11,6 +11,12 @@ from .mcmc_utils import (
     init_electron_configs
 )
 from .optimizer import create_optimizer, create_gradient_mask
+from .sharding import (
+    create_mesh, shard_walker, replicate,
+    pad_n_walkers, pad_walker,
+    get_walker_sharding, get_replicated_sharding,
+    get_vmap_fn, is_multi_gpu, n_devices,
+)
 
 __all__ = [
     # Walker functions
@@ -25,5 +31,10 @@ __all__ = [
     'optimize', 'optimize_ref_var',
     # Utility functions
     'prepare_sampling_results', 'report_progress', 'create_optimizer',
-    'init_electron_configs', 'create_gradient_mask'
+    'init_electron_configs', 'create_gradient_mask',
+    # Sharding utilities
+    'create_mesh', 'shard_walker', 'replicate',
+    'pad_n_walkers', 'pad_walker',
+    'get_walker_sharding', 'get_replicated_sharding',
+    'get_vmap_fn', 'is_multi_gpu', 'n_devices',
 ]

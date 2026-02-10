@@ -547,6 +547,7 @@ def optimize_ref_var(
     params=None,
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
+    multi_gpu: bool = False,
 ):
     """Perform variational Monte Carlo optimization using MCMC sampling.
 
@@ -568,6 +569,9 @@ def optimize_ref_var(
         move_type: "one" or "all" for MCMC electron moves
         opt_kwargs: Additional optimizer parameters
         params: Initial combined parameters [jastrow_params, linear_coeffs].
+        multi_gpu: If True, shard walkers across all available devices for
+                   data-parallel execution.  Requires n_walkers divisible by
+                   the device count (padding is added automatically).
 
     Returns:
         Dictionary with optimization results and statistics
@@ -586,32 +590,65 @@ def optimize_ref_var(
         if not isinstance(params, (list, tuple)) or len(params) != 2:
              raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
 
+    # ---- Multi-GPU setup ----
+    mesh = None
+    if multi_gpu:
+        from .sharding import (
+            create_mesh, shard_walker, replicate,
+            pad_n_walkers, pad_walker, n_devices as get_n_devices,
+        )
+        num_devices = get_n_devices()
+        if num_devices < 2:
+            print(f"Warning: multi_gpu=True but only {num_devices} device(s) found. "
+                  "Falling back to single-device mode.")
+            multi_gpu = False
+        else:
+            mesh = create_mesh()
+            padded_n = pad_n_walkers(n_walkers, num_devices)
+            if padded_n != n_walkers:
+                print(f"Padding n_walkers from {n_walkers} to {padded_n} "
+                      f"(divisible by {num_devices} devices)")
+                n_walkers = padded_n
+            print(f"Multi-GPU enabled: {num_devices} devices, "
+                  f"{n_walkers // num_devices} walkers/device")
+
     # Initialize walkers using the reference determinant's info
     ref_det = ansatz.dets[0]
     walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
 
     # Burn-in walkers using the initial combined parameters
+    # (burn-in runs on single device; sharding happens after)
     print("Performing burn-in...")
     walkers, acceptance_history, key, step_size = burn_in(
         ref_det, walkers, burn_in_steps, step_size, key, params=params, 
         move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
     print(f"Burn-in complete. Final step size: {step_size:.4f}")
 
+    # ---- Shard walkers across devices after burn-in ----
+    if multi_gpu and mesh is not None:
+        walkers = shard_walker(walkers, mesh)
+        params = replicate(params, mesh)
+        key = replicate(key, mesh)
+        print("Walkers sharded across devices.")
 
     # Create loss function using modular factory
+    # When multi_gpu, set max_vmap_batch_size=0 so loss uses jax.vmap
+    # (folx.batched_vmap doesn't preserve sharding)
+    loss_vmap_batch = 0 if multi_gpu else max_vmap_batch_size
     if cost_fn is None:
         # Use modular variance loss factory
         loss_fn = make_variance_loss(
             ansatz=ansatz,
             optimizer_type=optimizer_type,
             use_custom_jvp=True,
-            max_vmap_batch_size=max_vmap_batch_size
+            max_vmap_batch_size=loss_vmap_batch
         )
     else:
         loss_fn = cost_fn
 
     # Create MCMC step function
-    mcmc_step = make_mcmc_step(ref_det, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
+    mcmc_step = make_mcmc_step(ref_det, step_size, move_type,
+                               max_vmap_batch_size=0 if multi_gpu else max_vmap_batch_size)
 
     # Create optimizer and training step
     # Define loss function JVP for KFAC and Newton
@@ -622,6 +659,7 @@ def optimize_ref_var(
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
+        opt_kwargs["multi_gpu"] = multi_gpu
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
