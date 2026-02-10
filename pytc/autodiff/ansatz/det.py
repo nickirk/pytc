@@ -336,7 +336,6 @@ def compute_new_row(det: SlaterDet, ao_val, ao_grad, ao_lap, is_alpha):
     new_grad_row = jnp.einsum('xd,xj->jd', ao_grad, mo_coeff)
     new_lap_row = ao_lap @ mo_coeff
     return new_row, new_grad_row, new_lap_row
-    return new_row, new_grad_row, new_lap_row
 
 
 def compute_det_ratio_from_row(new_row, inv, row_idx):
