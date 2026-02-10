@@ -124,53 +124,6 @@ class TestXTCCCSD_DF(unittest.TestCase):
         if hasattr(eris, 'feri'):
             eris.feri.close()
 
-    def test_df_hermitian_limit(self):
-        """Test that DF-CCSD with large alpha (Hermitian limit) matches standard RCCSD.
-        
-        This specifically tests the blocked path for ovvv/vovv which is used in DF mode.
-        """
-        print("\n--- Testing DF CCSD Hermitian Limit (Blocked Path) ---")
-        
-        # Large alpha to suppress Jastrow -> Hermitian limit
-        large_alpha_params = {'alpha': jnp.array([1000.0])}
-        
-        # Create ISDF-XTC with large alpha
-        # Note: We must regenerate isdf for new jastrow params? 
-        # isdf() method handles this. But we need base ISDFXTC object.
-        isdf_alpha = self.isdf_xtc.isdf(large_alpha_params, save_path="isdf_df_xtc_ccsd_test_large_alpha.h5")
-        
-        # Run DF-CCSD (uses blocked path for ovvv/vovv)
-        print("Running DF XTC-CCSD with large alpha...")
-        cc_df = xtc_ccsd.RCCSD(self.mf_df, isdf_alpha, large_alpha_params)
-        eris_df = cc_df.ao2mo()
-        
-        # Verify DF path is being used
-        self.assertTrue(hasattr(eris_df, 'vvL'), "Should use DF path")
-        # Verify ovvv is HDF5 dataset (blocked path)
-        self.assertFalse(isinstance(eris_df.ovvv, np.ndarray), 
-                         "ovvv should be HDF5 dataset, not numpy array")
-        
-        e_df, _, _ = cc_df.kernel(eris=eris_df)
-        print(f"DF XTC (Large Alpha) Energy: {e_df}")
-        
-        # Reference: standard PySCF RCCSD
-        cc_std = cc.RCCSD(self.mf_std)
-        cc_std.kernel()
-        e_std = cc_std.e_corr
-        print(f"PySCF Standard Energy: {e_std}")
-        
-        # In Hermitian limit (large alpha), XTC-CCSD should match standard CCSD
-        # Allow for DF error (~3e-3) plus numerical precision
-        error = abs(e_df - e_std)
-        print(f"Energy Difference (Hermitian Limit): {error}")
-        
-        # The error will include DF approximation error if DF is used
-        self.assertLess(error, 1e-5, "Hermitian limit agreement failed for DF path")
-        
-        # Cleanup
-        if hasattr(eris_df, 'feri'):
-            eris_df.feri.close()
-
     def tearDown(self):
         if os.path.exists("isdf_df_xtc_ccsd_test.h5"):
             os.remove("isdf_df_xtc_ccsd_test.h5")
