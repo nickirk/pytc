@@ -548,6 +548,7 @@ def optimize_ref_var(
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
     multi_gpu: bool = False,
+    jacobian_sample_size: Optional[int] = None,
 ):
     """Perform variational Monte Carlo optimization using MCMC sampling.
 
@@ -572,6 +573,10 @@ def optimize_ref_var(
         multi_gpu: If True, shard walkers across all available devices for
                    data-parallel execution.  Requires n_walkers divisible by
                    the device count (padding is added automatically).
+        jacobian_sample_size: Optional[int]. If provided and using Newton optimizer,
+                             subsample this many walkers for Jacobian computation
+                             (curvature matrix approximation). Speeds up Newton steps
+                             when n_walkers is large. Typical: 500-2000 for 100k walkers.
 
     Returns:
         Dictionary with optimization results and statistics
@@ -660,6 +665,11 @@ def optimize_ref_var(
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         opt_kwargs["multi_gpu"] = multi_gpu
+        
+        # Add jacobian_sample_size if provided
+        if jacobian_sample_size is not None:
+            opt_kwargs["jacobian_sample_size"] = jacobian_sample_size
+        
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
