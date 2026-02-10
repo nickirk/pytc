@@ -103,6 +103,56 @@ def compute_jastrow_log_value(sj: SlaterJastrow, elec_coords, jastrow_params):
             
     return log_j_val
 
+
+def update_jastrow_one_electron(sj: SlaterJastrow, old_positions, new_positions,
+                                 electron_idx, jastrow_params, old_log_jastrow):
+    """Update Jastrow log-value after moving one electron.
+
+    Recomputes only the N-1 pairs involving ``electron_idx`` instead of
+    all N(N-1)/2 pairs:
+        new_log_J = old_log_J + sum_{j != k} [u_new(k,j) - u_old(k,j)]
+
+    Respects the argument order convention of compute_jastrow_log_value
+    (sum_{i<j} u(r_i, r_j)), which matters when u is asymmetric.
+
+    Args:
+        sj: SlaterJastrow ansatz
+        old_positions: (n_electrons, 3)
+        new_positions: (n_electrons, 3)
+        electron_idx: int
+        jastrow_params: Jastrow parameters
+        old_log_jastrow: scalar
+
+    Returns:
+        new_log_jastrow: scalar
+    """
+    n_electrons = old_positions.shape[0]
+    compute_fn = sj.jastrow._compute
+
+    r_k_old = old_positions[electron_idx]
+    r_k_new = new_positions[electron_idx]
+
+    other_indices = jnp.arange(n_electrons)
+
+    def scan_body(carry, j):
+        r_j = old_positions[j]
+        j_less_than_k = (j < electron_idx)
+        # j < k: pair was u(r_j, r_k); j > k: pair was u(r_k, r_j)
+        val_new = jnp.where(j_less_than_k,
+                            compute_fn(r_j, r_k_new, jastrow_params),
+                            compute_fn(r_k_new, r_j, jastrow_params))
+        val_old = jnp.where(j_less_than_k,
+                            compute_fn(r_j, r_k_old, jastrow_params),
+                            compute_fn(r_k_old, r_j, jastrow_params))
+        is_self = (j == electron_idx)
+        delta = jnp.where(is_self, 0.0, val_new - val_old)
+        return carry + delta, None
+
+    delta_log_j, _ = jax.lax.scan(scan_body, 0.0, other_indices)
+
+    return old_log_jastrow + delta_log_j
+
+
 def eval_sj(sj: SlaterJastrow, walker, params):
     """Evaluate wavefunction for a single walker with explicit parameters."""
     jastrow_params, linear_coeffs = params
