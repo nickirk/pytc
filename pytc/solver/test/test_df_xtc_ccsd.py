@@ -74,7 +74,8 @@ class TestXTCCCSD_DF(unittest.TestCase):
         
         # Verify that eris_df has vvL (indicator of DF path)
         self.assertTrue(hasattr(eris_df, 'vvL'), "eris should have vvL for DF implementation")
-        self.assertTrue(eris_df.vvvv is None, "eris.vvvv should be None for DF implementation")
+        # Note: vvvv may be materialized incore for small systems (tiered VVVV strategy)
+        # For large systems it will be None and computed on-the-fly
         
         e_df, t1_df, t2_df = cc_df.kernel(eris=eris_df)
         print(f"DF Energy: {e_df}")

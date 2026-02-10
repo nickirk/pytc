@@ -511,29 +511,6 @@ def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None, rank_block_size=Non
                                 rank_block_size)
 
 
-def contract_K3_isdf(phi_piv, U3, ranges=None):
-    r"""Contract K3 using precomputed U3 kernel and pivot values.
-    
-    K3_{pqrs} \approx \sum_{k,l} (\phi_p(z_k) \phi_q(z_k)) U3_{kl} (\phi_r(z_l) \phi_s(z_l))
-    
-    Args:
-        phi_piv: (Nb, N_fused) Values of phi at pivot points
-        U3: (N_fused, N_fused) Precomputed kernel
-        ranges: Optional tuple of (slice_p, slice_q, slice_r, slice_s)
-        
-    Returns:
-        K3: (Np, Nq, Nr, Ns)
-    """
-    if ranges is None:
-        slice_p = slice_q = slice_r = slice_s = slice(None)
-    else:
-        slice_p, slice_q, slice_r, slice_s = ranges
-        
-    phi_p = phi_piv[slice_p]
-    phi_q = phi_piv[slice_q]
-    phi_r = phi_piv[slice_r]
-    phi_s = phi_piv[slice_s]
-    
 @partial(jax.jit, static_argnums=(5,))
 def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     """JITted version of K3 contraction.

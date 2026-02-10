@@ -192,12 +192,14 @@ def estimate_blksize(nocc, nvir, phase, *,
         return int(can_fit), budget
 
     elif phase in ('ovvv_eri_build', 'vovv_eri_build'):
-        # During _compute_large_blocks: similar to ovvv/vovv but the
-        # persistent residents are different (no t2/tau/ERIs on GPU yet).
-        persistent_build = (O + V) ** 2 * B  # only fock-like small arrays
-        available = max(budget - persistent_build, 0)
-        per_blk = O * V * V * B * 2  # tc_blk + std_blk
-        per_blk *= 2
+        # Use host budget for this phase (GPU is self-managing).
+        if host_max_memory_mb is not None and host_max_memory_mb > 0:
+            host_budget = int(host_max_memory_mb * 1e6)
+        else:
+            host_budget = budget  # fall back to GPU budget as proxy
+        available = host_budget
+        persistent_build = 0  # already allocated, not subtracted
+        per_blk = O * V * V * B * 2  # std_blk + tc_blk
 
     else:
         raise ValueError(f"Unknown phase: {phase!r}")
@@ -207,10 +209,17 @@ def estimate_blksize(nocc, nvir, phase, *,
     blksize = max(1, int(usable / per_blk))
     blksize = min(nvir, blksize)
 
+    # For build phases, show the actual budget/persistent used
+    _log_budget = budget
+    _log_persistent = persistent
+    if phase in ('ovvv_eri_build', 'vovv_eri_build'):
+        _log_budget = host_budget
+        _log_persistent = persistent_build
+
     logger.debug(
         "estimate_blksize(phase=%s): budget=%.2f GB, persistent=%.2f GB, "
         "available=%.2f GB, per_blk=%.2f MB → blksize=%d",
-        phase, budget / 1e9, persistent / 1e9,
+        phase, _log_budget / 1e9, _log_persistent / 1e9,
         available / 1e9, per_blk / 1e6, blksize)
 
     return blksize, budget
