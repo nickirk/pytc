@@ -53,19 +53,26 @@ def _all_electron_move(ansatz, walker, step_size, key, params, batch_ansatz=None
 def _one_electron_move(ansatz, walker, step_size, key, params, batch_ansatz=None):
     """Move one randomly selected electron for each walker.
     
+    Uses cached log_psi/psi_sign from the walker to avoid recomputing the
+    current wavefunction value.  Only the *proposal* wavefunction is evaluated
+    via batch_ansatz.
+    
     Args:
         ansatz: Wavefunction object
-        walker: Walker dataclass with current state (batched)
+        walker: Walker dataclass with current state (batched).
+            Must have valid log_psi and psi_sign fields (populated by a
+            prior batch_ansatz call).
         step_size: Standard deviation of Gaussian proposal
         key: PRNG key
         params: Parameters for the ansatz
         batch_ansatz: Optional pre-vmapped ansatz function
         
     Returns:
-        proposals: Walker with proposed new positions and move_mask set
-        psi_values: Wavefunction values for current walker
-        new_psi_values: Wavefunction values for proposals
-        walker_updated: Updated current walker
+        psi_values: Wavefunction (sign, log|ψ|) for current walker (from cache)
+        new_psi_values: Wavefunction (sign, log|ψ|) for proposals
+        walker_updated: Current walker (unchanged)
+        proposals: Walker with proposed new positions, move_mask set, and
+            all Slater fields recomputed for the proposal geometry.
     """
     # Use provided batch_ansatz or create default vmap
     if batch_ansatz is None:
@@ -90,15 +97,13 @@ def _one_electron_move(ansatz, walker, step_size, key, params, batch_ansatz=None
         move_mask=move_mask
     )
     
-    # Compute current wavefunction value in tuple format
-    # Walker stores regular psi_values but we need tuple format for metropolis
-    # We need to recompute to get the tuple format
-    psi_values, walker_updated = batch_ansatz(walker, params)
+    # ---- Current ψ: use cached values from walker ----
+    psi_values = (walker.psi_sign, walker.log_psi)
     
-    # Proposals have move_mask indicating moved electron
+    # ---- Proposal ψ: full recomputation ----
     new_psi_values, proposals = batch_ansatz(proposals, params)
     
-    return psi_values, new_psi_values, walker_updated, proposals
+    return psi_values, new_psi_values, walker, proposals
 
 
 @jax.jit

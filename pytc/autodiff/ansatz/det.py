@@ -165,7 +165,9 @@ def eval_det_value(det: SlaterDet, walker):
         inv_up=inv_up,
         inv_down=inv_down,
         det_up=(sign_up, logdet_up),
-        det_down=(sign_down, logdet_down)
+        det_down=(sign_down, logdet_down),
+        log_psi=det_logabs,
+        psi_sign=det_sign,
     )
     
     return (det_sign, det_logabs), updated_walker
@@ -226,7 +228,9 @@ def eval_det_value_and_grad(det: SlaterDet, walker):
         grad_up=grad_up,
         grad_down=grad_down,
         lap_up=lap_up,
-        lap_down=lap_down
+        lap_down=lap_down,
+        log_psi=det_logabs,
+        psi_sign=det_sign,
     )
     
     return (det_sign, det_logabs), updated_walker

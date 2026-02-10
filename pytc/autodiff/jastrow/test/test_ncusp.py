@@ -33,7 +33,10 @@ def create_test_walker(positions, n_alpha, n_beta):
         grad_down=jnp.zeros((n_walkers, n_beta, n_beta, 3)),
         lap_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
         lap_down=jnp.zeros((n_walkers, n_beta, n_beta)),
-        move_mask=jnp.ones((n_walkers, positions.shape[1]), dtype=bool)
+        move_mask=jnp.ones((n_walkers, positions.shape[1]), dtype=bool),
+        log_psi=jnp.zeros((n_walkers,)),
+        psi_sign=jnp.zeros((n_walkers,)),
+        log_jastrow=jnp.zeros((n_walkers,)),
     )
 
 class TestNuclearCuspJastrow(unittest.TestCase):

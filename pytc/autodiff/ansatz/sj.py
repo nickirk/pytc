@@ -137,6 +137,13 @@ def eval_sj(sj: SlaterJastrow, walker, params):
     psi_logabs = log_jastrow_val + linear_combo_logabs
     psi_values = (psi_sign, psi_logabs)
     
+    # Cache psi values and Jastrow in the walker for MCMC reuse
+    final_updated_walker = final_updated_walker.replace(
+        log_psi=psi_logabs,
+        psi_sign=psi_sign,
+        log_jastrow=log_jastrow_val,
+    )
+    
     return psi_values, final_updated_walker
 
 from pytc.autodiff.vmc.hamiltonian import (

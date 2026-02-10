@@ -82,7 +82,10 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one",
         grad_down=jnp.where(accept_mask_4d, proposals.grad_down, current_walker.grad_down),
         lap_up=jnp.where(accept_mask_3d, proposals.lap_up, current_walker.lap_up),
         lap_down=jnp.where(accept_mask_3d, proposals.lap_down, current_walker.lap_down),
-        move_mask=jnp.zeros_like(current_walker.move_mask)  # Reset to all False after accept/reject
+        move_mask=jnp.zeros_like(current_walker.move_mask),  # Reset to all False after accept/reject
+        log_psi=jnp.where(accept_mask, proposals.log_psi, current_walker.log_psi),
+        psi_sign=jnp.where(accept_mask, proposals.psi_sign, current_walker.psi_sign),
+        log_jastrow=jnp.where(accept_mask, proposals.log_jastrow, current_walker.log_jastrow),
     )
     
     # Calculate acceptance rate
@@ -183,7 +186,10 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
         grad_down=jnp.where(accept_mask_4d, proposal_walkers.grad_down, walkers.grad_down),
         lap_up=jnp.where(accept_mask_3d, proposal_walkers.lap_up, walkers.lap_up),
         lap_down=jnp.where(accept_mask_3d, proposal_walkers.lap_down, walkers.lap_down),
-        move_mask=jnp.ones_like(walkers.move_mask, dtype=bool)  # All electrons moved
+        move_mask=jnp.ones_like(walkers.move_mask, dtype=bool),  # All electrons moved
+        log_psi=jnp.where(accept_mask, proposal_walkers.log_psi, walkers.log_psi),
+        psi_sign=jnp.where(accept_mask, proposal_walkers.psi_sign, walkers.psi_sign),
+        log_jastrow=jnp.where(accept_mask, proposal_walkers.log_jastrow, walkers.log_jastrow),
     )
     
     # Calculate acceptance rate

@@ -39,19 +39,16 @@ class NewtonOptimizer:
     def step(self, params, state, rng, batch, global_step_int=None):
         walkers, ansatz = batch
         
-        # 1. Compute Gradients
-        # We pass batch directly to value_and_grad_func.
-        # It should handle (walkers, ansatz) or walkers.
-        (loss, aux_data), grads = self.value_and_grad_func(params, batch)
-        
         # 2. Define MVP or Solve Exact
         if self.solver == "exact" or self.solver == "cholesky":
             # Exact inversion: (M + lambda I) delta = -g
             
             if self.curvature_type == "fisher":
                 # SR: S = Cov(grad_log_psi)
-                # J_i = d(log_psi(w_i))/dp
+                # Need loss + grads from value_and_grad_func, plus Jacobian separately.
+                (loss, aux_data), grads = self.value_and_grad_func(params, batch)
                 
+                # J_i = d(log_psi(w_i))/dp
                 def single_log_psi_grad(w, p):
                     return jax.grad(lambda pp: ansatz(w, pp)[0][1])(p)
                 
@@ -64,9 +61,6 @@ class NewtonOptimizer:
                 
                 # Flatten params structure for linear algebra
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
-                # Concatenate all parameter gradients into a single matrix (N, P_total)
-                # Note: This assumes all leaves are arrays. We need to handle this carefully.
-                # A safer way is to flatten each leaf and concatenate.
                 jac_mat = jnp.concatenate([jnp.reshape(leaf, (walkers.shape[0], -1)) for leaf in jac_flat], axis=1)
                 
                 # Center the Jacobian (Covariance)
@@ -77,28 +71,52 @@ class NewtonOptimizer:
                 curvature_mat = (jac_centered.T @ jac_centered) / n_walkers
                 
             elif self.curvature_type == "gauss_newton":
-                # GN: G = 2/N * J.T @ J
+                # GN: G = 2/N * J_centered.T @ J_centered
                 # J_i = d(E_L(w_i))/dp
+                #
+                # Optimization: compute Jacobian and local energies in one pass,
+                # then derive the variance loss and gradient analytically:
+                #   variance = sum((E - mean(E))^2) / (N - 1)
+                #   grad_variance = 2/(N-1) * J^T @ (E - mean(E))
+                # This avoids the separate value_and_grad_func call which would
+                # redundantly compute local energies 2 more times.
                 
-                def single_local_energy_grad(w, p):
-                    return jax.grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
+                def single_local_energy_and_grad(w, p):
+                    """Compute both E_L(w) and grad_p E_L(w) in one pass."""
+                    return jax.value_and_grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
                 
-                # Compute Jacobian for all walkers: Shape (N, P)
+                # Compute energies and Jacobian for all walkers simultaneously
                 if self.max_vmap_batch_size > 0:
-                    jac = folx.batched_vmap(single_local_energy_grad, max_batch_size=self.max_vmap_batch_size, in_axes=(0, None))(walkers, params)
+                    energies, jac = folx.batched_vmap(
+                        single_local_energy_and_grad, 
+                        max_batch_size=self.max_vmap_batch_size, 
+                        in_axes=(0, None)
+                    )(walkers, params)
                 else:
-                    jac = jax.vmap(single_local_energy_grad, in_axes=(0, None))(walkers, params)
-                
-                # Flatten params structure
-                jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
-                jac_mat = jnp.concatenate([jnp.reshape(leaf, (walkers.shape[0], -1)) for leaf in jac_flat], axis=1)
-                
-                # Center the Jacobian to match the iterative solver and correctly minimize variance
-                # The iterative solver centers the JVP output w = Jv - mean(Jv), which is equivalent
-                # to using a centered Jacobian matrix in the quadratic form.
-                jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
+                    energies, jac = jax.vmap(
+                        single_local_energy_and_grad, 
+                        in_axes=(0, None)
+                    )(walkers, params)
                 
                 n_walkers = walkers.shape[0]
+                
+                # Flatten Jacobian params structure to (N, P_total) matrix
+                jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
+                jac_mat = jnp.concatenate([jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat], axis=1)
+                
+                # Compute variance loss and auxiliary data analytically from energies
+                e_mean = jnp.mean(energies)
+                e_std = jnp.std(energies)
+                energy_diff = energies - e_mean
+                loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
+                aux_data = (e_mean, e_std)
+                
+                # Compute variance gradient analytically: 
+                # grad_variance = 2/(N-1) * J^T @ (E - mean(E))
+                grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
+                
+                # Center the Jacobian for curvature matrix
+                jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
                 curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
             
             else:
@@ -107,8 +125,12 @@ class NewtonOptimizer:
             # Add damping
             curvature_mat = curvature_mat + self.damping * jnp.eye(curvature_mat.shape[0])
             
-            # Flatten gradients to match matrix
-            grads_vec, unravel_fn = jax.flatten_util.ravel_pytree(grads)
+            # Flatten gradients to match matrix (for fisher, grads are pytree; for gauss_newton, already flat)
+            if self.curvature_type == "fisher":
+                grads_vec, unravel_fn = jax.flatten_util.ravel_pytree(grads)
+            else:
+                # gauss_newton: grads_vec is already flat, need unravel_fn
+                _, unravel_fn = jax.flatten_util.ravel_pytree(params)
             
             # Solve linear system
             # (M + lambda I) delta = -g
@@ -127,7 +149,9 @@ class NewtonOptimizer:
             
             return new_params, state + 1, {"loss": loss, "aux": aux_data}
 
-        # 2. Define MVP (CG Solver)
+        # CG Solver: need loss + grads from value_and_grad_func
+        (loss, aux_data), grads = self.value_and_grad_func(params, batch)
+        
         if self.curvature_type == "fisher":
             # SR: S = Cov(grad_log_psi)
             
