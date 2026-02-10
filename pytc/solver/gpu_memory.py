@@ -108,18 +108,44 @@ def get_gpu_budget_bytes(gpu_max_memory_mb=None):
 
 
 def _get_gpu_physical_bytes():
-    """Return the physical GPU memory capacity in bytes (ignoring user overrides).
+    """Return the physical GPU memory capacity in bytes.
 
-    Used for phases where we need to know the actual hardware limit
-    (e.g. how large an output tensor get_2b can produce) rather than
-    a user-imposed CCSD workspace budget.
+    Queries the actual hardware limit (total device memory), which is
+    independent of JAX's pre-allocation fraction.
     """
     try:
         import jax
         stats = jax.devices()[0].memory_stats()
+        # bytes_limit is JAX's pool limit (fraction of physical).
+        # For the *physical* capacity we want the pool limit divided by
+        # the pre-allocation fraction — but that's tricky to get.
+        # Instead, return bytes_limit as a conservative proxy.
         return int(stats['bytes_limit'])
     except Exception:
         return 80 * 1024 ** 3  # 80 GiB fallback (A100)
+
+
+def _get_gpu_free_bytes():
+    """Return the *currently free* GPU memory inside JAX's pre-allocated pool.
+
+    This accounts for JAX's pre-allocation fraction (default 75% of physical)
+    AND any tensors that are already resident on the device.  Much safer than
+    ``bytes_limit`` which ignores current allocations.
+
+    Falls back to ``_get_gpu_physical_bytes() * 0.75`` if stats are unavailable.
+    """
+    try:
+        import jax
+        stats = jax.devices()[0].memory_stats()
+        pool_limit = int(stats['bytes_limit'])
+        in_use = int(stats.get('bytes_in_use', 0))
+        free = pool_limit - in_use
+        logger.debug(
+            "_get_gpu_free_bytes: pool_limit=%.2f GB, in_use=%.2f GB, free=%.2f GB",
+            pool_limit / 1e9, in_use / 1e9, free / 1e9)
+        return max(free, 0)
+    except Exception:
+        return int(_get_gpu_physical_bytes() * 0.75)
 
 
 def estimate_blksize(nocc, nvir, phase, *,
@@ -215,33 +241,24 @@ def estimate_blksize(nocc, nvir, phase, *,
             host_budget = int(host_max_memory_mb * 1e6)
         else:
             host_budget = budget  # fall back to GPU budget as proxy
-        persistent_build = 0  # already allocated, not subtracted
         host_per_blk = O * V * V * B * 2  # std_blk + tc_blk
 
-        N_fused = naux if naux is not None else 0
-        gpu_physical = _get_gpu_physical_bytes()
-        kernel_resident = 0
-        if N_fused > 0:
-            nmo = O + V
-            kernel_resident = (N_fused * N_fused * 3      # U1 kernel
-                               + N_fused * N_fused         # U3 kernel
-                               + nmo * N_fused             # phi_isdf
-                               + nmo * N_fused * 3) * B    # grad_phi_isdf
-        gpu_available = max(gpu_physical - kernel_resident, 0)
+        # GPU side: query *actually free* memory in JAX's pool.
+        # This already accounts for the pre-allocation fraction (default 75%)
+        # AND any resident tensors (ISDF kernels, phi_isdf, etc.).
+        gpu_free = _get_gpu_free_bytes()
         gpu_per_blk = O * V * V * B * 3  # ~3 copies of output on GPU peak
 
         # Blksize is the min of host-derived and GPU-derived limits
         host_blk = max(1, int(host_budget * 0.8 / host_per_blk))
-        gpu_blk = max(1, int(gpu_available * 0.8 / gpu_per_blk))
+        gpu_blk = max(1, int(gpu_free * 0.8 / gpu_per_blk))
         blksize = min(host_blk, gpu_blk, nvir)
-        per_blk = host_per_blk  # for logging
-        available = min(host_budget, gpu_available)  # for logging
 
         logger.debug(
-            "estimate_blksize(phase=%s): host_budget=%.2f GB, gpu_physical=%.2f GB, "
-            "kernel_resident=%.2f GB, host_blk=%d, gpu_blk=%d → blksize=%d",
-            phase, host_budget / 1e9, gpu_physical / 1e9,
-            kernel_resident / 1e9, host_blk, gpu_blk, blksize)
+            "estimate_blksize(phase=%s): host_budget=%.2f GB, gpu_free=%.2f GB, "
+            "host_blk=%d, gpu_blk=%d → blksize=%d",
+            phase, host_budget / 1e9, gpu_free / 1e9,
+            host_blk, gpu_blk, blksize)
         return blksize, budget
 
     else:
