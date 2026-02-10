@@ -16,6 +16,13 @@ from . import kmat as kmat_jax
 
 logger = logging.getLogger(__name__)
 
+
+@jax.jit
+def _neg_sum_transposed(a, b):
+    """Fused -(a + transpose(b, (2,3,0,1))) — one XLA kernel, no intermediates."""
+    return -(a + jnp.transpose(b, (2, 3, 0, 1)))
+
+
 @struct.dataclass
 class XTC(TC):
     """JAX implementation of extended transcorrelated methods using flax dataclass.
@@ -1182,11 +1189,11 @@ class ISDFXTC(XTC, ISDFTC):
         if slice_p == slice_r and slice_q == slice_s:
             result = -(result + result.transpose(2, 3, 0, 1))
         else:
-            # Non-symmetric block: add transpose block directly
-            # Avoids materializing a separate result_T array
+            # Non-symmetric block: fuse transpose+add+negate to avoid
+            # materializing separate transpose and addition intermediates.
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             tmp = self._contract_delta_U_kernels(kernels, ranges_T)
-            result = -(result + tmp.transpose(2, 3, 0, 1))
+            result = _neg_sum_transposed(result, tmp)
             del tmp
 
         total_time = time.perf_counter() - start_time

@@ -882,6 +882,11 @@ class ISDFTC(TC):
         
         return self.replace(isdf_kernels=kernels, save_path=out_path)
 
+    @staticmethod
+    @jax.jit
+    def _add_transposed_scaled(result, tmp, scale):
+        """Fused transpose(2,3,0,1) + scale + add — one XLA kernel, no intermediates."""
+        return result + jnp.transpose(tmp, (2, 3, 0, 1)) * scale
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support.
@@ -932,14 +937,14 @@ class ISDFTC(TC):
             else:
                 tmp = kmat_jax.contract_K1_minus_K2_isdf(
                     self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
-            # Add transposed contribution directly to result (XLA fuses the
-            # transpose+scale+add into one kernel, so peak = result + tmp + new)
-            result += jax.lax.transpose(tmp, (2, 3, 0, 1)) * 0.5
+            # Fuse transpose+scale+add into one XLA kernel to avoid
+            # materializing separate transpose and scaled intermediates.
+            result = self._add_transposed_scaled(result, tmp, 0.5)
             del tmp
             
             # K3 transpose block
             tmp_k3 = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges_T)
-            result += jax.lax.transpose(tmp_k3, (2, 3, 0, 1)) * 0.5
+            result = self._add_transposed_scaled(result, tmp_k3, 0.5)
             del tmp_k3
         
         total_time = time.perf_counter() - start_time
