@@ -511,6 +511,107 @@ def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None, rank_block_size=Non
                                 rank_block_size)
 
 
+@partial(jax.jit, static_argnums=(7,))
+def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
+                                   grad_phi_p, grad_phi_q, U1,
+                                   rank_block_size=128):
+    """Compute (K1 - K2)[p,q,r,s] in a single scan pass.
+
+    K1 uses grad_phi on index p; K2 uses grad_phi on index q (then transposes
+    p↔q).  By computing both T-blocks in the same scan body and subtracting
+    before contracting with C_rs, we use **one** (Np,Nq,Nr,Ns) accumulator
+    instead of two, halving the peak memory compared to separate calls.
+
+    Peak GPU: 1×(Np,Nq,Nr,Ns) carry + 1×(Np,Nq,Nr,Ns) contribution
+            + 2×(Np,Nq,block) T-blocks + 1×(Nr,Ns,block) C_rs.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_fused = U1.shape[0]
+    n_rank = U1.shape[1]
+
+    # Pad rank dimension
+    padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
+    pad_width = padded_rank - n_rank
+    U1_padded = jnp.pad(U1, ((0, 0), (0, pad_width), (0, 0)))
+    phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width)))
+    phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width)))
+
+    n_blocks = padded_rank // rank_block_size
+    U1_scannable = U1_padded.reshape(N_fused, n_blocks, rank_block_size, 3).transpose(1, 0, 2, 3)
+    phi_r_scannable = phi_r_padded.reshape(Nr, n_blocks, rank_block_size).transpose(1, 0, 2)
+    phi_s_scannable = phi_s_padded.reshape(Ns, n_blocks, rank_block_size).transpose(1, 0, 2)
+
+    def _compute_T_block(grad_phi_bra, phi_ket, U1_block, N_bra, N_ket):
+        """Compute T[bra, ket, l'] = sum_{k,c} grad_phi_bra[bra,k,c] U1[k,l',c] phi_ket[ket,k]."""
+        def process_component(T_acc, c):
+            U1_slice = U1_block[:, :, c]  # (N_fused, block)
+            W = grad_phi_bra[:, :, c][:, :, None] * U1_slice[None, :, :]  # (N_bra, k, block)
+            W_perm = jnp.transpose(W, (0, 2, 1))  # (N_bra, block, k)
+            W_2d = W_perm.reshape(N_bra * rank_block_size, N_fused)
+            T_flat = jnp.matmul(W_2d, phi_ket.T)  # (N_bra*block, N_ket)
+            T_c = T_flat.reshape(N_bra, rank_block_size, N_ket)
+            T_c = jnp.transpose(T_c, (0, 2, 1))  # (N_bra, N_ket, block)
+            return T_acc + T_c, None
+
+        T_init = jnp.zeros((N_bra, N_ket, rank_block_size))
+        T_block, _ = jax.lax.scan(process_component, T_init, jnp.arange(3))
+        return T_block
+
+    def scan_l_block(carry, args):
+        U1_block, phi_r_block, phi_s_block = args
+
+        # T_K1[p, q, l'] using grad_phi_p
+        T_K1 = _compute_T_block(grad_phi_p, phi_q, U1_block, Np, Nq)
+
+        # T_K2[q, p, l'] using grad_phi_q  →  transpose to [p, q, l']
+        T_K2 = _compute_T_block(grad_phi_q, phi_p, U1_block, Nq, Np)
+        T_K2_T = jnp.transpose(T_K2, (1, 0, 2))  # (Np, Nq, block)
+
+        # Combined T
+        T_combined = T_K1 - T_K2_T  # (Np, Nq, block)
+
+        # C_rs[r, s, l']
+        C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :]  # (Nr, Ns, block)
+
+        contribution = jnp.einsum('pql,rsl->pqrs', T_combined, C_rs)
+        return carry + contribution, None
+
+    init = jnp.zeros((Np, Nq, Nr, Ns))
+    result, _ = jax.lax.scan(scan_l_block, init, (U1_scannable, phi_r_scannable, phi_s_scannable))
+    return result
+
+
+def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
+                               rank_block_size=None, gpu_max_memory_mb=None):
+    """Compute (K1 - K2)[pqrs] in one pass, halving GPU peak vs separate calls.
+
+    K2[pqrs] = K1[qprs] transposed, so the difference can be accumulated
+    in a single scan over the ISDF rank dimension.
+    """
+    if ranges is None:
+        slice_p = slice_q = slice_r = slice_s = slice(None)
+    else:
+        slice_p, slice_q, slice_r, slice_s = ranges
+
+    phi_p = phi_piv[slice_p]
+    phi_q = phi_piv[slice_q]
+    phi_r = phi_piv[slice_r]
+    phi_s = phi_piv[slice_s]
+    grad_phi_p = grad_phi_piv[slice_p]
+    grad_phi_q = grad_phi_piv[slice_q]
+
+    if rank_block_size is None:
+        from pytc.solver.gpu_memory import adaptive_rank_block_size
+        rank_block_size = adaptive_rank_block_size(
+            phi_p.shape[0], phi_q.shape[0], U1.shape[0],
+            gpu_max_memory_mb=gpu_max_memory_mb)
+
+    return contract_K1_minus_K2_isdf_jit(
+        phi_p, phi_q, phi_r, phi_s,
+        grad_phi_p, grad_phi_q, U1, rank_block_size)
+
+
 @partial(jax.jit, static_argnums=(5,))
 def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     """JITted version of K3 contraction.

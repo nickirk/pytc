@@ -218,11 +218,6 @@ def estimate_blksize(nocc, nvir, phase, *,
         persistent_build = 0  # already allocated, not subtracted
         host_per_blk = O * V * V * B * 2  # std_blk + tc_blk
 
-        # GPU side: get_2b internally holds ~3 output-sized arrays
-        # simultaneously (result accumulator + scan carry + contribution),
-        # plus ISDF kernel data that stays resident on GPU.
-        # Use physical GPU capacity here (not the user's CCSD workspace
-        # budget) because the build phase runs before CCSD data is loaded.
         N_fused = naux if naux is not None else 0
         gpu_physical = _get_gpu_physical_bytes()
         kernel_resident = 0
@@ -233,7 +228,7 @@ def estimate_blksize(nocc, nvir, phase, *,
                                + nmo * N_fused             # phi_isdf
                                + nmo * N_fused * 3) * B    # grad_phi_isdf
         gpu_available = max(gpu_physical - kernel_resident, 0)
-        gpu_per_blk = O * V * V * B * 3  # ~3 copies of output on GPU
+        gpu_per_blk = O * V * V * B * 3  # ~3 copies of output on GPU peak
 
         # Blksize is the min of host-derived and GPU-derived limits
         host_blk = max(1, int(host_budget * 0.8 / host_per_blk))

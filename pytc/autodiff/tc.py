@@ -884,7 +884,11 @@ class ISDFTC(TC):
 
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
-        """Calculate TC correction terms using ISDF with multi-GPU support."""
+        """Calculate TC correction terms using ISDF with multi-GPU support.
+
+        Memory-optimized: uses fused K1-K2 contraction and sequential
+        accumulation to reduce GPU peak from ~5-6× to ~3× output size.
+        """
         start_time = time.perf_counter()
         logger.debug("Starting ISDFTC.get_2b")
         if ranges is None and block_str is not None:
@@ -899,53 +903,44 @@ class ISDFTC(TC):
         U1 = kernels['K1_kernel']
         U3 = kernels['K3_kernel']
         
-        # Contract using pivot values
-        # We need phi and grad_phi at pivot points.
-        # self.phi_isdf is (Nb, N_fused), which ARE the values at pivot points (columns of phi).
-        # self.grad_phi_isdf is (Nb, N_fused, 3).
-        
-        # K1 term (nabla on p)
-        result = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
-        
-        # K2 term (nabla on q) - transpose of K1 if symmetric
         slice_p, slice_q, slice_r, slice_s = ranges if ranges else (slice(None), slice(None), slice(None), slice(None))
         
+        # --- Direct block: (K1 - K2 + K3)[pqrs] * 0.5 ---
         if slice_p == slice_q:
+            # K1 - K2 = K1 - K1^T(pq), use the symmetry shortcut
+            result = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
             result -= result.transpose(1, 0, 2, 3)
         else:
-            # Compute K2 explicitly
-            ranges_k2 = (slice_q, slice_p, slice_r, slice_s)
-            K2_transposed = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_k2)
-            result -= jax.lax.transpose(K2_transposed, (1, 0, 2, 3))
-            
-        # K3 term
+            # Fused K1 - K2 in a single scan pass (saves 1 full output array)
+            result = kmat_jax.contract_K1_minus_K2_isdf(
+                self.phi_isdf, self.grad_phi_isdf, U1, ranges)
+        
         result += kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges)
         result *= 0.5
         
-        # Symmetrize result (add transpose block) to match TC.get_2b
+        # --- Transpose block: (K1 - K2 + K3)[rspq] * 0.5, transposed to (pqrs) ---
         if slice_p == slice_r and slice_q == slice_s:
             result += result.transpose(2, 3, 0, 1)
         else:
-            
-            # Let's match TC.get_2b logic:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            slice_p_T, slice_q_T = slice_r, slice_s
             
-            # K1_T
-            result_T = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
-            
-            # K2_T
-            slice_p_T, slice_q_T, slice_r_T, slice_s_T = ranges_T
+            # Compute K1-K2 for transpose block and add to result directly
             if slice_p_T == slice_q_T:
-                result_T -= jax.lax.transpose(result_T, (1, 0, 2, 3))
+                tmp = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
+                tmp -= tmp.transpose(1, 0, 2, 3)
             else:
-                ranges_k2_T = (slice_q_T, slice_p_T, slice_r_T, slice_s_T)
-                K2_transposed_T = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges_k2_T)
-                result_T -= jax.lax.transpose(K2_transposed_T, (1, 0, 2, 3))
-                
-            # K3_T
-            result_T += kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges_T)
-            result_T *= 0.5
-            result += jax.lax.transpose(result_T, (2, 3, 0, 1))
+                tmp = kmat_jax.contract_K1_minus_K2_isdf(
+                    self.phi_isdf, self.grad_phi_isdf, U1, ranges_T)
+            # Add transposed contribution directly to result (XLA fuses the
+            # transpose+scale+add into one kernel, so peak = result + tmp + new)
+            result += jax.lax.transpose(tmp, (2, 3, 0, 1)) * 0.5
+            del tmp
+            
+            # K3 transpose block
+            tmp_k3 = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges_T)
+            result += jax.lax.transpose(tmp_k3, (2, 3, 0, 1)) * 0.5
+            del tmp_k3
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")

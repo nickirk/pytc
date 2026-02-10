@@ -425,13 +425,14 @@ class XTC(TC):
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         
-        tc_correction = super().get_2b(jastrow_params, ranges=ranges)
-        
-        delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
+        # Accumulate delta_U directly into tc_correction to avoid
+        # holding two output-sized arrays simultaneously.
+        result = super().get_2b(jastrow_params, ranges=ranges)
+        result = result + self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"XTC.get_2b completed in {time.perf_counter() - start_time:.4f} s")
-        return tc_correction + delta_U
+        return result
 
     def get_const(self, jastrow_params, dm1=None, delta_h=None):
         """Compute constant contribution."""
@@ -1179,20 +1180,18 @@ class ISDFXTC(XTC, ISDFTC):
         slice_p, slice_q, slice_r, slice_s = ranges
         
         if slice_p == slice_r and slice_q == slice_s:
-            final_result = -(result + result.transpose(2, 3, 0, 1))
+            result = -(result + result.transpose(2, 3, 0, 1))
         else:
-            # Non-symmetric block
-            # We need the transpose block (rs|pq)
+            # Non-symmetric block: add transpose block directly
+            # Avoids materializing a separate result_T array
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            
-            # Reuse kernels for transpose block
-            result_T = self._contract_delta_U_kernels(kernels, ranges_T)
-                
-            final_result = -(result + result_T.transpose(2, 3, 0, 1))
+            tmp = self._contract_delta_U_kernels(kernels, ranges_T)
+            result = -(result + tmp.transpose(2, 3, 0, 1))
+            del tmp
 
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
-        return final_result
+        return result
 
 
     def get_delta_h(self, jastrow_params, dm1=None, 
