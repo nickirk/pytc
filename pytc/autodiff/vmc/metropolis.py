@@ -82,7 +82,10 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one",
         grad_down=jnp.where(accept_mask_4d, proposals.grad_down, current_walker.grad_down),
         lap_up=jnp.where(accept_mask_3d, proposals.lap_up, current_walker.lap_up),
         lap_down=jnp.where(accept_mask_3d, proposals.lap_down, current_walker.lap_down),
-        move_mask=jnp.zeros_like(current_walker.move_mask)  # Reset to all False after accept/reject
+        move_mask=jnp.zeros_like(current_walker.move_mask),  # Reset to all False after accept/reject
+        log_psi=jnp.where(accept_mask, proposals.log_psi, current_walker.log_psi),
+        psi_sign=jnp.where(accept_mask, proposals.psi_sign, current_walker.psi_sign),
+        log_jastrow=jnp.where(accept_mask, proposals.log_jastrow, current_walker.log_jastrow),
     )
     
     # Calculate acceptance rate
@@ -183,7 +186,10 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
         grad_down=jnp.where(accept_mask_4d, proposal_walkers.grad_down, walkers.grad_down),
         lap_up=jnp.where(accept_mask_3d, proposal_walkers.lap_up, walkers.lap_up),
         lap_down=jnp.where(accept_mask_3d, proposal_walkers.lap_down, walkers.lap_down),
-        move_mask=jnp.ones_like(walkers.move_mask, dtype=bool)  # All electrons moved
+        move_mask=jnp.ones_like(walkers.move_mask, dtype=bool),  # All electrons moved
+        log_psi=jnp.where(accept_mask, proposal_walkers.log_psi, walkers.log_psi),
+        psi_sign=jnp.where(accept_mask, proposal_walkers.psi_sign, walkers.psi_sign),
+        log_jastrow=jnp.where(accept_mask, proposal_walkers.log_jastrow, walkers.log_jastrow),
     )
     
     # Calculate acceptance rate
@@ -198,8 +204,14 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
     This function validates move_type at creation time (not JIT time) and returns
     a JIT-compilable step function that performs Metropolis-Hastings sampling.
     
+    The ``ansatz`` argument is **captured** at factory time and used for all
+    subsequent MCMC steps.  This is critical for ``optimize_ref_var``, where
+    the factory receives ``ref_det`` (a ``SlaterDet``) so that walkers are
+    sampled from |Det|² regardless of what ansatz object is passed at call
+    time by the training loop.
+    
     Args:
-        ansatz: Wavefunction object (used for validation, not captured)
+        ansatz: Wavefunction object — captured and used for MCMC proposals.
         step_size: Standard deviation of Gaussian proposal for MCMC moves
         move_type: "all" to move all electrons at once, "one" to move one electron at a time
         max_vmap_batch_size: If > 0, use folx.batched_vmap with this batch size
@@ -215,21 +227,26 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
     if move_type not in ["all", "one"]:
         raise ValueError(f"move_type must be either 'all' or 'one', got '{move_type}'")
     
+    # Capture ansatz at factory time so the MCMC distribution is determined
+    # by the factory caller, not the training-loop caller.
+    captured_ansatz = ansatz
+    
     # Create batch_ansatz based on max_vmap_batch_size
     if max_vmap_batch_size > 0:
         batch_ansatz = folx.batched_vmap(
-            lambda w, p: ansatz(w, p), 
+            lambda w, p: captured_ansatz(w, p), 
             in_axes=(0, None), 
             max_batch_size=max_vmap_batch_size
         )
     else:
-        batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+        batch_ansatz = jax.vmap(lambda w, p: captured_ansatz(w, p), in_axes=(0, None))
     
     def mcmc_step(ansatz, walkers, key, params):
         """Single MCMC step - fully JIT-compatible.
         
         Args:
-            ansatz: Wavefunction object
+            ansatz: Wavefunction object (ignored — the captured ansatz from
+                    factory creation is used instead).
             walkers: Walker dataclass with current state
             key: PRNG key for random number generation
             params: Parameters for the ansatz [jastrow_params, linear_coeffs]
@@ -239,7 +256,7 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
             acceptance_rate: Fraction of proposals that were accepted
         """
         new_walkers, acceptance_rate = metropolis_hastings(
-            ansatz, walkers, step_size, key, params, 
+            captured_ansatz, walkers, step_size, key, params, 
             move_type=move_type, batch_ansatz=batch_ansatz
         )
         return new_walkers, acceptance_rate

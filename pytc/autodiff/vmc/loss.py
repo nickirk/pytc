@@ -231,7 +231,8 @@ def make_variance_loss(
     ansatz,
     optimizer_type: str = "adam",
     use_custom_jvp: bool = True,
-    max_vmap_batch_size: int = 0
+    max_vmap_batch_size: int = 0,
+    clip_multiplier: float = 5.0,
 ):
     """Factory to create variance-based loss function for reference variance optimization.
     
@@ -246,13 +247,12 @@ def make_variance_loss(
         use_custom_jvp: Whether to use custom JVP for memory-efficient gradients
         max_vmap_batch_size: If 0, use standard vmap. If >0, use folx.batched_vmap 
                             for memory efficiency. Recommended batch size: 10-50.
-        use_hamiltonian_grad: If True and use_custom_jvp=True, use Hamiltonian-based
-                            gradient method for Jastrow parameters:
-                            ∇σ² = 2/(n-1) Σ(E_L - Ē)[Ĥ(∂J/∂a) - E_L·∂J/∂a]
-                            This provides more memory-efficient gradients.
+        clip_multiplier: Multiplier for energy clipping range (clips to mean ± multiplier
+                         * mean absolute deviation (MAD) of the local energy). Set to 0 to
+                         disable clipping. Default 5.0, matching make_energy_loss.
     
     Returns:
-        Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_std))
+        Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_mad))
     """
     
     # Choose vmap implementation based on max_vmap_batch_size
@@ -296,13 +296,23 @@ def make_variance_loss(
             # Compute local energies
             energies = batch_local_energy(walkers, params)
             e_mean = jnp.mean(energies)
-            e_std = jnp.std(energies)
+            e_std = jnp.mean(jnp.abs(energies - e_mean))
+            
+            # Clip energies to suppress outliers (same scheme as make_energy_loss)
+            if clip_multiplier > 0:
+                energies = jnp.clip(
+                    energies,
+                    e_mean - clip_multiplier * e_std,
+                    e_mean + clip_multiplier * e_std,
+                )
+                # Recompute mean after clipping for a consistent variance
+                e_mean = jnp.mean(energies)
             
             # Sample variance: sum((E - <E>)^2) / (n - 1)
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             
-            return variance, (e_mean, e_std)
+            return variance, (e_mean, jnp.std(energies))
         
         @loss_fn.defjvp
         def loss_fn_jvp(primals, tangents):
@@ -327,11 +337,20 @@ def make_variance_loss(
             # Forward pass
             energies = batch_local_energy(walkers, params) # Pass ansatz
             e_mean = jnp.mean(energies)
-            e_std = jnp.std(energies)
+            e_std = jnp.mean(jnp.abs(energies - e_mean))
+            
+            # Clip energies (must match the forward pass exactly)
+            if clip_multiplier > 0:
+                energies = jnp.clip(
+                    energies,
+                    e_mean - clip_multiplier * e_std,
+                    e_mean + clip_multiplier * e_std,
+                )
+                e_mean = jnp.mean(energies)
             
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
-            aux_data = (e_mean, e_std)
+            aux_data = (e_mean, jnp.std(energies))
             
 
             
@@ -394,13 +413,22 @@ def make_variance_loss(
             # Compute local energies
             energies = batch_local_energy(walkers, params)
             e_mean = jnp.mean(energies)
-            e_std = jnp.std(energies)
+            e_std = jnp.mean(jnp.abs(energies - e_mean))
+            
+            # Clip energies
+            if clip_multiplier > 0:
+                energies = jnp.clip(
+                    energies,
+                    e_mean - clip_multiplier * e_std,
+                    e_mean + clip_multiplier * e_std,
+                )
+                e_mean = jnp.mean(energies)
             
             # Sample variance: sum((E - <E>)^2) / (n - 1)
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             
-            return variance, (e_mean, e_std)
+            return variance, (e_mean, jnp.std(energies))
         
         return loss_fn
 

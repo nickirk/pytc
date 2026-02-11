@@ -4,6 +4,7 @@ from scipy.interpolate import CubicSpline
 from .jastrow import Jastrow
 from functools import partial
 import jax
+import folx
 from flax import struct
 from typing import Tuple, List
 
@@ -236,13 +237,31 @@ class NuclearCusp(Jastrow):
         params = self._clip_params(params)
 
         # Compute polynomial coefficients from current params
+        poly_coeffs = self._precompute_poly_coeffs(params)
+
+        return self._compute_inner(r1, r2, params, poly_coeffs)
+
+    def _precompute_poly_coeffs(self, clipped_params):
+        """Compute polynomial coefficients from (already-clipped) params.
+
+        This only depends on ``params``, not on electron positions, so it
+        should be evaluated *once* and reused across all electron pairs.
+        """
         poly_coeffs = jnp.zeros((self.n_types, 5))
         for Z_idx, Z in enumerate(self.unique_Z):
-            rc = params['rc'][Z_idx]
-            X4 = params['X4'][Z_idx]
+            rc = clipped_params['rc'][Z_idx]
+            X4 = clipped_params['X4'][Z_idx]
             X = self._compute_X_values(Z_idx, rc, X4)
             alpha = self._compute_alpha_coeffs(Z, rc, X)
             poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
+        return poly_coeffs
+
+    def _compute_inner(self, r1, r2, clipped_params, poly_coeffs):
+        """Core per-pair computation with pre-supplied polynomial coefficients.
+
+        This is the part that genuinely depends on ``(r1, r2)`` and should
+        be called inside the N² vmap / folx.forward_laplacian.
+        """
 
         # Vectorized computation over nuclei
         def compute_nucleus_contribution(nucleus_idx):
@@ -253,7 +272,7 @@ class NuclearCusp(Jastrow):
             # Use array indexing instead of dictionary lookup
             Z = self.charges[nucleus_idx]
             Z_idx = self.Z_to_idx[Z.astype(jnp.int32)]
-            rc = params['rc'][Z_idx]
+            rc = clipped_params['rc'][Z_idx]
             
             # Use computed poly_coeffs instead of params
             coeffs = poly_coeffs[Z_idx]
@@ -285,6 +304,25 @@ class NuclearCusp(Jastrow):
     def grad_r(self, r1, r2, params):
         return super().grad_r(r1, r2, params)/2.*(self.nelectron - 1)/self.nelectron
     
+    def get_log_grads_r1(self, r1, r2, params):
+        """Compute ∇u and ∇²u w.r.t r1, hoisting poly_coeffs out of the pair loop.
+
+        The polynomial coefficients only depend on ``params`` (not on
+        ``r1``/``r2``), so we precompute them once here and pass them into
+        the ``folx.forward_laplacian`` call.  When this method is invoked
+        inside the N² vmap of ``compute_jastrow_terms``, XLA sees the
+        precomputation as a *constant* across the spatial derivative
+        computation, eliminating redundant spline evaluations.
+        """
+        clipped_params = self._clip_params(params)
+        poly_coeffs = self._precompute_poly_coeffs(clipped_params)
+
+        def scalar_fn(x):
+            return self._compute_inner(x, r2, clipped_params, poly_coeffs).reshape(-1)[0]
+
+        fwd_lapl = folx.forward_laplacian(scalar_fn)(r1)
+        return fwd_lapl.jacobian.dense_array, fwd_lapl.laplacian
+
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
 
