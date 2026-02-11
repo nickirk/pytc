@@ -138,8 +138,8 @@ class _ChemistsERIs(rccsd._ChemistsERIs):
         rccsd._ChemistsERIs.__init__(self, mol)
         self.xtc_obj = None
         self.jastrow_params = None
-        self.max_memory = 4000
-        self.gpu_max_memory = 4000
+        self.max_memory = None
+        self.gpu_max_memory = None
         if not hasattr(self, '_keys'):
             self._keys = set()
         self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'max_memory', 'gpu_max_memory'])
@@ -379,11 +379,15 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     _naux = None
     if with_df is not None and hasattr(eris, 'vvL'):
         _naux = eris.vvL.shape[1]
+    _n_fused = None
+    if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
+        _n_fused = xtc_obj.phi_isdf.shape[1]
     blksize, _ = estimate_blksize(
         nocc, nvir, 'vvvv',
         gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
         host_max_memory_mb=getattr(cc, 'max_memory', None),
-        naux=_naux)
+        naux=_naux,
+        n_fused=_n_fused)
     
     # Pre-unpack L_vv_full if using density fitting to avoid repeated IO/unpacking
     
@@ -786,7 +790,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 nocc, nvir, 'ovvv_eri_build',
                 gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
                 host_max_memory_mb=getattr(eris, 'max_memory', None),
-                naux=_n_fused)
+                n_fused=_n_fused)
             blksize = max(4, blksize)
             logger.debug(f"    Blksize for ovvv: {blksize}")
             for p0, p1 in lib.prange(0, nvir, blksize):
@@ -805,7 +809,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 nocc, nvir, 'vovv_eri_build',
                 gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
                 host_max_memory_mb=getattr(eris, 'max_memory', None),
-                naux=_n_fused)
+                n_fused=_n_fused)
             blksize = max(4, blksize)
             logger.debug(f"    Blksize for vovv: {blksize}")
             for p0, p1 in lib.prange(0, nvir, blksize):
