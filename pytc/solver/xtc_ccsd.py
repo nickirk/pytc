@@ -132,7 +132,7 @@ class RCCSD(rccsd.RCCSD):
                  if self.jastrow_params is not None:
                      new_cc.xtc_obj = new_cc.xtc_obj.isdf(self.jastrow_params)
             else:
-                 logger.warning("xtc_obj is already ISDFXTC, but n_rank_xtc provided. Ignoring n_rank_xtc re-decomposition for now to avoid complexity.")
+                logger.warning("xtc_obj is already ISDFXTC, but n_rank_xtc provided. Ignoring n_rank_xtc re-decomposition for now to avoid complexity.")
         
         return new_cc
 
@@ -149,6 +149,10 @@ class _ChemistsERIs(rccsd._ChemistsERIs):
         if not hasattr(self, '_keys'):
             self._keys = set()
         self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'max_memory', 'gpu_max_memory'])
+
+    def close(self):
+        if hasattr(self, 'feri') and hasattr(self.feri, 'close'):
+             self.feri.close()
 
 def _make_xtc_eris(cc, mo_coeff=None):
     if mo_coeff is None:

@@ -27,7 +27,7 @@ class TestXTCCCSD_DF(unittest.TestCase):
         self.mol = gto.M(
             atom='O 0 0 0; H 0 1 0; H 0 0 1',
             basis='sto-6g',
-            verbose=4
+            verbose=0
         )
         
         # Standard HF

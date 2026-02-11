@@ -1,12 +1,10 @@
 import logging
 import time
 import numpy as np
-from functools import reduce
 import jax
 import jax.numpy as jnp
 from pyscf import lib
 from pyscf import ao2mo
-from pyscf.ao2mo import _ao2mo
 
 from pytc.solver import xtc_ccsd
 from pytc.utils.gpu_memory import estimate_blksize, get_gpu_budget_bytes
