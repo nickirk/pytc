@@ -256,14 +256,28 @@ class XTC(TC):
         #G = np.zeros((N_rank, N_grid, 3))
         
         # Process r2 points in batches
+        from pytc.utils.prefetch import async_read, await_read
+        pending_grad = None
         for i in range(0, N_grid, batch_size):
             i_end = min(i + batch_size, N_grid)
             
-            # Get Jastrow gradients for this batch
-            u_grad_batch = jastrow_factor.grad(grid_points[i:i_end], grid_points)  # (batch, N_grid,  3)
+            # Get Jastrow gradients (prefetched or inline)
+            if pending_grad is not None:
+                u_grad_batch = await_read(pending_grad)
+                pending_grad = None
+            else:
+                u_grad_batch = jastrow_factor.grad(grid_points[i:i_end], grid_points)  # (batch, N_grid,  3)
+
             G = einsum('j,bj,ijc->bic', weights, xi_rho, u_grad_batch)  # (Nr, N_grid, 3)
         
             K = einsum('bic,dic->bdi', G, G)  # (N_grid, Nr, Nr)
+
+            # Prefetch next batch's gradients while we do einsums
+            next_i = i_end
+            if next_i < N_grid:
+                next_end = min(next_i + batch_size, N_grid)
+                pending_grad = async_read(
+                    lambda _s=next_i, _e=next_end: jastrow_factor.grad(grid_points[_s:_e], grid_points))
         
             # Compute weighted xi_rho for the chunk
             weighted_xi = xi_rho[:,i:i_end] * weights[None, i:i_end]  # (Nr, chunk_size)
@@ -365,17 +379,31 @@ class XTC(TC):
         weighted_rho = rho_paired * self.weights[None, :]  # (Nb^2, N_grid)
         
         # Process grid points in batches
+        from pytc.utils.prefetch import async_read, await_read
+        pending_grad = None
         for i in range(0, N_grid, batch_size):
             i_end = min(i + batch_size, N_grid)
             batch_points = self.grid_points[i:i_end]
             
-            # Get Jastrow gradients for this batch
-            u_grad_batch = self.jastrow_factor.grad(batch_points, self.grid_points)
+            # Get Jastrow gradients (prefetched or inline)
+            if pending_grad is not None:
+                u_grad_batch = await_read(pending_grad)
+                pending_grad = None
+            else:
+                u_grad_batch = self.jastrow_factor.grad(batch_points, self.grid_points)
             
             # Process each spatial component separately using np.dot
             for c in range(3):
                 u_grad_c = u_grad_batch[..., c]
                 result[:, i:i_end, c] = np.dot(weighted_rho, u_grad_c.T)
+
+            # Prefetch next batch's gradients while we proceed
+            next_i = i_end
+            if next_i < N_grid:
+                next_end = min(next_i + batch_size, N_grid)
+                pending_grad = async_read(
+                    lambda _s=next_i, _e=next_end: self.jastrow_factor.grad(
+                        self.grid_points[_s:_e], self.grid_points))
         
         return result
 

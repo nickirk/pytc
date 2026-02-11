@@ -13,6 +13,7 @@ import gc
 logger = logging.getLogger(__name__)
 
 
+@jax.jit
 def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
                                    phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray,
                                    rcond: float = 1e-14) -> jnp.ndarray:

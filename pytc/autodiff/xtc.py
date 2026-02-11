@@ -16,6 +16,52 @@ from . import kmat as kmat_jax
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Host-side cache for X orbital slices read from HDF5.
+#
+# Within each CCSD phase (ovvv / vovv / vvvv), every block iteration calls
+# _contract_delta_U_kernels with the *same* (slice_r, slice_s) — only the
+# (p, q) orbital indices vary.  Caching the last-read X slice avoids
+# re-reading tens of GB from HDF5 per block.
+#
+# The cache holds at most one slice.  When the phase changes (and the
+# (slice_r, slice_s) key changes), the old slice is replaced.
+# ---------------------------------------------------------------------------
+_X_HDF5_CACHE: dict = {"key": None, "data": None}
+
+
+def _read_X_slice(X, slice_r, slice_s):
+    """Read ``X[slice_r, slice_s]``, reusing a host-side cache when possible.
+
+    If *X* is an HDF5 dataset and the requested slice matches the
+    previous call, the cached numpy array is returned directly — no I/O.
+    """
+    if isinstance(X, h5py.Dataset):
+        key = (id(X), _slice_key(slice_r), _slice_key(slice_s))
+        if _X_HDF5_CACHE["key"] == key:
+            logger.debug("  X slice cache HIT  (%s, %s)", slice_r, slice_s)
+            return _X_HDF5_CACHE["data"]
+        logger.debug("  X slice cache MISS (%s, %s) — reading from HDF5", slice_r, slice_s)
+        data = X[slice_r, slice_s]
+        _X_HDF5_CACHE["key"] = key
+        _X_HDF5_CACHE["data"] = data
+        return data
+    # In-memory array: just slice directly.
+    return X[slice_r, slice_s]
+
+
+def invalidate_X_cache():
+    """Explicitly free the cached X slice (e.g., at end of CCSD iteration)."""
+    _X_HDF5_CACHE["key"] = None
+    _X_HDF5_CACHE["data"] = None
+
+
+def _slice_key(sl):
+    """Hashable representation of a slice or index array."""
+    if isinstance(sl, slice):
+        return ("slice", sl.start, sl.stop, sl.step)
+    return ("idx", tuple(np.asarray(sl).ravel()))
+
 
 @struct.dataclass
 class XTC(TC):
@@ -625,6 +671,22 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     return term_d + term_x
 
 
+@jax.jit
+def _delta_h_jk_terms(D, Gb, P_phi, phi_p, phi_q, Y_p, Y_q, wc,
+                       J_D_total, J_X, J_X_sym):
+    """JIT-compiled J/K algebra for get_delta_h (avoids re-tracing each call)."""
+    J_total = J_D_total + J_X + J_X_sym
+
+    DP = D * P_phi
+    DP_sym = DP + DP.T
+    K_D_total = jnp.linalg.multi_dot([phi_p, DP_sym, phi_q.T])
+    K_X_1 = -jnp.dot(phi_p, Y_q.T)
+    K_X_2 = -jnp.dot(Y_p, phi_q.T)
+    K_total = K_D_total + K_X_1 + K_X_2
+
+    return J_total - 0.5 * K_total
+
+
 @struct.dataclass
 class ISDFXTC(XTC, ISDFTC):
     """JAX implementation of extended transcorrelated methods using ISDF.
@@ -864,59 +926,65 @@ class ISDFXTC(XTC, ISDFTC):
             
         pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
 
+        from pytc.utils.prefetch import async_read, await_read
+
+        def _prepare_D_block(g0_loc):
+            """Prepare sharded data for one D-kernel grid block (background-safe)."""
+            g1_loc = min(g0_loc + host_grid_block_size, n_grid)
+            n_blk = g1_loc - g0_loc
+            rem = n_blk % n_devices
+            pad = (n_devices - rem) if rem != 0 else 0
+            n_blk_p = n_blk + pad
+            n_per_dev = n_blk_p // n_devices
+
+            gb = np.asarray(self.grid_points[g0_loc:g1_loc])
+            wb = np.asarray(self.weights[g0_loc:g1_loc])
+            if pad > 0:
+                gb = np.pad(gb, ((0, pad), (0, 0)))
+                wb = np.pad(wb, ((0, pad),))
+            s_grid = gb.reshape(n_devices, n_per_dev, 3)
+            s_weights = wb.reshape(n_devices, n_per_dev)
+
+            G_list = []
+            xi_list = []
+            for d in range(n_devices):
+                start = g0_loc + d * n_per_dev
+                end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
+                alen = end - start
+                G_d = -np.asarray(L_aux[:, start:end, :])
+                if alen < n_per_dev:
+                    G_d = np.pad(G_d, ((0, 0), (0, n_per_dev - alen), (0, 0)))
+                G_list.append(jax.device_put(G_d, devices[d]))
+                if self.xi_phi is not None:
+                    xp = np.asarray(self.xi_phi[:, start:end])
+                else:
+                    xp = np.asarray(xi_phi_ds[:, start:end])
+                if alen < n_per_dev:
+                    xp = np.pad(xp, ((0, 0), (0, n_per_dev - alen)))
+                xi_list.append(jax.device_put(xp, devices[d]))
+            s_G = jax.device_put_sharded(G_list, devices)
+            s_xi = jax.device_put_sharded(xi_list, devices)
+            return s_grid, s_weights, s_G, s_xi
+
         try:
+            pending_D = None
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
-                n_block = g1 - g0
                 logger.debug(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
-                
-                remainder = n_block % n_devices
-                padding = (n_devices - remainder) if remainder != 0 else 0
-                n_block_padded = n_block + padding
-                n_per_device = n_block_padded // n_devices
-                
-                # 1. Shard Grid and Weights
-                grid_block = self.grid_points[g0:g1]
-                weights_block = self.weights[g0:g1]
-                if padding > 0:
-                    grid_block = jnp.pad(grid_block, ((0, padding), (0, 0)))
-                    weights_block = jnp.pad(weights_block, ((0, padding),))
-                
-                sharded_grid = grid_block.reshape(n_devices, n_per_device, 3)
-                sharded_weights = weights_block.reshape(n_devices, n_per_device)
-                
-                # 2. Shard G (L_aux)
-                sharded_G_list = []
-                for d in range(n_devices):
-                    start = g0 + d * n_per_device
-                    end = min(g0 + (d + 1) * n_per_device, g1)
-                    actual_len = end - start
-                    
-                    # Slice L_aux (could be HDF5 dataset or JAX array)
-                    G_d = -L_aux[:, start:end, :]
-                    if actual_len < n_per_device:
-                        G_d = jnp.pad(G_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
-                    sharded_G_list.append(jax.device_put(G_d, devices[d]))
-                sharded_G = jax.device_put_sharded(sharded_G_list, devices)
-                
-                # 3. Shard xi_phi
-                sharded_xi_phi_list = []
-                for d in range(n_devices):
-                    start = g0 + d * n_per_device
-                    end = min(g0 + (d + 1) * n_per_device, g1)
-                    actual_len = end - start
-                    
-                    if self.xi_phi is not None:
-                        xi_phi_d = self.xi_phi[:, start:end]
-                    else:
-                        xi_phi_d = xi_phi_ds[:, start:end]
-                        
-                    if actual_len < n_per_device:
-                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
-                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
-                sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+
+                if pending_D is not None:
+                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = await_read(pending_D)
+                    pending_D = None
+                else:
+                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_D_block(g0)
                 
                 D_rep = pmapped_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
+
+                # While GPU runs pmap, prefetch next block
+                next_g0 = g0 + host_grid_block_size
+                if next_g0 < n_grid:
+                    pending_D = async_read(lambda _g=next_g0: _prepare_D_block(_g))
+
                 D += np.array(jnp.sum(D_rep, axis=0))
                 
                 # Explicitly clear memory
@@ -980,57 +1048,65 @@ class ISDFXTC(XTC, ISDFTC):
             
         pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
 
+        from pytc.utils.prefetch import async_read, await_read
+
+        def _prepare_X_block(g0_loc):
+            """Prepare sharded data for one X-kernel grid block (background-safe)."""
+            g1_loc = min(g0_loc + host_grid_block_size, n_grid)
+            n_blk = g1_loc - g0_loc
+            rem = n_blk % n_devices
+            pad = (n_devices - rem) if rem != 0 else 0
+            n_blk_p = n_blk + pad
+            n_per_dev = n_blk_p // n_devices
+
+            gb = np.asarray(self.grid_points[g0_loc:g1_loc])
+            wb = np.asarray(self.weights[g0_loc:g1_loc])
+            if pad > 0:
+                gb = np.pad(gb, ((0, pad), (0, 0)))
+                wb = np.pad(wb, ((0, pad),))
+            s_grid = gb.reshape(n_devices, n_per_dev, 3)
+            s_weights = wb.reshape(n_devices, n_per_dev)
+
+            G_list = []
+            xi_list = []
+            for d in range(n_devices):
+                start = g0_loc + d * n_per_dev
+                end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
+                alen = end - start
+                G_d = -np.asarray(L_aux[:, start:end, :])
+                if alen < n_per_dev:
+                    G_d = np.pad(G_d, ((0, 0), (0, n_per_dev - alen), (0, 0)))
+                G_list.append(jax.device_put(G_d, devices[d]))
+                if self.xi_phi is not None:
+                    xp = np.asarray(self.xi_phi[:, start:end])
+                else:
+                    xp = np.asarray(xi_phi_ds[:, start:end])
+                if alen < n_per_dev:
+                    xp = np.pad(xp, ((0, 0), (0, n_per_dev - alen)))
+                xi_list.append(jax.device_put(xp, devices[d]))
+            s_G = jax.device_put_sharded(G_list, devices)
+            s_xi = jax.device_put_sharded(xi_list, devices)
+            return s_grid, s_weights, s_G, s_xi
+
         try:
+            pending_X = None
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 logger.debug(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
-                n_block = g1 - g0
-                
-                remainder = n_block % n_devices
-                padding = (n_devices - remainder) if remainder != 0 else 0
-                n_block_padded = n_block + padding
-                n_per_device = n_block_padded // n_devices
-                
-                # 1. Shard Grid and Weights
-                grid_block = self.grid_points[g0:g1]
-                weights_block = self.weights[g0:g1]
-                if padding > 0:
-                    grid_block = jnp.pad(grid_block, ((0, padding), (0, 0)))
-                    weights_block = jnp.pad(weights_block, ((0, padding),))
-                
-                sharded_grid = grid_block.reshape(n_devices, n_per_device, 3)
-                sharded_weights = weights_block.reshape(n_devices, n_per_device)
-                
-                # 2. Shard G (L_aux)
-                sharded_G_list = []
-                for d in range(n_devices):
-                    start = g0 + d * n_per_device
-                    end = min(g0 + (d + 1) * n_per_device, g1)
-                    actual_len = end - start
-                    G_d = -L_aux[:, start:end, :]
-                    if actual_len < n_per_device:
-                        G_d = jnp.pad(G_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
-                    sharded_G_list.append(jax.device_put(G_d, devices[d]))
-                sharded_G = jax.device_put_sharded(sharded_G_list, devices)
-                
-                # 3. Shard xi_phi
-                sharded_xi_phi_list = []
-                for d in range(n_devices):
-                    start = g0 + d * n_per_device
-                    end = min(g0 + (d + 1) * n_per_device, g1)
-                    actual_len = end - start
-                    
-                    if self.xi_phi is not None:
-                        xi_phi_d = self.xi_phi[:, start:end]
-                    else:
-                        xi_phi_d = xi_phi_ds[:, start:end]
-                        
-                    if actual_len < n_per_device:
-                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
-                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
-                sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
+
+                if pending_X is not None:
+                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = await_read(pending_X)
+                    pending_X = None
+                else:
+                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_X_block(g0)
                 
                 X_rep = pmapped_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, L_Q)
+
+                # While GPU runs pmap, prefetch next block
+                next_g0 = g0 + host_grid_block_size
+                if next_g0 < n_grid:
+                    pending_X = async_read(lambda _g=next_g0: _prepare_X_block(_g))
+
                 X += np.array(jnp.sum(X_rep, axis=0))
                 
                 # Explicitly clear memory
@@ -1269,12 +1345,26 @@ class ISDFXTC(XTC, ISDFTC):
             # Process strictly in chunks to respect memory
             logger.debug("  Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
+            from pytc.utils.prefetch import async_read, await_read
+
+            pending_h = None
             for i in range(0, self.n_orb, chunk_size):
                 start = i
                 stop = min(i + chunk_size, self.n_orb)
                 sl = slice(start, stop)
                 logger.debug(f"  Processing slice {start}-{stop}")
-                X_chunk = X[sl] 
+
+                if pending_h is not None:
+                    X_chunk = await_read(pending_h)
+                    pending_h = None
+                else:
+                    X_chunk = np.asarray(X[sl])
+
+                # Prefetch next chunk while einsum runs
+                next_start = stop
+                if next_start < self.n_orb:
+                    next_stop = min(next_start + chunk_size, self.n_orb)
+                    pending_h = async_read(lambda _s=slice(next_start, next_stop): np.asarray(X[_s]))
                 
                 wc += jnp.einsum('rsc,rs->c', X_chunk, dm1[sl])
                 Y_all += jnp.einsum('rqc,rc->qc', X_chunk, phi_tilde[sl])
@@ -1309,15 +1399,32 @@ class ISDFXTC(XTC, ISDFTC):
             J_X_sym_blocks = []
             
             # Iterate p in chunks relative to result
+            from pytc.utils.prefetch import async_read, await_read
+            pending_jx = None
             for i in range(0, Np, orb_block_size):
                 i_end = min(i + orb_block_size, Np)
                 p_abs_start = start_p + i * step_p
                 p_abs_stop = start_p + i_end * step_p
                 p_abs_slice = slice(p_abs_start, p_abs_stop, step_p)
                 
-                # Load X block and contract
-                X_chunk = X[p_abs_slice, slice_q]
+                # Load X block (prefetched or inline)
+                if pending_jx is not None:
+                    X_chunk = await_read(pending_jx)
+                    pending_jx = None
+                else:
+                    X_chunk = np.asarray(X[p_abs_slice, slice_q])
+
                 block_res = - jnp.einsum('pqc,c->pq', X_chunk, Gb)
+
+                # Prefetch next X block while einsum runs
+                next_i = i + orb_block_size
+                if next_i < Np:
+                    ni_end = min(next_i + orb_block_size, Np)
+                    np_start = start_p + next_i * step_p
+                    np_stop = start_p + ni_end * step_p
+                    n_slice = slice(np_start, np_stop, step_p)
+                    pending_jx = async_read(lambda _sl=n_slice: np.asarray(X[_sl, slice_q]))
+
                 J_X_sym_blocks.append(block_res)
                 
             J_X_sym = jnp.concatenate(J_X_sym_blocks, axis=0)
@@ -1326,25 +1433,8 @@ class ISDFXTC(XTC, ISDFTC):
             X_pq = X[slice_p, slice_q]
             J_X_sym = - jnp.einsum('pqc,c->pq', X_pq, Gb)
         
-        # J_total = J_D_total + J_X + J_X_sym
-        J_total = J_D_total + J_X + J_X_sym
-        
-        # K terms
-        DP = D * P_phi
-        DP_sym = DP + DP.T
-        K_D_total = jnp.linalg.multi_dot([phi_p, DP_sym, phi_q.T])
-        
-        # K_X_1: - sum phi_p Y_q
-        K_X_1 = - jnp.dot(phi_p, Y_q.T)
-        
-        # K_X_2: - sum Y_p phi_q
-        K_X_2 = - jnp.dot(Y_p, phi_q.T)
-        
-        # K_total = K_D_total + K_X_1 + K_X_2
-        K_total = K_D_total + K_X_1 + K_X_2
-        
-        # delta_h = J_total - 0.5 * K_total
-        delta_h = J_total - 0.5 * K_total
+        delta_h = _delta_h_jk_terms(D, Gb, P_phi, phi_p, phi_q,
+                                    Y_p, Y_q, wc, J_D_total, J_X, J_X_sym)
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFXTC.get_delta_h completed in {total_time:.4f} s")
@@ -1372,7 +1462,7 @@ class ISDFXTC(XTC, ISDFTC):
         N_rank = X.shape[2]
         
         # Check size of X_sliced vs available GPU memory
-        from pytc.solver.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
+        from pytc.utils.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
         gpu_free_bytes = _get_gpu_free_bytes()
         available_gb = gpu_free_bytes / (1024.0**3)
         
@@ -1405,16 +1495,24 @@ class ISDFXTC(XTC, ISDFTC):
         phi_p = self.phi_isdf[slice_p]
         phi_q = self.phi_isdf[slice_q]
         
-        # Compute adaptive rank block size for this orbital slice
-        _rbs = adaptive_rank_block_size(
-            Np, Nq, N_rank,
-            gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
+        # Use fixed rank_block_size (worst-case over all phases) to avoid
+        # JIT recompilation when (Np, Nq) changes across CCSD blocks.
+        _rbs = self._get_fixed_rank_block_size()
+        if _rbs is None:
+            _rbs = adaptive_rank_block_size(
+                Np, Nq, N_rank,
+                gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
+
+        # Read the full X orbital slice into host RAM (cached across
+        # repeated calls with the same (slice_r, slice_s) — typical
+        # within a CCSD ERI phase).  The chunking path sub-slices
+        # from this host array rather than re-reading from HDF5.
+        X_full = _read_X_slice(X, slice_r, slice_s)
         
         if total_needed_gb < threshold:
             phi_r = self.phi_isdf[slice_r]
             phi_s = self.phi_isdf[slice_s]
-            X_sliced = X[slice_r, slice_s]
-            return _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
+            return _contract_delta_U_kernels_jit(D, X_full, phi_p, phi_q, phi_r, phi_s,
                                                   _rbs)
         
         # Chunking strategy to avoid VRAM exhaustion
@@ -1450,22 +1548,50 @@ class ISDFXTC(XTC, ISDFTC):
                          f"(est. per chunk: {chunk_total_gb:.2f} GB)")
             
             phi_s = self.phi_isdf[slice_s]
+
+            # Async prefetch: overlap host→device transfer of next chunk
+            # with the current GPU JIT computation.
+            from pytc.utils.prefetch import async_read, await_read
+
+            def _prepare_r_chunk(i_start):
+                """Prepare phi_r_chunk and X_chunk for a given r-index range."""
+                ie = min(i_start + orb_chunk_size, Nr)
+                alen = ie - i_start
+                pr = self.phi_isdf[r_idx[i_start:ie]]
+                xc = jnp.asarray(X_full[i_start:ie])
+                if alen < orb_chunk_size:
+                    pad = orb_chunk_size - alen
+                    pr = jnp.pad(pr, ((0, pad), (0, 0)))
+                    xc = jnp.pad(xc, ((0, pad), (0, 0), (0, 0)))
+                return pr, xc, alen
+
+            # Pre-compute first chunk synchronously
+            phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(0)
+            next_future = None
+
             for i in range(0, Nr, orb_chunk_size):
-                i_end = min(i + orb_chunk_size, Nr)
-                curr_r_idx = r_idx[i:i_end]
-                
-                phi_r_chunk = self.phi_isdf[curr_r_idx]
-                X_chunk = X[curr_r_idx, slice_s]
-                
-                # Recompute rank block size for the chunk dimensions
-                _rbs_chunk = adaptive_rank_block_size(
-                    Np, Nq, N_rank,
-                    gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
-                
-                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r_chunk, phi_s,
-                                                          _rbs_chunk)
-                result[:, :, i:i_end, :] = np.asarray(res_chunk)
+                # Use the already-prepared arrays
+                cur_phi_r = phi_r_chunk
+                cur_X = X_chunk
+                cur_actual = actual_len
+
+                # Start JIT computation on GPU
+                res_chunk = _contract_delta_U_kernels_jit(
+                    D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs)
+
+                # While GPU is busy, prepare the next chunk in background
+                next_i = i + orb_chunk_size
+                if next_i < Nr:
+                    next_future = async_read(_prepare_r_chunk, next_i)
+
+                result[:, :, i:i+cur_actual, :] = np.asarray(res_chunk)[:, :, :cur_actual, :]
                 del res_chunk
+
+                # Await next chunk if submitted
+                if next_future is not None and next_i < Nr:
+                    phi_r_chunk, X_chunk, actual_len = await_read(next_future)
+                    next_future = None
+
                 gc.collect()
         else:
             # Chunk over s
@@ -1479,21 +1605,48 @@ class ISDFXTC(XTC, ISDFTC):
                          f"(est. per chunk: {chunk_total_gb:.2f} GB)")
 
             phi_r = self.phi_isdf[slice_r]
+
+            # Async prefetch: overlap host→device transfer of next chunk.
+            from pytc.utils.prefetch import async_read, await_read
+
+            def _prepare_s_chunk(i_start):
+                """Prepare phi_s_chunk and X_chunk for a given s-index range."""
+                ie = min(i_start + orb_chunk_size, Ns)
+                alen = ie - i_start
+                ps = self.phi_isdf[s_idx[i_start:ie]]
+                xc = jnp.asarray(X_full[:, i_start:ie])
+                if alen < orb_chunk_size:
+                    pad = orb_chunk_size - alen
+                    ps = jnp.pad(ps, ((0, pad), (0, 0)))
+                    xc = jnp.pad(xc, ((0, 0), (0, pad), (0, 0)))
+                return ps, xc, alen
+
+            # Pre-compute first chunk synchronously
+            phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(0)
+            next_future = None
+
             for i in range(0, Ns, orb_chunk_size):
-                i_end = min(i + orb_chunk_size, Ns)
-                curr_s_idx = s_idx[i:i_end]
-                
-                phi_s_chunk = self.phi_isdf[curr_s_idx]
-                X_chunk = X[slice_r, curr_s_idx]
-                
-                _rbs_chunk = adaptive_rank_block_size(
-                    Np, Nq, N_rank,
-                    gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
-                
-                res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r, phi_s_chunk,
-                                                          _rbs_chunk)
-                result[:, :, :, i:i_end] = np.asarray(res_chunk)
+                cur_phi_s = phi_s_chunk
+                cur_X = X_chunk
+                cur_actual = actual_len
+
+                # Start JIT computation on GPU
+                res_chunk = _contract_delta_U_kernels_jit(
+                    D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs)
+
+                # While GPU is busy, prepare the next chunk in background
+                next_i = i + orb_chunk_size
+                if next_i < Ns:
+                    next_future = async_read(_prepare_s_chunk, next_i)
+
+                result[:, :, :, i:i+cur_actual] = np.asarray(res_chunk)[:, :, :, :cur_actual]
                 del res_chunk
+
+                # Await next chunk if submitted
+                if next_future is not None and next_i < Ns:
+                    phi_s_chunk, X_chunk, actual_len = await_read(next_future)
+                    next_future = None
+
                 gc.collect()
                 
         return jnp.asarray(result)

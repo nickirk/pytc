@@ -9,7 +9,7 @@ from pyscf import ao2mo
 from pyscf.ao2mo import _ao2mo
 
 from pytc.solver import xtc_ccsd
-from pytc.solver.gpu_memory import estimate_blksize, get_gpu_budget_bytes
+from pytc.utils.gpu_memory import estimate_blksize, get_gpu_budget_bytes
 from pytc.autodiff.xtc import XTC, ISDFXTC
 
 # JAX config
@@ -346,11 +346,14 @@ def _update_amps(cc, t1, t2, eris):
              tmp_a_acc += np.asarray(tmp_a_p)
              tmp_b_acc += np.asarray(tmp_b_p)
     else:
-        # Double-buffered: prefetch next block while GPU computes current block
-        # Pre-load first block
+        # Double-buffered: prefetch next block in background thread while GPU computes
+        from pytc.utils.prefetch import async_read, await_read
+
+        # Pre-load first block synchronously
         p0 = 0
         p1 = min(blksize, nvir)
         ovvv_blk_jax = jnp.asarray(xtc_ccsd._get_slice(eris.ovvv, slice(p0, p1), axis=2))
+        next_future = None
         
         for p0 in range(0, nvir, blksize):
             p1 = min(p0 + blksize, nvir)
@@ -362,11 +365,13 @@ def _update_amps(cc, t1, t2, eris):
                 cur_blk_jax, t1_jax, t2_jax, tau_jax
             )
             
-            # Prefetch next block while GPU computes (async H2D transfer)
+            # Kick off HDF5 read for next block in background thread
+            # so I/O overlaps with the GPU kernel above.
             next_p0 = p0 + blksize
             if next_p0 < nvir:
                 next_p1 = min(next_p0 + blksize, nvir)
-                ovvv_blk_jax = jnp.asarray(xtc_ccsd._get_slice(eris.ovvv, slice(next_p0, next_p1), axis=2))
+                next_future = async_read(
+                    xtc_ccsd._get_slice, eris.ovvv, slice(next_p0, next_p1), 2)
             
             # Accumulate on Host
             t1new_host[:, p0:p1] += np.asarray(t1_upd)
@@ -394,6 +399,11 @@ def _update_amps(cc, t1, t2, eris):
                 t_trans_blk = time.perf_counter() - t0_trans
                 logger.debug(f"      OVVV block {p0}:{p1}: Comp {t_comp_blk:.4f}s, Host accum {t_trans_blk:.4f}s")
             
+            # Await the background read and transfer to GPU for the next iteration
+            if next_future is not None and next_p0 < nvir:
+                ovvv_blk_jax = jnp.asarray(await_read(next_future))
+                next_future = None
+
             del cur_blk_jax, t1_upd, Lvv_blk
     t_t2 = time.perf_counter()
             
@@ -414,11 +424,14 @@ def _update_amps(cc, t1, t2, eris):
             host_max_memory_mb=getattr(cc, 'max_memory', None),
             include_accumulators=use_gpu_acc)
         
-        # Double-buffered: prefetch next block while GPU computes current block
-        # Pre-load first block
+        # Double-buffered: prefetch next block in background thread
+        from pytc.utils.prefetch import async_read, await_read
+
+        # Pre-load first block synchronously
         p0_first = 0
         p1_first = min(blksize_t2, nvir)
         vovv_slice_jax = jnp.asarray(xtc_ccsd._get_slice(eris.vovv, slice(p0_first, p1_first), axis=0))
+        next_future = None
         
         for p0 in range(0, nvir, blksize_t2):
             p1 = min(p0 + blksize_t2, nvir)
@@ -428,11 +441,12 @@ def _update_amps(cc, t1, t2, eris):
             t0_comp = time.perf_counter()
             term = kernel_process_vovv_block(cur_vovv_jax, eris_oovv, t1_slice_jax, t1_jax)
             
-            # Prefetch next block while GPU computes (async H2D transfer)
+            # Kick off HDF5 read for next block in background thread
             next_p0 = p0 + blksize_t2
             if next_p0 < nvir:
                 next_p1 = min(next_p0 + blksize_t2, nvir)
-                vovv_slice_jax = jnp.asarray(xtc_ccsd._get_slice(eris.vovv, slice(next_p0, next_p1), axis=0))
+                next_future = async_read(
+                    xtc_ccsd._get_slice, eris.vovv, slice(next_p0, next_p1), 0)
             
             term.block_until_ready()
             t_comp = time.perf_counter() - t0_comp
@@ -441,6 +455,12 @@ def _update_amps(cc, t1, t2, eris):
             t2new_host[:, :, p0:p1, :] += np.asarray(term)
             t_trans = time.perf_counter() - t0_trans
             logger.debug(f"      VOVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
+
+            # Await background read and transfer for next iteration
+            if next_future is not None and next_p0 < nvir:
+                vovv_slice_jax = jnp.asarray(await_read(next_future))
+                next_future = None
+
             del cur_vovv_jax
         
         t2new_host = t2new_host + t2new_host.transpose(1, 0, 3, 2)
@@ -533,6 +553,10 @@ def _update_amps(cc, t1, t2, eris):
     t1new_host /= eia_np
     t2new_host /= eijab_np
     
+    # Release the X slice cache at the end of each iteration.
+    from pytc.autodiff.xtc import invalidate_X_cache
+    invalidate_X_cache()
+
     logger.debug("_update_amps finished in %.3f s", time.perf_counter()-t_start)
     return t1new_host, t2new_host
 
@@ -586,15 +610,25 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             vvvv_jax = xtc_block
         return jnp.einsum('acbd,ijcd->ijab', vvvv_jax, t2)
 
+    # Prefetch: overlap get_2b(n+1) GPU compute with contract_block_kernel(n)
+    from pytc.utils.prefetch import async_read, await_read
+
+    pending_tc = None
+    pending_key = None
+
     for p0 in range(0, nvir, blksize):
         p1 = min(p0 + blksize, nvir)
         ranges = (slice(nocc + p0, nocc + p1), slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
         
         t_get_2b = time.perf_counter()
-        vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
-        # Force block to see true computation time if it returns JAX array
-        if hasattr(vvvv_block_jax, 'block_until_ready'):
-            vvvv_block_jax.block_until_ready()
+        # Await prefetched result if available
+        if pending_tc is not None and pending_key == (p0, p1):
+            vvvv_block_jax = await_read(pending_tc)
+            pending_tc = None
+        else:
+            vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
+            if hasattr(vvvv_block_jax, 'block_until_ready'):
+                vvvv_block_jax.block_until_ready()
         logger.debug(f"      get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
         
         L_ab_sub_jax = L_vv_full_jax[p0:p1] if with_df is not None else None
@@ -602,13 +636,11 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         if with_df is None:
              t_ao2mo = time.perf_counter()
              mo_v = cc.mo_coeff[:, nocc:]
-             # CPU-bound standard integral calculation
              std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
              logger.debug(f"      ao2mo (std integrals) took {time.perf_counter()-t_ao2mo:.4f} s")
              
              t_transfer = time.perf_counter()
              std_jax = jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
-             # Ensure transfer is complete before proceeding
              if hasattr(std_jax, 'block_until_ready'):
                  std_jax.block_until_ready()
              logger.debug(f"      Host->Device transfer of std integrals took {time.perf_counter()-t_transfer:.4f} s")
@@ -621,6 +653,17 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
              
         t0_comp = time.perf_counter()
         term = contract_block_kernel(t2_jax, vvvv_block_jax, L_ab_sub_jax, L_vv_full_jax)
+
+        # While GPU runs contract_block_kernel, kick off NEXT block's get_2b
+        next_p0 = p0 + blksize
+        if next_p0 < nvir:
+            next_p1 = min(next_p0 + blksize, nvir)
+            next_ranges = (slice(nocc + next_p0, nocc + next_p1),
+                           slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
+            pending_tc = async_read(
+                lambda r=next_ranges: xtc_obj.get_2b(jastrow_params, ranges=r))
+            pending_key = (next_p0, next_p1)
+
         term.block_until_ready()
         t_comp = time.perf_counter() - t0_comp
         

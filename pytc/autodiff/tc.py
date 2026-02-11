@@ -16,6 +16,14 @@ from . import kmat as kmat_jax
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for the fixed rank_block_size computed once per
+# (n_orb, N_fused) pair.  Using the worst-case orbital dimensions
+# (n_orb, n_orb) produces the most conservative (smallest) power-of-2
+# block size, which is safe for every (Np, Nq) slice encountered
+# during CCSD iterations.  This eliminates JIT recompilation from
+# changing static_argnums values across ovvv / vovv / vvvv phases.
+_FIXED_RBS_CACHE: dict = {}
+
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for a grid shard (pmapped)."""
     # Helper to calculate size from tuple (start, stop, step)
@@ -489,6 +497,32 @@ class ISDFTC(TC):
     is_incore: bool = struct.field(default=False, pytree_node=False)
     save_path: str = struct.field(default=None, pytree_node=False)
 
+    def _get_fixed_rank_block_size(self):
+        """Return a fixed rank_block_size that is safe for all orbital slices.
+
+        Uses worst-case dimensions ``(n_orb, n_orb)`` so that the resulting
+        power-of-2 block size is the smallest (most conservative) one.  Any
+        smaller ``(Np, Nq)`` combination would yield a larger or equal block
+        size, so this value is safe everywhere and avoids JIT recompilation
+        from changing ``static_argnums`` across CCSD phases.
+
+        The result is cached at module level keyed by ``(n_orb, N_fused)``
+        so the GPU budget query happens only once per run.
+
+        Returns ``None`` when ``phi_isdf`` is not yet available (pre-ISDF).
+        """
+        if self.phi_isdf is None:
+            return None
+        N_fused = self.phi_isdf.shape[1]
+        key = (int(self.n_orb), int(N_fused))
+        if key not in _FIXED_RBS_CACHE:
+            from pytc.utils.gpu_memory import adaptive_rank_block_size
+            rbs = adaptive_rank_block_size(self.n_orb, self.n_orb, N_fused)
+            logger.info(f"  Fixed rank_block_size = {rbs} "
+                        f"(worst-case n_orb={self.n_orb}, N_fused={N_fused})")
+            _FIXED_RBS_CACHE[key] = rbs
+        return _FIXED_RBS_CACHE[key]
+
     @classmethod
     def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
         """Initialize ISDFTC object from TC object.
@@ -597,55 +631,67 @@ class ISDFTC(TC):
         logger.info(f"  compute_kmat_kernels: Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
 
+        from pytc.utils.prefetch import async_read, await_read
+
+        def _prepare_kmat_block(g0_loc):
+            """Prepare sharded data for one grid block (runs in background thread)."""
+            g1_loc = min(g0_loc + host_grid_block_size, n_grid)
+            n_block_loc = g1_loc - g0_loc
+            remainder_loc = n_block_loc % n_devices
+            padding_loc = (n_devices - remainder_loc) if remainder_loc != 0 else 0
+            n_block_padded_loc = n_block_loc + padding_loc
+            n_per_dev = n_block_padded_loc // n_devices
+
+            grid_block = self.grid_points[g0_loc:g1_loc]
+            weights_block = self.weights[g0_loc:g1_loc]
+            if padding_loc > 0:
+                grid_block = np.pad(grid_block, ((0, padding_loc), (0, 0)))
+                weights_block = np.pad(weights_block, ((0, padding_loc),))
+            s_grid = grid_block.reshape(n_devices, n_per_dev, 3)
+            s_weights = weights_block.reshape(n_devices, n_per_dev)
+
+            phi_list = []
+            grad_list = []
+            for d in range(n_devices):
+                start = g0_loc + d * n_per_dev
+                end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
+                actual_len = end - start
+                if self.xi_phi is not None:
+                    xi_phi_d = self.xi_phi[:, start:end]
+                    xi_grad_d = self.xi_grad[:, start:end, :]
+                else:
+                    xi_phi_d = xi_phi_ds[:, start:end]
+                    xi_grad_d = xi_grad_ds[:, start:end, :]
+                if actual_len < n_per_dev:
+                    xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_dev - actual_len)))
+                    xi_grad_d = np.pad(xi_grad_d, ((0, 0), (0, n_per_dev - actual_len), (0, 0)))
+                phi_list.append(jax.device_put(xi_phi_d, devices[d]))
+                grad_list.append(jax.device_put(xi_grad_d, devices[d]))
+            s_xi_phi = jax.device_put_sharded(phi_list, devices)
+            s_xi_grad = jax.device_put_sharded(grad_list, devices)
+            return s_grid, s_weights, s_xi_phi, s_xi_grad
+
         try:
+            pending_kmat = None
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
-                n_block = g1 - g0
                 logger.info(f"    compute_kmat_kernels: Processing grid block [{g0}:{g1}]...")
-                
-                remainder = n_block % n_devices
-                padding = (n_devices - remainder) if remainder != 0 else 0
-                n_block_padded = n_block + padding
-                n_per_device = n_block_padded // n_devices
-                
-                # 1. Shard Grid and Weights
-                grid_block = self.grid_points[g0:g1]
-                weights_block = self.weights[g0:g1]
-                if padding > 0:
-                    grid_block = jnp.pad(grid_block, ((0, padding), (0, 0)))
-                    weights_block = jnp.pad(weights_block, ((0, padding),))
-                
-                sharded_grid = grid_block.reshape(n_devices, n_per_device, 3)
-                sharded_weights = weights_block.reshape(n_devices, n_per_device)
-                
-                # 2. Shard xi_phi and xi_grad
-                sharded_xi_phi_list = []
-                sharded_xi_grad_list = []
-                for d in range(n_devices):
-                    start = g0 + d * n_per_device
-                    end = min(g0 + (d + 1) * n_per_device, g1)
-                    actual_len = end - start
-                    
-                    if self.xi_phi is not None:
-                        xi_phi_d = self.xi_phi[:, start:end]
-                        xi_grad_d = self.xi_grad[:, start:end, :]
-                    else:
-                        xi_phi_d = xi_phi_ds[:, start:end]
-                        xi_grad_d = xi_grad_ds[:, start:end, :]
-                        
-                    if actual_len < n_per_device:
-                        xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_device - actual_len)))
-                        xi_grad_d = np.pad(xi_grad_d, ((0, 0), (0, n_per_device - actual_len), (0, 0)))
-                        
-                    sharded_xi_phi_list.append(jax.device_put(xi_phi_d, devices[d]))
-                    sharded_xi_grad_list.append(jax.device_put(xi_grad_d, devices[d]))
-                    
-                sharded_xi_phi = jax.device_put_sharded(sharded_xi_phi_list, devices)
-                sharded_xi_grad = jax.device_put_sharded(sharded_xi_grad_list, devices)
-                
+
+                # Fetch prepared data (prefetched or inline)
+                if pending_kmat is not None:
+                    sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad = await_read(pending_kmat)
+                    pending_kmat = None
+                else:
+                    sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad = _prepare_kmat_block(g0)
+
                 K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, jastrow_params,
                                                        full_grid, full_weights, full_xi_phi)
-                
+
+                # While GPU runs pmap, prefetch next block's data in background
+                next_g0 = g0 + host_grid_block_size
+                if next_g0 < n_grid:
+                    pending_kmat = async_read(lambda _g=next_g0: _prepare_kmat_block(_g))
+
                 K1_kernel += np.array(jnp.sum(K1_shards, axis=0))
                 K3_kernel += np.array(jnp.sum(K3_shards, axis=0))
                 
@@ -737,21 +783,37 @@ class ISDFTC(TC):
                 
                 # Inner loop: Integration blocks (g)
                 # Also controlled by host_grid_block_size to limit peak memory of inputs
+                from pytc.utils.prefetch import async_read, await_read
+
+                def _prepare_Laux_int_block(g0_loc):
+                    """Load integration chunk to device (background-thread safe)."""
+                    g1_loc = min(g0_loc + host_grid_block_size, n_grid)
+                    g_chunk = jax.device_put(np.asarray(self.grid_points[g0_loc:g1_loc]))
+                    w_chunk = jax.device_put(np.asarray(self.weights[g0_loc:g1_loc]))
+                    if self.xi_phi is not None:
+                        xi_chunk = jax.device_put(np.asarray(self.xi_phi[:, g0_loc:g1_loc]))
+                    else:
+                        xi_chunk = jax.device_put(np.asarray(xi_phi_ds[:, g0_loc:g1_loc]))
+                    return g_chunk, w_chunk, xi_chunk
+
+                pending_int = None
                 for g0 in range(0, n_grid, host_grid_block_size):
                     g1 = min(g0 + host_grid_block_size, n_grid)
                     
-                    # Load chunks to device
-                    grid_int_chunk = jax.device_put(self.grid_points[g0:g1])
-                    weights_int_chunk = jax.device_put(self.weights[g0:g1])
-                    
-                    if self.xi_phi is not None:
-                        xi_phi_chunk = jax.device_put(self.xi_phi[:, g0:g1])
+                    # Fetch prepared data (prefetched or inline)
+                    if pending_int is not None:
+                        grid_int_chunk, weights_int_chunk, xi_phi_chunk = await_read(pending_int)
+                        pending_int = None
                     else:
-                        xi_phi_chunk = jax.device_put(xi_phi_ds[:, g0:g1])
+                        grid_int_chunk, weights_int_chunk, xi_phi_chunk = _prepare_Laux_int_block(g0)
                             
                     # Compute partial update
-                    # The pmapped function uses scan internally with batch_size=1024
                     res_partial = pmapped_compute(sharded_grid_eval, jastrow_params, grid_int_chunk, weights_int_chunk, xi_phi_chunk)
+
+                    # While GPU runs pmap, prefetch next integration block
+                    next_g0 = g0 + host_grid_block_size
+                    if next_g0 < n_grid:
+                        pending_int = async_read(lambda _g=next_g0: _prepare_Laux_int_block(_g))
                     
                     if res_rep_accum is None:
                         res_rep_accum = res_partial
@@ -760,7 +822,6 @@ class ISDFTC(TC):
                     
                     # Explicitly free memory
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
-                    # gc.collect() # Optional, might be too slow to call every time
                 
                 # Store result for this evaluation block
                 res_block = res_rep_accum.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
@@ -888,6 +949,9 @@ class ISDFTC(TC):
         r_stop = slice_r_T.stop if slice_r_T.stop is not None else nmo
         r_len = r_stop - r_start
 
+        # Use fixed rank_block_size to avoid JIT recompilation.
+        rbs = self._get_fixed_rank_block_size()
+
         # Determine chunk boundaries
         chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
         for i0 in range(0, r_len, chunk_size):
@@ -898,14 +962,17 @@ class ISDFTC(TC):
             # K1-K2 sub-chunk on GPU
             if sub_slice_r == slice_s_T:
                 tmp = kmat_jax.contract_K1_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges)
+                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges,
+                    rank_block_size=rbs)
                 tmp = tmp - tmp.transpose(1, 0, 2, 3)
             else:
                 tmp = kmat_jax.contract_K1_minus_K2_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges)
+                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges,
+                    rank_block_size=rbs)
 
             # K3 sub-chunk on GPU
-            tmp = tmp + kmat_jax.contract_K3_isdf(self.phi_isdf, U3, sub_ranges)
+            tmp = tmp + kmat_jax.contract_K3_isdf(
+                self.phi_isdf, U3, sub_ranges, rank_block_size=rbs)
 
             # Transfer to host and accumulate — frees GPU memory for next chunk
             chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
@@ -936,21 +1003,29 @@ class ISDFTC(TC):
         U3 = kernels['K3_kernel']
         
         slice_p, slice_q, slice_r, slice_s = ranges if ranges else (slice(None), slice(None), slice(None), slice(None))
+
+        # Use a fixed rank_block_size for all kmat calls to avoid
+        # JIT recompilation when (Np, Nq) changes across CCSD phases.
+        rbs = self._get_fixed_rank_block_size()
         
         # --- Direct block: (K1 - K2 + K3)[pqrs] * 0.5 ---
         # Compute K1-K2, transfer to host, then K3, transfer to host.
         # Never hold two output-sized tensors on GPU simultaneously.
         if slice_p == slice_q:
-            k12 = kmat_jax.contract_K1_isdf(self.phi_isdf, self.grad_phi_isdf, U1, ranges)
+            k12 = kmat_jax.contract_K1_isdf(
+                self.phi_isdf, self.grad_phi_isdf, U1, ranges,
+                rank_block_size=rbs)
             k12 = k12 - k12.transpose(1, 0, 2, 3)
         else:
             k12 = kmat_jax.contract_K1_minus_K2_isdf(
-                self.phi_isdf, self.grad_phi_isdf, U1, ranges)
+                self.phi_isdf, self.grad_phi_isdf, U1, ranges,
+                rank_block_size=rbs)
         
         result_np = np.array(k12)  # writable host copy
         del k12
 
-        k3 = kmat_jax.contract_K3_isdf(self.phi_isdf, U3, ranges)
+        k3 = kmat_jax.contract_K3_isdf(
+            self.phi_isdf, U3, ranges, rank_block_size=rbs)
         result_np += np.asarray(k3)
         del k3
         result_np *= 0.5

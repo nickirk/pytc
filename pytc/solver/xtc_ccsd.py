@@ -9,7 +9,7 @@ from pyscf.cc import rintermediates as imd
 from pyscf import ao2mo
 from pyscf.ao2mo import _ao2mo
 
-from pytc.solver.gpu_memory import estimate_blksize
+from pytc.utils.gpu_memory import estimate_blksize, enable_xla_compilation_cache
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,10 @@ class RCCSD(rccsd.RCCSD):
             self.max_memory = getattr(mf, 'max_memory', 4000)
             
         self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'gpu_max_memory'])
+
+        # Enable XLA persistent compilation cache so compiled HLO programs
+        # are reused across CCSD iterations and across runs.
+        enable_xla_compilation_cache()
 
     def ao2mo(self, mo_coeff=None):
         mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
@@ -284,7 +288,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # eris.voov = get_block_df('voov') # Unused?
         
         # Tiered VVVV: materialize only if V^4 fits in a fraction of memory budget
-        from pytc.solver.gpu_memory import get_gpu_budget_bytes
+        from pytc.utils.gpu_memory import get_gpu_budget_bytes
         vvvv_bytes = float(nvir)**4 * 8
         gpu_budget = get_gpu_budget_bytes(getattr(cc, 'gpu_max_memory', None))
         host_budget = getattr(cc, 'max_memory', 4000) * 1e6
@@ -335,7 +339,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vovv = get_block('vovv')
         
         # Tiered VVVV: materialize only if V^4 fits in memory budget
-        from pytc.solver.gpu_memory import get_gpu_budget_bytes
+        from pytc.utils.gpu_memory import get_gpu_budget_bytes
         vvvv_bytes = float(nvir)**4 * 8
         gpu_budget = get_gpu_budget_bytes(getattr(cc, 'gpu_max_memory', None))
         host_budget = getattr(cc, 'max_memory', 4000) * 1e6
@@ -397,35 +401,46 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
          # This might be large (approx 5-10GB for 800 orbitals) but necessary for performance
          L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
 
+    # Prefetch: overlap get_2b(n+1) GPU compute with tensordot/einsum(n) CPU work.
+    from pytc.utils.prefetch import async_read, await_read
+
+    pending_tc = None    # Future for the NEXT block's get_2b result
+    pending_key = None   # (p0, p1) for the pending block
     for p0 in range(0, nvir, blksize):
         p1 = min(p0 + blksize, nvir)
         ranges = (slice(nocc + p0, nocc + p1), slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
-        
-        vvvv_block = np.array(xtc_obj.get_2b(jastrow_params, ranges=ranges))
-        
+
+        # Await the prefetched TC block if available, else compute inline.
+        if pending_tc is not None and pending_key == (p0, p1):
+            vvvv_block = await_read(pending_tc)
+            pending_tc = None
+        else:
+            vvvv_block = np.array(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+        # Kick off NEXT block's get_2b in background thread so GPU work
+        # overlaps with this iteration's CPU tensordot + einsum.
+        next_p0 = p0 + blksize
+        if next_p0 < nvir:
+            next_p1 = min(next_p0 + blksize, nvir)
+            next_ranges = (slice(nocc + next_p0, nocc + next_p1),
+                           slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
+            pending_tc = async_read(
+                lambda r=next_ranges: np.array(xtc_obj.get_2b(jastrow_params, ranges=r)))
+            pending_key = (next_p0, next_p1)
+
         logger.debug("    Contraction block %d:%d", p0, p1)
         t0 = time.perf_counter()
         if with_df is not None:
-             # L_vv_full is (nvir, nvir, naux)
-             # Slicing along axis 0 corresponds to 'a' index in L_ab (L|ab) -> unpacked to (a, b, L)
              L_ab_sub = L_vv_full[p0:p1]
-             
-             # Contract (a_blk, d, L) with (c, d, L) on L (axis 2) -> (a_blk, d, c, d)
-             # std_block shape is (blk, nvir, nvir, nvir)
              std_block = np.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
-             
-             # In-place add to avoid a 3rd (blk,V,V,V) copy on host
              vvvv_block += std_block
              del std_block
-             
         else:
              mo_v = cc.mo_coeff[:, nocc:]
              std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
              vvvv_block += std_block.reshape(p1-p0, nvir, nvir, nvir)
              del std_block
-        
-        # Transpose to (a, c, b, d) and contract
-        # .transpose() returns a view — no extra memory
+
         out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_block.transpose(0, 2, 1, 3), t2)
         del vvvv_block
         logger.debug("    Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
@@ -548,14 +563,20 @@ def _update_amps(cc, t1, t2, eris):
         tmp_a = lib.einsum('kdac,ijcd->kaij', eris_ovvv, tau)
         tmp_b = lib.einsum('kcbd,ijcd->kbij', eris_ovvv, tau)
     else:
-        # HDF5 blocked loop path
+        # HDF5 blocked loop path — prefetch next block while processing current one
+        from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
         blksize = max(4, int(mem_host / (nocc*nvir*nvir*8)))
         blksize = min(nvir, blksize)
-        logger.debug("    Starting ovvv loop (blksize=%d)", blksize)
+        logger.debug("    Starting ovvv loop (blksize=%d, prefetched)", blksize)
         t_loop = time.perf_counter()
-        for p0 in range(0, nvir, blksize):
-            p1 = min(p0 + blksize, nvir)
-            _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
+        chunks = [(p0, min(p0 + blksize, nvir))
+                  for p0 in range(0, nvir, blksize)]
+        loader = hdf5_slice_loader(eris.ovvv, axis=2)
+        with PrefetchIterator(chunks, loader) as pit:
+            for (p0, p1), ovvv_blk in pit:
+                _process_ovvv_block_prefetched(
+                    ovvv_blk, t1, t2, tau, t1new, Lvv,
+                    Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
         logger.debug("    ovvv loop done in %.3f s", time.perf_counter()-t_loop)
 
     t2new = np.zeros_like(t2)
@@ -568,17 +589,22 @@ def _update_amps(cc, t1, t2, eris):
         tmp = lib.einsum('abic,jc->ijab', tmp2, t1)
         t2new = tmp + tmp.transpose(1,0,3,2)
     else:
-        # HDF5 blocked loop path
+        # HDF5 blocked loop path — prefetch next block while processing current one
+        from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
         mem_host = cc.max_memory * 1e6
         blksize_t2 = max(4, int(mem_host / (nvir*nocc*nvir*8)))
         blksize_t2 = min(nvir, blksize_t2)
-        logger.debug("    Starting vovv loop (blksize=%d)", blksize_t2)
+        logger.debug("    Starting vovv loop (blksize=%d, prefetched)", blksize_t2)
         t_loop = time.perf_counter()
-        for p0 in range(0, nvir, blksize_t2):
-            p1 = min(p0 + blksize_t2, nvir)
-            _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1)
+        chunks = [(p0, min(p0 + blksize_t2, nvir))
+                  for p0 in range(0, nvir, blksize_t2)]
+        loader = hdf5_slice_loader(eris.vovv, axis=0)
+        with PrefetchIterator(chunks, loader) as pit:
+            for (p0, p1), vovv_slice in pit:
+                _process_vovv_block_prefetched(
+                    vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
         # Symmetrize the accumulated t2new from vovv blocks
-        t2new = t2new + t2new.transpose(1, 0, 3, 2)    
+        t2new = t2new + t2new.transpose(1, 0, 3, 2)
         logger.debug("    vovv loop done in %.3f s", time.perf_counter()-t_loop)
 
 
@@ -632,6 +658,11 @@ def _update_amps(cc, t1, t2, eris):
     t1new /= eia
     t2new /= eijab
 
+    # Release the X slice cache at the end of each iteration to
+    # free host memory between CCSD steps.
+    from pytc.autodiff.xtc import invalidate_X_cache
+    invalidate_X_cache()
+
     return t1new, t2new
 
 def _energy(cc, t1, t2, eris):
@@ -676,6 +707,15 @@ def _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_
     logger.debug("    _process_ovvv_block chunk %d:%d", p0, p1)
     t0 = time.perf_counter()
     ovvv_blk = _get_slice(eris.ovvv, slice(p0, p1), axis=2)  # (nocc, nvir, blk, nvir)
+    _process_ovvv_block_prefetched(ovvv_blk, t1, t2, tau, t1new, Lvv,
+                                    Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
+    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+
+
+def _process_ovvv_block_prefetched(ovvv_blk, t1, t2, tau, t1new, Lvv,
+                                    Wvoov, Wvovo, tmp_a, tmp_b, p0, p1):
+    """Process an already-loaded ovvv block (used by PrefetchIterator path)."""
+    t0 = time.perf_counter()
     
     # 1. Update t1new (ia)
     # PySCF: 2*einsum('kdac,ikcd->ia') - einsum('kcad,ikcd->ia')
@@ -719,6 +759,13 @@ def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1):
     logger.debug("    _process_vovv_block chunk %d:%d", p0, p1)
     t0 = time.perf_counter()
     vovv_slice = _get_slice(eris.vovv, slice(p0, p1), axis=0)  # (a_blk, i, b, c)
+    _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
+    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+
+
+def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1):
+    """Process an already-loaded vovv block (used by PrefetchIterator path)."""
+    t0 = time.perf_counter()
     
     # For tmp2 = -oovv.ka + vovv, we need the contribution for a in [p0:p1]
     # oovv is (k, i, b, c), t1 is (k, a)
@@ -797,15 +844,33 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 n_fused=_n_fused)
             blksize = max(4, blksize)
             logger.debug(f"    Blksize for ovvv: {blksize}")
+
+            # Prefetch: overlap the GPU get_2b of the NEXT block with the
+            # current block's CPU tensordot + HDF5 write.
+            from pytc.utils.prefetch import async_read, await_read
+            pending_tc = None
+            pending_key = None
             for p0, p1 in lib.prange(0, nvir, blksize):
                  L_vv_slice = L_vv_full[p0:p1] 
-                 # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
-                 # (L, k, c) x (a, d, L) -> (k, c, a, d) tensor dot
                  std_blk = np.tensordot(Lov_reshaped, L_vv_slice, axes=((0), (2)))
-                 # std_blk already (k, c, a, d)
                  
                  ranges = (slice(0, nocc), slice(nocc, nmo), slice(nocc+p0, nocc+p1), slice(nocc, nmo))
-                 tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+                 if pending_tc is not None and pending_key == (p0, p1):
+                     tc_blk = await_read(pending_tc)
+                     pending_tc = None
+                 else:
+                     tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+                 # Kick off NEXT block's get_2b in background
+                 next_p0 = p0 + blksize
+                 if next_p0 < nvir:
+                     next_p1 = min(next_p0 + blksize, nvir)
+                     next_ranges = (slice(0, nocc), slice(nocc, nmo),
+                                    slice(nocc+next_p0, nocc+next_p1), slice(nocc, nmo))
+                     pending_tc = async_read(
+                         lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+                     pending_key = (next_p0, next_p1)
+
                  ds[:, :, p0:p1, :] = std_blk + tc_blk
 
         elif name == 'vovv': # (c, k, a, d) - iterate 'c' (idx 0)
@@ -816,10 +881,29 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 n_fused=_n_fused)
             blksize = max(4, blksize)
             logger.debug(f"    Blksize for vovv: {blksize}")
+
+            from pytc.utils.prefetch import async_read, await_read
+            pending_tc = None
+            pending_key = None
             for p0, p1 in lib.prange(0, nvir, blksize):
-                Lov_slice = Lov_reshaped[:, :, p0:p1] # (L, k, c_blk)
+                Lov_slice = Lov_reshaped[:, :, p0:p1]
                 std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
                 std_blk = std_blk.transpose(1, 0, 2, 3) 
                 ranges = (slice(nocc+p0, nocc+p1), slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
-                tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+                if pending_tc is not None and pending_key == (p0, p1):
+                    tc_blk = await_read(pending_tc)
+                    pending_tc = None
+                else:
+                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+                # Kick off NEXT block's get_2b in background
+                next_p0 = p0 + blksize
+                if next_p0 < nvir:
+                    next_p1 = min(next_p0 + blksize, nvir)
+                    next_ranges = (slice(nocc+next_p0, nocc+next_p1),
+                                   slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
+                    pending_tc = async_read(
+                        lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+                    pending_key = (next_p0, next_p1)
+
                 ds[p0:p1, :, :, :] = std_blk + tc_blk

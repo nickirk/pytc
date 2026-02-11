@@ -502,7 +502,7 @@ def contract_K1_isdf(phi_piv, grad_phi_piv, U1, ranges=None, rank_block_size=Non
     grad_phi_p = grad_phi_piv[slice_p]
     
     if rank_block_size is None:
-        from pytc.solver.gpu_memory import adaptive_rank_block_size
+        from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(
             phi_p.shape[0], phi_q.shape[0], U1.shape[0],
             gpu_max_memory_mb=gpu_max_memory_mb)
@@ -602,7 +602,7 @@ def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
     grad_phi_q = grad_phi_piv[slice_q]
 
     if rank_block_size is None:
-        from pytc.solver.gpu_memory import adaptive_rank_block_size
+        from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(
             phi_p.shape[0], phi_q.shape[0], U1.shape[0],
             gpu_max_memory_mb=gpu_max_memory_mb)
@@ -696,7 +696,7 @@ def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
     phi_s = phi_piv[slice_s]
     
     if rank_block_size is None:
-        from pytc.solver.gpu_memory import adaptive_rank_block_size
+        from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(
             phi_p.shape[0], phi_q.shape[0], U3.shape[0],
             gpu_max_memory_mb=gpu_max_memory_mb)
