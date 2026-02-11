@@ -289,17 +289,38 @@ def estimate_blksize(nocc, nvir, phase, *,
 
         _N_fused = n_fused if n_fused is not None else (naux if naux is not None else 0)
         if _N_fused > 0:
-            # Estimate scan workspace (W intermediate) same as eri_build
+            # ----- TC scan workspace -----
             _peak_per_rank = max(V * _N_fused + V * V,
                                  _N_fused * V + V * V, 1) * B
-            import math
             _rank_blk = max(64, int(gpu_free * 0.5 / _peak_per_rank))
-            _rank_blk = 2 ** int(math.log2(max(_rank_blk, 1)))
+            _rank_blk = 2 ** int(np.log2(max(_rank_blk, 1)))
             _rank_blk = min(_rank_blk, 2048, _N_fused)
             _rank_blk = max(_rank_blk, 64)
-            scan_workspace = _N_fused * _rank_blk * V * B
+            tc_scan_ws = _N_fused * _rank_blk * V * B
+
+            # ----- Delta_U constant overhead -----
+            # get_2b calls ISDFTC.get_2b (TC) then get_delta_U (delta_U)
+            # sequentially.  The binding constraint is the phase that
+            # needs more GPU memory.
+            #
+            # For vvvv/vvvv_gpu, ranges=(blk, V, V, V):
+            #   delta_U: Np=blk, Nq=V, Nr=V, Ns=V
+            #   X_sliced = (V, V, N_fused) — CONSTANT, ~46 GB for large systems
+            #   D = (N_fused, N_fused) — constant
+            #   Peak: X_sliced(input+padded) + D + 3×carry (term_d+carry+contrib)
+            x_constant = V * V * _N_fused * B * 2   # input + padded copy
+            d_constant = _N_fused * _N_fused * B
+            du_constant = x_constant + d_constant
+
+            # TC phase: tc_scan_ws + 2× carry per blk
+            tc_per_blk = V * V * V * B * 2
+            # Delta_U phase: 3× carry per blk (term_d + carry + contribution)
+            du_per_blk = V * V * V * B * 3
         else:
-            scan_workspace = 0
+            tc_scan_ws = 0
+            du_constant = 0
+            tc_per_blk = V * V * V * B * 2
+            du_per_blk = V * V * V * B * 2
 
         if gpu_contraction:
             # Inside contract_block_kernel (all on GPU simultaneously):
@@ -308,15 +329,23 @@ def estimate_blksize(nocc, nvir, phase, *,
             #   sum                (blk,V,V,V) — xtc_block + tensordot
             #   einsum result      (O,O,blk,V) — output
             # XLA may fuse some of these, but peak ≈ 3× (blk,V,V,V).
-            # Plus the get_2b scan needs carry+contribution = 2× (blk,V,V,V),
-            # but those are freed before the kernel runs.
-            # Conservative: 3× (blk,V,V,V) for the kernel.
-            gpu_per_blk = V * V * V * B * 3
+            # Conservative: max of contraction kernel and delta_U.
+            kernel_per_blk = V * V * V * B * 3
+            # Contraction kernel also needs the xtc_block on GPU, so
+            # delta_U constant overhead doesn't apply during this phase.
+            # But get_2b's delta_U is the binding constraint for production.
+            gpu_per_blk = max(kernel_per_blk, du_per_blk)
         else:
-            gpu_per_blk = V * V * V * B * 2   # carry + contribution from get_2b scan
+            gpu_per_blk = du_per_blk
 
-        gpu_available = max(gpu_free - scan_workspace, 0)
-        gpu_blk = max(1, int(gpu_available * 0.65 / gpu_per_blk))
+        # GPU blksize = min of TC-limited and delta_U-limited
+        tc_avail = max(gpu_free - tc_scan_ws, 0)
+        du_avail = max(gpu_free - du_constant, 0)
+        gpu_blk_tc = max(1, int(tc_avail * 0.65 / tc_per_blk))
+        gpu_blk_du = max(1, int(du_avail * 0.45 / du_per_blk))
+        gpu_blk = min(gpu_blk_tc, gpu_blk_du)
+
+        scan_workspace = tc_scan_ws  # for logging
 
         blksize = min(host_blk, gpu_blk, nvir)
         logger.debug(
@@ -344,68 +373,89 @@ def estimate_blksize(nocc, nvir, phase, *,
             host_budget = int(host_max_memory_mb * 1e6)
         else:
             host_budget = budget  # fall back to GPU budget as proxy
-        
+
         # Per-blk cost: std_blk + tc_blk on host
         host_per_blk = O * V * V * B * 2  # std_blk + tc_blk
 
         # GPU side: query *actually free* memory in JAX's pool.
-        # This already accounts for the pre-allocation fraction (default 75%)
-        # AND any resident tensors (ISDF kernels, phi_isdf, etc.).
         gpu_free = _get_gpu_free_bytes()
 
-        # ----- Scan workspace overhead (constant, independent of blk) -----
-        # Inside each ISDF scan JIT (contract_K1_minus_K2_isdf_jit, etc.)
-        # the dominant intermediate is:
-        #   W: (N_fused, rank_block_size, max(Np,Nq)) × 8 bytes
-        # This must be subtracted from the GPU budget *before* we divide
-        # by the per-blk cost (carry + contribution).
-        #
-        # Compute rank_block_size the same way adaptive_rank_block_size does:
         N_fused = n_fused if n_fused is not None else (naux if naux is not None else 0)
         if N_fused > 0:
-            # Dimension order differs by phase:
-            # ovvv: ranges=(O, V, blk, V) → Np=O, Nq=V (at scan time)
-            # vovv: ranges=(blk, O, V, V) → Np=blk, Nq=O (at scan time)
-            #       Since blksize is unknown yet, use nvir as worst-case Np.
+            # ----- TC scan workspace (constant overhead during TC phase) -----
             if phase == 'vovv_eri_build':
-                _Np = nvir  # worst-case: full virtual dimension
-                _Nq = max(O, V)  # ket dimensions include O and V
+                _Np_tc = nvir   # worst-case Np for TC scan
+                _Nq_tc = max(O, V)
             else:  # ovvv_eri_build
-                _Np = O  # bra dimension (nocc)
-                _Nq = V  # ket dimension
-            _peak_per_rank = max(_Np * N_fused + _Np * _Nq,
-                                 N_fused * _Nq + _Np * _Nq, 1) * B
-            import math
-            _rank_blk = max(64, int(gpu_free * 0.5 / _peak_per_rank))
-            _rank_blk = 2 ** int(math.log2(max(_rank_blk, 1)))
-            _rank_blk = min(_rank_blk, 2048, N_fused)
-            _rank_blk = max(_rank_blk, 64)
-            # W intermediate: (N_fused, rank_blk, max(Np,Nq))
-            scan_workspace = N_fused * _rank_blk * max(_Np, _Nq) * B
+                _Np_tc = O
+                _Nq_tc = V
+            _peak = max(_Np_tc * N_fused + _Np_tc * _Nq_tc,
+                        N_fused * _Nq_tc + _Np_tc * _Nq_tc, 1) * B
+            _rblk = max(64, int(gpu_free * 0.5 / _peak))
+            _rblk = 2 ** int(np.log2(max(_rblk, 1)))
+            _rblk = min(_rblk, 2048, N_fused)
+            _rblk = max(_rblk, 64)
+            tc_scan_ws = N_fused * _rblk * max(_Np_tc, _Nq_tc) * B
+
+            # TC phase GPU constraint: scan_workspace + 2× carry per blk
+            tc_constant = tc_scan_ws
+            tc_per_blk = O * V * V * B * 2
+
+            # ----- Delta_U phase GPU overhead -----
+            # _contract_delta_U_kernels_jit runs TWO sequential scans:
+            #   1. D-scan: accumulates term_d (Np,Nq,Nr,Ns)
+            #   2. X-scan: accumulates term_x, with term_d still alive
+            # Peak during X-scan = X_sliced + D + 3× carry_size
+            #   (term_d + term_x carry + contribution)
+            #
+            # X_sliced = X[slice_r, slice_s] is transferred to GPU as a
+            # JIT argument and stays resident.  Inside the JIT, X_padded
+            # (a zero-padded copy, ~14% larger) is created.  Both coexist
+            # briefly.  To be safe, budget ~2× X_sliced for this overlap.
+            #
+            # Dimension mapping:
+            #   ovvv: ranges=(O,V,blk,V) → Np=O, Nq=V, Nr=blk, Ns=V
+            #     X_sliced = (blk, V, N_fused) → **proportional to blk**
+            #   vovv: ranges=(blk,O,V,V) → Np=blk, Nq=O, Nr=V, Ns=V
+            #     X_sliced = (V, V, N_fused) → **constant** (huge!)
+            d_overhead = N_fused * N_fused * B  # D matrix on GPU
+
+            if phase == 'vovv_eri_build':
+                # X_sliced constant: (V, V, N_fused).  Budget 2× for
+                # input + padded copy inside JIT.
+                x_constant = V * V * N_fused * B * 2
+                du_constant = x_constant + d_overhead
+                # 3× carry: term_d + carry + contribution
+                du_per_blk = O * V * V * B * 3
+            else:  # ovvv_eri_build
+                # X_sliced per-blk: (blk, V, N_fused).  Budget 2× for
+                # input + padded copy.
+                du_constant = d_overhead
+                du_per_blk = (3 * O * V * V + 2 * V * N_fused) * B
+
+            # GPU blksize = min of TC-limited and delta_U-limited
+            tc_avail = max(gpu_free - tc_constant, 0)
+            du_avail = max(gpu_free - du_constant, 0)
+
+            gpu_blk_tc = max(1, int(tc_avail * 0.65 / tc_per_blk))
+            gpu_blk_du = max(1, int(du_avail * 0.45 / du_per_blk))
+            gpu_blk = min(gpu_blk_tc, gpu_blk_du)
+
+            # For logging, record the binding workspace
+            scan_workspace = tc_scan_ws  # TC scan workspace (for log)
         else:
             scan_workspace = 0
+            gpu_blk = max(1, int(gpu_free * 0.65 / (O * V * V * B * 2)))
 
-        # Per-blk cost: carry + contribution inside lax.scan
-        #   carry:        (Np, Nq, blk, Ns) — persists across iterations
-        #   contribution: (Np, Nq, blk, Ns) — recomputed each step
-        gpu_per_blk = O * V * V * B * 2   # carry + contribution per unit blk
-
-        # Available GPU after subtracting scan workspace overhead
-        gpu_available = max(gpu_free - scan_workspace, 0)
-
-        # Blksize is the min of host-derived and GPU-derived limits.
-        # 0.65 safety factor on gpu_available to cover C_rs, scan
-        # double-buffering, and XLA scratch/fragmentation.
         host_blk = max(1, int(host_budget * 0.65 / host_per_blk))
-        gpu_blk = max(1, int(gpu_available * 0.65 / gpu_per_blk))
         blksize = min(host_blk, gpu_blk, nvir)
 
         logger.debug(
             "estimate_blksize(phase=%s): host_budget=%.2f GB, gpu_free=%.2f GB, "
-            "scan_workspace=%.2f GB, gpu_available=%.2f GB, "
+            "scan_workspace=%.2f GB, "
             "host_blk=%d, gpu_blk=%d → blksize=%d",
             phase, host_budget / 1e9, gpu_free / 1e9,
-            scan_workspace / 1e9, gpu_available / 1e9,
+            scan_workspace / 1e9,
             host_blk, gpu_blk, blksize)
         return blksize, budget
 
@@ -471,8 +521,7 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
     max_rank_block = max(min_block, int(budget * 0.5 / peak_per_rank))
 
     # Round down to power of 2
-    import math
-    max_rank_block = 2 ** int(math.log2(max(max_rank_block, 1)))
+    max_rank_block = 2 ** int(np.log2(max(max_rank_block, 1)))
     max_rank_block = min(max_rank_block, max_block, N_fused)
     max_rank_block = max(max_rank_block, min_block)
 

@@ -1372,23 +1372,30 @@ class ISDFXTC(XTC, ISDFTC):
         N_rank = X.shape[2]
         
         # Check size of X_sliced vs available GPU memory
-        from pytc.solver.gpu_memory import get_gpu_budget_bytes, adaptive_rank_block_size
-        gpu_budget = get_gpu_budget_bytes(getattr(self, 'gpu_max_memory', None))
-        available_gb = gpu_budget / (1024.0**3)
+        from pytc.solver.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
+        gpu_free_bytes = _get_gpu_free_bytes()
+        available_gb = gpu_free_bytes / (1024.0**3)
         
-        # Estimate total GPU memory needed for delta_U calculation:
-        # - X_sliced: (Nr, Ns, N_rank)
-        # - scan carry: (Np, Nq, Nr, Ns)
-        # - contribution: (Np, Nq, Nr, Ns)
-        # - intermediates: W, V_block, C_rs
+        # Estimate total GPU memory needed for delta_U calculation.
+        # _contract_delta_U_kernels_jit runs TWO sequential lax.scans:
+        #   1. D-scan: accumulates term_d (Np, Nq, Nr, Ns)
+        #   2. X-scan: accumulates term_x, with term_d still alive
+        # Peak during X-scan:
+        #   X_sliced (JIT input, stays resident) + X_padded (~14% larger copy)
+        #   + D (JIT input) + term_d + carry + contribution
+        #   ≈ X_sliced * 2 + D + 3 × carry
+        # Peak during D-scan:
+        #   X_sliced (alive for later) + D + 2 × carry + W + C_rs
         x_sliced_size_gb = (float(Nr) * float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
+        d_size_gb = (float(N_rank) * float(N_rank) * 8.0) / (1024.0**3)
         scan_carry_gb = (float(Np) * float(Nq) * float(Nr) * float(Ns) * 8.0) / (1024.0**3)
-        contribution_gb = scan_carry_gb  # same size as carry
-        total_needed_gb = x_sliced_size_gb + 2.0 * scan_carry_gb  # carry + contribution + X_sliced
+        # X_sliced input + padded copy ≈ 2× X_sliced
+        # + D matrix + 3× carry (term_d + carry + contribution)
+        total_needed_gb = x_sliced_size_gb * 2.0 + d_size_gb + 3.0 * scan_carry_gb
         
-        # Use a more conservative threshold that accounts for scan carry:
-        # - If total_needed exceeds 50% of GPU budget, chunk
-        # - This ensures we have room for intermediates and XLA overhead
+        # Threshold: use 80% of actually free GPU memory (not budget).
+        # This is more accurate than the budget-based estimate since it
+        # accounts for pre-allocated tensors (phi_isdf, etc.).
         threshold = available_gb * 0.5
         
         logger.debug(f"  delta_U memory estimate: X_sliced={x_sliced_size_gb:.2f} GB, "
@@ -1416,43 +1423,60 @@ class ISDFXTC(XTC, ISDFTC):
         # Pre-allocate result on host memory
         result = np.zeros((Np, Nq, Nr, Ns), dtype=np.float64)
         
-        # Choose chunk size to keep scan carry under control:
-        # Target: scan_carry_chunk = Np * Nq * Nr_chunk * Ns < threshold * 0.3
-        # This gives us 30% of GPU for carry, 30% for contribution, rest for X_sliced + overhead
-        target_carry_gb = threshold * 0.3
+        # Choose chunk size to keep TOTAL memory (X_chunk + 3× carry) under budget.
+        # For r-chunking (reducing Nr to Nr_chunk):
+        #   X_chunk = (Nr_chunk, Ns, N_rank)
+        #   carry_chunk = (Np, Nq, Nr_chunk, Ns)
+        #   Total per Nr_chunk_unit = Ns * N_rank * 8 * 2 (input+padded)
+        #                            + 3 * Np * Nq * Ns * 8
+        # For s-chunking (reducing Ns to Ns_chunk):
+        #   X_chunk = (Nr, Ns_chunk, N_rank)
+        #   carry_chunk = (Np, Nq, Nr, Ns_chunk)
+        #   Total per Ns_chunk_unit = Nr * N_rank * 8 * 2 (input+padded)
+        #                            + 3 * Np * Nq * Nr * 8
+        # Target: total + D fits in threshold.
+        target_gb = threshold - d_size_gb
+        target_gb = max(target_gb, 1.0)  # safety
         
         if Nr >= Ns:
-            # Chunk over r to reduce Nr_chunk
-            # scan_carry_chunk = Np * Nq * Nr_chunk * Ns
-            # Nr_chunk = (target_carry_gb * 1e9) / (Np * Nq * Ns * 8)
-            max_Nr_chunk = max(1, int((target_carry_gb * 1024.0**3) / (float(Np) * float(Nq) * float(Ns) * 8.0)))
+            # Chunk over r
+            per_r_unit_gb = (float(Ns) * float(N_rank) * 8.0 * 2.0
+                            + 3.0 * float(Np) * float(Nq) * float(Ns) * 8.0) / (1024.0**3)
+            max_Nr_chunk = max(1, int(target_gb / per_r_unit_gb)) if per_r_unit_gb > 0 else Nr
             orb_chunk_size = min(max_Nr_chunk, Nr)
+            
+            chunk_total_gb = orb_chunk_size * per_r_unit_gb + d_size_gb
             logger.debug(f"  Chunking over 'r' index. Chunk size: {orb_chunk_size} "
-                         f"(scan_carry per chunk: {(Np*Nq*orb_chunk_size*Ns*8.0)/(1024.0**3):.2f} GB)")
+                         f"(est. per chunk: {chunk_total_gb:.2f} GB)")
             
             phi_s = self.phi_isdf[slice_s]
             for i in range(0, Nr, orb_chunk_size):
                 i_end = min(i + orb_chunk_size, Nr)
                 curr_r_idx = r_idx[i:i_end]
                 
-                # Slice kernels
                 phi_r_chunk = self.phi_isdf[curr_r_idx]
-                # Advanced indexing for chunking
                 X_chunk = X[curr_r_idx, slice_s]
                 
+                # Recompute rank block size for the chunk dimensions
+                _rbs_chunk = adaptive_rank_block_size(
+                    Np, Nq, N_rank,
+                    gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
+                
                 res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r_chunk, phi_s,
-                                                          _rbs)
+                                                          _rbs_chunk)
                 result[:, :, i:i_end, :] = np.asarray(res_chunk)
                 del res_chunk
                 gc.collect()
         else:
-            # Chunk over s to reduce Ns_chunk
-            # scan_carry_chunk = Np * Nq * Nr * Ns_chunk
-            # Ns_chunk = (target_carry_gb * 1e9) / (Np * Nq * Nr * 8)
-            max_Ns_chunk = max(1, int((target_carry_gb * 1024.0**3) / (float(Np) * float(Nq) * float(Nr) * 8.0)))
+            # Chunk over s
+            per_s_unit_gb = (float(Nr) * float(N_rank) * 8.0 * 2.0
+                            + 3.0 * float(Np) * float(Nq) * float(Nr) * 8.0) / (1024.0**3)
+            max_Ns_chunk = max(1, int(target_gb / per_s_unit_gb)) if per_s_unit_gb > 0 else Ns
             orb_chunk_size = min(max_Ns_chunk, Ns)
+            
+            chunk_total_gb = orb_chunk_size * per_s_unit_gb + d_size_gb
             logger.debug(f"  Chunking over 's' index. Chunk size: {orb_chunk_size} "
-                         f"(scan_carry per chunk: {(Np*Nq*Nr*orb_chunk_size*8.0)/(1024.0**3):.2f} GB)")
+                         f"(est. per chunk: {chunk_total_gb:.2f} GB)")
 
             phi_r = self.phi_isdf[slice_r]
             for i in range(0, Ns, orb_chunk_size):
@@ -1462,8 +1486,12 @@ class ISDFXTC(XTC, ISDFTC):
                 phi_s_chunk = self.phi_isdf[curr_s_idx]
                 X_chunk = X[slice_r, curr_s_idx]
                 
+                _rbs_chunk = adaptive_rank_block_size(
+                    Np, Nq, N_rank,
+                    gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
+                
                 res_chunk = _contract_delta_U_kernels_jit(D, X_chunk, phi_p, phi_q, phi_r, phi_s_chunk,
-                                                          _rbs)
+                                                          _rbs_chunk)
                 result[:, :, :, i:i_end] = np.asarray(res_chunk)
                 del res_chunk
                 gc.collect()
