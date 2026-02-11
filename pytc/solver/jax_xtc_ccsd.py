@@ -555,19 +555,23 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         t2new_host += np.asarray(term)
         return
 
-    # Determine naux for DF overhead estimation
+    # Determine naux for DF overhead estimation and n_fused for GPU scan workspace
     with_df = getattr(cc, 'with_df', None)
     if with_df is None and getattr(cc._scf, 'with_df', None):
          with_df = cc._scf.with_df
     _naux = None
     if with_df is not None and hasattr(eris, 'vvL'):
         _naux = eris.vvL.shape[1]
+    _n_fused = None
+    if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
+        _n_fused = xtc_obj.phi_isdf.shape[1]
 
     blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv',
+        nocc, nvir, 'vvvv_gpu',
         gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
         host_max_memory_mb=getattr(cc, 'max_memory', None),
-        naux=_naux)
+        naux=_naux,
+        n_fused=_n_fused)
     logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
     
     L_vv_full_jax = None

@@ -161,8 +161,12 @@ def estimate_blksize(nocc, nvir, phase, *,
     nocc, nvir : int
         Occupied / virtual counts.
     phase : str
-        One of ``'ovvv'``, ``'vovv'``, ``'vvvv'``, ``'acc_decision'``,
-        ``'ovvv_eri_build'``, ``'vovv_eri_build'``.
+        One of ``'ovvv'``, ``'vovv'``, ``'vvvv'``, ``'vvvv_gpu'``,
+        ``'acc_decision'``, ``'ovvv_eri_build'``, ``'vovv_eri_build'``.
+        ``'vvvv'`` is for the host (NumPy) contraction path in xtc_ccsd;
+        ``'vvvv_gpu'`` is for the GPU (JAX) contraction path in
+        jax_xtc_ccsd, where L_vv_full, t2, and the contraction kernel
+        all reside on device.
     gpu_max_memory_mb : float | None
         User override for total GPU memory (MB).  **Authoritative** when set.
     host_max_memory_mb : float | None
@@ -224,26 +228,45 @@ def estimate_blksize(nocc, nvir, phase, *,
         per_blk = (O * V * V + V * O * V + O * O * V) * B
         per_blk *= 2
 
-    elif phase == 'vvvv':
-        # _contract_vvvv_t2: working arrays live on HOST (NumPy):
-        #   vvvv_block (blk,V,V,V), std_block (blk,V,V,V), L_vv_full (V,V,naux).
-        # However, xtc_obj.get_2b() produces the output on GPU first (the
-        # ISDF scan carry is (blk,V,V,V)), so the GPU must fit that tensor.
-        # Use a dual constraint: host for working arrays, GPU for get_2b.
+    elif phase in ('vvvv', 'vvvv_gpu'):
+        # Two variants:
+        # - 'vvvv': xtc_ccsd.py — contraction on HOST (NumPy).  GPU only
+        #   runs get_2b, then result is transferred to host.
+        # - 'vvvv_gpu': jax_xtc_ccsd.py — contraction on GPU (JAX).
+        #   After get_2b, the result stays on GPU and contract_block_kernel
+        #   runs tensordot + einsum, requiring additional GPU memory.
+        gpu_contraction = (phase == 'vvvv_gpu')
 
-        # --- Host constraint ---
-        if host_max_memory_mb is not None and host_max_memory_mb > 0:
-            host_avail = int(host_max_memory_mb * 1e6)
+        # _contract_vvvv_t2: working arrays live on HOST (NumPy) for 'vvvv',
+        #   or on GPU (JAX) for 'vvvv_gpu'.
+        # With in-place addition (vvvv_block += std_block), at most 2 copies
+        # of (blk,V,V,V) coexist.  After the add, std_block is deleted.
+        # xtc_obj.get_2b() produces the output on GPU first (the
+        # ISDF scan carry is (blk,V,V,V)), so the GPU must fit that tensor.
+
+        # --- Host constraint (only binding for 'vvvv') ---
+        if not gpu_contraction:
+            if host_max_memory_mb is not None and host_max_memory_mb > 0:
+                host_avail = int(host_max_memory_mb * 1e6)
+            else:
+                host_avail = available  # fall back
+
+            # Constant host overhead: L_vv_full, t2, out, t1
+            constant_host = 0
+            # naux here is the DF auxiliary basis size, not ISDF N_fused
+            if naux is not None and naux > 0:
+                constant_host += V * V * naux * B     # L_vv_full (V,V,naux)
+            constant_host += 2 * O * O * V * V * B    # t2 + out (O,O,V,V) each
+            constant_host += O * V * B                 # t1 (O,V)
+            host_avail = max(host_avail - constant_host, 0)
+
+            # Peak per-blk: 2× (blk,V,V,V) — vvvv_block + std_block coexist
+            # briefly before in-place add and del.  The einsum also creates
+            # a small (O,O,blk,V) intermediate that we fold into a 1.2× factor.
+            host_per_blk = int(2 * V * V * V * B * 1.2)
+            host_blk = max(1, int(host_avail * 0.8 / host_per_blk))
         else:
-            host_avail = available  # fall back
-        host_per_blk = 2 * V * V * V * B   # vvvv_block + std_block (host)
-        # L_vv_full overhead (if DF) — constant host allocation
-        # naux here is the DF auxiliary basis size, not ISDF N_fused
-        if naux is not None and naux > 0:
-            overhead = V * V * naux * B
-            host_avail = max(host_avail - overhead, 0)
-        host_per_blk *= 2  # einsum intermediates (vvvv_trans, contraction scratch)
-        host_blk = max(1, int(host_avail * 0.8 / host_per_blk))
+            host_blk = nvir  # not the binding constraint for GPU path
 
         # --- GPU constraint ---
         # get_2b runs ISDF scan with carry + contribution = 2×(blk,V,V,V)
@@ -252,6 +275,16 @@ def estimate_blksize(nocc, nvir, phase, *,
         # NOT the DF auxiliary basis size (naux).  n_fused is typically
         # much larger (e.g. 5050 vs ~500 for naux).
         gpu_free = _get_gpu_free_bytes()
+
+        # Constant GPU residents for the GPU contraction path:
+        #   L_vv_full_jax (V,V,naux_DF), t2_jax (O,O,V,V)
+        constant_gpu = 0
+        if gpu_contraction:
+            if naux is not None and naux > 0:
+                constant_gpu += V * V * naux * B     # L_vv_full_jax on GPU
+            constant_gpu += O * O * V * V * B        # t2_jax on GPU
+        gpu_free = max(gpu_free - constant_gpu, 0)
+
         _N_fused = n_fused if n_fused is not None else (naux if naux is not None else 0)
         if _N_fused > 0:
             # Estimate scan workspace (W intermediate) same as eri_build
@@ -265,16 +298,34 @@ def estimate_blksize(nocc, nvir, phase, *,
             scan_workspace = _N_fused * _rank_blk * V * B
         else:
             scan_workspace = 0
-        gpu_per_blk = V * V * V * B * 2   # carry + contribution
+
+        if gpu_contraction:
+            # Inside contract_block_kernel (all on GPU simultaneously):
+            #   xtc_block          (blk,V,V,V) — from get_2b, stays on GPU
+            #   tensordot result   (blk,V,V,V) — L_ab_sub @ L_vv_full
+            #   sum                (blk,V,V,V) — xtc_block + tensordot
+            #   einsum result      (O,O,blk,V) — output
+            # XLA may fuse some of these, but peak ≈ 3× (blk,V,V,V).
+            # Plus the get_2b scan needs carry+contribution = 2× (blk,V,V,V),
+            # but those are freed before the kernel runs.
+            # Conservative: 3× (blk,V,V,V) for the kernel.
+            gpu_per_blk = V * V * V * B * 3
+        else:
+            gpu_per_blk = V * V * V * B * 2   # carry + contribution from get_2b scan
+
         gpu_available = max(gpu_free - scan_workspace, 0)
         gpu_blk = max(1, int(gpu_available * 0.65 / gpu_per_blk))
 
         blksize = min(host_blk, gpu_blk, nvir)
         logger.debug(
-            "estimate_blksize(phase=%s): host_avail=%.2f GB, host_blk=%d, "
-            "gpu_free=%.2f GB, N_fused=%d, scan_ws=%.2f GB, gpu_blk=%d → blksize=%d",
-            phase, host_avail / 1e9, host_blk,
-            gpu_free / 1e9, _N_fused, scan_workspace / 1e9, gpu_blk, blksize)
+            "estimate_blksize(phase=%s): host_blk=%d, "
+            "gpu_free=%.2f GB (after constant_gpu=%.2f GB), "
+            "N_fused=%d, scan_ws=%.2f GB, gpu_per_blk=%.2f MB, "
+            "gpu_blk=%d → blksize=%d",
+            phase, host_blk,
+            gpu_free / 1e9, constant_gpu / 1e9,
+            _N_fused, scan_workspace / 1e9, gpu_per_blk / 1e6,
+            gpu_blk, blksize)
         return blksize, budget
 
     elif phase == 'acc_decision':

@@ -401,7 +401,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         p1 = min(p0 + blksize, nvir)
         ranges = (slice(nocc + p0, nocc + p1), slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
         
-        vvvv_block = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+        vvvv_block = np.array(xtc_obj.get_2b(jastrow_params, ranges=ranges))
         
         logger.debug("    Contraction block %d:%d", p0, p1)
         t0 = time.perf_counter()
@@ -414,16 +414,20 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
              # std_block shape is (blk, nvir, nvir, nvir)
              std_block = np.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
              
-             vvvv_block = vvvv_block + std_block
+             # In-place add to avoid a 3rd (blk,V,V,V) copy on host
+             vvvv_block += std_block
+             del std_block
              
         else:
              mo_v = cc.mo_coeff[:, nocc:]
              std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-             vvvv_block = vvvv_block + std_block.reshape(p1-p0, nvir, nvir, nvir)
+             vvvv_block += std_block.reshape(p1-p0, nvir, nvir, nvir)
+             del std_block
         
         # Transpose to (a, c, b, d) and contract
-        vvvv_trans = vvvv_block.transpose(0, 2, 1, 3)
-        out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_trans, t2)
+        # .transpose() returns a view — no extra memory
+        out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_block.transpose(0, 2, 1, 3), t2)
+        del vvvv_block
         logger.debug("    Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
     
     if L_vv_full is not None:
