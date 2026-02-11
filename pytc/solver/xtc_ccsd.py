@@ -17,6 +17,7 @@ class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""
     def __init__(self, mf, xtc_obj=None, jastrow_params=None, **kwargs):
         self.gpu_max_memory = kwargs.pop('gpu_max_memory', 4000)
+        self.on_the_fly_vvvv = kwargs.pop('on_the_fly_vvvv', False)
         max_memory = kwargs.pop('max_memory', None)
         rccsd.RCCSD.__init__(self, mf, **kwargs)
         self.xtc_obj = xtc_obj
@@ -27,7 +28,8 @@ class RCCSD(rccsd.RCCSD):
         if getattr(self, 'max_memory', None) is None:
             self.max_memory = getattr(mf, 'max_memory', 4000)
             
-        self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'gpu_max_memory'])
+        self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'gpu_max_memory',
+                                        'on_the_fly_vvvv'])
 
         # Enable XLA persistent compilation cache so compiled HLO programs
         # are reused across CCSD iterations and across runs.
@@ -271,7 +273,26 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.oovv = get_block_df('oovv') # 2 vir (11 GB)
         eris.vvoo = get_block_df('vvoo') # 2 vir (11 GB)
         
-        # Free L_vv_full after we are done with blocks needing it
+        # --- VVVV handling (must run before L_vv_full is freed) ---
+        vvvv_bytes = float(nvir)**4 * 8
+        on_the_fly = getattr(cc, 'on_the_fly_vvvv', False)
+        if on_the_fly:
+            logger.info(f"VVVV on-the-fly mode (on_the_fly_vvvv=True). "
+                        f"Skipping disk storage. "
+                        f"({vvvv_bytes/1e9:.2f} GB would be needed on disk)")
+            eris.vvvv = None
+        else:
+            logger.info(f"VVVV will be saved to disk ({vvvv_bytes/1e9:.2f} GB). "
+                        f"Set on_the_fly_vvvv=True to compute on-the-fly instead.")
+            # Save vvvv block-wise to HDF5 (same file as ovvv/vovv)
+            vvvv_shape = (nvir, nvir, nvir, nvir)
+            if 'vvvv' in eris.feri:
+                del eris.feri['vvvv']
+            eris.vvvv = eris.feri.create_dataset('vvvv', vvvv_shape, 'f8')
+            _compute_vvvv_block_df(eris, xtc_obj, jastrow_params,
+                                   L_vv_full, nocc, nvir, nmo, cc)
+
+        # Free L_vv_full after we are done with all blocks needing it
         del L_vv_full
         
         eris.ovvo = get_block_df('ovvo') # 2 vir
@@ -287,28 +308,9 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vovo = get_block_df('vovo') 
         # eris.voov = get_block_df('voov') # Unused?
         
-        # Tiered VVVV: materialize only if V^4 fits in a fraction of memory budget
-        from pytc.utils.gpu_memory import get_gpu_budget_bytes
-        vvvv_bytes = float(nvir)**4 * 8
-        gpu_budget = get_gpu_budget_bytes(getattr(cc, 'gpu_max_memory', None))
-        host_budget = getattr(cc, 'max_memory', 4000) * 1e6
-        # Use 30% of the smaller budget as threshold for incore VVVV
-        vvvv_budget = min(gpu_budget, host_budget) * 0.3
-        if vvvv_bytes < vvvv_budget:
-            logger.info(f"Materializing VVVV incore ({vvvv_bytes/1e9:.2f} GB < budget {vvvv_budget/1e9:.2f} GB)")
-            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str='vvvv'))
-            L_vv_local = lib.unpack_tril(eris.vvL[:], axis=0)
-            std_part = np.tensordot(L_vv_local, L_vv_local, axes=((2,), (2,)))
-            del L_vv_local
-            eris.vvvv = tc_part + std_part
-            del tc_part, std_part
-        else:
-            logger.info(f"VVVV too large for incore ({vvvv_bytes/1e9:.2f} GB > budget {vvvv_budget/1e9:.2f} GB), using on-the-fly")
-            eris.vvvv = None
-        
         del Loo, Lov, Lov_reshaped
 
-        # Keep eris.vvL for vvvv contraction
+        # Keep eris.vvL for on-the-fly vvvv contraction if needed
         
         return eris
 
@@ -338,32 +340,66 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vvov = get_block('vvov')
         eris.vovv = get_block('vovv')
         
-        # Tiered VVVV: materialize only if V^4 fits in memory budget
-        from pytc.utils.gpu_memory import get_gpu_budget_bytes
+        # --- VVVV handling ---
         vvvv_bytes = float(nvir)**4 * 8
-        gpu_budget = get_gpu_budget_bytes(getattr(cc, 'gpu_max_memory', None))
-        host_budget = getattr(cc, 'max_memory', 4000) * 1e6
-        vvvv_budget = min(gpu_budget, host_budget) * 0.3
-        if vvvv_bytes < vvvv_budget:
-            logger.info(f"Materializing VVVV incore ({vvvv_bytes/1e9:.2f} GB < budget {vvvv_budget/1e9:.2f} GB)")
-            eris.vvvv = get_block('vvvv')
-        else:
-            logger.info(f"VVVV too large for incore ({vvvv_bytes/1e9:.2f} GB > budget {vvvv_budget/1e9:.2f} GB), using on-the-fly")
+        on_the_fly = getattr(cc, 'on_the_fly_vvvv', False)
+        if on_the_fly:
+            logger.info(f"VVVV on-the-fly mode (on_the_fly_vvvv=True). "
+                        f"Skipping disk storage. "
+                        f"({vvvv_bytes/1e9:.2f} GB would be needed on disk)")
             eris.vvvv = None
+        else:
+            logger.info(f"VVVV will be saved to disk ({vvvv_bytes/1e9:.2f} GB). "
+                        f"Set on_the_fly_vvvv=True to compute on-the-fly instead.")
+            # Create HDF5 temp file for vvvv (no DF feri available in ao2mo path)
+            eris.feri = lib.H5TmpFile()
+            vvvv_shape = (nvir, nvir, nvir, nvir)
+            eris.vvvv = eris.feri.create_dataset('vvvv', vvvv_shape, 'f8')
+            _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params,
+                                      cc.mol, mo_coeff, nocc, nvir, nmo, cc)
         
         return eris
 
 
 
 def _contract_vvvv_t2(cc, t2, eris, out=None):
-    """Contraction of (vv|vv) with t2. Handles both materialized and block-wise cases."""
-    if eris.vvvv is not None:
-        # Materialized case: Transpose to (a, c, b, d) and contract
-        # Standard PySCF index for Wvvvv is (ab|cd) contracted with t2(ij|cd) gives (ij|ab)
-        # Here we follow PySCF's rintermediates.cc_Wvvvv logic if materialized
-        vvvv = np.asarray(eris.vvvv)
-        return lib.einsum('abcd,ijcd->ijab', vvvv.transpose(0, 2, 1, 3), t2)
+    """Contraction of (vv|vv) with t2. Handles HDF5-backed, in-memory, and on-the-fly cases."""
+    import h5py
 
+    if eris.vvvv is not None:
+        if isinstance(eris.vvvv, np.ndarray):
+            # In-memory numpy array (legacy small-molecule path)
+            vvvv = np.asarray(eris.vvvv)
+            return lib.einsum('abcd,ijcd->ijab', vvvv.transpose(0, 2, 1, 3), t2)
+
+        if isinstance(eris.vvvv, h5py.Dataset):
+            # HDF5-backed: read blocks from disk
+            if out is None:
+                out = np.zeros_like(t2)
+            nocc = cc.nocc
+            nvir = cc.nmo - nocc
+
+            mem_host = cc.max_memory * 1e6
+            # Block size: each block loads (blk, nvir, nvir, nvir) floats
+            blksize = max(4, int(mem_host / (nvir * nvir * nvir * 8)))
+            blksize = min(nvir, blksize)
+
+            from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
+            chunks = [(p0, min(p0 + blksize, nvir))
+                      for p0 in range(0, nvir, blksize)]
+            loader = hdf5_slice_loader(eris.vvvv, axis=0)
+            logger.debug("    VVVV contraction from disk (blksize=%d, n_blocks=%d)",
+                         blksize, len(chunks))
+            with PrefetchIterator(chunks, loader) as pit:
+                for (p0, p1), vvvv_blk in pit:
+                    t0 = time.perf_counter()
+                    out[:, :, p0:p1, :] += lib.einsum(
+                        'abcd,ijcd->ijab', vvvv_blk.transpose(0, 2, 1, 3), t2)
+                    logger.debug("      VVVV disk block %d:%d done in %.3f s",
+                                 p0, p1, time.perf_counter()-t0)
+            return out
+
+    # --- On-the-fly path (eris.vvvv is None) ---
     if out is None:
         out = np.zeros_like(t2)
 
@@ -907,3 +943,107 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                     pending_key = (next_p0, next_p1)
 
                 ds[p0:p1, :, :, :] = std_blk + tc_blk
+
+
+def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir, nmo, cc):
+    """Compute and write vvvv block to HDF5, block-wise (DF path).
+
+    vvvv shape: (a, b, c, d) = (nvir, nvir, nvir, nvir).
+    We iterate over the first index 'a' in blocks to limit memory usage.
+    """
+    _n_fused = None
+    if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
+        _n_fused = xtc_obj.phi_isdf.shape[1]
+    _naux = L_vv_full.shape[2] if L_vv_full is not None else None
+
+    blksize, _ = estimate_blksize(
+        nocc, nvir, 'vvvv',
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        naux=_naux,
+        n_fused=_n_fused)
+    blksize = max(4, blksize)
+    logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
+                f"n_blocks={(nvir+blksize-1)//blksize})")
+
+    from pytc.utils.prefetch import async_read, await_read
+    ds = eris.vvvv
+    pending_tc = None
+    pending_key = None
+    for p0, p1 in lib.prange(0, nvir, blksize):
+        L_ab_sub = L_vv_full[p0:p1]  # (blk, nvir, naux)
+        std_blk = np.tensordot(L_ab_sub, L_vv_full, axes=((2,), (2,)))  # (blk, nvir, nvir, nvir)
+
+        ranges = (slice(nocc+p0, nocc+p1), slice(nocc, nmo),
+                  slice(nocc, nmo), slice(nocc, nmo))
+        if pending_tc is not None and pending_key == (p0, p1):
+            tc_blk = await_read(pending_tc)
+            pending_tc = None
+        else:
+            tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+        # Kick off NEXT block's get_2b in background
+        next_p0 = p0 + blksize
+        if next_p0 < nvir:
+            next_p1 = min(next_p0 + blksize, nvir)
+            next_ranges = (slice(nocc+next_p0, nocc+next_p1),
+                           slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
+            pending_tc = async_read(
+                lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+            pending_key = (next_p0, next_p1)
+
+        ds[p0:p1, :, :, :] = std_blk + tc_blk
+        logger.debug(f"      VVVV block {p0}:{p1} written to disk")
+    logger.info("    VVVV disk write complete")
+
+
+def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc, nvir, nmo, cc):
+    """Compute and write vvvv block to HDF5, block-wise (ao2mo path).
+
+    vvvv shape: (a, b, c, d) = (nvir, nvir, nvir, nvir).
+    We iterate over the first index 'a' in blocks to limit memory usage.
+    """
+    _n_fused = None
+    if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
+        _n_fused = xtc_obj.phi_isdf.shape[1]
+
+    blksize, _ = estimate_blksize(
+        nocc, nvir, 'vvvv',
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        n_fused=_n_fused)
+    blksize = max(4, blksize)
+    logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
+                f"n_blocks={(nvir+blksize-1)//blksize})")
+
+    from pytc.utils.prefetch import async_read, await_read
+    ds = eris.vvvv
+    mo_v = mo_coeff[:, nocc:]
+    pending_tc = None
+    pending_key = None
+    for p0, p1 in lib.prange(0, nvir, blksize):
+        # Compute only the needed block of standard integrals
+        std_blk = ao2mo.general(mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
+        std_blk = std_blk.reshape(p1-p0, nvir, nvir, nvir)
+
+        ranges = (slice(nocc+p0, nocc+p1), slice(nocc, nmo),
+                  slice(nocc, nmo), slice(nocc, nmo))
+        if pending_tc is not None and pending_key == (p0, p1):
+            tc_blk = await_read(pending_tc)
+            pending_tc = None
+        else:
+            tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+        # Kick off NEXT block's get_2b in background
+        next_p0 = p0 + blksize
+        if next_p0 < nvir:
+            next_p1 = min(next_p0 + blksize, nvir)
+            next_ranges = (slice(nocc+next_p0, nocc+next_p1),
+                           slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
+            pending_tc = async_read(
+                lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+            pending_key = (next_p0, next_p1)
+
+        ds[p0:p1, :, :, :] = std_blk + tc_blk
+        logger.debug(f"      VVVV block {p0}:{p1} written to disk")
+    logger.info("    VVVV disk write complete")

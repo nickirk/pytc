@@ -568,17 +568,71 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     eris: NumPy/HDF5 backed.
     t2new_host: Accumulation target (NumPy).
     """
+    import h5py
     nocc = cc.nocc
     nvir = cc.nmo - nocc
     xtc_obj = cc.xtc_obj
     jastrow_params = cc.jastrow_params
     
     if eris.vvvv is not None:
-        vvvv_jax = jnp.asarray(eris.vvvv)
-        term = jnp.einsum('acbd,ijcd->ijab', vvvv_jax, t2_jax)
-        t2new_host += np.asarray(term)
-        return
+        if isinstance(eris.vvvv, np.ndarray):
+            # In-memory numpy array (legacy small-molecule path)
+            vvvv_jax = jnp.asarray(eris.vvvv)
+            term = jnp.einsum('acbd,ijcd->ijab', vvvv_jax, t2_jax)
+            t2new_host += np.asarray(term)
+            return
 
+        if isinstance(eris.vvvv, h5py.Dataset):
+            # HDF5-backed: read blocks from disk, transfer to GPU, contract
+            blksize, _ = estimate_blksize(
+                nocc, nvir, 'vvvv_gpu',
+                gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+                host_max_memory_mb=getattr(cc, 'max_memory', None))
+            logger.debug(f"    VVVV contraction from disk: blksize={blksize}, "
+                         f"n_blocks={(nvir+blksize-1)//blksize}")
+
+            @jax.jit
+            def contract_disk_kernel(t2, vvvv_block):
+                return jnp.einsum('acbd,ijcd->ijab', vvvv_block, t2)
+
+            from pytc.utils.prefetch import async_read, await_read
+            pending = None
+            pending_key = None
+
+            for p0 in range(0, nvir, blksize):
+                p1 = min(p0 + blksize, nvir)
+                t0 = time.perf_counter()
+
+                # Await prefetched block or read synchronously
+                if pending is not None and pending_key == (p0, p1):
+                    vvvv_blk_np = await_read(pending)
+                    pending = None
+                else:
+                    vvvv_blk_np = np.asarray(eris.vvvv[p0:p1])
+
+                vvvv_blk_jax = jnp.asarray(vvvv_blk_np)
+                del vvvv_blk_np
+
+                # Kick off NEXT block read in background
+                next_p0 = p0 + blksize
+                if next_p0 < nvir:
+                    next_p1 = min(next_p0 + blksize, nvir)
+                    pending = async_read(
+                        lambda s=slice(next_p0, next_p1): np.asarray(eris.vvvv[s]))
+                    pending_key = (next_p0, next_p1)
+
+                term = contract_disk_kernel(t2_jax, vvvv_blk_jax)
+                term.block_until_ready()
+                t_comp = time.perf_counter() - t0
+
+                t0_trans = time.perf_counter()
+                t2new_host[:, :, p0:p1, :] += np.asarray(term)
+                t_trans = time.perf_counter() - t0_trans
+                logger.debug(f"      VVVV disk block {p0}:{p1}: "
+                             f"Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
+            return
+
+    # --- On-the-fly path (eris.vvvv is None) ---
     # Determine naux for DF overhead estimation and n_fused for GPU scan workspace
     with_df = getattr(cc, 'with_df', None)
     if with_df is None and getattr(cc._scf, 'with_df', None):
@@ -596,7 +650,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         host_max_memory_mb=getattr(cc, 'max_memory', None),
         naux=_naux,
         n_fused=_n_fused)
-    logger.debug(f"    VVVV contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
+    logger.debug(f"    VVVV on-the-fly contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
     
     L_vv_full_jax = None
     if with_df is not None:
