@@ -2,7 +2,7 @@
 
 import unittest
 import numpy as np
-from pytc.jastrow import Jastrow, SM7  # Add SM7 to imports
+from pytc.legacy.jastrow import Jastrow, SM7  # Add SM7 to imports
 
 
 class SimpleTestJastrow(Jastrow):
@@ -177,7 +177,7 @@ class TestSM7(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up test cases."""
-        from pytc.jastrow import SM7
+        from pytc.legacy.jastrow import SM7
         
         # Create SM7 instance with He atom
         cls.jastrow = SM7(atom='He')

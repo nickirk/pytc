@@ -4,7 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
-from pytc.tc import TC
+from .tc import TC
 
 logger = logging.getLogger(__name__)
 einsum = partial(np.einsum, optimize='optimal')
@@ -237,7 +237,7 @@ class XTC(TC):
             weights: (N_grid,) Grid weights
             batch_size: Optional batch size for r2 coordinate
         """
-        from pytc.kmat import _get_safe_batch_size
+        from .kmat import _get_safe_batch_size
 
         if dm1 is None:
             dm1 = self._get_mf_dm()

@@ -1,8 +1,8 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, cc
-from pytc.xtc import XTC
-from pytc.jastrow import SM7, SM17
+from pytc.legacy.xtc import XTC
+from pytc.legacy.jastrow import SM7, SM17
 
 def get_be_ccpvtz():
     """Return a Be atom with cc-pVTZ basis for testing."""

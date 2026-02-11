@@ -3,8 +3,8 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, ao2mo
-from pytc.tc import TC
-from pytc.jastrow import Jastrow
+from pytc.legacy.tc import TC
+from pytc.legacy.jastrow import Jastrow
 
 
 def get_h2_sto3g():
@@ -68,7 +68,7 @@ class TestTC(unittest.TestCase):
     
     def test_two_body_terms(self):
         """Test calculation of two-body terms."""
-        from pytc.kmat import calc_K1, calc_K2, calc_K3
+        from pytc.legacy.kmat import calc_K1, calc_K2, calc_K3
         
         # Get orbital values on grid
         rho, nabla_rho = self.tc._get_intermediates()

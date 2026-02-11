@@ -4,9 +4,9 @@ import unittest
 import numpy as np
 from pyscf import gto, scf
 
-from pytc.xtc import XTC
-from pytc.jastrow import REXP
-from pytc.df import isdf_decompose_cholesky, reconstruct_rho, test_accuracy, test_multi_accuracy
+from pytc.legacy.xtc import XTC
+from pytc.legacy.jastrow import REXP
+from pytc.legacy.df import isdf_decompose_cholesky, reconstruct_rho, test_accuracy, test_multi_accuracy
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""

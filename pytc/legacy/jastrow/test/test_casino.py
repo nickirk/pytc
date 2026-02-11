@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 import os
-from pytc.jastrow import CASINO
+from pytc.legacy.jastrow import CASINO
 from pytc.utils.parser import parse_casl
 
 class TestCASINO(unittest.TestCase):

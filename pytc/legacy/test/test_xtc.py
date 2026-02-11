@@ -8,8 +8,8 @@ import time
 
 from pyscf import gto, scf, ao2mo
 
-from pytc.xtc import XTC
-from pytc.jastrow import REXP
+from pytc.legacy.xtc import XTC
+from pytc.legacy.jastrow import REXP
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""

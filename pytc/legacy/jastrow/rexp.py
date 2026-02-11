@@ -1,6 +1,6 @@
 
 import numpy as np
-from pytc.jastrow import Jastrow
+from . import Jastrow
 
 
 class REXP(Jastrow):

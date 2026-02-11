@@ -3,7 +3,7 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft
-from pytc.jastrow import REXP
+from pytc.legacy.jastrow import REXP
 import time
 
 def get_be_ccpvdz():
@@ -48,7 +48,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k_shapes(self):
         """Verify K matrix shapes."""
-        from pytc.kmat import calc_K1, calc_K2, calc_K3
+        from pytc.legacy.kmat import calc_K1, calc_K2, calc_K3
         import time 
         time_start = time.time() 
         k1 = calc_K1(self.rho_paired, self.nabla_rho_paired,
@@ -72,7 +72,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k2_k3_symmetry(self):
         """Test symmetry properties of K2 (laplacian) and K3 (square) integrals."""
-        from pytc.kmat import calc_K2, calc_K3
+        from pytc.legacy.kmat import calc_K2, calc_K3
         
         k2 = calc_K2(
             self.rho_paired,
@@ -96,7 +96,7 @@ class TestKmat(unittest.TestCase):
     
     def test_k1_k2_symmetry(self):
         """Test if K1 + K2 is equal to K1 with p and r indices swapped."""
-        from pytc.kmat import calc_K1, calc_K2
+        from pytc.legacy.kmat import calc_K1, calc_K2
         
         k1 = calc_K1(
             self.rho_paired,
@@ -130,7 +130,7 @@ class TestISDF(TestKmat):
         super().setUpClass()
         
         # Get reference K matrices
-        from pytc.kmat import calc_K1, calc_K2, calc_K3
+        from pytc.legacy.kmat import calc_K1, calc_K2, calc_K3
         
         cls.k1_ref = calc_K1(cls.rho_paired, cls.nabla_rho_paired,
                            cls.jastrow, cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
@@ -141,8 +141,8 @@ class TestISDF(TestKmat):
     
     def test_isdf_convergence(self):
         """Test if K1_isdf, K2_isdf, and K3_isdf converge to original values with increasing rank."""
-        from pytc.df import isdf_decompose_multi
-        from pytc.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
+        from pytc.legacy.df import isdf_decompose_multi
+        from pytc.legacy.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
 
         # Test different ranks as fractions of grid points
         ranks = [len(self.weights) // n for n in [1000, 100, 50]]

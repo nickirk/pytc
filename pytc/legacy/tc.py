@@ -3,8 +3,8 @@
 import numpy as np
 from functools import partial
 from pyscf import dft, ao2mo
-from pytc import lmat
-from pytc.df import isdf_decompose_multi, test_accuracy
+from . import lmat
+from .df import isdf_decompose_multi, test_accuracy
 import logging
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ class TC:
 
     def get_2b(self, dm1=None, dm2=None):
         """Calculate two-body terms K1 + K2 + K3."""
-        from pytc.kmat import (calc_K1, calc_K2, calc_K3, 
+        from .kmat import (calc_K1, calc_K2, calc_K3, 
                              calc_K1_isdf, calc_K2_isdf, calc_K3_isdf)
         
         

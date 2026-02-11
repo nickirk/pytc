@@ -3,8 +3,8 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf
-from pytc.jastrow import Jastrow
-from pytc import lmat
+from pytc.legacy.jastrow import Jastrow
+from pytc.legacy import lmat
 
 
 def get_h2_sto3g():
