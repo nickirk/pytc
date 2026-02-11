@@ -1375,10 +1375,25 @@ class ISDFXTC(XTC, ISDFTC):
         from pytc.solver.gpu_memory import get_gpu_budget_bytes, adaptive_rank_block_size
         gpu_budget = get_gpu_budget_bytes(getattr(self, 'gpu_max_memory', None))
         available_gb = gpu_budget / (1024.0**3)
-        # Use 30% of total budget as threshold for X_sliced loading
-        threshold = available_gb * 0.3
+        
+        # Estimate total GPU memory needed for delta_U calculation:
+        # - X_sliced: (Nr, Ns, N_rank)
+        # - scan carry: (Np, Nq, Nr, Ns)
+        # - contribution: (Np, Nq, Nr, Ns)
+        # - intermediates: W, V_block, C_rs
         x_sliced_size_gb = (float(Nr) * float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
-        logger.debug(f"  X_sliced dimensions: ({Nr}, {Ns}, {N_rank}) -> {x_sliced_size_gb:.2f} GB (Threshold: {threshold:.2f} GB)")
+        scan_carry_gb = (float(Np) * float(Nq) * float(Nr) * float(Ns) * 8.0) / (1024.0**3)
+        contribution_gb = scan_carry_gb  # same size as carry
+        total_needed_gb = x_sliced_size_gb + 2.0 * scan_carry_gb  # carry + contribution + X_sliced
+        
+        # Use a more conservative threshold that accounts for scan carry:
+        # - If total_needed exceeds 50% of GPU budget, chunk
+        # - This ensures we have room for intermediates and XLA overhead
+        threshold = available_gb * 0.5
+        
+        logger.debug(f"  delta_U memory estimate: X_sliced={x_sliced_size_gb:.2f} GB, "
+                     f"scan_carry={scan_carry_gb:.2f} GB, total={total_needed_gb:.2f} GB "
+                     f"(Threshold: {threshold:.2f} GB, dims: Np={Np}, Nq={Nq}, Nr={Nr}, Ns={Ns})")
         
         phi_p = self.phi_isdf[slice_p]
         phi_q = self.phi_isdf[slice_q]
@@ -1388,7 +1403,7 @@ class ISDFXTC(XTC, ISDFTC):
             Np, Nq, N_rank,
             gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
         
-        if x_sliced_size_gb < threshold:
+        if total_needed_gb < threshold:
             phi_r = self.phi_isdf[slice_r]
             phi_s = self.phi_isdf[slice_s]
             X_sliced = X[slice_r, slice_s]
@@ -1396,17 +1411,24 @@ class ISDFXTC(XTC, ISDFTC):
                                                   _rbs)
         
         # Chunking strategy to avoid VRAM exhaustion
-        logger.warning(f"  X_sliced ({x_sliced_size_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
+        logger.warning(f"  delta_U memory estimate ({total_needed_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
         
         # Pre-allocate result on host memory
         result = np.zeros((Np, Nq, Nr, Ns), dtype=np.float64)
         
+        # Choose chunk size to keep scan carry under control:
+        # Target: scan_carry_chunk = Np * Nq * Nr_chunk * Ns < threshold * 0.3
+        # This gives us 30% of GPU for carry, 30% for contribution, rest for X_sliced + overhead
+        target_carry_gb = threshold * 0.3
+        
         if Nr >= Ns:
-            # Chunk over r
-            r_slice_size_gb = (float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
-            # Target ~2GB per chunk
-            orb_chunk_size = max(1, int(threshold / r_slice_size_gb))
-            logger.debug(f"  Chunking over 'r' index. Chunk size: {orb_chunk_size}")
+            # Chunk over r to reduce Nr_chunk
+            # scan_carry_chunk = Np * Nq * Nr_chunk * Ns
+            # Nr_chunk = (target_carry_gb * 1e9) / (Np * Nq * Ns * 8)
+            max_Nr_chunk = max(1, int((target_carry_gb * 1024.0**3) / (float(Np) * float(Nq) * float(Ns) * 8.0)))
+            orb_chunk_size = min(max_Nr_chunk, Nr)
+            logger.debug(f"  Chunking over 'r' index. Chunk size: {orb_chunk_size} "
+                         f"(scan_carry per chunk: {(Np*Nq*orb_chunk_size*Ns*8.0)/(1024.0**3):.2f} GB)")
             
             phi_s = self.phi_isdf[slice_s]
             for i in range(0, Nr, orb_chunk_size):
@@ -1424,10 +1446,13 @@ class ISDFXTC(XTC, ISDFTC):
                 del res_chunk
                 gc.collect()
         else:
-            # Chunk over s
-            s_slice_size_gb = (float(Nr) * float(N_rank) * 8.0) / (1024.0**3)
-            orb_chunk_size = max(1, int(threshold / s_slice_size_gb))
-            logger.debug(f"  Chunking over 's' index. Chunk size: {orb_chunk_size}")
+            # Chunk over s to reduce Ns_chunk
+            # scan_carry_chunk = Np * Nq * Nr * Ns_chunk
+            # Ns_chunk = (target_carry_gb * 1e9) / (Np * Nq * Nr * 8)
+            max_Ns_chunk = max(1, int((target_carry_gb * 1024.0**3) / (float(Np) * float(Nq) * float(Nr) * 8.0)))
+            orb_chunk_size = min(max_Ns_chunk, Ns)
+            logger.debug(f"  Chunking over 's' index. Chunk size: {orb_chunk_size} "
+                         f"(scan_carry per chunk: {(Np*Nq*Nr*orb_chunk_size*8.0)/(1024.0**3):.2f} GB)")
 
             phi_r = self.phi_isdf[slice_r]
             for i in range(0, Ns, orb_chunk_size):

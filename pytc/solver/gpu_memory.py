@@ -344,6 +344,8 @@ def estimate_blksize(nocc, nvir, phase, *,
             host_budget = int(host_max_memory_mb * 1e6)
         else:
             host_budget = budget  # fall back to GPU budget as proxy
+        
+        # Per-blk cost: std_blk + tc_blk on host
         host_per_blk = O * V * V * B * 2  # std_blk + tc_blk
 
         # GPU side: query *actually free* memory in JAX's pool.
@@ -361,8 +363,16 @@ def estimate_blksize(nocc, nvir, phase, *,
         # Compute rank_block_size the same way adaptive_rank_block_size does:
         N_fused = n_fused if n_fused is not None else (naux if naux is not None else 0)
         if N_fused > 0:
-            _Np = O  # bra dimension (nocc for ovvv/vovv)
-            _Nq = V  # ket dimension
+            # Dimension order differs by phase:
+            # ovvv: ranges=(O, V, blk, V) → Np=O, Nq=V (at scan time)
+            # vovv: ranges=(blk, O, V, V) → Np=blk, Nq=O (at scan time)
+            #       Since blksize is unknown yet, use nvir as worst-case Np.
+            if phase == 'vovv_eri_build':
+                _Np = nvir  # worst-case: full virtual dimension
+                _Nq = max(O, V)  # ket dimensions include O and V
+            else:  # ovvv_eri_build
+                _Np = O  # bra dimension (nocc)
+                _Nq = V  # ket dimension
             _peak_per_rank = max(_Np * N_fused + _Np * _Nq,
                                  N_fused * _Nq + _Np * _Nq, 1) * B
             import math
