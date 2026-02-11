@@ -246,24 +246,26 @@ def estimate_blksize(nocc, nvir, phase, *,
 
         # --- Host constraint (only binding for 'vvvv') ---
         if not gpu_contraction:
+            # For the host path, use host_budget directly (not GPU-capped 'available')
             if host_max_memory_mb is not None and host_max_memory_mb > 0:
                 host_avail = int(host_max_memory_mb * 1e6)
             else:
-                host_avail = available  # fall back
-
-            # Constant host overhead: L_vv_full, t2, out, t1
+                host_avail = available  # fall back to whatever budget we have
+            
+            # Subtract persistent host residents + vvvv-specific overhead
+            host_avail = max(host_avail - persistent, 0)
+            
+            # Additional constant host overhead for this phase: L_vv_full
             constant_host = 0
             # naux here is the DF auxiliary basis size, not ISDF N_fused
             if naux is not None and naux > 0:
                 constant_host += V * V * naux * B     # L_vv_full (V,V,naux)
-            constant_host += 2 * O * O * V * V * B    # t2 + out (O,O,V,V) each
-            constant_host += O * V * B                 # t1 (O,V)
             host_avail = max(host_avail - constant_host, 0)
 
             # Peak per-blk: 2× (blk,V,V,V) — vvvv_block + std_block coexist
-            # briefly before in-place add and del.  The einsum also creates
-            # a small (O,O,blk,V) intermediate that we fold into a 1.2× factor.
-            host_per_blk = int(2 * V * V * V * B * 1.2)
+            # briefly. The einsum('abcd,ijcd->ijab', vvvv_block, t2) may
+            # also create temporaries.  Use 4× to match the previous safe estimate.
+            host_per_blk = int(4 * V * V * V * B)
             host_blk = max(1, int(host_avail * 0.8 / host_per_blk))
         else:
             host_blk = nvir  # not the binding constraint for GPU path
