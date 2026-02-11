@@ -386,7 +386,7 @@ def estimate_blksize(nocc, nvir, phase, *,
         # Blksize is the min of host-derived and GPU-derived limits.
         # 0.65 safety factor on gpu_available to cover C_rs, scan
         # double-buffering, and XLA scratch/fragmentation.
-        host_blk = max(1, int(host_budget * 0.8 / host_per_blk))
+        host_blk = max(1, int(host_budget * 0.65 / host_per_blk))
         gpu_blk = max(1, int(gpu_available * 0.65 / gpu_per_blk))
         blksize = min(host_blk, gpu_blk, nvir)
 
