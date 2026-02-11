@@ -631,7 +631,7 @@ class ISDFTC(TC):
         logger.info(f"  compute_kmat_kernels: Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
         pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
 
-        from pytc.utils.prefetch import async_read, await_read
+        from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
         def _prepare_kmat_block(g0_loc):
             """Prepare sharded data for one grid block (runs in background thread)."""
@@ -657,11 +657,11 @@ class ISDFTC(TC):
                 end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
                 actual_len = end - start
                 if self.xi_phi is not None:
-                    xi_phi_d = self.xi_phi[:, start:end]
-                    xi_grad_d = self.xi_grad[:, start:end, :]
+                    xi_phi_d = safe_hdf5_read(self.xi_phi, (slice(None), slice(start, end)))
+                    xi_grad_d = safe_hdf5_read(self.xi_grad, (slice(None), slice(start, end), slice(None)))
                 else:
-                    xi_phi_d = xi_phi_ds[:, start:end]
-                    xi_grad_d = xi_grad_ds[:, start:end, :]
+                    xi_phi_d = safe_hdf5_read(xi_phi_ds, (slice(None), slice(start, end)))
+                    xi_grad_d = safe_hdf5_read(xi_grad_ds, (slice(None), slice(start, end), slice(None)))
                 if actual_len < n_per_dev:
                     xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_dev - actual_len)))
                     xi_grad_d = np.pad(xi_grad_d, ((0, 0), (0, n_per_dev - actual_len), (0, 0)))
@@ -783,7 +783,7 @@ class ISDFTC(TC):
                 
                 # Inner loop: Integration blocks (g)
                 # Also controlled by host_grid_block_size to limit peak memory of inputs
-                from pytc.utils.prefetch import async_read, await_read
+                from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
                 def _prepare_Laux_int_block(g0_loc):
                     """Load integration chunk to device (background-thread safe)."""
@@ -791,9 +791,9 @@ class ISDFTC(TC):
                     g_chunk = jax.device_put(np.asarray(self.grid_points[g0_loc:g1_loc]))
                     w_chunk = jax.device_put(np.asarray(self.weights[g0_loc:g1_loc]))
                     if self.xi_phi is not None:
-                        xi_chunk = jax.device_put(np.asarray(self.xi_phi[:, g0_loc:g1_loc]))
+                        xi_chunk = jax.device_put(safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc))))
                     else:
-                        xi_chunk = jax.device_put(np.asarray(xi_phi_ds[:, g0_loc:g1_loc]))
+                        xi_chunk = jax.device_put(safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc))))
                     return g_chunk, w_chunk, xi_chunk
 
                 pending_int = None

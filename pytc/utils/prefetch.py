@@ -34,6 +34,7 @@ Usage example (OVVV consume loop)::
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import (
     Any,
@@ -47,6 +48,38 @@ from typing import (
 )
 
 logger = logging.getLogger(__name__)
+
+# HDF5 is NOT thread-safe by default — serialize all HDF5 reads
+_HDF5_LOCK = threading.Lock()
+
+
+def safe_hdf5_read(dataset: Any, idx: Any) -> Any:
+    """Safely read from HDF5 dataset with thread serialization.
+    
+    If dataset is an HDF5 dataset (has .file attribute), the read is
+    protected by _HDF5_LOCK to prevent deadlocks. For numpy arrays or
+    other objects, reads directly without locking.
+    
+    Parameters
+    ----------
+    dataset : h5py.Dataset or array-like
+        The dataset to read from.
+    idx : tuple or slice
+        The index/slice to read.
+        
+    Returns
+    -------
+    np.ndarray
+        The read data as a numpy array.
+    """
+    import numpy as np
+    
+    is_hdf5 = hasattr(dataset, "file")
+    if is_hdf5:
+        with _HDF5_LOCK:
+            return np.asarray(dataset[idx])
+    else:
+        return np.asarray(dataset[idx])
 
 K = TypeVar("K")   # chunk key  (e.g. (p0, p1) tuple)
 V = TypeVar("V")   # loaded value (e.g. numpy array)
@@ -190,6 +223,9 @@ def hdf5_slice_loader(
     ``dataset[..., start:stop, ...]`` along *axis*, converting to a
     numpy array via ``np.asarray``.
 
+    **Thread-safety**: All HDF5 reads are serialized via a module-level
+    lock to avoid deadlocks (HDF5 is not thread-safe by default).
+
     Parameters
     ----------
     dataset : h5py.Dataset or numpy array
@@ -204,13 +240,20 @@ def hdf5_slice_loader(
     import numpy as _np
 
     ndim = len(dataset.shape) if hasattr(dataset, "shape") else None
+    # Detect if dataset is an HDF5 dataset (h5py.Dataset has .file attribute)
+    is_hdf5 = hasattr(dataset, "file")
 
     def _load(key: Tuple[int, int]) -> Any:
         p0, p1 = key
         if ndim is not None:
             idx = [slice(None)] * ndim
             idx[axis] = slice(p0, p1)
-            return _np.asarray(dataset[tuple(idx)])
+            # Serialize HDF5 access to avoid deadlocks
+            if is_hdf5:
+                with _HDF5_LOCK:
+                    return _np.asarray(dataset[tuple(idx)])
+            else:
+                return _np.asarray(dataset[tuple(idx)])
         return dataset
 
     return _load

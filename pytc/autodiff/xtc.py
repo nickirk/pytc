@@ -926,7 +926,7 @@ class ISDFXTC(XTC, ISDFTC):
             
         pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
 
-        from pytc.utils.prefetch import async_read, await_read
+        from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
         def _prepare_D_block(g0_loc):
             """Prepare sharded data for one D-kernel grid block (background-safe)."""
@@ -951,14 +951,14 @@ class ISDFXTC(XTC, ISDFTC):
                 start = g0_loc + d * n_per_dev
                 end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
                 alen = end - start
-                G_d = -np.asarray(L_aux[:, start:end, :])
+                G_d = -safe_hdf5_read(L_aux, (slice(None), slice(start, end), slice(None)))
                 if alen < n_per_dev:
                     G_d = np.pad(G_d, ((0, 0), (0, n_per_dev - alen), (0, 0)))
                 G_list.append(jax.device_put(G_d, devices[d]))
                 if self.xi_phi is not None:
-                    xp = np.asarray(self.xi_phi[:, start:end])
+                    xp = safe_hdf5_read(self.xi_phi, (slice(None), slice(start, end)))
                 else:
-                    xp = np.asarray(xi_phi_ds[:, start:end])
+                    xp = safe_hdf5_read(xi_phi_ds, (slice(None), slice(start, end)))
                 if alen < n_per_dev:
                     xp = np.pad(xp, ((0, 0), (0, n_per_dev - alen)))
                 xi_list.append(jax.device_put(xp, devices[d]))
@@ -1048,7 +1048,7 @@ class ISDFXTC(XTC, ISDFTC):
             
         pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
 
-        from pytc.utils.prefetch import async_read, await_read
+        from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
         def _prepare_X_block(g0_loc):
             """Prepare sharded data for one X-kernel grid block (background-safe)."""
@@ -1073,14 +1073,14 @@ class ISDFXTC(XTC, ISDFTC):
                 start = g0_loc + d * n_per_dev
                 end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
                 alen = end - start
-                G_d = -np.asarray(L_aux[:, start:end, :])
+                G_d = -safe_hdf5_read(L_aux, (slice(None), slice(start, end), slice(None)))
                 if alen < n_per_dev:
                     G_d = np.pad(G_d, ((0, 0), (0, n_per_dev - alen), (0, 0)))
                 G_list.append(jax.device_put(G_d, devices[d]))
                 if self.xi_phi is not None:
-                    xp = np.asarray(self.xi_phi[:, start:end])
+                    xp = safe_hdf5_read(self.xi_phi, (slice(None), slice(start, end)))
                 else:
-                    xp = np.asarray(xi_phi_ds[:, start:end])
+                    xp = safe_hdf5_read(xi_phi_ds, (slice(None), slice(start, end)))
                 if alen < n_per_dev:
                     xp = np.pad(xp, ((0, 0), (0, n_per_dev - alen)))
                 xi_list.append(jax.device_put(xp, devices[d]))
@@ -1345,7 +1345,7 @@ class ISDFXTC(XTC, ISDFTC):
             # Process strictly in chunks to respect memory
             logger.debug("  Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
-            from pytc.utils.prefetch import async_read, await_read
+            from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
             pending_h = None
             for i in range(0, self.n_orb, chunk_size):
@@ -1358,13 +1358,13 @@ class ISDFXTC(XTC, ISDFTC):
                     X_chunk = await_read(pending_h)
                     pending_h = None
                 else:
-                    X_chunk = np.asarray(X[sl])
+                    X_chunk = safe_hdf5_read(X, sl)
 
                 # Prefetch next chunk while einsum runs
                 next_start = stop
                 if next_start < self.n_orb:
                     next_stop = min(next_start + chunk_size, self.n_orb)
-                    pending_h = async_read(lambda _s=slice(next_start, next_stop): np.asarray(X[_s]))
+                    pending_h = async_read(lambda _s=slice(next_start, next_stop): safe_hdf5_read(X, _s))
                 
                 wc += jnp.einsum('rsc,rs->c', X_chunk, dm1[sl])
                 Y_all += jnp.einsum('rqc,rc->qc', X_chunk, phi_tilde[sl])
@@ -1399,7 +1399,7 @@ class ISDFXTC(XTC, ISDFTC):
             J_X_sym_blocks = []
             
             # Iterate p in chunks relative to result
-            from pytc.utils.prefetch import async_read, await_read
+            from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
             pending_jx = None
             for i in range(0, Np, orb_block_size):
                 i_end = min(i + orb_block_size, Np)
@@ -1412,7 +1412,7 @@ class ISDFXTC(XTC, ISDFTC):
                     X_chunk = await_read(pending_jx)
                     pending_jx = None
                 else:
-                    X_chunk = np.asarray(X[p_abs_slice, slice_q])
+                    X_chunk = safe_hdf5_read(X, (p_abs_slice, slice_q))
 
                 block_res = - jnp.einsum('pqc,c->pq', X_chunk, Gb)
 
@@ -1423,7 +1423,7 @@ class ISDFXTC(XTC, ISDFTC):
                     np_start = start_p + next_i * step_p
                     np_stop = start_p + ni_end * step_p
                     n_slice = slice(np_start, np_stop, step_p)
-                    pending_jx = async_read(lambda _sl=n_slice: np.asarray(X[_sl, slice_q]))
+                    pending_jx = async_read(lambda _sl=n_slice: safe_hdf5_read(X, (_sl, slice_q)))
 
                 J_X_sym_blocks.append(block_res)
                 
