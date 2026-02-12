@@ -6,8 +6,8 @@ import jax.numpy as jnp
 import os
 from pyscf import gto, scf, cc
 
-from pytc.autodiff import xtc
-from pytc.autodiff.jastrow import rexp
+from pytc import xtc
+from pytc.jastrow import rexp
 from pytc.solver import xtc_ccsd
 
 # Enable float64 for JAX

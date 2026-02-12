@@ -1,209 +1,228 @@
-"""Test for two-body matrix elements K."""
+"""Tests for JAX implementation of kinetic matrix elements."""
 
 import unittest
 import numpy as np
-from pyscf import gto, scf, dft
-from pytc.jastrow import REXP
-import time
+import jax
+# Enable float64 support
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+from pytc.legacy.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
+from pytc.kmat import calc_K1, calc_K3
+from pytc.jastrow import Poly
 
-def get_be_ccpvdz():
-    """Return a Be atom with cc-pVDZ basis for testing."""
-    mol = gto.M(atom='Be 0 0 0;  ', basis='ccpvdz', unit='Bohr')
-    mf = scf.RHF(mol)
-    mf.kernel()
-    return mol, mf
 
 class TestKmat(unittest.TestCase):
-    """Test K matrix elements."""
+    """Test JAX implementation of K matrix elements."""
     
-    @classmethod
-    def setUpClass(cls):
-        """Set up a Be atom for all tests in this class."""
-        cls.mol, cls.mf = get_be_ccpvdz()
-        cls.n_orb = cls.mf.mo_coeff.shape[1]
-        cls.jastrow = REXP([0.5])  # alpha = 0.5
+    def setUp(self):
+        """Set up test fixtures."""
+        rng = np.random.RandomState(42)
         
-        # Set up grid points for testing
-        grids = dft.gen_grid.Grids(cls.mol)
-        grids.level = 1  # Use coarse grid for testing
-        grids.build()
-        cls.grid_points = grids.coords  # Keep original shape (N_grid, 3)
-        cls.weights = grids.weights
+        # Create multiple test systems with different sizes
+        self.test_configs = [
+            # Small system
+            {'Nb': 2, 'N_grid': 3, 'name': 'small'},
+            # Medium system
+            {'Nb': 4, 'N_grid': 10, 'name': 'medium'},
+            # Larger system
+            {'Nb': 6, 'N_grid': 20, 'name': 'large'}
+        ]
         
-        # Prepare basis functions on grid with correct shapes
-        ao = dft.numint.eval_ao(cls.mol, cls.grid_points, deriv=1)
-        cls.rho = np.dot(ao[0], cls.mf.mo_coeff).T  # Shape: (N_orb, N_grid)
-        cls.nabla_rho = np.dot(ao[1:4].transpose(1,0,2), 
-                              cls.mf.mo_coeff).transpose(2,0,1)  # Shape: (N_orb, N_grid, 3)
+        for config in self.test_configs:
+            Nb, N_grid = config['Nb'], config['N_grid']
+            # Create test data for each configuration
+            config['grid_points'] = rng.randn(N_grid, 3)
+            config['weights'] = rng.rand(N_grid)  # Random weights
+            
+            # Generate orbitals (phi) and gradients (grad_phi)
+            config['phi'] = rng.randn(Nb, N_grid)
+            config['grad_phi'] = rng.randn(Nb, N_grid, 3)
+            
+            # Compute paired densities for NumPy reference (which expects pairs)
+            # phi_paired_ij = phi_i * phi_j
+            config['phi_paired'] = np.einsum('in,jn->ijn', config['phi'], config['phi']).reshape(Nb * Nb, N_grid)
+            
+            # grad_phi_paired_ij = grad_phi_i * phi_j
+            # Note: This matches JAX calc_K1 logic (grad on first index)
+            config['grad_phi_paired'] = np.einsum('ind,jn->ijnd', config['grad_phi'], config['phi']).reshape(Nb * Nb, N_grid, 3)
         
-        # Prepare paired indices for testing
-        cls.rho_paired = np.einsum('in,jn->ijn', 
-                                  cls.rho, 
-                                  cls.rho).reshape(-1, len(cls.weights))
+        # Create Jastrow factors
+        self.params = jnp.array([1.0])
+        self.jastrow_jax = Poly()
         
-        cls.nabla_rho_paired = np.einsum('ind,jn->ijnd', 
-                                        cls.nabla_rho, 
-                                        cls.rho).reshape(-1, len(cls.weights), 3)
-        
+        class PolyNumpy:
+            """NumPy implementation to match original implementation."""
+            def __init__(self, params):
+                self.params = params
+                
+            def grad(self, r1, r2):
+                """Numpy gradient computation handling both single and batched inputs."""
+                # Handle single point inputs
+                if r1.ndim == 1:
+                    r1 = r1[None, :]
+                if r2.ndim == 1:
+                    r2 = r2[None, :]
+                    
+                diff = r1[:, None, :] - r2[None, :, :]
+                r12 = np.sqrt(np.sum(diff * diff, axis=-1) + 1e-10)  # Match epsilon
+                grad = diff / r12[..., None]
+                grad = grad * self.params[0]
+                
+                # Return single point result without batch dimensions
+                if grad.shape[0] == 1 and grad.shape[1] == 1:
+                    return grad[0, 0]
+                return grad
+                
+        self.jastrow_numpy = PolyNumpy(self.params)
     
-    def test_k_shapes(self):
-        """Verify K matrix shapes."""
-        from pytc.kmat import calc_K1, calc_K2, calc_K3
-        import time 
-        time_start = time.time() 
-        k1 = calc_K1(self.rho_paired, self.nabla_rho_paired,
-                   self.jastrow, self.grid_points, self.weights).reshape((self.n_orb,)*4)
-        k1_time = time.time() - time_start
-        time_start = time.time()
-        k2 = calc_K2(self.rho_paired, self.nabla_rho_paired,
-                   self.jastrow, self.grid_points, self.weights).reshape((self.n_orb,)*4)
-        k2_time = time.time() - time_start
-        time_start = time.time()
-        k3 = calc_K3(self.rho_paired, self.jastrow,
-                   self.grid_points, self.weights).reshape((self.n_orb,)*4)
-        k3_time = time.time() - time_start
-        print(f"K1 time: {k1_time}")
-        print(f"K2 time: {k2_time}")
-        print(f"K3 time: {k3_time}")
-        
-        
-        for k in (k1, k2, k3):
-            self.assertEqual(k.shape, (self.n_orb,)*4)
+    def test_K1_shapes(self):
+        """Test K1 output shapes for different input sizes."""
+        for config in self.test_configs:
+            with self.subTest(size=config['name']):
+                Nb = config['Nb']
+                result = calc_K1(
+                    jnp.asarray(config['phi']),
+                    jnp.asarray(config['grad_phi']),
+                    self.jastrow_jax,
+                    self.params,  # Add params argument
+                    jnp.asarray(config['grid_points']),
+                    jnp.asarray(config['weights'])
+                )
+                self.assertEqual(result.shape, (Nb * Nb, Nb * Nb))
     
-    def test_k2_k3_symmetry(self):
-        """Test symmetry properties of K2 (laplacian) and K3 (square) integrals."""
-        from pytc.kmat import calc_K2, calc_K3
-        
-        k2 = calc_K2(
-            self.rho_paired,
-            self.nabla_rho_paired,
-            self.jastrow,
-            self.grid_points,
-            self.weights
-        ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
-        k3 = calc_K3(
-            self.rho_paired,
-            self.jastrow,
-            self.grid_points,
-            self.weights
-        ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
-        # Test symmetries using array operations
-        for K, name in [(k2, 'K2'), (k3, 'K3')]:
-            self.assertTrue(np.allclose(K.transpose(1,0,3,2), K),
-                          msg=f"{name} transpose symmetry failed")
+    def test_K1_against_numpy_all_sizes(self):
+        """Compare JAX K1 implementation against numpy for different sizes."""
+        for config in self.test_configs:
+            with self.subTest(size=config['name']):
+                k1_jax_raw = calc_K1(
+                    jnp.asarray(config['phi']),
+                    jnp.asarray(config['grad_phi']),
+                    self.jastrow_jax,
+                    self.params,  # Add params argument
+                    jnp.asarray(config['grid_points']),
+                    jnp.asarray(config['weights'])
+                )
+                # JAX returns (Nb, Nb, Nb, Nb) flattened to (Nb^2, Nb^2)
+                # This matches NumPy (Nb^2, Nb^2)
+                k1_jax = k1_jax_raw
+                
+                k1_numpy = calc_K1_numpy(
+                    config['phi_paired'],
+                    config['grad_phi_paired'],
+                    self.jastrow_numpy,
+                    config['grid_points'],
+                    config['weights']
+                )
+                
+                np.testing.assert_allclose(
+                    np.asarray(k1_jax), k1_numpy,
+                    rtol=1e-5, atol=1e-5,
+                    err_msg=f"JAX and numpy K1 don't match for {config['name']} system"
+                )
     
-    def test_k1_k2_symmetry(self):
-        """Test if K1 + K2 is equal to K1 with p and r indices swapped."""
-        from pytc.kmat import calc_K1, calc_K2
-        
-        k1 = calc_K1(
-            self.rho_paired,
-            self.nabla_rho_paired,
-            self.jastrow,
-            self.grid_points,
-            self.weights
-        ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
-        k2 = calc_K2(
-            self.rho_paired,
-            self.nabla_rho_paired,
-            self.jastrow,
-            self.grid_points,
-            self.weights
-        ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-        
-        tmp = k1 + k2
-        # swap p and r indices
-        tmp = tmp.swapaxes(0, 1)
-        # compare each element
-        self.assertTrue(np.allclose(k1, -tmp))
-
-
-class TestISDF(TestKmat):
-    """Test ISDF implementation of K matrices."""
+    def test_K3_shapes(self):
+        """Test K3 output shapes for different input sizes."""
+        for config in self.test_configs:
+            with self.subTest(size=config['name']):
+                Nb = config['Nb']
+                result = calc_K3(
+                    jnp.asarray(config['phi']),
+                    self.jastrow_jax,
+                    self.params,  # Add params argument
+                    jnp.asarray(config['grid_points']),
+                    jnp.asarray(config['weights'])
+                )
+                self.assertEqual(result.shape, (Nb * Nb, Nb * Nb))
     
-    @classmethod
-    def setUpClass(cls):
-        """Set up test case with Be atom."""
-        super().setUpClass()
-        
-        # Get reference K matrices
-        from pytc.kmat import calc_K1, calc_K2, calc_K3
-        
-        cls.k1_ref = calc_K1(cls.rho_paired, cls.nabla_rho_paired,
-                           cls.jastrow, cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
-        cls.k2_ref = calc_K2(cls.rho_paired, cls.nabla_rho_paired,
-                           cls.jastrow, cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
-        cls.k3_ref = calc_K3(cls.rho_paired, cls.jastrow,
-                           cls.grid_points, cls.weights).reshape(cls.n_orb, cls.n_orb, cls.n_orb, cls.n_orb)
+    def test_K3_against_numpy_all_sizes(self):
+        """Compare JAX K3 implementation against numpy for different sizes."""
+        for config in self.test_configs:
+            with self.subTest(size=config['name']):
+                k3_jax = calc_K3(
+                    jnp.asarray(config['phi']),
+                    self.jastrow_jax,
+                    self.params,  # Add params argument
+                    jnp.asarray(config['grid_points']),
+                    jnp.asarray(config['weights'])
+                )
+                
+                k3_numpy = calc_K3_numpy(
+                    config['phi_paired'],
+                    self.jastrow_numpy,
+                    config['grid_points'],
+                    config['weights']
+                )
+                
+                np.testing.assert_allclose(
+                    np.asarray(k3_jax), k3_numpy,
+                    rtol=1e-5, atol=1e-5,
+                    err_msg=f"JAX and numpy K3 don't match for {config['name']} system"
+                )
     
-    def test_isdf_convergence(self):
-        """Test if K1_isdf, K2_isdf, and K3_isdf converge to original values with increasing rank."""
-        from pytc.df import isdf_decompose_multi
-        from pytc.kmat import calc_K1_isdf, calc_K2_isdf, calc_K3_isdf
+    def test_batch_size_handling(self):
+        """Test different batch sizes produce same results."""
+        config = self.test_configs[-1]  # Use largest system
+        batch_sizes = [1, 5, 10, 20]
+        
+        # Get reference result with default batch size
+        ref_k1 = calc_K1(
+            jnp.asarray(config['phi']),
+            jnp.asarray(config['grad_phi']),
+            self.jastrow_jax,
+            self.params,  # Add params argument
+            jnp.asarray(config['grid_points']),
+            jnp.asarray(config['weights'])
+        )
+        
+        ref_k3 = calc_K3(
+            jnp.asarray(config['phi']),
+            self.jastrow_jax,
+            self.params,  # Add params argument
+            jnp.asarray(config['grid_points']),
+            jnp.asarray(config['weights'])
+        )
+        
+        for batch_size in batch_sizes:
+            with self.subTest(batch_size=batch_size):
+                # Test K1
+                k1 = calc_K1(
+                    jnp.asarray(config['phi']),
+                    jnp.asarray(config['grad_phi']),
+                    self.jastrow_jax,
+                    self.params,  # Add params argument
+                    jnp.asarray(config['grid_points']),
+                    jnp.asarray(config['weights']),
+                    batch_size=batch_size
+                )
+                np.testing.assert_allclose(k1, ref_k1, rtol=1e-5, atol=1e-5)
+                
+                # Test K3
+                k3 = calc_K3(
+                    jnp.asarray(config['phi']),
+                    self.jastrow_jax,
+                    self.params,  # Add params argument
+                    jnp.asarray(config['grid_points']),
+                    jnp.asarray(config['weights']),
+                    batch_size=batch_size
+                )
+                np.testing.assert_allclose(k3, ref_k3, rtol=1e-5, atol=1e-5)
+    
+    def test_single_point_gradient(self):
+        """Test single point gradient computation matches between JAX and NumPy."""
+        r1 = np.array([0., 0., 0.])
+        r2 = np.array([1., 0., 0.])
+        
+        grad_jax = self.jastrow_jax.grad_r(r1, r2, self.params)
+        grad_numpy = self.jastrow_numpy.grad(r1, r2)
+        
+        np.testing.assert_allclose(
+            np.asarray(grad_jax), grad_numpy,
+            rtol=1e-5, atol=1e-5,
+            err_msg="Single point gradients don't match"
+        )
 
-        # Test different ranks as fractions of grid points
-        ranks = [len(self.weights) // n for n in [1000, 100, 50]]
-        errors_k1, errors_k2, errors_k3 = [], [], []
-        times_k1, times_k2, times_k3 = [], [], []
-
-        for rank in ranks:
-            # Perform ISDF decomposition
-            C_rho, xi_rho, C_grad, xi_grad, fused_pivots = isdf_decompose_multi(
-                self.rho_paired, 
-                self.nabla_rho_paired,
-                rank, rank
-            )
-
-            # Compute K1, K2, and K3 using ISDF
-            start_time = time.time()
-            k1_isdf = calc_K1_isdf(
-                C_rho, xi_rho, C_grad, xi_grad,
-                self.jastrow, self.grid_points, self.weights
-            ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-            times_k1.append(time.time() - start_time)
-
-            start_time = time.time()
-            k2_isdf = calc_K2_isdf(
-                C_rho, xi_rho, C_grad, xi_grad,
-                self.jastrow, self.grid_points, self.weights
-            ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-            times_k2.append(time.time() - start_time)
-            # assert the relation betweek K1 and K2
-            tmp = k1_isdf + k2_isdf
-            tmp = tmp.swapaxes(0, 1)
-            self.assertTrue(np.allclose(k1_isdf, -tmp))
-
-            start_time = time.time()
-            k3_isdf = calc_K3_isdf(
-                C_rho, xi_rho,
-                self.jastrow, self.grid_points, self.weights
-            ).reshape(self.n_orb, self.n_orb, self.n_orb, self.n_orb)
-            times_k3.append(time.time() - start_time)
-
-            # Calculate relative errors
-            error_k1 = np.linalg.norm(k1_isdf - self.k1_ref) / np.linalg.norm(self.k1_ref)
-            error_k2 = np.linalg.norm(k2_isdf - self.k2_ref) / np.linalg.norm(self.k2_ref)
-            error_k3 = np.linalg.norm(k3_isdf - self.k3_ref) / np.linalg.norm(self.k3_ref)
-
-            errors_k1.append(error_k1)
-            errors_k2.append(error_k2)
-            errors_k3.append(error_k3)
-
-            print(f"ISDF rank {len(fused_pivots)}: K_err=({error_k1:.1e},{error_k2:.1e},{error_k3:.1e})")
-
-        # Check if errors decrease with increasing rank
-        self.assertTrue(all(errors_k1[i] > errors_k1[i+1] for i in range(len(errors_k1)-1)))
-        self.assertTrue(all(errors_k2[i] > errors_k2[i+1] for i in range(len(errors_k2)-1)))
-        self.assertTrue(all(errors_k3[i] > errors_k3[i+1] for i in range(len(errors_k3)-1)))
-
-        # Check if final errors are below thresholds
-        self.assertLess(errors_k1[-1], 1e-5)
-        self.assertLess(errors_k2[-1], 1e-5)
-        self.assertLess(errors_k3[-1], 1e-5)
 
 
 if __name__ == '__main__':
     unittest.main()
+

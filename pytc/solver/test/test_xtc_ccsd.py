@@ -5,8 +5,8 @@ import jax
 import jax.numpy as jnp
 from pyscf import gto, scf, lib, cc
 
-from pytc.autodiff import xtc
-from pytc.autodiff.jastrow import rexp
+from pytc import xtc
+from pytc.jastrow import rexp
 from pytc.solver import xtc_ccsd
 
 

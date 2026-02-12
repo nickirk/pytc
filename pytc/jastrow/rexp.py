@@ -1,53 +1,65 @@
+from pytc import jastrow
+import jax
+import jax.numpy as jnp
+from flax import struct
 
-import numpy as np
-from pytc.jastrow import Jastrow
+def _safe_norm_np(x, epsilon):
+    # Match NumPy behavior: r + eps (not sqrt(r^2 + eps^2))
+    # This ensures JAX and NumPy implementations give identical results
+    return jnp.sqrt(jnp.sum(x*x, axis=-1)) + epsilon
 
-
-class REXP(Jastrow):
-
-    def __call__(self, r1, r2):
-        """Evaluate Jastrow factor at given positions."""
-        r1 = np.atleast_2d(r1)
-        r2 = np.atleast_2d(r2)
-        r12 = np.linalg.norm(r1[:, None, :] - r2[None, :], axis=-1)
-        r12 += 1e-8  # Regularization to avoid division by zero
-        return 0.5 * r12 * np.exp(-self.params[0] * r12)
+@struct.dataclass
+class REXP(jastrow.Jastrow):
+    """Exponential Jastrow factor: u(r) = 0.5 * r * exp(-alpha * r)."""
     
+    epsilon: float = struct.field(pytree_node=False, default=1e-8)
+    name: str = struct.field(pytree_node=False, default=None)
+        
+    def _compute(self, r1, r2, params):
+        r12 = r1-r2
+        # Use custom norm to match NumPy behavior
+        r12_norm = _safe_norm_np(r12, jnp.array(self.epsilon))
+        return 0.5*jnp.exp(-params['alpha'] * r12_norm) * r12_norm
 
-    def _process_grad_batch(self, r1, r2):
-        """Compute gradient of Jastrow factor 1/2*r_{12}*exp(-param*r_{12}) with respect to r1.
+    def __call__(self, r1, r2, params):
+        return super().__call__(r1, r2, params)
+    
+    def init_params(self, **kwargs):
+        alpha = kwargs.get('alpha', 0.5)
+        return {'alpha': jnp.array([alpha])}
+
+    def grad_r_batch(self, r1_batch, r2_batch, params):
+        """Compute gradients for a batch of r1 and r2 points analytically.
         
         Args:
-            r1: Position vectors with shape (n_r1, 3)
-            r2: Position vectors with shape (n_r2, 3)
-        
+            r1_batch: (batch_size_out, 3)
+            r2_batch: (batch_size_in, 3)
+            params: Jastrow parameters
+            
         Returns:
-            Gradient vectors with shape (n_r1, 3)
+            Gradients of shape (batch_size_out, batch_size_in, 3)
         """
-        # Compute pairwise differences between all points
-        diff = r1[:, None, :] - r2[None, :, :]  # Shape: (n_r1, n_r2, 3)
+        # r1_batch: (N_out, 3)
+        # r2_batch: (N_in, 3)
         
-        # Compute distances between all pairs
-        r12_squared = np.sum(diff**2, axis=-1)  # Shape: (n_r1, n_r2)
-        r12 = np.sqrt(r12_squared)  # Shape: (n_r1, n_r2)
+        # diff: (N_out, N_in, 3)
+        diff = r1_batch[:, None, :] - r2_batch[None, :, :]
         
-        # Regularization to avoid division by zero
-        #safe_r12 = np.maximum(r12, 1e-8)
-        safe_r12 = r12 + 1e-8
+        # dist: (N_out, N_in)
+        dist = _safe_norm_np(diff, jnp.array(self.epsilon))
         
-        # Calculate derivative of 1/2*r*exp(-param*r) with respect to r
-        # df/dr = 1/2 * exp(-param*r) * (1 - param*r)
-        df_dr = 0.5 * np.exp(-self.params[0] * safe_r12) * (1 - self.params[0] * safe_r12)
+        alpha = params['alpha'][0]
         
-        # Compute gradient direction (r1-r2)/r12
-        direction = diff / safe_r12[..., None]
+        # u = 0.5 * r * exp(-alpha * r)
+        # grad = 0.5 * exp(-alpha * r) * (1 - alpha * r) * (diff / r)
         
-        # Apply the derivative magnitude to the direction
-        gradients = df_dr[..., None] * direction
+        prefactor = 0.5 * jnp.exp(-alpha * dist) * (1 - alpha * dist)
         
-        # Zero out gradients where r12 is near zero
-        #mask = (r12 > 1e-10)[..., None]
-        #gradients = np.where(mask, gradients, np.zeros_like(gradients))
+        # Avoid division by zero (handled by safe norm, but explicit safety for direction)
+        # safe_dist = dist + epsilon (already done in _safe_norm_np if we used it directly, 
+        # but _safe_norm_np returns r+eps)
         
-        # Sum over r2 dimension to get net gradient at each r1
-        return gradients
+        # diff / dist: (N_out, N_in, 3)
+        direction = diff / dist[..., None]
+        
+        return prefactor[..., None] * direction

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytc"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python TransCorrelation package"
 authors = [
     {name = "Ke Liao", email = "ke.liao.whu@gmail.com"}

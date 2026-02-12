@@ -1,270 +1,344 @@
-"""
-This module implements the density-fitting for transcorrelated integrals.
-"""
+"""JAX implementation of Density Fitting / ISDF."""
+import jax
+import jax.numpy as jnp
 import numpy as np
-from typing import Tuple 
-import time  
+from functools import partial
+import os
 import logging
+import time
+import h5py
+import uuid
+import gc
 
 logger = logging.getLogger(__name__)
 
-def calculate_norm(rho: np.ndarray) -> np.ndarray:
-    """Calculate the norm of the input tensor along trailing dimensions.
-    Args:
-        rho: Input tensor (N_b, N_grid, *trailing_dims) or (N_b, N_grid)
-    Returns:
-        rho_normed: Normed tensor (N_b, N_grid)
-    """
-    if rho.ndim > 2:
-        return np.linalg.norm(rho.reshape(rho.shape[0], rho.shape[1], -1), axis=-1)
-    return rho
 
-def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
-    """Pivoted Cholesky decomposition with fixed rank.
+@jax.jit
+def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
+                                   phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray,
+                                   rcond: float = 1e-14) -> jnp.ndarray:
+    """Fast solver using LU decomposition for structured least-squares.
+    
+    Solves min ||C*X - B||² where:
+      C[pq, m] = phi_piv_p[p, m] * phi_piv_q[q, m]
+      B[pq, g] = phi_p_batch[p, g] * phi_q_batch[q, g]
+    
+    This exploits the separable structure to avoid O(N^2) intermediates:
+    (C^T B)[m, g] = (sum_p phi_piv_p[p,m]*phi_p_batch[p,g]) * (sum_q phi_piv_q[q,m]*phi_q_batch[q,g])
     
     Args:
-        M: Input matrix to decompose (positive semi-definite)
-        n_rank: Number of pivots to select
-        tol: Tolerance for early termination and numerical stability
-    
+        phi_piv_p: (n_orb, n_fused) first factor of pivots
+        phi_piv_q: (n_orb, n_fused) second factor of pivots
+        phi_p_batch: (n_orb, batch_size) first factor of target
+        phi_q_batch: (n_orb, batch_size) second factor of target
+        rcond: Relative regularization strength (default 1e-14)
+        
     Returns:
-        L: Lower triangular factor
-        piv: Selected pivot indices
+        X: (n_fused, batch_size) solutions
     """
-    start_time = time.time()
-    n = M.shape[0]
+    # Compute A^T A efficiently using the Kronecker-like structure
+    gram_p = phi_piv_p.T @ phi_piv_p  # (n_fused, n_fused)
+    gram_q = phi_piv_q.T @ phi_piv_q  # (n_fused, n_fused)
+    ATA = gram_p * gram_q  # Element-wise product
     
-    perm = np.arange(n)
-    L = np.zeros((n, n))
-    d = np.diag(M).copy()
+    # Compute A^T B efficiently using separable structure
+    term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)  # (n_fused, batch_size)
+    term_q = jnp.matmul(phi_piv_q.T, phi_q_batch)  # (n_fused, batch_size)
+    ATB = term_p * term_q  # (n_fused, batch_size)
     
-    # Initial error is the trace
-    initial_err = np.sum(d)
-    current_err = initial_err
+    # Use LU solve (jnp.linalg.solve) with Tikhonov regularization
+    diag_mean = jnp.mean(jnp.diag(ATA))
+    jitter = diag_mean * rcond
+    ATA_reg = ATA + jitter * jnp.eye(ATA.shape[0])
+    X = jnp.linalg.solve(ATA_reg, ATB)
     
-    if initial_err < 0:
-        raise ValueError("Input matrix must be positive semi-definite")
-    
-    for k in range(min(n_rank, n)):
-        if k > 0:
-            # Update diagonal elements
-            d[perm[k:]] = np.diag(M)[perm[k:]] - np.sum(L[perm[k:], :k]**2, axis=1)
-        
-        # Find maximum diagonal element
-        max_val = np.max(d[perm[k:]])
-        
-        # Check for numerical stability
-        if max_val < tol:
-            logger.warning(f"Small pivot encountered at step {k}: {max_val:.2e}")
-            end_time = time.time()
-            logger.info(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
-            return L[:, :k], perm[:k]
-        
-        pivot = k + np.argmax(d[perm[k:]])
-        
-        # Swap pivot if needed
-        if pivot != k:
-            perm[k], perm[pivot] = perm[pivot], perm[k]
-        
-        L[perm[k], k] = np.sqrt(d[perm[k]])
-        
-        if k < n_rank - 1:
-            row_k = M[perm[k], perm[k+1:]] - L[perm[k], :k] @ L[perm[k+1:], :k].T
-            L[perm[k+1:], k] = row_k / L[perm[k], k]
-        
-        # Calculate error
-        current_err = np.sum(d[perm[k+1:]])
-        rel_err = current_err / initial_err
-        #print(f"Step {k}: Relative error = {rel_err:.2e}")
-        
-        # Early termination if accuracy is reached
-        if rel_err < tol:
-            logger.info(f"Converged at step {k} with relative error {rel_err:.2e}")
-            end_time = time.time()
-            logger.info(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
-            return L[:, :k+1], perm[:k+1]
-    
-    end_time = time.time()
-    logger.info(f"Pivoted Cholesky decomposition took {end_time - start_time:.2f} seconds")
-    return L[:, :n_rank], perm[:n_rank]
+    return X
 
-def solve_least_squares(C: np.ndarray, rho: np.ndarray) -> np.ndarray:
-    """Solve least squares problem for interpolation coefficients.
+
+solve_normal_equations_batch = jax.jit(solve_normal_equations_batch, static_argnames=['rcond'])
+
+
+@partial(jax.jit, static_argnames=('n_rank',))
+def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
+    """Specialized pivoted Cholesky for phi decomposition."""
+    n_grid = phi_weighted.shape[1]
+    
+    # Initialize diagonal
+    diag_err = jnp.sum(phi_weighted**2, axis=0)**2 + shift
+    
+    # Storage for L factor (N_grid, n_rank)
+    L = jnp.zeros((n_grid, n_rank))
+    pivots = jnp.zeros(n_rank, dtype=int)
+    
+    def body_fn(step, state):
+        diag_err, L, pivots = state
+        pivot = jnp.argmax(diag_err)
+        pivots = pivots.at[step].set(pivot)
+        pivot_val = diag_err[pivot]
+        
+        # gram_col_phi logic
+        dot = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
+        S_col = dot**2
+        S_col = S_col.at[pivot].add(shift)
+        
+        dot_prod = jnp.dot(L, L[pivot])
+        is_small = pivot_val < 1e-12
+        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
+        inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
+        
+        l_col = (S_col - dot_prod) * inv_sqrt_pivot
+        l_col = jnp.where(is_small, 0.0, l_col)
+        L = L.at[:, step].set(l_col)
+        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
+        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        
+        return diag_err, L, pivots
+
+    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
+    return final_pivots
+
+
+@partial(jax.jit, static_argnames=('n_rank',))
+def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
+    """Specialized pivoted Cholesky for gradient decomposition."""
+    n_grid = phi_weighted.shape[1]
+    
+    # Initialize diagonal
+    A_diag = jnp.sum(phi_weighted**2, axis=0)
+    B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
+    diag_err = A_diag * B_diag + shift
+    
+    # Storage for L factor (N_grid, n_rank)
+    L = jnp.zeros((n_grid, n_rank))
+    pivots = jnp.zeros(n_rank, dtype=int)
+    
+    def body_fn(step, state):
+        diag_err, L, pivots = state
+        pivot = jnp.argmax(diag_err)
+        pivots = pivots.at[step].set(pivot)
+        pivot_val = diag_err[pivot]
+        
+        # gram_col_grad logic
+        A_col = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
+        B_col = jnp.zeros(n_grid)
+        for c in range(3):
+            B_col += jnp.dot(grad_phi_weighted[:, :, c].T, grad_phi_weighted[:, pivot, c])
+        S_col = A_col * B_col
+        S_col = S_col.at[pivot].add(shift)
+        
+        dot_prod = jnp.dot(L, L[pivot])
+        is_small = pivot_val < 1e-12
+        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
+        inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
+        
+        l_col = (S_col - dot_prod) * inv_sqrt_pivot
+        l_col = jnp.where(is_small, 0.0, l_col)
+        L = L.at[:, step].set(l_col)
+        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
+        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        
+        return diag_err, L, pivots
+
+    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
+    return final_pivots
+
+
+
+
+
+
+def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
+                   grid_batch_size=4096, rcond=1e-14,
+                   is_incore=False, save_path=None):
+    """Perform ISDF decomposition of orbitals and their gradients.
+    
+    Memory-efficient implementation using SVD-based solver to avoid
+    materializing large C matrices (n_orb² × n_fused).
+    
     Args:
-        C: Selected columns (N_b*N_b, n_rank, *trailing_dims)
-        rho: Original tensor (N_b*N_b, N_grid, *trailing_dims)
-
+        phi: Orbitals on grid (n_orb, n_grid)
+        grad_phi: Orbital gradients on grid (n_orb, n_grid, 3)
+        n_rank_phi: Rank for phi decomposition
+        n_rank_grad: Rank for gradient decomposition
+        weights: Optional (n_grid,) array of integration weights. 
+                 If provided, pivot selection is weighted by these weights.
+        grid_batch_size: Number of grid points to process in each batch
+        rcond: Relative condition number cutoff for SVD pseudoinverse (default 1e-14).
+               Smaller values retain more singular values (more accurate but less stable).
+        
     Returns:
-        xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
+        phi_piv: (N_orb, N_fused)
+        xi_phi: (N_fused, N_grid)
+        grad_phi_piv: (N_orb, N_fused, 3)
+        xi_grad: (N_fused, N_grid, 3)
+        pivots: (N_fused,)
     """
-    if C.ndim > 2:
-        xi_list = []
-        for i in range(rho.shape[-1]):
-            xi_i, *_ = np.linalg.lstsq(C[..., i], rho[..., i], rcond=None)
-            xi_list.append(xi_i)
-        return np.stack(xi_list, axis=-1)
+    if save_path is not None and os.path.exists(save_path):
+        try:
+            with h5py.File(save_path, 'r') as f:
+                if all(k in f for k in ['xi_phi', 'xi_grad', 'pivots', 'phi_isdf', 'grad_phi_isdf']):
+                    logger.info(f"Loading ISDF decomposition from {save_path}")
+                    pivots = jnp.array(f['pivots'][:])
+                    phi_piv = jnp.array(f['phi_isdf'][:])
+                    grad_phi_piv = jnp.array(f['grad_phi_isdf'][:])
+                    
+                    if is_incore:
+                        cpu_device = jax.devices("cpu")[0]
+                        xi_phi = jax.device_put(f['xi_phi'][:], cpu_device)
+                        xi_grad = jax.device_put(f['xi_grad'][:], cpu_device)
+                    else:
+                        xi_phi = None
+                        xi_grad = None
+                        
+                    return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, save_path
+        except Exception as e:
+            logger.warning(f"Failed to load ISDF from {save_path}: {e}. Recomputing...")
+
+    n_orb, n_grid = phi.shape
+    
+    if weights is None:
+        w_sqrt = jnp.ones(n_grid)
     else:
-        xi, *_ = np.linalg.lstsq(C, rho, rcond=None)
-        return xi
-
-def isdf_decompose_cholesky(rho: np.ndarray, n_rank: int) -> Tuple[np.ndarray, np.ndarray]:
-    """ISDF decomposition using pivoted Cholesky, generalized for tensors.
-    Args:
-        rho: Input tensor (N_b, N_grid, *trailing_dims) or (N_b, N_grid)
-        n_rank: Number of interpolation points
-    Returns:
-        C: Selected columns from rho (N_b, n_rank, *trailing_dims) or (N_b, n_rank)
-        xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims) or (n_rank, N_grid)
-    """
-    start_time = time.time()
-    rho_normed = calculate_norm(rho)
-    S = rho_normed.T @ rho_normed
-    S[np.diag_indices_from(S)] += 1e-12 * np.max(np.abs(np.diag(S)))
-
-    _, piv = pivoted_cholesky(S, n_rank)
-    C = np.take(rho, piv, axis=1)
-    xi = solve_least_squares(C, rho)
-
-    end_time = time.time()
-    logger.info(f"ISDF decomposition took {end_time - start_time:.2f} seconds")
-    return C, xi
-
-def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank2: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """ISDF decomposition for two densities with pivot fusion.
-
-    Args:
-        rho1: First overlap density (N_b*N_b, N_grid, *trailing_dims)
-        rho2: Second overlap density (N_b*N_b, N_grid, *trailing_dims)
-        n_rank1: Number of interpolation points for rho1
-        n_rank2: Number of interpolation points for rho2
-
-    Returns:
-        C1: Selected columns from rho1 using fused pivots (N_b*N_b, n_fused, *trailing_dims)
-        xi1: Interpolation coefficients for rho1 (n_fused, N_grid, *trailing_dims)
-        C2: Selected columns from rho2 using fused pivots (N_b*N_b, n_fused, *trailing_dims)
-        xi2: Interpolation coefficients for rho2 (n_fused, N_grid, *trailing_dims)
-        piv_fused: Combined pivot indices
-    """
-    # Normalize rho1 and rho2 along trailing dimensions
-    rho1_normed = calculate_norm(rho1)
-    rho2_normed = calculate_norm(rho2)
-
-    # Form overlap matrices S1 and S2
-    S1 = rho1_normed.T @ rho1_normed
-    S2 = rho2_normed.T @ rho2_normed
-
-    # Add small diagonal shift for stability
-    shift1 = 1e-12 * np.max(np.abs(np.diag(S1)))
-    shift2 = 1e-12 * np.max(np.abs(np.diag(S2)))
-    S1[np.diag_indices_from(S1)] += shift1
-    S2[np.diag_indices_from(S2)] += shift2
-
-    # Get pivots for each density separately
-    _, piv1 = pivoted_cholesky(S1, n_rank1)
-    _, piv2 = pivoted_cholesky(S2, n_rank2)
-
-    # Combine and uniquify pivots
-    piv_fused = np.unique(np.concatenate([piv1, piv2]))
-
-    # Select columns using fused pivots
-    if rho1.ndim > 2:
-        C1 = np.take(rho1, piv_fused, axis=1)
-    else:
-        C1 = rho1[:, piv_fused]
-
-    if rho2.ndim > 2:
-        C2 = np.take(rho2, piv_fused, axis=1)
-    else:
-        C2 = rho2[:, piv_fused]
-
-    # Solve least squares problems
-    xi1 = solve_least_squares(C1, rho1)
-    xi2 = solve_least_squares(C2, rho2)
-
-    return C1, xi1, C2, xi2, piv_fused
-
-def reconstruct_rho(C: np.ndarray, xi: np.ndarray) -> np.ndarray:
-    """Reconstruct tensor from decomposition.
-
-    Args:
-        C: Selected columns (N_b, n_rank, *trailing_dims)
-        xi: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
-
-    Returns:
-        Reconstructed tensor with same shape as original
-    """
-    if C.ndim > 2:
-        return np.einsum('br...,rg...->bg...', C, xi)
-    else:
-        return C @ xi
-
-def test_accuracy(rho_orig: np.ndarray, C: np.ndarray, P: np.ndarray) -> Tuple[float, float]:
-    """Calculate reconstruction relative and absolute errors.
-    
-    Args:
-        rho_orig: Original tensor (N_b, N_grid, *trailing_dims)
-        C: Selected columns (N_b, n_rank, *trailing_dims)
-        P: Interpolation coefficients (n_rank, N_grid, *trailing_dims)
+        w_sqrt = jnp.sqrt(jnp.abs(weights))  # Use abs to avoid NaN
         
-    Returns:
-        rel_error: Relative error of reconstruction
-        abs_error: Absolute error of reconstruction
-    """
-    rho_recon = reconstruct_rho(C, P)
-    abs_error = np.linalg.norm(rho_recon - rho_orig)
-    rel_error = abs_error / np.linalg.norm(rho_orig)
-    return rel_error, abs_error
+    start_time = time.perf_counter()
+    logger.info(f"Starting ISDF decomposition with n_orb={n_orb}, n_grid={n_grid}, n_rank_phi={n_rank_phi}, n_rank_grad={n_rank_grad}")
+    if weights is not None:
+        logger.info(f"  Using integration weights (min={jnp.min(weights):.3e}, max={jnp.max(weights):.3e})")
 
-def test_multi_accuracy(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank2: int) -> Tuple[float, float, float, float, int]:
-    """Test reconstruction accuracy for two densities using fused pivots.
+    # --- 1. Phi Decomposition ---
+    t0 = time.perf_counter()
     
-    Args:
-        rho1, rho2: Input densities to approximate
-        n_rank1, n_rank2: Desired ranks for each density
+    # Apply weights to orbitals for pivot selection
+    # The Gram matrix is (phi^T W phi)(phi^T W phi) where W = diag(weights)
+    # Equivalently: (sqrt(W) phi)^T (sqrt(W) phi) squared
+    phi_weighted = phi * w_sqrt  # (n_orb, n_grid)
+        
+    # Pre-compute diagonal for phi to calculate shift
+    orb_sq = jnp.sum(phi_weighted**2, axis=0)  # Weighted orbital norms
+    diag_phi = orb_sq**2
+    shift_phi = 1e-12 * jnp.max(jnp.abs(diag_phi))
+
+    pivots_phi = _pivoted_cholesky_phi(phi_weighted, n_rank_phi, shift_phi)
+    t1 = time.perf_counter()
+    logger.debug(f"Phi decomposition completed in {t1 - t0:.4f} s")
+
+    # --- 2. Gradient Decomposition ---
+    t0 = time.perf_counter()
     
-    Returns:
-        rel_error1: Relative error for rho1 reconstruction
-        abs_error1: Absolute error for rho1 reconstruction
-        rel_error2: Relative error for rho2 reconstruction
-        abs_error2: Absolute error for rho2 reconstruction
-        n_fused: Number of fused pivots used
-    """
-    C1, xi1, C2, xi2, piv_fused = isdf_decompose_multi(rho1, rho2, n_rank1, n_rank2)
+    # Apply weights to gradients for pivot selection
+    grad_phi_weighted = grad_phi * w_sqrt[:, None]  # (n_orb, n_grid, 3)
     
-    # Reuse test_accuracy for both rho1 and rho2
-    rel_error1, abs_error1 = test_accuracy(rho1, C1, xi1)
-    rel_error2, abs_error2 = test_accuracy(rho2, C2, xi2)
+    # Pre-compute diagonal for grad to calculate shift
+    A_diag = jnp.sum(phi_weighted**2, axis=0)
+    B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
+    diag_grad = A_diag * B_diag
+    shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
+
+    pivots_grad = _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad)
+    t1 = time.perf_counter()
+    logger.debug(f"Grad decomposition completed in {t1 - t0:.4f} s")
     
-    return rel_error1, abs_error1, rel_error2, abs_error2, len(piv_fused)
+    # --- 3. Fuse pivots ---
+    t0 = time.perf_counter()
+    
+    # Use numpy for unique to avoid JAX dynamic shape overhead
+    pivots_all = np.concatenate([np.array(pivots_phi), np.array(pivots_grad)])
+    pivots = jnp.array(np.unique(pivots_all))
+    n_fused = pivots.shape[0]
+    t1 = time.perf_counter()
+    logger.info(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
+    
+    # --- 4. Extract pivot values ---
+    t0 = time.perf_counter()
+    
+    phi_piv = phi[:, pivots]  # (n_orb, n_fused)
+    grad_phi_piv = grad_phi[:, pivots, :]  # (n_orb, n_fused, 3)
+    
+    t1 = time.perf_counter()
+    logger.debug(f"Pivot values extracted in {t1 - t0:.4f} s")
+    
+    # --- 5. Solve for xi_phi and xi_grad using fast normal equations solver ---
+    t0 = time.perf_counter()
+    logger.info("Using fast normal equations solver")
 
-# Example usage
-if __name__ == "__main__":
-    # Generate test data
-    Nb = 10
-    N_grid = 500
-    rank = 5
-    U = np.random.randn(Nb**2, rank)
-    V = np.random.randn(N_grid, rank)
-    rho = U @ V.T  # Construct low-rank matrix
+    # Solve for xi_phi and xi_grad
+    cpu_device = jax.devices("cpu")[0]
+    grid_batch_size = min(grid_batch_size, n_grid)
+    n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size if grid_batch_size > 0 else 0
+    
+    # Setup storage
+    h5_file = None
+    if is_incore:
+        logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
+        xi_phi_storage = np.zeros((n_fused, n_grid), dtype=phi.dtype)
+        xi_grad_storage = np.zeros((n_fused, n_grid, 3), dtype=phi.dtype)
+    else:
+        if save_path is None:
+            save_path = f"isdf_temp_{uuid.uuid4().hex[:8]}.h5"
+            logger.info(f"  No save_path provided, creating temporary HDF5: {save_path}")
+        
+        h5_file = h5py.File(save_path, 'a')
+        logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
+        
+        # Create/Reset datasets
+        for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
+            if name in h5_file: del h5_file[name]
+            h5_file.create_dataset(name, shape=shape, dtype=phi.dtype)
+        
+        # Store metadata
+        for name, data in [('pivots', pivots), ('phi_isdf', phi_piv), ('grad_phi_isdf', grad_phi_piv)]:
+            if name in h5_file: del h5_file[name]
+            h5_file.create_dataset(name, data=np.array(data))
+        
+        xi_phi_storage = h5_file['xi_phi']
+        xi_grad_storage = h5_file['xi_grad']
 
-    # Perform Cholesky-based ISDF decomposition with fixed rank
-    C, P = isdf_decompose_cholesky(rho, n_rank=rank)
-
-    # Test reconstruction accuracy
-    error = test_accuracy(rho, C, P)
-    print(f"Reconstruction relative error: {error:.2e}")
-    print(f"Number of auxiliary basis: {C.shape[1]}")
-
-    # Test with two densities of different ranks
-    rank1, rank2 = 5, 8
-    U1 = np.random.randn(Nb**2, rank1)
-    U2 = np.random.randn(Nb**2, rank2)
-    V1 = np.random.randn(N_grid, rank1)
-    V2 = np.random.randn(N_grid, rank2)
-    rho1 = U1 @ V1.T
-    rho2 = U2 @ V2.T
-
-    err1, err2, n_fused = test_multi_accuracy(rho1, rho2, rank1, rank2)
-    print(f"Rho1 error: {err1:.2e}")
-    print(f"Rho2 error: {err2:.2e}")
-    print(f"Number of fused pivots: {n_fused}")
+    try:
+        t_batch_start = time.perf_counter()
+        for batch_idx in range(n_batches):
+            g_start = batch_idx * grid_batch_size
+            g_end = min(g_start + grid_batch_size, n_grid)
+            
+            # 1. Xi_phi
+            phi_batch = phi[:, g_start:g_end]
+            xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, 
+                                    phi_batch, phi_batch, rcond=rcond)
+            xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
+            
+            # 2. Xi_grad
+            for c in range(3):
+                grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
+                xi_grad_batch = solve_normal_equations_batch(grad_phi_piv[:, :, c], phi_piv,
+                                         grad_phi_batch_c, phi_batch, rcond=rcond)
+                xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
+            
+            if batch_idx % 4 == 0 and batch_idx > 0:
+                elapsed = time.perf_counter() - t_batch_start
+                rate = batch_idx / elapsed
+                eta = (n_batches - batch_idx) / rate if rate > 0 else 0
+                logger.debug(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
+        
+        # Load into JAX CPU RAM if requested
+        if is_incore:
+            xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
+            xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
+        else:
+            xi_phi = None
+            xi_grad = None
+        
+        # Explicitly delete storage to save RAM
+        if is_incore:
+            del xi_phi_storage, xi_grad_storage
+            gc.collect()
+        
+    finally:
+        if h5_file is not None:
+            h5_file.close()
+        gc.collect()
+    
+    total_time = time.perf_counter() - start_time
+    logger.debug(f"Total fused ranks = {n_fused}")
+    logger.info(f"ISDF decomposition total time: {total_time:.4f} s")
+    
+    return phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, save_path

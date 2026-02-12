@@ -58,10 +58,10 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pyscf import gto, scf
 
-from pytc.autodiff.vmc import optimize_ref_var
-from pytc.autodiff.ansatz.sj import SlaterJastrow
-from pytc.autodiff.ansatz.det import SlaterDet
-from pytc.autodiff.jastrow import CompositeJastrow, NuclearCusp, BoysHandy
+from pytc.vmc import optimize_ref_var
+from pytc.ansatz.sj import SlaterJastrow
+from pytc.ansatz.det import SlaterDet
+from pytc.jastrow import CompositeJastrow, NuclearCusp, BoysHandy
 
 # Set up a molecule with PySCF
 mol = gto.Mole()
@@ -101,8 +101,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pyscf import gto, scf, cc
 
-from pytc.autodiff import xtc
-from pytc.autodiff.jastrow import rexp
+from pytc import xtc
+from pytc.jastrow import rexp
 
 # Set up molecule
 mol = gto.M(atom='O 0 0 0; H 0 1 0; H 0 0 1', basis='ccpvdz')
@@ -141,17 +141,17 @@ See the `pytc/examples/` directory for complete examples:
 
 To run the tests:
 ```bash
-# General tests
+# Core tests
 python -m unittest discover pytc/test
 
-# Autodiff/JAX tests
-python -m unittest discover pytc/autodiff/test
-python -m unittest discover pytc/autodiff/ansatz/test
-python -m unittest discover pytc/autodiff/vmc/test
-python -m unittest discover pytc/autodiff/jastrow/test
+# Submodule tests
+python -m unittest discover pytc/ansatz/test
+python -m unittest discover pytc/vmc/test
+python -m unittest discover pytc/jastrow/test
+python -m unittest discover pytc/solver/test
 
-# Utility tests
-python -m unittest discover pytc/utils/test
+# Legacy tests (NumPy implementation)
+python -m unittest discover pytc/legacy/test
 ```
 
 ## Publications
@@ -173,7 +173,9 @@ Contributions are welcome! Here's how you can help:
 3. **Run the tests** before submitting:
    ```bash
    python -m unittest discover pytc/test
-   python -m unittest discover pytc/autodiff/test
+   python -m unittest discover pytc/ansatz/test
+   python -m unittest discover pytc/vmc/test
+   python -m unittest discover pytc/jastrow/test
    ```
 4. Submit a pull request with a clear description of your changes
 

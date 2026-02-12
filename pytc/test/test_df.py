@@ -1,127 +1,97 @@
-"""Test for density-fitting and tensor decomposition implementations."""
-
 import unittest
 import numpy as np
+import jax
+import jax.numpy as jnp
 from pyscf import gto, scf
+from pytc.df import isdf_decompose
+from pytc.tc import TC
 
-from pytc.xtc import XTC
-from pytc.jastrow import REXP
-from pytc.df import isdf_decompose_cholesky, reconstruct_rho, test_accuracy, test_multi_accuracy
+jax.config.update("jax_enable_x64", True)
 
-def get_be_ccpvdz():
-    """Return a Be atom with cc-pVDZ basis for testing."""
-    mol = gto.M(atom='Be 0 0 0', basis='ccpvdz', unit='Bohr')
-    mf = scf.RHF(mol)
-    mf.kernel()
-    return mol, mf
+class TestISDFReconstruction(unittest.TestCase):
+    def setUp(self):
+        # Setup H4 chain system with ccpvtz basis
+        atom = []
+        for i in range(4):
+            atom.append(f'H 0 0 {i*1.4}')
+        self.mol = gto.M(atom=atom, basis='ccpvtz', unit='Bohr', verbose=0)
+        self.mf = scf.RHF(self.mol).run()
+        
+        # Initialize TC object to get orbitals and gradients on grid
+        # We use a dummy Jastrow factor as we only need phi and grad_phi
+        from pytc.jastrow.rexp import REXP
+        self.tc = TC.from_pyscf(self.mf, REXP(), grid_lvl=1)
+        
+        self.phi = self.tc.phi
+        self.grad_phi = self.tc.grad_phi
+        self.weights = self.tc.weights
+        
+        print(f"\nSystem: H4, Basis: ccpvdz, Grid size: {self.phi.shape[1]}")
 
-class TestDF(unittest.TestCase):
-    """Test density-fitting and tensor decomposition methods."""
-
-    @classmethod
-    def setUpClass(cls):
-        """Set up test case using Be atom."""
-        # Get mean-field data
-        _, cls.mf = get_be_ccpvdz()
-
-        # Create REXP instance
-        cls.jastrow = REXP([1.4])
-
-        # Initialize XTC
-        cls.xtc = XTC(cls.mf, cls.jastrow, grid_lvl=1)
-
-        # Get orbital values on grid
-        mo_values, _ = cls.xtc._eval_basis_on_grid()
-        rho = mo_values
-
-        # Get paired density
-        cls.rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(cls.xtc.weights))
-
-        # Get mo_grad for tensor tests
-        _, cls.mo_grad = cls.xtc._eval_basis_on_grid()
-        cls.rho_grad = cls.mo_grad  # Shape (Nb, N_grid, 3)
-
-    def test_tensor_decomposition(self):
-        """Test ISDF decomposition with tensor input."""
-        n_rank = 40
-        # Input has shape (Nb, N_grid, 3)
-        C, xi = isdf_decompose_cholesky(self.rho_grad, n_rank=n_rank)
-
-        # Check shapes including trailing dimensions
-        self.assertEqual(C.shape, (self.rho_grad.shape[0], n_rank, 3))
-        self.assertEqual(xi.shape, (n_rank, self.rho_grad.shape[1], 3))
-
-        # Test reconstruction
-        rho_reconstructed = reconstruct_rho(C, xi)
-        self.assertEqual(rho_reconstructed.shape, self.rho_grad.shape)
-
-        # Check error using norm along spatial dimensions
-        error = np.linalg.norm(rho_reconstructed - self.rho_grad) / np.linalg.norm(self.rho_grad)
-        self.assertLess(error, 1e-4)
-
-    def test_multi_decomposition(self):
-        """Test decomposition of scalar and tensor densities."""
-        # Use both scalar and tensor valued densities
-        rank = 50
-
-        # Create tensor test density
-        rho_tensor = self.rho_grad  # Shape (Nb, N_grid, 3)
-
-        # Test decomposition with mixed types
-        rel_error1, abs_error1, rel_error2, abs_error2, n_fused = test_multi_accuracy(
-            self.rho_paired,  # Matrix input
-            rho_tensor,       # Tensor input
-            rank, rank
-        )
-
-        # Check errors are reasonable
-        self.assertLess(rel_error1, 1e-4)
-        self.assertLess(rel_error2, 1e-4)
-
-        # Check number of fused pivots
-        self.assertLessEqual(n_fused, 2 * rank)
-        self.assertGreaterEqual(n_fused, rank)
-
-    def test_rank_convergence(self):
-        """Test ISDF decomposition with different ranks."""
-        # Test both matrix and tensor inputs
-        for input_data in [self.rho_paired, self.rho_grad]:
-            ranks = [10, 20, 40]
-            errors = []
-
-            for rank in ranks:
-                C, xi = isdf_decompose_cholesky(input_data, n_rank=rank)
-
-                # Reconstruct and check error
-                reconstructed = reconstruct_rho(C, xi)
-                error = np.linalg.norm(reconstructed - input_data) / np.linalg.norm(input_data)
-                errors.append(error)
-
-            # Check that error decreases with increasing rank
-            # Check that error generally decreases (highest rank should have lowest error)
-            self.assertLess(errors[-1], errors[0])
-
-    def test_reconstruction_shapes(self):
-        """Test shape preservation in reconstruction."""
-        rank = 150
-
-        # Test matrix input
-        C_mat, xi_mat = isdf_decompose_cholesky(self.rho_paired, n_rank=rank)
-        recon_mat = reconstruct_rho(C_mat, xi_mat)
-        self.assertEqual(recon_mat.shape, self.rho_paired.shape)
-
-        # Check reconstruction accuracy
-        rel_error, _ = test_accuracy(self.rho_paired, C_mat, xi_mat)
-        self.assertLess(rel_error, 1e-4)
-
-        # Test tensor input
-        C_tens, xi_tens = isdf_decompose_cholesky(self.rho_grad, n_rank=rank)
-        recon_tens = reconstruct_rho(C_tens, xi_tens)
-        self.assertEqual(recon_tens.shape, self.rho_grad.shape)
-
-        # Check reconstruction accuracy
-        rel_error, _ = test_accuracy(self.rho_grad, C_tens, xi_tens)
-        self.assertLess(rel_error, 1e-4)
+    def test_reconstruction_convergence(self):
+        """Verify that phi and grad_phi overlaps are reconstructed accurately and converge with rank."""
+        n_orb, n_grid = self.phi.shape
+        
+        # Exact overlaps on grid
+        # S_ij = sum_g w_g phi_i(g) phi_j(g)
+        phi_weighted = self.phi * self.weights[None, :]
+        S_exact = jnp.dot(phi_weighted, self.phi.T)
+        
+        # G_ij,c = sum_g w_g grad_phi_i,c(g) phi_j(g)
+        G_exact = jnp.einsum('igc,g,jg->ijc', self.grad_phi, self.weights, self.phi)
+        
+        ranks = [400, 600, 800]
+        
+        print(f"\n{'Rank':<10} {'S Rel Error':<15} {'S Max Abs':<15} {'G Rel Error':<15} {'G Max Abs':<15}")
+        print("-" * 75)
+        
+        prev_S_error = float('inf')
+        prev_G_error = float('inf')
+        
+        for n_rank in ranks:
+            # Perform ISDF decomposition
+            phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose(
+                self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights, rcond=1e-14, is_incore=True
+            )
+            
+            # Reconstruct overlaps
+            # S_reconst_ij = sum_m C_phi_ij,m * (sum_g xi_phi_m,g * w_g)
+            # C_phi_ij,m = phi_i,m * phi_j,m
+            xi_phi_weighted_sum = jnp.dot(xi_phi, self.weights)
+            C_phi = jnp.einsum('pm,qm->pqm', phi_piv, phi_piv).reshape(-1, len(pivots))
+            S_reconst = jnp.dot(C_phi, xi_phi_weighted_sum).reshape(n_orb, n_orb)
+            
+            # G_reconst_ij,c = sum_m C_grad_ij,m,c * (sum_g xi_grad_m,g,c * w_g)
+            # xi_grad is (n_fused, n_grid, 3)
+            xi_grad_weighted_sum = jnp.einsum('mgc,g->mc', xi_grad, self.weights)
+            # C_grad is (n_orb^2, n_fused, 3)
+            # C_grad_ij,m,c = grad_phi_i,m,c * phi_j,m
+            C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, len(pivots), 3)
+            G_reconst = jnp.einsum('nmc,mc->nc', C_grad, xi_grad_weighted_sum).reshape(n_orb, n_orb, 3)
+            
+            # Compute relative errors
+            S_error = jnp.linalg.norm(S_reconst - S_exact) / jnp.linalg.norm(S_exact)
+            G_error = jnp.linalg.norm(G_reconst - G_exact) / jnp.linalg.norm(G_exact)
+            
+            # Compute max absolute errors
+            S_max_abs = jnp.max(jnp.abs(S_reconst - S_exact))
+            G_max_abs = jnp.max(jnp.abs(G_reconst - G_exact))
+            
+            print(f"{n_rank:<10} {S_error:<15.2e} {S_max_abs:<15.2e} {G_error:<15.2e} {G_max_abs:<15.2e}")
+            
+            # Check for convergence
+            if n_rank > ranks[0]:
+                if S_error > 1e-12:
+                    self.assertLess(S_error, prev_S_error, f"S error did not decrease at rank {n_rank}")
+                if G_error > 1e-12:
+                    self.assertLess(G_error, prev_G_error, f"G error did not decrease at rank {n_rank}")
+            
+            prev_S_error = S_error
+            prev_G_error = G_error
+            
+        # Final accuracy check
+        self.assertLess(S_error, 1e-4, f"Final S reconstruction error {S_error} is too high")
+        self.assertLess(G_error, 1e-3, f"Final G reconstruction error {G_error} is too high")
 
 if __name__ == '__main__':
     unittest.main()

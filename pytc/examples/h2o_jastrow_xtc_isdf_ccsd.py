@@ -4,8 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 from pyscf import gto, scf, cc, lib
 
-from pytc.autodiff import xtc
-from pytc.autodiff.jastrow import rexp
+from pytc import xtc
+from pytc.jastrow import rexp
 
 # Set number of threads for PySCF/NumPy
 lib.num_threads(1)
