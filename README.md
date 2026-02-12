@@ -20,7 +20,6 @@
 
 - Python >= 3.10
 - numpy
-- numba (optional: JIT compilation for heavy numerical functions on CPU)
 - scipy
 - jax (autodiff and GPU acceleration)
   > **Note**: To run on GPUs, you must install the correct version of JAX. See the [JAX installation guide](https://github.com/google/jax#installation).
@@ -31,7 +30,7 @@
 - flax (neural network)
 - folx 
 - optax (machine learning optimizers)
-- pyscf ([modified version](https://github.com/nickirk/pyscf/tree/tc-ccsd) for tc-ccsd only. Otherwise, official pyscf also works)
+- pyscf
 
 ## Installation
 
