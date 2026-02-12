@@ -118,11 +118,13 @@ class TestShardingUtilities(unittest.TestCase):
         np.testing.assert_allclose(pr, p)
 
     def test_get_vmap_fn(self):
-        """get_vmap_fn returns jax.vmap when multi_gpu=True."""
-        fn = get_vmap_fn(multi_gpu=True)
+        """get_vmap_fn returns jax.vmap in multi-device environment."""
+        # Auto-detects 4 devices
+        fn = get_vmap_fn()
         self.assertIs(fn, jax.vmap)
 
-        fn2 = get_vmap_fn(multi_gpu=False, max_vmap_batch_size=0)
+        # Still returns jax.vmap if max_vmap_batch_size=0
+        fn2 = get_vmap_fn(max_vmap_batch_size=0)
         self.assertIs(fn2, jax.vmap)
 
     def test_pad_walker(self):
@@ -308,7 +310,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
             damping=1e-5,
             curvature_type="gauss_newton",
             solver="exact",
-            multi_gpu=False,
         )
         key_ref = random.PRNGKey(99)
         state_ref = opt_ref.init(params, key_ref, (walkers, sj))
@@ -328,7 +329,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
             damping=1e-5,
             curvature_type="gauss_newton",
             solver="exact",
-            multi_gpu=True,
         )
         key_mg = random.PRNGKey(99)
         state_mg = opt_mg.init(ps, key_mg, (ws, sj))
@@ -389,7 +389,6 @@ class TestOptimizeRefVarMultiGPU(unittest.TestCase):
             opt_kwargs={'damping': 1e-5, 'solver': 'exact'},
             max_vmap_batch_size=0,
             key=key,
-            multi_gpu=True,
         )
 
         self.assertEqual(len(results['energies']), 3)

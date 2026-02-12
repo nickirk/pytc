@@ -22,7 +22,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, multi_gpu=False, clip_multiplier=5.0):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -32,23 +32,15 @@ class NewtonOptimizer:
         self.solver = solver
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
         self.jacobian_sample_size = jacobian_sample_size
-        self.multi_gpu = multi_gpu
         self.clip_multiplier = clip_multiplier
 
     def _get_vmap(self):
         """Return the appropriate vmap implementation.
 
-        When ``multi_gpu=True`` always use ``jax.vmap`` so that sharding
-        is preserved across devices.  ``folx.batched_vmap`` gathers results
-        to all devices, defeating multi-GPU parallelism.
+        Automatically detects multi-GPU environments via get_vmap_fn.
         """
-        if self.multi_gpu:
-            return jax.vmap
-        if self.max_vmap_batch_size > 0:
-            return lambda fn, **kw: folx.batched_vmap(
-                fn, max_batch_size=self.max_vmap_batch_size, **kw
-            )
-        return jax.vmap
+        from .sharding import get_vmap_fn
+        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size)
 
     def init(self, params, rng, batch):
         return 0  # step count
@@ -109,7 +101,7 @@ class NewtonOptimizer:
                     # Use rng to select a random subset of walker indices
                     indices = jax.random.choice(rng, n_walkers_total,
                                                 shape=(sample_size,), replace=False)
-                    indices = jnp.sort(indices)  # sort for deterministic gather
+                    indices = jnp.sort(indices).astype(jnp.int32)  # sort for deterministic gather
                     sub_walkers = jax.tree_util.tree_map(lambda x: x[indices], walkers)
                 else:
                     sample_size = n_walkers_total
@@ -318,7 +310,6 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             solver=merged_kwargs.get("solver", "exact"),
             solve_kwargs=merged_kwargs.get("solve_kwargs", None),
             jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
-            multi_gpu=merged_kwargs.get("multi_gpu", False),
             clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
         )
     else:
