@@ -3,12 +3,12 @@ import os
 from line_profiler import LineProfiler
 import unittest
 import io
-from pytc.autodiff.vmc.test.test_vmc import TestJastrowOptimization
-from pytc.autodiff.vmc.metropolis import metropolis_hastings, metropolis_hastings_importance_sampling
-from pytc.autodiff.vmc.sampling import sample, burn_in_with_importance
-from pytc.autodiff.vmc.moves import _one_electron_move
-from pytc.autodiff.ansatz.det import SlaterDet
-from pytc.autodiff.ansatz.sj import SlaterJastrow
+from pytc.vmc.test.test_vmc import TestJastrowOptimization
+from pytc.vmc.metropolis import metropolis_hastings, metropolis_hastings_importance_sampling
+from pytc.vmc.sampling import sample, burn_in_with_importance
+from pytc.vmc.moves import _one_electron_move
+from pytc.ansatz.det import SlaterDet
+from pytc.ansatz.sj import SlaterJastrow
 from pyscf.dft import numint  # Import numint to profile AO evaluations
 
 # Create test instance

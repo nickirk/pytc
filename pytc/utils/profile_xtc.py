@@ -3,8 +3,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
-from pytc.autodiff.xtc import XTC
-from pytc.autodiff.jastrow import REXP
+from pytc.xtc import XTC
+from pytc.jastrow import REXP
 import resource
 
 # Enable float64

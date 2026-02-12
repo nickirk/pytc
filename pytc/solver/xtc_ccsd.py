@@ -121,7 +121,7 @@ class RCCSD(rccsd.RCCSD):
              new_cc.with_df.auxbasis = auxbasis
              
         # 2. Setup ISDF-XTC
-        from pytc.autodiff.xtc import ISDFXTC
+        from pytc.xtc import ISDFXTC
         if with_isdf_xtc is not None:
             new_cc.xtc_obj = with_isdf_xtc
         elif n_rank_xtc is not None:
@@ -168,7 +168,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
     if with_df is None and getattr(cc._scf, 'with_df', None):
         with_df = cc._scf.with_df
 
-    from pytc.autodiff.xtc import XTC, ISDFXTC
+    from pytc.xtc import XTC, ISDFXTC
     if isinstance(xtc_obj, XTC) and not isinstance(xtc_obj, ISDFXTC) and with_df is None:
         logger.info("Using XTC.make_eris for standard XTC object")
         return xtc_obj.make_eris(cc._scf, jastrow_params)
@@ -700,7 +700,7 @@ def _update_amps(cc, t1, t2, eris):
 
     # Release the X slice cache at the end of each iteration to
     # free host memory between CCSD steps.
-    from pytc.autodiff.xtc import invalidate_X_cache
+    from pytc.xtc import invalidate_X_cache
     invalidate_X_cache()
 
     return t1new, t2new

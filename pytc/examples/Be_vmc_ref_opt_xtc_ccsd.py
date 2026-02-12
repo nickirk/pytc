@@ -6,11 +6,11 @@ import time
 
 from pyscf import gto, scf
 
-from pytc.autodiff.vmc import sample, optimize_ref_var
-from pytc.autodiff.ansatz.sj import SlaterJastrow
-from pytc.autodiff.ansatz.det import SlaterDet
-from pytc.autodiff.jastrow import CompositeJastrow, NuclearCusp, NeuralEE, NeuralEN, NeuralEEN, REXP 
-from pytc.autodiff.jastrow import BoysHandy
+from pytc.vmc import sample, optimize_ref_var
+from pytc.ansatz.sj import SlaterJastrow
+from pytc.ansatz.det import SlaterDet
+from pytc.jastrow import CompositeJastrow, NuclearCusp, NeuralEE, NeuralEN, NeuralEEN, REXP 
+from pytc.jastrow import BoysHandy
 
 
 
@@ -143,7 +143,7 @@ def do_ccsd(mf, jastrow_factor, params):
     import numpy as np
     from functools import reduce
 
-    from pytc.autodiff.xtc import XTC
+    from pytc.xtc import XTC
     # only need the jastrow params
     xtc = XTC(mf, jastrow_factor, grid_lvl=2)
 

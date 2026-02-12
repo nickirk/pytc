@@ -9,8 +9,8 @@ import sys
 # 1. Configure JAX for high precision
 jax.config.update("jax_enable_x64", True)
 
-from pytc.autodiff.xtc import XTC, ISDFXTC
-from pytc.autodiff.jastrow.rexp import REXP
+from pytc.xtc import XTC, ISDFXTC
+from pytc.jastrow.rexp import REXP
 
 def run_autodiff_isdf_example():
     """

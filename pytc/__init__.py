@@ -39,3 +39,30 @@ def setup_logging(level=logging.INFO):
 
 # Initialize logging when package is imported
 setup_logging()
+
+# Primary API - JAX autodiff implementations
+from . import tc
+from . import xtc
+from . import scf
+from . import df
+from . import kmat
+from . import lmat
+from . import tc_helper
+
+# Submodules
+from . import ansatz
+from . import jastrow
+from . import vmc
+
+__all__ = [
+    'tc',
+    'xtc', 
+    'scf',
+    'df',
+    'kmat',
+    'lmat',
+    'tc_helper',
+    'ansatz',
+    'jastrow',
+    'vmc',
+]

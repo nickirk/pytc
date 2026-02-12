@@ -8,7 +8,7 @@ from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
 from pytc.utils.gpu_memory import estimate_blksize, get_gpu_budget_bytes
-from pytc.autodiff.xtc import XTC, ISDFXTC
+from pytc.xtc import XTC, ISDFXTC
 
 # JAX config
 jax.config.update("jax_enable_x64", True)
@@ -552,7 +552,7 @@ def _update_amps(cc, t1, t2, eris):
     t2new_host /= eijab_np
     
     # Release the X slice cache at the end of each iteration.
-    from pytc.autodiff.xtc import invalidate_X_cache
+    from pytc.xtc import invalidate_X_cache
     invalidate_X_cache()
 
     logger.debug("_update_amps finished in %.3f s", time.perf_counter()-t_start)
