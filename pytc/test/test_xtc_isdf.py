@@ -21,7 +21,7 @@ class TestISDF(unittest.TestCase):
         self.jastrow_params_jax = {'alpha': jnp.array([1.0])}
         
         # NumPy Jastrow
-        from pytc.jastrow.rexp import REXP as REXP_numpy
+        from pytc.legacy.jastrow.rexp import REXP as REXP_numpy
         self.jastrow_numpy = REXP_numpy(params=np.array([1.0]), mol=self.mol)
         self.jastrow_params_numpy = np.array([1.0])
         
@@ -29,8 +29,8 @@ class TestISDF(unittest.TestCase):
         self.tc_jax = TC.from_pyscf(self.mf, self.jastrow_jax, grid_lvl=2)
         self.xtc_jax = XTC.from_pyscf(self.mf, self.jastrow_jax, grid_lvl=2)
         
-        from pytc.tc import TC as TC_numpy
-        from pytc.xtc import XTC as XTC_numpy
+        from pytc.legacy.tc import TC as TC_numpy
+        from pytc.legacy.xtc import XTC as XTC_numpy
         self.tc_numpy = TC_numpy(self.mf, self.jastrow_numpy, grid_lvl=2)
         self.xtc_numpy = XTC_numpy(self.mf, self.jastrow_numpy, grid_lvl=2)
         

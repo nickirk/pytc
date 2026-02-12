@@ -5,7 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
-from pytc.tc import TC as TC_numpy
+from pytc.legacy.tc import TC as TC_numpy
 from pytc.tc import TC as TC_jax
 from pytc.jastrow import Poly
 from pytc import tc_helper

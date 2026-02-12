@@ -7,8 +7,8 @@ import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 
-from pytc.xtc import XTC as XTC_numpy
-from pytc.jastrow import REXP as REXP_np
+from pytc.legacy.xtc import XTC as XTC_numpy
+from pytc.legacy.jastrow import REXP as REXP_np
 from pytc.xtc import XTC as XTC_jax
 from pytc.jastrow import REXP as REXP_jax
 from pytc import tc_helper

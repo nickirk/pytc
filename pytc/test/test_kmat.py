@@ -6,7 +6,7 @@ import jax
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from pytc.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
+from pytc.legacy.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
 from pytc.kmat import calc_K1, calc_K3
 from pytc.jastrow import Poly
 
