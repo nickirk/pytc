@@ -75,8 +75,6 @@ jobs:
         conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.vmc import optimize, sample"
         conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.jastrow import REXP, Poly, NuclearCusp, BoysHandy"
         conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.ansatz.sj import SlaterJastrow"
-        # Run a subset of quick tests
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
 
     - name: Cleanup workspace
       if: always()

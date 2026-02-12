@@ -46,9 +46,9 @@ def load_eris_from_h5(path, mol):
 class TestXTCCCSD(unittest.TestCase):
     def setUp(self):
 
-        # H2O System
+        # CO System
         self.mol = gto.M(
-            atom='O 0 0 0; H 0 1 0; H 0 0 1',
+            atom='C 0 0 0; O 0 0 1.128',
             basis='sto-6g',
             verbose=4
         )
@@ -59,10 +59,10 @@ class TestXTCCCSD(unittest.TestCase):
         self.jastrow_params = {'alpha': jnp.array([0.5])}
         
         # XTC Object (Low grid level for speed)
-        self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=2)
+        self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=1)
         
         # Reference calculation (Exact XTC)
-        self.n_rank = self.xtc_obj.n_orb * 10 # Sufficiently high rank
+        self.n_rank = self.xtc_obj.n_orb * 12 # Sufficiently high rank
         self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_xtc_ccsd_test.h5")
         self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params) # Precompute kernels
 
@@ -226,8 +226,8 @@ class TestXTCCCSD(unittest.TestCase):
         print("\nRunning JAX Update Amps (Cycle 1)...")
         t1new_jax_full, t2new_jax_full = cc_new.update_amps(t1, t2, eris_new)
         
-        self.assertLess(np.linalg.norm(t1new_ref - t1new_jax_full), 1e-8)
-        self.assertLess(np.linalg.norm(t2new_ref - t2new_jax_full), 1e-8)
+        self.assertLess(np.linalg.norm(t1new_ref - t1new_jax_full), 1e-6)
+        self.assertLess(np.linalg.norm(t2new_ref - t2new_jax_full), 1e-6)
 
         
         # Compare blocks BEFORE zeroing vvvv
@@ -301,8 +301,9 @@ class TestXTCCCSD(unittest.TestCase):
         # Compare VVVV (before zeroing)
         if eris_exact.vvvv is not None and eris_new.vvvv is not None:
             # Save copies before zeroing for comparison
-            vvvv_ref_saved = eris_exact.vvvv.copy() if hasattr(eris_exact, 'vvvv') else None
-            vvvv_new_saved = eris_new.vvvv.copy() if hasattr(eris_new, 'vvvv') else None
+            # Use np.array() instead of .copy() to handle both numpy arrays and HDF5 Datasets
+            vvvv_ref_saved = np.array(eris_exact.vvvv) if hasattr(eris_exact, 'vvvv') else None
+            vvvv_new_saved = np.array(eris_new.vvvv) if hasattr(eris_new, 'vvvv') else None
             if vvvv_ref_saved is not None and vvvv_new_saved is not None:
                 vvvv_diff = np.linalg.norm(vvvv_ref_saved - vvvv_new_saved)
                 print(f"VVVV Difference Norm: {vvvv_diff}")

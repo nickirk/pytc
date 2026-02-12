@@ -154,6 +154,18 @@ class _ChemistsERIs(rccsd._ChemistsERIs):
         if hasattr(self, 'feri') and hasattr(self.feri, 'close'):
              self.feri.close()
 
+    def __del__(self):
+        """
+        Some DF/ao2mo paths store large ERI blocks in an HDF5 handle (self.feri).
+        In test suites, these objects may become unreachable without explicit
+        close() calls, which can leave HDF5 files/datasets open and lead to
+        cross-test state leakage.
+        """
+        try:
+            self.close()
+        except Exception:
+            pass
+
 def _make_xtc_eris(cc, mo_coeff=None):
     if mo_coeff is None:
         mo_coeff = cc.mo_coeff
