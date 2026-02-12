@@ -1,6 +1,4 @@
-import numpy as np
-from functools import partial
-from typing import Union, Callable, Any, Tuple
+from typing import Union, Callable, Tuple
 import jax
 import jax.numpy as jnp
 from flax import struct

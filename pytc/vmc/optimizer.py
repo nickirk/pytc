@@ -5,7 +5,6 @@ import jax.numpy as jnp
 import jax.scipy.sparse.linalg as spla
 import optax
 import folx
-from typing import Dict, Any, Optional
 from jax.tree_util import tree_map
 from jax.lax import stop_gradient
 import jax.flatten_util

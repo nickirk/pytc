@@ -2,9 +2,7 @@
 
 import numpy as np
 import jax.numpy as jnp
-import jax
 from jax import random
-import functools
 from typing import Dict, Any, List, Optional, Tuple 
 
 def analyze_energies(sampling_results: Dict[str, Any]) -> Dict[str, Any]:

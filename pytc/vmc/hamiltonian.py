@@ -2,8 +2,6 @@
 
 import jax
 import jax.numpy as jnp
-from functools import partial
-import folx
 
 
 def compute_jastrow_terms(sj, elec_coords, jastrow_params):

@@ -1,10 +1,8 @@
 """Implementation of the quantum many-body wavefunction ansatz."""
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 from typing import List, Any
-from functools import partial
 from flax import struct
 
 from pytc.ansatz.det import SlaterDet, value_and_grad, grad 

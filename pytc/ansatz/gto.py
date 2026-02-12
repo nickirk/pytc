@@ -1,9 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
-from typing import Generator, Tuple, List, Any
-import itertools
+from typing import Generator, Tuple
 from pyscf import gto
 from flax import struct
 

@@ -8,7 +8,6 @@ import time
 import jax.numpy as jnp
 from jax import random
 from flax.struct import dataclass
-from typing import Optional
 
 from .mcmc_utils import init_electron_configs
 

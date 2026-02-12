@@ -8,10 +8,8 @@ import jax
 import jax.numpy as jnp
 from jax import random
 import folx
-import functools
 
 from .moves import _all_electron_move, _one_electron_move, _compute_green_function
-from .walker import Walker
 
 
 def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one", batch_ansatz=None):

@@ -1,7 +1,7 @@
 
 import numpy as np
 import scipy.linalg
-from pyscf import scf, lib
+from pyscf import scf
 from pyscf.scf import hf
 import jax
 import jax.numpy as jnp

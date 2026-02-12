@@ -1,7 +1,6 @@
 """JAX implementation of Transcorrelated method."""
 
-from functools import partial
-from typing import Any, Optional
+from typing import Any
 import numpy as np
 import os
 import logging

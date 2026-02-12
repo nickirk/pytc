@@ -10,8 +10,7 @@ import jax.numpy as jnp
 from jax import random
 
 from pytc.ansatz.det import (
-    SlaterDet,
-    rank1_update_one_electron,
+    rank1_update_one_electron
 )
 from pytc.ansatz.sj import SlaterJastrow, update_jastrow_one_electron
 

@@ -35,10 +35,9 @@ from jax.tree_util import tree_map
 import optax
 from typing import Dict, Any, Optional
 
-from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling, make_mcmc_step, make_mcmc_step_importance
-from .walker import initialize_walkers, Walker
+from .metropolis import make_mcmc_step, make_mcmc_step_importance
+from .walker import initialize_walkers
 from .sampling import burn_in, burn_in_with_importance
-from .mcmc_utils import init_electron_configs
 from .optimizer import create_optimizer, create_gradient_mask
 from .loss import make_energy_loss, make_variance_loss
 

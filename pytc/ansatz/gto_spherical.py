@@ -9,8 +9,7 @@ by grouping basis functions by angular momentum.
 import jax
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
-from typing import List, Tuple, Dict, Any
+from typing import Dict
 from pyscf import gto
 import folx
 from flax import struct

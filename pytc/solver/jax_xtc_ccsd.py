@@ -7,8 +7,7 @@ from pyscf import lib
 from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
-from pytc.utils.gpu_memory import estimate_blksize, get_gpu_budget_bytes
-from pytc.xtc import XTC, ISDFXTC
+from pytc.utils.gpu_memory import estimate_blksize
 
 # JAX config
 jax.config.update("jax_enable_x64", True)

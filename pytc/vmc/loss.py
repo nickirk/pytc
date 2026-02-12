@@ -7,8 +7,7 @@ optimization, including energy minimization and variance minimization.
 import functools
 import jax
 import jax.numpy as jnp
-from jax import tree_util
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 import folx
 
 
