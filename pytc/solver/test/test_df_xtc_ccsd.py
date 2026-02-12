@@ -23,9 +23,9 @@ class TestXTCCCSD_DF(unittest.TestCase):
         if os.path.exists("isdf_df_xtc_ccsd_test_large_alpha.h5"):
             os.remove("isdf_df_xtc_ccsd_test_large_alpha.h5")
         
-        # H2O System (Same as test_xtc_ccsd.py)
+        # CO System
         self.mol = gto.M(
-            atom='C 0 1 0; O 0 0 1',
+            atom='C 0 0 0; O 0 0 1.128',
             basis='sto-6g',
             verbose=0
         )
@@ -46,9 +46,9 @@ class TestXTCCCSD_DF(unittest.TestCase):
         
         # Precompute ISDF-XTC to save time in tests if needed (optional)
         # We use ISDF for the DF test case as requested to avoid mismatch
-        self.n_rank = self.xtc_obj.n_orb * 10 
-        #self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_df_xtc_ccsd_test.h5")
-        #self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params, save_path="isdf_df_xtc_ccsd_test.h5") # Precompute kernels for ISDF-XTC
+        self.n_rank = self.xtc_obj.n_orb * 12 
+        self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_df_xtc_ccsd_test.h5")
+        self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params, save_path="isdf_df_xtc_ccsd_test.h5") # Precompute kernels for ISDF-XTC
     
     @unittest.skip("Temporarily skipping due to test isolation issues")
     def test_df_rccsd_energy(self):

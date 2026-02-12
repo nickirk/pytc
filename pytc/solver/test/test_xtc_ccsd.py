@@ -16,9 +16,9 @@ jax.config.update("jax_enable_x64", True)
 class TestXTCCCSD(unittest.TestCase):
     def setUp(self):
 
-        # H2O System
+        # CO System
         self.mol = gto.M(
-            atom='C 0 1 0; O 0 0 1',
+            atom='C 0 0 0; O 0 0 1.128',
             basis='sto-6g',
             verbose=4
         )
@@ -32,7 +32,7 @@ class TestXTCCCSD(unittest.TestCase):
         self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=1)
         
         # Reference calculation (Exact XTC)
-        self.n_rank = self.xtc_obj.n_orb * 10 # Sufficiently high rank
+        self.n_rank = self.xtc_obj.n_orb * 12 # Sufficiently high rank
         self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_xtc_ccsd_test.h5")
         #self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params) # Precompute kernels
 
