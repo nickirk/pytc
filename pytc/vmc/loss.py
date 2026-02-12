@@ -8,7 +8,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from typing import Callable, Optional
-import folx
+from .sharding import get_vmap_fn
 
 
 def make_energy_loss(
@@ -17,7 +17,8 @@ def make_energy_loss(
     cost_fn: Optional[Callable] = None,
     clip_multiplier: float = 5.0,
     use_custom_jvp: bool = True,
-    max_vmap_batch_size: int = 0
+    max_vmap_batch_size: int = 0,
+    mesh: Optional[jax.sharding.Mesh] = None,
 ):
     """Factory to create energy-based loss function for VMC optimization.
     
@@ -31,7 +32,8 @@ def make_energy_loss(
         clip_multiplier: Multiplier for energy clipping range (clips to mean ± multiplier * std)
         use_custom_jvp: Whether to use custom JVP for memory-efficient gradients
         max_vmap_batch_size: If 0, use standard vmap everywhere. If >0, use folx.batched_vmap 
-                            Requires folx package. Recommended batch size: 10-50.
+                            (or sharded_batched_vmap if multi-device).
+        mesh: Optional device mesh for sharding.
     
     Returns:
         Loss function with signature (params, batch_data) -> (loss, AuxData)
@@ -42,11 +44,8 @@ def make_energy_loss(
     if cost_fn is None:
         cost_fn = jnp.mean
     
-    # Choose vmap implementation based on max_vmap_batch_size
-    if max_vmap_batch_size == 0:
-        vmap_impl = jax.vmap
-    else:
-        vmap_impl = functools.partial(folx.batched_vmap, max_batch_size=max_vmap_batch_size)
+    # Choose vmap implementation
+    vmap_impl = get_vmap_fn(max_vmap_batch_size, mesh)
     
     batch_local_energy = vmap_impl(
         lambda w, p: ansatz.local_energy(w, p)[0],
@@ -232,6 +231,7 @@ def make_variance_loss(
     use_custom_jvp: bool = True,
     max_vmap_batch_size: int = 0,
     clip_multiplier: float = 5.0,
+    mesh: Optional[jax.sharding.Mesh] = None,
 ):
     """Factory to create variance-based loss function for reference variance optimization.
     
@@ -249,16 +249,15 @@ def make_variance_loss(
         clip_multiplier: Multiplier for energy clipping range (clips to mean ± multiplier
                          * mean absolute deviation (MAD) of the local energy). Set to 0 to
                          disable clipping. Default 5.0, matching make_energy_loss.
+        mesh: Optional device mesh for sharding.
     
     Returns:
         Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_mad))
     """
     
-    # Choose vmap implementation based on max_vmap_batch_size
-    if max_vmap_batch_size == 0:
-        vmap_impl = jax.vmap
-    else:
-        vmap_impl = functools.partial(folx.batched_vmap, max_batch_size=max_vmap_batch_size)
+    # Choose vmap implementation
+    vmap_impl = get_vmap_fn(max_vmap_batch_size, mesh)
+    
     # Define batch_local_energy using the current ansatz
     batch_local_energy = vmap_impl(
         lambda w, p: ansatz.local_energy(w, p)[0],

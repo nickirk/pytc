@@ -28,7 +28,11 @@
   > pip install -U "jax[cuda12]"
   > ```
 - flax (neural network)
-- folx 
+- folx (latest version from GitHub required for multi-GPU sharding fixes):
+  ```bash
+  pip install git+https://github.com/microsoft/folx.git
+  ```
+ 
 - optax (machine learning optimizers)
 - pyscf
 

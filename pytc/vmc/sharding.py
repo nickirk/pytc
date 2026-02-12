@@ -198,12 +198,43 @@ def sharded_batched_vmap(fn, max_batch_size, mesh=None, in_axes=0, out_axes=0):
     )
 
 
+def shard_vmap(fn, mesh=None, in_axes=0, out_axes=0):
+    """A version of jax.vmap that works across multiple devices using shard_map."""
+    if shard_map is None:
+        return jax.vmap(fn, in_axes=in_axes, out_axes=out_axes)
+
+    if mesh is None:
+        mesh = create_mesh()
+
+    # Determine sharding specs based on in_axes/out_axes
+    def _axis_to_spec(ax):
+        if ax == 0: return P("walkers")
+        return P(None)
+
+    if isinstance(in_axes, (list, tuple)):
+        in_specs = tuple(_axis_to_spec(ax) for ax in in_axes)
+    else:
+        in_specs = _axis_to_spec(in_axes)
+
+    if isinstance(out_axes, (list, tuple)):
+        out_specs = tuple(_axis_to_spec(ax) for ax in out_axes)
+    else:
+        out_specs = _axis_to_spec(out_axes)
+
+    return shard_map(
+        jax.vmap(fn, in_axes=in_axes, out_axes=out_axes),
+        mesh=mesh,
+        in_specs=in_specs, out_specs=out_specs
+    )
+
+
 def get_vmap_fn(max_vmap_batch_size: int = 0, mesh: Optional[Mesh] = None):
     """Return the appropriate vmap implementation.
 
     Automatically detects if multiple GPUs are available. If so, and
     ``max_vmap_batch_size > 0``, uses ``sharded_batched_vmap`` which
-    combines sharding and batching.
+    combines sharding and batching. If ``max_vmap_batch_size == 0``,
+    uses ``shard_vmap`` for sharded data-parallel execution.
 
     Returns
     -------
@@ -219,7 +250,11 @@ def get_vmap_fn(max_vmap_batch_size: int = 0, mesh: Optional[Mesh] = None):
                 mesh=mesh
             )
         else:
-            return jax.vmap
+            import functools
+            return functools.partial(
+                shard_vmap,
+                mesh=mesh
+            )
     else:
         if max_vmap_batch_size > 0:
             import folx

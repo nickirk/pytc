@@ -349,6 +349,33 @@ def optimize(
     # Initialize walkers
     walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
+    # ---- Multi-GPU setup ----
+    from .sharding import (
+        create_mesh, shard_walker, replicate,
+        pad_n_walkers, pad_walker, n_devices as get_n_devices,
+        is_multi_gpu as check_multi_gpu
+    )
+    
+    multi_gpu = check_multi_gpu()
+    mesh = None
+    if multi_gpu:
+        num_devices = get_n_devices()
+        mesh = create_mesh()
+        padded_n = pad_n_walkers(n_walkers, num_devices)
+        if padded_n != n_walkers:
+            print(f"Padding n_walkers from {n_walkers} to {padded_n} "
+                  f"(divisible by {num_devices} devices)")
+            n_walkers = padded_n
+        
+        # Shard walkers, params and key
+        walkers = shard_walker(walkers, mesh)
+        if params is not None:
+            params = replicate(params, mesh)
+        key = replicate(key, mesh)
+        
+        print(f"Multi-GPU auto-detected: {num_devices} devices, "
+              f"{n_walkers // num_devices} walkers/device")
+
     # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
@@ -377,7 +404,8 @@ def optimize(
         cost_fn=user_or_default_cost_fn,
         clip_multiplier=5.0,
         use_custom_jvp=use_custom_jvp,
-        max_vmap_batch_size=max_vmap_batch_size
+        max_vmap_batch_size=max_vmap_batch_size,
+        mesh=mesh
     )
 
     # Create mask for parameter freezing
@@ -614,20 +642,19 @@ def optimize_ref_var(
     ref_det = ansatz.dets[0]
     walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
 
-    # Burn-in walkers using the initial combined parameters
-    # (burn-in runs on single device; sharding happens after)
-    print("Performing burn-in...")
-    walkers, acceptance_history, key, step_size = burn_in(
-        ref_det, walkers, burn_in_steps, step_size, key, params=params, 
-        move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
-    print(f"Burn-in complete. Final step size: {step_size:.4f}")
-
-    # ---- Shard walkers across devices after burn-in ----
+    # ---- Shard walkers across devices before burn-in ----
     if multi_gpu and mesh is not None:
         walkers = shard_walker(walkers, mesh)
         params = replicate(params, mesh)
         key = replicate(key, mesh)
         print("Walkers sharded across devices.")
+
+    # Burn-in walkers using the initial combined parameters
+    print("Performing burn-in...")
+    walkers, acceptance_history, key, step_size = burn_in(
+        ref_det, walkers, burn_in_steps, step_size, key, params=params, 
+        move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
+    print(f"Burn-in complete. Final step size: {step_size:.4f}")
 
     # Create loss function using modular factory
     if cost_fn is None:
@@ -636,7 +663,8 @@ def optimize_ref_var(
             ansatz=ansatz,
             optimizer_type=optimizer_type,
             use_custom_jvp=True,
-            max_vmap_batch_size=max_vmap_batch_size
+            max_vmap_batch_size=max_vmap_batch_size,
+            mesh=mesh
         )
     else:
         loss_fn = cost_fn
