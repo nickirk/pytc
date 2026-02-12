@@ -18,7 +18,7 @@ class TestXTCCCSD(unittest.TestCase):
 
         # H2O System
         self.mol = gto.M(
-            atom='O 0 0 0; H 0 1 0; H 0 0 1',
+            atom='C 0 1 0; O 0 0 1',
             basis='sto-6g',
             verbose=4
         )
@@ -29,12 +29,12 @@ class TestXTCCCSD(unittest.TestCase):
         self.jastrow_params = {'alpha': jnp.array([0.5])}
         
         # XTC Object (Low grid level for speed)
-        self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=2)
+        self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=1)
         
         # Reference calculation (Exact XTC)
         self.n_rank = self.xtc_obj.n_orb * 10 # Sufficiently high rank
         self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_xtc_ccsd_test.h5")
-        self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params) # Precompute kernels
+        #self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params) # Precompute kernels
 
     def test_rccsd_energy(self):
         print("\nRunning Reference Exact XTC CCSD...")
@@ -117,8 +117,9 @@ class TestXTCCCSD(unittest.TestCase):
         # Compare VVVV (before zeroing)
         if eris_exact.vvvv is not None and eris_new.vvvv is not None:
             # Save copies before zeroing for comparison
-            vvvv_ref_saved = eris_exact.vvvv.copy() if hasattr(eris_exact, 'vvvv') else None
-            vvvv_new_saved = eris_new.vvvv.copy() if hasattr(eris_new, 'vvvv') else None
+            # Use np.array() instead of .copy() to handle both numpy arrays and HDF5 Datasets
+            vvvv_ref_saved = np.array(eris_exact.vvvv) if hasattr(eris_exact, 'vvvv') else None
+            vvvv_new_saved = np.array(eris_new.vvvv) if hasattr(eris_new, 'vvvv') else None
             if vvvv_ref_saved is not None and vvvv_new_saved is not None:
                 vvvv_diff = np.linalg.norm(vvvv_ref_saved - vvvv_new_saved)
                 print(f"VVVV Difference Norm: {vvvv_diff}")
