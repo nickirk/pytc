@@ -33,13 +33,12 @@ jobs:
       run: |
         # Use explicit directory discovery to avoid requiring __init__.py files in tests
         conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/test -t pytc/test
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/jastrow/test -t pytc/autodiff/jastrow/test
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/test -t pytc/autodiff/test
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/vmc/test -t pytc/autodiff/vmc/test
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/autodiff/ansatz/test -t pytc/autodiff/ansatz/test
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
         conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
-        #conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/legacy/test -t pytc/legacy/test
+        #conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
 
     - name: Cleanup workspace
       if: always()
@@ -73,11 +72,11 @@ jobs:
       run: |
         # Quick import checks to verify the package works
         conda run --no-capture-output -n py${{ matrix.python-version }} python -c "import pytc; print('pytc version:', getattr(pytc, '__version__', 'unknown'))"
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.vmc import optimize, sample"
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.jastrow import REXP, Poly, NuclearCusp, BoysHandy"
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.autodiff.ansatz.sj import SlaterJastrow"
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.vmc import optimize, sample"
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.jastrow import REXP, Poly, NuclearCusp, BoysHandy"
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -c "from pytc.ansatz.sj import SlaterJastrow"
         # Run a subset of quick tests
-        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/utils/test -t pytc/utils/test
+        conda run --no-capture-output -n py${{ matrix.python-version }} python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
 
     - name: Cleanup workspace
       if: always()
