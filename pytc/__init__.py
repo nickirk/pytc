@@ -2,6 +2,13 @@ import logging
 import sys
 from pathlib import Path
 
+# Apply folx fix for multi-GPU sharding
+try:
+    from .utils.folx_fix import apply_fix
+    apply_fix()
+except ImportError:
+    pass  # folx might not be installed or used
+
 # Create logs directory if it doesn't exist
 log_dir = Path(__file__).parent.parent / 'logs'
 log_dir.mkdir(exist_ok=True)

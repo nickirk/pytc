@@ -118,14 +118,17 @@ class TestShardingUtilities(unittest.TestCase):
         np.testing.assert_allclose(pr, p)
 
     def test_get_vmap_fn(self):
-        """get_vmap_fn returns jax.vmap in multi-device environment."""
+        """get_vmap_fn returns shard_vmap in multi-device environment."""
+        from pytc.vmc.sharding import shard_vmap
+        
         # Auto-detects 4 devices
         fn = get_vmap_fn()
-        self.assertIs(fn, jax.vmap)
+        # It returns a partial(shard_vmap, ...)
+        self.assertEqual(fn.func, shard_vmap)
 
-        # Still returns jax.vmap if max_vmap_batch_size=0
+        # Still returns shard_vmap if max_vmap_batch_size=0
         fn2 = get_vmap_fn(max_vmap_batch_size=0)
-        self.assertIs(fn2, jax.vmap)
+        self.assertEqual(fn2.func, shard_vmap)
 
     def test_pad_walker(self):
         """pad_walker should extend walker to target size."""
