@@ -53,7 +53,7 @@ class NuclearCusp(Jastrow):
         max_Z = int(jnp.max(unique_Z))
         Z_to_idx = -jnp.ones(max_Z + 1, dtype=jnp.int32)
         for i, Z in enumerate(unique_Z):
-            Z_to_idx = Z_to_idx.at[int(Z)].set(i)
+            Z_to_idx = Z_to_idx.at[int(Z)].set(jnp.int32(i))
 
         # Create radial grids for each nucleus
         r_grids_list = []

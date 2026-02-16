@@ -23,7 +23,7 @@ dependencies = [
     "jax",
     "optax",
     "flax",
-    "folx",
+    "folx @ git+https://github.com/microsoft/folx.git@47a0e8d",
 
     "pyscf",
 ]

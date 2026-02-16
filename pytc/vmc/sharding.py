@@ -34,6 +34,38 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from typing import Optional
+import inspect
+
+# Import shard_map - try new location first, then experimental
+try:
+    from jax import shard_map
+except ImportError:
+    try:
+        from jax.experimental.shard_map import shard_map
+    except ImportError:
+        shard_map = None
+
+# Check which parameter name to use (check_vma in new, check_rep in old)
+_shard_map_uses_check_vma = False
+if shard_map is not None:
+    try:
+        sig = inspect.signature(shard_map)
+        _shard_map_uses_check_vma = 'check_vma' in sig.parameters
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+def n_devices() -> int:
+    """Number of local devices available to this process."""
+    return jax.local_device_count()
+
+
+def is_multi_gpu() -> bool:
+    """True if more than one local device is available."""
+    return n_devices() > 1
 
 
 # ---------------------------------------------------------------------------
@@ -130,21 +162,117 @@ def pad_walker(walker, target_n_walkers: int):
 # Multi-GPU aware vmap selection
 # ---------------------------------------------------------------------------
 
-def get_vmap_fn(multi_gpu: bool, max_vmap_batch_size: int = 0):
+def sharded_batched_vmap(fn, max_batch_size, mesh=None, in_axes=0, out_axes=0):
+    """A version of folx.batched_vmap that works across multiple devices.
+
+    It uses ``jax.shard_map`` to distribute the computation across devices,
+    and then ``folx.batched_vmap`` on each device to process the local shard
+    in memory-efficient chunks.
+    """
+    import folx
+    import functools
+
+    if shard_map is None:
+        import warnings
+        warnings.warn("shard_map not found, falling back to jax.vmap")
+        return jax.vmap(fn, in_axes=in_axes, out_axes=out_axes)
+
+    if mesh is None:
+        mesh = create_mesh()
+
+    # Determine sharding specs based on in_axes/out_axes
+    # We assume 'walkers' is the axis name
+    def _axis_to_spec(ax):
+        if ax == 0: return P("walkers")
+        return P(None)
+
+    if isinstance(in_axes, (list, tuple)):
+        in_specs = tuple(_axis_to_spec(ax) for ax in in_axes)
+    else:
+        in_specs = _axis_to_spec(in_axes)
+
+    if isinstance(out_axes, (list, tuple)):
+        out_specs = tuple(_axis_to_spec(ax) for ax in out_axes)
+    else:
+        out_specs = _axis_to_spec(out_axes)
+
+    # The inner function used by shard_map
+    def local_batched_fn(*args, **kwargs):
+        return folx.batched_vmap(
+            fn, max_batch_size=max_batch_size,
+            in_axes=in_axes, out_axes=out_axes
+        )(*args, **kwargs)
+
+    # Use check_vma=False (or check_rep=False for old JAX) for folx compatibility
+    kwargs = {'mesh': mesh, 'in_specs': in_specs, 'out_specs': out_specs}
+    if _shard_map_uses_check_vma:
+        kwargs['check_vma'] = False
+    else:
+        kwargs['check_rep'] = False
+    
+    return shard_map(local_batched_fn, **kwargs)
+
+
+def shard_vmap(fn, mesh=None, in_axes=0, out_axes=0):
+    """A version of jax.vmap that works across multiple devices using shard_map."""
+    if shard_map is None:
+        return jax.vmap(fn, in_axes=in_axes, out_axes=out_axes)
+
+    if mesh is None:
+        mesh = create_mesh()
+
+    # Determine sharding specs based on in_axes/out_axes
+    def _axis_to_spec(ax):
+        if ax == 0: return P("walkers")
+        return P(None)
+
+    if isinstance(in_axes, (list, tuple)):
+        in_specs = tuple(_axis_to_spec(ax) for ax in in_axes)
+    else:
+        in_specs = _axis_to_spec(in_axes)
+
+    if isinstance(out_axes, (list, tuple)):
+        out_specs = tuple(_axis_to_spec(ax) for ax in out_axes)
+    else:
+        out_specs = _axis_to_spec(out_axes)
+
+    # Use check_vma=False (or check_rep=False for old JAX) for folx compatibility
+    kwargs = {'mesh': mesh, 'in_specs': in_specs, 'out_specs': out_specs}
+    if _shard_map_uses_check_vma:
+        kwargs['check_vma'] = False
+    else:
+        kwargs['check_rep'] = False
+    
+    return shard_map(jax.vmap(fn, in_axes=in_axes, out_axes=out_axes), **kwargs)
+
+
+def get_vmap_fn(max_vmap_batch_size: int = 0, mesh: Optional[Mesh] = None):
     """Return the appropriate vmap implementation.
 
-    When ``multi_gpu=True``, always use ``jax.vmap`` (preserves sharding).
-    When ``multi_gpu=False``, honour ``max_vmap_batch_size`` as before
-    (``folx.batched_vmap`` for memory efficiency on a single device).
+    Automatically detects if multiple GPUs are available. If so, and
+    ``max_vmap_batch_size > 0``, uses ``sharded_batched_vmap`` which
+    combines sharding and batching. If ``max_vmap_batch_size == 0``,
+    uses ``shard_vmap`` for sharded data-parallel execution.
 
     Returns
     -------
     callable
         A vmap-like function with ``(fn, in_axes, ...)`` signature.
     """
-    if multi_gpu:
-        # jax.vmap preserves sharding; folx.batched_vmap does not.
-        return jax.vmap
+    if is_multi_gpu():
+        if max_vmap_batch_size > 0:
+            import functools
+            return functools.partial(
+                sharded_batched_vmap,
+                max_batch_size=max_vmap_batch_size,
+                mesh=mesh
+            )
+        else:
+            import functools
+            return functools.partial(
+                shard_vmap,
+                mesh=mesh
+            )
     else:
         if max_vmap_batch_size > 0:
             import folx
@@ -156,15 +284,3 @@ def get_vmap_fn(multi_gpu: bool, max_vmap_batch_size: int = 0):
             return jax.vmap
 
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
-
-def is_multi_gpu() -> bool:
-    """True if more than one device is available."""
-    return jax.device_count() > 1
-
-
-def n_devices() -> int:
-    """Number of local devices."""
-    return jax.local_device_count()

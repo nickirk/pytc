@@ -57,7 +57,7 @@ class BoysHandy(Jastrow):
         
         atom_type_map = jnp.zeros(natom, dtype=jnp.int32)
         for i, charge in enumerate(nuclear_charges):
-            type_idx = jnp.where(unique_charges == charge)[0][0]
+            type_idx = jnp.where(unique_charges == charge)[0][0].astype(jnp.int32)
             atom_type_map = atom_type_map.at[i].set(type_idx)
         
         if terms_per_nucleus is None:
