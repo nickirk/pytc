@@ -367,7 +367,9 @@ def optimize(
                   f"(divisible by {num_devices} devices)")
             n_walkers = padded_n
         
-        # Shard walkers, params and key
+        # Pad walkers to match device count, then shard
+        padded_n = pad_n_walkers(walkers.positions.shape[0], num_devices)
+        walkers, _ = pad_walker(walkers, padded_n)
         walkers = shard_walker(walkers, mesh)
         if params is not None:
             params = replicate(params, mesh)
@@ -644,6 +646,8 @@ def optimize_ref_var(
 
     # ---- Shard walkers across devices before burn-in ----
     if multi_gpu and mesh is not None:
+        padded_n = pad_n_walkers(walkers.positions.shape[0], num_devices)
+        walkers, _ = pad_walker(walkers, padded_n)
         walkers = shard_walker(walkers, mesh)
         params = replicate(params, mesh)
         key = replicate(key, mesh)

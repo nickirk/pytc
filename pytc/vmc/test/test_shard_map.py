@@ -20,6 +20,8 @@ class TestShardMap(unittest.TestCase):
 
     def test_shard_map_with_local_batching(self):
         """Verify that shard_map can distribute walkers and batch locally."""
+        import numpy as np
+        
         if shard_map is None:
             self.skipTest("shard_map not available")
 
@@ -63,7 +65,6 @@ class TestShardMap(unittest.TestCase):
         self.assertEqual(result.shape, (n_walkers, 1))
         np_result = jax.device_get(result)
         expected = np.arange(n_walkers).reshape(n_walkers, 1) * 2
-        import numpy as np
         np.testing.assert_allclose(np_result, expected)
         
         # Verify it's still sharded
