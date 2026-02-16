@@ -34,14 +34,25 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from typing import Optional
+import inspect
 
+# Import shard_map - try new location first, then experimental
 try:
-    from jax.shard_map import shard_map
+    from jax import shard_map
 except ImportError:
     try:
         from jax.experimental.shard_map import shard_map
     except ImportError:
         shard_map = None
+
+# Check which parameter name to use (check_vma in new, check_rep in old)
+_shard_map_uses_check_vma = False
+if shard_map is not None:
+    try:
+        sig = inspect.signature(shard_map)
+        _shard_map_uses_check_vma = 'check_vma' in sig.parameters
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Query helpers
@@ -192,10 +203,14 @@ def sharded_batched_vmap(fn, max_batch_size, mesh=None, in_axes=0, out_axes=0):
             in_axes=in_axes, out_axes=out_axes
         )(*args, **kwargs)
 
-    return shard_map(
-        local_batched_fn, mesh=mesh,
-        in_specs=in_specs, out_specs=out_specs
-    )
+    # Use check_vma=False (or check_rep=False for old JAX) for folx compatibility
+    kwargs = {'mesh': mesh, 'in_specs': in_specs, 'out_specs': out_specs}
+    if _shard_map_uses_check_vma:
+        kwargs['check_vma'] = False
+    else:
+        kwargs['check_rep'] = False
+    
+    return shard_map(local_batched_fn, **kwargs)
 
 
 def shard_vmap(fn, mesh=None, in_axes=0, out_axes=0):
@@ -221,11 +236,14 @@ def shard_vmap(fn, mesh=None, in_axes=0, out_axes=0):
     else:
         out_specs = _axis_to_spec(out_axes)
 
-    return shard_map(
-        jax.vmap(fn, in_axes=in_axes, out_axes=out_axes),
-        mesh=mesh,
-        in_specs=in_specs, out_specs=out_specs
-    )
+    # Use check_vma=False (or check_rep=False for old JAX) for folx compatibility
+    kwargs = {'mesh': mesh, 'in_specs': in_specs, 'out_specs': out_specs}
+    if _shard_map_uses_check_vma:
+        kwargs['check_vma'] = False
+    else:
+        kwargs['check_rep'] = False
+    
+    return shard_map(jax.vmap(fn, in_axes=in_axes, out_axes=out_axes), **kwargs)
 
 
 def get_vmap_fn(max_vmap_batch_size: int = 0, mesh: Optional[Mesh] = None):
