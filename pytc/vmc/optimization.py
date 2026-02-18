@@ -346,12 +346,9 @@ def optimize(
             return jnp.mean(energies_for_cost)
         user_or_default_cost_fn = energy_cost_fn
     
-    # Initialize walkers
-    walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
-    
     # ---- Multi-GPU setup ----
     from .sharding import (
-        create_mesh, shard_walker, replicate,
+        create_mesh, replicate, initialize_walkers_sharded,
         pad_n_walkers, pad_walker, n_devices as get_n_devices,
         is_multi_gpu as check_multi_gpu
     )
@@ -367,23 +364,28 @@ def optimize(
                   f"(divisible by {num_devices} devices)")
             n_walkers = padded_n
         
-        # Shard walkers, params and key
-        walkers = shard_walker(walkers, mesh)
+        print(f"Multi-GPU auto-detected: {num_devices} devices, "
+              f"{n_walkers // num_devices} walkers/device")
+    
+    # Initialize walkers
+    if multi_gpu and mesh is not None:
+        walkers = initialize_walkers_sharded(
+            ansatz, n_walkers, mesh, initial_walkers=initial_walkers, key=key
+        )
         if params is not None:
             params = replicate(params, mesh)
         key = replicate(key, mesh)
-        
-        print(f"Multi-GPU auto-detected: {num_devices} devices, "
-              f"{n_walkers // num_devices} walkers/device")
+    else:
+        walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
 
     # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
-            ansatz, walkers, burn_in_steps, step_size, key, params)
+            ansatz, walkers, burn_in_steps, step_size, key, params, mesh=mesh)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
             ansatz, walkers, burn_in_steps, step_size, key, params, 
-            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
+            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     
     print("Starting optimization...")
     
@@ -413,9 +415,12 @@ def optimize(
 
     # Create MCMC step function using factory
     if use_importance_sampling:
-        mcmc_step = make_mcmc_step_importance(ansatz, step_size)
+        mcmc_step = make_mcmc_step_importance(ansatz, step_size, mesh=mesh)
     else:
-        mcmc_step = make_mcmc_step(ansatz, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
+        mcmc_step = make_mcmc_step(
+            ansatz, step_size, move_type,
+            max_vmap_batch_size=max_vmap_batch_size, mesh=mesh
+        )
 
     # Define loss function JVP for KFAC and Newton
     loss_fn_jvp = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
@@ -515,9 +520,12 @@ def optimize(
             
             # Recreate mcmc_step with new step_size
             if use_importance_sampling:
-                mcmc_step = make_mcmc_step_importance(ansatz, step_size)
+                mcmc_step = make_mcmc_step_importance(ansatz, step_size, mesh=mesh)
             else:
-                mcmc_step = make_mcmc_step(ansatz, step_size, move_type, max_vmap_batch_size=max_vmap_batch_size)
+                mcmc_step = make_mcmc_step(
+                    ansatz, step_size, move_type,
+                    max_vmap_batch_size=max_vmap_batch_size, mesh=mesh
+                )
             
             # Recreate training_step with new mcmc_step
             if optimizer_type.lower() in ["newton"]:
@@ -620,7 +628,7 @@ def optimize_ref_var(
 
     # ---- Multi-GPU setup ----
     from .sharding import (
-        create_mesh, shard_walker, replicate,
+        create_mesh, replicate, initialize_walkers_sharded,
         pad_n_walkers, pad_walker, n_devices as get_n_devices,
         is_multi_gpu as check_multi_gpu
     )
@@ -640,20 +648,21 @@ def optimize_ref_var(
 
     # Initialize walkers using the reference determinant's info
     ref_det = ansatz.dets[0]
-    walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
-
-    # ---- Shard walkers across devices before burn-in ----
     if multi_gpu and mesh is not None:
-        walkers = shard_walker(walkers, mesh)
+        walkers = initialize_walkers_sharded(
+            ref_det, n_walkers, mesh, initial_walkers=initial_walkers, key=key
+        )
         params = replicate(params, mesh)
         key = replicate(key, mesh)
-        print("Walkers sharded across devices.")
+        print("Walkers initialized and sharded across devices.")
+    else:
+        walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
 
     # Burn-in walkers using the initial combined parameters
     print("Performing burn-in...")
     walkers, acceptance_history, key, step_size = burn_in(
         ref_det, walkers, burn_in_steps, step_size, key, params=params, 
-        move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
+        move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     print(f"Burn-in complete. Final step size: {step_size:.4f}")
 
     # Create loss function using modular factory
@@ -671,7 +680,7 @@ def optimize_ref_var(
 
     # Create MCMC step function
     mcmc_step = make_mcmc_step(ref_det, step_size, move_type,
-                               max_vmap_batch_size=max_vmap_batch_size)
+                               max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
 
     # Create optimizer and training step
     # Define loss function JVP for KFAC and Newton

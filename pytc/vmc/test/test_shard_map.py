@@ -5,6 +5,7 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 import unittest
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 try:
     from jax.shard_map import shard_map
@@ -63,7 +64,6 @@ class TestShardMap(unittest.TestCase):
         self.assertEqual(result.shape, (n_walkers, 1))
         np_result = jax.device_get(result)
         expected = np.arange(n_walkers).reshape(n_walkers, 1) * 2
-        import numpy as np
         np.testing.assert_allclose(np_result, expected)
         
         # Verify it's still sharded

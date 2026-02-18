@@ -7,9 +7,11 @@ including both standard MCMC and importance sampling with drift-diffusion.
 import jax
 import jax.numpy as jnp
 from jax import random
+from jax.sharding import PartitionSpec as P
 import folx
 
 from .moves import _all_electron_move, _one_electron_move, _compute_green_function
+from .sharding import shard_map_wrap
 
 
 def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one", batch_ansatz=None):
@@ -196,7 +198,7 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     return new_walkers, acceptance_rate
 
 
-def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
+def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0, mesh=None):
     """Factory to create a JIT-compilable MCMC step function.
     
     This function validates move_type at creation time (not JIT time) and returns
@@ -239,6 +241,33 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
     else:
         batch_ansatz = jax.vmap(lambda w, p: captured_ansatz(w, p), in_axes=(0, None))
     
+    def _mcmc_step_single_device(walkers, key, params):
+        new_walkers, acceptance_rate = metropolis_hastings(
+            captured_ansatz, walkers, step_size, key, params,
+            move_type=move_type, batch_ansatz=batch_ansatz
+        )
+        return new_walkers, acceptance_rate
+
+    if mesh is not None:
+        axis_name = "walkers"
+
+        def _mcmc_step_sharded(walkers, key, params):
+            # Create per-device independent RNG streams while remaining fully JIT/SPMD.
+            key = random.fold_in(key, jax.lax.axis_index(axis_name))
+            new_walkers, acceptance_rate = _mcmc_step_single_device(walkers, key, params)
+            acceptance_rate = (
+                jax.lax.psum(acceptance_rate, axis_name)
+                / jax.lax.psum(jnp.array(1.0, dtype=acceptance_rate.dtype), axis_name)
+            )
+            return new_walkers, acceptance_rate
+
+        sharded_step = shard_map_wrap(
+            _mcmc_step_sharded,
+            mesh=mesh,
+            in_specs=(P(axis_name), P(), P()),
+            out_specs=(P(axis_name), P()),
+        )
+
     def mcmc_step(ansatz, walkers, key, params):
         """Single MCMC step - fully JIT-compatible.
         
@@ -253,17 +282,17 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0):
             new_walkers: Updated walker state after MCMC step
             acceptance_rate: Fraction of proposals that were accepted
         """
-        new_walkers, acceptance_rate = metropolis_hastings(
-            captured_ansatz, walkers, step_size, key, params, 
-            move_type=move_type, batch_ansatz=batch_ansatz
-        )
+        if mesh is not None:
+            new_walkers, acceptance_rate = sharded_step(walkers, key, params)
+        else:
+            new_walkers, acceptance_rate = _mcmc_step_single_device(walkers, key, params)
         return new_walkers, acceptance_rate
     
     # JIT compile the step function
     return jax.jit(mcmc_step)
 
 
-def make_mcmc_step_importance(ansatz, time_step):
+def make_mcmc_step_importance(ansatz, time_step, mesh=None):
     """Factory to create a JIT-compilable importance sampling MCMC step.
     
     Args:
@@ -274,11 +303,39 @@ def make_mcmc_step_importance(ansatz, time_step):
         A JIT-compiled function with signature:
             mcmc_step(ansatz, walkers, key, params) -> (new_walkers, acceptance_rate)
     """
+    captured_ansatz = ansatz
+
+    def _mcmc_step_single_device(walkers, key, params):
+        new_walkers, acceptance_rate = metropolis_hastings_importance_sampling(
+            captured_ansatz, walkers, time_step, key, params
+        )
+        return new_walkers, acceptance_rate
+
+    if mesh is not None:
+        axis_name = "walkers"
+
+        def _mcmc_step_sharded(walkers, key, params):
+            key = random.fold_in(key, jax.lax.axis_index(axis_name))
+            new_walkers, acceptance_rate = _mcmc_step_single_device(walkers, key, params)
+            acceptance_rate = (
+                jax.lax.psum(acceptance_rate, axis_name)
+                / jax.lax.psum(jnp.array(1.0, dtype=acceptance_rate.dtype), axis_name)
+            )
+            return new_walkers, acceptance_rate
+
+        sharded_step = shard_map_wrap(
+            _mcmc_step_sharded,
+            mesh=mesh,
+            in_specs=(P(axis_name), P(), P()),
+            out_specs=(P(axis_name), P()),
+        )
+
     def mcmc_step(ansatz, walkers, key, params):
         """Single importance sampling MCMC step - fully JIT-compatible."""
-        new_walkers, acceptance_rate = metropolis_hastings_importance_sampling(
-            ansatz, walkers, time_step, key, params
-        )
+        if mesh is not None:
+            new_walkers, acceptance_rate = sharded_step(walkers, key, params)
+        else:
+            new_walkers, acceptance_rate = _mcmc_step_single_device(walkers, key, params)
         return new_walkers, acceptance_rate
     
     # JIT compile the step function

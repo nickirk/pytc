@@ -35,6 +35,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from typing import Optional
 import inspect
+import contextlib
+import time
 
 # Import shard_map - try new location first, then experimental
 try:
@@ -156,6 +158,88 @@ def pad_walker(walker, target_n_walkers: int):
     # Handle tuple fields (det_up, det_down) via tree_map
     padded = jax.tree_util.tree_map(_pad_leaf, walker)
     return padded, current  # return original count for later un-padding
+
+
+def _slice_along_first_axis(pytree, start: int, end: int):
+    """Slice a pytree along the leading axis for all non-scalar leaves."""
+    def _slice_leaf(x):
+        if hasattr(x, "ndim") and x.ndim > 0:
+            return x[start:end]
+        return x
+    return jax.tree_util.tree_map(_slice_leaf, pytree)
+
+
+def _assemble_sharded_from_local_pytrees(local_pytrees, mesh: Mesh, axis_name: str = "walkers"):
+    """Assemble per-device local pytrees into a globally sharded pytree."""
+    devices = list(mesh.devices.flat)
+    n_devices_local = len(devices)
+    walker_sharding = get_walker_sharding(mesh, axis_name)
+    replicated_sharding = get_replicated_sharding(mesh)
+
+    leaves_by_device = [jax.tree_util.tree_leaves(p) for p in local_pytrees]
+    treedef = jax.tree_util.tree_structure(local_pytrees[0])
+    assembled_leaves = []
+
+    for leaf_group in zip(*leaves_by_device):
+        first = leaf_group[0]
+        if not hasattr(first, "ndim"):
+            first = jnp.asarray(first)
+            leaf_group = tuple(jnp.asarray(x) for x in leaf_group)
+
+        if first.ndim == 0:
+            assembled = jax.device_put(first, replicated_sharding)
+        else:
+            local_shape = first.shape
+            global_shape = (local_shape[0] * n_devices_local, *local_shape[1:])
+            per_device = [
+                jax.device_put(leaf_group[i], devices[i])
+                for i in range(n_devices_local)
+            ]
+            assembled = jax.make_array_from_single_device_arrays(
+                global_shape, walker_sharding, per_device
+            )
+        assembled_leaves.append(assembled)
+
+    return jax.tree_util.tree_unflatten(treedef, assembled_leaves)
+
+
+def initialize_walkers_sharded(ansatz, n_walkers: int, mesh: Mesh, initial_walkers=None, key=None):
+    """Initialize walkers independently per device and return globally sharded walkers.
+
+    This avoids creating a full ``(n_walkers, ...)`` walker tensor on one GPU
+    before sharding, which is important for very large walker counts.
+    """
+    from .walker import initialize_walkers  # local import to avoid cycles
+
+    if key is None:
+        key = jax.random.PRNGKey(int(time.time()))
+
+    devices = list(mesh.devices.flat)
+    n_devices_local = len(devices)
+    if n_walkers % n_devices_local != 0:
+        raise ValueError(
+            f"n_walkers={n_walkers} must be divisible by n_devices={n_devices_local}."
+        )
+    local_n = n_walkers // n_devices_local
+    local_keys = jax.random.split(key, n_devices_local)
+
+    cpu_devices = jax.devices("cpu")
+    cpu_ctx = jax.default_device(cpu_devices[0]) if cpu_devices else contextlib.nullcontext()
+
+    local_walkers = []
+    for i in range(n_devices_local):
+        start = i * local_n
+        end = (i + 1) * local_n
+        local_initial = None
+        if initial_walkers is not None:
+            local_initial = _slice_along_first_axis(initial_walkers, start, end)
+        with cpu_ctx:
+            local_walker = initialize_walkers(
+                ansatz, local_n, initial_walkers=local_initial, key=local_keys[i]
+            )
+        local_walkers.append(local_walker)
+
+    return _assemble_sharded_from_local_pytrees(local_walkers, mesh, axis_name="walkers")
 
 
 # ---------------------------------------------------------------------------
@@ -284,3 +368,14 @@ def get_vmap_fn(max_vmap_batch_size: int = 0, mesh: Optional[Mesh] = None):
             return jax.vmap
 
 
+def shard_map_wrap(fn, mesh: Mesh, in_specs, out_specs):
+    """Apply ``shard_map`` with compatibility flags across JAX versions."""
+    if shard_map is None:
+        return fn
+
+    kwargs = {"mesh": mesh, "in_specs": in_specs, "out_specs": out_specs}
+    if _shard_map_uses_check_vma:
+        kwargs["check_vma"] = False
+    else:
+        kwargs["check_rep"] = False
+    return shard_map(fn, **kwargs)

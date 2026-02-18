@@ -10,13 +10,22 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random
+from jax.sharding import PartitionSpec as P
+import folx
 from typing import Dict, Any
 
-from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling
+from .metropolis import (
+    metropolis_hastings, metropolis_hastings_importance_sampling,
+    make_mcmc_step, make_mcmc_step_importance
+)
 from .walker import initialize_walkers
 from .mcmc_utils import prepare_sampling_results, report_progress
 from functools import partial
-from .sharding import get_vmap_fn
+from .sharding import (
+    get_vmap_fn, shard_map_wrap,
+    create_mesh, pad_n_walkers, n_devices, is_multi_gpu,
+    initialize_walkers_sharded, replicate
+)
 
 
 def burn_in(ansatz, 
@@ -27,7 +36,8 @@ def burn_in(ansatz,
             params=None, 
             report_interval=100, 
             move_type="one",
-            max_vmap_batch_size=0):
+            max_vmap_batch_size=0,
+            mesh=None):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -55,15 +65,49 @@ def burn_in(ansatz,
     _warmup_ansatz = vmap_fn(lambda w, p: ansatz(w, p), in_axes=(0, None))
     _, walkers = _warmup_ansatz(walkers, params)
 
-    # JIT-compile the MCMC step function to speed up the loop
-    # We partial out move_type since it's a static string argument
-    # step_size is passed as argument so it can vary without recompilation
-    mcmc_step = jax.jit(
-        partial(metropolis_hastings, move_type=move_type, batch_ansatz=vmap_fn(
-            lambda w, p: ansatz(w, p), 
-            in_axes=(0, None)
-        ))
-    )
+    if mesh is not None:
+        axis_name = "walkers"
+        local_batch_ansatz = (
+            folx.batched_vmap(
+                lambda w, p: ansatz(w, p),
+                in_axes=(0, None),
+                max_batch_size=max_vmap_batch_size,
+            ) if max_vmap_batch_size > 0 else
+            jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
+        )
+
+        def _mcmc_step_sharded(walkers, key, params, step_size):
+            key = random.fold_in(key, jax.lax.axis_index(axis_name))
+            walkers_out, acceptance = metropolis_hastings(
+                ansatz, walkers, step_size, key, params,
+                move_type=move_type, batch_ansatz=local_batch_ansatz
+            )
+            acceptance = (
+                jax.lax.psum(acceptance, axis_name)
+                / jax.lax.psum(jnp.array(1.0, dtype=acceptance.dtype), axis_name)
+            )
+            return walkers_out, acceptance
+
+        sharded_step = shard_map_wrap(
+            _mcmc_step_sharded,
+            mesh=mesh,
+            in_specs=(P(axis_name), P(), P(), P()),
+            out_specs=(P(axis_name), P()),
+        )
+
+        def mcmc_step(_ansatz, walkers, step_size, key, params):
+            return sharded_step(walkers, key, params, step_size)
+    else:
+        # JIT-compile the MCMC step function to speed up the loop.
+        # We partial out move_type since it's a static string argument.
+        # step_size is passed as argument so it can vary without recompilation.
+        mcmc_step = partial(
+            metropolis_hastings, move_type=move_type, batch_ansatz=vmap_fn(
+                lambda w, p: ansatz(w, p),
+                in_axes=(0, None)
+            )
+        )
+    mcmc_step = jax.jit(mcmc_step)
     
     start_time = time.time()
     for step in range(n_steps):
@@ -86,7 +130,7 @@ def burn_in(ansatz,
     return walkers, acceptance_history, key, step_size
 
 
-def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, report_interval=100):
+def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, report_interval=100, mesh=None):
     """Perform burn-in steps for MCMC sampling with importance sampling.
     
     Args:
@@ -107,8 +151,32 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
         
     print(f"Starting burn-in with {n_steps} steps using importance sampling...")
     
-    # JIT-compile the MCMC step
-    mcmc_step = jax.jit(metropolis_hastings_importance_sampling)
+    if mesh is not None:
+        axis_name = "walkers"
+
+        def _mcmc_step_sharded(walkers, key, params, time_step):
+            key = random.fold_in(key, jax.lax.axis_index(axis_name))
+            walkers_out, acceptance = metropolis_hastings_importance_sampling(
+                ansatz, walkers, time_step, key, params
+            )
+            acceptance = (
+                jax.lax.psum(acceptance, axis_name)
+                / jax.lax.psum(jnp.array(1.0, dtype=acceptance.dtype), axis_name)
+            )
+            return walkers_out, acceptance
+
+        sharded_step = shard_map_wrap(
+            _mcmc_step_sharded,
+            mesh=mesh,
+            in_specs=(P(axis_name), P(), P(), P()),
+            out_specs=(P(axis_name), P()),
+        )
+
+        def mcmc_step(_ansatz, walkers, time_step, key, params):
+            return sharded_step(walkers, key, params, time_step)
+    else:
+        mcmc_step = metropolis_hastings_importance_sampling
+    mcmc_step = jax.jit(mcmc_step)
     
     time_start = time.time()
     for step in range(n_steps):
@@ -162,8 +230,29 @@ def sample(
     if key is None:
         key = random.PRNGKey(int(time.time()))
     
+    # ---- Multi-GPU setup ----
+    mesh = None
+    if is_multi_gpu():
+        num_devices = n_devices()
+        mesh = create_mesh()
+        padded_n = pad_n_walkers(n_walkers, num_devices)
+        if padded_n != n_walkers:
+            print(f"Padding n_walkers from {n_walkers} to {padded_n} "
+                  f"(divisible by {num_devices} devices)")
+            n_walkers = padded_n
+        print(f"Multi-GPU auto-detected: {num_devices} devices, "
+              f"{n_walkers // num_devices} walkers/device")
+    
     # Initialize walkers
-    walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
+    if mesh is not None:
+        walkers = initialize_walkers_sharded(
+            ansatz, n_walkers, mesh, initial_walkers=initial_walkers, key=key
+        )
+        if params is not None:
+            params = replicate(params, mesh)
+        key = replicate(key, mesh)
+    else:
+        walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
     print("Starting production sampling...")
     print(f"Burn-in steps = {burn_in_steps}")
@@ -177,11 +266,11 @@ def sample(
     # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
-            ansatz, walkers, burn_in_steps, step_size, key, params)
+            ansatz, walkers, burn_in_steps, step_size, key, params, mesh=mesh)
     else:
         walkers, acceptance_history, key, step_size = burn_in(
             ansatz, walkers, burn_in_steps, step_size, key=key, params=params, 
-            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size)
+            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     
     # Storage for collected samples
     collected_samples = []
@@ -189,15 +278,13 @@ def sample(
     step_times = []
     
     # JIT-compile MCMC step for production run
-    vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size)
+    vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     if use_importance_sampling:
-        mcmc_step = jax.jit(metropolis_hastings_importance_sampling)
+        mcmc_step = make_mcmc_step_importance(ansatz, step_size, mesh=mesh)
     else:
-        mcmc_step = jax.jit(
-            partial(metropolis_hastings, move_type=move_type, batch_ansatz=vmap_fn(
-            lambda w, p: ansatz(w, p), 
-            in_axes=(0, None)
-        ))
+        mcmc_step = make_mcmc_step(
+            ansatz, step_size, move_type,
+            max_vmap_batch_size=max_vmap_batch_size, mesh=mesh
         )
         
     # JIT-compile energy evaluation
@@ -212,7 +299,7 @@ def sample(
         
         key, subkey = random.split(key)
         walkers, acceptance = mcmc_step(
-            ansatz, walkers, step_size, subkey, params)
+            ansatz, walkers, subkey, params)
             
         acceptance_history.append(acceptance)
         
