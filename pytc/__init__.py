@@ -40,6 +40,10 @@ def setup_logging(level=logging.INFO):
 # Initialize logging when package is imported
 setup_logging()
 
+# Log startup information for reproducibility
+from . import log
+log.log_startup_info()
+
 # Primary API - JAX autodiff implementations
 from . import tc
 from . import xtc
@@ -56,7 +60,7 @@ from . import vmc
 
 __all__ = [
     'tc',
-    'xtc', 
+    'xtc',
     'scf',
     'df',
     'kmat',
@@ -65,4 +69,6 @@ __all__ = [
     'ansatz',
     'jastrow',
     'vmc',
+    # Logging utilities
+    'log',
 ]
