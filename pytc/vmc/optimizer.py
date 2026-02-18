@@ -1,5 +1,6 @@
 """Optimizer implementations for VMC."""
 
+import logging
 import jax
 import jax.numpy as jnp
 import jax.scipy.sparse.linalg as spla
@@ -8,6 +9,8 @@ import folx
 from jax.tree_util import tree_map
 from jax.lax import stop_gradient
 import jax.flatten_util
+
+logger = logging.getLogger(__name__)
 
 class NewtonOptimizer:
     """Newton Optimizer (formerly Matrix-Free Optimizer).
@@ -341,7 +344,7 @@ def create_gradient_mask(ansatz, params, frozen_params):
     jastrow_params = params[0]
     linear_coeffs = params[1]
 
-    print(f"Creating gradient mask for frozen Jastrow parameters: {frozen_params}")
+    logger.info(f"Creating gradient mask for frozen Jastrow parameters: {frozen_params}")
     jastrows = ansatz.jastrow.jastrows
     if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
         raise TypeError(f"Jastrow params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
@@ -362,7 +365,7 @@ def create_gradient_mask(ansatz, params, frozen_params):
         if should_freeze:
             # Apply stop_gradient to all leaves in the frozen parameter PyTree
             param_pytree = tree_map(stop_gradient, param_pytree)
-            print(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
+            logger.info(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
         masked_jastrow_params.append(param_pytree)
 
     # Return the masked parameters
