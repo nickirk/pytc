@@ -394,6 +394,38 @@ class TestNewtonMultiGPU(unittest.TestCase):
 
         print(f"✓ Newton multi_gpu step matches single-device: loss={loss_ref:.6f}")
 
+    def test_newton_nondivisible_jacobian_sample_size(self):
+        """Non-divisible jacobian_sample_size should be auto-adjusted in multi-device mode."""
+        sj, det, params, mol, mf = _make_h2()
+        key = random.PRNGKey(123)
+        n_walkers = 8
+
+        walkers = initialize_walkers(det, n_walkers, key=key)
+        batch_ansatz = jax.vmap(lambda w, p: sj(w, p), in_axes=(0, None))
+        _, walkers = batch_ansatz(walkers, params)
+
+        from pytc.vmc.loss import make_variance_loss
+        loss_fn = make_variance_loss(ansatz=sj, optimizer_type='newton', max_vmap_batch_size=0)
+        loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+
+        mesh = create_mesh()
+        ws = shard_walker(walkers, mesh)
+        ps = replicate(params, mesh)
+
+        opt = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1,
+            damping=1e-5,
+            curvature_type="gauss_newton",
+            solver="exact",
+            jacobian_sample_size=5,  # not divisible by 4 devices
+        )
+        state = opt.init(ps, key, (ws, sj))
+        new_params, _, stats = opt.step(ps, state, key, (ws, sj))
+
+        self.assertTrue(np.isfinite(float(stats['loss'])))
+        self.assertEqual(new_params[1].shape, ps[1].shape)
+
     @classmethod
     def tearDownClass(cls):
         jax.clear_caches()

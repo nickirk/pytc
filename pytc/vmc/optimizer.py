@@ -98,6 +98,14 @@ class NewtonOptimizer:
                 # Sub-sample walkers for the Jacobian if requested
                 if self.jacobian_sample_size > 0 and self.jacobian_sample_size < n_walkers_total:
                     sample_size = self.jacobian_sample_size
+                    # In multi-device mode, shard_map requires the sharded axis
+                    # length to be divisible by device count.
+                    from .sharding import is_multi_gpu, n_devices
+                    if is_multi_gpu():
+                        ndev = n_devices()
+                        if sample_size % ndev != 0:
+                            sample_size = max(ndev, (sample_size // ndev) * ndev)
+                        sample_size = min(sample_size, n_walkers_total)
                     # Use rng to select a random subset of walker indices
                     indices = jax.random.choice(rng, n_walkers_total,
                                                 shape=(sample_size,), replace=False)
