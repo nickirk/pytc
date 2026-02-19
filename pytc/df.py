@@ -317,7 +317,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                 elapsed = time.perf_counter() - t_batch_start
                 rate = batch_idx / elapsed
                 eta = (n_batches - batch_idx) / rate if rate > 0 else 0
-                logger.debug(f"    Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
+                logger.debug(f"Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
         
         # Load into JAX CPU RAM if requested
         if is_incore:

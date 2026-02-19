@@ -35,7 +35,7 @@ from pytc.vmc.optimizer import NewtonOptimizer
 from pytc.vmc.sharding import (
     create_mesh, shard_walker, replicate,
     pad_n_walkers, pad_walker,
-    get_vmap_fn, is_multi_gpu, n_devices,
+    get_vmap_fn, is_multi_gpu, n_devices, initialize_walkers_sharded,
 )
 
 
@@ -140,6 +140,14 @@ class TestShardingUtilities(unittest.TestCase):
         self.assertEqual(padded.positions.shape[0], 8)
         # First 6 rows should be unchanged
         np.testing.assert_allclose(padded.positions[:6], walkers.positions)
+
+    def test_initialize_walkers_sharded(self):
+        """initialize_walkers_sharded creates directly sharded walker state."""
+        sj, det, params, mol, mf = _make_h2()
+        mesh = create_mesh()
+        walkers = initialize_walkers_sharded(det, 8, mesh, key=random.PRNGKey(7))
+        self.assertEqual(walkers.positions.shape[0], 8)
+        self.assertEqual(walkers.positions.sharding.spec[0], "walkers")
 
     @classmethod
     def tearDownClass(cls):
@@ -274,6 +282,35 @@ class TestShardedComputation(unittest.TestCase):
 
         print(f"✓ MCMC step with sharded walkers: acceptance={accept_val:.3f}")
 
+    def test_sharded_mcmc_uses_independent_device_rng(self):
+        """Replicated key should still yield different proposals across devices."""
+        from pytc.vmc.metropolis import make_mcmc_step
+
+        sj, det, params, mol, mf = _make_h2()
+        mesh = create_mesh()
+        n_walkers = 8
+
+        walkers = initialize_walkers(det, n_walkers, key=random.PRNGKey(0))
+        # Make all walkers identical so divergence must come from RNG streams.
+        walkers = jax.tree_util.tree_map(
+            lambda x: jnp.repeat(x[:1], n_walkers, axis=0) if isinstance(x, jnp.ndarray) and x.ndim > 0 else x,
+            walkers,
+        )
+
+        ws = shard_walker(walkers, mesh)
+        ps = replicate(params, mesh)
+        key = replicate(random.PRNGKey(123), mesh)
+
+        mcmc_step = make_mcmc_step(
+            det, 0.5, move_type="all", max_vmap_batch_size=0, mesh=mesh
+        )
+        new_walkers, _ = mcmc_step(det, ws, key, ps)
+
+        shard_positions = [np.array(s.data) for s in new_walkers.positions.addressable_shards]
+        # At least one device shard should differ from shard 0 if RNG is independent.
+        any_diff = any(not np.allclose(shard_positions[0], arr) for arr in shard_positions[1:])
+        self.assertTrue(any_diff, "Expected per-device independent RNG streams in sharded MCMC.")
+
     @classmethod
     def tearDownClass(cls):
         jax.clear_caches()
@@ -356,6 +393,38 @@ class TestNewtonMultiGPU(unittest.TestCase):
             )
 
         print(f"✓ Newton multi_gpu step matches single-device: loss={loss_ref:.6f}")
+
+    def test_newton_nondivisible_jacobian_sample_size(self):
+        """Non-divisible jacobian_sample_size should be auto-adjusted in multi-device mode."""
+        sj, det, params, mol, mf = _make_h2()
+        key = random.PRNGKey(123)
+        n_walkers = 8
+
+        walkers = initialize_walkers(det, n_walkers, key=key)
+        batch_ansatz = jax.vmap(lambda w, p: sj(w, p), in_axes=(0, None))
+        _, walkers = batch_ansatz(walkers, params)
+
+        from pytc.vmc.loss import make_variance_loss
+        loss_fn = make_variance_loss(ansatz=sj, optimizer_type='newton', max_vmap_batch_size=0)
+        loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+
+        mesh = create_mesh()
+        ws = shard_walker(walkers, mesh)
+        ps = replicate(params, mesh)
+
+        opt = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1,
+            damping=1e-5,
+            curvature_type="gauss_newton",
+            solver="exact",
+            jacobian_sample_size=5,  # not divisible by 4 devices
+        )
+        state = opt.init(ps, key, (ws, sj))
+        new_params, _, stats = opt.step(ps, state, key, (ws, sj))
+
+        self.assertTrue(np.isfinite(float(stats['loss'])))
+        self.assertEqual(new_params[1].shape, ps[1].shape)
 
     @classmethod
     def tearDownClass(cls):

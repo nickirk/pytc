@@ -232,7 +232,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         Loo, Lov = _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff)
         
         def get_block_df(block_str):
-            logger.debug(f"    Computing block {block_str}")
+            logger.debug(f"Computing block {block_str}")
             tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
             
             if block_str == 'oooo':
@@ -337,7 +337,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eri_std_full = eri_std_full.reshape(nmo, nmo, nmo, nmo)
         
         def get_block(block_str):
-            logger.debug(f"    Computing block {block_str} for xtc")
+            logger.debug(f"Computing block {block_str} for xtc")
             tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
             slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
             return eri_std_full[tuple(slices)] + tc_part
@@ -404,14 +404,14 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             chunks = [(p0, min(p0 + blksize, nvir))
                       for p0 in range(0, nvir, blksize)]
             loader = hdf5_slice_loader(eris.vvvv, axis=0)
-            logger.debug("    VVVV contraction from disk (blksize=%d, n_blocks=%d)",
+            logger.debug("VVVV contraction from disk (blksize=%d, n_blocks=%d)",
                          blksize, len(chunks))
             with PrefetchIterator(chunks, loader) as pit:
                 for (p0, p1), vvvv_blk in pit:
                     t0 = time.perf_counter()
                     out[:, :, p0:p1, :] += lib.einsum(
                         'abcd,ijcd->ijab', vvvv_blk.transpose(0, 2, 1, 3), t2)
-                    logger.debug("      VVVV disk block %d:%d done in %.3f s",
+                    logger.debug("VVVV disk block %d:%d done in %.3f s",
                                  p0, p1, time.perf_counter()-t0)
             return out
 
@@ -480,7 +480,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
                 lambda r=next_ranges: np.array(xtc_obj.get_2b(jastrow_params, ranges=r)))
             pending_key = (next_p0, next_p1)
 
-        logger.debug("    Contraction block %d:%d", p0, p1)
+        logger.debug("Contraction block %d:%d", p0, p1)
         t0 = time.perf_counter()
         if with_df is not None:
              L_ab_sub = L_vv_full[p0:p1]
@@ -495,7 +495,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
 
         out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_block.transpose(0, 2, 1, 3), t2)
         del vvvv_block
-        logger.debug("    Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+        logger.debug("Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
     
     if L_vv_full is not None:
         del L_vv_full
@@ -532,7 +532,7 @@ def _update_amps(cc, t1, t2, eris):
     Foo = imd.cc_Foo(t1,t2,eris)
     Fvv = imd.cc_Fvv(t1,t2,eris)
     Fov = imd.cc_Fov(t1,t2,eris)
-    logger.debug("    imd Foo, Fvv, Fov done in %.3f s", time.perf_counter()-t0)
+    logger.debug("imd Foo, Fvv, Fov done in %.3f s", time.perf_counter()-t0)
 
     Foo[np.diag_indices(nocc)] -= mo_e_o
     # Keep an unshifted copy of Fvv for Lvv initialization
@@ -547,7 +547,7 @@ def _update_amps(cc, t1, t2, eris):
     t1new +=  -np.einsum('kc,ikca->ia', Fov, t2)
     t1new +=   np.einsum('kc,ic,ka->ia', Fov, t1, t1)
     t1new += eris.fock[nocc:, :nocc].T
-    logger.debug("    T1 initial terms done in %.3f s", time.perf_counter()-t_start)
+    logger.debug("T1 initial terms done in %.3f s", time.perf_counter()-t_start)
     
     eris_ovvo = np.asarray(eris.ovvo)
     eris_oovv = np.asarray(eris.oovv)
@@ -596,7 +596,7 @@ def _update_amps(cc, t1, t2, eris):
     Wvovo -= lib.einsum('lcki,la->akci', eris_ovoo, t1)
     Wvovo -= 0.5*lib.einsum('lckd,ilda->akci', eris_ovov, t2)
     Wvovo -= lib.einsum('lckd,id,la->akci', eris_ovov, t1, t1)
-    logger.debug("    Wvoov, Wvovo basic terms done in %.3f s", time.perf_counter()-t_start)
+    logger.debug("Wvoov, Wvovo basic terms done in %.3f s", time.perf_counter()-t_start)
 
 
 
@@ -619,7 +619,7 @@ def _update_amps(cc, t1, t2, eris):
         from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
         blksize = max(4, int(mem_host / (nocc*nvir*nvir*8)))
         blksize = min(nvir, blksize)
-        logger.debug("    Starting ovvv loop (blksize=%d, prefetched)", blksize)
+        logger.debug("Starting ovvv loop (blksize=%d, prefetched)", blksize)
         t_loop = time.perf_counter()
         chunks = [(p0, min(p0 + blksize, nvir))
                   for p0 in range(0, nvir, blksize)]
@@ -629,7 +629,7 @@ def _update_amps(cc, t1, t2, eris):
                 _process_ovvv_block_prefetched(
                     ovvv_blk, t1, t2, tau, t1new, Lvv,
                     Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
-        logger.debug("    ovvv loop done in %.3f s", time.perf_counter()-t_loop)
+        logger.debug("ovvv loop done in %.3f s", time.perf_counter()-t_loop)
 
     t2new = np.zeros_like(t2)
     
@@ -646,7 +646,7 @@ def _update_amps(cc, t1, t2, eris):
         mem_host = cc.max_memory * 1e6
         blksize_t2 = max(4, int(mem_host / (nvir*nocc*nvir*8)))
         blksize_t2 = min(nvir, blksize_t2)
-        logger.debug("    Starting vovv loop (blksize=%d, prefetched)", blksize_t2)
+        logger.debug("Starting vovv loop (blksize=%d, prefetched)", blksize_t2)
         t_loop = time.perf_counter()
         chunks = [(p0, min(p0 + blksize_t2, nvir))
                   for p0 in range(0, nvir, blksize_t2)]
@@ -657,7 +657,7 @@ def _update_amps(cc, t1, t2, eris):
                     vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
         # Symmetrize the accumulated t2new from vovv blocks
         t2new = t2new + t2new.transpose(1, 0, 3, 2)
-        logger.debug("    vovv loop done in %.3f s", time.perf_counter()-t_loop)
+        logger.debug("vovv loop done in %.3f s", time.perf_counter()-t_loop)
 
 
     tmp2  = lib.einsum('kcai,jc->akij', eris_ovvo, t1)
@@ -666,7 +666,7 @@ def _update_amps(cc, t1, t2, eris):
 
     t2new -= tmp + tmp.transpose(1,0,3,2)
     t2new += np.asarray(eris.vovo).transpose(1,3,0,2)
-    logger.debug("    t2new basic terms done in %.3f s", time.perf_counter()-t_start)
+    logger.debug("t2new basic terms done in %.3f s", time.perf_counter()-t_start)
 
     # Add W loops
     Loo = imd.Loo(t1, t2, eris)
@@ -686,7 +686,7 @@ def _update_amps(cc, t1, t2, eris):
     t2new += lib.einsum('klij,klab->ijab', Woooo, tau)
     t_vvvv = time.perf_counter()
     t2new += _contract_vvvv_t2(cc, tau, eris)
-    logger.debug("    _contract_vvvv_t2 done in %.3f s", time.perf_counter()-t_vvvv)
+    logger.debug("_contract_vvvv_t2 done in %.3f s", time.perf_counter()-t_vvvv)
 
     # Use precomputed tmp_a, tmp_b
     t2new -= lib.einsum('kb,kaij->ijab', t1, tmp_a)
@@ -703,7 +703,7 @@ def _update_amps(cc, t1, t2, eris):
     t2new -= (tmp + tmp.transpose(1,0,3,2))
     tmp = lib.einsum('bkci,kjac->ijab', Wvovo, t2)
     t2new -= (tmp + tmp.transpose(1,0,3,2))
-    logger.debug("    Final t1/t2 processing done in %.3f s", time.perf_counter()-t_start)
+    logger.debug("Final t1/t2 processing done in %.3f s", time.perf_counter()-t_start)
 
     eia = mo_e_o[:,None] - mo_e_v
     eijab = lib.direct_sum('ia,jb->ijab',eia,eia)
@@ -756,12 +756,12 @@ def _process_ovvv_block(eris, t1, t2, tau, t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_
     - tmp_b: einsum('kcbd,ijcd->kbij')
     """
     # ovvv_blk: (k, d, a_blk, c) - sliced along 'a' (axis 2)
-    logger.debug("    _process_ovvv_block chunk %d:%d", p0, p1)
+    logger.debug("_process_ovvv_block chunk %d:%d", p0, p1)
     t0 = time.perf_counter()
     ovvv_blk = _get_slice(eris.ovvv, slice(p0, p1), axis=2)  # (nocc, nvir, blk, nvir)
     _process_ovvv_block_prefetched(ovvv_blk, t1, t2, tau, t1new, Lvv,
                                     Wvoov, Wvovo, tmp_a, tmp_b, p0, p1)
-    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 
 def _process_ovvv_block_prefetched(ovvv_blk, t1, t2, tau, t1new, Lvv,
@@ -803,16 +803,16 @@ def _process_ovvv_block_prefetched(ovvv_blk, t1, t2, tau, t1new, Lvv,
     # k=axis0, c=axis1, b=axis2 (which is our 'a'), d=axis3 (which is our 'c')
     # So we're computing contributions to tmp_b[:, p0:p1, :, :] 
     tmp_b[:, p0:p1, :, :] += lib.einsum('kcbd,ijcd->kbij', ovvv_blk, tau)
-    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1):
     """Process a chunk of vovv block for t2 updates."""
     # vovv shape is (a, i, b, c) - slice along axis 0 (a)
-    logger.debug("    _process_vovv_block chunk %d:%d", p0, p1)
+    logger.debug("_process_vovv_block chunk %d:%d", p0, p1)
     t0 = time.perf_counter()
     vovv_slice = _get_slice(eris.vovv, slice(p0, p1), axis=0)  # (a_blk, i, b, c)
     _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
-    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 
 def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1):
@@ -834,7 +834,7 @@ def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
     # Only add to the a_blk slice, symmetrization will be handled by the caller
     t2new[:, :, p0:p1, :] += term
 
-    logger.debug("    chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
 def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     """Initialize DF tensors and HDF5 file."""
@@ -895,7 +895,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 host_max_memory_mb=getattr(eris, 'max_memory', None),
                 n_fused=_n_fused)
             blksize = max(4, blksize)
-            logger.debug(f"    Blksize for ovvv: {blksize}")
+            logger.debug(f"Blksize for ovvv: {blksize}")
 
             # Prefetch: overlap the GPU get_2b of the NEXT block with the
             # current block's CPU tensordot + HDF5 write.
@@ -932,7 +932,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                 host_max_memory_mb=getattr(eris, 'max_memory', None),
                 n_fused=_n_fused)
             blksize = max(4, blksize)
-            logger.debug(f"    Blksize for vovv: {blksize}")
+            logger.debug(f"Blksize for vovv: {blksize}")
 
             from pytc.utils.prefetch import async_read, await_read
             pending_tc = None
@@ -1009,7 +1009,7 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             pending_key = (next_p0, next_p1)
 
         ds[p0:p1, :, :, :] = std_blk + tc_blk
-        logger.debug(f"      VVVV block {p0}:{p1} written to disk")
+        logger.debug(f"VVVV block {p0}:{p1} written to disk")
     logger.info("    VVVV disk write complete")
 
 
@@ -1061,5 +1061,5 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
             pending_key = (next_p0, next_p1)
 
         ds[p0:p1, :, :, :] = std_blk + tc_blk
-        logger.debug(f"      VVVV block {p0}:{p1} written to disk")
+        logger.debug(f"VVVV block {p0}:{p1} written to disk")
     logger.info("    VVVV disk write complete")
