@@ -235,7 +235,8 @@ def initialize_walkers_sharded(ansatz, n_walkers: int, mesh: Mesh, initial_walke
             local_initial = _slice_along_first_axis(initial_walkers, start, end)
         with cpu_ctx:
             local_walker = initialize_walkers(
-                ansatz, local_n, initial_walkers=local_initial, key=local_keys[i]
+                ansatz, local_n, initial_walkers=local_initial, key=local_keys[i],
+                log_init=(i == 0),
             )
         local_walkers.append(local_walker)
 

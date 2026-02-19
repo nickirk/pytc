@@ -87,7 +87,7 @@ def initialize_walker_state(ansatz, positions):
     )
 
 
-def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
+def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None, log_init: bool = True):
     """Initialize walker configurations based on molecular structure.
     
     Args:
@@ -119,7 +119,10 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None):
         
         # Initialize electron positions based on nuclear positions and spin counts
         key, subkey = random.split(key)
-        positions = init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, subkey, n_alpha=n_alpha)
+        positions = init_electron_configs(
+            atom_coords, atom_charges, n_electrons, n_walkers, subkey,
+            n_alpha=n_alpha, log_init=log_init
+        )
     
     # Create Walker state with all-True move_mask
     return initialize_walker_state(ansatz, positions)

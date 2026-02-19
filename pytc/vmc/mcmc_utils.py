@@ -166,7 +166,7 @@ def report_progress(step, total_steps, acceptance_history, step_times, energies=
 
 
 
-def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key, n_alpha=None):
+def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key, n_alpha=None, log_init: bool = True):
     """Initialize electron configurations based on atomic positions with proper spin ordering.
     
     Args:
@@ -193,9 +193,10 @@ def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key
     # Use the pairing-based electron distribution algorithm
     alpha_counts, beta_counts = _distribute_electrons_by_pairing(atom_charges, n_alpha, n_beta)
     
-    logger.info(f"Electron distribution by atom:")
-    for i in range(len(alpha_counts)):
-        logger.info(f"  Atom {i}: {alpha_counts[i]} up, {beta_counts[i]} down")
+    if log_init:
+        logger.info("Electron distribution by atom:")
+        for i in range(len(alpha_counts)):
+            logger.info(f"  Atom {i}: {alpha_counts[i]} up, {beta_counts[i]} down")
     
     # Generate positions for up-spin electrons around each atom
     alpha_positions = []
@@ -246,7 +247,8 @@ def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key
     # Combine up and down positions in correct order
     all_positions = jnp.concatenate([all_alpha_positions, all_beta_positions], axis=1)
     
-    logger.info(f"Initialized {n_alpha} up-spin and {n_beta} down-spin electrons around {n_atoms} atoms")
+    if log_init:
+        logger.info(f"Initialized {n_alpha} up-spin and {n_beta} down-spin electrons around {n_atoms} atoms")
     
     return all_positions
 
