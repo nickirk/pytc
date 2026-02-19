@@ -7,11 +7,31 @@ log_dir = Path(__file__).parent.parent / 'logs'
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / 'pytc.log'
 
+
+class LevelIndentFormatter(logging.Formatter):
+    """Formatter that indents DEBUG messages by two spaces."""
+    DEBUG_INDENT = "  "
+
+    def format(self, record):
+        original_msg = record.msg
+        if record.levelno == logging.DEBUG:
+            if isinstance(original_msg, str):
+                record.msg = original_msg.lstrip()
+                if record.msg:
+                    record.msg = f"{self.DEBUG_INDENT}{record.msg}"
+            else:
+                record.msg = f"{self.DEBUG_INDENT}{original_msg}"
+        try:
+            return super().format(record)
+        finally:
+            record.msg = original_msg
+
+
 # Configure logging
 def setup_logging(level=logging.INFO):
     # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    formatter = LevelIndentFormatter(
+        '%(asctime)s - %(name)-28s - %(levelname)-8s - %(message)s'
     )
 
     # Setup file handler

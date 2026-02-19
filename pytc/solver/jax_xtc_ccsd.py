@@ -200,7 +200,7 @@ def _update_amps(cc, t1, t2, eris):
     # ovoo needed for accumulator base, T1 core, and Loo
     eris_ovoo = jnp.asarray(eris.ovoo)
     # oooo, vooo, vovo deferred to Phase 6 (basic T2 terms)
-    logger.debug(f"    Phase 1 data transfer to GPU took {time.perf_counter()-t_start:.4f} s")
+    logger.debug(f"Phase 1 data transfer to GPU took {time.perf_counter()-t_start:.4f} s")
     t_kernels = time.perf_counter()
     
     # 2. Compute intermediates (Micro-Kernels)
@@ -208,14 +208,14 @@ def _update_amps(cc, t1, t2, eris):
     Fov = _jax_cc_Fov(t1_jax, fock_jax, eris_ovov)
     Foo = _jax_cc_Foo(t1_jax, t2_jax, fock_jax, eris_ovov)
     Fvv = _jax_cc_Fvv(t1_jax, t2_jax, fock_jax, eris_ovov)
-    logger.debug(f"    Micro-kernels (Foo/Fov/Fvv) took {time.perf_counter()-t_kernels:.4f} s")
+    logger.debug(f"Micro-kernels (Foo/Fov/Fvv) took {time.perf_counter()-t_kernels:.4f} s")
     
     Foo_shifted = Foo.at[jnp.diag_indices(nocc)].add(-mo_e_o)
     Fvv_shifted = Fvv.at[jnp.diag_indices(nvir)].add(-mo_e_v)
     # Keep unshifted Fvv for Lvv
     Fvv_unshifted = Fvv
     jax.block_until_ready([Foo_shifted, Fvv_shifted])
-    logger.debug(f"    Micro-kernels (Foo/Fov/Fvv) and shift took {time.perf_counter()-t_kernels:.4f} s")
+    logger.debug(f"Micro-kernels (Foo/Fov/Fvv) and shift took {time.perf_counter()-t_kernels:.4f} s")
     
     size_W = nvir * nocc * nocc * nvir * 8
     size_tmp = nocc * nvir * nocc * nocc * 8
@@ -228,7 +228,7 @@ def _update_amps(cc, t1, t2, eris):
         nocc, nvir, 'acc_decision', gpu_max_memory_mb=_gpu_max)
     use_gpu_acc = bool(use_gpu_acc_flag)
         
-    logger.debug(f"    Accumulators need {total_acc_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
+    logger.debug(f"Accumulators need {total_acc_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
 
     # Initialize accumulators with non-ovvv terms
     if use_gpu_acc:
@@ -307,7 +307,7 @@ def _update_amps(cc, t1, t2, eris):
     t_trans_dur = time.perf_counter() - t_trans
     
     del t1new_jax # Free GPU memory
-    logger.debug(f"    T1 core updates: Comp {t_comp_dur:.4f}s, Host accum {t_trans_dur:.4f}s")
+    logger.debug(f"T1 core updates: Comp {t_comp_dur:.4f}s, Host accum {t_trans_dur:.4f}s")
     
     t_ovvv = time.perf_counter()
     
@@ -394,7 +394,7 @@ def _update_amps(cc, t1, t2, eris):
                 tmp_a_acc[:, p0:p1] += np.asarray(tmp_a_blk)
                 tmp_b_acc[:, p0:p1] += np.asarray(tmp_b_blk)
                 t_trans_blk = time.perf_counter() - t0_trans
-                logger.debug(f"      OVVV block {p0}:{p1}: Comp {t_comp_blk:.4f}s, Host accum {t_trans_blk:.4f}s")
+                logger.debug(f"OVVV block {p0}:{p1}: Comp {t_comp_blk:.4f}s, Host accum {t_trans_blk:.4f}s")
             
             # Await the background read and transfer to GPU for the next iteration
             if next_future is not None and next_p0 < nvir:
@@ -451,7 +451,7 @@ def _update_amps(cc, t1, t2, eris):
             t0_trans = time.perf_counter()
             t2new_host[:, :, p0:p1, :] += np.asarray(term)
             t_trans = time.perf_counter() - t0_trans
-            logger.debug(f"      VOVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
+            logger.debug(f"VOVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
 
             # Await background read and transfer for next iteration
             if next_future is not None and next_p0 < nvir:
@@ -464,7 +464,7 @@ def _update_amps(cc, t1, t2, eris):
         
     t2new_host += np.asarray(t2new_jax)
     del t2new_jax
-    logger.debug(f"    T2 core updates (VOVV) took {time.perf_counter()-t_t2:.4f} s")
+    logger.debug(f"T2 core updates (VOVV) took {time.perf_counter()-t_t2:.4f} s")
     
     # === Phase 5: Free eris_oovv (no longer needed after VOVV) ===
     del eris_oovv
@@ -485,7 +485,7 @@ def _update_amps(cc, t1, t2, eris):
     eris_vovo = jnp.asarray(eris.vovo)   # ~2 GB
     # Reload eris_ovvo (needed for tmp2 below; was freed implicitly or still live)
     # It was loaded in Phase 1 and not freed, so it's still available.
-    logger.debug(f"    Phase 6 deferred ERI load done")
+    logger.debug(f"Phase 6 deferred ERI load done")
         
     # Basic T2 terms
     t2new_basic = jnp.zeros_like(t2_jax)
@@ -535,7 +535,7 @@ def _update_amps(cc, t1, t2, eris):
     del eris_oooo, eris_vooo, eris_vovo
     del Wvoov_acc, Wvovo_acc, tmp_a_acc, tmp_b_acc, Lvv_acc
     del Loo_jax, Woooo_jax
-    logger.debug(f"    Phase 7: freed ERIs/accumulators before VVVV")
+    logger.debug(f"Phase 7: freed ERIs/accumulators before VVVV")
 
     # --- VVVV Contraction ---
     _contract_vvvv_t2(cc, tau_jax, eris, t2new_host)
@@ -585,7 +585,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                 nocc, nvir, 'vvvv_gpu',
                 gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
                 host_max_memory_mb=getattr(cc, 'max_memory', None))
-            logger.debug(f"    VVVV contraction from disk: blksize={blksize}, "
+            logger.debug(f"VVVV contraction from disk: blksize={blksize}, "
                          f"n_blocks={(nvir+blksize-1)//blksize}")
 
             @jax.jit
@@ -625,7 +625,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                 t0_trans = time.perf_counter()
                 t2new_host[:, :, p0:p1, :] += np.asarray(term)
                 t_trans = time.perf_counter() - t0_trans
-                logger.debug(f"      VVVV disk block {p0}:{p1}: "
+                logger.debug(f"VVVV disk block {p0}:{p1}: "
                              f"Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
             return
 
@@ -647,7 +647,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         host_max_memory_mb=getattr(cc, 'max_memory', None),
         naux=_naux,
         n_fused=_n_fused)
-    logger.debug(f"    VVVV on-the-fly contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
+    logger.debug(f"VVVV on-the-fly contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
     
     L_vv_full_jax = None
     if with_df is not None:
@@ -680,7 +680,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
             if hasattr(vvvv_block_jax, 'block_until_ready'):
                 vvvv_block_jax.block_until_ready()
-        logger.debug(f"      get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
+        logger.debug(f"get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
         
         L_ab_sub_jax = L_vv_full_jax[p0:p1] if with_df is not None else None
         
@@ -688,19 +688,19 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
              t_ao2mo = time.perf_counter()
              mo_v = cc.mo_coeff[:, nocc:]
              std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-             logger.debug(f"      ao2mo (std integrals) took {time.perf_counter()-t_ao2mo:.4f} s")
+             logger.debug(f"ao2mo (std integrals) took {time.perf_counter()-t_ao2mo:.4f} s")
              
              t_transfer = time.perf_counter()
              std_jax = jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
              if hasattr(std_jax, 'block_until_ready'):
                  std_jax.block_until_ready()
-             logger.debug(f"      Host->Device transfer of std integrals took {time.perf_counter()-t_transfer:.4f} s")
+             logger.debug(f"Host->Device transfer of std integrals took {time.perf_counter()-t_transfer:.4f} s")
              
              t_add = time.perf_counter()
              vvvv_block_jax = vvvv_block_jax + std_jax
              if hasattr(vvvv_block_jax, 'block_until_ready'):
                  vvvv_block_jax.block_until_ready()
-             logger.debug(f"      Element-wise addition (vvvv + std) took {time.perf_counter()-t_add:.4f} s")
+             logger.debug(f"Element-wise addition (vvvv + std) took {time.perf_counter()-t_add:.4f} s")
              
         t0_comp = time.perf_counter()
         term = contract_block_kernel(t2_jax, vvvv_block_jax, L_ab_sub_jax, L_vv_full_jax)
@@ -721,7 +721,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         t0_trans = time.perf_counter()
         t2new_host[:, :, p0:p1, :] += np.asarray(term)
         t_trans = time.perf_counter() - t0_trans
-        logger.debug(f"      VVVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
+        logger.debug(f"VVVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
     
     if L_vv_full_jax is not None:
         del L_vv_full_jax

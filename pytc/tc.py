@@ -578,7 +578,7 @@ class ISDFTC(TC):
         n_rank = self.phi_isdf.shape[1]
         
         # Pad grid to be divisible by n_devices
-        logger.debug(f"     compute_kmat_kernels: Padding grid to be divisible by {n_devices} devices...")
+        logger.debug(f"compute_kmat_kernels: Padding grid to be divisible by {n_devices} devices...")
         devices = jax.local_devices()
         
         if host_grid_block_size is None:
@@ -764,7 +764,7 @@ class ISDFTC(TC):
             for r0 in range(0, n_grid, host_grid_block_size):
                 r1 = min(r0 + host_grid_block_size, n_grid)
                 n_eval = r1 - r0
-                logger.debug(f"    _compute_L_aux: Processing evaluation block [{r0}:{r1}]...")
+                logger.debug(f"_compute_L_aux: Processing evaluation block [{r0}:{r1}]...")
                 
                 remainder = n_eval % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
@@ -870,11 +870,11 @@ class ISDFTC(TC):
                     logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
                     kernels['K3_kernel'] = f['K3_kernel'][:]
                     if self.is_incore:
-                        logger.debug(f"  incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
+                        logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
                         kernels['L_aux'] = f['L_aux'][:]
                         f.close()
                     else:
-                        logger.debug(f"  out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
+                        logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
                         kernels['L_aux'] = f['L_aux'] 
 
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")

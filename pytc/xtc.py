@@ -39,9 +39,9 @@ def _read_X_slice(X, slice_r, slice_s):
     if isinstance(X, h5py.Dataset):
         key = (id(X), _slice_key(slice_r), _slice_key(slice_s))
         if _X_HDF5_CACHE["key"] == key:
-            logger.debug("  X slice cache HIT  (%s, %s)", slice_r, slice_s)
+            logger.debug("X slice cache HIT  (%s, %s)", slice_r, slice_s)
             return _X_HDF5_CACHE["data"]
-        logger.debug("  X slice cache MISS (%s, %s) — reading from HDF5", slice_r, slice_s)
+        logger.debug("X slice cache MISS (%s, %s) — reading from HDF5", slice_r, slice_s)
         data = X[slice_r, slice_s]
         _X_HDF5_CACHE["key"] = key
         _X_HDF5_CACHE["data"] = data
@@ -774,14 +774,14 @@ class ISDFXTC(XTC, ISDFTC):
                     logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
                     kernels['D'] = f['D'][:]
                     if self.is_incore:
-                        logger.debug("  incore mode: Loading X with shape: {f['X'].shape} on host RAM")
+                        logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
                         kernels['X'] = f['X'][:]
                         f.close()
                     else:
                         # Stream X from file. 
                         # Return the dataset object directly. 
                         # Do NOT close 'f' here; the dataset object keeps the file open.
-                        logger.debug(f"  out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
+                        logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
                         kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
@@ -970,7 +970,7 @@ class ISDFXTC(XTC, ISDFTC):
             pending_D = None
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
-                logger.debug(f"    _compute_D_kernel: Processing grid block [{g0}:{g1}]...")
+                logger.debug(f"_compute_D_kernel: Processing grid block [{g0}:{g1}]...")
 
                 if pending_D is not None:
                     sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = await_read(pending_D)
@@ -1092,7 +1092,7 @@ class ISDFXTC(XTC, ISDFTC):
             pending_X = None
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
-                logger.debug(f"    _compute_X_kernel: Processing grid block [{g0}:{g1}]...")
+                logger.debug(f"_compute_X_kernel: Processing grid block [{g0}:{g1}]...")
 
                 if pending_X is not None:
                     sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = await_read(pending_X)
@@ -1378,7 +1378,7 @@ class ISDFXTC(XTC, ISDFTC):
         
         if is_hdf5:
             # Process strictly in chunks to respect memory
-            logger.debug("  Streaming X in chunks from HDF5")
+            logger.debug("Streaming X in chunks from HDF5")
             chunk_size = orb_block_size # Adjust based on memory
             from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
@@ -1387,7 +1387,7 @@ class ISDFXTC(XTC, ISDFTC):
                 start = i
                 stop = min(i + chunk_size, self.n_orb)
                 sl = slice(start, stop)
-                logger.debug(f"  Processing slice {start}-{stop}")
+                logger.debug(f"Processing slice {start}-{stop}")
 
                 if pending_h is not None:
                     X_chunk = await_read(pending_h)
@@ -1523,7 +1523,7 @@ class ISDFXTC(XTC, ISDFTC):
         # accounts for pre-allocated tensors (phi_isdf, etc.).
         threshold = available_gb * 0.5
         
-        logger.debug(f"  delta_U memory estimate: X_sliced={x_sliced_size_gb:.2f} GB, "
+        logger.debug(f"delta_U memory estimate: X_sliced={x_sliced_size_gb:.2f} GB, "
                      f"scan_carry={scan_carry_gb:.2f} GB, total={total_needed_gb:.2f} GB "
                      f"(Threshold: {threshold:.2f} GB, dims: Np={Np}, Nq={Nq}, Nr={Nr}, Ns={Ns})")
         
@@ -1579,7 +1579,7 @@ class ISDFXTC(XTC, ISDFTC):
             orb_chunk_size = min(max_Nr_chunk, Nr)
             
             chunk_total_gb = orb_chunk_size * per_r_unit_gb + d_size_gb
-            logger.debug(f"  Chunking over 'r' index. Chunk size: {orb_chunk_size} "
+            logger.debug(f"Chunking over 'r' index. Chunk size: {orb_chunk_size} "
                          f"(est. per chunk: {chunk_total_gb:.2f} GB)")
             
             phi_s = self.phi_isdf[slice_s]
@@ -1636,7 +1636,7 @@ class ISDFXTC(XTC, ISDFTC):
             orb_chunk_size = min(max_Ns_chunk, Ns)
             
             chunk_total_gb = orb_chunk_size * per_s_unit_gb + d_size_gb
-            logger.debug(f"  Chunking over 's' index. Chunk size: {orb_chunk_size} "
+            logger.debug(f"Chunking over 's' index. Chunk size: {orb_chunk_size} "
                          f"(est. per chunk: {chunk_total_gb:.2f} GB)")
 
             phi_r = self.phi_isdf[slice_r]
