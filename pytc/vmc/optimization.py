@@ -25,6 +25,7 @@ The optimization module supports two complementary training patterns:
 The factory function make_training_step() supports both patterns.
 """
 
+import logging
 import time
 import numpy as np
 import jax
@@ -40,6 +41,8 @@ from .walker import initialize_walkers
 from .sampling import burn_in, burn_in_with_importance
 from .optimizer import create_optimizer, create_gradient_mask
 from .loss import make_energy_loss, make_variance_loss
+
+logger = logging.getLogger(__name__)
 
 
 def make_opt_update_step(loss_fn, optimizer):
@@ -360,11 +363,11 @@ def optimize(
         mesh = create_mesh()
         padded_n = pad_n_walkers(n_walkers, num_devices)
         if padded_n != n_walkers:
-            print(f"Padding n_walkers from {n_walkers} to {padded_n} "
+            logger.info(f"Padding n_walkers from {n_walkers} to {padded_n} "
                   f"(divisible by {num_devices} devices)")
             n_walkers = padded_n
         
-        print(f"Multi-GPU auto-detected: {num_devices} devices, "
+        logger.info(f"Multi-GPU auto-detected: {num_devices} devices, "
               f"{n_walkers // num_devices} walkers/device")
     
     # Initialize walkers
@@ -387,7 +390,7 @@ def optimize(
             ansatz, walkers, burn_in_steps, step_size, key, params, 
             move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     
-    print("Starting optimization...")
+    logger.info("Starting optimization...")
     
     # Initialize parameters if not provided
     if params is None:
@@ -463,9 +466,9 @@ def optimize(
         )
 
     # ========== MAIN LOOP (Uses JIT-compiled step) ==========
-    print(f"Starting optimization with {n_opt_steps} steps...")
+    logger.info(f"Starting optimization with {n_opt_steps} steps...")
     if adaptive_step_size:
-        print(f"Adaptive step-size enabled (target accept=0.5, adjust every {step_size_adjust_interval} steps)")
+        logger.info(f"Adaptive step-size enabled (target accept=0.5, adjust every {step_size_adjust_interval} steps)")
     
     losses = []
     energies = []
@@ -544,14 +547,14 @@ def optimize(
         if opt_step % log_frequency == 0 or opt_step == n_opt_steps - 1:
             elapsed = time.time() - start_time
             step_size_str = f" | StepSize: {step_size:.4f}" if adaptive_step_size else ""
-            print(f"Step {opt_step:5d} | Cost: {cost_val:.6f} | "
+            logger.info(f"Step {opt_step:5d} | Cost: {cost_val:.6f} | "
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
                   f"Accept: {pmove_val:.3f}{step_size_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
     
-    print("Optimization complete!")
+    logger.info("Optimization complete!")
     if adaptive_step_size:
-        print(f"Final step size: {step_size:.4f}")
+        logger.info(f"Final step size: {step_size:.4f}")
     
     return {
         "cost": np.array(losses),
@@ -640,10 +643,10 @@ def optimize_ref_var(
         mesh = create_mesh()
         padded_n = pad_n_walkers(n_walkers, num_devices)
         if padded_n != n_walkers:
-            print(f"Padding n_walkers from {n_walkers} to {padded_n} "
+            logger.info(f"Padding n_walkers from {n_walkers} to {padded_n} "
                   f"(divisible by {num_devices} devices)")
             n_walkers = padded_n
-        print(f"Multi-GPU auto-detected: {num_devices} devices, "
+        logger.info(f"Multi-GPU auto-detected: {num_devices} devices, "
               f"{n_walkers // num_devices} walkers/device")
 
     # Initialize walkers using the reference determinant's info
@@ -654,16 +657,16 @@ def optimize_ref_var(
         )
         params = replicate(params, mesh)
         key = replicate(key, mesh)
-        print("Walkers initialized and sharded across devices.")
+        logger.info("Walkers initialized and sharded across devices.")
     else:
         walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
 
     # Burn-in walkers using the initial combined parameters
-    print("Performing burn-in...")
+    logger.info("Performing burn-in...")
     walkers, acceptance_history, key, step_size = burn_in(
         ref_det, walkers, burn_in_steps, step_size, key, params=params, 
         move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
-    print(f"Burn-in complete. Final step size: {step_size:.4f}")
+    logger.info(f"Burn-in complete. Final step size: {step_size:.4f}")
 
     # Create loss function using modular factory
     if cost_fn is None:
@@ -718,7 +721,7 @@ def optimize_ref_var(
         )
 
     # ========== MAIN LOOP (Uses JIT-compiled step) ==========
-    print(f"Starting optimization with {n_opt_steps} steps...")
+    logger.info(f"Starting optimization with {n_opt_steps} steps...")
     
     losses = []
     energies = []
@@ -729,7 +732,7 @@ def optimize_ref_var(
     start_time = time.time()
     
     # Run first step separately to measure compilation time
-    print("Compiling training step...")
+    logger.info("Compiling training step...")
     compilation_start = time.time()
     
     key, subkey = random.split(key)
@@ -742,7 +745,7 @@ def optimize_ref_var(
             ansatz, walkers, params, opt_state, subkey
         )
     compilation_end = time.time()
-    print(f"Compilation + First Step finished in {compilation_end - compilation_start:.2f}s")
+    logger.info(f"Compilation + First Step finished in {compilation_end - compilation_start:.2f}s")
     
     # Process first step results
     variance_val = float(jax.device_get(loss))
@@ -762,7 +765,7 @@ def optimize_ref_var(
     )
     params_history.append(params_copy)
     
-    print(f"Step     0 | Var: {variance_val:.6f} | "
+    logger.info(f"Step     0 | Var: {variance_val:.6f} | "
           f"E: {energy_val:.6f}±{std_val:.6f} | "
           f"Accept: {pmove_val:.3f} | Time: {compilation_end - start_time:.2f}s")
 
@@ -802,12 +805,12 @@ def optimize_ref_var(
             
             # Print progress
             elapsed = time.time() - start_time
-            print(f"Step {opt_step:5d} | Var: {variance_val:.6f} | "
+            logger.info(f"Step {opt_step:5d} | Var: {variance_val:.6f} | "
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
                   f"Accept: {pmove_val:.3f} | Time: {elapsed:.2f}s")
             start_time = time.time()
     
-    print("Optimization complete!")
+    logger.info("Optimization complete!")
     
     
     return {

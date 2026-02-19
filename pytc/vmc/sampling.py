@@ -5,6 +5,7 @@ including both standard MCMC and importance sampling variants.
 """
 
 import gc
+import logging
 import time
 import numpy as np
 import jax
@@ -26,6 +27,8 @@ from .sharding import (
     create_mesh, pad_n_walkers, n_devices, is_multi_gpu,
     initialize_walkers_sharded, replicate
 )
+
+logger = logging.getLogger(__name__)
 
 
 def burn_in(ansatz, 
@@ -57,7 +60,7 @@ def burn_in(ansatz,
     if n_steps <= 0:
         return walkers, acceptance_history, key, step_size
         
-    print(f"Starting burn-in with {n_steps} steps...")
+    logger.info(f"Starting burn-in with {n_steps} steps...")
     
     # Warm up walker cache (populate log_psi, psi_sign) so that
     # _one_electron_move can reuse cached values instead of recomputing.
@@ -120,13 +123,13 @@ def burn_in(ansatz,
         acceptance_history.append(acceptance_float)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
+            logger.info(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
             step_size *= acceptance_float / 0.5
             start_time = time.time()
             # Periodic garbage collection
             gc.collect()
     
-    print("Burn-in complete.")
+    logger.info("Burn-in complete.")
     return walkers, acceptance_history, key, step_size
 
 
@@ -149,7 +152,7 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
     if n_steps <= 0:
         return walkers, acceptance_history, key
         
-    print(f"Starting burn-in with {n_steps} steps using importance sampling...")
+    logger.info(f"Starting burn-in with {n_steps} steps using importance sampling...")
     
     if mesh is not None:
         axis_name = "walkers"
@@ -186,11 +189,11 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
         acceptance_history.append(acceptance)
         
         if step % report_interval == 0:
-            print(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}, time: {time.time() - time_start:.2f}s")
+            logger.info(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_history[-1]}, time: {time.time() - time_start:.2f}s")
             time_step *= acceptance_history[-1]/0.5
             time_start = time.time()
     
-    print("Burn-in complete.")
+    logger.info("Burn-in complete.")
     return walkers, acceptance_history, key, time_step
 
 
@@ -254,14 +257,14 @@ def sample(
     else:
         walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
     
-    print("Starting production sampling...")
-    print(f"Burn-in steps = {burn_in_steps}")
-    print(f"Number of walkers = {n_walkers}")
-    print(f"Number of steps = {n_steps}")
-    print(f"Thinning factor = {thinning}")
-    print(f"Step size = {step_size:.4f}")
-    print(f"Using importance sampling: {use_importance_sampling}")
-    print(f"Move type: {move_type}")
+    logger.info("Starting production sampling...")
+    logger.info(f"Burn-in steps = {burn_in_steps}")
+    logger.info(f"Number of walkers = {n_walkers}")
+    logger.info(f"Number of steps = {n_steps}")
+    logger.info(f"Thinning factor = {thinning}")
+    logger.info(f"Step size = {step_size:.4f}")
+    logger.info(f"Using importance sampling: {use_importance_sampling}")
+    logger.info(f"Move type: {move_type}")
     
     # Perform burn-in with appropriate method
     if use_importance_sampling:
@@ -320,7 +323,7 @@ def sample(
             if not collected_energies and step == 0:
                  energies = batch_local_energy(walkers, params)
             
-            print(f"Batch mean energy: {jnp.mean(energies):.6f}")
+            logger.info(f"Batch mean energy: {jnp.mean(energies):.6f}")
             report_progress(step, n_steps, acceptance_history, step_times, 
                            collected_energies if collected_energies else None)
             start_time = time.time()

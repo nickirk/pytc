@@ -21,6 +21,8 @@ class TestShardMap(unittest.TestCase):
 
     def test_shard_map_with_local_batching(self):
         """Verify that shard_map can distribute walkers and batch locally."""
+        import numpy as np
+        
         if shard_map is None:
             self.skipTest("shard_map not available")
 

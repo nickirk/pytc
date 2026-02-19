@@ -1,9 +1,12 @@
 """Utility functions for analyzing quantum Monte Carlo samples."""
 
+import logging
 import numpy as np
 import jax.numpy as jnp
 from jax import random
-from typing import Dict, Any, List, Optional, Tuple 
+from typing import Dict, Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__) 
 
 def analyze_energies(sampling_results: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze energy convergence and statistics from sampling results.
@@ -155,11 +158,11 @@ def report_progress(step, total_steps, acceptance_history, step_times, energies=
     """
     recent_acceptance = jnp.mean(jnp.array(acceptance_history[-100:]))
     recent_time = jnp.mean(jnp.array(step_times[-100:]))
-    print(f"Step {step}/{total_steps}, Acceptance: {recent_acceptance:.4f}, Time/step: {recent_time:.2f}s")
-    
+    logger.info(f"Step {step}/{total_steps}, Acceptance: {recent_acceptance:.4f}, Time/step: {recent_time:.2f}s")
+
     if energies:
         recent_energy = jnp.mean(jnp.concatenate(energies))
-        print(f"  Current energy: {recent_energy:.6f}")
+        logger.info(f"  Current energy: {recent_energy:.6f}")
 
 
 
@@ -190,9 +193,9 @@ def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key
     # Use the pairing-based electron distribution algorithm
     alpha_counts, beta_counts = _distribute_electrons_by_pairing(atom_charges, n_alpha, n_beta)
     
-    print(f"Electron distribution by atom:")
+    logger.info(f"Electron distribution by atom:")
     for i in range(len(alpha_counts)):
-        print(f"  Atom {i}: {alpha_counts[i]} up, {beta_counts[i]} down")
+        logger.info(f"  Atom {i}: {alpha_counts[i]} up, {beta_counts[i]} down")
     
     # Generate positions for up-spin electrons around each atom
     alpha_positions = []
@@ -243,7 +246,7 @@ def init_electron_configs(atom_coords, atom_charges, n_electrons, n_walkers, key
     # Combine up and down positions in correct order
     all_positions = jnp.concatenate([all_alpha_positions, all_beta_positions], axis=1)
     
-    print(f"Initialized {n_alpha} up-spin and {n_beta} down-spin electrons around {n_atoms} atoms")
+    logger.info(f"Initialized {n_alpha} up-spin and {n_beta} down-spin electrons around {n_atoms} atoms")
     
     return all_positions
 
