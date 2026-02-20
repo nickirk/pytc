@@ -133,7 +133,44 @@ e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 
 ## Code Overview
 
-<img width="1041" height="731" alt="pytc" src="https://github.com/user-attachments/assets/b7ac0fb8-d960-4474-8283-1891b9de6228" />
+
+<div align="center">
+
+```mermaid
+flowchart TD
+    PySCF["🔬 PySCF — gto.Mole · scf.RHF"]
+
+    subgraph jastrow["pytc.jastrow"]
+        J["BoysHandy · NuclearCusp · NeuralNet · REXP"]
+    end
+
+    subgraph ansatz["pytc.ansatz"]
+        SJ["SlaterJastrow = SlaterDet + Jastrow"]
+    end
+
+    subgraph vmc["pytc.vmc"]
+        V["Metropolis sampler — SR / Adam optimizer"]
+    end
+
+    subgraph xtc["pytc.xtc · kmat · df"]
+        X["XTC exact / ISDFXTC D & X kernels / K1 · K3"]
+    end
+
+    subgraph solver["pytc.solver"]
+        S["RCCSD — non-Hermitian CCSD"]
+    end
+
+    PySCF --> jastrow
+    PySCF --> ansatz
+    jastrow --> ansatz
+    ansatz -->|VMC optimize| vmc
+    vmc -->|optimized params| xtc
+    jastrow -->|Jastrow factor| xtc
+    xtc -->|ERIs| solver
+    PySCF -->|mf| solver
+```
+
+</div>
 
 ## Usage
 
@@ -186,3 +223,11 @@ Contributions are welcome! Here's how you can help:
 - Follow the existing code conventions in the repository
 - Use type hints where appropriate
 - Add docstrings to new functions and classes
+
+## For AI Agents
+
+If you are an AI coding assistant working on this repository, please read the documentation in the `.agents/` directory before proceeding. This directory contains important rules, architecture details, and step-by-step workflows.
+
+- `.agents/rules.md`: Core conventions and constraints for `pytc`.
+- `.agents/ARCHITECTURE.md`: High-level explanation of the codebase structure.
+- `.agents/workflows/`: Checklists and standardized processes for adding code (e.g., adding a new Jastrow factor, creating PRs).
