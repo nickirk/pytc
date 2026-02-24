@@ -13,6 +13,7 @@ Default settings are intentionally small enough for quick local runs.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import time
 import uuid
@@ -64,11 +65,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-path", type=str, default=None,
                    help="Optional HDF5 path. Default: auto temp file name per run.")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logger level for pytc package output.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    pytc_logger = logging.getLogger("pytc")
+    pytc_logger.setLevel(getattr(logging, args.log_level))
+    for handler in pytc_logger.handlers:
+        handler.setLevel(getattr(logging, args.log_level))
+
     if args.verbose:
         print("JAX devices:", jax.devices(), flush=True)
     print(f"local_device_count={jax.local_device_count()}", flush=True)

@@ -757,7 +757,15 @@ class ISDFXTC(XTC, ISDFTC):
             save_path=actual_save_path
         )
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000, orb_block_size=128, host_grid_block_size=None):
+    def isdf(
+        self,
+        jastrow_params,
+        save_path=None,
+        batch_size=1000,
+        orb_block_size=128,
+        host_grid_block_size=None,
+        x_s_panel_blocks=1,
+    ):
         """Compute ISDF intermediates and store them.
         
         Args:
@@ -766,6 +774,8 @@ class ISDFXTC(XTC, ISDFTC):
             batch_size: Batch size for computation.
             orb_block_size: Block size for orbital batching of X kernel.
             host_grid_block_size: Block size for grid batching on host.
+            x_s_panel_blocks: Number of contiguous `s` orbital blocks processed
+                together per X-kernel grid pass.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -806,7 +816,8 @@ class ISDFXTC(XTC, ISDFTC):
             jastrow_params, batch_size, L_aux=kernels.get('L_aux'),
             orb_block_size=orb_block_size,
             save_path=out_path,
-            host_grid_block_size=host_grid_block_size
+            host_grid_block_size=host_grid_block_size,
+            x_s_panel_blocks=x_s_panel_blocks,
         )
         kernels.update(delta_u_kernels)
         
@@ -826,7 +837,16 @@ class ISDFXTC(XTC, ISDFTC):
         
         return self.replace(isdf_kernels=kernels, save_path=out_path)
 
-    def compute_delta_u_kernels(self, jastrow_params, batch_size=1000, L_aux=None, orb_block_size=128, save_path=None, host_grid_block_size=None):
+    def compute_delta_u_kernels(
+        self,
+        jastrow_params,
+        batch_size=1000,
+        L_aux=None,
+        orb_block_size=128,
+        save_path=None,
+        host_grid_block_size=None,
+        x_s_panel_blocks=1,
+    ):
         """Compute D, X kernels for Delta U with orbital and grid batching."""
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
@@ -878,21 +898,47 @@ class ISDFXTC(XTC, ISDFTC):
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
+        x_s_panel_blocks = max(1, int(x_s_panel_blocks))
+        s_panel_span = max(1, orb_block_size) * x_s_panel_blocks
+
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
         for r0 in range(0, n_orb, orb_block_size):
             r1 = min(r0 + orb_block_size, n_orb)
             logger.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
-            for s0 in range(r0, n_orb, orb_block_size):  # Start from r0 for upper triangle
-                s1 = min(s0 + orb_block_size, n_orb)
-            
-                ranges = (slice(None), slice(None), slice(r0, r1), slice(s0, s1))
-                X_block = self._compute_X_kernel(jastrow_params, ranges, batch_size, L_aux, Gb=Gb, L_Q=L_Q, host_grid_block_size=host_grid_block_size)
-                X_block_np = np.array(X_block)
-                X[r0:r1, s0:s1, :] = X_block_np
-                # Fill symmetric block (only if not diagonal)
-                if r0 != s0:
-                    X[s0:s1, r0:r1, :] = X_block_np.transpose(1, 0, 2)
-                del X_block, X_block_np
+            for s_panel0 in range(r0, n_orb, s_panel_span):
+                s_panel1 = min(s_panel0 + s_panel_span, n_orb)
+                logger.debug(
+                    "  compute_delta_u_kernels: X panel r=[%d:%d], s=[%d:%d], panel_blocks=%d",
+                    r0, r1, s_panel0, s_panel1, x_s_panel_blocks,
+                )
+                ranges = (
+                    slice(None),
+                    slice(None),
+                    slice(r0, r1),
+                    slice(s_panel0, s_panel1),
+                )
+                X_panel = self._compute_X_kernel(
+                    jastrow_params,
+                    ranges,
+                    batch_size,
+                    L_aux,
+                    Gb=Gb,
+                    L_Q=L_Q,
+                    host_grid_block_size=host_grid_block_size,
+                )
+                X_panel_np = np.asarray(X_panel)
+
+                for s0 in range(s_panel0, s_panel1, orb_block_size):
+                    s1 = min(s0 + orb_block_size, s_panel1)
+                    off0 = s0 - s_panel0
+                    off1 = s1 - s_panel0
+                    X_block_np = X_panel_np[:, off0:off1, :]
+                    X[r0:r1, s0:s1, :] = X_block_np
+                    # Fill symmetric block (only if not diagonal).
+                    if r0 != s0:
+                        X[s0:s1, r0:r1, :] = X_block_np.transpose(1, 0, 2)
+
+                del X_panel, X_panel_np
                 gc.collect()
                 
         if save_path:
@@ -900,6 +946,84 @@ class ISDFXTC(XTC, ISDFTC):
             return {'D': f['D'][:], 'X': X}
         else:
             return {'D': D, 'X': X}
+
+    def _iter_sharded_delta_u_blocks(
+        self,
+        L_aux,
+        xi_phi_source,
+        host_grid_block_size,
+        block_padded,
+        n_rank,
+        devices,
+        grid_sharding,
+        weights_sharding,
+        g_sharding,
+        xi_sharding,
+    ):
+        """Yield prefetch-staged and sharded grid blocks for D/X kernels."""
+        from pytc.utils.prefetch import PrefetchIterator, safe_hdf5_read
+
+        n_devices = len(devices)
+        n_grid = self.grid_points.shape[0]
+        n_per_dev = block_padded // n_devices
+        block_keys = [
+            (g0, min(g0 + host_grid_block_size, n_grid))
+            for g0 in range(0, n_grid, host_grid_block_size)
+        ]
+
+        def _load_block(key):
+            g0_loc, g1_loc = key
+            t_host_start = time.perf_counter()
+
+            gb = np.asarray(self.grid_points[g0_loc:g1_loc])
+            wb = np.asarray(self.weights[g0_loc:g1_loc])
+            G_block = -safe_hdf5_read(L_aux, (slice(None), slice(g0_loc, g1_loc), slice(None)))
+            xi_block = safe_hdf5_read(
+                xi_phi_source,
+                (slice(None), slice(g0_loc, g1_loc)),
+            )
+
+            cur_len = g1_loc - g0_loc
+            if cur_len < block_padded:
+                pad = block_padded - cur_len
+                gb = np.pad(gb, ((0, pad), (0, 0)))
+                wb = np.pad(wb, ((0, pad),))
+                G_block = np.pad(G_block, ((0, 0), (0, pad), (0, 0)))
+                xi_block = np.pad(xi_block, ((0, 0), (0, pad)))
+
+            t_host = time.perf_counter() - t_host_start
+            return g0_loc, g1_loc, gb, wb, G_block, xi_block, t_host
+
+        with PrefetchIterator(block_keys, _load_block, prefetch_depth=1) as block_iter:
+            for _, loaded in block_iter:
+                g0_loc, g1_loc, gb, wb, G_block, xi_block, t_host = loaded
+                t_h2d_start = time.perf_counter()
+                grid_parts = []
+                weight_parts = []
+                g_parts = []
+                xi_parts = []
+                for d in range(n_devices):
+                    s = d * n_per_dev
+                    e = (d + 1) * n_per_dev
+                    grid_parts.append(jax.device_put(gb[s:e], devices[d]))
+                    weight_parts.append(jax.device_put(wb[s:e], devices[d]))
+                    g_parts.append(jax.device_put(G_block[:, s:e, :], devices[d]))
+                    xi_parts.append(jax.device_put(xi_block[:, s:e], devices[d]))
+
+                s_grid = jax.make_array_from_single_device_arrays(
+                    (block_padded, 3), grid_sharding, grid_parts
+                )
+                s_weights = jax.make_array_from_single_device_arrays(
+                    (block_padded,), weights_sharding, weight_parts
+                )
+                s_G = jax.make_array_from_single_device_arrays(
+                    (n_rank, block_padded, 3), g_sharding, g_parts
+                )
+                s_xi = jax.make_array_from_single_device_arrays(
+                    (n_rank, block_padded), xi_sharding, xi_parts
+                )
+                t_h2d = time.perf_counter() - t_h2d_start
+                yield g0_loc, g1_loc, s_grid, s_weights, s_G, s_xi, t_host, t_h2d
 
     def _compute_D_kernel(self, jastrow_params, batch_size=1024, L_aux=None, Gb=None, host_grid_block_size=None):
         """Compute D kernel for Delta U with grid-blocking to save host RAM."""
@@ -937,8 +1061,6 @@ class ISDFXTC(XTC, ISDFTC):
         xi_sharding = NamedSharding(mesh, P(None, 'devices'))
         g_sharding = NamedSharding(mesh, P(None, 'devices', None))
 
-        from pytc.utils.prefetch import safe_hdf5_read
-
         @shard_map(
             mesh=mesh,
             in_specs=(P('devices', None), P('devices'), P(None, 'devices'), P(None, 'devices', None), P()),
@@ -954,57 +1076,48 @@ class ISDFXTC(XTC, ISDFTC):
 
         params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
         block_padded = ((host_grid_block_size + n_devices - 1) // n_devices) * n_devices
-        n_per_dev = block_padded // n_devices
 
-        def _prepare_D_block(g0_loc):
-            """Prepare one host block and place it as named-sharded device arrays."""
-            g1_loc = min(g0_loc + host_grid_block_size, n_grid)
-            gb = np.asarray(self.grid_points[g0_loc:g1_loc])
-            wb = np.asarray(self.weights[g0_loc:g1_loc])
-
-            G_block = -safe_hdf5_read(L_aux, (slice(None), slice(g0_loc, g1_loc), slice(None)))
-            if self.xi_phi is not None:
-                xi_block = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc)))
-            else:
-                xi_block = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc)))
-
-            cur_len = g1_loc - g0_loc
-            if cur_len < block_padded:
-                pad = block_padded - cur_len
-                gb = np.pad(gb, ((0, pad), (0, 0)))
-                wb = np.pad(wb, ((0, pad),))
-                G_block = np.pad(G_block, ((0, 0), (0, pad), (0, 0)))
-                xi_block = np.pad(xi_block, ((0, 0), (0, pad)))
-
-            grid_parts = []
-            w_parts = []
-            g_parts = []
-            xi_parts = []
-            for d in range(n_devices):
-                s = d * n_per_dev
-                e = (d + 1) * n_per_dev
-                grid_parts.append(jax.device_put(gb[s:e], devices[d]))
-                w_parts.append(jax.device_put(wb[s:e], devices[d]))
-                g_parts.append(jax.device_put(G_block[:, s:e, :], devices[d]))
-                xi_parts.append(jax.device_put(xi_block[:, s:e], devices[d]))
-
-            s_grid = jax.make_array_from_single_device_arrays((block_padded, 3), grid_sharding, grid_parts)
-            s_weights = jax.make_array_from_single_device_arrays((block_padded,), weights_sharding, w_parts)
-            s_G = jax.make_array_from_single_device_arrays((n_rank, block_padded, 3), g_sharding, g_parts)
-            s_xi = jax.make_array_from_single_device_arrays((n_rank, block_padded), xi_sharding, xi_parts)
-            return s_grid, s_weights, s_G, s_xi
+        n_blocks = (n_grid + host_grid_block_size - 1) // host_grid_block_size
+        block_input_bytes = (
+            block_padded * 3 * 8 +             # grid
+            block_padded * 8 +                 # weights
+            n_rank * block_padded * 3 * 8 +    # G
+            n_rank * block_padded * 8          # xi
+        )
+        d_reduce_bytes = n_rank * n_rank * 8
+        t_prepare_host = 0.0
+        t_h2d = 0.0
+        t_shard_compute = 0.0
+        t_host_accumulate = 0.0
+        t_kernel_start = time.perf_counter()
 
         try:
-            logger.info(
+            logger.debug(
                 f"  _compute_D_kernel: Starting shard_map "
                 f"(n_rank={n_rank}, n_grid={n_grid}, n_devices={n_devices})..."
             )
-            for g0 in range(0, n_grid, host_grid_block_size):
-                g1 = min(g0 + host_grid_block_size, n_grid)
+            xi_phi_source = self.xi_phi if self.xi_phi is not None else xi_phi_ds
+            for g0, g1, sharded_grid, sharded_weights, sharded_G, sharded_xi_phi, t_host_blk, t_h2d_blk in self._iter_sharded_delta_u_blocks(
+                L_aux=L_aux,
+                xi_phi_source=xi_phi_source,
+                host_grid_block_size=host_grid_block_size,
+                block_padded=block_padded,
+                n_rank=n_rank,
+                devices=devices,
+                grid_sharding=grid_sharding,
+                weights_sharding=weights_sharding,
+                g_sharding=g_sharding,
+                xi_sharding=xi_sharding,
+            ):
                 logger.debug(f"_compute_D_kernel: Processing grid block [{g0}:{g1}]...")
-                sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_D_block(g0)
+                t_prepare_host += t_host_blk
+                t_h2d += t_h2d_blk
+                t_compute_start = time.perf_counter()
                 D_rep = sharded_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, params_rep)
+                t_shard_compute += time.perf_counter() - t_compute_start
+                t_accum_start = time.perf_counter()
                 D += np.asarray(D_rep)
+                t_host_accumulate += time.perf_counter() - t_accum_start
                 
                 # Explicitly clear memory
                 del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, D_rep
@@ -1012,6 +1125,19 @@ class ISDFXTC(XTC, ISDFTC):
                 
         finally:
             if f_xi: f_xi.close()
+        t_total = time.perf_counter() - t_kernel_start
+        logger.debug(
+            "  _compute_D_kernel profile: blocks=%d, input_block=%.2f MiB, reduce_block=%.2f MiB, "
+            "prepare_host=%.4f s, host_to_device=%.4f s, shard_compute=%.4f s, host_accumulate=%.4f s, total=%.4f s",
+            n_blocks,
+            block_input_bytes / (1024.0 ** 2),
+            d_reduce_bytes / (1024.0 ** 2),
+            t_prepare_host,
+            t_h2d,
+            t_shard_compute,
+            t_host_accumulate,
+            t_total,
+        )
             
         return D
 
@@ -1065,8 +1191,6 @@ class ISDFXTC(XTC, ISDFTC):
         xi_sharding = NamedSharding(mesh, P(None, 'devices'))
         g_sharding = NamedSharding(mesh, P(None, 'devices', None))
 
-        from pytc.utils.prefetch import safe_hdf5_read
-
         @shard_map(
             mesh=mesh,
             in_specs=(P('devices', None), P('devices'), P(None, 'devices'), P(None, 'devices', None), P()),
@@ -1082,57 +1206,48 @@ class ISDFXTC(XTC, ISDFTC):
 
         params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
         block_padded = ((host_grid_block_size + n_devices - 1) // n_devices) * n_devices
-        n_per_dev = block_padded // n_devices
 
-        def _prepare_X_block(g0_loc):
-            """Prepare one host block and place it as named-sharded device arrays."""
-            g1_loc = min(g0_loc + host_grid_block_size, n_grid)
-            gb = np.asarray(self.grid_points[g0_loc:g1_loc])
-            wb = np.asarray(self.weights[g0_loc:g1_loc])
-
-            G_block = -safe_hdf5_read(L_aux, (slice(None), slice(g0_loc, g1_loc), slice(None)))
-            if self.xi_phi is not None:
-                xi_block = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc)))
-            else:
-                xi_block = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc)))
-
-            cur_len = g1_loc - g0_loc
-            if cur_len < block_padded:
-                pad = block_padded - cur_len
-                gb = np.pad(gb, ((0, pad), (0, 0)))
-                wb = np.pad(wb, ((0, pad),))
-                G_block = np.pad(G_block, ((0, 0), (0, pad), (0, 0)))
-                xi_block = np.pad(xi_block, ((0, 0), (0, pad)))
-
-            grid_parts = []
-            w_parts = []
-            g_parts = []
-            xi_parts = []
-            for d in range(n_devices):
-                s = d * n_per_dev
-                e = (d + 1) * n_per_dev
-                grid_parts.append(jax.device_put(gb[s:e], devices[d]))
-                w_parts.append(jax.device_put(wb[s:e], devices[d]))
-                g_parts.append(jax.device_put(G_block[:, s:e, :], devices[d]))
-                xi_parts.append(jax.device_put(xi_block[:, s:e], devices[d]))
-
-            s_grid = jax.make_array_from_single_device_arrays((block_padded, 3), grid_sharding, grid_parts)
-            s_weights = jax.make_array_from_single_device_arrays((block_padded,), weights_sharding, w_parts)
-            s_G = jax.make_array_from_single_device_arrays((n_rank, block_padded, 3), g_sharding, g_parts)
-            s_xi = jax.make_array_from_single_device_arrays((n_rank, block_padded), xi_sharding, xi_parts)
-            return s_grid, s_weights, s_G, s_xi
+        n_blocks = (n_grid + host_grid_block_size - 1) // host_grid_block_size
+        block_input_bytes = (
+            block_padded * 3 * 8 +             # grid
+            block_padded * 8 +                 # weights
+            n_rank * block_padded * 3 * 8 +    # G
+            n_rank * block_padded * 8          # xi
+        )
+        x_reduce_bytes = Nr * Ns * n_rank * 8
+        t_prepare_host = 0.0
+        t_h2d = 0.0
+        t_shard_compute = 0.0
+        t_host_accumulate = 0.0
+        t_kernel_start = time.perf_counter()
 
         try:
-            logger.info(
+            logger.debug(
                 f"  _compute_X_kernel: Starting shard_map "
                 f"(n_rank={n_rank}, n_grid={n_grid}, n_devices={n_devices})..."
             )
-            for g0 in range(0, n_grid, host_grid_block_size):
-                g1 = min(g0 + host_grid_block_size, n_grid)
+            xi_phi_source = self.xi_phi if self.xi_phi is not None else xi_phi_ds
+            for g0, g1, sharded_grid, sharded_weights, sharded_G, sharded_xi_phi, t_host_blk, t_h2d_blk in self._iter_sharded_delta_u_blocks(
+                L_aux=L_aux,
+                xi_phi_source=xi_phi_source,
+                host_grid_block_size=host_grid_block_size,
+                block_padded=block_padded,
+                n_rank=n_rank,
+                devices=devices,
+                grid_sharding=grid_sharding,
+                weights_sharding=weights_sharding,
+                g_sharding=g_sharding,
+                xi_sharding=xi_sharding,
+            ):
                 logger.debug(f"_compute_X_kernel: Processing grid block [{g0}:{g1}]...")
-                sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_X_block(g0)
+                t_prepare_host += t_host_blk
+                t_h2d += t_h2d_blk
+                t_compute_start = time.perf_counter()
                 X_rep = sharded_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, params_rep)
+                t_shard_compute += time.perf_counter() - t_compute_start
+                t_accum_start = time.perf_counter()
                 X += np.asarray(X_rep)
+                t_host_accumulate += time.perf_counter() - t_accum_start
                 
                 # Explicitly clear memory
                 del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, X_rep
@@ -1140,6 +1255,19 @@ class ISDFXTC(XTC, ISDFTC):
                 
         finally:
             if f_xi: f_xi.close()
+        t_total = time.perf_counter() - t_kernel_start
+        logger.debug(
+            "  _compute_X_kernel profile: blocks=%d, input_block=%.2f MiB, reduce_block=%.2f MiB, "
+            "prepare_host=%.4f s, host_to_device=%.4f s, shard_compute=%.4f s, host_accumulate=%.4f s, total=%.4f s",
+            n_blocks,
+            block_input_bytes / (1024.0 ** 2),
+            x_reduce_bytes / (1024.0 ** 2),
+            t_prepare_host,
+            t_h2d,
+            t_shard_compute,
+            t_host_accumulate,
+            t_total,
+        )
             
         return X
 
