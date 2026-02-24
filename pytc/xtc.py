@@ -8,11 +8,14 @@ import logging
 import time
 import jax
 import jax.numpy as jnp
+from jax import shard_map
+from jax.sharding import NamedSharding, PartitionSpec as P
 import h5py
 from flax import struct
 from .tc import TC, ISDFTC
 from . import tc_helper
 from . import kmat as kmat_jax
+from .utils import sharding_core
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +190,7 @@ class XTC(TC):
         start_time = time.perf_counter()
         logger.debug("Starting XTC.get_delta_U")
         n_devices = jax.local_device_count()
+        devices = jax.local_devices()
         n_grid = self.n_grid
         
         if dm1 is None:
@@ -203,22 +207,26 @@ class XTC(TC):
         remainder = n_grid % n_devices
         if remainder != 0:
             padding = n_devices - remainder
-            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
-            padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_phi = jnp.pad(self.phi, ((0, 0), (0, padding)))
+            padded_grid_points = np.pad(np.asarray(self.grid_points), ((0, padding), (0, 0)))
+            padded_weights = np.pad(np.asarray(self.weights), ((0, padding),))
+            padded_phi = np.pad(np.asarray(self.phi), ((0, 0), (0, padding)))
         else:
-            padded_grid_points = self.grid_points
-            padded_weights = self.weights
-            padded_phi = self.phi
-            
-        n_grid_padded = padded_grid_points.shape[0]
-        n_per_device = n_grid_padded // n_devices
-        
-        # Shard arrays for r1: (n_devices, n_per_device, ...)
-        sharded_grid_r1 = padded_grid_points.reshape(n_devices, n_per_device, 3)
-        sharded_weights_r1 = padded_weights.reshape(n_devices, n_per_device)
-        # phi: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
-        sharded_phi_r1 = padded_phi.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
+            padded_grid_points = np.asarray(self.grid_points)
+            padded_weights = np.asarray(self.weights)
+            padded_phi = np.asarray(self.phi)
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        grid_sharding = NamedSharding(mesh, P('devices', None))
+        weights_sharding = NamedSharding(mesh, P('devices'))
+        phi_sharding = NamedSharding(mesh, P(None, 'devices'))
+
+        sharded_grid_r1 = jax.device_put(padded_grid_points, grid_sharding)
+        sharded_weights_r1 = jax.device_put(padded_weights, weights_sharding)
+        sharded_phi_r1 = jax.device_put(padded_phi, phi_sharding)
+        params_rep = jax.tree_util.tree_map(
+            lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
+        )
         
         # Define ranges
         if ranges is None:
@@ -410,12 +418,16 @@ class XTC(TC):
             total_delta_U = jax.lax.psum(local_delta_U, axis_name='devices')
             return total_delta_U
 
-        # Execute pmap
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, None))
-        
-        delta_U_replicated = pmapped_compute(sharded_grid_r1, sharded_weights_r1, sharded_phi_r1, jastrow_params)
-        
-        total_delta_U = delta_U_replicated[0]
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P('devices', None), P('devices'), P(None, 'devices'), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+        def sharded_compute(grid_r1, weights_r1, phi_r1, params):
+            return compute_on_device(grid_r1, weights_r1, phi_r1, params)
+
+        total_delta_U = sharded_compute(sharded_grid_r1, sharded_weights_r1, sharded_phi_r1, params_rep)
         
         total_time = time.perf_counter() - start_time
         logger.debug(f"XTC.get_delta_U completed in {total_time:.4f} s")
@@ -717,6 +729,7 @@ class ISDFXTC(XTC, ISDFTC):
             n_rank = xtc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
+        logger.info("ISDFXTC.from_xtc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
             is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
@@ -916,76 +929,82 @@ class ISDFXTC(XTC, ISDFTC):
         if self.xi_phi is None and self.save_path:
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
-            
-        # 4. Run pmap
-        def compute_D_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb):
-            return self._calc_D_shard(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        grid_sharding = NamedSharding(mesh, P('devices', None))
+        weights_sharding = NamedSharding(mesh, P('devices'))
+        xi_sharding = NamedSharding(mesh, P(None, 'devices'))
+        g_sharding = NamedSharding(mesh, P(None, 'devices', None))
+
+        from pytc.utils.prefetch import safe_hdf5_read
+
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P('devices', None), P('devices'), P(None, 'devices'), P(None, 'devices', None), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+        def sharded_D(grid_shard, weights_shard, xi_shard, G_shard, params):
+            d_local = self._calc_D_shard(
+                params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
                 Gb, phi_isdf, None, n_orb, batch_size
             )
-            
-        pmapped_D = jax.pmap(compute_D_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None))
+            return jax.lax.psum(d_local, 'devices')
 
-        from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
+        params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
+        block_padded = ((host_grid_block_size + n_devices - 1) // n_devices) * n_devices
+        n_per_dev = block_padded // n_devices
 
         def _prepare_D_block(g0_loc):
-            """Prepare sharded data for one D-kernel grid block (background-safe)."""
+            """Prepare one host block and place it as named-sharded device arrays."""
             g1_loc = min(g0_loc + host_grid_block_size, n_grid)
-            n_blk = g1_loc - g0_loc
-            rem = n_blk % n_devices
-            pad = (n_devices - rem) if rem != 0 else 0
-            n_blk_p = n_blk + pad
-            n_per_dev = n_blk_p // n_devices
-
             gb = np.asarray(self.grid_points[g0_loc:g1_loc])
             wb = np.asarray(self.weights[g0_loc:g1_loc])
-            if pad > 0:
+
+            G_block = -safe_hdf5_read(L_aux, (slice(None), slice(g0_loc, g1_loc), slice(None)))
+            if self.xi_phi is not None:
+                xi_block = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc)))
+            else:
+                xi_block = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc)))
+
+            cur_len = g1_loc - g0_loc
+            if cur_len < block_padded:
+                pad = block_padded - cur_len
                 gb = np.pad(gb, ((0, pad), (0, 0)))
                 wb = np.pad(wb, ((0, pad),))
-            s_grid = gb.reshape(n_devices, n_per_dev, 3)
-            s_weights = wb.reshape(n_devices, n_per_dev)
+                G_block = np.pad(G_block, ((0, 0), (0, pad), (0, 0)))
+                xi_block = np.pad(xi_block, ((0, 0), (0, pad)))
 
-            G_list = []
-            xi_list = []
+            grid_parts = []
+            w_parts = []
+            g_parts = []
+            xi_parts = []
             for d in range(n_devices):
-                start = g0_loc + d * n_per_dev
-                end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
-                alen = end - start
-                G_d = -safe_hdf5_read(L_aux, (slice(None), slice(start, end), slice(None)))
-                if alen < n_per_dev:
-                    G_d = np.pad(G_d, ((0, 0), (0, n_per_dev - alen), (0, 0)))
-                G_list.append(jax.device_put(G_d, devices[d]))
-                if self.xi_phi is not None:
-                    xp = safe_hdf5_read(self.xi_phi, (slice(None), slice(start, end)))
-                else:
-                    xp = safe_hdf5_read(xi_phi_ds, (slice(None), slice(start, end)))
-                if alen < n_per_dev:
-                    xp = np.pad(xp, ((0, 0), (0, n_per_dev - alen)))
-                xi_list.append(jax.device_put(xp, devices[d]))
-            s_G = jax.device_put_sharded(G_list, devices)
-            s_xi = jax.device_put_sharded(xi_list, devices)
+                s = d * n_per_dev
+                e = (d + 1) * n_per_dev
+                grid_parts.append(jax.device_put(gb[s:e], devices[d]))
+                w_parts.append(jax.device_put(wb[s:e], devices[d]))
+                g_parts.append(jax.device_put(G_block[:, s:e, :], devices[d]))
+                xi_parts.append(jax.device_put(xi_block[:, s:e], devices[d]))
+
+            s_grid = jax.make_array_from_single_device_arrays((block_padded, 3), grid_sharding, grid_parts)
+            s_weights = jax.make_array_from_single_device_arrays((block_padded,), weights_sharding, w_parts)
+            s_G = jax.make_array_from_single_device_arrays((n_rank, block_padded, 3), g_sharding, g_parts)
+            s_xi = jax.make_array_from_single_device_arrays((n_rank, block_padded), xi_sharding, xi_parts)
             return s_grid, s_weights, s_G, s_xi
 
         try:
-            pending_D = None
+            logger.info(
+                f"  _compute_D_kernel: Starting shard_map "
+                f"(n_rank={n_rank}, n_grid={n_grid}, n_devices={n_devices})..."
+            )
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 logger.debug(f"_compute_D_kernel: Processing grid block [{g0}:{g1}]...")
-
-                if pending_D is not None:
-                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = await_read(pending_D)
-                    pending_D = None
-                else:
-                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_D_block(g0)
-                
-                D_rep = pmapped_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb)
-
-                # While GPU runs pmap, prefetch next block
-                next_g0 = g0 + host_grid_block_size
-                if next_g0 < n_grid:
-                    pending_D = async_read(lambda _g=next_g0: _prepare_D_block(_g))
-
-                D += np.array(jnp.sum(D_rep, axis=0))
+                sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_D_block(g0)
+                D_rep = sharded_D(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, params_rep)
+                D += np.asarray(D_rep)
                 
                 # Explicitly clear memory
                 del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, D_rep
@@ -1038,76 +1057,82 @@ class ISDFXTC(XTC, ISDFTC):
         if self.xi_phi is None and self.save_path:
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
-            
-        # 4. Run pmap
-        def compute_X_on_device(grid_shard, weights_shard, xi_shard, G_shard, jastrow_params, Gb, dm1, phi_isdf, n_orb, L_Q):
-            return self._calc_X_shard(
-                jastrow_params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        grid_sharding = NamedSharding(mesh, P('devices', None))
+        weights_sharding = NamedSharding(mesh, P('devices'))
+        xi_sharding = NamedSharding(mesh, P(None, 'devices'))
+        g_sharding = NamedSharding(mesh, P(None, 'devices', None))
+
+        from pytc.utils.prefetch import safe_hdf5_read
+
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P('devices', None), P('devices'), P(None, 'devices'), P(None, 'devices', None), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+        def sharded_X(grid_shard, weights_shard, xi_shard, G_shard, params):
+            x_local = self._calc_X_shard(
+                params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
                 Gb, phi_isdf, ranges, n_orb, batch_size, L_Q
             )
-            
-        pmapped_X = jax.pmap(compute_X_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None, None, None))
+            return jax.lax.psum(x_local, 'devices')
 
-        from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
+        params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
+        block_padded = ((host_grid_block_size + n_devices - 1) // n_devices) * n_devices
+        n_per_dev = block_padded // n_devices
 
         def _prepare_X_block(g0_loc):
-            """Prepare sharded data for one X-kernel grid block (background-safe)."""
+            """Prepare one host block and place it as named-sharded device arrays."""
             g1_loc = min(g0_loc + host_grid_block_size, n_grid)
-            n_blk = g1_loc - g0_loc
-            rem = n_blk % n_devices
-            pad = (n_devices - rem) if rem != 0 else 0
-            n_blk_p = n_blk + pad
-            n_per_dev = n_blk_p // n_devices
-
             gb = np.asarray(self.grid_points[g0_loc:g1_loc])
             wb = np.asarray(self.weights[g0_loc:g1_loc])
-            if pad > 0:
+
+            G_block = -safe_hdf5_read(L_aux, (slice(None), slice(g0_loc, g1_loc), slice(None)))
+            if self.xi_phi is not None:
+                xi_block = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc)))
+            else:
+                xi_block = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc)))
+
+            cur_len = g1_loc - g0_loc
+            if cur_len < block_padded:
+                pad = block_padded - cur_len
                 gb = np.pad(gb, ((0, pad), (0, 0)))
                 wb = np.pad(wb, ((0, pad),))
-            s_grid = gb.reshape(n_devices, n_per_dev, 3)
-            s_weights = wb.reshape(n_devices, n_per_dev)
+                G_block = np.pad(G_block, ((0, 0), (0, pad), (0, 0)))
+                xi_block = np.pad(xi_block, ((0, 0), (0, pad)))
 
-            G_list = []
-            xi_list = []
+            grid_parts = []
+            w_parts = []
+            g_parts = []
+            xi_parts = []
             for d in range(n_devices):
-                start = g0_loc + d * n_per_dev
-                end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
-                alen = end - start
-                G_d = -safe_hdf5_read(L_aux, (slice(None), slice(start, end), slice(None)))
-                if alen < n_per_dev:
-                    G_d = np.pad(G_d, ((0, 0), (0, n_per_dev - alen), (0, 0)))
-                G_list.append(jax.device_put(G_d, devices[d]))
-                if self.xi_phi is not None:
-                    xp = safe_hdf5_read(self.xi_phi, (slice(None), slice(start, end)))
-                else:
-                    xp = safe_hdf5_read(xi_phi_ds, (slice(None), slice(start, end)))
-                if alen < n_per_dev:
-                    xp = np.pad(xp, ((0, 0), (0, n_per_dev - alen)))
-                xi_list.append(jax.device_put(xp, devices[d]))
-            s_G = jax.device_put_sharded(G_list, devices)
-            s_xi = jax.device_put_sharded(xi_list, devices)
+                s = d * n_per_dev
+                e = (d + 1) * n_per_dev
+                grid_parts.append(jax.device_put(gb[s:e], devices[d]))
+                w_parts.append(jax.device_put(wb[s:e], devices[d]))
+                g_parts.append(jax.device_put(G_block[:, s:e, :], devices[d]))
+                xi_parts.append(jax.device_put(xi_block[:, s:e], devices[d]))
+
+            s_grid = jax.make_array_from_single_device_arrays((block_padded, 3), grid_sharding, grid_parts)
+            s_weights = jax.make_array_from_single_device_arrays((block_padded,), weights_sharding, w_parts)
+            s_G = jax.make_array_from_single_device_arrays((n_rank, block_padded, 3), g_sharding, g_parts)
+            s_xi = jax.make_array_from_single_device_arrays((n_rank, block_padded), xi_sharding, xi_parts)
             return s_grid, s_weights, s_G, s_xi
 
         try:
-            pending_X = None
+            logger.info(
+                f"  _compute_X_kernel: Starting shard_map "
+                f"(n_rank={n_rank}, n_grid={n_grid}, n_devices={n_devices})..."
+            )
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 logger.debug(f"_compute_X_kernel: Processing grid block [{g0}:{g1}]...")
-
-                if pending_X is not None:
-                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = await_read(pending_X)
-                    pending_X = None
-                else:
-                    sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_X_block(g0)
-                
-                X_rep = pmapped_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, jastrow_params, Gb, dm1, phi_isdf, n_orb, L_Q)
-
-                # While GPU runs pmap, prefetch next block
-                next_g0 = g0 + host_grid_block_size
-                if next_g0 < n_grid:
-                    pending_X = async_read(lambda _g=next_g0: _prepare_X_block(_g))
-
-                X += np.array(jnp.sum(X_rep, axis=0))
+                sharded_grid, sharded_weights, sharded_G, sharded_xi_phi = _prepare_X_block(g0)
+                X_rep = sharded_X(sharded_grid, sharded_weights, sharded_xi_phi, sharded_G, params_rep)
+                X += np.asarray(X_rep)
                 
                 # Explicitly clear memory
                 del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, X_rep
@@ -1271,7 +1296,7 @@ class ISDFXTC(XTC, ISDFTC):
 
 
     def get_delta_U(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
-        """Get delta_U matrix using ISDF with pmap support."""
+        """Get delta_U matrix using ISDF with shard_map multi-device support."""
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
             
@@ -1547,8 +1572,34 @@ class ISDFXTC(XTC, ISDFTC):
         if total_needed_gb < threshold:
             phi_r = self.phi_isdf[slice_r]
             phi_s = self.phi_isdf[slice_s]
-            return _contract_delta_U_kernels_jit(D, X_full, phi_p, phi_q, phi_r, phi_s,
-                                                  _rbs)
+            n_devices = jax.local_device_count()
+            if n_devices > 1 and Np >= n_devices:
+                mesh = sharding_core.create_1d_mesh(axis_name='devices')
+                p_sharding = NamedSharding(mesh, P('devices', None))
+                p_padded = ((Np + n_devices - 1) // n_devices) * n_devices
+                if p_padded > Np:
+                    phi_p_pad = jnp.pad(phi_p, ((0, p_padded - Np), (0, 0)))
+                else:
+                    phi_p_pad = phi_p
+                phi_p_sharded = jax.device_put(np.asarray(phi_p_pad), p_sharding)
+
+                @shard_map(
+                    mesh=mesh,
+                    in_specs=(P(), P(), P('devices', None), P(), P(), P()),
+                    out_specs=P('devices', None, None, None),
+                    check_vma=False,
+                )
+                def _contract_sharded(D_in, X_in, phi_p_in, phi_q_in, phi_r_in, phi_s_in):
+                    return _contract_delta_U_kernels_jit(
+                        D_in, X_in, phi_p_in, phi_q_in, phi_r_in, phi_s_in, _rbs
+                    )
+
+                out = _contract_sharded(D, X_full, phi_p_sharded, phi_q, phi_r, phi_s)
+                return out[:Np]
+
+            return _contract_delta_U_kernels_jit(
+                D, X_full, phi_p, phi_q, phi_r, phi_s, _rbs
+            )
         
         # Chunking strategy to avoid VRAM exhaustion
         logger.warning(f"  delta_U memory estimate ({total_needed_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
@@ -1686,4 +1737,3 @@ class ISDFXTC(XTC, ISDFTC):
                 
         return jnp.asarray(result)
     
-

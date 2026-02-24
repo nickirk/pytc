@@ -8,10 +8,13 @@ import time
 import gc
 import jax
 import jax.numpy as jnp
+from jax import shard_map
+from jax.sharding import NamedSharding, PartitionSpec as P
 import h5py
 from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
+from .utils import sharding_core
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +27,7 @@ logger = logging.getLogger(__name__)
 _FIXED_RBS_CACHE: dict = {}
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
-    """Compute K terms for a grid shard (pmapped)."""
+    """Compute K terms for one device shard."""
     # Helper to calculate size from tuple (start, stop, step)
     def get_size(r, size):
         start, stop, step = slice(*r).indices(size)
@@ -242,56 +245,62 @@ class TC:
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         n_devices = jax.local_device_count()
+        devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
-        
-        # Pad grid to be divisible by n_devices
+
+        # Pad grid axis to be divisible by n_devices
         remainder = n_grid % n_devices
-        if remainder != 0:
-            padding = n_devices - remainder
-            padded_grid_points = jnp.pad(self.grid_points, ((0, padding), (0, 0)))
-            padded_weights = jnp.pad(self.weights, ((0, padding),))
-            padded_phi = jnp.pad(self.phi, ((0, 0), (0, padding)))
-            padded_grad_phi = jnp.pad(self.grad_phi, ((0, 0), (0, padding), (0, 0)))
+        padding = (n_devices - remainder) if remainder != 0 else 0
+        if padding > 0:
+            padded_grid_points = np.pad(np.asarray(self.grid_points), ((0, padding), (0, 0)))
+            padded_weights = np.pad(np.asarray(self.weights), ((0, padding),))
+            padded_phi = np.pad(np.asarray(self.phi), ((0, 0), (0, padding)))
+            padded_grad_phi = np.pad(np.asarray(self.grad_phi), ((0, 0), (0, padding), (0, 0)))
         else:
-            padded_grid_points = self.grid_points
-            padded_weights = self.weights
-            padded_phi = self.phi
-            padded_grad_phi = self.grad_phi
-            
-        n_grid_padded = padded_grid_points.shape[0]
-        n_per_device = n_grid_padded // n_devices
-        
-        # Shard arrays: (n_devices, n_per_device, ...)
-        # grid: (N, 3) -> (n_dev, N_per, 3)
-        sharded_grid = padded_grid_points.reshape(n_devices, n_per_device, 3)
-        # weights: (N,) -> (n_dev, N_per)
-        sharded_weights = padded_weights.reshape(n_devices, n_per_device)
-        # phi: (Nb, N) -> (Nb, n_dev, N_per) -> (n_dev, Nb, N_per)
-        sharded_phi = padded_phi.reshape(self.n_orb, n_devices, n_per_device).transpose(1, 0, 2)
-        # grad_phi: (Nb, N, 3) -> (Nb, n_dev, N_per, 3) -> (n_dev, Nb, N_per, 3)
-        sharded_grad_phi = padded_grad_phi.reshape(self.n_orb, n_devices, n_per_device, 3).transpose(1, 0, 2, 3)
-        
-        # Execute pmap
-        pmapped_compute = jax.pmap(
-            _compute_2b_shard, 
-            axis_name='devices',
-            in_axes=(0, 0, 0, 0, None, None, None, None),
-            static_broadcasted_argnums=(6, 7)
+            padded_grid_points = np.asarray(self.grid_points)
+            padded_weights = np.asarray(self.weights)
+            padded_phi = np.asarray(self.phi)
+            padded_grad_phi = np.asarray(self.grad_phi)
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        grid_sharding = NamedSharding(mesh, P('devices', None))
+        weights_sharding = NamedSharding(mesh, P('devices'))
+        phi_sharding = NamedSharding(mesh, P(None, 'devices'))
+        grad_sharding = NamedSharding(mesh, P(None, 'devices', None))
+
+        sharded_grid = jax.device_put(padded_grid_points, grid_sharding)
+        sharded_weights = jax.device_put(padded_weights, weights_sharding)
+        sharded_phi = jax.device_put(padded_phi, phi_sharding)
+        sharded_grad_phi = jax.device_put(padded_grad_phi, grad_sharding)
+        params_rep = jax.tree_util.tree_map(
+            lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
         )
+
+        def _run_sharded(ranges_local):
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P(None, 'devices'), P(None, 'devices', None), P('devices', None), P('devices'), P()),
+                out_specs=P(),
+                check_vma=False,
+            )
+            def _compute(phi_shard, grad_shard, grid_shard, weights_shard, params):
+                return _compute_2b_shard(
+                    phi_shard, grad_shard, grid_shard, weights_shard,
+                    params, self.jastrow_factor, ranges_local, batch_size
+                )
+
+            return _compute(sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights, params_rep)
         
         if ranges is None:
             full_slice = slice(None)
             ranges = (full_slice, full_slice, full_slice, full_slice)
             
-        # Convert slices to hashable tuples for JAX static args
+        # Convert slices to hashable tuples for static closure args
         ranges_tuple = tuple((s.start, s.stop, s.step) for s in ranges)
-            
+
         # Compute main block: 0.5 * (K1 - K2 + K3)
-        result_sum = pmapped_compute(
-            sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
-            jastrow_params, self.jastrow_factor, ranges_tuple, batch_size
-        )
-        result = result_sum[0]
+        result = _run_sharded(ranges_tuple)
         
         # Add transpose block: (r, s, p, q)
         # Check if ranges imply symmetry
@@ -304,11 +313,7 @@ class TC:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             ranges_T_tuple = tuple((s.start, s.stop, s.step) for s in ranges_T)
             
-            result_sum_T = pmapped_compute(
-                sharded_phi, sharded_grad_phi, sharded_grid, sharded_weights,
-                jastrow_params, self.jastrow_factor, ranges_T_tuple, batch_size
-            )
-            result_T = result_sum_T[0]
+            result_T = _run_sharded(ranges_T_tuple)
             
             result += jax.lax.transpose(result_T, (2, 3, 0, 1))
         
@@ -542,6 +547,7 @@ class ISDFTC(TC):
             n_rank = tc_obj.grid_points.shape[0] // 4
             
         # Perform ISDF decomposition
+        logger.info("ISDFTC.from_tc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
             is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
@@ -580,6 +586,11 @@ class ISDFTC(TC):
         # Pad grid to be divisible by n_devices
         logger.debug(f"compute_kmat_kernels: Padding grid to be divisible by {n_devices} devices...")
         devices = jax.local_devices()
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        r2_grid_sharding = NamedSharding(mesh, P('devices', None))
+        r2_weights_sharding = NamedSharding(mesh, P('devices'))
+        r2_xi_sharding = NamedSharding(mesh, P(None, 'devices'))
         
         if host_grid_block_size is None:
             host_grid_block_size = n_grid
@@ -596,106 +607,117 @@ class ISDFTC(TC):
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
             xi_grad_ds = f_xi['xi_grad']
-            
-        # Full arrays for r2 (ket side) - on CPU
-        full_grid = jax.device_put(np.asarray(self.grid_points), devices[0])
-        full_weights = jax.device_put(np.asarray(self.weights), devices[0])
-        
-        if self.xi_phi is not None:
-            full_xi_phi = jax.device_put(self.xi_phi, devices[0])
-        else:
-            full_xi_phi = jax.device_put(xi_phi_ds[:], devices[0])
-            
+
+        from pytc.utils.prefetch import safe_hdf5_read
+
+        # Build r2-sharded arrays once (persistent across r1 host blocks).
+        n_per_dev_r2 = (n_grid + n_devices - 1) // n_devices
+        n_grid_r2_padded = n_per_dev_r2 * n_devices
+        grid_r2_parts = []
+        weights_r2_parts = []
+        xi_phi_r2_parts = []
+        for d in range(n_devices):
+            g0 = d * n_per_dev_r2
+            g1 = min(g0 + n_per_dev_r2, n_grid)
+            cur_len = g1 - g0
+
+            grid_d = np.asarray(self.grid_points[g0:g1])
+            weights_d = np.asarray(self.weights[g0:g1])
+            if self.xi_phi is not None:
+                xi_phi_d = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0, g1)))
+            else:
+                xi_phi_d = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0, g1)))
+
+            if cur_len < n_per_dev_r2:
+                pad = n_per_dev_r2 - cur_len
+                grid_d = np.pad(grid_d, ((0, pad), (0, 0)))
+                weights_d = np.pad(weights_d, ((0, pad),))
+                xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, pad)))
+
+            grid_r2_parts.append(jax.device_put(grid_d, devices[d]))
+            weights_r2_parts.append(jax.device_put(weights_d, devices[d]))
+            xi_phi_r2_parts.append(jax.device_put(xi_phi_d, devices[d]))
+
+        sharded_grid_r2 = jax.make_array_from_single_device_arrays(
+            (n_grid_r2_padded, 3), r2_grid_sharding, grid_r2_parts
+        )
+        sharded_weights_r2 = jax.make_array_from_single_device_arrays(
+            (n_grid_r2_padded,), r2_weights_sharding, weights_r2_parts
+        )
+        sharded_xi_phi_r2 = jax.make_array_from_single_device_arrays(
+            (n_rank, n_grid_r2_padded), r2_xi_sharding, xi_phi_r2_parts
+        )
+
         jastrow_factor = self.jastrow_factor
-        
-        def compute_on_device(grid_shard, weights_shard, xi_phi_shard, xi_grad_shard, jastrow_params, 
-                              full_grid, full_weights, full_xi_phi):
-            K1_shard = kmat_jax.calc_K1_kernel(
-                xi_grad_shard, full_xi_phi, weights_shard, full_weights,
-                jastrow_factor, jastrow_params,
-                grid_shard, full_grid, batch_size
-            )
-            
-            K3_shard = kmat_jax.calc_K3_kernel(
-                xi_phi_shard, full_xi_phi, weights_shard, full_weights,
-                jastrow_factor, jastrow_params,
-                grid_shard, full_grid, batch_size
-            )
-            return K1_shard, K3_shard
-            
-        # Convert ALL inputs to NumPy to avoid "incompatible devices" error in pmap.
-        # JAX will then handle broadcasting and streaming from Host RAM.
-        # Note: sharded_xi_phi and sharded_xi_grad are already device-resident or NumPy.
 
-        logger.info(f"  compute_kmat_kernels: Starting pmap for K-kernels (n_fused={n_rank}, n_grid={n_grid})...")
-        pmapped_compute = jax.pmap(compute_on_device, axis_name='devices', in_axes=(0, 0, 0, 0, None, None, None, None))
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P(), P(), P(), P(), P('devices', None), P('devices'), P(None, 'devices'), P()),
+            out_specs=(P(), P()),
+            check_vma=False,
+        )
+        def sharded_compute(
+            grid_r1_block, weights_r1_block, xi_phi_r1_block, xi_grad_r1_block,
+            grid_r2, weights_r2, xi_phi_r2, params
+        ):
+            k1_local = kmat_jax.calc_K1_kernel(
+                xi_grad_r1_block, xi_phi_r2, weights_r1_block, weights_r2,
+                jastrow_factor, params, grid_r1_block, grid_r2, batch_size
+            )
+            k3_local = kmat_jax.calc_K3_kernel(
+                xi_phi_r1_block, xi_phi_r2, weights_r1_block, weights_r2,
+                jastrow_factor, params, grid_r1_block, grid_r2, batch_size
+            )
+            return jax.lax.psum(k1_local, 'devices'), jax.lax.psum(k3_local, 'devices')
 
-        from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
+        params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
 
         def _prepare_kmat_block(g0_loc):
-            """Prepare sharded data for one grid block (runs in background thread)."""
+            """Prepare replicated r1 block data for one host block."""
             g1_loc = min(g0_loc + host_grid_block_size, n_grid)
-            n_block_loc = g1_loc - g0_loc
-            remainder_loc = n_block_loc % n_devices
-            padding_loc = (n_devices - remainder_loc) if remainder_loc != 0 else 0
-            n_block_padded_loc = n_block_loc + padding_loc
-            n_per_dev = n_block_padded_loc // n_devices
-
+            cur_len = g1_loc - g0_loc
             grid_block = self.grid_points[g0_loc:g1_loc]
             weights_block = self.weights[g0_loc:g1_loc]
-            if padding_loc > 0:
-                grid_block = np.pad(grid_block, ((0, padding_loc), (0, 0)))
-                weights_block = np.pad(weights_block, ((0, padding_loc),))
-            s_grid = grid_block.reshape(n_devices, n_per_dev, 3)
-            s_weights = weights_block.reshape(n_devices, n_per_dev)
 
-            phi_list = []
-            grad_list = []
-            for d in range(n_devices):
-                start = g0_loc + d * n_per_dev
-                end = min(g0_loc + (d + 1) * n_per_dev, g1_loc)
-                actual_len = end - start
-                if self.xi_phi is not None:
-                    xi_phi_d = safe_hdf5_read(self.xi_phi, (slice(None), slice(start, end)))
-                    xi_grad_d = safe_hdf5_read(self.xi_grad, (slice(None), slice(start, end), slice(None)))
-                else:
-                    xi_phi_d = safe_hdf5_read(xi_phi_ds, (slice(None), slice(start, end)))
-                    xi_grad_d = safe_hdf5_read(xi_grad_ds, (slice(None), slice(start, end), slice(None)))
-                if actual_len < n_per_dev:
-                    xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, n_per_dev - actual_len)))
-                    xi_grad_d = np.pad(xi_grad_d, ((0, 0), (0, n_per_dev - actual_len), (0, 0)))
-                phi_list.append(jax.device_put(xi_phi_d, devices[d]))
-                grad_list.append(jax.device_put(xi_grad_d, devices[d]))
-            s_xi_phi = jax.device_put_sharded(phi_list, devices)
-            s_xi_grad = jax.device_put_sharded(grad_list, devices)
-            return s_grid, s_weights, s_xi_phi, s_xi_grad
+            if self.xi_phi is not None:
+                xi_phi_block = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc)))
+                xi_grad_block = safe_hdf5_read(self.xi_grad, (slice(None), slice(g0_loc, g1_loc), slice(None)))
+            else:
+                xi_phi_block = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc)))
+                xi_grad_block = safe_hdf5_read(xi_grad_ds, (slice(None), slice(g0_loc, g1_loc), slice(None)))
+
+            if cur_len < host_grid_block_size:
+                pad = host_grid_block_size - cur_len
+                grid_block = np.pad(grid_block, ((0, pad), (0, 0)))
+                weights_block = np.pad(weights_block, ((0, pad),))
+                xi_phi_block = np.pad(xi_phi_block, ((0, 0), (0, pad)))
+                xi_grad_block = np.pad(xi_grad_block, ((0, 0), (0, pad), (0, 0)))
+
+            r_grid = jax.device_put(np.asarray(grid_block), rep_sharding)
+            r_weights = jax.device_put(np.asarray(weights_block), rep_sharding)
+            r_xi_phi = jax.device_put(np.asarray(xi_phi_block), rep_sharding)
+            r_xi_grad = jax.device_put(np.asarray(xi_grad_block), rep_sharding)
+            return r_grid, r_weights, r_xi_phi, r_xi_grad
 
         try:
-            pending_kmat = None
+            logger.info(
+                f"  compute_kmat_kernels: Starting shard_map for K-kernels "
+                f"(n_fused={n_rank}, n_grid={n_grid}, n_devices={n_devices})..."
+            )
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
                 logger.info(f"    compute_kmat_kernels: Processing grid block [{g0}:{g1}]...")
-
-                # Fetch prepared data (prefetched or inline)
-                if pending_kmat is not None:
-                    sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad = await_read(pending_kmat)
-                    pending_kmat = None
-                else:
-                    sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad = _prepare_kmat_block(g0)
-
-                K1_shards, K3_shards = pmapped_compute(sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, jastrow_params,
-                                                       full_grid, full_weights, full_xi_phi)
-
-                # While GPU runs pmap, prefetch next block's data in background
-                next_g0 = g0 + host_grid_block_size
-                if next_g0 < n_grid:
-                    pending_kmat = async_read(lambda _g=next_g0: _prepare_kmat_block(_g))
-
-                K1_kernel += np.array(jnp.sum(K1_shards, axis=0))
-                K3_kernel += np.array(jnp.sum(K3_shards, axis=0))
+                r_grid, r_weights, r_xi_phi, r_xi_grad = _prepare_kmat_block(g0)
+                K1_block, K3_block = sharded_compute(
+                    r_grid, r_weights, r_xi_phi, r_xi_grad,
+                    sharded_grid_r2, sharded_weights_r2, sharded_xi_phi_r2,
+                    params_rep
+                )
+                K1_kernel += np.asarray(K1_block)
+                K3_kernel += np.asarray(K3_block)
                 
                 # Explicitly clear memory
-                del sharded_grid, sharded_weights, sharded_xi_phi, sharded_xi_grad, K1_shards, K3_shards
+                del r_grid, r_weights, r_xi_phi, r_xi_grad, K1_block, K3_block
                 gc.collect()
                 
         finally:
@@ -730,6 +752,13 @@ class ISDFTC(TC):
         if self.xi_phi is None and self.save_path:
             f_xi = h5py.File(self.save_path, 'r')
             xi_phi_ds = f_xi['xi_phi']
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        eval_sharding = NamedSharding(mesh, P('devices', None))
+        params_rep = jax.tree_util.tree_map(
+            lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
+        )
             
         def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
             def scan_body(carry, i):
@@ -757,7 +786,14 @@ class ISDFTC(TC):
             res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
             return res
 
-        pmapped_compute = jax.pmap(compute_block_on_device, in_axes=(0, None, None, None, None))
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P('devices', None), P(), P(), P(), P()),
+            out_specs=P(None, 'devices', None),
+            check_vma=False,
+        )
+        def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+            return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
 
         try:
             # Outer loop: Evaluation blocks (r)
@@ -769,12 +805,11 @@ class ISDFTC(TC):
                 remainder = n_eval % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
                 n_eval_padded = n_eval + padding
-                n_per_device_local = n_eval_padded // n_devices
                 
-                grid_eval_block = self.grid_points[r0:r1]
+                grid_eval_block = np.asarray(self.grid_points[r0:r1])
                 if padding > 0:
-                    grid_eval_block = jnp.pad(grid_eval_block, ((0, padding), (0, 0)))
-                sharded_grid_eval = grid_eval_block.reshape(n_devices, n_per_device_local, 3)
+                    grid_eval_block = np.pad(grid_eval_block, ((0, padding), (0, 0)))
+                sharded_grid_eval = jax.device_put(grid_eval_block, eval_sharding)
                 
                 # Initialize accumulator on device
                 # We can use the first result to initialize, or create zeros
@@ -787,18 +822,22 @@ class ISDFTC(TC):
                 def _prepare_Laux_int_block(g0_loc):
                     """Load integration chunk to device (background-thread safe)."""
                     g1_loc = min(g0_loc + host_grid_block_size, n_grid)
-                    g_chunk = jax.device_put(np.asarray(self.grid_points[g0_loc:g1_loc]))
-                    w_chunk = jax.device_put(np.asarray(self.weights[g0_loc:g1_loc]))
+                    g_chunk = jax.device_put(np.asarray(self.grid_points[g0_loc:g1_loc]), rep_sharding)
+                    w_chunk = jax.device_put(np.asarray(self.weights[g0_loc:g1_loc]), rep_sharding)
                     if self.xi_phi is not None:
-                        xi_chunk = jax.device_put(safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc))))
+                        xi_chunk = jax.device_put(
+                            safe_hdf5_read(self.xi_phi, (slice(None), slice(g0_loc, g1_loc))),
+                            rep_sharding,
+                        )
                     else:
-                        xi_chunk = jax.device_put(safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc))))
+                        xi_chunk = jax.device_put(
+                            safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0_loc, g1_loc))),
+                            rep_sharding,
+                        )
                     return g_chunk, w_chunk, xi_chunk
 
                 pending_int = None
                 for g0 in range(0, n_grid, host_grid_block_size):
-                    g1 = min(g0 + host_grid_block_size, n_grid)
-                    
                     # Fetch prepared data (prefetched or inline)
                     if pending_int is not None:
                         grid_int_chunk, weights_int_chunk, xi_phi_chunk = await_read(pending_int)
@@ -807,9 +846,11 @@ class ISDFTC(TC):
                         grid_int_chunk, weights_int_chunk, xi_phi_chunk = _prepare_Laux_int_block(g0)
                             
                     # Compute partial update
-                    res_partial = pmapped_compute(sharded_grid_eval, jastrow_params, grid_int_chunk, weights_int_chunk, xi_phi_chunk)
+                    res_partial = sharded_compute(
+                        sharded_grid_eval, params_rep, grid_int_chunk, weights_int_chunk, xi_phi_chunk
+                    )
 
-                    # While GPU runs pmap, prefetch next integration block
+                    # While shard_map runs, prefetch next integration block.
                     next_g0 = g0 + host_grid_block_size
                     if next_g0 < n_grid:
                         pending_int = async_read(lambda _g=next_g0: _prepare_Laux_int_block(_g))
@@ -823,8 +864,8 @@ class ISDFTC(TC):
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
                 
                 # Store result for this evaluation block
-                res_block = res_rep_accum.transpose(1, 0, 2, 3).reshape(n_rank, -1, 3)
-                L_aux_out[:, r0:r1, :] = np.array(res_block[:, :n_eval, :])
+                res_block = res_rep_accum[:, :n_eval, :]
+                L_aux_out[:, r0:r1, :] = np.asarray(res_block)
                 
                 del sharded_grid_eval, res_rep_accum, res_block
                 gc.collect()
@@ -1182,5 +1223,3 @@ class ISDFTC(TC):
         K_tot = K_dir + K_trans
         
         return -(J_tot - 0.5 * K_tot)
-
-
