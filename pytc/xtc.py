@@ -765,6 +765,7 @@ class ISDFXTC(XTC, ISDFTC):
         orb_block_size=128,
         host_grid_block_size=None,
         x_s_panel_blocks=1,
+        d_reduce_group_blocks=1,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -776,6 +777,8 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size: Block size for grid batching on host.
             x_s_panel_blocks: Number of contiguous `s` orbital blocks processed
                 together per X-kernel grid pass.
+            d_reduce_group_blocks: Group size multiplier for D-kernel grid
+                blocking (`D` effective host block = group * host_grid_block_size).
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -818,6 +821,7 @@ class ISDFXTC(XTC, ISDFTC):
             save_path=out_path,
             host_grid_block_size=host_grid_block_size,
             x_s_panel_blocks=x_s_panel_blocks,
+            d_reduce_group_blocks=d_reduce_group_blocks,
         )
         kernels.update(delta_u_kernels)
         
@@ -846,6 +850,7 @@ class ISDFXTC(XTC, ISDFTC):
         save_path=None,
         host_grid_block_size=None,
         x_s_panel_blocks=1,
+        d_reduce_group_blocks=1,
     ):
         """Compute D, X kernels for Delta U with orbital and grid batching."""
         if L_aux is None:
@@ -866,7 +871,14 @@ class ISDFXTC(XTC, ISDFTC):
         
         # 1. Compute D kernel
         logger.info("Computing D kernel...")
-        D = self._compute_D_kernel(jastrow_params, batch_size, L_aux, Gb=Gb, host_grid_block_size=host_grid_block_size)
+        D = self._compute_D_kernel(
+            jastrow_params,
+            batch_size,
+            L_aux,
+            Gb=Gb,
+            host_grid_block_size=host_grid_block_size,
+            d_reduce_group_blocks=d_reduce_group_blocks,
+        )
         
         # 2. Compute X kernel with orbital batching
         logger.info("Computing X kernel...")
@@ -1025,7 +1037,15 @@ class ISDFXTC(XTC, ISDFTC):
                 t_h2d = time.perf_counter() - t_h2d_start
                 yield g0_loc, g1_loc, s_grid, s_weights, s_G, s_xi, t_host, t_h2d
 
-    def _compute_D_kernel(self, jastrow_params, batch_size=1024, L_aux=None, Gb=None, host_grid_block_size=None):
+    def _compute_D_kernel(
+        self,
+        jastrow_params,
+        batch_size=1024,
+        L_aux=None,
+        Gb=None,
+        host_grid_block_size=None,
+        d_reduce_group_blocks=1,
+    ):
         """Compute D kernel for Delta U with grid-blocking to save host RAM."""
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
@@ -1038,6 +1058,15 @@ class ISDFXTC(XTC, ISDFTC):
         
         if host_grid_block_size is None:
             host_grid_block_size = n_grid
+        d_reduce_group_blocks = max(1, int(d_reduce_group_blocks))
+        d_host_grid_block_size = host_grid_block_size * d_reduce_group_blocks
+        if d_reduce_group_blocks > 1:
+            logger.debug(
+                "_compute_D_kernel: using grouped D block size=%d (base=%d, group=%d)",
+                d_host_grid_block_size,
+                host_grid_block_size,
+                d_reduce_group_blocks,
+            )
             
         if Gb is None:
             Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
@@ -1075,9 +1104,9 @@ class ISDFXTC(XTC, ISDFTC):
             return jax.lax.psum(d_local, 'devices')
 
         params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
-        block_padded = ((host_grid_block_size + n_devices - 1) // n_devices) * n_devices
+        block_padded = ((d_host_grid_block_size + n_devices - 1) // n_devices) * n_devices
 
-        n_blocks = (n_grid + host_grid_block_size - 1) // host_grid_block_size
+        n_blocks = (n_grid + d_host_grid_block_size - 1) // d_host_grid_block_size
         block_input_bytes = (
             block_padded * 3 * 8 +             # grid
             block_padded * 8 +                 # weights
@@ -1100,7 +1129,7 @@ class ISDFXTC(XTC, ISDFTC):
             for g0, g1, sharded_grid, sharded_weights, sharded_G, sharded_xi_phi, t_host_blk, t_h2d_blk in self._iter_sharded_delta_u_blocks(
                 L_aux=L_aux,
                 xi_phi_source=xi_phi_source,
-                host_grid_block_size=host_grid_block_size,
+                host_grid_block_size=d_host_grid_block_size,
                 block_padded=block_padded,
                 n_rank=n_rank,
                 devices=devices,

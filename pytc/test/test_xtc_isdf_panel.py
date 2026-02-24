@@ -56,6 +56,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
             orb_block_size=orb_block_size,
             host_grid_block_size=host_grid_block_size,
             x_s_panel_blocks=2,
+            d_reduce_group_blocks=2,
         )
 
         np.testing.assert_allclose(
