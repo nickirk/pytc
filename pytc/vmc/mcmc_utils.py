@@ -338,6 +338,7 @@ def save_optimization_history(data: Dict[str, Any], filepath: str) -> str:
     """
     import h5py
     import jax
+    import numpy as np
     
     def _save_element(group, name, item):
         """Recursively saves elements (dicts, lists, arrays) to an HDF5 group."""
@@ -352,6 +353,8 @@ def save_optimization_history(data: Dict[str, Any], filepath: str) -> str:
         # Handle lists or tuples containing sub-trees (e.g., layer parameters)
         elif isinstance(item, (list, tuple)):
             subgroup = group.create_group(name)
+            if isinstance(item, tuple):
+                subgroup.attrs['__is_tuple__'] = True
             for i, v in enumerate(item):
                 _save_element(subgroup, str(i), v)
                 
@@ -397,15 +400,22 @@ def load_optimization_history(filepath: str) -> Dict[str, Any]:
         if isinstance(item, h5py.Group):
             result = {}
             for k, v in item.items():
+                if k == '__is_tuple__':
+                    continue
                 result[k] = _load_element(v)
                 
             # Check if this group was originally a list/tuple (all keys are digits)
             if all(k.isdigit() for k in result.keys()) and len(result) > 0:
-                # Reconstruct list safely
+                # Reconstruct list/tuple safely
                 max_idx = max(int(k) for k in result.keys())
                 sub_list = [None] * (max_idx + 1)
                 for k, v in result.items():
                     sub_list[int(k)] = v
+                    
+                # If we marked it as a tuple, convert it back to a tuple
+                if '__is_tuple__' in item.attrs and item.attrs['__is_tuple__']:
+                    return tuple(sub_list)
+                    
                 return sub_list
             return result
         else:
