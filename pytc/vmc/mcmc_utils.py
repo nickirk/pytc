@@ -337,6 +337,7 @@ def save_optimization_history(data: Dict[str, Any], filepath: str) -> str:
         Path to the saved HDF5 file.
     """
     import h5py
+    import jax
     
     def _save_element(group, name, item):
         """Recursively saves elements (dicts, lists, arrays) to an HDF5 group."""
@@ -365,14 +366,58 @@ def save_optimization_history(data: Dict[str, Any], filepath: str) -> str:
     with h5py.File(filepath, 'w') as f:
         for key, value in data.items():
             if key == 'params':
-                # 'params' is a list of dictionary checkpoints
-                params_group = f.create_group('params')
-                for step_idx, step_params in enumerate(value):
-                    # Save each step's parameters in its own subgroup (e.g., 'step_0', 'step_1')
-                    _save_element(params_group, f"step_{step_idx}", step_params)
+                # Convert list of PyTrees -> PyTree of stacked arrays (axis 0 is the step)
+                stacked_params = jax.tree_util.tree_map(
+                    lambda *leaves: np.stack(leaves), 
+                    *value
+                )
+                # Now save the single stacked PyTree structure
+                _save_element(f, 'params', stacked_params)
             else:
                 # Top level metrics (cost, energies, stds, acceptance) are arrays
                 f.create_dataset(key, data=value)
                 
     logger.info(f"Successfully saved optimization history to {filepath}")
     return filepath
+
+def load_optimization_history(filepath: str) -> Dict[str, Any]:
+    """Load the optimization history from an HDF5 file.
+    
+    Args:
+        filepath: Path to the HDF5 file.
+        
+    Returns:
+        Dictionary with 'cost', 'energies', 'stds', 'acceptance', 'params'.
+        'params' is a PyTree where each leaf is stacked along axis=0 (the step).
+    """
+    import h5py
+    
+    def _load_element(item):
+        """Recursively reconstructs the dictionary/list tree from an HDF5 group/dataset."""
+        if isinstance(item, h5py.Group):
+            result = {}
+            for k, v in item.items():
+                result[k] = _load_element(v)
+                
+            # Check if this group was originally a list/tuple (all keys are digits)
+            if all(k.isdigit() for k in result.keys()) and len(result) > 0:
+                # Reconstruct list safely
+                max_idx = max(int(k) for k in result.keys())
+                sub_list = [None] * (max_idx + 1)
+                for k, v in result.items():
+                    sub_list[int(k)] = v
+                return sub_list
+            return result
+        else:
+            # It's a dataset, pull the numpy array into memory
+            return item[()]
+            
+    data = {}
+    with h5py.File(filepath, 'r') as f:
+        for key in f.keys():
+            if key == 'params':
+                data[key] = _load_element(f[key])
+            else:
+                data[key] = f[key][()]
+                
+    return data
