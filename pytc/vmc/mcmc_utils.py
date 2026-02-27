@@ -324,3 +324,55 @@ def _distribute_electrons_by_pairing(atom_charges, n_alpha, n_beta):
             remaining_beta -= 1
             
     return jnp.array(alpha_counts), jnp.array(beta_counts)
+
+def save_optimization_history(data: Dict[str, Any], filepath: str) -> str:
+    """Save the optimization history dictionary to an HDF5 file.
+    
+    Args:
+        data: Dictionary with keys 'cost', 'energies', 'stds', 'acceptance', 'params'
+            as outputted by the optimization loop.
+        filepath: Path to the HDF5 file (e.g., 'optimization_results.h5').
+        
+    Returns:
+        Path to the saved HDF5 file.
+    """
+    import h5py
+    
+    def _save_element(group, name, item):
+        """Recursively saves elements (dicts, lists, arrays) to an HDF5 group."""
+        
+        # Handle dictionary-like objects (e.g., dict, flax FrozenDict)
+        if hasattr(item, 'items') and callable(item.items):
+            subgroup = group.create_group(name)
+            for k, v in item.items():
+                # HDF5 keys must be strings
+                _save_element(subgroup, str(k), v)
+                
+        # Handle lists or tuples containing sub-trees (e.g., layer parameters)
+        elif isinstance(item, (list, tuple)):
+            subgroup = group.create_group(name)
+            for i, v in enumerate(item):
+                _save_element(subgroup, str(i), v)
+                
+        # Base case: leaves of the tree (numpy arrays, scalars)
+        else:
+            try:
+                group.create_dataset(name, data=item)
+            except TypeError:
+                # If h5py doesn't naturally support the type, cast it to string
+                group.create_dataset(name, data=str(item))
+
+    with h5py.File(filepath, 'w') as f:
+        for key, value in data.items():
+            if key == 'params':
+                # 'params' is a list of dictionary checkpoints
+                params_group = f.create_group('params')
+                for step_idx, step_params in enumerate(value):
+                    # Save each step's parameters in its own subgroup (e.g., 'step_0', 'step_1')
+                    _save_element(params_group, f"step_{step_idx}", step_params)
+            else:
+                # Top level metrics (cost, energies, stds, acceptance) are arrays
+                f.create_dataset(key, data=value)
+                
+    logger.info(f"Successfully saved optimization history to {filepath}")
+    return filepath
