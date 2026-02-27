@@ -37,6 +37,7 @@ from typing import Optional
 import inspect
 import contextlib
 import time
+from pytc.utils import sharding_core
 
 # Import shard_map - try new location first, then experimental
 try:
@@ -62,12 +63,12 @@ if shard_map is not None:
 
 def n_devices() -> int:
     """Number of local devices available to this process."""
-    return jax.local_device_count()
+    return sharding_core.n_local_devices()
 
 
 def is_multi_gpu() -> bool:
     """True if more than one local device is available."""
-    return n_devices() > 1
+    return sharding_core.is_multi_device()
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +89,7 @@ def create_mesh(devices=None, axis_name: str = "walkers"):
     -------
     jax.sharding.Mesh
     """
-    if devices is None:
-        devices = jax.devices()
-    return Mesh(devices, axis_names=(axis_name,))
+    return sharding_core.create_1d_mesh(devices=devices, axis_name=axis_name)
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +98,12 @@ def create_mesh(devices=None, axis_name: str = "walkers"):
 
 def get_walker_sharding(mesh: Mesh, axis_name: str = "walkers"):
     """NamedSharding that partitions the leading (walker) dimension."""
-    return NamedSharding(mesh, P(axis_name))
+    return sharding_core.get_partitioned_sharding(mesh, axis_name=axis_name)
 
 
 def get_replicated_sharding(mesh: Mesh):
     """NamedSharding that replicates data on every device."""
-    return NamedSharding(mesh, P())
+    return sharding_core.get_replicated_sharding(mesh)
 
 
 def shard_walker(walker, mesh: Mesh, axis_name: str = "walkers"):

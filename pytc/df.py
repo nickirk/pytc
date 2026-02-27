@@ -1,6 +1,7 @@
 """JAX implementation of Density Fitting / ISDF."""
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 import numpy as np
 from functools import partial
 import os
@@ -56,6 +57,59 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
 
 
 solve_normal_equations_batch = jax.jit(solve_normal_equations_batch, static_argnames=['rcond'])
+
+
+@jax.jit
+def _build_normal_matrix(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray) -> jnp.ndarray:
+    """Build unregularized normal-equation matrix for structured LS."""
+    gram_p = phi_piv_p.T @ phi_piv_p
+    gram_q = phi_piv_q.T @ phi_piv_q
+    return gram_p * gram_q
+
+
+def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
+                                    rcond: float = 1e-14,
+                                    max_jitter_tries: int = 8,
+                                    jitter_growth: float = 10.0):
+    """Prepare robust Cholesky factor for repeated batched solves.
+
+    Uses adaptive jitter escalation to guarantee numerically SPD matrices.
+    """
+    ata = _build_normal_matrix(phi_piv_p, phi_piv_q)
+    ata = 0.5 * (ata + ata.T)
+    diag_mean = float(jnp.mean(jnp.diag(ata)))
+    eps_scale = float(jnp.finfo(ata.dtype).eps) * max(diag_mean, 1.0)
+    base_jitter = max(diag_mean * rcond, eps_scale)
+    eye = jnp.eye(ata.shape[0], dtype=ata.dtype)
+
+    last_chol = None
+    for attempt in range(max_jitter_tries):
+        jitter = base_jitter * (jitter_growth ** attempt)
+        chol, lower = jsp_linalg.cho_factor(ata + jitter * eye, lower=True)
+        if bool(jnp.all(jnp.isfinite(chol))):
+            if attempt > 0:
+                logger.warning(
+                    "Cholesky jitter escalated: base=%.3e final=%.3e tries=%d",
+                    base_jitter, jitter, attempt + 1
+                )
+            return chol, bool(lower)
+        last_chol = chol
+
+    raise np.linalg.LinAlgError(
+        f"Adaptive Cholesky failed after {max_jitter_tries} tries; "
+        f"base_jitter={base_jitter:.3e}, last_nonfinite={bool(jnp.any(jnp.isnan(last_chol)))}"
+    )
+
+
+@partial(jax.jit, static_argnames=('lower',))
+def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
+                                          phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
+                                          phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray) -> jnp.ndarray:
+    """Solve batched normal equations using precomputed Cholesky factor."""
+    term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)
+    term_q = jnp.matmul(phi_piv_q.T, phi_q_batch)
+    atb = term_p * term_q
+    return jsp_linalg.cho_solve((chol, lower), atb)
 
 
 @partial(jax.jit, static_argnames=('n_rank',))
@@ -267,6 +321,16 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     grid_batch_size = min(grid_batch_size, n_grid)
     n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size if grid_batch_size > 0 else 0
     
+    # Pre-factor normal-equation matrices once and reuse for all grid batches.
+    # This avoids rebuilding/re-factorizing ATA in every batch.
+    phi_chol, phi_lower = prepare_normal_equations_solver(phi_piv, phi_piv, rcond=rcond)
+    grad_chol = []
+    grad_lower = []
+    for c in range(3):
+        chol_c, lower_c = prepare_normal_equations_solver(grad_phi_piv[:, :, c], phi_piv, rcond=rcond)
+        grad_chol.append(chol_c)
+        grad_lower.append(lower_c)
+    
     # Setup storage
     h5_file = None
     if is_incore:
@@ -302,15 +366,18 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
             
             # 1. Xi_phi
             phi_batch = phi[:, g_start:g_end]
-            xi_phi_batch = solve_normal_equations_batch(phi_piv, phi_piv, 
-                                    phi_batch, phi_batch, rcond=rcond)
+            xi_phi_batch = solve_normal_equations_batch_prepared(
+                phi_chol, phi_lower, phi_piv, phi_piv, phi_batch, phi_batch
+            )
             xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
             
             # 2. Xi_grad
             for c in range(3):
                 grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
-                xi_grad_batch = solve_normal_equations_batch(grad_phi_piv[:, :, c], phi_piv,
-                                         grad_phi_batch_c, phi_batch, rcond=rcond)
+                xi_grad_batch = solve_normal_equations_batch_prepared(
+                    grad_chol[c], grad_lower[c], grad_phi_piv[:, :, c], phi_piv,
+                    grad_phi_batch_c, phi_batch
+                )
                 xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
             
             if batch_idx % 4 == 0 and batch_idx > 0:
