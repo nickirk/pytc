@@ -2098,7 +2098,7 @@ if __name__ == '__main__':
     mf = scf.RKS(mol)
     mf.xc = 'WB97XD'
     mf.kernel()
-    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-6, isdf_rcond = 1e-6)
+    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-7, isdf_naux_factor = 4, isdf_gammas = [0.25, 0.5])
     
     # Cholesky decomposing fxc is not worth it unless you want a large number of roots
     # mytd.load_fxc_intermediates()

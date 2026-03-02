@@ -86,9 +86,22 @@ While the above formulation integrates $J_{\nu\mu}$ directly on the numerical gr
 
 Instead of generic atom-centered bases, uncontracted s-type Gaussian functions are centered exactly at the chosen interpolant pivots ($\mathbf{r}_\mu$). The exponents ($\alpha_\mu$) are dynamically determined by the local pivot density via a Nearest-Neighbor KDTree lookup:
 $$ \alpha_\mu = \frac{\gamma}{h_\mu^2} $$
-Where $h_\mu$ is the distance to the nearest neighbor (or local mean radius) and $\gamma$ is a scaling/overlap coverage factor (typically 0.4 to 0.8).
+Where $h_\mu$ is the distance to the nearest neighbor (or local mean radius) and $\gamma$ is a coverage factor. To enhance basis flexibility, multiple $\gamma$ values (e.g., $0.25, 0.5, 1.0$) can be used to generate multiple s-functions per pivot.
 
 By projecting the numerical ISDF interpolants $\zeta_\mu(\mathbf{r})$ onto this compact floating basis set using an SVD-based pseudo-inverse, the discrete ISDF kernels are evaluated using mathematically exact, rapid analytical PySCF $(P|Q)$ Coulomb integrals. This reduces the kernel construction cost dramatically while simultaneously eliminating grid-based singularity noise for the long-range tails.
+
+**SVD-Based Pseudo-Inverse Projection:**
+The projection solves the linear system representing the overlap of the dynamically constructed auxiliary basis function ($\chi_P$) and the target ISDF interpolating functions ($\zeta_\mu$). Instead of a direct inverse, an SVD-based pseudo-inverse is employed to evaluate the expansion coefficients ($d$).
+
+1. **Auxiliary Metric Matrix ($S_{PQ}$)**: First, it evaluates the overlap of the uncontracted gaussians defined dynamically at the pivot centers: 
+   $$ S_{PQ} = \sum_{r} w(r) \chi_P(r) \chi_Q(r) $$
+2. **Overlap Vector ($V_{P\mu}$)**: It computes the projection of the auxiliary basis onto the original ISDF interpolants across the real-space grid: 
+   $$ V_{P\mu} = \sum_{r} w(r) \chi_P(r) \zeta_\mu(r) $$
+3. **Truncated SVD**: Since the floating uncontracted s-functions can form a nearly linearly dependent basis (especially with multiple gammas), $S_{PQ}$ is often ill-conditioned. Scipy's `linalg.svd` factors $S_{PQ} = U \Sigma V^H$. A strict cutoff threshold zeroes out singular values below the limit $s_0 \times \text{rcond}$.
+4. **Coefficient Matrix ($d$)**: Using the stable pseudoinverse $S_{PQ}^{+}$, the robust projection coefficients are constructed:
+   $$ d = S_{PQ}^{+} V_{P\mu} $$
+5. **Analytical J-Kernel**: The matrix is reconstructed exactly using analytical 2-center 2-electron integrals $J_{PQ} = (P|Q)$, circumventing grid-based integration errors for the long-range Coulomb singularity:
+   $$ J_{\mu\nu} = d^T J_{PQ} d $$
 
 ### ISDF Exchange-Correlation kernels ($f_{xc}$)
 Just like the Coulomb kernel, the TDDFT XC response matrix $f_{xc}$ can be compressed from the massive $N_{grid} \times N_{grid}$ grid dimensions down to the compact $N_{piv} \times N_{piv}$ auxiliary space.
