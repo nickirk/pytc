@@ -15,7 +15,9 @@ import os
 import numpy as np
 import scipy
 import scipy.linalg as sla
+import jax
 import jax.numpy as jnp
+jax.config.update("jax_enable_x64", True)
 from jax.scipy import special as jsp
 import h5py
 
@@ -26,6 +28,8 @@ from pyscf.tools import mo_mapping
 # from fxc import einsum, isdf_lda_mvp, isdf_gga_mvp
 
 DEFAULT_EINSUM_BACKEND = 'pytblis'
+HARTREE2EV = nist.HARTREE2EV
+
 
 def einsum(script, *tensors, out=None, alpha=1.0, beta=0.0, einsum_backend = DEFAULT_EINSUM_BACKEND):
     '''Wrapper for einsum supporting pytblis, pyscf.lib.einsum, or numpy.einsum backends.'''
@@ -66,7 +70,6 @@ def einsum(script, *tensors, out=None, alpha=1.0, beta=0.0, einsum_backend = DEF
         return out
 
 # --- ISDF Extentions ---
-
 def compute_J_munu(xi_phi, weights, coords):
     """
     Computes J_{mu, nu} = sum_i sum_j w_i w_j xi_mu(r_i) (1/|r_i - r_j|) xi_nu(r_j)
@@ -147,6 +150,62 @@ def compute_J_munu_lr(xi_phi, weights, coords, omega):
     t1 = time.time()
     print(f"Building J_munu_lr took: {t1 - t0:.2f} s")
     return J_munu_lr
+
+
+def compute_ISDF_J_kernels_DF(xi_phi, weights, coords, mol, aux_basis='def2-universal-jkfit', omega=0, rcond=1e-12):
+    """
+    Computes a single J_munu (either standard Coulomb or range-separated) by 
+    projecting ISDF interpolants onto a Gaussian auxiliary basis and using 
+    analytical integrals.
+    
+    Uses an SVD-based pseudo-inverse for robust projection.
+    """
+    import pyscf.gto
+    from scipy import linalg
+    import time
+    
+    label = "Standard Coulomb" if omega == 0 else f"Range-Separated (omega={omega})"
+    print(f"\nBuilding Analytical DF J-Kernel ({label}) with basis: {aux_basis}...")
+    t0 = time.time()
+    
+    # 1. Create Auxiliary Molecule
+    t_start = time.time()
+    aux_mol = pyscf.gto.M(atom=mol.atom, basis=aux_basis)
+    if omega > 0:
+        aux_mol.set_range_coulomb(omega)
+    print(f"  Step 1: Create Aux Mol took: {time.time() - t_start:.4f} s")
+    
+    # 2. Evaluate Auxiliary Basis on the ISDF Grid
+    t_start = time.time()
+    aux_eval = aux_mol.eval_gto('GTOval', coords)
+    print(f"  Step 2: Eval Aux GTOs on grid took: {time.time() - t_start:.4f} s")
+    
+    # 3. Project ISDF onto Auxiliary Basis
+    t_start = time.time()
+    w_aux_eval = (aux_eval * weights[:, None]).T
+    S_PQ = w_aux_eval @ aux_eval         
+    V_Pmu = w_aux_eval @ xi_phi.T        
+    print(f"  Step 3: S_PQ and V_Pmu contractions took: {time.time() - t_start:.4f} s")
+    
+    # 4. SVD-based pseudo-inverse
+    t_start = time.time()
+    U, s, Vh = linalg.svd(S_PQ, full_matrices=False)
+    mask = s > s[0] * rcond
+    s_inv = np.zeros_like(s)
+    s_inv[mask] = 1.0 / s[mask]
+    d = (Vh.T * s_inv) @ (U.T @ V_Pmu)
+    print(f"  Step 4: SVD and d coefficient solve took: {time.time() - t_start:.4f} s")
+    
+    # 5. Compute J via Analytical Exact Integrals (P|Q)
+    t_start = time.time()
+    J_PQ = aux_mol.intor('int2c2e')      
+    J_munu = d.T @ J_PQ @ d
+    print(f"  Step 5: J_PQ and J_munu contraction took: {time.time() - t_start:.4f} s")
+    
+    t1 = time.time()
+    print(f"Analytical J-kernel build total took: {t1 - t0:.2f} s")
+    return J_munu
+
 
 def isdf_lda_mvp(C_o, C_v, V_xc, z):
     """
@@ -253,12 +312,6 @@ def compress_isdf_gga_kernel(xi_phi, xi_grad, wfxc):
             V_fxc[y, x] = tmp @ xi_full[x].T
             
     return V_fxc
-
-HARTREE2EV = nist.HARTREE2EV
-
-# einsum = lib.einsum
-
-
 
 def tddft_full_diagonalization(multi, nocc, mo_energy, C_o, C_v, J, J_rsh = None, TDA=False, ni_fn = None, hyb_coeff = 1.0, k_rsh = None, subset_by_value = None, hybrid=True):
     """Full diagonalization of tddft equation.
@@ -525,7 +578,7 @@ def tddft_davidson(
         raise ValueError
 
     if ntri_found < ntri:
-        lib.logger.info(tddft, f'only {ntri_found} trial vectors are generated rather than {ntri}.')
+        print(f'only {ntri_found} trial vectors are generated rather than {ntri}.')
         ntri = ntri_found
     if ntri_found < init_ntri:
         raise ValueError('cannot find enough trial vectors; lower e_min or add more trial vectors')
@@ -692,7 +745,7 @@ def tddft_davidson(
     
 
     while iter < max_iter:
-        lib.logger.info(tddft, '\ntddft Davidson #%d iteration, ntri= %d , nprod= %d .', iter + 1, ntri, nprod)
+        print('\ntddft Davidson #%d iteration, ntri= %d , nprod= %d .', iter + 1, ntri, nprod)
         if not TDA:
             # TODO: Replace Lpq contractions inside _tddft_contraction with ISDF contractions
             apb_prod[nprod:ntri, :], amb_prod[nprod:ntri, :], contract_work_this_iter = _tddft_contraction(
@@ -729,7 +782,7 @@ def tddft_davidson(
                 k_rsh = tddft.k_rsh
             )
         total_contract_work += contract_work_this_iter
-        lib.logger.info(tddft, f'work for iter {iter+1}: {float(contract_work_this_iter):.2E}')
+        print(f'work for iter {iter+1}: {float(contract_work_this_iter):.2E}')
 
         Mp, Mm, mmwork = update_mp_mm(Mp, Mm, tri_vec, apb_prod, amb_prod, ntri, nprod)
         Mp_sym = (Mp + Mp.T) / 2.0
@@ -778,7 +831,7 @@ def tddft_davidson(
         if emin_index + nroot_current > ntri:
             emin_index = ntri - nroot_current
             if ntri >= nroot:
-                lib.logger.info(tddft, 'fewer than nroot exci found above e_min.')
+                print('fewer than nroot exci found above e_min.')
 
         if core_orbs is not None and nspin == 1 and expand_only_core:
             if not hasattr(tddft, 'mol'):
@@ -845,8 +898,7 @@ def tddft_davidson(
 
         max_res_norm = np.max(res_norms)
         conv_vec = res_norms < residue_thresh
-        lib.logger.info(tddft, 'max residue norm = %.4e', max_res_norm)
-        print('max residue norm = %.4e', max_res_norm)
+        print(f'max residue norm = {max_res_norm:0.4e}')
         if conv_vec.size >= nroot:
             if np.all(conv_vec[:nroot]):
                 conv = True
@@ -906,7 +958,7 @@ def tddft_davidson(
                 raise ValueError('Exceeded max_vec. Davidson algorithm for tddft is not converged!')
             tri_vec[ntri : ntri + n_new_vec] = orth_res[:n_new_vec]
             ntri += n_new_vec
-            lib.logger.info(tddft, 'add %d new trial vectors.', n_new_vec)
+            print(f'add {n_new_vec} new trial vectors.')
         else:
             raise ValueError('No new vectors, but Davidson has not converged')
         conv = False
@@ -919,12 +971,12 @@ def tddft_davidson(
 
 
 
-    lib.logger.info(tddft, f'tddft converged in {iter} iterations, final subspace size = {nprod}')
-    lib.logger.info(tddft, f'total work for contraction: {float(total_contract_work):.2E}')
-    lib.logger.info(tddft, f'total work for linalg: {float(total_linalg_work):.2E}')
-    lib.logger.info(tddft, f'Mp condition number: {np.linalg.cond(Mp_sym)}')
+    print(f'tddft converged in {iter} iterations, final subspace size = {nprod}')
+    print(f'total work for contraction: {float(total_contract_work):.2E}')
+    print(f'total work for linalg: {float(total_linalg_work):.2E}')
+    print(f'Mp condition number: {np.linalg.cond(Mp_sym)}')
     if Mm is not None:
-        lib.logger.info(tddft, f'Mm condition number: {np.linalg.cond(Mm_sym)}')
+        print(f'Mm condition number: {np.linalg.cond(Mm_sym)}')
 
     found_roots = np.flatnonzero((exci >= e_min) & conv_vec)
     nrootfound = found_roots.size
@@ -1307,6 +1359,7 @@ def _isdf_contractions(C_o, C_v, J, apb_prod, amb_prod, tri_vec, work_done, nocc
 
     return apb_prod, amb_prod, work_done
 
+
 def _tddft_contraction(multi, nocc, mo_energy, C_o, C_v, J, tri_vec, TDA=False, ni_fn = None,
                       hyb_coeff = 1.0, hybrid = True, rsh = False, J_rsh = None, k_rsh = 0.0):
     """Contraction for TDDFT matrix and trial vectors using ISDF.
@@ -1509,6 +1562,7 @@ class TDDFT(lib.StreamObject):
         nocc=None,
         isdf_rcond=1e-6,
         isdf_grid_level=3,
+        isdf_naux_factor=8,
         verbose=5,
         # options
         TDA=False,
@@ -1566,6 +1620,7 @@ class TDDFT(lib.StreamObject):
         # ISDF parameters
         self.isdf_rcond = isdf_rcond
         self.isdf_grid_level = isdf_grid_level
+        self.isdf_naux_factor = isdf_naux_factor
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -1627,10 +1682,10 @@ class TDDFT(lib.StreamObject):
         import time
         from pyscf import dft
         from pytc.df import isdf_decompose as isdf_decompose_jax
-       # from isdf_coulomb_exchange import compute_J_munu, compute_J_munu_lr
+        # from isdf_coulomb_exchange import compute_J_munu, compute_J_munu_lr
         import jax.numpy as jnp
 
-        lib.logger.info(self, '\n--- Starting Auto ISDF Decomposition ---')
+        print('\n--- Starting Auto ISDF Decomposition ---')
         grids = dft.gen_grid.Grids(self.mol)
         grids.level = getattr(self, 'isdf_grid_level', 3)
         grids.build()
@@ -1644,8 +1699,8 @@ class TDDFT(lib.StreamObject):
         self.C_v_gga = []
         
         # Determine Ranks (Using default conservative heuristics, customize as needed)
-        n_rank_phi = 30 * self.nmo
-        n_rank_grad = 30 * self.nmo
+        n_rank_phi = self.isdf_naux_factor * self.nmo
+        n_rank_grad = self.isdf_naux_factor * self.nmo
 
         # We need a unified J kernel across spins (it's solely spatial)
         # We will decompose the spatial orbitals if Restricted, or alpha/beta if Unrestricted
@@ -1675,7 +1730,7 @@ class TDDFT(lib.StreamObject):
                 jnp.array(weights), grid_batch_size=8192, is_incore=True, rcond=self.isdf_rcond
             )
             t1 = time.time()
-            lib.logger.info(self, f"ISDF decomposition for spin {s} took: {t1 - t0:.2f} s")
+            print(f"ISDF decomposition for spin {s} took: {t1 - t0:.2f} s")
             
             C_val = np.array(phi_piv).T
             C_grad = np.array(grad_phi_piv).transpose(2, 1, 0)
@@ -1699,19 +1754,23 @@ class TDDFT(lib.StreamObject):
                 self.xi_phi = np.array(xi_phi, dtype=np.float64)
                 self.xi_grad = np.array(xi_grad, dtype=np.float64)
                 
-                # Build the Coulomb matrix just once
+                # Build the Analytical J-Kernels (Direct Grid)
                 t0 = time.time()
-                self.J = np.array(compute_J_munu(xi_phi, jnp.array(weights), jnp.array(grids.coords)))
-                t1 = time.time()
-                lib.logger.info(self, f"ISDF Coulomb J kernel build took: {t1 - t0:.2f} s")
+                self.J = np.array(compute_J_munu(
+                    self.xi_phi, weights, grids.coords
+                ))
                 
                 if getattr(self, 'omega', 0.0) > 0:
-                    t0 = time.time()
-                    self.J_rsh = np.array(compute_J_munu_lr(xi_phi, jnp.array(weights), jnp.array(grids.coords), self.omega))
-                    t1 = time.time()
-                    lib.logger.info(self, f"ISDF RSH J_lr kernel build took: {t1 - t0:.2f} s")
+                    self.J_rsh = np.array(compute_J_munu_lr(
+                        self.xi_phi, weights, grids.coords, self.omega
+                    ))
+                else:
+                    self.J_rsh = None
+                
+                t1 = time.time()
+                print(f"Analytical ISDF J-kernel build(s) took: {t1 - t0:.2f} s")
                  
-        lib.logger.info(self, '--- Finished Auto ISDF Decomposition ---\n')
+        print('--- Finished Auto ISDF Decomposition ---\n')
         
     def dump_flags(self):
         log = lib.logger.Logger(self.stdout, self.verbose)
@@ -1772,7 +1831,7 @@ class TDDFT(lib.StreamObject):
 
             # Compress wfxc into ISDF interpolant space: (ngrid,) -> (naux, naux)
             self.wfxc = compress_isdf_lda_kernel(self.xi_phi, wfxc)
-            lib.logger.info(self, f'ISDF LDA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
+            print(f'ISDF LDA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
             return
 
         elif self.xctype == 'GGA':
@@ -1800,11 +1859,11 @@ class TDDFT(lib.StreamObject):
             # Compress wfxc into ISDF interpolant space: (4, 4, ngrid) -> (4, 4, naux, naux)
             # wfxc is (x, y, r) from eval_xc_eff; compress_isdf_gga_kernel expects (y, x, r)
             self.wfxc = compress_isdf_gga_kernel(self.xi_phi, self.xi_grad, wfxc.transpose(1, 0, 2))
-            lib.logger.info(self, f'ISDF GGA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
+            print(f'ISDF GGA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
             return
                 
         elif self.xctype == 'HF':
-            lib.logger.info(self, '\n : no fxc needed for Hartree-Fock%s')
+            print('\n : no fxc needed for Hartree-Fock%s')
 
         elif self.xctype == 'NLC':
             raise NotImplementedError
@@ -1828,7 +1887,7 @@ class TDDFT(lib.StreamObject):
 
     def full_diagonalization(self, multi, subset_by_value = None):
         cput0 = (time.process_time(), time.perf_counter())
-        lib.logger.info(self, '\ntddft full diagonalization: %s', multi)
+        print('\ntddft full diagonalization: %s', multi)
         self.multi = multi
 
         # set nroot as full dimension for analysis
@@ -1838,7 +1897,7 @@ class TDDFT(lib.StreamObject):
 
         # A+B, A-B, X+Y, X-Y
         mem = (self.nroot * self.nroot * 4) * 8
-        lib.logger.info(self, 'tddft needs at least %.1f GB memory.', mem / 1.0e9)
+        print('tddft needs at least %.1f GB memory.', mem / 1.0e9)
 
         if self.ni is not None:
             
@@ -2168,12 +2227,12 @@ if __name__ == '__main__':
     print('Davidson mae vs PySCF:', HARTREE2EV*np.mean(np.abs(exci_new-pyscf_ref)))
 
     # Run full diagonalization as a sanity check
-    from pyscf.dft.libxc import xc_type
-    mytd.xctype = xc_type(mf.xc)
-    exci_full = np.sort(mytd.full_diagonalization(multi = 's')[0])
+    # from pyscf.dft.libxc import xc_type
+    # mytd.xctype = xc_type(mf.xc)
+    # exci_full = np.sort(mytd.full_diagonalization(multi = 's')[0])
 
     
-    print('Full diag S1:', exci_full[:10]*HARTREE2EV)
-    print('Full diag mae vs PySCF:', HARTREE2EV*np.mean(np.abs(exci_full[:10]-pyscf_ref)))
+    # print('Full diag S1-S10:', exci_full[:10]*HARTREE2EV)
+    # print('Full diag mae vs PySCF:', HARTREE2EV*np.mean(np.abs(exci_full[:10]-pyscf_ref)))
 
     
