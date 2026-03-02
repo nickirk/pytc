@@ -25,6 +25,9 @@ from pyscf import lib, dft
 from pyscf.data import nist
 from pyscf.tools import mo_mapping
 
+from scipy.spatial import KDTree
+import pyscf.gto
+
 # from fxc import einsum, isdf_lda_mvp, isdf_gga_mvp
 
 DEFAULT_EINSUM_BACKEND = 'pytblis'
@@ -151,26 +154,96 @@ def compute_J_munu_lr(xi_phi, weights, coords, omega):
     print(f"Building J_munu_lr took: {t1 - t0:.2f} s")
     return J_munu_lr
 
+def compute_dynamic_alphas(pivots, gammas=[0.25, 0.5]):
+    """
+    Determines optimal Gaussian exponents based on local pivot density.
+    
+    Args:
+        pivots: (Naux, 3) array of pivot coordinates.
+        gammas: Coverage factors as a list. Higher = narrower Gaussians.
+        
+    Returns:
+        alphas: (Naux, len(gammas)) array of exponents.
+    """
+    # 1. Build a KDTree for fast neighbor lookup
+    tree = KDTree(pivots)
+    
+    # 2. Query the distance to the 2nd nearest neighbor 
+    # (The 1st nearest neighbor is always the point itself, dist=0)
+    dists, _ = tree.query(pivots, k=2)
+    h_i = dists[:, 1]
+    
+    # 3. Handle potential duplicate points to avoid division by zero
+    # Replace zeros with a tiny epsilon or a mean distance
+    h_i = np.where(h_i < 1e-8, np.mean(h_i), h_i)
+    
+    # 4. Apply the scaling law
+    gammas_arr = np.array(gammas)
+    alphas = gammas_arr[None, :] / (h_i[:, None]**2)
+    
+    return alphas
 
-def compute_ISDF_J_kernels_DF(xi_phi, weights, coords, mol, aux_basis='def2-universal-jkfit', omega=0, rcond=1e-12):
+def build_floating_basis(pivots, alphas, unit='Bohr'):
+    """
+    Builds a PySCF Mole object with floating s-type Gaussians at ISDF pivots.
+    
+    Args:
+        pivots: (Naux, 3) numpy array of spatial coordinates.
+        alphas: (Naux,) numpy array of Gaussian exponents (or a single float).
+        unit: 'Bohr' or 'Angstrom' corresponding to your pivot coordinates.
+    """
+    Naux = len(pivots)
+    
+    # If a single alpha is provided, broadcast it to all pivots
+    if isinstance(alphas, (float, int)):
+        alphas = np.full((Naux, 1), alphas)
+    elif alphas.ndim == 1:
+        alphas = alphas[:, None]
+        
+    # 1. Define Ghost Atoms at the pivot coordinates
+    # We name them X0, X1, X2... so we can assign a unique alpha to each if needed
+    ghost_atoms = [(f'X{i}', coord) for i, coord in enumerate(pivots)]
+    
+    # 2. Define the Custom Basis Dictionary
+    # PySCF basis format: { 'AtomSymbol': [[ angular_momentum, (exponent, contraction_coeff) ]] }
+    # l=0 is an s-type function. We use an uncontracted coefficient of 1.0.
+    custom_basis = {}
+    for i in range(Naux):
+        funcs = []
+        for a in alphas[i]:
+            funcs.append([0, (a, 1.0)])
+        custom_basis[f'X{i}'] = funcs
+    
+    # 3. Build the Auxiliary PySCF Object
+    aux_mol = pyscf.gto.M(
+        atom=ghost_atoms,
+        basis=custom_basis,
+        charge=0,
+        spin=0,
+        unit=unit
+    )
+    
+    return aux_mol
+
+def compute_ISDF_J_kernels_DF(xi_phi, weights, coords, pivots, gammas=[0.25, 0.5, 1.0], omega=0, rcond=1e-12):
     """
     Computes a single J_munu (either standard Coulomb or range-separated) by 
-    projecting ISDF interpolants onto a Gaussian auxiliary basis and using 
+    projecting ISDF interpolants onto a floating Gaussian auxiliary basis and using 
     analytical integrals.
     
     Uses an SVD-based pseudo-inverse for robust projection.
     """
-    import pyscf.gto
     from scipy import linalg
     import time
     
     label = "Standard Coulomb" if omega == 0 else f"Range-Separated (omega={omega})"
-    print(f"\nBuilding Analytical DF J-Kernel ({label}) with basis: {aux_basis}...")
+    print(f"\nBuilding Analytical DF J-Kernel ({label}) with floating basis (gammas={gammas})...")
     t0 = time.time()
     
     # 1. Create Auxiliary Molecule
     t_start = time.time()
-    aux_mol = pyscf.gto.M(atom=mol.atom, basis=aux_basis)
+    alphas = compute_dynamic_alphas(pivots, gammas=gammas)
+    aux_mol = build_floating_basis(pivots, alphas)
     if omega > 0:
         aux_mol.set_range_coulomb(omega)
     print(f"  Step 1: Create Aux Mol took: {time.time() - t_start:.4f} s")
@@ -1563,6 +1636,7 @@ class TDDFT(lib.StreamObject):
         isdf_rcond=1e-6,
         isdf_grid_level=3,
         isdf_naux_factor=8,
+        isdf_gammas=[0.25, 0.5],
         verbose=5,
         # options
         TDA=False,
@@ -1621,6 +1695,7 @@ class TDDFT(lib.StreamObject):
         self.isdf_rcond = isdf_rcond
         self.isdf_grid_level = isdf_grid_level
         self.isdf_naux_factor = isdf_naux_factor
+        self.isdf_gammas = isdf_gammas
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -1725,12 +1800,14 @@ class TDDFT(lib.StreamObject):
                 nstart += ao.shape[1]
             
             t0 = time.time()
-            phi_piv, xi_phi, grad_phi_piv, xi_grad, _, _ = isdf_decompose_jax(
+            phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
                 jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
                 jnp.array(weights), grid_batch_size=8192, is_incore=True, rcond=self.isdf_rcond
             )
             t1 = time.time()
             print(f"ISDF decomposition for spin {s} took: {t1 - t0:.2f} s")
+            
+            pivot_coords = grids.coords[np.array(pivots)]
             
             C_val = np.array(phi_piv).T
             C_grad = np.array(grad_phi_piv).transpose(2, 1, 0)
@@ -1754,15 +1831,15 @@ class TDDFT(lib.StreamObject):
                 self.xi_phi = np.array(xi_phi, dtype=np.float64)
                 self.xi_grad = np.array(xi_grad, dtype=np.float64)
                 
-                # Build the Analytical J-Kernels (Direct Grid)
+                # Build the Analytical J-Kernels (DF)
                 t0 = time.time()
-                self.J = np.array(compute_J_munu(
-                    self.xi_phi, weights, grids.coords
+                self.J = np.array(compute_ISDF_J_kernels_DF(
+                    self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas
                 ))
                 
                 if getattr(self, 'omega', 0.0) > 0:
-                    self.J_rsh = np.array(compute_J_munu_lr(
-                        self.xi_phi, weights, grids.coords, self.omega
+                    self.J_rsh = np.array(compute_ISDF_J_kernels_DF(
+                        self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas, omega=self.omega
                     ))
                 else:
                     self.J_rsh = None
@@ -2005,193 +2082,6 @@ class TDDFT(lib.StreamObject):
         )
         lib.logger.timer(self, 'tddft full diagonalization', *cput0)
         return self.exci, self.X_vec, self.Y_vec
-
-    def analyze(self, thresh=0.1, oscillator=True, s2=True, e_min=0.0):
-        """Analyze excitations.
-
-        Args:
-            thresh (float, optional): threshold to print dominant component. Defaults to 0.1.
-            oscillator (bool, optional): calculate oscillator strength. Defaults to True.
-            s2 (bool, optional): calculate <S2> expectation value. Defaults to True.
-            e_min (float, optional): minimum excitation energy to analyze. Defaults to 0.0.
-
-        Returns:
-            all_data (list): list of dictionaries containing results of analysis.
-        """
-        multi = self.multi
-        nspin = self.nspin
-        nmo = self.nmo
-        nocc = self.nocc
-
-        emin_index = np.searchsorted(self.exci, e_min, side='left')
-        exci = self.exci[emin_index:]
-
-        X_vec = [X_vec_s[emin_index:] for X_vec_s in self.X_vec]
-        Y_vec = [Y_vec_s[emin_index:] for Y_vec_s in self.Y_vec]
-        nvir = [(nmo - nocc[i]) for i in range(nspin)]
-
-        if oscillator is True:
-            dipole, oscillator_strength = _get_oscillator_strength(
-                multi=multi, exci=exci, X_vec=X_vec, Y_vec=Y_vec, mo_coeff=self.mo_coeff, nocc=nocc, mol=self.mol
-            )
-
-        if s2 is True and nspin == 2:
-            s2 = _get_spin_square(nocc=nocc, X_vec=X_vec, Y_vec=Y_vec, mo_coeff=self.mo_coeff, ovlp=self.mf.get_ovlp())
-
-        all_data = []
-
-        print('-' * 55)
-        if multi == 's':
-            print('restricted singlet tddft')
-        elif multi == 't':
-            print('restricted triplet tddft')
-        elif multi == 'u':
-            print('unrestricted tddft')
-        for r in range(exci.size):
-            this_datum = {
-                'excited_state': r + 1,
-                'excitation_energy': float(exci[r]),
-                'excitation_energy_ev': float(exci[r] * HARTREE2EV),
-            }
-            print('-' * 55)
-            print('excited state: %-d' % (r + 1))
-            print('excitation energy:   %15.8f   AU   %15.8f   eV' % (exci[r], exci[r] * HARTREE2EV))
-            if multi == 's':
-                if oscillator is True:
-                    print('spin allowed, oscillator strength:   %15.8f   AU' % oscillator_strength[r])
-                    print(
-                        'transition dipole: x =  %15.6f  , y =  %15.6f  , z =  %15.6f'
-                        % (dipole[0][r], dipole[1][r], dipole[2][r])
-                    )
-                    this_datum['oscillator_strength'] = float(oscillator_strength[r])
-                    this_datum['transition_dipole'] = (float(dipole[0][r]), float(dipole[1][r]), float(dipole[2][r]))
-            elif multi == 't':
-                if oscillator is True:
-                    print('spin forbidden, oscillator strength and transition dipoles are not defined')
-            elif multi == 'u':
-                if s2 is True:
-                    print('<S^2> =    %.6f', s2[r])
-                if oscillator is True:
-                    print('oscillator strength:   %15.8f   AU' % oscillator_strength[r])
-                    print(
-                        'transition dipole: x =  %15.6f  , y =  %15.6f  , z =  %15.6f'
-                        % (dipole[0][r], dipole[1][r], dipole[2][r])
-                    )
-                    this_datum['s2'] = s2[r]
-                    this_datum['oscillator_strength'] = float(oscillator_strength[r])
-                    this_datum['transition_dipole'] = (float(dipole[0][r]), float(dipole[1][r]), float(dipole[2][r]))
-
-            def print_component(comp, with_spin=False):
-                if not with_spin:
-                    print(f"{comp['i']:5} -> {comp['a']:5}, {comp['weight']:15f}, {comp['type']}")
-                else:
-                    print(
-                        f"{comp['i']:5} -> {comp['a']:5}, spin {comp['spin']}, {comp['weight']:15f}, {comp['type']}"
-                    )
-
-            this_datum_components = []
-            print('dominant component')
-            if nspin == 1:
-                for i in range(nocc[0]):
-                    for a in range(nvir[0]):
-                        if abs(X_vec[0][r][i][a]) > thresh:
-                            comp = {
-                                    'i': i + 1,
-                                    'a': int(a + nocc[0] + 1),
-                                    'spin': 0,
-                                    'weight': float(X_vec[0][r][i][a]),
-                                    'type': 'X',
-                            }
-                            this_datum_components.append(comp)
-                            print_component(comp)
-                        if abs(Y_vec[0][r][i][a]) > thresh:
-                            comp = {
-                                    'i': i + 1,
-                                    'a': int(a + nocc[0] + 1),
-                                    'spin': 0,
-                                    'weight': float(Y_vec[0][r][i][a]),
-                                    'type': 'Y',
-                            }
-                            this_datum_components.append(comp)
-                            print_component(comp)
-            else:
-                for s in range(nspin):
-                    spin = 'a' if s == 0 else 'b'
-                    for i in range(nocc[s]):
-                        for a in range(nvir[s]):
-                            if abs(X_vec[s][r][i][a]) > thresh:
-                                comp = {
-                                        'i': i + 1,
-                                        'a': int(a + nocc[s] + 1),
-                                        'spin': s,
-                                        'weight': float(X_vec[s][r][i][a]),
-                                        'type': 'X',
-                                }
-                                this_datum_components.append(comp)
-                                print_component(comp, with_spin=True)
-                            if abs(Y_vec[s][r][i][a]) > thresh:
-                                comp = {
-                                        'i': i + 1,
-                                        'a': int(a + nocc[s] + 1),
-                                        'spin': s,
-                                        'weight': float(X_vec[s][r][i][a]),
-                                        'type': 'Y',
-                                }
-                                this_datum_components.append(comp)
-                                print_component(comp, with_spin=True)
-            this_datum['components'] = this_datum_components
-            all_data.append(this_datum)
-        return all_data
-
-    def get_oscillator_strength(self):
-        """Get transition dipoles and oscillator strengths.
-
-        Returns:
-            dipole (double ndarray): transition dipoles.
-            oscillator_strength (double array): oscillator strengths.
-        """
-        assert self.exci is not None and self.X_vec is not None and self.Y_vec is not None
-        assert self.mo_coeff is not None and self.mol is not None
-        dipole, oscillator_strength = _get_oscillator_strength(
-            multi=self.multi,
-            exci=self.exci,
-            X_vec=self.X_vec,
-            Y_vec=self.Y_vec,
-            mo_coeff=self.mo_coeff,
-            nocc=self.nocc,
-            mol=self.mol,
-        )
-
-        return dipole, oscillator_strength
-
-    def _contract_multipole(self, ints, hermi=True, xy=None):
-        '''ints is the integral tensor of a spin-independent operator'''
-        if xy is None: xy = self.xy
-        nstates = len(xy)
-        pol_shape = ints.shape[:-2]
-        nao = ints.shape[-1]
-
-        if not self.multi.lower() == 's':
-            return np.zeros((nstates,) + pol_shape)
-
-        mo_coeff = self.mo_coeff[0]
-        mo_occ = self.mo_occ[0]
-        orbo = mo_coeff[:,mo_occ==2]
-        orbv = mo_coeff[:,mo_occ==0]
-
-        #Incompatible to old numpy version
-        #ints = numpy.einsum('...pq,pi,qj->...ij', ints, orbo, orbv.conj())
-        ints = lib.einsum('xpq,pi,qj->xij', ints.reshape(-1,nao,nao), orbo, orbv.conj())
-        pol = np.array([np.einsum('xij,ij->x', ints, x) * 2 for x,y in xy])
-        if isinstance(xy[0][1], np.ndarray):
-            if hermi:
-                pol += [np.einsum('xij,ij->x', ints, y) * 2 for x,y in xy]
-            else:  # anti-Hermitian
-                pol -= [np.einsum('xij,ij->x', ints, y) * 2 for x,y in xy]
-        pol = pol.reshape((nstates,)+pol_shape)
-        return pol
-    
-
 
 if __name__ == '__main__':
     from pyscf import gto, dft, scf
