@@ -80,7 +80,15 @@ $$ J_{\nu \mu} = \iint d\mathbf{r} d\mathbf{r}' \frac{\zeta_\nu(\mathbf{r}) \zet
 For Range-Separated Hybrids (RSH), the Long-Range (LR) exact exchange requires a complementary Long-Range Coulomb Kernel ($J_{\nu \mu}^{LR}$) modulated by the error function:
 $$ J_{\nu \mu}^{LR} = \iint d\mathbf{r} d\mathbf{r}' \frac{\text{erf}(\omega |\mathbf{r} - \mathbf{r}'|)}{|\mathbf{r} - \mathbf{r}'|} \zeta_\nu(\mathbf{r}) \zeta_\mu(\mathbf{r}') $$
 
+#### Floating Gaussian Basis Evaluation
 
+While the above formulation integrates $J_{\nu\mu}$ directly on the numerical grid, evaluating the exact Coulomb interaction in real-space pairs scales at a prohibitive $\mathcal{O}(N_{grid}^2)$. To bypass this massive computational bottleneck, `pytc` employs an auxiliary **Floating Gaussian Basis** constructed dynamically around the extracted ISDF pivot coordinates.
+
+Instead of generic atom-centered bases, uncontracted s-type Gaussian functions are centered exactly at the chosen interpolant pivots ($\mathbf{r}_\mu$). The exponents ($\alpha_\mu$) are dynamically determined by the local pivot density via a Nearest-Neighbor KDTree lookup:
+$$ \alpha_\mu = \frac{\gamma}{h_\mu^2} $$
+Where $h_\mu$ is the distance to the nearest neighbor (or local mean radius) and $\gamma$ is a scaling/overlap coverage factor (typically 0.4 to 0.8).
+
+By projecting the numerical ISDF interpolants $\zeta_\mu(\mathbf{r})$ onto this compact floating basis set using an SVD-based pseudo-inverse, the discrete ISDF kernels are evaluated using mathematically exact, rapid analytical PySCF $(P|Q)$ Coulomb integrals. This reduces the kernel construction cost dramatically while simultaneously eliminating grid-based singularity noise for the long-range tails.
 
 ### ISDF Exchange-Correlation kernels ($f_{xc}$)
 Just like the Coulomb kernel, the TDDFT XC response matrix $f_{xc}$ can be compressed from the massive $N_{grid} \times N_{grid}$ grid dimensions down to the compact $N_{piv} \times N_{piv}$ auxiliary space.
