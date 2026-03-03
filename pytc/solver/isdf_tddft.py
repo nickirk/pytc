@@ -17,6 +17,9 @@ import scipy
 import scipy.linalg as sla
 import jax
 import jax.numpy as jnp
+from jax import lax
+import gc
+
 jax.config.update("jax_enable_x64", True)
 from jax.scipy import special as jsp
 import h5py
@@ -33,6 +36,42 @@ import pyscf.gto
 DEFAULT_EINSUM_BACKEND = 'pytblis'
 HARTREE2EV = nist.HARTREE2EV
 
+import jax
+import psutil
+import os
+
+def print_memory_usage(named_arrays):
+    """
+    Identifies all live arrays on the default GPU and prints their 
+    size, shape, and memory footprint in MiB.
+    """
+    
+    print(f"\n{'Variable Name':<25} | {'Variable Shape':<25} | {'Dtype':<10} | {'Memory (MiB)':<12} | Device")
+    print("-" * 55)
+    
+    total_mem_bytes = 0
+    count = 0
+    
+    for name, arr in named_arrays.items():
+        # Check if the array is actually on the device we are looking at
+        device = getattr(arr, 'device', 'CPU')
+        try:
+            shape = arr.shape
+            dtype = arr.dtype
+            size_bytes = arr.nbytes
+            
+            mem_mib = size_bytes / (1024**2)
+            print(f"{name:<25} | {str(shape):<25} | {str(dtype):<10} | {mem_mib:>10.2f} MiB | {device}")
+            
+            total_mem_bytes += size_bytes
+            count += 1
+        except (AttributeError, RuntimeError):
+            continue
+
+    total_mib = total_mem_bytes / (1024**2)
+    print("-" * 55)
+    print(f"Total Live Arrays: {count}")
+    print(f"Total GPU Memory Used: {total_mib:.2f} MiB")
 
 def einsum(script, *tensors, out=None, alpha=1.0, beta=0.0, einsum_backend = DEFAULT_EINSUM_BACKEND):
     '''Wrapper for einsum supporting pytblis, pyscf.lib.einsum, or numpy.einsum backends.'''
@@ -225,7 +264,81 @@ def build_floating_basis(pivots, alphas, unit='Bohr'):
     
     return aux_mol
 
-def compute_ISDF_J_kernels_DF(xi_phi, weights, coords, pivots, gammas=[0.25, 0.5, 1.0], omega=0, rcond=1e-12):
+@jax.jit
+def _compute_J_jax_core(aux_eval, weights, xi_phi, J_PQ, rcond):
+    """
+    Pure JAX implementation of the projection and contraction.
+    Runs entirely on GPU.
+    """
+    # Step 3: Contractions
+    # w_aux_eval is (Naux, Ngrid)
+    w_aux_eval = (aux_eval * weights[:, None]).T
+    
+    # S_PQ: (Naux, Naux) | V_Pmu: (Naux, Nmunu)
+    S_PQ = jnp.matmul(w_aux_eval, aux_eval)
+    V_Pmu = jnp.matmul(w_aux_eval, xi_phi.T)
+    
+    # Step 4: GPU-accelerated SVD
+    # JAX uses cuSOLVER on NVIDIA GPUs for this
+    U, s, Vh = jnp.linalg.svd(S_PQ, full_matrices=False)
+    
+    # Robust pseudo-inverse
+    mask = s > s[0] * rcond
+    s_inv = jnp.where(mask, 1.0 / s, 0.0)
+    
+    # Calculate d coefficients: (Naux, Nmunu)
+    # Equivalent to S_PQ_inv @ V_Pmu
+    d = jnp.matmul(Vh.T, (s_inv[:, None] * jnp.matmul(U.T, V_Pmu)))
+    
+    # Step 5: Final Double Contraction
+    # Result = d.T @ J_PQ @ d
+    # Using jnp.einsum or chain matmuls for speed
+    J_munu = jnp.matmul(d.T, jnp.matmul(J_PQ, d))
+    
+    return J_munu
+
+
+def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12):
+    import time
+    from pyscf import gto
+    
+    # --- CPU PREPROCESSING (PySCF) ---
+    t_start = time.time()
+    alphas = compute_dynamic_alphas(pivots, gammas=gammas)
+    aux_mol = build_floating_basis(pivots, alphas)
+    print_memory_usage({name: val for name, val in locals().items()})
+    
+    if omega > 0:
+        aux_mol.set_range_coulomb(omega)
+        
+    # Generate the static matrices on CPU
+    R_cpu = aux_mol.eval_gto('GTOval', coords)
+    J_PQ_cpu = aux_mol.intor('int2c2e')
+    print(f"PySCF Preprocessing: {time.time() - t_start:.4f}s")
+    print_memory_usage({name: val for name, val in locals().items()})
+    
+    # --- DEVICE TRANSFER ---
+    # Move everything to GPU memory
+    t_transfer = time.time()
+    R_gpu = jax.device_put(jnp.array(R_cpu))
+    J_PQ_gpu = jax.device_put(jnp.array(J_PQ_cpu))
+    xi_phi_gpu = jax.device_put(jnp.array(xi_phi))
+    weights_gpu = jax.device_put(jnp.array(weights))
+    print(f"Host-to-Device Transfer: {time.time() - t_transfer:.4f}s")
+    print_memory_usage({name: val for name, val in locals().items()})
+
+    # --- JAX KERNEL EXECUTION ---
+    t_jax = time.time()
+    J_munu = _compute_J_jax_core(R_gpu, weights_gpu, xi_phi_gpu, J_PQ_gpu, rcond)
+
+    # Block until finished to get accurate timing (JAX is asynchronous)
+    J_munu.block_until_ready()
+    print(f"JAX GPU Kernel: {time.time() - t_jax:.4f}s")
+    print_memory_usage({name: val for name, val in locals().items()})
+    
+    return J_munu
+
+def compute_ISDF_J_kernels_DF(xi_phi, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12):
     """
     Computes a single J_munu (either standard Coulomb or range-separated) by 
     projecting ISDF interpolants onto a floating Gaussian auxiliary basis and using 
@@ -347,42 +460,39 @@ def isdf_gga_mvp(C_o, C_v, V_fxc, z):
     
     return mvp
 
+@jax.jit
 def compress_isdf_lda_kernel(xi, wfxc):
     """
-    Compress the N_grid x N_grid LDA kernel into N_aux x N_aux.
-    
-    xi: (naux, ngrid) - ISDF interpolation functions $\zeta_{\mu}(\mathbf{r})$
-    wfxc: (ngrid,) - Grid integrated fxc kernel
-    
-    Returns:
-    V_xc: (naux, naux)
+    GPU Accelerated LDA compression.
+    xi: (naux, ngrid)
+    wfxc: (ngrid,)
     """
-    # V^{\nu \mu} = \sum_{r} \zeta_{\nu}(r) f(r) \zeta_{\mu}(r)
-    # return einsum('nr,r,mr->nm', xi, wfxc, xi)
-    return (xi * wfxc[None, :]) @ xi.T  # Hadamard + DGEMM
+    # Using jnp.matmul with broadcasting for the weight
+    # (naux, ngrid) * (1, ngrid) @ (ngrid, naux)
+    return (xi * wfxc[None, :]) @ xi.T
 
-
+@jax.jit
 def compress_isdf_gga_kernel(xi_phi, xi_grad, wfxc):
     """
-    Compress the GGA fxc kernel into the ISDF auxiliary basis using both density and gradient interpolators.
-    xi_phi: (naux, ngrid)
-    xi_grad: (naux, ngrid, 3) 
-    wfxc: (4, 4, ngrid) containing w(r) * f_{xy}(r)
+    JAX version of GGA compression.
+    Maintains your loop structure and logic exactly.
     """
     naux, ngrid = xi_phi.shape
     
-    # Pack interpolators into a single array (4, naux, ngrid)
-    xi_full = np.zeros((4, naux, ngrid))
-    xi_full[0] = xi_phi
-    xi_full[1:4] = np.transpose(xi_grad, (2, 0, 1))
+    # 1. Initialize and Pack Interpolators
+    # We use .at[].set() to mirror your NumPy assignments
+    xi_full = jnp.zeros((4, naux, ngrid))
+    xi_full = xi_full.at[0].set(xi_phi)
+    xi_full = xi_full.at[1:4].set(jnp.transpose(xi_grad, (2, 0, 1)))
     
-    # Contract: V_{yx}^{nu, mu} = sum_r xi_{nu, y}(r) * wfxc_{yx}(r) * xi_{mu, x}(r)
-    V_fxc = np.zeros((4, 4, naux, naux))
+    # 2. Contract components
+    V_fxc = jnp.zeros((4, 4, naux, naux))
     for y in range(4):
         for x in range(4):
             # Hadamard product over grid, then DGEMM
             tmp = xi_full[y] * wfxc[y, x][None, :]
-            V_fxc[y, x] = tmp @ xi_full[x].T
+            # Maintain the nested loop structure as requested
+            V_fxc = V_fxc.at[y, x].set(tmp @ xi_full[x].T)
             
     return V_fxc
 
@@ -1634,6 +1744,7 @@ class TDDFT(lib.StreamObject):
         # initialize with nocc, mo_energy, C_o, C_v, J
         nocc=None,
         isdf_rcond=1e-6,
+        isdf_grid_batch_size=2048,
         isdf_grid_level=3,
         isdf_naux_factor=8,
         isdf_gammas=[0.25, 0.5],
@@ -1696,6 +1807,7 @@ class TDDFT(lib.StreamObject):
         self.isdf_grid_level = isdf_grid_level
         self.isdf_naux_factor = isdf_naux_factor
         self.isdf_gammas = isdf_gammas
+        self.isdf_grid_batch_size = isdf_grid_batch_size
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -1783,6 +1895,7 @@ class TDDFT(lib.StreamObject):
         # but in a rigorous implementation, spin-unrestricted usually shares a single spatial ISDF basis.
 
         for s in range(self.nspin):
+            print_memory_usage({name: val for name, val in locals().items()})
             nocc_s = self.nocc[s] if isinstance(self.nocc, list) else self.nocc
             orbs_s = self.mo_coeff[s]
             
@@ -1799,14 +1912,15 @@ class TDDFT(lib.StreamObject):
                 weights[nstart:nstop] = weight
                 nstart += ao.shape[1]
             
+            print_memory_usage({name: val for name, val in locals().items()})
             t0 = time.time()
             phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
                 jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
-                jnp.array(weights), grid_batch_size=8192, is_incore=True, rcond=self.isdf_rcond
+                jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size, is_incore=True, rcond=self.isdf_rcond
             )
+            gc.collect()
             t1 = time.time()
             print(f"ISDF decomposition for spin {s} took: {t1 - t0:.2f} s")
-            
             pivot_coords = grids.coords[np.array(pivots)]
             
             C_val = np.array(phi_piv).T
@@ -1825,27 +1939,33 @@ class TDDFT(lib.StreamObject):
             C_v_gga_s = C_full[:, :, nocc_s:]
             self.C_o_gga.append(C_o_gga_s)
             self.C_v_gga.append(C_v_gga_s)
+            print_memory_usage({name: val for name, val in locals().items()})
             
             if s == 0:
                 # Save xi_phi and xi_grad for later fxc kernel compression (force float64)
                 self.xi_phi = np.array(xi_phi, dtype=np.float64)
                 self.xi_grad = np.array(xi_grad, dtype=np.float64)
-                
+                del xi_phi, xi_grad, grad_phi_piv, pivots
+                print_memory_usage({name: val for name, val in locals().items()})
+
                 # Build the Analytical J-Kernels (DF)
                 t0 = time.time()
-                self.J = np.array(compute_ISDF_J_kernels_DF(
+                self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
                     self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas
                 ))
                 
                 if getattr(self, 'omega', 0.0) > 0:
-                    self.J_rsh = np.array(compute_ISDF_J_kernels_DF(
+                    self.J_rsh = np.array(compute_ISDF_J_kernels_DF_gpu(
                         self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas, omega=self.omega
                     ))
                 else:
                     self.J_rsh = None
                 
+                print_memory_usage({name: val for name, val in locals().items()})
                 t1 = time.time()
                 print(f"Analytical ISDF J-kernel build(s) took: {t1 - t0:.2f} s")
+            else:
+                raise NotImplementedError
                  
         print('--- Finished Auto ISDF Decomposition ---\n')
         
@@ -1894,6 +2014,7 @@ class TDDFT(lib.StreamObject):
         orbo = self.mo_coeff[0][:,:self.nocc[0]]
         
         if self.xctype == 'LDA':
+            t0 = time.time()
             ao_deriv = 0
             wfxc = np.zeros((self.mf.grids.coords.shape[0]))       
             nstart, nstop = 0, 0
@@ -1905,13 +2026,15 @@ class TDDFT(lib.StreamObject):
                 wfxc[nstart:nstop] = fxc[0,0] * weight
 
                 nstart += ao.shape[0]
-
+            t1 = time.time()
+            print(f'LDA fxc kernel calculated in real-space, took: {t1 - t0:.2f} s"')
             # Compress wfxc into ISDF interpolant space: (ngrid,) -> (naux, naux)
             self.wfxc = compress_isdf_lda_kernel(self.xi_phi, wfxc)
             print(f'ISDF LDA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
             return
 
         elif self.xctype == 'GGA':
+            t0 = time.time()
             ao_deriv = 1
             wfxc = np.zeros((4, 4, self.mf.grids.coords.shape[0]))       
             nstart, nstop = 0, 0
@@ -1932,11 +2055,14 @@ class TDDFT(lib.StreamObject):
                 del rho
                 nstart += ao.shape[1]
                 del ao, mask, weight, coords
-
+            t1 = time.time()
+            print(f'GGA fxc kernel calculated in real-space, took: {t1 - t0:.2f} s"')
             # Compress wfxc into ISDF interpolant space: (4, 4, ngrid) -> (4, 4, naux, naux)
             # wfxc is (x, y, r) from eval_xc_eff; compress_isdf_gga_kernel expects (y, x, r)
+            t0 = time.time()
             self.wfxc = compress_isdf_gga_kernel(self.xi_phi, self.xi_grad, wfxc.transpose(1, 0, 2))
-            print(f'ISDF GGA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
+            t1 = time.time()
+            print(f'ISDF GGA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}, took: {t1 - t0:.2f} s"')
             return
                 
         elif self.xctype == 'HF':
