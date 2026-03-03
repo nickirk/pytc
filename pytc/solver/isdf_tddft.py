@@ -1736,6 +1736,170 @@ def _get_spin_square(nocc, X_vec, Y_vec, mo_coeff, ovlp):
     return s2
 
 
+# ---------------------------------------------------------------------------
+# Streaming helpers: build J_munu and wfxc without holding full xi_phi/xi_grad
+# ---------------------------------------------------------------------------
+
+def compute_ISDF_J_kernels_DF_streaming(
+    h5_path, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12,
+    batch_size=4096
+):
+    """
+    Streaming + JAX/GPU-accelerated version of compute_ISDF_J_kernels_DF.
+
+    Reads xi_phi from `h5_path` in grid batches, immediately moves each
+    batch to the JAX default device (GPU if available, else CPU), and
+    accumulates S_PQ and V_Pmu entirely on-device.  The final SVD and
+    contraction J = d^T J_PQ d are also performed in JAX.
+
+    args:
+        h5_path  : str  — path to HDF5 file containing dataset 'xi_phi'  (naux, ngrid)
+        weights  : (ngrid,) integration weights
+        coords   : (ngrid, 3) grid coordinates
+        pivots   : (naux, 3) ISDF pivot coordinates
+        gammas, omega, rcond : same as compute_ISDF_J_kernels_DF
+        batch_size : number of grid points processed per batch
+
+    Returns:
+        J_munu : (naux, naux) ndarray  (on CPU)
+    """
+    label = "Standard Coulomb" if omega == 0 else f"Range-Separated (omega={omega})"
+    print(f"\nBuilding Streaming J-Kernel ({label}) [JAX] with floating basis (gammas={gammas})...")
+    t0 = time.time()
+
+    # Build auxiliary molecule (CPU / PySCF, done once)
+    alphas  = compute_dynamic_alphas(pivots, gammas=gammas)
+    aux_mol = build_floating_basis(pivots, alphas)
+    if omega > 0:
+        aux_mol.set_range_coulomb(omega)
+
+    n_grid   = coords.shape[0]
+    n_aux_df = aux_mol.nao
+
+    with h5py.File(h5_path, 'r') as f:
+        n_fused = f['xi_phi'].shape[0]
+
+        # Accumulators live on the JAX device (GPU if available)
+        S_PQ  = jnp.zeros((n_aux_df, n_aux_df), dtype=jnp.float64)
+        V_Pmu = jnp.zeros((n_aux_df, n_fused),  dtype=jnp.float64)
+
+        for g_start in range(0, n_grid, batch_size):
+            g_end     = min(g_start + batch_size, n_grid)
+            coords_b  = coords[g_start:g_end]                           # (B, 3)  CPU numpy
+            weights_b = weights[g_start:g_end]                          # (B,)    CPU numpy
+
+            # aux_eval is a PySCF CPU call — result is numpy
+            aux_b_np  = aux_mol.eval_gto('GTOval', coords_b)            # (B, naux_df)
+
+            # Push batch to device
+            aux_b  = jnp.array(aux_b_np)                                # (B, naux_df) GPU
+            xi_b   = jnp.array(f['xi_phi'][:, g_start:g_end])          # (naux, B)    GPU
+            w_b    = jnp.array(weights_b)                               # (B,)         GPU
+
+            w_aux_b = (aux_b * w_b[:, None]).T                          # (naux_df, B) GPU
+
+            S_PQ   = S_PQ  + jnp.matmul(w_aux_b, aux_b)                # (naux_df, naux_df)
+            V_Pmu  = V_Pmu + jnp.matmul(w_aux_b, xi_b.T)               # (naux_df, naux)
+
+    # Analytical 2-centre integrals (PySCF CPU → GPU)
+    J_PQ = jnp.array(aux_mol.intor('int2c2e'))                          # (naux_df, naux_df)
+
+    # SVD pseudo-inverse of S_PQ on device
+    U, s, Vh = jnp.linalg.svd(S_PQ, full_matrices=False)
+    mask  = s > s[0] * rcond
+    s_inv = jnp.where(mask, 1.0 / jnp.where(mask, s, 1.0), 0.0)
+    d = jnp.matmul(Vh.T * s_inv, jnp.matmul(U.T, V_Pmu))               # (naux_df, naux)
+
+    J_munu = jnp.matmul(d.T, jnp.matmul(J_PQ, d))                      # (naux, naux)
+    J_munu.block_until_ready()
+
+    print(f"Streaming J-kernel build took: {time.time() - t0:.2f} s")
+    return np.array(J_munu)
+
+
+def compress_isdf_lda_kernel_streaming(h5_path, wfxc_real, batch_size=4096):
+    """
+    Streaming + JAX/GPU-accelerated LDA fxc compression.
+
+    Computes  wfxc[mu, nu] = sum_g  xi_phi[mu,g] * wfxc_real[g] * xi_phi[nu,g]
+    by reading xi_phi in batches from HDF5 and accumulating on the JAX device.
+
+    Args:
+        h5_path   : str — HDF5 file with dataset 'xi_phi'  (naux, ngrid)
+        wfxc_real : (ngrid,) ndarray of  fxc * weight  on the grid
+        batch_size : grid batch size
+
+    Returns:
+        wfxc : (naux, naux) ndarray  (on CPU)
+    """
+    print("Streaming LDA fxc compression [JAX]...")
+    t0 = time.time()
+    with h5py.File(h5_path, 'r') as f:
+        n_fused, n_grid = f['xi_phi'].shape
+        wfxc = jnp.zeros((n_fused, n_fused), dtype=jnp.float64)        # accumulator on device
+
+        for g_start in range(0, n_grid, batch_size):
+            g_end = min(g_start + batch_size, n_grid)
+            xi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])           # (naux, B) GPU
+            w_b   = jnp.array(wfxc_real[g_start:g_end])                 # (B,)      GPU
+            wfxc  = wfxc + jnp.matmul(xi_b * w_b, xi_b.T)              # (naux, naux)
+
+    wfxc.block_until_ready()
+    result = np.array(wfxc)
+    print(f"  => wfxc shape {result.shape}, took {time.time()-t0:.2f} s")
+    return result
+
+
+def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096):
+    """
+    Streaming + JAX/GPU-accelerated GGA fxc compression.
+
+    Computes  wfxc[y, x, mu, nu] = sum_g  xi_full[y,mu,g] * wfxc_real[y,x,g] * xi_full[x,nu,g]
+    where xi_full[0] = xi_phi and xi_full[1:4] = xi_grad.
+
+    Args:
+        h5_path   : str — HDF5 file with datasets 'xi_phi' (naux, ngrid)
+                          and 'xi_grad' (naux, ngrid, 3)
+        wfxc_real : (4, 4, ngrid) ndarray of fxc * weight  (y, x, r) convention
+        batch_size : grid batch size
+
+    Returns:
+        wfxc : (4, 4, naux, naux) ndarray  (on CPU)
+    """
+    print("Streaming GGA fxc compression [JAX]...")
+    t0 = time.time()
+
+    # Move per-component weight slices to device once (small: 4x4xB per batch)
+    with h5py.File(h5_path, 'r') as f:
+        n_fused, n_grid = f['xi_phi'].shape
+        wfxc = jnp.zeros((4, 4, n_fused, n_fused), dtype=jnp.float64)  # accumulator on device
+
+        for g_start in range(0, n_grid, batch_size):
+            g_end     = min(g_start + batch_size, n_grid)
+
+            # Load from HDF5 and push to device
+            xi_phi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])       # (naux, B)
+            xi_grad_b = jnp.array(f['xi_grad'][:, g_start:g_end, :])   # (naux, B, 3)
+
+            # xi_full[0] = xi_phi;  xi_full[1:4] = xi_grad components
+            xi_full = jnp.concatenate([
+                xi_phi_b[None],                                          # (1, naux, B)
+                xi_grad_b.transpose(2, 0, 1),                           # (3, naux, B)
+            ], axis=0)                                                   # (4, naux, B)
+
+            # Accumulate all 16 (y, x) pairs
+            w_batch = jnp.array(wfxc_real[:, :, g_start:g_end])         # (4, 4, B) on device
+            for y in range(4):
+                for x in range(4):
+                    tmp = xi_full[y] * w_batch[y, x]                    # (naux, B) Hadamard
+                    wfxc = wfxc.at[y, x].add(jnp.matmul(tmp, xi_full[x].T))  # (naux, naux)
+
+    wfxc.block_until_ready()
+    result = np.array(wfxc)
+    print(f"  => wfxc shape {result.shape}, took {time.time()-t0:.2f} s")
+    return result
+
+
 class TDDFT(lib.StreamObject):
     def __init__(
         self,
@@ -1748,6 +1912,8 @@ class TDDFT(lib.StreamObject):
         isdf_grid_level=3,
         isdf_naux_factor=8,
         isdf_gammas=[0.25, 0.5],
+        isdf_stream_path=None,
+        isdf_stream_batch_size=4096,
         verbose=5,
         # options
         TDA=False,
@@ -1808,6 +1974,13 @@ class TDDFT(lib.StreamObject):
         self.isdf_naux_factor = isdf_naux_factor
         self.isdf_gammas = isdf_gammas
         self.isdf_grid_batch_size = isdf_grid_batch_size
+        # Streaming: if set, xi_phi/xi_grad are written to this HDF5 path and
+        # streamed during J-kernel build and fxc compression instead of being
+        # loaded fully into RAM.  After all compressed objects are built the
+        # file is deleted automatically.
+        self.isdf_stream_path = isdf_stream_path
+        self.isdf_stream_batch_size = isdf_stream_batch_size
+        self._isdf_h5_path = None  # internal: set during _build_isdf_intermediates
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -1914,10 +2087,30 @@ class TDDFT(lib.StreamObject):
             
             print_memory_usage({name: val for name, val in locals().items()})
             t0 = time.time()
-            phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
-                jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
-                jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size, is_incore=True, rcond=self.isdf_rcond
-            )
+
+            # --- Decide streaming vs in-core BEFORE the decompose call (spin 0 only) ---
+            # In streaming mode, xi_phi/xi_grad are written directly to HDF5 and
+            # returned as None, so they never occupy RAM beyond isdf_decompose.
+            if s == 0 and self.isdf_stream_path is not None:
+                # Resolve HDF5 path (True → auto temp under /tmp)
+                if self.isdf_stream_path is True:
+                    import uuid as _uuid
+                    stream_h5 = f"/tmp/isdf_stream_{_uuid.uuid4().hex[:8]}.h5"
+                else:
+                    stream_h5 = self.isdf_stream_path
+                phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
+                    jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
+                    jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size,
+                    is_incore=False, save_path=stream_h5, rcond=self.isdf_rcond
+                )  # xi_phi and xi_grad are None here (written to stream_h5)
+            else:
+                stream_h5 = None  # sentinel: non-streaming
+                phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
+                    jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
+                    jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size,
+                    is_incore=True, rcond=self.isdf_rcond
+                )
+
             gc.collect()
             t1 = time.time()
             print(f"ISDF decomposition for spin {s} took: {t1 - t0:.2f} s")
@@ -1942,25 +2135,55 @@ class TDDFT(lib.StreamObject):
             print_memory_usage({name: val for name, val in locals().items()})
             
             if s == 0:
-                # Save xi_phi and xi_grad for later fxc kernel compression (force float64)
-                self.xi_phi = np.array(xi_phi, dtype=np.float64)
-                self.xi_grad = np.array(xi_grad, dtype=np.float64)
-                del xi_phi, xi_grad, grad_phi_piv, pivots
-                print_memory_usage({name: val for name, val in locals().items()})
-
-                # Build the Analytical J-Kernels (DF)
                 t0 = time.time()
-                self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
-                    self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas
-                ))
-                
-                if getattr(self, 'omega', 0.0) > 0:
-                    self.J_rsh = np.array(compute_ISDF_J_kernels_DF_gpu(
-                        self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas, omega=self.omega
-                    ))
+                if stream_h5 is not None:
+                    # --- Streaming mode ---
+                    # stream_h5 was resolved and isdf_decompose used is_incore=False,
+                    # so xi_phi/xi_grad are None (written to HDF5).
+                    # Remember the path so load_fxc_intermediates can stream from it.
+                    self._isdf_h5_path = stream_h5
+                    del xi_phi, xi_grad, grad_phi_piv, pivots
+
+                    # Build J-kernel by streaming from HDF5 (no full xi_phi in RAM)
+                    self.J = compute_ISDF_J_kernels_DF_streaming(
+                        stream_h5, weights, grids.coords, pivot_coords,
+                        gammas=self.isdf_gammas, batch_size=self.isdf_stream_batch_size
+                    )
+                    if getattr(self, 'omega', 0.0) > 0:
+                        self.J_rsh = compute_ISDF_J_kernels_DF_streaming(
+                            stream_h5, weights, grids.coords, pivot_coords,
+                            gammas=self.isdf_gammas, omega=self.omega,
+                            batch_size=self.isdf_stream_batch_size
+                        )
+                    else:
+                        self.J_rsh = None
+
+                    # If there is no fxc to compress (pure HF), we can delete the
+                    # HDF5 immediately since load_fxc_intermediates will never be called.
+                    if getattr(self, 'ni', None) is None:
+                        if os.path.exists(stream_h5):
+                            os.remove(stream_h5)
+                        self._isdf_h5_path = None
                 else:
-                    self.J_rsh = None
-                
+                    # --- Non-streaming (original) mode ---
+                    # Save xi_phi and xi_grad for later fxc kernel compression (force float64)
+                    self.xi_phi = np.array(xi_phi, dtype=np.float64)
+                    self.xi_grad = np.array(xi_grad, dtype=np.float64)
+                    del xi_phi, xi_grad, grad_phi_piv, pivots
+                    print_memory_usage({name: val for name, val in locals().items()})
+
+                    # Build the Analytical J-Kernels (DF)
+                    self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
+                        self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas
+                    ))
+                    if getattr(self, 'omega', 0.0) > 0:
+                        self.J_rsh = np.array(compute_ISDF_J_kernels_DF_gpu(
+                            self.xi_phi, weights, grids.coords, pivot_coords,
+                            gammas=self.isdf_gammas, omega=self.omega
+                        ))
+                    else:
+                        self.J_rsh = None
+
                 print_memory_usage({name: val for name, val in locals().items()})
                 t1 = time.time()
                 print(f"Analytical ISDF J-kernel build(s) took: {t1 - t0:.2f} s")
@@ -2016,7 +2239,8 @@ class TDDFT(lib.StreamObject):
         if self.xctype == 'LDA':
             t0 = time.time()
             ao_deriv = 0
-            wfxc = np.zeros((self.mf.grids.coords.shape[0]))       
+            n_grid_lda = self.mf.grids.coords.shape[0]
+            wfxc = np.zeros(n_grid_lda)       
             nstart, nstop = 0, 0
             for ao, mask, weight, coords \
                     in self.ni.block_loop(self.mf.mol, self.mf.grids, self.mol.nao, ao_deriv, max_memory):
@@ -2029,7 +2253,18 @@ class TDDFT(lib.StreamObject):
             t1 = time.time()
             print(f'LDA fxc kernel calculated in real-space, took: {t1 - t0:.2f} s"')
             # Compress wfxc into ISDF interpolant space: (ngrid,) -> (naux, naux)
-            self.wfxc = compress_isdf_lda_kernel(self.xi_phi, wfxc)
+            if self._isdf_h5_path is not None:
+                # Streaming: read xi_phi from HDF5 in batches
+                self.wfxc = compress_isdf_lda_kernel_streaming(
+                    self._isdf_h5_path, wfxc, batch_size=self.isdf_stream_batch_size
+                )
+                # HDF5 no longer needed — delete it
+                if os.path.exists(self._isdf_h5_path):
+                    os.remove(self._isdf_h5_path)
+                self._isdf_h5_path = None
+            else:
+                self.wfxc = compress_isdf_lda_kernel(self.xi_phi, wfxc)
+                del self.xi_phi, self.xi_grad
             print(f'ISDF LDA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}')
             return
 
@@ -2060,7 +2295,20 @@ class TDDFT(lib.StreamObject):
             # Compress wfxc into ISDF interpolant space: (4, 4, ngrid) -> (4, 4, naux, naux)
             # wfxc is (x, y, r) from eval_xc_eff; compress_isdf_gga_kernel expects (y, x, r)
             t0 = time.time()
-            self.wfxc = compress_isdf_gga_kernel(self.xi_phi, self.xi_grad, wfxc.transpose(1, 0, 2))
+            # Transpose to (y, x, r) convention before compression
+            wfxc_yx = wfxc.transpose(1, 0, 2)  # (4, 4, ngrid)
+            if self._isdf_h5_path is not None:
+                # Streaming: read xi_phi/xi_grad from HDF5 in batches
+                self.wfxc = compress_isdf_gga_kernel_streaming(
+                    self._isdf_h5_path, wfxc_yx, batch_size=self.isdf_stream_batch_size
+                )
+                # HDF5 no longer needed — delete it
+                if os.path.exists(self._isdf_h5_path):
+                    os.remove(self._isdf_h5_path)
+                self._isdf_h5_path = None
+            else:
+                self.wfxc = compress_isdf_gga_kernel(self.xi_phi, self.xi_grad, wfxc_yx)
+                del self.xi_phi, self.xi_grad
             t1 = time.time()
             print(f'ISDF GGA fxc kernel compressed: {wfxc.shape} -> {self.wfxc.shape}, took: {t1 - t0:.2f} s"')
             return
@@ -2224,7 +2472,7 @@ if __name__ == '__main__':
     mf = scf.RKS(mol)
     mf.xc = 'WB97XD'
     mf.kernel()
-    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-7, isdf_naux_factor = 4, isdf_gammas = [0.25, 0.5])
+    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-7, isdf_naux_factor = 4, isdf_gammas = [0.25, 0.5], isdf_stream_path = './my_isdf_tmp.h5')
     
     # Cholesky decomposing fxc is not worth it unless you want a large number of roots
     # mytd.load_fxc_intermediates()
