@@ -1914,6 +1914,7 @@ class TDDFT(lib.StreamObject):
         isdf_gammas=[0.25, 0.5],
         isdf_stream_path=None,
         isdf_stream_batch_size=4096,
+        isdf_exact_J=False,
         verbose=5,
         # options
         TDA=False,
@@ -1980,6 +1981,7 @@ class TDDFT(lib.StreamObject):
         # file is deleted automatically.
         self.isdf_stream_path = isdf_stream_path
         self.isdf_stream_batch_size = isdf_stream_batch_size
+        self.isdf_exact_J = isdf_exact_J  # if True, use O(Ngrid^2) compute_J_munu directly
         self._isdf_h5_path = None  # internal: set during _build_isdf_intermediates
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
@@ -2046,10 +2048,7 @@ class TDDFT(lib.StreamObject):
         import jax.numpy as jnp
 
         print('\n--- Starting Auto ISDF Decomposition ---')
-        grids = dft.gen_grid.Grids(self.mol)
-        grids.level = getattr(self, 'isdf_grid_level', 3)
-        grids.build()
-        
+        grids = self.mf.grids
         ni = getattr(self.mf, '_numint', dft.numint.NumInt())
         
         # Build grid data for all spin channels individually
@@ -2085,6 +2084,7 @@ class TDDFT(lib.StreamObject):
                 weights[nstart:nstop] = weight
                 nstart += ao.shape[1]
             
+
             print_memory_usage({name: val for name, val in locals().items()})
             t0 = time.time()
 
@@ -2144,19 +2144,35 @@ class TDDFT(lib.StreamObject):
                     self._isdf_h5_path = stream_h5
                     del xi_phi, xi_grad, grad_phi_piv, pivots
 
-                    # Build J-kernel by streaming from HDF5 (no full xi_phi in RAM)
-                    self.J = compute_ISDF_J_kernels_DF_streaming(
-                        stream_h5, weights, grids.coords, pivot_coords,
-                        gammas=self.isdf_gammas, batch_size=self.isdf_stream_batch_size
-                    )
-                    if getattr(self, 'omega', 0.0) > 0:
-                        self.J_rsh = compute_ISDF_J_kernels_DF_streaming(
-                            stream_h5, weights, grids.coords, pivot_coords,
-                            gammas=self.isdf_gammas, omega=self.omega,
-                            batch_size=self.isdf_stream_batch_size
-                        )
+                    # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
+                    if self.isdf_exact_J:
+                        # Load xi_phi from HDF5 into JAX (naux, ngrid)
+                        with h5py.File(stream_h5, 'r') as _f:
+                            _xi_phi_jax = jnp.array(_f['xi_phi'][:])
+                        self.J = np.array(compute_J_munu(
+                            _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords)
+                        ))
+                        if getattr(self, 'omega', 0.0) > 0:
+                            self.J_rsh = np.array(compute_J_munu_lr(
+                                _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords),
+                                omega=self.omega
+                            ))
+                        else:
+                            self.J_rsh = None
+                        del _xi_phi_jax
                     else:
-                        self.J_rsh = None
+                        self.J = compute_ISDF_J_kernels_DF_streaming(
+                            stream_h5, weights, grids.coords, pivot_coords,
+                            gammas=self.isdf_gammas, batch_size=self.isdf_stream_batch_size
+                        )
+                        if getattr(self, 'omega', 0.0) > 0:
+                            self.J_rsh = compute_ISDF_J_kernels_DF_streaming(
+                                stream_h5, weights, grids.coords, pivot_coords,
+                                gammas=self.isdf_gammas, omega=self.omega,
+                                batch_size=self.isdf_stream_batch_size
+                            )
+                        else:
+                            self.J_rsh = None
 
                     # If there is no fxc to compress (pure HF), we can delete the
                     # HDF5 immediately since load_fxc_intermediates will never be called.
@@ -2172,17 +2188,31 @@ class TDDFT(lib.StreamObject):
                     del xi_phi, xi_grad, grad_phi_piv, pivots
                     print_memory_usage({name: val for name, val in locals().items()})
 
-                    # Build the Analytical J-Kernels (DF)
-                    self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
-                        self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas
-                    ))
-                    if getattr(self, 'omega', 0.0) > 0:
-                        self.J_rsh = np.array(compute_ISDF_J_kernels_DF_gpu(
-                            self.xi_phi, weights, grids.coords, pivot_coords,
-                            gammas=self.isdf_gammas, omega=self.omega
+                    # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
+                    if self.isdf_exact_J:
+                        _xi_jax = jnp.array(self.xi_phi)
+                        self.J = np.array(compute_J_munu(
+                            _xi_jax, jnp.array(weights), jnp.array(grids.coords)
                         ))
+                        if getattr(self, 'omega', 0.0) > 0:
+                            self.J_rsh = np.array(compute_J_munu_lr(
+                                _xi_jax, jnp.array(weights), jnp.array(grids.coords),
+                                omega=self.omega
+                            ))
+                        else:
+                            self.J_rsh = None
+                        del _xi_jax
                     else:
-                        self.J_rsh = None
+                        self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
+                            self.xi_phi, weights, grids.coords, pivot_coords, gammas=self.isdf_gammas
+                        ))
+                        if getattr(self, 'omega', 0.0) > 0:
+                            self.J_rsh = np.array(compute_ISDF_J_kernels_DF_gpu(
+                                self.xi_phi, weights, grids.coords, pivot_coords,
+                                gammas=self.isdf_gammas, omega=self.omega
+                            ))
+                        else:
+                            self.J_rsh = None
 
                 print_memory_usage({name: val for name, val in locals().items()})
                 t1 = time.time()
@@ -2472,11 +2502,7 @@ if __name__ == '__main__':
     mf = scf.RKS(mol)
     mf.xc = 'WB97XD'
     mf.kernel()
-    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-7, isdf_naux_factor = 4, isdf_gammas = [0.25, 0.5], isdf_stream_path = './my_isdf_tmp.h5')
     
-    # Cholesky decomposing fxc is not worth it unless you want a large number of roots
-    # mytd.load_fxc_intermediates()
-    # mytd.Lia_fxc = cholesky_fit_gga(mytd.rho_o, mytd.rho_v, mytd.wfxc, tol = 1e-4, max_rank = 2000)
     pyscf_td = mf.TDDFT()
     pyscf_td.singlet = True
     pyscf_td.nstates = 10
@@ -2485,6 +2511,7 @@ if __name__ == '__main__':
     print('---values in eV---')
     print('pyscf exci:', pyscf_ref*HARTREE2EV)
 
+    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-7, isdf_rcond = 1e-14, isdf_grid_level = 3, isdf_naux_factor = 6, isdf_gammas = [0.25, 0.5], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False)
     exci_new = np.sort(mytd.kernel(multi = 's')[0])
     
     print('Davidson exci:', exci_new*HARTREE2EV)
