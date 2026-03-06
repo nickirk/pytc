@@ -267,7 +267,8 @@ class NuclearCusp(Jastrow):
         def compute_nucleus_contribution(nucleus_idx):
             # Get distance from electron to this nucleus
             dr = r1 - self.coords[nucleus_idx]
-            r = jnp.sqrt(jnp.sum(dr**2))
+            # Use maximum to avoid inf gradient of sqrt at r=0
+            r = jnp.sqrt(jnp.maximum(jnp.sum(dr**2), 1e-30))
             
             # Use array indexing instead of dictionary lookup
             Z = self.charges[nucleus_idx]
@@ -285,10 +286,13 @@ class NuclearCusp(Jastrow):
             # Get φ_s value with numerical safeguard
             phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
             
-            # Add small constants to prevent division by zero or log(0)
-            eps = 0.0
-            ratio = (phi_cusp + eps)/(phi_s + eps)
-            # Use log1p for better numerical stability when ratio is close to 1
+            # Guard against phi_s = 0 or phi_s < 0 (orbitals can be negative).
+            # jnp.where evaluates both branches in JAX, so we must make the
+            # log argument strictly positive even when r > rc to avoid NaN.
+            safe_phi_s = jnp.maximum(jnp.abs(phi_s), 1e-30)
+            if phi_s < 0:
+                safe_phi_s = -safe_phi_s
+            ratio = phi_cusp / safe_phi_s
             log_term = jnp.log(ratio)
             
             # Combine using cutoff
