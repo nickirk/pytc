@@ -290,8 +290,6 @@ class NuclearCusp(Jastrow):
             # jnp.where evaluates both branches in JAX, so we must make the
             # log argument strictly positive even when r > rc to avoid NaN.
             safe_phi_s = jnp.maximum(jnp.abs(phi_s), 1e-30)
-            if phi_s < 0:
-                safe_phi_s = -safe_phi_s
             ratio = phi_cusp / safe_phi_s
             log_term = jnp.log(ratio)
             
