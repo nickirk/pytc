@@ -267,8 +267,8 @@ class NuclearCusp(Jastrow):
         def compute_nucleus_contribution(nucleus_idx):
             # Get distance from electron to this nucleus
             dr = r1 - self.coords[nucleus_idx]
-            # Use maximum to avoid inf gradient of sqrt at r=0
-            r = jnp.sqrt(jnp.maximum(jnp.sum(dr**2), 1e-30))
+            # Add epsilon inside sqrt to avoid singular gradient at r = 0 while keeping it smooth
+            r = jnp.sqrt(jnp.sum(dr**2) + 1e-30)
             
             # Use array indexing instead of dictionary lookup
             Z = self.charges[nucleus_idx]
