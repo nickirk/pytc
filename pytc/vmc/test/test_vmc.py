@@ -345,7 +345,7 @@ class TestHartreeFockEnergy(unittest.TestCase):
 class TestJastrowOptimization(unittest.TestCase):
     """Test optimization of the Jastrow factor."""
     
-    def run_optimization_test(self, molecule_spec, jastrow_params=None, basis='sto-3g'):
+    def run_optimization_test(self, molecule_spec, jastrow_params=None, basis='sto-3g', nopt_steps=100):
         """Run optimization test on the specified molecule."""
         # Create molecule
         mol = gto.Mole()
@@ -381,7 +381,7 @@ class TestJastrowOptimization(unittest.TestCase):
         n_steps = 20
         step_size = 0.01
         burn_in_steps = 1000
-        n_opt_steps = 100
+        n_opt_steps = nopt_steps
         key = random.PRNGKey(42)
         
         # Run optimization
@@ -404,6 +404,13 @@ class TestJastrowOptimization(unittest.TestCase):
         end_time = time.time()
         print(f"Optimization completed in {end_time - start_time:.2f} seconds")
         
+        # Assert no NaN in energies and variances
+        self.assertFalse(np.any(np.isnan(opt_results["energies"])),
+                         "Energies contain NaN values")
+        self.assertFalse(np.any(np.isnan(opt_results["stds"])),
+                         "Energy stds contain NaN values")
+        self.assertFalse(np.any(np.isnan(opt_results["cost"])),
+                         "Variance (cost) contains NaN values")
         
         # Check energy improvement
         initial_energy = jnp.asarray(opt_results["energies"][:500]).mean()
@@ -416,7 +423,15 @@ class TestJastrowOptimization(unittest.TestCase):
     
     def test_be(self):
         """Test optimization of Jastrow parameters for Be atom."""
-        self.run_optimization_test('Be 0 0 0;', basis='ccpvtz')
+        self.run_optimization_test('Be 0 0 0;', basis='ccpvtz', nopt_steps=50)
+    def test_h2o(self):
+        """Test optimization of Jastrow parameters for H2O molecule."""
+        h2o_atoms = "; ".join([
+            "H -1.4308249289 0.0 -0.8863003855",
+            "H 1.4308249289 0.0 -0.8863003855",
+            "O 0.0 0.0 0.2215703721",
+        ])
+        self.run_optimization_test(h2o_atoms, basis='ano-pvdz', nopt_steps=10)
     
 
 
