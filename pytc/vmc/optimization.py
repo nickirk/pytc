@@ -570,7 +570,7 @@ def optimize_ref_var(
     ansatz,
     cost_fn=None,
     n_walkers: int = 100,
-    n_steps: int = 20,  # MCMC steps per optimization update
+    n_steps: int = 20,
     step_size: float = 1.0,
     burn_in_steps: int = 1000,
     initial_walkers=None,
@@ -586,6 +586,8 @@ def optimize_ref_var(
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
     jacobian_sample_size: Optional[int] = None,
+    n_mcmc_per_opt: Optional[int] = None,
+    n_opt_per_mcmc: Optional[int] = None,
 ):
     """Perform variational Monte Carlo optimization using MCMC sampling.
 
@@ -594,7 +596,10 @@ def optimize_ref_var(
         cost_fn: Cost function (defaults to reference variance if None).
                  Should accept (params, walkers) and return (cost, aux_data).
         n_walkers: Number of parallel walkers
-        n_steps: Number of MCMC steps per optimization update
+        n_steps: Legacy training cadence parameter. If neither
+                 ``n_mcmc_per_opt`` nor ``n_opt_per_mcmc`` is provided,
+                 ``optimize_ref_var`` preserves its historical behavior and
+                 uses ``n_opt_per_mcmc=n_steps``.
         step_size: Standard deviation of Gaussian proposal for MCMC
         burn_in_steps: Number of initial MCMC steps to discard (equilibration)
         initial_walkers: Optional initial positions, otherwise initialized near nuclei
@@ -611,6 +616,10 @@ def optimize_ref_var(
                              subsample this many walkers for Jacobian computation
                              (curvature matrix approximation). Speeds up Newton steps
                              when n_walkers is large. Typical: 500-2000 for 100k walkers.
+        n_mcmc_per_opt: Optional explicit number of MCMC steps before each
+                        optimization update.
+        n_opt_per_mcmc: Optional explicit number of optimization steps before
+                        each MCMC refresh.
 
     Returns:
         Dictionary with optimization results and statistics
@@ -628,6 +637,23 @@ def optimize_ref_var(
     else:
         if not isinstance(params, (list, tuple)) or len(params) != 2:
              raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
+
+    if n_mcmc_per_opt is None and n_opt_per_mcmc is None:
+        n_mcmc_per_opt = 1
+        n_opt_per_mcmc = n_steps
+    elif n_mcmc_per_opt is None:
+        n_mcmc_per_opt = 1
+    elif n_opt_per_mcmc is None:
+        n_opt_per_mcmc = 1
+
+    if n_mcmc_per_opt < 1 or n_opt_per_mcmc < 1:
+        raise ValueError("`n_mcmc_per_opt` and `n_opt_per_mcmc` must both be >= 1.")
+
+    if n_mcmc_per_opt > 1 and n_opt_per_mcmc > 1:
+        raise ValueError(
+            "`optimize_ref_var` supports either multiple MCMC steps per update "
+            "or multiple optimization steps per MCMC refresh, not both at once."
+        )
 
     # ---- Multi-GPU setup ----
     from .sharding import (
@@ -705,7 +731,10 @@ def optimize_ref_var(
         opt_state = optimizer.init(params, subkey, (walkers, ansatz))
         
         training_step = make_second_order_training_step(
-            mcmc_step, optimizer, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
+            mcmc_step,
+            optimizer,
+            n_mcmc_per_opt=n_mcmc_per_opt,
+            n_opt_per_mcmc=n_opt_per_mcmc,
         )
         # Newton needs explicit JIT
         training_step = jax.jit(training_step)
@@ -714,10 +743,13 @@ def optimize_ref_var(
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         opt_state = optimizer.init(params)
         
-        # Create Optax training step - use n_opt_per_mcmc pattern for variance optimization
+        # Create Optax training step with configurable cadence.
         opt_update_step = make_opt_update_step(loss_fn, optimizer)
         training_step = make_training_step(
-            mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_mcmc=n_steps
+            mcmc_step,
+            opt_update_step,
+            n_mcmc_per_opt=n_mcmc_per_opt,
+            n_opt_per_mcmc=n_opt_per_mcmc,
         )
 
     # ========== MAIN LOOP (Uses JIT-compiled step) ==========
