@@ -179,7 +179,7 @@ class BoysHandy(Jastrow):
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
         
-        c = jnp.where(self._cusp_mask, 1/(2*d[:, None]), c_raw)
+        c = jnp.where(self._cusp_mask, 0.5, c_raw)
 
         def compute_term(atom_idx):
             type_idx = self.atom_type_map[atom_idx]
@@ -218,7 +218,7 @@ class BoysHandy(Jastrow):
             
             # Compute term values
             non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
-            cusp_term = 2.0 * v_r12_o
+            cusp_term = (2.0 / d_I) * v_r12_o
             
             # Select term type based on cusp mask
             term_vals = jnp.where(mask, cusp_term, non_cusp_term)
