@@ -1760,6 +1760,16 @@ class ISDFXTC(XTC, ISDFTC):
         
         # Chunking strategy to avoid VRAM exhaustion
         logger.warning(f"  delta_U memory estimate ({total_needed_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
+
+        # Keep pre-chunking in NumPy on host to avoid invoking JAX
+        # runtime from background threads.
+        phi_isdf_np = self.phi_isdf if isinstance(self.phi_isdf, np.ndarray) else np.asarray(self.phi_isdf)
+        if isinstance(r_idx, np.ndarray):
+            r_idx_np = r_idx
+            s_idx_np = s_idx
+        else:
+            r_idx_np = np.asarray(r_idx)
+            s_idx_np = np.asarray(s_idx)
         
         # Pre-allocate result on host memory
         result = np.zeros((Np, Nq, Nr, Ns), dtype=np.float64)
@@ -1797,16 +1807,16 @@ class ISDFXTC(XTC, ISDFTC):
             from pytc.utils.prefetch import async_read, await_read
 
             def _prepare_r_chunk(i_start):
-                """Prepare phi_r_chunk and X_chunk for a given r-index range."""
+                """Prepare phi_r_chunk and X_chunk for a given r-index range (host side)."""
                 ie = min(i_start + orb_chunk_size, Nr)
                 alen = ie - i_start
-                pr = self.phi_isdf[r_idx[i_start:ie]]
-                xc = jnp.asarray(X_full[i_start:ie])
+                pr_np = phi_isdf_np[r_idx_np[i_start:ie]]
+                xc_np = np.asarray(X_full[i_start:ie])
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
-                    pr = jnp.pad(pr, ((0, pad), (0, 0)))
-                    xc = jnp.pad(xc, ((0, pad), (0, 0), (0, 0)))
-                return pr, xc, alen
+                    pr_np = np.pad(pr_np, ((0, pad), (0, 0)))
+                    xc_np = np.pad(xc_np, ((0, pad), (0, 0), (0, 0)))
+                return pr_np, xc_np, alen
 
             # Pre-compute first chunk synchronously
             phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(0)
@@ -1814,8 +1824,8 @@ class ISDFXTC(XTC, ISDFTC):
 
             for i in range(0, Nr, orb_chunk_size):
                 # Use the already-prepared arrays
-                cur_phi_r = phi_r_chunk
-                cur_X = X_chunk
+                cur_phi_r = jnp.asarray(phi_r_chunk)
+                cur_X = jnp.asarray(X_chunk)
                 cur_actual = actual_len
 
                 # Start JIT computation on GPU
@@ -1853,16 +1863,16 @@ class ISDFXTC(XTC, ISDFTC):
             from pytc.utils.prefetch import async_read, await_read
 
             def _prepare_s_chunk(i_start):
-                """Prepare phi_s_chunk and X_chunk for a given s-index range."""
+                """Prepare phi_s_chunk and X_chunk for a given s-index range (host side)."""
                 ie = min(i_start + orb_chunk_size, Ns)
                 alen = ie - i_start
-                ps = self.phi_isdf[s_idx[i_start:ie]]
-                xc = jnp.asarray(X_full[:, i_start:ie])
+                ps_np = phi_isdf_np[s_idx_np[i_start:ie]]
+                xc_np = np.asarray(X_full[:, i_start:ie])
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
-                    ps = jnp.pad(ps, ((0, pad), (0, 0)))
-                    xc = jnp.pad(xc, ((0, 0), (0, pad), (0, 0)))
-                return ps, xc, alen
+                    ps_np = np.pad(ps_np, ((0, pad), (0, 0)))
+                    xc_np = np.pad(xc_np, ((0, 0), (0, pad), (0, 0)))
+                return ps_np, xc_np, alen
 
             # Pre-compute first chunk synchronously
             phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(0)
@@ -1874,6 +1884,8 @@ class ISDFXTC(XTC, ISDFTC):
                 cur_actual = actual_len
 
                 # Start JIT computation on GPU
+                cur_phi_s = jnp.asarray(cur_phi_s)
+                cur_X = jnp.asarray(cur_X)
                 res_chunk = _contract_delta_U_kernels_jit(
                     D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs)
 
