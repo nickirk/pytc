@@ -184,9 +184,10 @@ class NewtonOptimizer:
             delta = unravel_fn(delta_vec)
             
             # Update
-            new_params = jax.tree_util.tree_map(lambda p, d: p + self.learning_rate * d, params, delta)
+            lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
+            new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
             
-            return new_params, state + 1, {"loss": loss, "aux": aux_data}
+            return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr}
 
         # CG Solver: need loss + grads from value_and_grad_func
         (loss, aux_data), grads = self.value_and_grad_func(params, batch)
@@ -275,29 +276,48 @@ class NewtonOptimizer:
         )
         
         # 4. Update
-        new_params = jax.tree_util.tree_map(lambda p, d: p + self.learning_rate * d, params, delta)
+        lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
+        new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
         
-        return new_params, state + 1, {"loss": loss, "aux": aux_data}
+        return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr}
 
 def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
-    """Create an optimizer based on specified type and parameters."""
+    """Create an optimizer based on specified type and parameters.
+    
+    Args:
+        optimizer_type: "adam", "sgd", "rmsprop", "lion", or "newton"
+        learning_rate: Initial learning rate (float) or an optax schedule (callable).
+        opt_kwargs: Additional optimizer parameters. 
+            - For optax optimizers: can include 'decay_rate' and 'transition_steps'
+              to customize the default 1/(1+t) schedule.
+            - For Newton: can include 'min_learning_rate' (default 0.01).
+    """
     if opt_kwargs is None:
         opt_kwargs = {}
     
-    base_kwargs = {}
-    merged_kwargs = {**base_kwargs, **opt_kwargs}
-    def schedule_lr(step):
-        return learning_rate / (1.0 + step/100)
+    merged_kwargs = {**opt_kwargs}
+    
+    # Define a default schedule if learning_rate is a float
+    if not callable(learning_rate):
+        def schedule_lr(step):
+            decay_rate = merged_kwargs.get("decay_rate", 1.0)
+            transition_steps = merged_kwargs.get("transition_steps", 100)
+            return learning_rate / (1.0 + (step / transition_steps) * decay_rate)
+    else:
+        schedule_lr = learning_rate
     
     if optimizer_type.lower() == "adam":
-        #return optax.adamw(learning_rate=schedule_lr)
         return optax.chain(
-            optax.scale_by_adam(),
+            optax.scale_by_adam(
+                b1=merged_kwargs.get("b1", 0.9),
+                b2=merged_kwargs.get("b2", 0.999),
+                eps=merged_kwargs.get("eps", 1e-8)
+            ),
             optax.scale_by_learning_rate(schedule_lr),
         )
     elif optimizer_type.lower() == "sgd":
         return optax.chain(
-            optax.sgd(learning_rate=learning_rate),
+            optax.sgd(learning_rate=1.0), # Rescaled by schedule below
             optax.scale_by_learning_rate(schedule_lr),
         )
     elif optimizer_type.lower() == "rmsprop":
@@ -306,14 +326,23 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             optax.scale_by_learning_rate(schedule_lr),
         )
     elif optimizer_type.lower() == "lion":
-        return optax.lion(learning_rate=learning_rate, b1=merged_kwargs.get("b1", 0.9), b2=merged_kwargs.get("b2", 0.99))
+        # Lion currently doesn't easily chain with custom schedules in this simple way if using optax.lion
+        # but we can wrap it if needed. For now using constant or optax native.
+        return optax.lion(learning_rate=schedule_lr, b1=merged_kwargs.get("b1", 0.9), b2=merged_kwargs.get("b2", 0.99))
     elif optimizer_type.lower() == "newton":
         if "value_and_grad_func" not in merged_kwargs:
             raise ValueError("Newton optimizer requires value_and_grad_func in opt_kwargs")
             
+        # For Newton, wrap the schedule with a minimum value
+        min_lr = merged_kwargs.get("min_learning_rate", 0.01)
+        
+        def newton_schedule(step):
+            current_lr = schedule_lr(step) if callable(schedule_lr) else schedule_lr
+            return jnp.maximum(current_lr, min_lr)
+            
         return NewtonOptimizer(
             value_and_grad_func=merged_kwargs["value_and_grad_func"],
-            learning_rate=learning_rate,
+            learning_rate=newton_schedule,
             damping=merged_kwargs.get("damping", 1e-3),
             maxiter=merged_kwargs.get("maxiter", 100),
             curvature_type=merged_kwargs.get("curvature", "fisher"),
