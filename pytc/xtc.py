@@ -1761,9 +1761,10 @@ class ISDFXTC(XTC, ISDFTC):
         # Chunking strategy to avoid VRAM exhaustion
         logger.warning(f"  delta_U memory estimate ({total_needed_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
 
-        # Keep pre-chunking in NumPy on host to avoid invoking JAX
-        # runtime from background threads.
-        phi_isdf_np = self.phi_isdf if isinstance(self.phi_isdf, np.ndarray) else np.asarray(self.phi_isdf)
+        # Keep 1-D index arrays on host (cheap); avoid eagerly copying the full
+        # phi_isdf matrix — only the rows needed per chunk are materialised
+        # inside _prepare_*_chunk below.
+        phi_isdf_src = self.phi_isdf  # may be a JAX array or np.ndarray
         if isinstance(r_idx, np.ndarray):
             r_idx_np = r_idx
             s_idx_np = s_idx
@@ -1807,7 +1808,8 @@ class ISDFXTC(XTC, ISDFTC):
                 """Prepare phi_r_chunk and X_chunk for a given r-index range (host side)."""
                 ie = min(i_start + orb_chunk_size, Nr)
                 alen = ie - i_start
-                pr_np = phi_isdf_np[r_idx_np[i_start:ie]]
+                # Convert only the rows needed for this chunk, not the full phi_isdf.
+                pr_np = np.asarray(phi_isdf_src[r_idx_np[i_start:ie]])
                 xc_np = np.asarray(X_full[i_start:ie])
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
@@ -1867,7 +1869,8 @@ class ISDFXTC(XTC, ISDFTC):
                 """Prepare phi_s_chunk and X_chunk for a given s-index range (host side)."""
                 ie = min(i_start + orb_chunk_size, Ns)
                 alen = ie - i_start
-                ps_np = phi_isdf_np[s_idx_np[i_start:ie]]
+                # Convert only the rows needed for this chunk, not the full phi_isdf.
+                ps_np = np.asarray(phi_isdf_src[s_idx_np[i_start:ie]])
                 xc_np = np.asarray(X_full[:, i_start:ie])
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen

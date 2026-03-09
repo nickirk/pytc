@@ -4,8 +4,15 @@ These tests are intended to make the performance delta between the original
 autodiff ``BoysHandy`` and ``BoysHandyAnalytical`` visible on the local
 machine. They print timings and verify numerical agreement, but keep runtime
 bounded by benchmarking the core ``compute_jastrow_terms`` hotspot directly.
+
+These benchmarks are **skipped by default** in the normal unit-test suite
+because they build and SCF-solve large PySCF systems (H20, H40) and can take
+several minutes. To run them, set the environment variable::
+
+    PYTC_RUN_BENCHMARKS=1 python -m pytest pytc/jastrow/test/test_bha_benchmark.py
 """
 
+import os
 import time
 import unittest
 
@@ -55,6 +62,10 @@ def make_bh_ansatz(mol, det, bh_cls):
     return sj, params
 
 
+@unittest.skipUnless(
+    os.environ.get("PYTC_RUN_BENCHMARKS", "0") == "1",
+    "Skipping heavy benchmark tests. Set PYTC_RUN_BENCHMARKS=1 to enable.",
+)
 class TestBoysHandyBenchmark(unittest.TestCase):
     def setUp(self):
         self.key = random.PRNGKey(0)
