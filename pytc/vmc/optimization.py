@@ -41,6 +41,7 @@ from .walker import initialize_walkers
 from .sampling import burn_in, burn_in_with_importance
 from .optimizer import create_optimizer, create_gradient_mask
 from .loss import make_energy_loss, make_variance_loss
+from .mcmc_utils import save_optimization_history
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,8 @@ def optimize(
     use_custom_jvp: bool = True,
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
+    save_frequency: int = 100,
+    save_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -558,6 +561,19 @@ def optimize(
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
                   f"Accept: {pmove_val:.3f}{step_size_str}{lr_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
+
+        # Periodic save to disk
+        if save_path and (opt_step + 1) % save_frequency == 0:
+            current_history = {
+                "cost": np.array(losses),
+                "energies": np.array(energies),
+                "stds": np.array(stds),
+                "acceptance": np.array(acceptances),
+                "params": params_history,
+                "step_sizes": np.array(step_sizes) if adaptive_step_size else None
+            }
+            save_optimization_history(current_history, save_path)
+            logger.info(f"Saved intermediate optimization history to {save_path}")
     
     logger.info("Optimization complete!")
     if adaptive_step_size:
@@ -593,6 +609,8 @@ def optimize_ref_var(
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
     jacobian_sample_size: Optional[int] = None,
+    save_frequency: int = 100,
+    save_path: Optional[str] = None,
 ):
     """Perform variational Monte Carlo optimization using MCMC sampling.
 
@@ -820,6 +838,18 @@ def optimize_ref_var(
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
                   f"Accept: {pmove_val:.3f}{lr_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
+
+        # Periodic save to disk
+        if save_path and (opt_step + 1) % save_frequency == 0:
+            current_history = {
+                "cost": np.array(losses),
+                "energies": np.array(energies),
+                "stds": np.array(stds),
+                "acceptance": np.array(acceptances),
+                "params": params_history
+            }
+            save_optimization_history(current_history, save_path)
+            logger.info(f"Saved intermediate optimization history to {save_path}")
     
     logger.info("Optimization complete!")
     
