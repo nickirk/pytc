@@ -1799,12 +1799,9 @@ class ISDFXTC(XTC, ISDFTC):
             chunk_total_gb = orb_chunk_size * per_r_unit_gb + d_size_gb
             logger.debug(f"Chunking over 'r' index. Chunk size: {orb_chunk_size} "
                          f"(est. per chunk: {chunk_total_gb:.2f} GB)")
+            logger.debug(f"  Chunking with adaptive pad over r indices. Total Nr={Nr}, Ns={Ns}.")
             
             phi_s = self.phi_isdf[slice_s]
-
-            # Async prefetch: overlap host→device transfer of next chunk
-            # with the current GPU JIT computation.
-            from pytc.utils.prefetch import async_read, await_read
 
             def _prepare_r_chunk(i_start):
                 """Prepare phi_r_chunk and X_chunk for a given r-index range (host side)."""
@@ -1820,9 +1817,14 @@ class ISDFXTC(XTC, ISDFTC):
 
             # Pre-compute first chunk synchronously
             phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(0)
-            next_future = None
+            chunk_timer = time.perf_counter()
 
             for i in range(0, Nr, orb_chunk_size):
+                chunk_id = i // orb_chunk_size
+                logger.debug(
+                    f"  Starting delta_U chunk r[{i}:{i+orb_chunk_size}] "
+                    f"(idx={chunk_id}, prepped_len={actual_len}, Np={Np}, Nq={Nq}, Ns={Ns})"
+                )
                 # Use the already-prepared arrays
                 cur_phi_r = jnp.asarray(phi_r_chunk)
                 cur_X = jnp.asarray(X_chunk)
@@ -1832,18 +1834,19 @@ class ISDFXTC(XTC, ISDFTC):
                 res_chunk = _contract_delta_U_kernels_jit(
                     D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs)
 
-                # While GPU is busy, prepare the next chunk in background
                 next_i = i + orb_chunk_size
                 if next_i < Nr:
-                    next_future = async_read(_prepare_r_chunk, next_i)
+                    # Prepare next chunk on host while current chunk is being reduced.
+                    phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(next_i)
 
                 result[:, :, i:i+cur_actual, :] = np.asarray(res_chunk)[:, :, :cur_actual, :]
                 del res_chunk
 
-                # Await next chunk if submitted
-                if next_future is not None and next_i < Nr:
-                    phi_r_chunk, X_chunk, actual_len = await_read(next_future)
-                    next_future = None
+                elapsed = time.perf_counter() - chunk_timer
+                logger.debug(
+                    f"  Finished delta_U chunk r[{i}:{i+cur_actual}] in {elapsed:.3f} s"
+                )
+                chunk_timer = time.perf_counter()
 
                 gc.collect()
         else:
@@ -1856,11 +1859,9 @@ class ISDFXTC(XTC, ISDFTC):
             chunk_total_gb = orb_chunk_size * per_s_unit_gb + d_size_gb
             logger.debug(f"Chunking over 's' index. Chunk size: {orb_chunk_size} "
                          f"(est. per chunk: {chunk_total_gb:.2f} GB)")
+            logger.debug(f"  Chunking with adaptive pad over s indices. Total Nr={Nr}, Ns={Ns}.")
 
             phi_r = self.phi_isdf[slice_r]
-
-            # Async prefetch: overlap host→device transfer of next chunk.
-            from pytc.utils.prefetch import async_read, await_read
 
             def _prepare_s_chunk(i_start):
                 """Prepare phi_s_chunk and X_chunk for a given s-index range (host side)."""
@@ -1876,9 +1877,14 @@ class ISDFXTC(XTC, ISDFTC):
 
             # Pre-compute first chunk synchronously
             phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(0)
-            next_future = None
+            chunk_timer = time.perf_counter()
 
             for i in range(0, Ns, orb_chunk_size):
+                chunk_id = i // orb_chunk_size
+                logger.debug(
+                    f"  Starting delta_U chunk s[{i}:{i+orb_chunk_size}] "
+                    f"(idx={chunk_id}, prepped_len={actual_len}, Np={Np}, Nq={Nq}, Nr={Nr})"
+                )
                 cur_phi_s = phi_s_chunk
                 cur_X = X_chunk
                 cur_actual = actual_len
@@ -1889,18 +1895,19 @@ class ISDFXTC(XTC, ISDFTC):
                 res_chunk = _contract_delta_U_kernels_jit(
                     D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs)
 
-                # While GPU is busy, prepare the next chunk in background
                 next_i = i + orb_chunk_size
                 if next_i < Ns:
-                    next_future = async_read(_prepare_s_chunk, next_i)
+                    # Prepare next chunk on host while current chunk is being reduced.
+                    phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(next_i)
 
                 result[:, :, :, i:i+cur_actual] = np.asarray(res_chunk)[:, :, :, :cur_actual]
                 del res_chunk
 
-                # Await next chunk if submitted
-                if next_future is not None and next_i < Ns:
-                    phi_s_chunk, X_chunk, actual_len = await_read(next_future)
-                    next_future = None
+                elapsed = time.perf_counter() - chunk_timer
+                logger.debug(
+                    f"  Finished delta_U chunk s[{i}:{i+cur_actual}] in {elapsed:.3f} s"
+                )
+                chunk_timer = time.perf_counter()
 
                 gc.collect()
                 
