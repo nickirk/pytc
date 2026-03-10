@@ -63,6 +63,11 @@ def make_test_system(atom_spec, basis='sto-3g', n_walkers=50, key=None):
     return mol, mf, sj, det, params, walkers
 
 
+def make_h_chain(n_atoms, dist=1.4):
+    """Create a hydrogen chain with Bohr spacing."""
+    return "; ".join(f"H 0 0 {i * dist}" for i in range(n_atoms))
+
+
 class TestNewtonMergedGradient(unittest.TestCase):
     """Test that merged gradient+Jacobian gives identical results to the original."""
     
@@ -193,6 +198,183 @@ class TestNewtonMergedGradient(unittest.TestCase):
                         "Parameters should change after Newton step")
         
         print(f"✓ Newton step OK. Loss: {loss_val:.6f}, E: {float(e_mean):.6f}±{float(e_std):.6f}")
+
+    def test_batched_accumulators_match_full_jacobian_stats(self):
+        """Batched GN sufficient statistics should match the full Jacobian formulas."""
+        ansatz = self.sj
+        params = self.params
+        walkers = self.walkers
+        n_walkers = walkers.shape[0]
+
+        def single_local_energy_and_grad(w, p):
+            return jax.value_and_grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
+
+        energies_full, jac_full = jax.vmap(
+            single_local_energy_and_grad, in_axes=(0, None)
+        )(walkers, params)
+        jac_mat_full = NewtonOptimizer._flatten_jacobian(jac_full, n_walkers)
+
+        e_mean_full = jnp.mean(energies_full)
+        energy_diff_full = energies_full - e_mean_full
+        loss_full = jnp.sum(energy_diff_full**2) / (n_walkers - 1)
+        grad_full = (2.0 / (n_walkers - 1)) * (jac_mat_full.T @ energy_diff_full)
+        jac_centered_full = jac_mat_full - jnp.mean(jac_mat_full, axis=0, keepdims=True)
+        curv_full = (2.0 / n_walkers) * (jac_centered_full.T @ jac_centered_full)
+
+        batch_size = 7
+        n_params = jac_mat_full.shape[1]
+        sum_e = 0.0
+        sum_e2 = 0.0
+        sum_j = jnp.zeros((n_params,))
+        sum_jte = jnp.zeros((n_params,))
+        sum_jtj = jnp.zeros((n_params, n_params))
+
+        for start in range(0, n_walkers, batch_size):
+            stop = min(start + batch_size, n_walkers)
+            batch_walkers = jax.tree_util.tree_map(lambda x: x[start:stop], walkers)
+            energies_batch, jac_batch = jax.vmap(
+                single_local_energy_and_grad, in_axes=(0, None)
+            )(batch_walkers, params)
+            jac_mat_batch = NewtonOptimizer._flatten_jacobian(jac_batch, stop - start)
+            sum_e = sum_e + jnp.sum(energies_batch)
+            sum_e2 = sum_e2 + jnp.sum(energies_batch**2)
+            sum_j = sum_j + jnp.sum(jac_mat_batch, axis=0)
+            sum_jte = sum_jte + jac_mat_batch.T @ energies_batch
+            sum_jtj = sum_jtj + jac_mat_batch.T @ jac_mat_batch
+
+        e_mean_batched = sum_e / n_walkers
+        loss_batched = (sum_e2 - n_walkers * e_mean_batched**2) / (n_walkers - 1)
+        grad_batched = (2.0 / (n_walkers - 1)) * (
+            sum_jte - n_walkers * (sum_j / n_walkers) * e_mean_batched
+        )
+        curv_batched = (2.0 / n_walkers) * (
+            sum_jtj - n_walkers * jnp.outer(sum_j / n_walkers, sum_j / n_walkers)
+        )
+
+        np.testing.assert_allclose(float(loss_batched), float(loss_full), rtol=1e-10)
+        np.testing.assert_allclose(grad_batched, grad_full, rtol=1e-10)
+        np.testing.assert_allclose(curv_batched, curv_full, rtol=1e-10)
+
+    def test_batched_newton_step_matches_unbatched(self):
+        """Batched GN accumulation should match the existing unbatched exact step."""
+        ansatz = self.sj
+        params = self.params
+        walkers = self.walkers
+        batch = (walkers, ansatz)
+        key = random.PRNGKey(99)
+
+        loss_fn = make_variance_loss(
+            ansatz=ansatz,
+            optimizer_type="newton",
+            use_custom_jvp=True,
+            max_vmap_batch_size=0,
+        )
+        loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+
+        opt_ref = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1,
+            damping=1e-5,
+            curvature_type="gauss_newton",
+            solver="exact",
+            max_vmap_batch_size=0,
+        )
+        ref_state = opt_ref.init(params, key, batch)
+        ref_params, _, ref_stats = opt_ref.step(params, ref_state, key, batch)
+
+        opt_batched = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1,
+            damping=1e-5,
+            curvature_type="gauss_newton",
+            solver="exact",
+            max_vmap_batch_size=7,
+        )
+        batched_state = opt_batched.init(params, key, batch)
+        batched_params, _, batched_stats = opt_batched.step(params, batched_state, key, batch)
+
+        np.testing.assert_allclose(float(batched_stats["loss"]), float(ref_stats["loss"]), rtol=1e-10)
+        np.testing.assert_allclose(
+            np.array(batched_stats["aux"][0]),
+            np.array(ref_stats["aux"][0]),
+            rtol=1e-10,
+        )
+        np.testing.assert_allclose(
+            np.array(batched_stats["aux"][1]),
+            np.array(ref_stats["aux"][1]),
+            rtol=1e-10,
+        )
+        for p_batched, p_ref in zip(
+            jax.tree_util.tree_leaves(batched_params),
+            jax.tree_util.tree_leaves(ref_params),
+        ):
+            np.testing.assert_allclose(np.array(p_batched), np.array(p_ref), rtol=1e-10)
+
+    def test_batched_newton_step_with_jacobian_sampling_is_finite(self):
+        """Batched GN accumulation should still work with Jacobian subsampling."""
+        ansatz = self.sj
+        params = self.params
+        walkers = self.walkers
+        batch = (walkers, ansatz)
+        key = random.PRNGKey(123)
+
+        loss_fn = make_variance_loss(
+            ansatz=ansatz,
+            optimizer_type="newton",
+            use_custom_jvp=True,
+            max_vmap_batch_size=0,
+        )
+        loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+
+        optimizer = NewtonOptimizer(
+            value_and_grad_func=loss_fn_jvp,
+            learning_rate=0.1,
+            damping=1e-5,
+            curvature_type="gauss_newton",
+            solver="exact",
+            max_vmap_batch_size=7,
+            jacobian_sample_size=11,
+        )
+        state = optimizer.init(params, key, batch)
+        new_params, _, stats = optimizer.step(params, state, key, batch)
+
+        self.assertTrue(np.isfinite(float(stats["loss"])))
+        self.assertTrue(np.isfinite(float(stats["aux"][0])))
+        self.assertTrue(np.isfinite(float(stats["aux"][1])))
+        self.assertEqual(new_params[1].shape, params[1].shape)
+
+
+class TestBatchedNewtonIntegration(unittest.TestCase):
+    """Integration coverage for batched GN accumulation in optimize_ref_var."""
+
+    def test_optimize_ref_var_h_chain_runs_with_batched_newton(self):
+        """A small H-chain should run end-to-end with batched GN accumulation."""
+        mol, mf, sj, det, params, _ = make_test_system(
+            make_h_chain(6, dist=1.0),
+            basis="sto-3g",
+            n_walkers=32,
+            key=random.PRNGKey(7),
+        )
+        del mol, mf, det
+
+        results = optimize_ref_var(
+            sj,
+            params=params,
+            n_walkers=32,
+            n_steps=1,
+            step_size=0.2,
+            burn_in_steps=0,
+            n_opt_steps=1,
+            optimizer_type="newton",
+            learning_rate=0.1,
+            max_vmap_batch_size=4,
+            key=random.PRNGKey(8),
+            adaptive_step_size=False,
+        )
+
+        self.assertEqual(len(results["energies"]), 1)
+        self.assertTrue(np.isfinite(results["energies"][0]))
+        self.assertTrue(np.isfinite(results["cost"][0]))
 
 
 class TestPsiCaching(unittest.TestCase):
