@@ -203,7 +203,10 @@ class BoysHandy(Jastrow):
             
             def get_powers(x, degree):
                 exponents = jnp.arange(degree + 1)
-                return jnp.power(x, exponents)
+                safe_x = jnp.where(x == 0.0, 1.0, x)
+                powers = jnp.power(safe_x[..., None], exponents)
+                mask = (x == 0.0)[..., None] & (exponents > 0)
+                return jnp.where(mask, 0.0, powers)
             
             p_r1I = get_powers(r1I, self.max_degree)
             p_r2I = get_powers(r2I, self.max_degree)
