@@ -19,6 +19,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import gc
+from pytc.df import isdf_decompose
+from pytc.df_outcore import isdf_decompose_outcore
 
 jax.config.update("jax_enable_x64", True)
 from jax.scipy import special as jsp
@@ -39,6 +41,49 @@ HARTREE2EV = nist.HARTREE2EV
 import jax
 import psutil
 import os
+
+def print_jax_vram_summary():
+    """Prints a detailed variable-by-variable summary of JAX VRAM usage."""
+    print("\n--- JAX GPU Memory Inventory ---")
+    
+    # Get all live arrays on the default device
+    device = jax.devices()[0]
+    live_arrays = jax.live_arrays()
+    
+    total_mem = 0
+    inventory = []
+
+    for arr in live_arrays:
+        # Check if the array is actually on the GPU
+        if arr.device == device:
+            # size in bytes -> MiB
+            size_mib = arr.nbytes / (1024**2)
+            total_mem += size_mib
+            
+            # Try to find the name (JAX arrays don't always store their Python name)
+            # but we can see the shape and dtype
+            inventory.append({
+                "shape": str(arr.shape),
+                "dtype": str(arr.dtype),
+                "size_mib": size_mib
+            })
+
+    # Sort by size descending
+    inventory.sort(key=lambda x: x['size_mib'], reverse=True)
+
+    print(f"{'Shape':<25} | {'Dtype':<10} | {'Memory (MiB)':<15}")
+    print("-" * 55)
+    for item in inventory:
+        print(f"{item['shape']:<25} | {item['dtype']:<10} | {item['size_mib']:>10.2f} MiB")
+    
+    print("-" * 55)
+    print(f"Total JAX Managed VRAM: {total_mem:.2f} MiB")
+    
+    # Compare with what the Driver/NVIDIA sees
+    stats = device.memory_stats()
+    bytes_in_use = stats['bytes_in_use'] / (1024**2)
+    print(f"XLA Pooled Memory (Actual GPU usage): {bytes_in_use:.2f} MiB")
+    print("---------------------------------\n")
 
 def print_memory_usage(named_arrays):
     """
@@ -71,7 +116,7 @@ def print_memory_usage(named_arrays):
     total_mib = total_mem_bytes / (1024**2)
     print("-" * 55)
     print(f"Total Live Arrays: {count}")
-    print(f"Total GPU Memory Used: {total_mib:.2f} MiB")
+    print(f"Total Memory Used: {total_mib:.2f} MiB")
 
 def einsum(script, *tensors, out=None, alpha=1.0, beta=0.0, einsum_backend = DEFAULT_EINSUM_BACKEND):
     '''Wrapper for einsum supporting pytblis, pyscf.lib.einsum, or numpy.einsum backends.'''
@@ -306,7 +351,7 @@ def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25,
     t_start = time.time()
     alphas = compute_dynamic_alphas(pivots, gammas=gammas)
     aux_mol = build_floating_basis(pivots, alphas)
-    print_memory_usage({name: val for name, val in locals().items()})
+    print_jax_vram_summary()
     
     if omega > 0:
         aux_mol.set_range_coulomb(omega)
@@ -315,7 +360,7 @@ def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25,
     R_cpu = aux_mol.eval_gto('GTOval', coords)
     J_PQ_cpu = aux_mol.intor('int2c2e')
     print(f"PySCF Preprocessing: {time.time() - t_start:.4f}s")
-    print_memory_usage({name: val for name, val in locals().items()})
+    print_jax_vram_summary()
     
     # --- DEVICE TRANSFER ---
     # Move everything to GPU memory
@@ -325,7 +370,7 @@ def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25,
     xi_phi_gpu = jax.device_put(jnp.array(xi_phi))
     weights_gpu = jax.device_put(jnp.array(weights))
     print(f"Host-to-Device Transfer: {time.time() - t_transfer:.4f}s")
-    print_memory_usage({name: val for name, val in locals().items()})
+    print_jax_vram_summary()
 
     # --- JAX KERNEL EXECUTION ---
     t_jax = time.time()
@@ -334,7 +379,7 @@ def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25,
     # Block until finished to get accurate timing (JAX is asynchronous)
     J_munu.block_until_ready()
     print(f"JAX GPU Kernel: {time.time() - t_jax:.4f}s")
-    print_memory_usage({name: val for name, val in locals().items()})
+    print_jax_vram_summary()
     
     return J_munu
 
@@ -1608,134 +1653,6 @@ def _tddft_contraction(multi, nocc, mo_energy, C_o, C_v, J, tri_vec, TDA=False, 
 
     return apb_prod, amb_prod, work_done
 
-def _get_oscillator_strength(multi, exci, X_vec, Y_vec, mo_coeff, nocc, mol):
-    """Get transition dipoles and oscillator strengths.
-
-    Args:
-        multi (char): multiplicity. "s"=singlet, "t"=triplet, "u"=unrestricted.
-        exci (double array): excitation energy.
-        X_vec (double ndarray): X block of eigenvector (excitation).
-        Y_vec (double ndarray): Y block of eigenvector (de-excitation).
-        mo_coeff (double ndarray): coefficient from AO to MO.
-        nocc (int array): number of occupied orbitals.
-        mol (pyscf.gto.mole.Mole): Mole object for generating dipole matrix.
-
-    Returns:
-        dipole (double ndarray): transition dipoles of all excitations.
-        oscillator_strength (double array): oscillator strengths of all excitations.
-    """
-    nspin, nao, nmo = mo_coeff.shape
-    nroot = X_vec[0].shape[0]
-
-    dipole = np.zeros(shape=[3, nroot], dtype=np.double, order='F')
-    oscillator_strength = np.zeros(shape=[nroot], dtype=np.double)
-
-    # tddft is blind to triplet oscillator strength
-    if multi == 't':
-        return dipole, oscillator_strength
-
-    with mol.with_common_orig((0, 0, 0)):
-        ao_dip = mol.intor_symmetric('int1e_r', comp=3)
-
-    # Transform AO dipole integrals to MO basis
-    mo_dip = [mo_coeff[s][:, : nocc[s]].T @ ao_dip @ mo_coeff[s][:, nocc[s] :] for s in range(nspin)]
-
-    for j in range(nroot):
-        for s in range(nspin):
-            dipole[:, j] += einsum('ia,xia->x', X_vec[s][j], mo_dip[s]) + einsum(
-                'ia,xia->x', Y_vec[s][j], mo_dip[s]
-            )
-
-    if nspin == 1:
-        dipole *= np.sqrt(2)
-
-    oscillator_strength = (2 / 3) * exci * np.sum(dipole**2, axis=0)
-
-    return dipole, oscillator_strength
-
-
-def _get_spin_square(nocc, X_vec, Y_vec, mo_coeff, ovlp):
-    """Get <S2> expectation value.
-
-    Args:
-        nocc (int array): number of occupied orbitals.
-        X_vec (double ndarray): X block of eigenvector (excitation).
-        Y_vec (double ndarray): Y block of eigenvector (de-excitation).
-        mo_coeff (double ndarray): coefficient from AO to MO.
-        ovlp (double ndarray): overlap matrix.
-
-    Returns:
-        s2 (double array): <S2> expectation value of excitations.
-    """
-    nroot = X_vec[0].shape[0]
-    ab_ovlp = mo_coeff[0].T @ ovlp @ mo_coeff[1]
-    s2 = np.zeros(shape=[nroot], dtype=np.double)
-    s2[:] = nocc[0] - (nocc[0] - nocc[1]) / 2.0 + ((nocc[0] - nocc[1]) / 2.0) ** 2
-    for iroot in range(nroot):
-        # alpha excitation ket
-        # a alpha and j beta exchange: alpha excitation bra
-        s2[iroot] -= einsum(
-            'ia,ib,aj,bj->',
-            X_vec[0][iroot] + Y_vec[0][iroot],
-            X_vec[0][iroot] - Y_vec[0][iroot],
-            ab_ovlp[nocc[0] :, : nocc[1]],
-            ab_ovlp[nocc[0] :, : nocc[1]],
-        )
-        # a alpha and j beta exchange: beta excitation bra
-        s2[iroot] -= einsum(
-            'ia,jb,ij,ab->',
-            X_vec[0][iroot] + Y_vec[0][iroot],
-            X_vec[1][iroot] - Y_vec[1][iroot],
-            ab_ovlp[: nocc[0], : nocc[1]],
-            ab_ovlp[nocc[0] :, nocc[1] :],
-        )
-        # i alpha and j beta exchange: same alpha excitation bra
-        s2[iroot] -= einsum(
-            'ia,ia,jk->',
-            X_vec[0][iroot] + Y_vec[0][iroot],
-            X_vec[0][iroot] - Y_vec[0][iroot],
-            ab_ovlp[: nocc[0], : nocc[1]] ** 2,
-        )
-        s2[iroot] += einsum(
-            'ia,ia,ik->',
-            X_vec[0][iroot] + Y_vec[0][iroot],
-            X_vec[0][iroot] - Y_vec[0][iroot],
-            ab_ovlp[: nocc[0], : nocc[1]] ** 2,
-        )
-        # beta excitation ket
-        # i alpha and b beta exchange: beta excitation bra
-        s2[iroot] -= einsum(
-            'ia,ib,ja,jb->',
-            X_vec[1][iroot] + Y_vec[1][iroot],
-            X_vec[1][iroot] - Y_vec[1][iroot],
-            ab_ovlp[: nocc[0], nocc[1] :],
-            ab_ovlp[: nocc[0], nocc[1] :],
-        )
-        # i alpha and b beta exchange: alpha excitation bra
-        s2[iroot] -= einsum(
-            'ia,jb,ji,ba->',
-            X_vec[1][iroot] + Y_vec[1][iroot],
-            X_vec[0][iroot] - Y_vec[0][iroot],
-            ab_ovlp[: nocc[0], : nocc[1]],
-            ab_ovlp[nocc[0] :, nocc[1] :],
-        )
-        # i alpha and j beta exchange: same alpha excitation bra
-        s2[iroot] -= einsum(
-            'ia,ia,jk->',
-            X_vec[1][iroot] + Y_vec[1][iroot],
-            X_vec[1][iroot] - Y_vec[1][iroot],
-            ab_ovlp[: nocc[0], : nocc[1]] ** 2,
-        )
-        s2[iroot] += einsum(
-            'ia,ia,ji->',
-            X_vec[1][iroot] + Y_vec[1][iroot],
-            X_vec[1][iroot] - Y_vec[1][iroot],
-            ab_ovlp[: nocc[0], : nocc[1]] ** 2,
-        )
-
-    return s2
-
-
 # ---------------------------------------------------------------------------
 # Streaming helpers: build J_munu and wfxc without holding full xi_phi/xi_grad
 # ---------------------------------------------------------------------------
@@ -1774,7 +1691,7 @@ def compute_ISDF_J_kernels_DF_streaming(
         aux_mol.set_range_coulomb(omega)
 
     n_grid   = coords.shape[0]
-    n_aux_df = aux_mol.nao
+    n_aux_df = aux_mol.nao # n_aux_df = naux * len(gammas)
 
     with h5py.File(h5_path, 'r') as f:
         n_fused = f['xi_phi'].shape[0]
@@ -1800,15 +1717,55 @@ def compute_ISDF_J_kernels_DF_streaming(
 
             S_PQ   = S_PQ  + jnp.matmul(w_aux_b, aux_b)                # (naux_df, naux_df)
             V_Pmu  = V_Pmu + jnp.matmul(w_aux_b, xi_b.T)               # (naux_df, naux)
+            
+    S_PQ.block_until_ready()
+    V_Pmu.block_until_ready()
+
+    del aux_b, xi_b, w_b, w_aux_b
+    gc.collect()
+    jax.clear_caches()
+    
+    # SVD pseudo-inverse of S_PQ on device
+    # U, s, Vh = jnp.linalg.svd(S_PQ, full_matrices=False)
+    # mask  = s > s[0] * rcond
+    # s_inv = jnp.where(mask, 1.0 / jnp.where(mask, s, 1.0), 0.0)
+    # d = jnp.matmul(Vh.T * s_inv, jnp.matmul(U.T, V_Pmu))               # (naux_df, naux)
+    
+    # 1. Solve Symmetric Eigenproblem
+    # S_PQ is (n_df, n_df)
+    s, U = jnp.linalg.eigh(S_PQ)
+    
+    # 2. Sort descending (eigh returns ascending)
+    s = s[::-1]
+    U = U[:, ::-1]
+    
+    # 3. Apply rcond mask to find the effective rank (k)
+    k = jnp.sum(s > (s[0] * rcond)) # Number of 'important' dimensions
+    
+    # 4. projection to df auxiliary space
+    # --- MEMORY SAVING TRUNCATION ---
+    # Slice U and s to only include the 'k' significant components.
+    print_jax_vram_summary()
+
+    # d = jnp.einsum('ij,lj,la->ia', U[:, :k] * (1.0 / s[:k]), U[:, :k], V_Pmu, precision=jax.lax.Precision.HIGHEST)
+    U_s = U[:, :k] * (1.0 / s[:k])
+    U_s.block_until_ready()
+
+    del s
+    gc.collect()
+    jax.clear_caches()
+
+    d = U[:, :k].T @ V_Pmu  # Result is (k, a)
+    d = U_s @ d             # Result is (N, a)
+
+    d.block_until_ready()
+
+    del S_PQ, V_Pmu, U, U_s  # Include all names used in the function
+    gc.collect()
+    jax.clear_caches()
 
     # Analytical 2-centre integrals (PySCF CPU → GPU)
     J_PQ = jnp.array(aux_mol.intor('int2c2e'))                          # (naux_df, naux_df)
-
-    # SVD pseudo-inverse of S_PQ on device
-    U, s, Vh = jnp.linalg.svd(S_PQ, full_matrices=False)
-    mask  = s > s[0] * rcond
-    s_inv = jnp.where(mask, 1.0 / jnp.where(mask, s, 1.0), 0.0)
-    d = jnp.matmul(Vh.T * s_inv, jnp.matmul(U.T, V_Pmu))               # (naux_df, naux)
 
     J_munu = jnp.matmul(d.T, jnp.matmul(J_PQ, d))                      # (naux, naux)
     J_munu.block_until_ready()
@@ -2041,11 +1998,6 @@ class TDDFT(lib.StreamObject):
 
     def _build_isdf_intermediates(self):
         """Automatically construct the ISDF interpolants and exact J matrices from the PySCF molecule object."""
-        import time
-        from pyscf import dft
-        from pytc.df import isdf_decompose as isdf_decompose_jax
-        # from isdf_coulomb_exchange import compute_J_munu, compute_J_munu_lr
-        import jax.numpy as jnp
 
         print('\n--- Starting Auto ISDF Decomposition ---')
         grids = self.mf.grids
@@ -2067,7 +2019,7 @@ class TDDFT(lib.StreamObject):
         # but in a rigorous implementation, spin-unrestricted usually shares a single spatial ISDF basis.
 
         for s in range(self.nspin):
-            print_memory_usage({name: val for name, val in locals().items()})
+            print_jax_vram_summary()
             nocc_s = self.nocc[s] if isinstance(self.nocc, list) else self.nocc
             orbs_s = self.mo_coeff[s]
             
@@ -2075,6 +2027,7 @@ class TDDFT(lib.StreamObject):
             phi = np.zeros((self.nmo, n_grid_total))
             grad_phi = np.zeros((self.nmo, n_grid_total, 3))
             weights = np.zeros(n_grid_total)
+            grid_coords = np.zeros((n_grid_total,3))
             
             nstart, nstop = 0, 0
             for ao, mask, weight, coords in ni.block_loop(self.mol, grids, self.mol.nao, 1, self.mf.max_memory):
@@ -2082,10 +2035,11 @@ class TDDFT(lib.StreamObject):
                 phi[:, nstart:nstop] = (ao[0] @ orbs_s).T
                 grad_phi[:, nstart:nstop, :] = (ao[1:4] @ orbs_s).transpose(2, 1, 0)
                 weights[nstart:nstop] = weight
+                grid_coords[nstart:nstop] = coords
                 nstart += ao.shape[1]
             
-
-            print_memory_usage({name: val for name, val in locals().items()})
+            del ao, mask, weight, coords
+            print_jax_vram_summary()
             t0 = time.time()
 
             # --- Decide streaming vs in-core BEFORE the decompose call (spin 0 only) ---
@@ -2098,18 +2052,23 @@ class TDDFT(lib.StreamObject):
                     stream_h5 = f"/tmp/isdf_stream_{_uuid.uuid4().hex[:8]}.h5"
                 else:
                     stream_h5 = self.isdf_stream_path
-                phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
-                    jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
-                    jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size,
-                    is_incore=False, save_path=stream_h5, rcond=self.isdf_rcond
-                )  # xi_phi and xi_grad are None here (written to stream_h5)
+                
+                with h5py.File(stream_h5, 'w') as f:
+                    f.create_dataset('phi', data=phi)
+                    f.create_dataset('grad_phi', data=grad_phi)
+                self.isdf_output_path = stream_h5.replace('.h5', '_out.h5')
+                pivots, phi_piv, grad_phi_piv = isdf_decompose_outcore(
+                    stream_h5, self.isdf_output_path, n_rank_phi, n_rank_grad,
+                    jnp.array(grid_coords), jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size, rcond=self.isdf_rcond
+                ) 
             else:
                 stream_h5 = None  # sentinel: non-streaming
-                phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose_jax(
+                phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose(
                     jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
                     jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size,
                     is_incore=True, rcond=self.isdf_rcond
                 )
+            del phi, grad_phi
 
             gc.collect()
             t1 = time.time()
@@ -2132,7 +2091,7 @@ class TDDFT(lib.StreamObject):
             C_v_gga_s = C_full[:, :, nocc_s:]
             self.C_o_gga.append(C_o_gga_s)
             self.C_v_gga.append(C_v_gga_s)
-            print_memory_usage({name: val for name, val in locals().items()})
+            print_jax_vram_summary()
             
             if s == 0:
                 t0 = time.time()
@@ -2142,32 +2101,33 @@ class TDDFT(lib.StreamObject):
                     # so xi_phi/xi_grad are None (written to HDF5).
                     # Remember the path so load_fxc_intermediates can stream from it.
                     self._isdf_h5_path = stream_h5
-                    del xi_phi, xi_grad, grad_phi_piv, pivots
+                    # del pivots, phi_piv, grad_phi_piv
 
                     # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
                     if self.isdf_exact_J:
-                        # Load xi_phi from HDF5 into JAX (naux, ngrid)
-                        with h5py.File(stream_h5, 'r') as _f:
-                            _xi_phi_jax = jnp.array(_f['xi_phi'][:])
-                        self.J = np.array(compute_J_munu(
-                            _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords)
-                        ))
-                        if getattr(self, 'omega', 0.0) > 0:
-                            self.J_rsh = np.array(compute_J_munu_lr(
-                                _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords),
-                                omega=self.omega
-                            ))
-                        else:
-                            self.J_rsh = None
-                        del _xi_phi_jax
+                        raise NotImplementedError
+                        # # Load xi_phi from HDF5 into JAX (naux, ngrid)
+                        # with h5py.File(self.isdf_output_path, 'r') as _f:
+                        #     _xi_phi_jax = jnp.array(_f['xi_phi'][:])
+                        # self.J = np.array(compute_J_munu(
+                        #     _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords)
+                        # ))
+                        # if getattr(self, 'omega', 0.0) > 0:
+                        #     self.J_rsh = np.array(compute_J_munu_lr(
+                        #         _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords),
+                        #         omega=self.omega
+                        #     ))
+                        # else:
+                        #     self.J_rsh = None
+                        # del _xi_phi_jax
                     else:
                         self.J = compute_ISDF_J_kernels_DF_streaming(
-                            stream_h5, weights, grids.coords, pivot_coords,
+                            self.isdf_output_path, weights, grids.coords, pivot_coords,
                             gammas=self.isdf_gammas, batch_size=self.isdf_stream_batch_size
                         )
                         if getattr(self, 'omega', 0.0) > 0:
                             self.J_rsh = compute_ISDF_J_kernels_DF_streaming(
-                                stream_h5, weights, grids.coords, pivot_coords,
+                                self.isdf_output_path, weights, grids.coords, pivot_coords,
                                 gammas=self.isdf_gammas, omega=self.omega,
                                 batch_size=self.isdf_stream_batch_size
                             )
@@ -2186,7 +2146,7 @@ class TDDFT(lib.StreamObject):
                     self.xi_phi = np.array(xi_phi, dtype=np.float64)
                     self.xi_grad = np.array(xi_grad, dtype=np.float64)
                     del xi_phi, xi_grad, grad_phi_piv, pivots
-                    print_memory_usage({name: val for name, val in locals().items()})
+                    print_jax_vram_summary()
 
                     # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
                     if self.isdf_exact_J:
@@ -2214,7 +2174,7 @@ class TDDFT(lib.StreamObject):
                         else:
                             self.J_rsh = None
 
-                print_memory_usage({name: val for name, val in locals().items()})
+                print_jax_vram_summary()
                 t1 = time.time()
                 print(f"Analytical ISDF J-kernel build(s) took: {t1 - t0:.2f} s")
             else:
@@ -2286,7 +2246,7 @@ class TDDFT(lib.StreamObject):
             if self._isdf_h5_path is not None:
                 # Streaming: read xi_phi from HDF5 in batches
                 self.wfxc = compress_isdf_lda_kernel_streaming(
-                    self._isdf_h5_path, wfxc, batch_size=self.isdf_stream_batch_size
+                    self.isdf_output_path, wfxc, batch_size=self.isdf_stream_batch_size
                 )
                 # HDF5 no longer needed — delete it
                 if os.path.exists(self._isdf_h5_path):
@@ -2330,7 +2290,7 @@ class TDDFT(lib.StreamObject):
             if self._isdf_h5_path is not None:
                 # Streaming: read xi_phi/xi_grad from HDF5 in batches
                 self.wfxc = compress_isdf_gga_kernel_streaming(
-                    self._isdf_h5_path, wfxc_yx, batch_size=self.isdf_stream_batch_size
+                    self.isdf_output_path, wfxc_yx, batch_size=self.isdf_stream_batch_size
                 )
                 # HDF5 no longer needed — delete it
                 if os.path.exists(self._isdf_h5_path):

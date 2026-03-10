@@ -76,6 +76,7 @@ def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarr
     Uses adaptive jitter escalation to guarantee numerically SPD matrices.
     """
     ata = _build_normal_matrix(phi_piv_p, phi_piv_q)
+    print('passed _build_normal_matrix')
     ata = 0.5 * (ata + ata.T)
     diag_mean = float(jnp.mean(jnp.diag(ata)))
     eps_scale = float(jnp.finfo(ata.dtype).eps) * max(diag_mean, 1.0)
