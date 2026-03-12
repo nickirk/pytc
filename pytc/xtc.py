@@ -1,5 +1,6 @@
 """JAX implementation of X transcorrelated methods."""
 
+import contextlib
 from functools import partial, reduce
 import numpy as np
 import os
@@ -70,6 +71,105 @@ def _slice_key(sl):
     if isinstance(sl, slice):
         return ("slice", sl.start, sl.stop, sl.step)
     return ("idx", tuple(np.asarray(sl).ravel()))
+
+
+def _chunk_selector(idx, start, stop):
+    """Convert a contiguous subrange of indices into a slice when possible."""
+    sub = np.asarray(idx[start:stop])
+    if sub.size == 0:
+        return slice(0, 0, 1)
+    if sub.size == 1:
+        i = int(sub[0])
+        return slice(i, i + 1, 1)
+
+    steps = np.diff(sub)
+    if np.all(steps == steps[0]):
+        step = int(steps[0])
+        return slice(int(sub[0]), int(sub[-1] + step), step)
+    return sub
+
+
+def _estimate_delta_u_contraction_bytes(Np, Nq, Nr, Ns, N_rank):
+    """Estimate device memory for the legacy scan-based Delta U kernel."""
+    x_sliced_size_bytes = int(Nr * Ns * N_rank * 8)
+    d_size_bytes = int(N_rank * N_rank * 8)
+    scan_carry_bytes = int(Np * Nq * Nr * Ns * 8)
+    total_needed_bytes = x_sliced_size_bytes * 2 + d_size_bytes + 3 * scan_carry_bytes
+    return x_sliced_size_bytes, d_size_bytes, scan_carry_bytes, total_needed_bytes
+
+
+def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
+    """Estimate device memory for the balanced direct Delta U tile kernel."""
+    B = 8
+    d_size_bytes = int(N_rank * N_rank * B)
+    x_sliced_size_bytes = int(Nr * Ns * N_rank * B)
+    cpq_size_bytes = int(Np * Nq * N_rank * B)
+    crs_size_bytes = int(Nr * Ns * N_rank * B)
+    out_size_bytes = int(Np * Nq * Nr * Ns * B)
+    # Conservative peak: D + X + two orbital panels + transformed panel + output + X term.
+    total_needed_bytes = (
+        d_size_bytes
+        + x_sliced_size_bytes
+        + cpq_size_bytes
+        + crs_size_bytes
+        + cpq_size_bytes
+        + 2 * out_size_bytes
+    )
+    return {
+        "D": d_size_bytes,
+        "X": x_sliced_size_bytes,
+        "Cpq": cpq_size_bytes,
+        "Crs": crs_size_bytes,
+        "out": out_size_bytes,
+        "total": total_needed_bytes,
+    }
+
+
+def _pad_leading_axis(arr, target):
+    """Pad the leading axis of an array with zeros up to ``target``."""
+    cur = arr.shape[0]
+    if cur == target:
+        return jnp.asarray(arr)
+    if cur > target:
+        raise ValueError(f"cannot pad axis-0 from {cur} down to {target}")
+    pad_cfg = [(0, target - cur)] + [(0, 0)] * (arr.ndim - 1)
+    return jnp.pad(jnp.asarray(arr), pad_cfg)
+
+
+def _get_device_free_bytes(device=None):
+    """Return currently free bytes for a specific local device when possible."""
+    if device is not None:
+        try:
+            stats = device.memory_stats()
+            pool_limit = int(stats['bytes_limit'])
+            in_use = int(stats.get('bytes_in_use', 0))
+            return max(pool_limit - in_use, 0)
+        except Exception:
+            pass
+
+    from pytc.utils.gpu_memory import _get_gpu_free_bytes
+    return _get_gpu_free_bytes()
+
+
+def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=None):
+    """Execute one XTC 2-body tile using the internal tile API only."""
+    if not hasattr(xtc_obj, "_assemble_2b_tile"):
+        raise TypeError(
+            f"{type(xtc_obj).__name__} does not implement the internal XTC tile API"
+        )
+
+    kernels = getattr(xtc_obj, "isdf_kernels", None)
+    required = ("K1_kernel", "K3_kernel", "D", "X")
+    if kernels is None or any(key not in kernels for key in required):
+        missing = [key for key in required if kernels is None or key not in kernels]
+        raise RuntimeError(
+            "XTC tile execution requires precomputed ISDF kernels. "
+            f"Missing: {missing}"
+        )
+
+    return xtc_obj._assemble_2b_tile(
+        jastrow_params, kernels, ranges, device=device, panel_size=panel_size
+    )
 
 
 @struct.dataclass
@@ -687,6 +787,21 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     term_x, _ = jax.lax.scan(scan_c_block, term_x_init, (X_scannable, phi_p_scannable, phi_q_scannable))
 
     return term_d + term_x
+
+
+@jax.jit
+def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
+    """Balanced direct Delta U tile contraction using fixed-shape matmuls."""
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+
+    cpq = (phi_p[:, None, :] * phi_q[None, :, :]).reshape(Np * Nq, D.shape[0])
+    crs = (phi_r[:, None, :] * phi_s[None, :, :]).reshape(Nr * Ns, D.shape[1])
+    x_flat = X_sliced.reshape(Nr * Ns, X_sliced.shape[2])
+
+    d_term = jnp.matmul(jnp.matmul(cpq, D), crs.T)
+    x_term = jnp.matmul(cpq, x_flat.T)
+    return (d_term - x_term).reshape(Np, Nq, Nr, Ns)
 
 
 @jax.jit
@@ -1478,36 +1593,8 @@ class ISDFXTC(XTC, ISDFTC):
              kernels = self.compute_delta_u_kernels(jastrow_params, batch_size)
         else:
             kernels = self.isdf_kernels
-            
-        result = self._contract_delta_U_kernels(kernels, ranges)
-        
-        # Symmetrize the result: final = -(result + T_full.transpose(2,3,0,1))
-        slice_p, slice_q, slice_r, slice_s = ranges
-        
-        if slice_p == slice_r and slice_q == slice_s:
-            result = -(result + result.transpose(2, 3, 0, 1))
-        else:
-            # Transfer direct block to host, then sub-chunk the transpose
-            # block on GPU → accumulate on host.  Avoids holding two full
-            # output-sized tensors on GPU simultaneously.
-            result_np = -np.asarray(result)
-            del result
-            nmo = self.phi_isdf.shape[0]
-            r_start = slice_r.start if slice_r.start is not None else 0
-            r_stop = slice_r.stop if slice_r.stop is not None else nmo
-            r_len = r_stop - r_start
-            n_sub = 2
-            chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
-            for i0 in range(0, r_len, chunk_size):
-                i1 = min(i0 + chunk_size, r_len)
-                sub_ranges = (slice(r_start + i0, r_start + i1),
-                              slice_s, slice_p, slice_q)
-                tmp = self._contract_delta_U_kernels(kernels, sub_ranges)
-                chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
-                del tmp
-                result_np[:, :, i0:i1, :] -= chunk_np
-                del chunk_np
-            result = jnp.asarray(result_np)
+
+        result = self._assemble_delta_u_tile(kernels, ranges)
 
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
@@ -1518,7 +1605,7 @@ class ISDFXTC(XTC, ISDFTC):
                     block_str=None, ranges=None, 
                     orb_block_size=256,
                     batch_size=1000):
-        """Get or compute delta_h using ISDF kernels efficiently.
+        r"""Get or compute delta_h using ISDF kernels efficiently.
         
         Evaluates $\delta h_{pq} = \sum_{rs} (2 \Delta U_{pqrs} - \Delta U_{psrq}) \gamma_{rs}$
         directly from ISDF kernels D and X.
@@ -1687,7 +1774,6 @@ class ISDFXTC(XTC, ISDFTC):
         # Check size of X_sliced vs available GPU memory
         from pytc.utils.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
         gpu_free_bytes = _get_gpu_free_bytes()
-        available_gb = gpu_free_bytes / (1024.0**3)
         
         # Estimate total GPU memory needed for delta_U calculation.
         # _contract_delta_U_kernels_jit runs TWO sequential lax.scans:
@@ -1699,25 +1785,31 @@ class ISDFXTC(XTC, ISDFTC):
         #   ≈ X_sliced * 2 + D + 3 × carry
         # Peak during D-scan:
         #   X_sliced (alive for later) + D + 2 × carry + W + C_rs
-        x_sliced_size_gb = (float(Nr) * float(Ns) * float(N_rank) * 8.0) / (1024.0**3)
-        d_size_gb = (float(N_rank) * float(N_rank) * 8.0) / (1024.0**3)
-        scan_carry_gb = (float(Np) * float(Nq) * float(Nr) * float(Ns) * 8.0) / (1024.0**3)
-        # X_sliced input + padded copy ≈ 2× X_sliced
-        # + D matrix + 3× carry (term_d + carry + contribution)
-        total_needed_gb = x_sliced_size_gb * 2.0 + d_size_gb + 3.0 * scan_carry_gb
+        x_sliced_size_bytes, d_size_bytes, scan_carry_bytes, total_needed_bytes = (
+            _estimate_delta_u_contraction_bytes(Np, Nq, Nr, Ns, N_rank)
+        )
         
         # Threshold: use 80% of actually free GPU memory (not budget).
         # This is more accurate than the budget-based estimate since it
         # accounts for pre-allocated tensors (phi_isdf, etc.).
-        threshold = available_gb * 0.5
+        threshold_bytes = int(gpu_free_bytes * 0.5)
         
-        logger.debug(f"delta_U memory estimate: X_sliced={x_sliced_size_gb:.2f} GB, "
-                     f"scan_carry={scan_carry_gb:.2f} GB, total={total_needed_gb:.2f} GB "
-                     f"(Threshold: {threshold:.2f} GB, dims: Np={Np}, Nq={Nq}, Nr={Nr}, Ns={Ns})")
+        logger.debug(
+            "delta_U memory estimate: X_sliced=%.2f GB, scan_carry=%.2f GB, total=%.2f GB "
+            "(threshold=%.2f GB, dims: Np=%d, Nq=%d, Nr=%d, Ns=%d)",
+            x_sliced_size_bytes / (1024.0**3),
+            scan_carry_bytes / (1024.0**3),
+            total_needed_bytes / (1024.0**3),
+            threshold_bytes / (1024.0**3),
+            Np, Nq, Nr, Ns,
+        )
         
+        if total_needed_bytes < threshold_bytes:
+            return self._get_delta_u_direct_tile(kernels, ranges)
+
         phi_p = self.phi_isdf[slice_p]
         phi_q = self.phi_isdf[slice_q]
-        
+
         # Use fixed rank_block_size (worst-case over all phases) to avoid
         # JIT recompilation when (Np, Nq) changes across CCSD blocks.
         _rbs = self._get_fixed_rank_block_size()
@@ -1725,47 +1817,14 @@ class ISDFXTC(XTC, ISDFTC):
             _rbs = adaptive_rank_block_size(
                 Np, Nq, N_rank,
                 gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
-
-        # Read the full X orbital slice into host RAM (cached across
-        # repeated calls with the same (slice_r, slice_s) — typical
-        # within a CCSD ERI phase).  The chunking path sub-slices
-        # from this host array rather than re-reading from HDF5.
-        X_full = _read_X_slice(X, slice_r, slice_s)
         
-        if total_needed_gb < threshold:
-            phi_r = self.phi_isdf[slice_r]
-            phi_s = self.phi_isdf[slice_s]
-            n_devices = jax.local_device_count()
-            if n_devices > 1 and Np >= n_devices:
-                mesh = sharding_core.create_1d_mesh(axis_name='devices')
-                p_sharding = NamedSharding(mesh, P('devices', None))
-                p_padded = ((Np + n_devices - 1) // n_devices) * n_devices
-                if p_padded > Np:
-                    phi_p_pad = jnp.pad(phi_p, ((0, p_padded - Np), (0, 0)))
-                else:
-                    phi_p_pad = phi_p
-                phi_p_sharded = jax.device_put(np.asarray(phi_p_pad), p_sharding)
-
-                @shard_map(
-                    mesh=mesh,
-                    in_specs=(P(), P(), P('devices', None), P(), P(), P()),
-                    out_specs=P('devices', None, None, None),
-                    check_vma=False,
-                )
-                def _contract_sharded(D_in, X_in, phi_p_in, phi_q_in, phi_r_in, phi_s_in):
-                    return _contract_delta_U_kernels_jit(
-                        D_in, X_in, phi_p_in, phi_q_in, phi_r_in, phi_s_in, _rbs
-                    )
-
-                out = _contract_sharded(D, X_full, phi_p_sharded, phi_q, phi_r, phi_s)
-                return out[:Np]
-
-            return _contract_delta_U_kernels_jit(
-                D, X_full, phi_p, phi_q, phi_r, phi_s, _rbs
-            )
-        
-        # Chunking strategy to avoid VRAM exhaustion
-        logger.warning(f"  delta_U memory estimate ({total_needed_gb:.2f} GB) exceeds {threshold:.2f} GB limit. Chunking orbital indices.")
+        # Chunking strategy to avoid VRAM exhaustion. Stream only the X panel
+        # needed for each chunk instead of first materializing the full X slice.
+        logger.warning(
+            "  delta_U memory estimate (%.2f GB) exceeds %.2f GB limit. Chunking orbital indices.",
+            total_needed_bytes / (1024.0**3),
+            threshold_bytes / (1024.0**3),
+        )
 
         # Keep 1-D index arrays on host (cheap); avoid eagerly copying the full
         # phi_isdf matrix — only the rows needed per chunk are materialised
@@ -1793,20 +1852,20 @@ class ISDFXTC(XTC, ISDFTC):
         #   Total per Ns_chunk_unit = Nr * N_rank * 8 * 2 (input+padded)
         #                            + 3 * Np * Nq * Nr * 8
         # Target: total + D fits in threshold.
-        target_gb = threshold - d_size_gb
-        target_gb = max(target_gb, 1.0)  # safety
+        target_bytes = max(threshold_bytes - d_size_bytes, 1)
         
         if Nr >= Ns:
             # Chunk over r
-            per_r_unit_gb = (float(Ns) * float(N_rank) * 8.0 * 2.0
-                            + 3.0 * float(Np) * float(Nq) * float(Ns) * 8.0) / (1024.0**3)
-            max_Nr_chunk = max(1, int(target_gb / per_r_unit_gb)) if per_r_unit_gb > 0 else Nr
+            per_r_unit_bytes = int(2 * Ns * N_rank * 8 + 3 * Np * Nq * Ns * 8)
+            max_Nr_chunk = max(1, int(target_bytes / max(per_r_unit_bytes, 1))) if per_r_unit_bytes > 0 else Nr
             orb_chunk_size = min(max_Nr_chunk, Nr)
             
-            chunk_total_gb = orb_chunk_size * per_r_unit_gb + d_size_gb
-            logger.debug(f"Chunking over 'r' index. Chunk size: {orb_chunk_size} "
-                         f"(est. per chunk: {chunk_total_gb:.2f} GB)")
-            logger.debug(f"  Chunking with adaptive pad over r indices. Total Nr={Nr}, Ns={Ns}.")
+            chunk_total_bytes = orb_chunk_size * per_r_unit_bytes + d_size_bytes
+            logger.debug(
+                "Chunking over 'r' index. Chunk size: %d (est. per chunk: %.2f GB)",
+                orb_chunk_size, chunk_total_bytes / (1024.0**3),
+            )
+            logger.debug("  Chunking with streaming r panels. Total Nr=%d, Ns=%d.", Nr, Ns)
             
             phi_s = self.phi_isdf[slice_s]
 
@@ -1814,9 +1873,9 @@ class ISDFXTC(XTC, ISDFTC):
                 """Prepare phi_r_chunk and X_chunk for a given r-index range (host side)."""
                 ie = min(i_start + orb_chunk_size, Nr)
                 alen = ie - i_start
-                # Convert only the rows needed for this chunk, not the full phi_isdf.
-                pr_np = np.asarray(phi_isdf_src[r_idx_np[i_start:ie]])
-                xc_np = np.asarray(X_full[i_start:ie])
+                r_sel = _chunk_selector(r_idx_np, i_start, ie)
+                pr_np = np.asarray(phi_isdf_src[r_sel])
+                xc_np = np.asarray(_read_X_slice(X, r_sel, slice_s))
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
                     pr_np = np.pad(pr_np, ((0, pad), (0, 0)))
@@ -1859,15 +1918,16 @@ class ISDFXTC(XTC, ISDFTC):
                 gc.collect()
         else:
             # Chunk over s
-            per_s_unit_gb = (float(Nr) * float(N_rank) * 8.0 * 2.0
-                            + 3.0 * float(Np) * float(Nq) * float(Nr) * 8.0) / (1024.0**3)
-            max_Ns_chunk = max(1, int(target_gb / per_s_unit_gb)) if per_s_unit_gb > 0 else Ns
+            per_s_unit_bytes = int(2 * Nr * N_rank * 8 + 3 * Np * Nq * Nr * 8)
+            max_Ns_chunk = max(1, int(target_bytes / max(per_s_unit_bytes, 1))) if per_s_unit_bytes > 0 else Ns
             orb_chunk_size = min(max_Ns_chunk, Ns)
             
-            chunk_total_gb = orb_chunk_size * per_s_unit_gb + d_size_gb
-            logger.debug(f"Chunking over 's' index. Chunk size: {orb_chunk_size} "
-                         f"(est. per chunk: {chunk_total_gb:.2f} GB)")
-            logger.debug(f"  Chunking with adaptive pad over s indices. Total Nr={Nr}, Ns={Ns}.")
+            chunk_total_bytes = orb_chunk_size * per_s_unit_bytes + d_size_bytes
+            logger.debug(
+                "Chunking over 's' index. Chunk size: %d (est. per chunk: %.2f GB)",
+                orb_chunk_size, chunk_total_bytes / (1024.0**3),
+            )
+            logger.debug("  Chunking with streaming s panels. Total Nr=%d, Ns=%d.", Nr, Ns)
 
             phi_r = self.phi_isdf[slice_r]
 
@@ -1875,9 +1935,9 @@ class ISDFXTC(XTC, ISDFTC):
                 """Prepare phi_s_chunk and X_chunk for a given s-index range (host side)."""
                 ie = min(i_start + orb_chunk_size, Ns)
                 alen = ie - i_start
-                # Convert only the rows needed for this chunk, not the full phi_isdf.
-                ps_np = np.asarray(phi_isdf_src[s_idx_np[i_start:ie]])
-                xc_np = np.asarray(X_full[:, i_start:ie])
+                s_sel = _chunk_selector(s_idx_np, i_start, ie)
+                ps_np = np.asarray(phi_isdf_src[s_sel])
+                xc_np = np.asarray(_read_X_slice(X, slice_r, s_sel))
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
                     ps_np = np.pad(ps_np, ((0, pad), (0, 0)))
@@ -1921,4 +1981,124 @@ class ISDFXTC(XTC, ISDFTC):
                 gc.collect()
                 
         return jnp.asarray(result)
+
+    def _get_delta_u_direct_tile(self, kernels, ranges, device=None, panel_size=None):
+        """Compute one unsymmetrized Delta U tile from prepared kernel panels."""
+        D = kernels['D']
+        X = kernels['X']
+        slice_p, slice_q, slice_r, slice_s = ranges
+
+        cache_getter = getattr(self, "_get_isdf_device_cache", None)
+        cache = (
+            cache_getter(
+                kernels, device=device, include_grad=False, include_delta_u=True
+            )
+            if callable(cache_getter) else None
+        )
+        phi_src = cache["phi_isdf"] if cache is not None else self.phi_isdf
+        D_resident = cache.get("D") if cache is not None else None
+
+        phi_p = phi_src[slice_p]
+        phi_q = phi_src[slice_q]
+        phi_r = phi_src[slice_r]
+        phi_s = phi_src[slice_s]
+
+        p_len = phi_p.shape[0]
+        Nq = phi_q.shape[0]
+        r_len = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+        N_rank = D.shape[0]
+        Np = panel_size or p_len
+        Nr = panel_size or r_len
+
+        mem = _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank)
+        total_needed_bytes = mem["total"]
+        threshold_bytes = int(_get_device_free_bytes(device) * 0.5)
+        if total_needed_bytes >= threshold_bytes:
+            raise RuntimeError(
+                "Delta U direct tile exceeds available device memory: "
+                f"need ~{total_needed_bytes / (1024.0 ** 3):.2f} GiB for "
+                f"tile ({Np}, {Nq}, {Nr}, {Ns}), have "
+                f"~{threshold_bytes / (1024.0 ** 3):.2f} GiB usable. "
+                "Reduce the solver VVVV panel size."
+            )
+
+        X_sliced = _read_X_slice(X, slice_r, slice_s)
+        if panel_size is not None:
+            phi_p = _pad_leading_axis(phi_p, panel_size)
+            phi_r = _pad_leading_axis(phi_r, panel_size)
+            X_sliced = _pad_leading_axis(X_sliced, panel_size)
+        else:
+            phi_p = jnp.asarray(phi_p)
+            phi_r = jnp.asarray(phi_r)
+            X_sliced = jnp.asarray(X_sliced)
+        phi_q = jnp.asarray(phi_q)
+        phi_s = jnp.asarray(phi_s)
+        if device is not None:
+            D = D_resident if D_resident is not None else jax.device_put(np.asarray(D), device)
+            X_sliced = jax.device_put(X_sliced, device)
+            if cache is None:
+                phi_p = jax.device_put(phi_p, device)
+                phi_q = jax.device_put(phi_q, device)
+                phi_r = jax.device_put(phi_r, device)
+                phi_s = jax.device_put(phi_s, device)
+        device_ctx = (
+            jax.default_device(device)
+            if device is not None
+            else contextlib.nullcontext()
+        )
+        with device_ctx:
+            return _contract_delta_u_direct_tile_jit(
+                jnp.asarray(D),
+                jnp.asarray(X_sliced),
+                jnp.asarray(phi_p),
+                jnp.asarray(phi_q),
+                jnp.asarray(phi_r),
+                jnp.asarray(phi_s),
+            )
+
+    def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None):
+        """Assemble and symmetrize one finished Delta U tile."""
+        direct = self._get_delta_u_direct_tile(
+            kernels, ranges, device=device, panel_size=panel_size)
+
+        slice_p, slice_q, slice_r, slice_s = ranges
+        if slice_p == slice_r and slice_q == slice_s:
+            return -(direct + direct.transpose(2, 3, 0, 1))
+
+        result_np = -np.asarray(direct)
+        del direct
+        if panel_size is not None:
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            tmp = self._get_delta_u_direct_tile(
+                kernels, ranges_T, device=device, panel_size=panel_size)
+            result_np -= np.asarray(tmp.transpose(2, 3, 0, 1))
+            del tmp
+        else:
+            nmo = self.phi_isdf.shape[0]
+            r_start = slice_r.start if slice_r.start is not None else 0
+            r_stop = slice_r.stop if slice_r.stop is not None else nmo
+            r_len = r_stop - r_start
+            n_sub = 2
+            chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+            for i0 in range(0, r_len, chunk_size):
+                i1 = min(i0 + chunk_size, r_len)
+                sub_ranges = (slice(r_start + i0, r_start + i1),
+                              slice_s, slice_p, slice_q)
+                tmp = self._get_delta_u_direct_tile(kernels, sub_ranges, device=device)
+                chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
+                del tmp
+                result_np[:, :, i0:i1, :] -= chunk_np
+                del chunk_np
+        return jnp.asarray(result_np)
+
+    def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None, panel_size=None):
+        """Assemble a finished ISDF-XTC 2-body tile from TC and Delta U parts."""
+        del jastrow_params  # Reserved for future per-tile kernel refresh logic.
+        tc_tile = np.array(super()._assemble_tc_tile(
+            kernels, ranges, device=device, panel_size=panel_size))
+        delta_u_tile = np.array(self._assemble_delta_u_tile(
+            kernels, ranges, device=device, panel_size=panel_size))
+        tc_tile += delta_u_tile
+        return jnp.asarray(tc_tile)
     

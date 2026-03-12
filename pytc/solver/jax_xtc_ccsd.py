@@ -7,6 +7,8 @@ from pyscf import lib
 from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
+from pytc import xtc as xtc_mod
+from pytc.utils.gpu_memory import resolve_vvvv_panel_block_sizes
 from pytc.utils.gpu_memory import estimate_blksize
 
 # JAX config
@@ -641,87 +643,134 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
 
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv_gpu',
+    p_blksize, r_blksize = resolve_vvvv_panel_block_sizes(
+        nocc, nvir,
+        p_block_size=getattr(cc, 'vvvv_p_block_size', None),
+        r_block_size=getattr(cc, 'vvvv_r_block_size', None),
         gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
         naux=_naux,
-        n_fused=_n_fused)
-    logger.debug(f"VVVV on-the-fly contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
-    
-    L_vv_full_jax = None
+        n_fused=_n_fused,
+        include_eris=True,
+        include_accumulators=False,
+    )
+    panel_size = p_blksize
+    logger.debug(
+        "VVVV on-the-fly contraction: p_blksize=%d, r_blksize=%d, n_p_blocks=%d, n_r_blocks=%d",
+        p_blksize, r_blksize,
+        (nvir + p_blksize - 1) // p_blksize,
+        (nvir + r_blksize - 1) // r_blksize,
+    )
+
+    L_vv_full_host = None
     if with_df is not None:
-         L_vv_full_jax = jnp.asarray(lib.unpack_tril(eris.vvL[:], axis=0))
+         L_vv_full_host = lib.unpack_tril(eris.vvL[:], axis=0)
 
     @jax.jit
-    def contract_block_kernel(t2, xtc_block, L_ab_sub, L_vv_full):
-        if L_ab_sub is not None:
-            vvvv_jax = xtc_block + jnp.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
+    def contract_tc_tile_kernel(t2, xtc_tile):
+        return jnp.einsum('abcd,ijcd->ijab', xtc_tile.transpose(0, 2, 1, 3), t2)
+
+    @jax.jit
+    def contract_df_tile_kernel(t2, xtc_tile, L_p_tile, L_r_tile):
+        std_tile = jnp.tensordot(L_p_tile, L_r_tile, axes=((2,), (2,)))
+        vvvv_tile = xtc_tile + std_tile
+        return jnp.einsum('abcd,ijcd->ijab', vvvv_tile.transpose(0, 2, 1, 3), t2)
+
+    devices = xtc_ccsd._solver_local_devices()
+    t2_by_device = {}
+    for device in devices:
+        if device is None:
+            t2_by_device[None] = t2_jax
         else:
-            vvvv_jax = xtc_block
-        return jnp.einsum('acbd,ijcd->ijab', vvvv_jax, t2)
+            t2_by_device[device] = jax.device_put(t2_jax, device)
 
-    # Prefetch: overlap get_2b(n+1) GPU compute with contract_block_kernel(n)
-    from pytc.utils.prefetch import async_read, await_read
+    mo_v = None if with_df is not None else cc.mo_coeff[:, nocc:]
+    tile_specs = []
+    for p0 in range(0, nvir, p_blksize):
+        p1 = min(p0 + p_blksize, nvir)
+        for r0 in range(0, nvir, r_blksize):
+            r1 = min(r0 + r_blksize, nvir)
+            tile_specs.append((p0, p1, r0, r1))
 
-    pending_tc = None
-    pending_key = None
-
-    for p0 in range(0, nvir, blksize):
-        p1 = min(p0 + blksize, nvir)
-        ranges = (slice(nocc + p0, nocc + p1), slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
-        
-        t_get_2b = time.perf_counter()
-        # Await prefetched result if available
-        if pending_tc is not None and pending_key == (p0, p1):
-            vvvv_block_jax = await_read(pending_tc)
-            pending_tc = None
+    def issue_tile(spec, device):
+        p0, p1, r0, r1 = spec
+        p_len = p1 - p0
+        r_len = r1 - r0
+        ranges = (
+            slice(nocc + p0, nocc + p1),
+            slice(nocc, cc.nmo),
+            slice(nocc + r0, nocc + r1),
+            slice(nocc, cc.nmo),
+        )
+        t0 = time.perf_counter()
+        vvvv_tile_jax = xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size
+        )
+        logger.debug(
+            "get_2b (tile p[%d:%d] r[%d:%d] on device %s) issued in %.4f s",
+            p0, p1, r0, r1, getattr(device, "id", "host"), time.perf_counter() - t0,
+        )
+        if device is not None:
+            with jax.default_device(device):
+                if with_df is not None:
+                    L_p_tile = np.zeros((panel_size, nvir, L_vv_full_host.shape[2]))
+                    L_r_tile = np.zeros((panel_size, nvir, L_vv_full_host.shape[2]))
+                    L_p_tile[:p_len] = L_vv_full_host[p0:p1]
+                    L_r_tile[:r_len] = L_vv_full_host[r0:r1]
+                    L_p_tile_jax = jax.device_put(L_p_tile, device)
+                    L_r_tile_jax = jax.device_put(L_r_tile, device)
+                    term = contract_df_tile_kernel(
+                        t2_by_device[device], vvvv_tile_jax, L_p_tile_jax, L_r_tile_jax
+                    )
+                else:
+                    std_tile = ao2mo.general(
+                        cc.mol,
+                        (mo_v[:, p0:p1], mo_v, mo_v[:, r0:r1], mo_v),
+                        compact=False,
+                    )
+                    std_tile_pad = np.zeros((panel_size, nvir, panel_size, nvir))
+                    std_tile_pad[:p_len, :, :r_len, :] = std_tile.reshape(p_len, nvir, r_len, nvir)
+                    std_tile_jax = jax.device_put(
+                        std_tile_pad, device
+                    )
+                    term = contract_tc_tile_kernel(t2_by_device[device], vvvv_tile_jax + std_tile_jax)
         else:
-            vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
-            if hasattr(vvvv_block_jax, 'block_until_ready'):
-                vvvv_block_jax.block_until_ready()
-        logger.debug(f"get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
-        
-        L_ab_sub_jax = L_vv_full_jax[p0:p1] if with_df is not None else None
-        
-        if with_df is None:
-             t_ao2mo = time.perf_counter()
-             mo_v = cc.mo_coeff[:, nocc:]
-             std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-             logger.debug(f"ao2mo (std integrals) took {time.perf_counter()-t_ao2mo:.4f} s")
-             
-             t_transfer = time.perf_counter()
-             std_jax = jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
-             if hasattr(std_jax, 'block_until_ready'):
-                 std_jax.block_until_ready()
-             logger.debug(f"Host->Device transfer of std integrals took {time.perf_counter()-t_transfer:.4f} s")
-             
-             t_add = time.perf_counter()
-             vvvv_block_jax = vvvv_block_jax + std_jax
-             if hasattr(vvvv_block_jax, 'block_until_ready'):
-                 vvvv_block_jax.block_until_ready()
-             logger.debug(f"Element-wise addition (vvvv + std) took {time.perf_counter()-t_add:.4f} s")
-             
-        t0_comp = time.perf_counter()
-        term = contract_block_kernel(t2_jax, vvvv_block_jax, L_ab_sub_jax, L_vv_full_jax)
+            if with_df is not None:
+                L_p_tile = np.zeros((panel_size, nvir, L_vv_full_host.shape[2]))
+                L_r_tile = np.zeros((panel_size, nvir, L_vv_full_host.shape[2]))
+                L_p_tile[:p_len] = L_vv_full_host[p0:p1]
+                L_r_tile[:r_len] = L_vv_full_host[r0:r1]
+                term = contract_df_tile_kernel(
+                    t2_by_device[None],
+                    vvvv_tile_jax,
+                    jnp.asarray(L_p_tile),
+                    jnp.asarray(L_r_tile),
+                )
+            else:
+                std_tile = ao2mo.general(
+                    cc.mol,
+                    (mo_v[:, p0:p1], mo_v, mo_v[:, r0:r1], mo_v),
+                    compact=False,
+                )
+                std_tile_pad = np.zeros((panel_size, nvir, panel_size, nvir))
+                std_tile_pad[:p_len, :, :r_len, :] = std_tile.reshape(p_len, nvir, r_len, nvir)
+                term = contract_tc_tile_kernel(
+                    t2_by_device[None],
+                    vvvv_tile_jax + jnp.asarray(std_tile_pad),
+                )
+        return term
 
-        # While GPU runs contract_block_kernel, kick off NEXT block's get_2b
-        next_p0 = p0 + blksize
-        if next_p0 < nvir:
-            next_p1 = min(next_p0 + blksize, nvir)
-            next_ranges = (slice(nocc + next_p0, nocc + next_p1),
-                           slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
-            pending_tc = async_read(
-                lambda r=next_ranges: xtc_obj.get_2b(jastrow_params, ranges=r))
-            pending_key = (next_p0, next_p1)
-
-        term.block_until_ready()
-        t_comp = time.perf_counter() - t0_comp
-        
+    def consume_tile(spec, device, term):
+        p0, p1, r0, r1 = spec
+        p_len = p1 - p0
+        r_len = r1 - r0
         t0_trans = time.perf_counter()
-        t2new_host[:, :, p0:p1, :] += np.asarray(term)
-        t_trans = time.perf_counter() - t0_trans
-        logger.debug(f"VVVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
-    
-    if L_vv_full_jax is not None:
-        del L_vv_full_jax
+        t2new_host[:, :, p0:p1, r0:r1] += np.asarray(term)[:, :, :p_len, :r_len]
+        logger.debug(
+            "VVVV tile p[%d:%d] r[%d:%d] on device %s accumulated in %.4fs",
+            p0, p1, r0, r1, getattr(device, "id", "host"), time.perf_counter() - t0_trans,
+        )
+
+    xtc_ccsd._round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+
+    if L_vv_full_host is not None:
+        del L_vv_full_host

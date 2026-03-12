@@ -1,5 +1,6 @@
 import logging
 import time
+from collections import deque
 import numpy as np
 import jax
 from functools import reduce
@@ -9,7 +10,12 @@ from pyscf.cc import rintermediates as imd
 from pyscf import ao2mo
 from pyscf.ao2mo import _ao2mo
 
-from pytc.utils.gpu_memory import estimate_blksize, enable_xla_compilation_cache
+from pytc.utils.gpu_memory import (
+    estimate_blksize,
+    resolve_vvvv_panel_block_sizes,
+    enable_xla_compilation_cache,
+)
+from pytc import xtc as xtc_mod
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +24,8 @@ class RCCSD(rccsd.RCCSD):
     def __init__(self, mf, xtc_obj=None, jastrow_params=None, **kwargs):
         self.gpu_max_memory = kwargs.pop('gpu_max_memory', 4000)
         self.on_the_fly_vvvv = kwargs.pop('on_the_fly_vvvv', False)
+        self.vvvv_p_block_size = kwargs.pop('vvvv_p_block_size', None)
+        self.vvvv_r_block_size = kwargs.pop('vvvv_r_block_size', None)
         max_memory = kwargs.pop('max_memory', None)
         rccsd.RCCSD.__init__(self, mf, **kwargs)
         self.xtc_obj = xtc_obj
@@ -28,8 +36,10 @@ class RCCSD(rccsd.RCCSD):
         if getattr(self, 'max_memory', None) is None:
             self.max_memory = getattr(mf, 'max_memory', 4000)
             
-        self._keys = self._keys.union(['xtc_obj', 'jastrow_params', 'gpu_max_memory',
-                                        'on_the_fly_vvvv'])
+        self._keys = self._keys.union([
+            'xtc_obj', 'jastrow_params', 'gpu_max_memory',
+            'on_the_fly_vvvv', 'vvvv_p_block_size', 'vvvv_r_block_size',
+        ])
 
         # Enable XLA persistent compilation cache so compiled HLO programs
         # are reused across CCSD iterations and across runs.
@@ -136,6 +146,49 @@ class RCCSD(rccsd.RCCSD):
         
         return new_cc
 
+def _next_vvvv_panel_key(p0, p_blksize, r0, r_blksize, nvir):
+    """Return the next `(p0, p1, r0, r1)` tile key in row-major order."""
+    next_r0 = r0 + r_blksize
+    if next_r0 < nvir:
+        return (
+            p0,
+            min(p0 + p_blksize, nvir),
+            next_r0,
+            min(next_r0 + r_blksize, nvir),
+        )
+
+    next_p0 = p0 + p_blksize
+    if next_p0 < nvir:
+        return (
+            next_p0,
+            min(next_p0 + p_blksize, nvir),
+            0,
+            min(r_blksize, nvir),
+        )
+    return None
+
+def _solver_local_devices():
+    """Return local accelerator devices for solver-side round-robin scheduling."""
+    devices = tuple(jax.local_devices())
+    return devices if devices else (None,)
+
+
+def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None):
+    """Issue one tile per device and harvest results in round-robin order."""
+    devices = devices or _solver_local_devices()
+    n_devices = len(devices)
+    pending = deque()
+
+    for tile_id, spec in enumerate(tile_specs):
+        device = devices[tile_id % n_devices]
+        pending.append((spec, device, issue_tile(spec, device)))
+        if len(pending) >= n_devices:
+            ready_spec, ready_device, handle = pending.popleft()
+            consume_tile(ready_spec, ready_device, handle)
+
+    while pending:
+        ready_spec, ready_device, handle = pending.popleft()
+        consume_tile(ready_spec, ready_device, handle)
 
 
 class _ChemistsERIs(rccsd._ChemistsERIs):
@@ -438,12 +491,19 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv',
+    p_blksize, r_blksize = resolve_vvvv_panel_block_sizes(
+        nocc, nvir,
+        p_block_size=getattr(cc, 'vvvv_p_block_size', None),
+        r_block_size=getattr(cc, 'vvvv_r_block_size', None),
         gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
         naux=_naux,
-        n_fused=_n_fused)
+        n_fused=_n_fused,
+        include_eris=False,
+        include_accumulators=False,
+    )
+    panel_size = p_blksize
+    panel_size = p_blksize
+    panel_size = p_blksize
     
     # Pre-unpack L_vv_full if using density fitting to avoid repeated IO/unpacking
     
@@ -453,49 +513,64 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
          # This might be large (approx 5-10GB for 800 orbitals) but necessary for performance
          L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
 
-    # Prefetch: overlap get_2b(n+1) GPU compute with tensordot/einsum(n) CPU work.
-    from pytc.utils.prefetch import async_read, await_read
+    devices = _solver_local_devices()
+    logger.debug(
+        "VVVV on-the-fly contraction: scheduling %d panel pipelines across %d local devices",
+        ((nvir + p_blksize - 1) // p_blksize) * ((nvir + r_blksize - 1) // r_blksize),
+        len(devices),
+    )
+    mo_v = None if with_df is not None else cc.mo_coeff[:, nocc:]
 
-    pending_tc = None    # Future for the NEXT block's get_2b result
-    pending_key = None   # (p0, p1) for the pending block
-    for p0 in range(0, nvir, blksize):
-        p1 = min(p0 + blksize, nvir)
-        ranges = (slice(nocc + p0, nocc + p1), slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
+    tile_specs = []
+    for p0 in range(0, nvir, p_blksize):
+        p1 = min(p0 + p_blksize, nvir)
+        for r0 in range(0, nvir, r_blksize):
+            r1 = min(r0 + r_blksize, nvir)
+            tile_specs.append((p0, p1, r0, r1))
 
-        # Await the prefetched TC block if available, else compute inline.
-        if pending_tc is not None and pending_key == (p0, p1):
-            vvvv_block = await_read(pending_tc)
-            pending_tc = None
-        else:
-            vvvv_block = np.array(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+    def issue_tile(spec, device):
+        p0, p1, r0, r1 = spec
+        ranges = (
+            slice(nocc + p0, nocc + p1),
+            slice(nocc, nmo),
+            slice(nocc + r0, nocc + r1),
+            slice(nocc, nmo),
+        )
+        return xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
 
-        # Kick off NEXT block's get_2b in background thread so GPU work
-        # overlaps with this iteration's CPU tensordot + einsum.
-        next_p0 = p0 + blksize
-        if next_p0 < nvir:
-            next_p1 = min(next_p0 + blksize, nvir)
-            next_ranges = (slice(nocc + next_p0, nocc + next_p1),
-                           slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
-            pending_tc = async_read(
-                lambda r=next_ranges: np.array(xtc_obj.get_2b(jastrow_params, ranges=r)))
-            pending_key = (next_p0, next_p1)
-
-        logger.debug("Contraction block %d:%d", p0, p1)
+    def consume_tile(spec, device, tile_handle):
+        p0, p1, r0, r1 = spec
+        p_len = p1 - p0
+        r_len = r1 - r0
+        logger.debug(
+            "Contraction tile p[%d:%d] r[%d:%d] on device %s",
+            p0, p1, r0, r1, getattr(device, "id", "host"),
+        )
         t0 = time.perf_counter()
+        vvvv_tile = np.asarray(tile_handle)
         if with_df is not None:
-             L_ab_sub = L_vv_full[p0:p1]
-             std_block = np.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
-             vvvv_block += std_block
-             del std_block
+            std_tile = np.tensordot(L_vv_full[p0:p1], L_vv_full[r0:r1], axes=((2,), (2,)))
+            vvvv_tile = vvvv_tile[:p_len, :, :r_len, :] + std_tile
+            del std_tile
         else:
-             mo_v = cc.mo_coeff[:, nocc:]
-             std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-             vvvv_block += std_block.reshape(p1-p0, nvir, nvir, nvir)
-             del std_block
+            std_tile = ao2mo.general(
+                cc.mol,
+                (mo_v[:, p0:p1], mo_v, mo_v[:, r0:r1], mo_v),
+                compact=False,
+            )
+            vvvv_tile = vvvv_tile[:p_len, :, :r_len, :] + std_tile.reshape(p_len, nvir, r_len, nvir)
+            del std_tile
 
-        out[:, :, p0:p1, :] += lib.einsum('abcd,ijcd->ijab', vvvv_block.transpose(0, 2, 1, 3), t2)
-        del vvvv_block
-        logger.debug("Block %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+        out[:, :, p0:p1, r0:r1] += lib.einsum(
+            'abcd,ijcd->ijab', vvvv_tile.transpose(0, 2, 1, 3), t2
+        )
+        logger.debug(
+            "Tile p[%d:%d] r[%d:%d] done in %.3f s",
+            p0, p1, r0, r1, time.perf_counter() - t0,
+        )
+
+    _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
     
     if L_vv_full is not None:
         del L_vv_full
@@ -911,7 +986,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                      tc_blk = await_read(pending_tc)
                      pending_tc = None
                  else:
-                     tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+                     tc_blk = np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, ranges))
 
                  # Kick off NEXT block's get_2b in background
                  next_p0 = p0 + blksize
@@ -920,7 +995,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                      next_ranges = (slice(0, nocc), slice(nocc, nmo),
                                     slice(nocc+next_p0, nocc+next_p1), slice(nocc, nmo))
                      pending_tc = async_read(
-                         lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+                         lambda r=next_ranges: np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, r)))
                      pending_key = (next_p0, next_p1)
 
                  ds[:, :, p0:p1, :] = std_blk + tc_blk
@@ -946,7 +1021,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                     tc_blk = await_read(pending_tc)
                     pending_tc = None
                 else:
-                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+                    tc_blk = np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, ranges))
 
                 # Kick off NEXT block's get_2b in background
                 next_p0 = p0 + blksize
@@ -955,7 +1030,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                     next_ranges = (slice(nocc+next_p0, nocc+next_p1),
                                    slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
                     pending_tc = async_read(
-                        lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+                        lambda r=next_ranges: np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, r)))
                     pending_key = (next_p0, next_p1)
 
                 ds[p0:p1, :, :, :] = std_blk + tc_blk
@@ -972,44 +1047,58 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         _n_fused = xtc_obj.phi_isdf.shape[1]
     _naux = L_vv_full.shape[2] if L_vv_full is not None else None
 
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv',
+    p_blksize, r_blksize = resolve_vvvv_panel_block_sizes(
+        nocc, nvir,
+        p_block_size=getattr(cc, 'vvvv_p_block_size', None),
+        r_block_size=getattr(cc, 'vvvv_r_block_size', None),
         gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
         naux=_naux,
-        n_fused=_n_fused)
-    blksize = max(4, blksize)
-    logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
-                f"n_blocks={(nvir+blksize-1)//blksize})")
+        n_fused=_n_fused,
+        include_eris=False,
+        include_accumulators=False,
+    )
+    panel_size = p_blksize
+    logger.info(
+        "    Writing VVVV to disk (p_blksize=%d, r_blksize=%d, n_p_blocks=%d, n_r_blocks=%d)",
+        p_blksize, r_blksize,
+        (nvir + p_blksize - 1) // p_blksize,
+        (nvir + r_blksize - 1) // r_blksize,
+    )
 
-    from pytc.utils.prefetch import async_read, await_read
     ds = eris.vvvv
-    pending_tc = None
-    pending_key = None
-    for p0, p1 in lib.prange(0, nvir, blksize):
-        L_ab_sub = L_vv_full[p0:p1]  # (blk, nvir, naux)
-        std_blk = np.tensordot(L_ab_sub, L_vv_full, axes=((2,), (2,)))  # (blk, nvir, nvir, nvir)
+    devices = _solver_local_devices()
+    for p0, p1 in lib.prange(0, nvir, p_blksize):
+        L_p = L_vv_full[p0:p1]
+        vvvv_slab = np.empty((p1 - p0, nvir, nvir, nvir), dtype=np.float64)
 
-        ranges = (slice(nocc+p0, nocc+p1), slice(nocc, nmo),
-                  slice(nocc, nmo), slice(nocc, nmo))
-        if pending_tc is not None and pending_key == (p0, p1):
-            tc_blk = await_read(pending_tc)
-            pending_tc = None
-        else:
-            tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+        tile_specs = [
+            (p0, p1, r0, min(r0 + r_blksize, nvir))
+            for r0 in range(0, nvir, r_blksize)
+        ]
 
-        # Kick off NEXT block's get_2b in background
-        next_p0 = p0 + blksize
-        if next_p0 < nvir:
-            next_p1 = min(next_p0 + blksize, nvir)
-            next_ranges = (slice(nocc+next_p0, nocc+next_p1),
-                           slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
-            pending_tc = async_read(
-                lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
-            pending_key = (next_p0, next_p1)
+        def issue_tile(spec, device):
+            _, _, r0, r1 = spec
+            ranges = (
+                slice(nocc + p0, nocc + p1),
+                slice(nocc, nmo),
+                slice(nocc + r0, nocc + r1),
+                slice(nocc, nmo),
+            )
+            return xtc_mod.compute_2b_tile(
+                xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
 
-        ds[p0:p1, :, :, :] = std_blk + tc_blk
-        logger.debug(f"VVVV block {p0}:{p1} written to disk")
+        def consume_tile(spec, device, tile_handle):
+            _, _, r0, r1 = spec
+            p_len = p1 - p0
+            r_len = r1 - r0
+            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]
+            std_tile = np.tensordot(L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
+            vvvv_slab[:, :, r0:r1, :] = std_tile + tc_tile
+
+        _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+
+        ds[p0:p1, :, :, :] = vvvv_slab
+        logger.debug("VVVV slab %d:%d written to disk", p0, p1)
     logger.info("    VVVV disk write complete")
 
 
@@ -1048,7 +1137,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
             tc_blk = await_read(pending_tc)
             pending_tc = None
         else:
-            tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+            tc_blk = np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, ranges))
 
         # Kick off NEXT block's get_2b in background
         next_p0 = p0 + blksize
@@ -1057,7 +1146,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
             next_ranges = (slice(nocc+next_p0, nocc+next_p1),
                            slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
             pending_tc = async_read(
-                lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
+                lambda r=next_ranges: np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, r)))
             pending_key = (next_p0, next_p1)
 
         ds[p0:p1, :, :, :] = std_blk + tc_blk

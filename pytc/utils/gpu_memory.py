@@ -476,6 +476,107 @@ def estimate_blksize(nocc, nvir, phase, *,
     return blksize, budget
 
 
+def estimate_vvvv_panel_blksize(nocc, nvir, *,
+                                gpu_max_memory_mb=None,
+                                include_eris=False,
+                                include_accumulators=False,
+                                naux=None,
+                                n_fused=None,
+                                safety_factor=0.5):
+    """Estimate a safe square `(p, r)` tile size for panelized VVVV work.
+
+    The estimate is driven by *usable* VRAM: the smaller of
+    `(configured budget - persistent residents)` and the currently free bytes
+    reported by JAX's allocator.  The tile model is intentionally conservative
+    and includes:
+
+    - tile-local `get_2b()` output `(blk, V, blk, V)`
+    - ISDF X panels `X_p` and `X_r` when `n_fused` is known
+    - DF operands `L_p` and `L_r` when `naux` is known
+    - the tile-local CCSD contraction output `(O, O, blk, blk)`
+    """
+    O, V, B = nocc, nvir, 8
+
+    gpu_budget = get_gpu_budget_bytes(gpu_max_memory_mb)
+    persistent = estimate_persistent_gpu_bytes(
+        nocc, nvir,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+    )
+    gpu_free = _get_gpu_free_bytes()
+    usable = max(min(max(gpu_budget - persistent, 0), gpu_free), 0)
+
+    Nf = n_fused if n_fused is not None else 0
+    d_constant = Nf * Nf * B
+    target = max(int(max(usable - d_constant, 0) * safety_factor), 0)
+
+    def tile_bytes(blk):
+        tile = blk * V * blk * V * B
+        x_panels = 0
+        if Nf > 0:
+            # X_p and X_r each appear once as an input and once more as a
+            # conservative allowance for flatten/materialization overhead.
+            x_panels = 4 * blk * V * Nf * B
+        df_operands = 0
+        if naux is not None and naux > 0:
+            df_operands = 2 * blk * V * naux * B
+        out_tile = O * O * blk * blk * B
+        # Conservative allowance: TC tile + transpose/add staging + DF tile.
+        return x_panels + df_operands + 4 * tile + out_tile
+
+    lo = 1
+    hi = max(1, nvir)
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if tile_bytes(mid) <= target:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    best = max(1, min(best, nvir))
+    logger.debug(
+        "estimate_vvvv_panel_blksize: usable=%.2f GB, D=%.2f GB, "
+        "target=%.2f GB, naux=%s, n_fused=%s -> blk=%d",
+        usable / 1e9, d_constant / 1e9, target / 1e9,
+        naux, n_fused, best,
+    )
+    return best, usable
+
+
+def resolve_vvvv_panel_block_sizes(nocc, nvir, *,
+                                   p_block_size=None,
+                                   r_block_size=None,
+                                   gpu_max_memory_mb=None,
+                                   include_eris=False,
+                                   include_accumulators=False,
+                                   naux=None,
+                                   n_fused=None):
+    """Resolve one square VVVV panel size from overrides or a VRAM estimate."""
+    auto_blk, _ = estimate_vvvv_panel_blksize(
+        nocc, nvir,
+        gpu_max_memory_mb=gpu_max_memory_mb,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+        naux=naux,
+        n_fused=n_fused,
+    )
+    if p_block_size is not None and r_block_size is not None and int(p_block_size) != int(r_block_size):
+        raise ValueError(
+            "Balanced VVVV tiling requires vvvv_p_block_size == vvvv_r_block_size. "
+            "Set only one override or use the same value for both."
+        )
+
+    panel_blk = p_block_size or r_block_size or auto_blk
+    panel_blk = max(1, min(int(panel_blk), nvir))
+    logger.debug(
+        "Resolved square VVVV panel block: panel_blk=%d (auto=%d)",
+        panel_blk, auto_blk,
+    )
+    return panel_blk, panel_blk
+
+
 def adaptive_rank_block_size(Np, Nq, N_fused, *,
                               gpu_max_memory_mb=None,
                               min_block=64, max_block=2048):

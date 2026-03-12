@@ -1,5 +1,6 @@
 """JAX implementation of Transcorrelated method."""
 
+import contextlib
 from typing import Any
 import numpy as np
 import os
@@ -25,6 +26,44 @@ logger = logging.getLogger(__name__)
 # during CCSD iterations.  This eliminates JIT recompilation from
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
+_ISDF_DEVICE_CACHE: dict = {}
+
+
+def _array_nbytes(arr):
+    """Return the byte size of an array-like object without copying."""
+    shape = getattr(arr, "shape", None)
+    dtype = getattr(arr, "dtype", None)
+    if shape is None or dtype is None:
+        arr_np = np.asarray(arr)
+        return int(arr_np.size * arr_np.dtype.itemsize)
+    return int(np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize)
+
+
+def _get_local_device_free_bytes(device):
+    """Return free bytes for one local device when available."""
+    try:
+        stats = device.memory_stats()
+        pool_limit = int(stats["bytes_limit"])
+        in_use = int(stats.get("bytes_in_use", 0))
+        return max(pool_limit - in_use, 0)
+    except Exception:
+        return 1 << 60
+
+
+def _cache_d_on_device(device, arr, *, fraction=0.35):
+    """Whether a persistent device cache should keep ``arr`` resident."""
+    return _array_nbytes(arr) <= int(_get_local_device_free_bytes(device) * fraction)
+
+
+def _pad_leading_axis(arr, target):
+    """Pad the leading axis of an array with zeros up to ``target``."""
+    cur = arr.shape[0]
+    if cur == target:
+        return arr
+    if cur > target:
+        raise ValueError(f"cannot pad axis-0 from {cur} down to {target}")
+    pad_cfg = [(0, target - cur)] + [(0, 0)] * (arr.ndim - 1)
+    return jnp.pad(jnp.asarray(arr), pad_cfg)
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for one device shard."""
@@ -527,6 +566,37 @@ class ISDFTC(TC):
             _FIXED_RBS_CACHE[key] = rbs
         return _FIXED_RBS_CACHE[key]
 
+    def _get_isdf_device_cache(self, kernels=None, device=None, *,
+                               include_grad=False,
+                               include_delta_u=False):
+        """Return persistent ISDF operands resident on one device."""
+        if device is None:
+            return None
+
+        key = (id(self), getattr(device, "id", repr(device)))
+        cache = _ISDF_DEVICE_CACHE.get(key)
+        if cache is None:
+            cache = {
+                "phi_isdf": jax.device_put(np.asarray(self.phi_isdf), device),
+            }
+            _ISDF_DEVICE_CACHE[key] = cache
+
+        if include_grad and "grad_phi_isdf" not in cache:
+            cache["grad_phi_isdf"] = jax.device_put(np.asarray(self.grad_phi_isdf), device)
+
+        if include_delta_u and kernels is not None and "D" in kernels and "D" not in cache:
+            if _cache_d_on_device(device, kernels["D"]):
+                logger.debug(
+                    "Caching Delta U D kernel on device %s (%.2f GiB)",
+                    getattr(device, "id", "host"),
+                    _array_nbytes(kernels["D"]) / (1024.0 ** 3),
+                )
+                cache["D"] = jax.device_put(np.asarray(kernels["D"]), device)
+            else:
+                cache["D"] = None
+
+        return cache
+
     @classmethod
     def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
         """Initialize ISDFTC object from TC object.
@@ -966,7 +1036,7 @@ class ISDFTC(TC):
         return self.replace(isdf_kernels=kernels, save_path=out_path)
 
     def _accumulate_transpose_block(self, result_np, U1, U3, ranges_T,
-                                    scale, n_sub=2):
+                                    scale, n_sub=2, device=None):
         """Compute transpose block in sub-chunks on GPU, accumulate on host.
 
         Each sub-chunk is computed on GPU, transferred to host via np.asarray(),
@@ -994,31 +1064,128 @@ class ISDFTC(TC):
 
         # Determine chunk boundaries
         chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+        cache_getter = getattr(self, "_get_isdf_device_cache", None)
+        cache = (
+            cache_getter(device=device, include_grad=True)
+            if callable(cache_getter) else None
+        )
+        phi_full = cache["phi_isdf"] if cache is not None else self.phi_isdf
+        grad_full = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
+        u1 = jax.device_put(U1, device) if device is not None else U1
+        u3 = jax.device_put(U3, device) if device is not None else U3
+        device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
         for i0 in range(0, r_len, chunk_size):
             i1 = min(i0 + chunk_size, r_len)
             sub_slice_r = slice(r_start + i0, r_start + i1)
             sub_ranges = (sub_slice_r, slice_s_T, slice_p_T, slice_q_T)
 
             # K1-K2 sub-chunk on GPU
-            if sub_slice_r == slice_s_T:
-                tmp = kmat_jax.contract_K1_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges,
-                    rank_block_size=rbs)
-                tmp = tmp - tmp.transpose(1, 0, 2, 3)
-            else:
-                tmp = kmat_jax.contract_K1_minus_K2_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges,
-                    rank_block_size=rbs)
+            with device_ctx:
+                if sub_slice_r == slice_s_T:
+                    tmp = kmat_jax.contract_K1_isdf(
+                        phi_full, grad_full, u1, sub_ranges, rank_block_size=rbs)
+                    tmp = tmp - tmp.transpose(1, 0, 2, 3)
+                else:
+                    tmp = kmat_jax.contract_K1_minus_K2_isdf(
+                        phi_full, grad_full, u1, sub_ranges, rank_block_size=rbs)
 
-            # K3 sub-chunk on GPU
-            tmp = tmp + kmat_jax.contract_K3_isdf(
-                self.phi_isdf, U3, sub_ranges, rank_block_size=rbs)
+                # K3 sub-chunk on GPU
+                tmp = tmp + kmat_jax.contract_K3_isdf(
+                    phi_full, u3, sub_ranges, rank_block_size=rbs)
 
             # Transfer to host and accumulate — frees GPU memory for next chunk
             chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
             del tmp
             result_np[:, :, i0:i1, :] += chunk_np * scale
             del chunk_np
+
+    def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None):
+        """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
+        U1 = kernels['K1_kernel']
+        U3 = kernels['K3_kernel']
+        slice_p, slice_q, slice_r, slice_s = ranges
+
+        rbs = self._get_fixed_rank_block_size()
+        u1 = jax.device_put(U1, device) if device is not None else U1
+        u3 = jax.device_put(U3, device) if device is not None else U3
+        device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
+
+        cache_getter = getattr(self, "_get_isdf_device_cache", None)
+        cache = (
+            cache_getter(device=device, include_grad=True)
+            if callable(cache_getter) else None
+        )
+        phi_src = cache["phi_isdf"] if cache is not None else self.phi_isdf
+        grad_src = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
+
+        phi_p = phi_src[slice_p]
+        phi_q = phi_src[slice_q]
+        phi_r = phi_src[slice_r]
+        phi_s = phi_src[slice_s]
+        grad_phi_p = grad_src[slice_p]
+        grad_phi_q = grad_src[slice_q]
+
+        if panel_size is not None:
+            phi_p = _pad_leading_axis(phi_p, panel_size)
+            phi_r = _pad_leading_axis(phi_r, panel_size)
+            grad_phi_p = _pad_leading_axis(grad_phi_p, panel_size)
+        else:
+            phi_p = jnp.asarray(phi_p)
+            phi_r = jnp.asarray(phi_r)
+            grad_phi_p = jnp.asarray(grad_phi_p)
+
+        phi_q = jnp.asarray(phi_q)
+        phi_s = jnp.asarray(phi_s)
+        grad_phi_q = jnp.asarray(grad_phi_q)
+        if device is not None and cache is None:
+            phi_p = jax.device_put(phi_p, device)
+            phi_q = jax.device_put(phi_q, device)
+            phi_r = jax.device_put(phi_r, device)
+            phi_s = jax.device_put(phi_s, device)
+            grad_phi_p = jax.device_put(grad_phi_p, device)
+            grad_phi_q = jax.device_put(grad_phi_q, device)
+
+        with device_ctx:
+            if slice_p == slice_q:
+                k12 = kmat_jax.contract_K1_isdf_jit(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, u1, rbs)
+                k12 = k12 - k12.transpose(1, 0, 2, 3)
+            else:
+                k12 = kmat_jax.contract_K1_minus_K2_isdf_jit(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs)
+
+            result_np = np.array(k12)
+            del k12
+            k3 = kmat_jax.contract_K3_isdf_jit(
+                phi_p, phi_q, phi_r, phi_s, u3, rbs)
+            result_np += np.asarray(k3)
+            del k3
+            result_np *= 0.5
+            return jnp.asarray(result_np)
+
+    def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None):
+        """Assemble and symmetrize one finished TC tile."""
+        direct = self._get_tc_direct_tile(
+            kernels, ranges, device=device, panel_size=panel_size)
+        result_np = np.array(direct)
+        del direct
+
+        slice_p, slice_q, slice_r, slice_s = ranges
+        if slice_p == slice_r and slice_q == slice_s:
+            result_np += result_np.transpose(2, 3, 0, 1)
+        else:
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            if panel_size is not None:
+                tmp = self._get_tc_direct_tile(
+                    kernels, ranges_T, device=device, panel_size=panel_size)
+                result_np += np.asarray(tmp.transpose(2, 3, 0, 1))
+                del tmp
+            else:
+                self._accumulate_transpose_block(
+                    result_np, kernels['K1_kernel'], kernels['K3_kernel'],
+                    ranges_T, scale=0.5, n_sub=2, device=device)
+
+        return jnp.asarray(-result_np)
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support.
@@ -1038,51 +1205,11 @@ class ISDFTC(TC):
             kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
         else:
             kernels = self.isdf_kernels
-            
-        U1 = kernels['K1_kernel']
-        U3 = kernels['K3_kernel']
-        
-        slice_p, slice_q, slice_r, slice_s = ranges if ranges else (slice(None), slice(None), slice(None), slice(None))
 
-        # Use a fixed rank_block_size for all kmat calls to avoid
-        # JIT recompilation when (Np, Nq) changes across CCSD phases.
-        rbs = self._get_fixed_rank_block_size()
-        
-        # --- Direct block: (K1 - K2 + K3)[pqrs] * 0.5 ---
-        # Compute K1-K2, transfer to host, then K3, transfer to host.
-        # Never hold two output-sized tensors on GPU simultaneously.
-        if slice_p == slice_q:
-            k12 = kmat_jax.contract_K1_isdf(
-                self.phi_isdf, self.grad_phi_isdf, U1, ranges,
-                rank_block_size=rbs)
-            k12 = k12 - k12.transpose(1, 0, 2, 3)
-        else:
-            k12 = kmat_jax.contract_K1_minus_K2_isdf(
-                self.phi_isdf, self.grad_phi_isdf, U1, ranges,
-                rank_block_size=rbs)
-        
-        result_np = np.array(k12)  # writable host copy
-        del k12
-
-        k3 = kmat_jax.contract_K3_isdf(
-            self.phi_isdf, U3, ranges, rank_block_size=rbs)
-        result_np += np.asarray(k3)
-        del k3
-        result_np *= 0.5
-        
-        # --- Transpose block: (K1 - K2 + K3)[rspq] * 0.5, transposed to (pqrs) ---
-        if slice_p == slice_r and slice_q == slice_s:
-            result_np += result_np.transpose(2, 3, 0, 1)
-        else:
-            ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            # Sub-chunk the transpose block on GPU, accumulate on host.
-            # GPU only holds one sub-chunk at a time.
-            self._accumulate_transpose_block(
-                result_np, U1, U3, ranges_T, scale=0.5, n_sub=2)
-        
+        result = self._assemble_tc_tile(kernels, ranges)
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
-        return jnp.asarray(-result_np)
+        return result
 
     def get_3b_fock(self, jastrow_params, dm1, L_aux=None):
         """Get 3-body Fock matrix correction using ISDF.
