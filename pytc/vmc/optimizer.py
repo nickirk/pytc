@@ -45,6 +45,65 @@ class NewtonOptimizer:
         from .sharding import get_vmap_fn
         return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size)
 
+    def _get_unbatched_vmap(self):
+        """Return a per-batch vmap without nested folx batching."""
+        from .sharding import get_vmap_fn
+        return get_vmap_fn(max_vmap_batch_size=0)
+
+    def _get_effective_batch_size(self, n_walkers: int) -> int:
+        """Return a batch size compatible with the current execution mode."""
+        if self.max_vmap_batch_size <= 0:
+            return n_walkers
+
+        batch_size = min(self.max_vmap_batch_size, n_walkers)
+
+        from .sharding import is_multi_gpu, n_devices
+        if is_multi_gpu():
+            ndev = n_devices()
+            if batch_size % ndev != 0:
+                batch_size = max(ndev, (batch_size // ndev) * ndev)
+            batch_size = min(batch_size, n_walkers)
+
+        return batch_size
+
+    @staticmethod
+    def _slice_walkers(walkers, start: int, stop: int):
+        """Slice a walker pytree along the walker dimension."""
+        return jax.tree_util.tree_map(lambda x: x[start:stop], walkers)
+
+    @staticmethod
+    def _pad_walkers_to_batch_multiple(walkers, batch_size: int):
+        """Pad walkers along axis 0 so they reshape cleanly into batches."""
+        n_walkers = walkers.shape[0]
+        n_batches = (n_walkers + batch_size - 1) // batch_size
+        padded_n = n_batches * batch_size
+        pad_count = padded_n - n_walkers
+        if pad_count == 0:
+            mask = jnp.ones((padded_n,), dtype=bool)
+            return walkers, mask, n_batches
+
+        padded_walkers = jax.tree_util.tree_map(
+            lambda x: jnp.concatenate(
+                [x, jnp.repeat(x[:1], pad_count, axis=0)],
+                axis=0,
+            ),
+            walkers,
+        )
+        mask = jnp.concatenate(
+            [jnp.ones((n_walkers,), dtype=bool), jnp.zeros((pad_count,), dtype=bool)],
+            axis=0,
+        )
+        return padded_walkers, mask, n_batches
+
+    @staticmethod
+    def _flatten_jacobian(jacobian, n_walkers: int):
+        """Flatten a per-walker Jacobian pytree to an ``(N, P)`` matrix."""
+        jac_flat, _ = jax.tree_util.tree_flatten(jacobian)
+        return jnp.concatenate(
+            [jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat],
+            axis=1,
+        )
+
     def init(self, params, rng, batch):
         return 0  # step count
 
@@ -95,6 +154,9 @@ class NewtonOptimizer:
                 def single_local_energy_and_grad(w, p):
                     """Compute both E_L(w) and grad_p E_L(w) in one pass."""
                     return jax.value_and_grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
+
+                def single_local_energy(w, p):
+                    return ansatz.local_energy(w, p)[0]
                 
                 n_walkers_total = walkers.shape[0]
                 
@@ -117,46 +179,156 @@ class NewtonOptimizer:
                 else:
                     sample_size = n_walkers_total
                     sub_walkers = walkers
-                
-                # Compute energies and Jacobian for (sub-sampled) walkers
-                vmap_fn = self._get_vmap()
-                energies, jac = vmap_fn(
-                    single_local_energy_and_grad, 
-                    in_axes=(0, None)
-                )(sub_walkers, params)
-                
+
                 n_walkers = sample_size
-                
-                # Clip energies to suppress outliers.  The gradient is
-                # 2/(M-1) * J^T @ (E - mean(E)), so clipping energies
-                # naturally limits the influence of extreme walkers.
-                if self.clip_multiplier > 0:
-                    e_mean_raw = jnp.mean(energies)
-                    e_std_raw = jnp.mean(jnp.abs(energies - e_mean_raw))
-                    energies = jnp.clip(
-                        energies,
-                        e_mean_raw - self.clip_multiplier * e_std_raw,
-                        e_mean_raw + self.clip_multiplier * e_std_raw,
+
+                if self.max_vmap_batch_size > 0:
+                    batch_vmap_fn = self._get_unbatched_vmap()
+                    batch_size = self._get_effective_batch_size(n_walkers)
+                    padded_walkers, padded_mask, n_batches = self._pad_walkers_to_batch_multiple(
+                        sub_walkers,
+                        batch_size,
                     )
-                
-                # Flatten Jacobian params structure to (M, P_total) matrix
-                jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
-                jac_mat = jnp.concatenate([jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat], axis=1)
-                
-                # Compute variance loss and auxiliary data analytically from energies
-                e_mean = jnp.mean(energies)
-                e_std = jnp.std(energies)
-                energy_diff = energies - e_mean
-                loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
-                aux_data = (e_mean, e_std)
-                
-                # Compute variance gradient analytically: 
-                # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
-                grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
-                
-                # Center the Jacobian for curvature matrix
-                jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
-                curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
+                    batched_walkers = jax.tree_util.tree_map(
+                        lambda x: x.reshape((n_batches, batch_size) + x.shape[1:]),
+                        padded_walkers,
+                    )
+                    batched_mask = padded_mask.reshape((n_batches, batch_size))
+                    params_vec, _ = jax.flatten_util.ravel_pytree(params)
+                    param_dtype = params_vec.dtype
+
+                    def masked_energy_batch(batch_walkers, batch_mask):
+                        energies_batch = batch_vmap_fn(
+                            single_local_energy,
+                            in_axes=(0, None),
+                        )(batch_walkers, params)
+                        return jnp.where(batch_mask, energies_batch, 0.0)
+
+                    def masked_energy_jacobian_batch(batch_walkers, batch_mask, clip_lo, clip_hi):
+                        energies_batch, jac_batch = batch_vmap_fn(
+                            single_local_energy_and_grad,
+                            in_axes=(0, None),
+                        )(batch_walkers, params)
+                        energies_batch = jnp.where(batch_mask, energies_batch, 0.0)
+                        if clip_lo is not None and clip_hi is not None:
+                            clipped = jnp.clip(energies_batch, clip_lo, clip_hi)
+                            energies_batch = jnp.where(batch_mask, clipped, 0.0)
+                        jac_mat_batch = self._flatten_jacobian(jac_batch, batch_size)
+                        jac_mat_batch = jnp.where(batch_mask[:, None], jac_mat_batch, 0.0)
+                        return energies_batch, jac_mat_batch
+
+                    clip_lo = None
+                    clip_hi = None
+                    if self.clip_multiplier > 0:
+                        def mean_scan_body(carry, xs):
+                            batch_walkers, batch_mask = xs
+                            energies_batch = masked_energy_batch(batch_walkers, batch_mask)
+                            return carry + jnp.sum(energies_batch), None
+
+                        sum_e_raw, _ = jax.lax.scan(
+                            mean_scan_body,
+                            jnp.array(0.0, dtype=param_dtype),
+                            (batched_walkers, batched_mask),
+                        )
+
+                        e_mean_raw = sum_e_raw / n_walkers
+                        def mad_scan_body(carry, xs):
+                            batch_walkers, batch_mask = xs
+                            energies_batch = masked_energy_batch(batch_walkers, batch_mask)
+                            mad_terms = jnp.where(
+                                batch_mask,
+                                jnp.abs(energies_batch - e_mean_raw),
+                                0.0,
+                            )
+                            return carry + jnp.sum(mad_terms), None
+
+                        mad_sum, _ = jax.lax.scan(
+                            mad_scan_body,
+                            jnp.array(0.0, dtype=param_dtype),
+                            (batched_walkers, batched_mask),
+                        )
+
+                        e_std_raw = mad_sum / n_walkers
+                        clip_lo = e_mean_raw - self.clip_multiplier * e_std_raw
+                        clip_hi = e_mean_raw + self.clip_multiplier * e_std_raw
+
+                    init_carry = (
+                        jnp.array(0.0, dtype=param_dtype),
+                        jnp.array(0.0, dtype=param_dtype),
+                        jnp.zeros_like(params_vec),
+                        jnp.zeros_like(params_vec),
+                        jnp.zeros((params_vec.shape[0], params_vec.shape[0]), dtype=param_dtype),
+                    )
+
+                    def stats_scan_body(carry, xs):
+                        sum_e, sum_e2, sum_j, sum_jte, sum_jtj = carry
+                        batch_walkers, batch_mask = xs
+                        energies_batch, jac_mat_batch = masked_energy_jacobian_batch(
+                            batch_walkers,
+                            batch_mask,
+                            clip_lo,
+                            clip_hi,
+                        )
+                        sum_e = sum_e + jnp.sum(energies_batch)
+                        sum_e2 = sum_e2 + jnp.sum(energies_batch**2)
+                        sum_j = sum_j + jnp.sum(jac_mat_batch, axis=0)
+                        sum_jte = sum_jte + jac_mat_batch.T @ energies_batch
+                        sum_jtj = sum_jtj + jac_mat_batch.T @ jac_mat_batch
+                        return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), None
+
+                    (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), _ = jax.lax.scan(
+                        stats_scan_body,
+                        init_carry,
+                        (batched_walkers, batched_mask),
+                    )
+
+                    e_mean = sum_e / n_walkers
+                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_walkers - e_mean**2, 0.0))
+                    mean_j = sum_j / n_walkers
+                    loss = (sum_e2 - n_walkers * e_mean**2) / (n_walkers - 1)
+                    aux_data = (e_mean, e_std)
+                    grads_vec = (2.0 / (n_walkers - 1)) * (
+                        sum_jte - n_walkers * mean_j * e_mean
+                    )
+                    curvature_mat = (2.0 / n_walkers) * (
+                        sum_jtj - n_walkers * jnp.outer(mean_j, mean_j)
+                    )
+                else:
+                    # Compute energies and Jacobian for (sub-sampled) walkers
+                    vmap_fn = self._get_vmap()
+                    energies, jac = vmap_fn(
+                        single_local_energy_and_grad,
+                        in_axes=(0, None)
+                    )(sub_walkers, params)
+
+                    # Clip energies to suppress outliers.  The gradient is
+                    # 2/(M-1) * J^T @ (E - mean(E)), so clipping energies
+                    # naturally limits the influence of extreme walkers.
+                    if self.clip_multiplier > 0:
+                        e_mean_raw = jnp.mean(energies)
+                        e_std_raw = jnp.mean(jnp.abs(energies - e_mean_raw))
+                        energies = jnp.clip(
+                            energies,
+                            e_mean_raw - self.clip_multiplier * e_std_raw,
+                            e_mean_raw + self.clip_multiplier * e_std_raw,
+                        )
+
+                    jac_mat = self._flatten_jacobian(jac, n_walkers)
+
+                    # Compute variance loss and auxiliary data analytically from energies
+                    e_mean = jnp.mean(energies)
+                    e_std = jnp.std(energies)
+                    energy_diff = energies - e_mean
+                    loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
+                    aux_data = (e_mean, e_std)
+
+                    # Compute variance gradient analytically:
+                    # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
+                    grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
+
+                    # Center the Jacobian for curvature matrix
+                    jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
+                    curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
             
             else:
                 raise ValueError(f"Unknown curvature type: {self.curvature_type}")
