@@ -41,6 +41,7 @@ from .walker import initialize_walkers
 from .sampling import burn_in, burn_in_with_importance
 from .optimizer import create_optimizer, create_gradient_mask
 from .loss import make_energy_loss, make_variance_loss
+from .mcmc_utils import save_optimization_history
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,10 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
                 ansatz, params, walkers, opt_state, subkey
             )
         
+        # Try to get learning rate from opt_update_step's auxiliary output if possible
+        # but for Optax it's cleaner to just return it from here if we want to log it.
+        # However, optax.scale_by_learning_rate usually handles it within opt_state.
+        
         return walkers, params, opt_state, loss, aux_data, pmove
     
     return jax.jit(training_step)
@@ -277,7 +282,8 @@ def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_op
             loss = stats['loss']
             aux_data = stats['aux']
         
-        return walkers, params, opt_state, loss, aux_data, pmove
+        lr = stats.get('lr', None)
+        return walkers, params, opt_state, loss, aux_data, pmove, lr
     
     return training_step
 
@@ -309,6 +315,8 @@ def optimize(
     use_custom_jvp: bool = True,
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
+    save_frequency: int = 100,
+    save_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Perform wavefunction optimization using MCMC sampling.
     
@@ -483,13 +491,14 @@ def optimize(
         key, subkey = random.split(key)
         
         if optimizer_type.lower() in ["newton"]:
-            walkers, params, opt_state, loss, aux_data, pmove = training_step(
+            walkers, params, opt_state, loss, aux_data, pmove, current_lr = training_step(
                 ansatz, walkers, params, opt_state, subkey, opt_step
             )
         else:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
                 ansatz, walkers, params, opt_state, subkey
             )
+            current_lr = None # Optax handles internally, could extract from opt_state if needed
         
         # Materialize values
         cost_val = float(jax.device_get(loss))
@@ -545,12 +554,26 @@ def optimize(
         # Print progress
         log_frequency = 1  # Log ~100 times
         if opt_step % log_frequency == 0 or opt_step == n_opt_steps - 1:
+            lr_str = f" | LR: {current_lr:.4f}" if current_lr is not None else ""
             elapsed = time.time() - start_time
             step_size_str = f" | StepSize: {step_size:.4f}" if adaptive_step_size else ""
             logger.info(f"Step {opt_step:5d} | Cost: {cost_val:.6f} | "
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
-                  f"Accept: {pmove_val:.3f}{step_size_str} | Time: {elapsed:.2f}s")
+                  f"Accept: {pmove_val:.3f}{step_size_str}{lr_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
+
+        # Periodic save to disk
+        if save_path and (opt_step + 1) % save_frequency == 0:
+            current_history = {
+                "cost": np.array(losses),
+                "energies": np.array(energies),
+                "stds": np.array(stds),
+                "acceptance": np.array(acceptances),
+                "params": params_history,
+                "step_sizes": np.array(step_sizes) if adaptive_step_size else None
+            }
+            save_optimization_history(current_history, save_path)
+            logger.info(f"Saved intermediate optimization history to {save_path}")
     
     logger.info("Optimization complete!")
     if adaptive_step_size:
@@ -586,6 +609,8 @@ def optimize_ref_var(
     adaptive_step_size: bool = True,
     step_size_adjust_interval: int = 10,
     jacobian_sample_size: Optional[int] = None,
+    save_frequency: int = 100,
+    save_path: Optional[str] = None,
     n_mcmc_per_opt: Optional[int] = None,
     n_opt_per_mcmc: Optional[int] = None,
 ):
@@ -769,13 +794,14 @@ def optimize_ref_var(
     
     key, subkey = random.split(key)
     if optimizer_type.lower() in ["newton"]:
-        walkers, params, opt_state, loss, aux_data, pmove = training_step(
+        walkers, params, opt_state, loss, aux_data, pmove, current_lr = training_step(
             ansatz, walkers, params, opt_state, subkey, 0
         )
     else:
         walkers, params, opt_state, loss, aux_data, pmove = training_step(
             ansatz, walkers, params, opt_state, subkey
         )
+        current_lr = None
     compilation_end = time.time()
     logger.info(f"Compilation + First Step finished in {compilation_end - compilation_start:.2f}s")
     
@@ -797,21 +823,23 @@ def optimize_ref_var(
     )
     params_history.append(params_copy)
     
+    lr_str = f" | LR: {current_lr:.4f}" if current_lr is not None else ""
     logger.info(f"Step     0 | Var: {variance_val:.6f} | "
           f"E: {energy_val:.6f}±{std_val:.6f} | "
-          f"Accept: {pmove_val:.3f} | Time: {compilation_end - start_time:.2f}s")
+          f"Accept: {pmove_val:.3f}{lr_str} | Time: {compilation_end - start_time:.2f}s")
 
     for opt_step in range(1, n_opt_steps):
         key, subkey = random.split(key)
         
         if optimizer_type.lower() in ["newton"]:
-            walkers, params, opt_state, loss, aux_data, pmove = training_step(
+            walkers, params, opt_state, loss, aux_data, pmove, current_lr = training_step(
                 ansatz, walkers, params, opt_state, subkey, opt_step
             )
         else:
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
                 ansatz, walkers, params, opt_state, subkey
             )
+            current_lr = None
         
         variance_val = float(jax.device_get(loss))
         energy_val, std_val = jax.device_get(aux_data)
@@ -836,11 +864,24 @@ def optimize_ref_var(
             params_history.append(params_copy)
             
             # Print progress
+            lr_str = f" | LR: {current_lr:.4f}" if current_lr is not None else ""
             elapsed = time.time() - start_time
             logger.info(f"Step {opt_step:5d} | Var: {variance_val:.6f} | "
                   f"E: {energy_val:.6f}±{std_val:.6f} | "
-                  f"Accept: {pmove_val:.3f} | Time: {elapsed:.2f}s")
+                  f"Accept: {pmove_val:.3f}{lr_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
+
+        # Periodic save to disk
+        if save_path and (opt_step + 1) % save_frequency == 0:
+            current_history = {
+                "cost": np.array(losses),
+                "energies": np.array(energies),
+                "stds": np.array(stds),
+                "acceptance": np.array(acceptances),
+                "params": params_history
+            }
+            save_optimization_history(current_history, save_path)
+            logger.info(f"Saved intermediate optimization history to {save_path}")
     
     logger.info("Optimization complete!")
     

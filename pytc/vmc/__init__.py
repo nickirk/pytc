@@ -11,6 +11,7 @@ from .mcmc_utils import (
     init_electron_configs
 )
 from .optimizer import create_optimizer, create_gradient_mask
+from .blocking import block_analysis, analyze_optimization_history
 from .sharding import (
     create_mesh, shard_walker, replicate,
     pad_n_walkers, pad_walker,
@@ -32,6 +33,7 @@ __all__ = [
     # Utility functions
     'prepare_sampling_results', 'report_progress', 'create_optimizer',
     'init_electron_configs', 'create_gradient_mask',
+    'block_analysis', 'analyze_optimization_history',
     # Sharding utilities
     'create_mesh', 'shard_walker', 'replicate',
     'pad_n_walkers', 'pad_walker',
