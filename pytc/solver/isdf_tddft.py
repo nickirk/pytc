@@ -165,6 +165,71 @@ def compute_J_munu_lr(xi_phi, weights, coords, omega):
     print(f"Building J_munu_lr took: {t1 - t0:.2f} s")
     return J_munu_lr
 
+def compute_J_munu_numpy(xi_phi, weights, coords):
+    """NumPy equivalent for exact J_{mu, nu}."""
+    print("\nBuilding ISDF kernel J_{mu, nu} [NUMPY]...")
+    t0 = time.time()
+    
+    w_xi = xi_phi * weights[None, :]
+    n_fused, n_grid = w_xi.shape
+    
+    J_munu = np.zeros((n_fused, n_fused))
+    
+    batch_size = 500
+    for i in range(0, n_grid, batch_size):
+        end_i = min(i + batch_size, n_grid)
+        r_i = coords[i:end_i]
+        w_xi_i = w_xi[:, i:end_i]
+        
+        diff = r_i[:, None, :] - coords[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+        
+        inv_dist = 1.0 / np.where(dist < 1e-10, 1e10, dist)
+        
+        v_j = inv_dist @ w_xi.T
+        J_munu_batch = w_xi_i @ v_j
+        
+        J_munu += J_munu_batch
+
+    t1 = time.time()
+    print(f"Building J_munu [NUMPY] took: {t1 - t0:.2f} s")
+    return J_munu
+
+def compute_J_munu_lr_numpy(xi_phi, weights, coords, omega):
+    """NumPy equivalent for exact J_{mu, nu}^{lr}."""
+    print(f"\nBuilding ISDF range-separated kernel J_{{mu, nu}}^{{lr}} [NUMPY] with omega={omega}...")
+    t0 = time.time()
+    
+    import scipy.special
+    
+    w_xi = xi_phi * weights[None, :]
+    n_fused, n_grid = w_xi.shape
+    
+    J_munu_lr = np.zeros((n_fused, n_fused))
+    
+    batch_size = 500
+    for i in range(0, n_grid, batch_size):
+        end_i = min(i + batch_size, n_grid)
+        r_i = coords[i:end_i]
+        w_xi_i = w_xi[:, i:end_i]
+        
+        diff = r_i[:, None, :] - coords[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+        
+        safe_dist = np.where(dist < 1e-10, 1e10, dist)
+        kernel_val = scipy.special.erf(omega * dist) / safe_dist
+        
+        kernel_val = np.where(dist < 1e-10, 2.0 * omega / np.sqrt(np.pi), kernel_val)
+        
+        v_j = kernel_val @ w_xi.T
+        J_munu_batch = w_xi_i @ v_j
+        
+        J_munu_lr += J_munu_batch
+
+    t1 = time.time()
+    print(f"Building J_munu_lr range separated [NUMPY] took: {t1 - t0:.2f} s")
+    return J_munu_lr
+
 def compute_dynamic_alphas(pivots, gammas=[0.25, 0.5]):
     """
     Determines optimal Gaussian exponents based on local pivot density.
@@ -1588,29 +1653,30 @@ def _tddft_contraction(multi, nocc, mo_energy, C_o, C_v, J, tri_vec, TDA=False, 
 
 def compute_ISDF_J_kernels_DF_streaming(
     h5_path, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12,
-    batch_size=4096
+    batch_size=4096, backend='jax'
 ):
     """
-    Streaming + JAX/GPU-accelerated version of compute_ISDF_J_kernels_DF.
+    Streaming version of compute_ISDF_J_kernels_DF.
 
-    Reads xi_phi from `h5_path` in grid batches, immediately moves each
-    batch to the JAX default device (GPU if available, else CPU), and
-    accumulates S_PQ and V_Pmu entirely on-device.  The final SVD and
-    contraction J = d^T J_PQ d are also performed in JAX.
+    Reads xi_phi from `h5_path` in grid batches and accumulates S_PQ and
+    V_Pmu.  When backend='jax' (default) each batch is pushed to the JAX
+    default device (GPU if available).  When backend='numpy' everything
+    runs on CPU with pure NumPy — no JAX required.
 
-    args:
-        h5_path  : str  — path to HDF5 file containing dataset 'xi_phi'  (naux, ngrid)
-        weights  : (ngrid,) integration weights
-        coords   : (ngrid, 3) grid coordinates
-        pivots   : (naux, 3) ISDF pivot coordinates
+    Args:
+        h5_path   : str  — HDF5 file with dataset 'xi_phi'  (naux, ngrid)
+        weights   : (ngrid,) integration weights
+        coords    : (ngrid, 3) grid coordinates
+        pivots    : (naux, 3) ISDF pivot coordinates
         gammas, omega, rcond : same as compute_ISDF_J_kernels_DF
         batch_size : number of grid points processed per batch
+        backend   : 'jax' (default, GPU-accelerated) or 'numpy' (CPU-only)
 
     Returns:
         J_munu : (naux, naux) ndarray  (on CPU)
     """
     label = "Standard Coulomb" if omega == 0 else f"Range-Separated (omega={omega})"
-    print(f"\nBuilding Streaming J-Kernel ({label}) [JAX] with floating basis (gammas={gammas})...")
+    print(f"\nBuilding Streaming J-Kernel ({label}) [{backend.upper()}] with floating basis (gammas={gammas})...")
     t0 = time.time()
 
     # Build auxiliary molecule (CPU / PySCF, done once)
@@ -1620,146 +1686,180 @@ def compute_ISDF_J_kernels_DF_streaming(
         aux_mol.set_range_coulomb(omega)
 
     n_grid   = coords.shape[0]
-    n_aux_df = aux_mol.nao # n_aux_df = naux * len(gammas)
+    n_aux_df = aux_mol.nao  # n_aux_df = naux * len(gammas)
 
     with h5py.File(h5_path, 'r') as f:
         n_fused = f['xi_phi'].shape[0]
 
-        # Accumulators live on the JAX device (GPU if available)
         S_PQ  = np.zeros((n_aux_df, n_aux_df), dtype=np.float64)
         V_Pmu = np.zeros((n_aux_df, n_fused),  dtype=np.float64)
 
         for g_start in range(0, n_grid, batch_size):
             g_end     = min(g_start + batch_size, n_grid)
-            coords_b  = coords[g_start:g_end]                           # (B, 3)  CPU numpy
-            weights_b = weights[g_start:g_end]                          # (B,)    CPU numpy
+            coords_b  = coords[g_start:g_end]            # (B, 3)
+            weights_b = weights[g_start:g_end]           # (B,)
 
-            # aux_eval is a PySCF CPU call — result is numpy
-            aux_b_np  = aux_mol.eval_gto('GTOval', coords_b)            # (B, naux_df)
+            # aux_eval is always a PySCF CPU call
+            aux_b_np = aux_mol.eval_gto('GTOval', coords_b)  # (B, naux_df)
 
-            # Push batch to device
-            aux_b  = jnp.array(aux_b_np)                                # (B, naux_df) GPU
-            xi_b   = jnp.array(f['xi_phi'][:, g_start:g_end])          # (naux, B)    GPU
-            w_b    = jnp.array(weights_b)                               # (B,)         GPU
+            if backend == 'numpy':
+                # Pure NumPy path — no device transfers
+                w_aux_b = (aux_b_np * weights_b[:, None]).T   # (naux_df, B)
+                xi_b_np = np.array(f['xi_phi'][:, g_start:g_end])  # (naux, B)
+                S_PQ  += np.matmul(w_aux_b, aux_b_np)         # (naux_df, naux_df)
+                V_Pmu += np.matmul(w_aux_b, xi_b_np.T)        # (naux_df, naux)
+                del xi_b_np, w_aux_b
+            else:
+                # JAX path — push batch to device (GPU if available)
+                aux_b  = jnp.array(aux_b_np)
+                xi_b   = jnp.array(f['xi_phi'][:, g_start:g_end])
+                w_b    = jnp.array(weights_b)
+                w_aux_b = (aux_b * w_b[:, None]).T             # (naux_df, B)
+                S_PQ  += np.array(jnp.matmul(w_aux_b, aux_b))
+                V_Pmu += np.array(jnp.matmul(w_aux_b, xi_b.T))
+                del aux_b, xi_b, w_b, w_aux_b
 
-            w_aux_b = (aux_b * w_b[:, None]).T                          # (naux_df, B) GPU
-
-            S_PQ   = S_PQ  + np.array(jnp.matmul(w_aux_b, aux_b))                # (naux_df, naux_df)
-            V_Pmu  = V_Pmu + np.array(jnp.matmul(w_aux_b, xi_b.T))             # (naux_df, naux)
-            
-
-    del aux_b, xi_b, w_b, w_aux_b
     gc.collect()
-    jax.clear_caches()
-    
-    # SVD pseudo-inverse of S_PQ on device
-    # U, s, Vh = jnp.linalg.svd(S_PQ, full_matrices=False)
-    # mask  = s > s[0] * rcond
-    # s_inv = jnp.where(mask, 1.0 / jnp.where(mask, s, 1.0), 0.0)
-    # d = jnp.matmul(Vh.T * s_inv, jnp.matmul(U.T, V_Pmu))               # (naux_df, naux)
-    
-    # 1. Solve Symmetric Eigenproblem
-    # S_PQ is (n_df, n_df)
+    if backend == 'jax':
+        jax.clear_caches()
+
+    # 1. Solve symmetric eigenproblem (always NumPy — already on CPU)
     s, U = np.linalg.eigh(S_PQ)
-    
+
     # 2. Sort descending (eigh returns ascending)
     s = s[::-1]
     U = U[:, ::-1]
-    
+
     # 3. Apply rcond mask to find the effective rank (k)
-    k = jnp.sum(s > (s[0] * rcond)) # Number of 'important' dimensions
+    k = int(np.sum(s > (s[0] * rcond)))  # Number of 'important' dimensions
     print(f'k / n_aux_df for eigh(S_PQ): {k} / {n_aux_df}')
     print(f'minimum eigval(S_PQ):', s.min())
-    
-    # 4. projection to df auxiliary space
-    # --- MEMORY SAVING TRUNCATION ---
-    # Slice U and s to only include the 'k' significant components.
 
-    # d = jnp.einsum('ij,lj,la->ia', U[:, :k] * (1.0 / s[:k]), U[:, :k], V_Pmu, precision=jax.lax.Precision.HIGHEST)
+    # 4. Project to DF auxiliary space
     U_s = U[:, :k] * (1.0 / s[:k])
-    d = U[:, :k].T @ V_Pmu  # Result is (k, a)
-    d = U_s @ d             # Result is (N, a)
+    d = U[:, :k].T @ V_Pmu  # (k, naux)
+    d = U_s @ d             # (n_aux_df, naux)
 
-    del S_PQ, V_Pmu, U, U_s  # Include all names used in the function
+    del S_PQ, V_Pmu, U, U_s
     gc.collect()
 
-    # Analytical 2-centre integrals (PySCF CPU → GPU)
-    J_PQ = aux_mol.intor('int2c2e')                          # (naux_df, naux_df)
-    J_munu = d.T @ J_PQ @ d                      # (naux, naux)
+    # Analytical 2-centre integrals (PySCF CPU)
+    J_PQ   = aux_mol.intor('int2c2e')  # (naux_df, naux_df)
+    J_munu = d.T @ J_PQ @ d           # (naux, naux)
 
     print(f"Streaming J-kernel build took: {time.time() - t0:.2f} s")
     return J_munu
 
 
-def compress_isdf_lda_kernel_streaming(h5_path, wfxc_real, batch_size=4096):
+def compress_isdf_lda_kernel_streaming(h5_path, wfxc_real, batch_size=4096, backend='jax'):
     """
-    Streaming + JAX/GPU-accelerated LDA fxc compression.
+    Streaming LDA fxc compression.
 
     Computes  wfxc[mu, nu] = sum_g  xi_phi[mu,g] * wfxc_real[g] * xi_phi[nu,g]
-    by reading xi_phi in batches from HDF5 and accumulating on the JAX device.
+    by reading xi_phi in batches from HDF5.
+    When backend='jax' (default) each batch is pushed to the JAX device.
+    When backend='numpy' everything runs as pure NumPy on CPU.
 
     Args:
         h5_path   : str — HDF5 file with dataset 'xi_phi'  (naux, ngrid)
         wfxc_real : (ngrid,) ndarray of  fxc * weight  on the grid
         batch_size : grid batch size
+        backend   : 'jax' (default) or 'numpy'
 
     Returns:
         wfxc : (naux, naux) ndarray  (on CPU)
     """
-    print("Streaming LDA fxc compression [JAX]...")
+    print(f"Streaming LDA fxc compression [{backend.upper()}]...")
     t0 = time.time()
     with h5py.File(h5_path, 'r') as f:
         n_fused, n_grid = f['xi_phi'].shape
-        wfxc = np.zeros((n_fused, n_fused), dtype=np.float64)        # accumulator on device
+        wfxc = np.zeros((n_fused, n_fused), dtype=np.float64)
 
         for g_start in range(0, n_grid, batch_size):
             g_end = min(g_start + batch_size, n_grid)
-            xi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])           # (naux, B) GPU
-            w_b   = jnp.array(wfxc_real[g_start:g_end])                 # (B,)      GPU
-            wfxc  = wfxc + np.array(jnp.matmul(xi_b * w_b, xi_b.T))              # (naux, naux)
+            if backend == 'numpy':
+                xi_b = np.array(f['xi_phi'][:, g_start:g_end])  # (naux, B)
+                w_b  = np.asarray(wfxc_real[g_start:g_end])     # (B,)
+                wfxc += np.matmul(xi_b * w_b, xi_b.T)           # (naux, naux)
+                del xi_b, w_b
+            else:
+                xi_b = jnp.array(f['xi_phi'][:, g_start:g_end])  # (naux, B) GPU
+                w_b  = jnp.array(wfxc_real[g_start:g_end])       # (B,)      GPU
+                wfxc += np.array(jnp.matmul(xi_b * w_b, xi_b.T)) # (naux, naux)
+                del xi_b, w_b
 
-    print(f"  => wfxc shape {result.shape}, took {time.time()-t0:.2f} s")
-    return result
+    print(f"  => wfxc shape {wfxc.shape}, took {time.time()-t0:.2f} s")
+    return wfxc
 
-def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096):
-    print("Streaming GGA fxc compression [JAX-Optimized]...")
+def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, backend='jax'):
+    """
+    Streaming GGA fxc compression.
+
+    Computes  wfxc[y,x,mu,nu] = sum_g  xi_full[y,mu,g] * wfxc_real[y,x,g] * xi_full[x,nu,g]
+    where xi_full = [xi_phi, xi_grad_x, xi_grad_y, xi_grad_z]  (shape 4, naux, ngrid).
+    When backend='jax' (default) each batch is pushed to the JAX device.
+    When backend='numpy' everything runs as pure NumPy on CPU.
+
+    Args:
+        h5_path   : str — HDF5 file with datasets 'xi_phi' (naux, ngrid) and
+                          'xi_grad' (naux, ngrid, 3)
+        wfxc_real : (4, 4, ngrid) ndarray of fxc (transposed to (y, x, r) convention)
+        batch_size : grid batch size
+        backend   : 'jax' (default) or 'numpy'
+
+    Returns:
+        wfxc_cpu : (4, 4, naux, naux) ndarray  (on CPU)
+    """
+    print(f"Streaming GGA fxc compression [{backend.upper()}]...")
     t0 = time.time()
 
     with h5py.File(h5_path, 'r') as f:
         n_aux, n_grid = f['xi_phi'].shape
-        # Accumulator stays on CPU (NumPy) to save VRAM
         wfxc_cpu = np.zeros((4, 4, n_aux, n_aux), dtype=np.float64)
 
         for g_start in range(0, n_grid, batch_size):
             g_end = min(g_start + batch_size, n_grid)
-            
-            # 1. Load and Fuse Intermediates (4, n_aux, B)
-            xi_phi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])
-            xi_grad_b = jnp.array(f['xi_grad'][:, g_start:g_end, :])
-            
-            # Shape: (4, n_aux, batch)
-            xi_full = jnp.concatenate([
-                xi_phi_b[None, :, :], 
-                xi_grad_b.transpose(2, 0, 1)
-            ], axis=0)
 
-            # 2. Load Weights (4, 4, batch)
-            w_batch = jnp.array(wfxc_real[:, :, g_start:g_end])
+            if backend == 'numpy':
+                # Load intermediates into numpy
+                xi_phi_b  = np.array(f['xi_phi'][:, g_start:g_end])       # (naux, B)
+                xi_grad_b = np.array(f['xi_grad'][:, g_start:g_end, :])   # (naux, B, 3)
 
-            # 3. The "JAX-onic" Core
-            # y, x: component indices (4)
-            # m, n: aux indices (n_aux)
-            # g:    grid index (batch)
-            # We contract over 'g' to get (4, 4, n_aux, n_aux)
-            update = jnp.einsum('ymg, xng, yxg -> yxmn', xi_full, xi_full, w_batch)
-            
-            # 4. Single sync and update per batch
-            update.block_until_ready()
-            wfxc_cpu += np.array(update)
+                # Shape: (4, naux, B)
+                xi_full = np.concatenate([
+                    xi_phi_b[np.newaxis, :, :],
+                    xi_grad_b.transpose(2, 0, 1)
+                ], axis=0)
 
-            # Explicit Cleanup
-            del xi_phi_b, xi_grad_b, xi_full, w_batch, update
-            jax.clear_caches()
+                w_batch = wfxc_real[:, :, g_start:g_end]  # (4, 4, B) — already numpy
+
+                # Vectorized: no loops over y/x.
+                # weighted_xi[y,x,m,g] = xi_full[y,m,g] * w_batch[y,x,g]
+                weighted_xi = xi_full[:, np.newaxis, :, :] * w_batch[:, :, np.newaxis, :]  # (4,4,n_aux,B)
+                # Batched matmul: (4,4,n_aux,B) @ (1,4,B,n_aux) -> (4,4,n_aux,n_aux)
+                # np.matmul broadcasts (4,4) vs (1,4) batch dims correctly.
+                update = weighted_xi @ xi_full.transpose(0, 2, 1)[np.newaxis]  # (4,4,n_aux,n_aux)
+                wfxc_cpu += update
+                del xi_phi_b, xi_grad_b, xi_full, w_batch, weighted_xi, update
+            else:
+                # JAX path
+                xi_phi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])
+                xi_grad_b = jnp.array(f['xi_grad'][:, g_start:g_end, :])
+
+                # Shape: (4, naux, B)
+                xi_full = jnp.concatenate([
+                    xi_phi_b[None, :, :],
+                    xi_grad_b.transpose(2, 0, 1)
+                ], axis=0)
+
+                w_batch = jnp.array(wfxc_real[:, :, g_start:g_end])  # (4, 4, B)
+
+                update = jnp.einsum('ymg, xng, yxg -> yxmn', xi_full, xi_full, w_batch)
+                update.block_until_ready()
+                wfxc_cpu += np.array(update)
+
+                del xi_phi_b, xi_grad_b, xi_full, w_batch, update
+                jax.clear_caches()
 
     print(f"  => wfxc shape {wfxc_cpu.shape}, took {time.time()-t0:.2f} s")
     return wfxc_cpu
@@ -1776,11 +1876,12 @@ class TDDFT(lib.StreamObject):
         isdf_grid_batch_size=2048,
         isdf_grid_level=3,
         isdf_naux_factor=8,
-        isdf_gammas=[0.25, 0.5],
+        isdf_gammas=[0.1, 0.25],
         isdf_stream_path=None,
         isdf_stream_batch_size=4096,
         isdf_exact_J=False,
         isdf_grid_rho_cutoff = 0,
+        isdf_backend = 'jax',
         verbose=5,
         # options
         TDA=False,
@@ -1850,6 +1951,7 @@ class TDDFT(lib.StreamObject):
         self.isdf_stream_batch_size = isdf_stream_batch_size
         self.isdf_exact_J = isdf_exact_J  # if True, use O(Ngrid^2) compute_J_munu directly
         self._isdf_h5_path = None  # internal: set during _build_isdf_intermediates
+        self.isdf_backend = isdf_backend  # 'jax' or 'numpy' for isdf_decompose_outcore
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -1975,12 +2077,16 @@ class TDDFT(lib.StreamObject):
                     f.create_dataset('phi', data=phi)
                     f.create_dataset('grad_phi', data=grad_phi)
                 self.isdf_output_path = stream_h5.replace('.h5', '_out.h5')
+                _gc = np.array(grid_coords) if self.isdf_backend == 'numpy' else jnp.array(grid_coords)
+                _wt = np.array(weights)      if self.isdf_backend == 'numpy' else jnp.array(weights)
                 pivots, phi_piv, grad_phi_piv = isdf_decompose_outcore(
                     stream_h5, self.isdf_output_path, n_rank_phi, n_rank_grad,
-                    jnp.array(grid_coords), jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size, rcond=self.isdf_rcond
-                ) 
+                    _gc, _wt, grid_batch_size=self.isdf_grid_batch_size,
+                    rcond=self.isdf_rcond, backend=self.isdf_backend
+                )
             else:
                 stream_h5 = None  # sentinel: non-streaming
+
                 phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose(
                     jnp.array(phi), jnp.array(grad_phi), n_rank_phi, n_rank_grad,
                     jnp.array(weights), grid_batch_size=self.isdf_grid_batch_size,
@@ -2023,31 +2129,49 @@ class TDDFT(lib.StreamObject):
 
                     # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
                     if self.isdf_exact_J:
-                        raise NotImplementedError
-                        # # Load xi_phi from HDF5 into JAX (naux, ngrid)
-                        # with h5py.File(self.isdf_output_path, 'r') as _f:
-                        #     _xi_phi_jax = jnp.array(_f['xi_phi'][:])
-                        # self.J = np.array(compute_J_munu(
-                        #     _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords)
-                        # ))
-                        # if getattr(self, 'omega', 0.0) > 0:
-                        #     self.J_rsh = np.array(compute_J_munu_lr(
-                        #         _xi_phi_jax, jnp.array(weights), jnp.array(grids.coords),
-                        #         omega=self.omega
-                        #     ))
-                        # else:
-                        #     self.J_rsh = None
-                        # del _xi_phi_jax
+                        import h5py
+                        with h5py.File(self.isdf_output_path, 'r') as _f:
+                            xi_phi_arr = _f['xi_phi'][:]
+                        
+                        if self.isdf_backend == 'jax':
+                            print('Exact J for Streaming ISDF in JAX...')
+                            _xi_jax = jnp.array(xi_phi_arr)
+                            self.J = np.array(compute_J_munu(
+                                _xi_jax, jnp.array(weights), jnp.array(grid_coords)
+                            ))
+                            if getattr(self, 'omega', 0.0) > 0:
+                                self.J_rsh = np.array(compute_J_munu_lr(
+                                    _xi_jax, jnp.array(weights), jnp.array(grid_coords),
+                                    omega=self.omega
+                                ))
+                            else:
+                                self.J_rsh = None
+                            del _xi_jax
+                        else:
+                            print('Exact J for Streaming ISDF in NUMPY...')
+                            self.J = compute_J_munu_numpy(
+                                xi_phi_arr, np.array(weights), np.array(grid_coords)
+                            )
+                            if getattr(self, 'omega', 0.0) > 0:
+                                self.J_rsh = compute_J_munu_lr_numpy(
+                                    xi_phi_arr, np.array(weights), np.array(grid_coords),
+                                    omega=self.omega
+                                )
+                            else:
+                                self.J_rsh = None
+                        del xi_phi_arr
                     else:
                         self.J = compute_ISDF_J_kernels_DF_streaming(
                             self.isdf_output_path, weights, grid_coords, pivot_coords,
-                            gammas=self.isdf_gammas, batch_size=self.isdf_stream_batch_size
+                            gammas=self.isdf_gammas, batch_size=self.isdf_stream_batch_size,
+                            backend=self.isdf_backend
                         )
                         if getattr(self, 'omega', 0.0) > 0:
                             self.J_rsh = compute_ISDF_J_kernels_DF_streaming(
                                 self.isdf_output_path, weights, grid_coords, pivot_coords,
                                 gammas=self.isdf_gammas, omega=self.omega,
-                                batch_size=self.isdf_stream_batch_size
+                                batch_size=self.isdf_stream_batch_size,
+                                backend=self.isdf_backend
                             )
                         else:
                             self.J_rsh = None
@@ -2069,18 +2193,30 @@ class TDDFT(lib.StreamObject):
 
                     # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
                     if self.isdf_exact_J:
-                        _xi_jax = jnp.array(self.xi_phi)
-                        self.J = np.array(compute_J_munu(
-                            _xi_jax, jnp.array(weights), jnp.array(grid_coords)
-                        ))
-                        if getattr(self, 'omega', 0.0) > 0:
-                            self.J_rsh = np.array(compute_J_munu_lr(
-                                _xi_jax, jnp.array(weights), jnp.array(grid_coords),
-                                omega=self.omega
+                        if self.isdf_backend == 'jax':
+                            _xi_jax = jnp.array(self.xi_phi)
+                            self.J = np.array(compute_J_munu(
+                                _xi_jax, jnp.array(weights), jnp.array(grid_coords)
                             ))
+                            if getattr(self, 'omega', 0.0) > 0:
+                                self.J_rsh = np.array(compute_J_munu_lr(
+                                    _xi_jax, jnp.array(weights), jnp.array(grid_coords),
+                                    omega=self.omega
+                                ))
+                            else:
+                                self.J_rsh = None
+                            del _xi_jax
                         else:
-                            self.J_rsh = None
-                        del _xi_jax
+                            self.J = compute_J_munu_numpy(
+                                self.xi_phi, np.array(weights), np.array(grid_coords)
+                            )
+                            if getattr(self, 'omega', 0.0) > 0:
+                                self.J_rsh = compute_J_munu_lr_numpy(
+                                    self.xi_phi, np.array(weights), np.array(grid_coords),
+                                    omega=self.omega
+                                )
+                            else:
+                                self.J_rsh = None
                     else:
                         self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
                             self.xi_phi, weights, grid_coords, pivot_coords, gammas=self.isdf_gammas
@@ -2166,7 +2302,8 @@ class TDDFT(lib.StreamObject):
             if self._isdf_h5_path is not None:
                 # Streaming: read xi_phi from HDF5 in batches
                 self.wfxc = compress_isdf_lda_kernel_streaming(
-                    self.isdf_output_path, wfxc, batch_size=self.isdf_stream_batch_size
+                    self.isdf_output_path, wfxc, batch_size=self.isdf_stream_batch_size,
+                    backend=self.isdf_backend
                 )
                 # HDF5 no longer needed — delete it
                 if os.path.exists(self._isdf_h5_path):
@@ -2210,7 +2347,8 @@ class TDDFT(lib.StreamObject):
             if self._isdf_h5_path is not None:
                 # Streaming: read xi_phi/xi_grad from HDF5 in batches
                 self.wfxc = compress_isdf_gga_kernel_streaming(
-                    self.isdf_output_path, wfxc_yx, batch_size=self.isdf_stream_batch_size
+                    self.isdf_output_path, wfxc_yx, batch_size=self.isdf_stream_batch_size,
+                    backend=self.isdf_backend
                 )
                 # HDF5 no longer needed — delete it
                 if os.path.exists(self._isdf_h5_path):
@@ -2391,7 +2529,7 @@ if __name__ == '__main__':
     print('---values in eV---')
     print('pyscf exci:', pyscf_ref*HARTREE2EV)
 
-    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-7, isdf_rcond = 1e-14, isdf_grid_level = 3, isdf_naux_factor = 6, isdf_gammas = [0.25, 0.5], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False)
+    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-7, isdf_rcond = 1e-14, isdf_grid_level = 2, isdf_naux_factor = 8, isdf_gammas = [0.1, 0.25], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False, isdf_backend = 'numpy', isdf_grid_batch_size = 8192)
     exci_new = np.sort(mytd.kernel(multi = 's')[0])
     
     print('Davidson exci:', exci_new*HARTREE2EV)
