@@ -1876,7 +1876,7 @@ class TDDFT(lib.StreamObject):
         isdf_grid_batch_size=2048,
         isdf_grid_level=3,
         isdf_naux_factor=8,
-        isdf_gammas=[0.1, 0.25],
+        isdf_gammas=[0.1, 0.4],
         isdf_stream_path=None,
         isdf_stream_batch_size=4096,
         isdf_exact_J=False,
