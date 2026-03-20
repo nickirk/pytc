@@ -1881,7 +1881,7 @@ class TDDFT(lib.StreamObject):
         isdf_stream_batch_size=4096,
         isdf_exact_J=False,
         isdf_grid_rho_cutoff = 0,
-        isdf_backend = 'jax',
+        isdf_backend = 'numpy',
         verbose=5,
         # options
         TDA=False,
