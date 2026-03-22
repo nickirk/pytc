@@ -100,6 +100,7 @@ myst_enable_extensions = [
 html_theme = "furo"
 html_title = "pytc"
 html_static_path = ["_static"]
+html_baseurl = "https://nickirk.github.io/pytc/"
 
 html_theme_options = {
     "source_repository": "https://github.com/nickirk/pytc",
