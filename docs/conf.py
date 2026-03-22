@@ -49,6 +49,27 @@ autodoc_default_options = {
     "show-inheritance": True,
 }
 
+# Mock heavy runtime dependencies that are unavailable on Read the Docs.
+# These packages are never actually imported during the docs build; Sphinx
+# creates lightweight stand-ins so that autodoc can still introspect the
+# source code and extract docstrings.
+# Only enable mocking when running on RTD (locally all deps are installed).
+if os.environ.get("READTHEDOCS"):
+    autodoc_mock_imports = [
+        "jax",
+        "jaxlib",
+        "flax",
+        "optax",
+        "folx",
+        "pyscf",
+        "scipy",
+        "numpy",
+        "h5py",
+        "basis_set_exchange",
+        "line_profiler",
+        "psutil",
+    ]
+
 # -- autosummary configuration -----------------------------------------------
 autosummary_generate = True  # Auto-generate stub pages for all discovered modules
 

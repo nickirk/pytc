@@ -44,6 +44,7 @@ docs = [
     "furo",
     "myst-parser",
     "sphinx-copybutton",
+    "sphinx-autodoc-typehints",
 ]
 
 [project.urls]
