@@ -14,14 +14,16 @@ logger = logging.getLogger(__name__)
 
 class NewtonOptimizer:
     """Newton Optimizer (formerly Matrix-Free Optimizer).
-    
+
     Supports:
+
     - Stochastic Reconfiguration (SR) / Natural Gradient for Energy Minimization
       (curvature="fisher")
     - Gauss-Newton for Variance Minimization
       (curvature="gauss_newton")
-      
+
     Solvers:
+
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
@@ -455,14 +457,14 @@ class NewtonOptimizer:
 
 def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
     """Create an optimizer based on specified type and parameters.
-    
+
     Args:
         optimizer_type: "adam", "sgd", "rmsprop", "lion", or "newton"
         learning_rate: Initial learning rate (float) or an optax schedule (callable).
-        opt_kwargs: Additional optimizer parameters. 
-            - For optax optimizers: can include 'decay_rate' and 'transition_steps'
-              to customize the default 1/(1+t) schedule.
-            - For Newton: can include 'min_learning_rate' (default 0.01).
+        opt_kwargs: Additional optimizer parameters.
+            For optax optimizers: can include 'decay_rate' and 'transition_steps'
+            to customize the default 1/(1+t) schedule.
+            For Newton: can include 'min_learning_rate' (default 0.01).
     """
     if opt_kwargs is None:
         opt_kwargs = {}

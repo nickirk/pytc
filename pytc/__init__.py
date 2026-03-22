@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -60,9 +61,10 @@ def setup_logging(level=logging.INFO):
 # Initialize logging when package is imported
 setup_logging()
 
-# Log startup information for reproducibility
-from . import log
-log.log_startup_info()
+# Log startup information for reproducibility (skip during Sphinx autodoc builds)
+if not os.environ.get("SPHINX_AUTODOC_BUILD"):
+    from . import log
+    log.log_startup_info()
 
 # Primary API - JAX autodiff implementations
 from . import tc

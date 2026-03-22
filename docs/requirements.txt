@@ -1,0 +1,10 @@
+# Sphinx toolchain (installed in CI via GitHub Actions)
+sphinx>=7.0
+furo
+myst-parser
+sphinx-copybutton
+sphinx-autodoc-typehints
+
+# Note: the pytc package is NOT pip-installed.  conf.py adds the repo root
+# to sys.path and mocks heavy runtime deps (JAX, PySCF, flax, …) so the
+# docs build works without a GPU stack.

@@ -39,6 +39,13 @@ classifiers = [
 gpu = [
     "jaxlib[cuda]",
 ]
+docs = [
+    "sphinx>=7.0",
+    "furo",
+    "myst-parser",
+    "sphinx-copybutton",
+    "sphinx-autodoc-typehints",
+]
 
 [project.urls]
 Homepage = "https://github.com/nickirk/pytc"
