@@ -13,6 +13,7 @@
 .tchint/
 .venv/
 doc/
+docs/_build/
 *egg-info/
 build/
 tmp*
