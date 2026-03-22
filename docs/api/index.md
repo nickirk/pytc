@@ -1,11 +1,11 @@
 # API Reference
 
-```{toctree}
-:maxdepth: 2
+Full automatically-generated reference for every public module, class, and function in `pytc`.
 
-jastrow
-ansatz
-vmc
-xtc
-solver
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :recursive:
+
+   pytc
 ```

@@ -14,6 +14,7 @@
 .venv/
 doc/
 docs/_build/
+docs/api/generated/
 *egg-info/
 build/
 tmp*
