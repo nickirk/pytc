@@ -1,5 +1,9 @@
 # Read the Docs configuration file
 # See https://docs.readthedocs.io/en/stable/config-file/v2.html
+#
+# NOTE: Read the Docs free tier does not support private repositories.
+# This file is kept for future use when pytc becomes open source.
+# Currently, docs are deployed via GitHub Actions to GitHub Pages.
 
 version: 2
 
