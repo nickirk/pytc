@@ -571,13 +571,14 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
         raise ValueError(f"backend must be 'jax' or 'numpy', got {backend!r}")
 
     use_numpy = (backend == 'numpy')
-
+    
     with h5py.File(input_stream_path, 'r') as f_in:
         h5_phi = f_in['phi']
         h5_grad = f_in['grad_phi']
         n_orb, n_grid = h5_phi.shape
 
         # --- 1. Pivoted Cholesky ---
+        t0 = time.time()
         initial_pivs = np.arange(n_grid)
 
         if use_numpy:
@@ -634,10 +635,11 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
             initial_pivs[np.array(pivots_phi_idx)],
             initial_pivs[np.array(pivots_grad_idx)]
         ]))
-
-        print(f'[{backend}] Passed select_pivots. Final Rank: {len(pivots_final)}')
+        t1 = time.time()
+        print(f'[{backend}] Passed select_pivots. Final Rank: {len(pivots_final)}. Took: {t1-t0:0.2f}')
 
         # --- 3. Extract Pivot Values and Prepare Solvers ---
+        t0 = time.time()
         if use_numpy:
             phi_piv = np.array(h5_phi[:, pivots_final])        # (n_orb, n_fused)
             grad_piv = np.array(h5_grad[:, pivots_final, :])   # (n_orb, n_fused, 3)
@@ -659,8 +661,10 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
                 c_h, l_h = prepare_normal_equations_solver(grad_piv[:, :, c], phi_piv, rcond=rcond)
                 g_chol.append(c_h)
                 g_low.append(l_h)
-
+        t1 = time.time()
+        print(f'[{backend}] Passed prepare_normal_equations_solver. Took: {t1-t0:0.2f}')
         # --- 4. Solve Normal Equations in Batches ---
+        t0 = time.time()
         with h5py.File(output_stream_path, 'w') as f_out:
             xi_p = f_out.create_dataset('xi_phi', (len(pivots_final), n_grid), dtype='f8')
             xi_g = f_out.create_dataset('xi_grad', (len(pivots_final), n_grid, 3), dtype='f8')
@@ -718,8 +722,8 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
                 t1 = time.time()
                 print(f"[{backend}] Normal equations progress: {end}/{n_grid} grid points processed. "
                       f"Batch took: {t1-t0:.2f}s")
-
-    print(f'[{backend}] Passed all!')
+    t1 = time.time()
+    print(f'[{backend}] Passed all! Took: {t1-t0:0.2f}')
     # Return as NumPy to ensure calling scope doesn't accidentally keep JAX pointers alive
     return pivots_final, np.array(phi_piv), np.array(grad_piv)
 
