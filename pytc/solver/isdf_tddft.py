@@ -1882,6 +1882,8 @@ class TDDFT(lib.StreamObject):
         isdf_exact_J=False,
         isdf_grid_rho_cutoff = 0,
         isdf_backend = 'numpy',
+        isdf_cd_sample_factor = None,
+        isdf_cd_seed = 42,
         verbose=5,
         # options
         TDA=False,
@@ -1952,6 +1954,8 @@ class TDDFT(lib.StreamObject):
         self.isdf_exact_J = isdf_exact_J  # if True, use O(Ngrid^2) compute_J_munu directly
         self._isdf_h5_path = None  # internal: set during _build_isdf_intermediates
         self.isdf_backend = isdf_backend  # 'jax' or 'numpy' for isdf_decompose_outcore
+        self.isdf_cd_sample_factor = isdf_cd_sample_factor
+        self.isdf_cd_seed = isdf_cd_seed
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -2066,6 +2070,7 @@ class TDDFT(lib.StreamObject):
             # In streaming mode, xi_phi/xi_grad are written directly to HDF5 and
             # returned as None, so they never occupy RAM beyond isdf_decompose.
             if s == 0 and self.isdf_stream_path is not None:
+                import h5py
                 # Resolve HDF5 path (True → auto temp under /tmp)
                 if self.isdf_stream_path is True:
                     import uuid as _uuid
@@ -2082,7 +2087,9 @@ class TDDFT(lib.StreamObject):
                 pivots, phi_piv, grad_phi_piv = isdf_decompose_outcore(
                     stream_h5, self.isdf_output_path, n_rank_phi, n_rank_grad,
                     _gc, _wt, grid_batch_size=self.isdf_grid_batch_size,
-                    rcond=self.isdf_rcond, backend=self.isdf_backend
+                    rcond=self.isdf_rcond, backend=self.isdf_backend,
+                    cd_sample_factor=self.isdf_cd_sample_factor,
+                    cd_seed=self.isdf_cd_seed
                 )
             else:
                 stream_h5 = None  # sentinel: non-streaming
@@ -2120,6 +2127,7 @@ class TDDFT(lib.StreamObject):
             if s == 0:
                 t0 = time.time()
                 if stream_h5 is not None:
+                    import h5py
                     # --- Streaming mode ---
                     # stream_h5 was resolved and isdf_decompose used is_incore=False,
                     # so xi_phi/xi_grad are None (written to HDF5).
@@ -2129,7 +2137,6 @@ class TDDFT(lib.StreamObject):
 
                     # Build J-kernel: exact O(Ngrid^2) or floating-basis DF
                     if self.isdf_exact_J:
-                        import h5py
                         with h5py.File(self.isdf_output_path, 'r') as _f:
                             xi_phi_arr = _f['xi_phi'][:]
                         
@@ -2529,7 +2536,7 @@ if __name__ == '__main__':
     print('---values in eV---')
     print('pyscf exci:', pyscf_ref*HARTREE2EV)
 
-    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-7, isdf_rcond = 1e-14, isdf_grid_level = 2, isdf_naux_factor = 8, isdf_gammas = [0.1, 0.25], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False, isdf_backend = 'numpy', isdf_grid_batch_size = 8192)
+    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-14, isdf_grid_level = 2, isdf_naux_factor = 8, isdf_gammas = [0.1, 0.4], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False, isdf_backend = 'numpy', isdf_grid_batch_size = 8192, isdf_cd_sample_factor = 100)
     exci_new = np.sort(mytd.kernel(multi = 's')[0])
     
     print('Davidson exci:', exci_new*HARTREE2EV)

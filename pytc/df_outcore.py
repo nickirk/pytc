@@ -352,7 +352,7 @@ def get_max_orbital_importance_numpy(input_stream_path, weights=None, batch_size
     return max_phi, max_grad_norm
 
 
-def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift):
+def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift, cd_sample_factor=None, cd_seed=42):
     """
     NumPy version of _pivoted_cholesky_phi (from df.py).
     Uses a plain Python for loop instead of jax.lax.fori_loop.
@@ -361,22 +361,37 @@ def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift):
         phi_weighted: (n_orb, n_grid) np.ndarray
         n_rank: int
         shift: float
+        cd_sample_factor: float or None. Subset grid points to min(n_grid, int(n_orb * cd_sample_factor))
+        cd_seed: int. Random seed for reproducible sampling
 
     Returns:
         pivots: (n_rank,) np.ndarray of int
     """
-    n_grid = phi_weighted.shape[1]
-    diag_err = np.sum(phi_weighted**2, axis=0)**2 + shift  # (n_grid,)
+    n_orb = phi_weighted.shape[0]
+    n_grid_full = phi_weighted.shape[1]
+    
+    if cd_sample_factor is not None:
+        num_samples = min(n_grid_full, int(n_orb * cd_sample_factor))
+        # sample without replacement
+        rng = np.random.RandomState(cd_seed)
+        grid_idx = rng.choice(n_grid_full, num_samples, replace=False)
+        phi_weighted_sub = phi_weighted[:, grid_idx]
+    else:
+        grid_idx = np.arange(n_grid_full)
+        phi_weighted_sub = phi_weighted
+
+    n_grid = phi_weighted_sub.shape[1]
+    diag_err = np.sum(phi_weighted_sub**2, axis=0)**2 + shift  # (n_grid,)
     L = np.zeros((n_grid, n_rank))
     pivots = np.zeros(n_rank, dtype=np.int32)
 
     for step in range(n_rank):
         pivot = int(np.argmax(diag_err))
-        pivots[step] = pivot
+        pivots[step] = grid_idx[pivot]
         pivot_val = diag_err[pivot]
 
-        # Gram column: dot(phi_weighted.T, phi_weighted[:, pivot])^2
-        dot = phi_weighted.T @ phi_weighted[:, pivot]  # (n_grid,)
+        # Gram column: dot(phi_weighted_sub.T, phi_weighted_sub[:, pivot])^2
+        dot = phi_weighted_sub.T @ phi_weighted_sub[:, pivot]  # (n_grid,)
         S_col = dot**2
         S_col[pivot] += shift
 
@@ -397,7 +412,7 @@ def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift):
     return pivots
 
 
-def _pivoted_cholesky_grad_numpy(phi_weighted, grad_phi_weighted, n_rank, shift):
+def _pivoted_cholesky_grad_numpy(phi_weighted, grad_phi_weighted, n_rank, shift, cd_sample_factor=None, cd_seed=42):
     """
     NumPy version of _pivoted_cholesky_grad (from df.py).
     Uses a plain Python for loop instead of jax.lax.fori_loop.
@@ -407,26 +422,42 @@ def _pivoted_cholesky_grad_numpy(phi_weighted, grad_phi_weighted, n_rank, shift)
         grad_phi_weighted: (n_orb, n_grid, 3) np.ndarray
         n_rank: int
         shift: float
+        cd_sample_factor: float or None. Subset grid points to min(n_grid, int(n_orb * cd_sample_factor))
+        cd_seed: int. Random seed for reproducible sampling
 
     Returns:
         pivots: (n_rank,) np.ndarray of int
     """
-    n_grid = phi_weighted.shape[1]
-    A_diag = np.sum(phi_weighted**2, axis=0)
-    B_diag = np.sum(np.sum(grad_phi_weighted**2, axis=2), axis=0)
+    n_orb = phi_weighted.shape[0]
+    n_grid_full = phi_weighted.shape[1]
+    
+    if cd_sample_factor is not None:
+        num_samples = min(n_grid_full, int(n_orb * cd_sample_factor))
+        rng = np.random.RandomState(cd_seed)
+        grid_idx = rng.choice(n_grid_full, num_samples, replace=False)
+        phi_weighted_sub = phi_weighted[:, grid_idx]
+        grad_phi_weighted_sub = grad_phi_weighted[:, grid_idx, :]
+    else:
+        grid_idx = np.arange(n_grid_full)
+        phi_weighted_sub = phi_weighted
+        grad_phi_weighted_sub = grad_phi_weighted
+
+    n_grid = phi_weighted_sub.shape[1]
+    A_diag = np.sum(phi_weighted_sub**2, axis=0)
+    B_diag = np.sum(np.sum(grad_phi_weighted_sub**2, axis=2), axis=0)
     diag_err = A_diag * B_diag + shift
     L = np.zeros((n_grid, n_rank))
     pivots = np.zeros(n_rank, dtype=np.int32)
 
     for step in range(n_rank):
         pivot = int(np.argmax(diag_err))
-        pivots[step] = pivot
+        pivots[step] = grid_idx[pivot]
         pivot_val = diag_err[pivot]
 
-        A_col = phi_weighted.T @ phi_weighted[:, pivot]  # (n_grid,)
+        A_col = phi_weighted_sub.T @ phi_weighted_sub[:, pivot]  # (n_grid,)
         B_col = np.zeros(n_grid)
         for c in range(3):
-            B_col += grad_phi_weighted[:, :, c].T @ grad_phi_weighted[:, pivot, c]
+            B_col += grad_phi_weighted_sub[:, :, c].T @ grad_phi_weighted_sub[:, pivot, c]
         S_col = A_col * B_col
         S_col[pivot] += shift
 
@@ -520,7 +551,7 @@ def _solve_normal_equations_batch_prepared_numpy(chol, phi_piv_p, phi_piv_q,
 
 def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_rank_grad,
                     grid_coords, weights, grid_batch_size=4096, rcond=1e-14,
-                    backend='jax'):
+                    backend='jax', cd_sample_factor=None, cd_seed=42):
     """
     Full Out-of-Core ISDF for Phi and Grad_Phi with aggressive memory cleanup.
 
@@ -558,7 +589,9 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
             diag_phi = np.sum(phi_weighted**2, axis=0)**2
             shift_phi = float(1e-12 * np.max(np.abs(diag_phi)))
 
-            pivots_phi_idx = _pivoted_cholesky_phi_numpy(phi_weighted, n_rank_phi, shift_phi)
+            pivots_phi_idx = _pivoted_cholesky_phi_numpy(
+                phi_weighted, n_rank_phi, shift_phi, cd_sample_factor, cd_seed
+            )
 
             grad_phi_weighted = grad_sub * w_sqrt[:, None]
             A_diag = np.sum(phi_weighted**2, axis=0)
@@ -567,7 +600,8 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
             shift_grad = float(1e-12 * np.max(np.abs(diag_grad)))
 
             pivots_grad_idx = _pivoted_cholesky_grad_numpy(
-                phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad)
+                phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad, cd_sample_factor, cd_seed
+            )
 
             del phi_sub, grad_sub, phi_weighted, grad_phi_weighted
             gc.collect()
