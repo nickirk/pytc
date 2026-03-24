@@ -1695,16 +1695,31 @@ def compute_ISDF_J_kernels_DF_streaming(
     n_grid   = coords.shape[0]
     n_aux_df = aux_mol.nao  # n_aux_df = naux * len(gammas)
 
-    with h5py.File(h5_path, 'r') as f:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_batch_j(start_idx, end_idx):
+        return np.array(f['xi_phi'][:, start_idx:end_idx]), weights[start_idx:end_idx], coords[start_idx:end_idx]
+
+    with h5py.File(h5_path, 'r') as f, ThreadPoolExecutor(max_workers=1) as executor:
         n_fused = f['xi_phi'].shape[0]
 
         S_PQ  = np.zeros((n_aux_df, n_aux_df), dtype=np.float64)
         V_Pmu = np.zeros((n_aux_df, n_fused),  dtype=np.float64)
 
+        next_future = None
+        if n_grid > 0:
+            first_end = min(batch_size, n_grid)
+            next_future = executor.submit(fetch_batch_j, 0, first_end)
+
         for g_start in range(0, n_grid, batch_size):
             g_end     = min(g_start + batch_size, n_grid)
-            coords_b  = coords[g_start:g_end]            # (B, 3)
-            weights_b = weights[g_start:g_end]           # (B,)
+            
+            xi_b_cpu, weights_b, coords_b = next_future.result()
+
+            next_start = g_start + batch_size
+            if next_start < n_grid:
+                next_end = min(next_start + batch_size, n_grid)
+                next_future = executor.submit(fetch_batch_j, next_start, next_end)
 
             # aux_eval is always a PySCF CPU call
             aux_b_np = aux_mol.eval_gto('GTOval', coords_b)  # (B, naux_df)
@@ -1712,19 +1727,18 @@ def compute_ISDF_J_kernels_DF_streaming(
             if backend == 'numpy':
                 # Pure NumPy path — no device transfers
                 w_aux_b = (aux_b_np * weights_b[:, None]).T   # (naux_df, B)
-                xi_b_np = np.array(f['xi_phi'][:, g_start:g_end])  # (naux, B)
                 S_PQ  += np.matmul(w_aux_b, aux_b_np)         # (naux_df, naux_df)
-                V_Pmu += np.matmul(w_aux_b, xi_b_np.T)        # (naux_df, naux)
-                del xi_b_np, w_aux_b
+                V_Pmu += np.matmul(w_aux_b, xi_b_cpu.T)        # (naux_df, naux)
+                del w_aux_b, xi_b_cpu
             else:
                 # JAX path — push batch to device (GPU if available)
                 aux_b  = jax.device_put(jnp.array(aux_b_np))
-                xi_b   = jax.device_put(jnp.array(f['xi_phi'][:, g_start:g_end]))
+                xi_b   = jax.device_put(jnp.array(xi_b_cpu))
                 w_b    = jax.device_put(jnp.array(weights_b))
                 spq_batch, vpm_batch = update_df_kernels(aux_b, xi_b, w_b)
                 S_PQ  += np.array(spq_batch)
                 V_Pmu += np.array(vpm_batch)
-                del aux_b, xi_b, w_b, spq_batch, vpm_batch
+                del aux_b, xi_b, w_b, spq_batch, vpm_batch, xi_b_cpu
 
     gc.collect()
     if backend == 'jax':
@@ -1830,17 +1844,37 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
     t0 = time.time()
     _tt = {'h5': 0.0, 'xi': 0.0, 'w': 0.0, 'einsum': 0.0, 'copy': 0.0}
 
-    with h5py.File(h5_path, 'r') as f:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_batch_gga(start_idx, end_idx):
+        xi_phi_b  = np.array(f['xi_phi'][:, start_idx:end_idx])
+        xi_grad_b = np.array(f['xi_grad'][:, start_idx:end_idx, :])
+        w_batch   = np.array(wfxc_real[:, :, start_idx:end_idx])
+        return xi_phi_b, xi_grad_b, w_batch
+
+    with h5py.File(h5_path, 'r') as f, ThreadPoolExecutor(max_workers=1) as executor:
         n_aux, n_grid = f['xi_phi'].shape
         wfxc_cpu = np.zeros((4, 4, n_aux, n_aux), dtype=np.float64)
+
+        next_future = None
+        if n_grid > 0:
+            first_end = min(batch_size, n_grid)
+            next_future = executor.submit(fetch_batch_gga, 0, first_end)
 
         for g_start in range(0, n_grid, batch_size):
             g_end = min(g_start + batch_size, n_grid)
 
+            xi_phi_b_cpu, xi_grad_b_cpu, w_batch_cpu = next_future.result()
+
+            next_start = g_start + batch_size
+            if next_start < n_grid:
+                next_end = min(next_start + batch_size, n_grid)
+                next_future = executor.submit(fetch_batch_gga, next_start, next_end)
+
             if backend == 'numpy':
                 # Load intermediates into numpy
-                xi_phi_b  = np.array(f['xi_phi'][:, g_start:g_end])       # (naux, B)
-                xi_grad_b = np.array(f['xi_grad'][:, g_start:g_end, :])   # (naux, B, 3)
+                xi_phi_b  = xi_phi_b_cpu
+                xi_grad_b = xi_grad_b_cpu
 
                 # Shape: (4, naux, B)
                 xi_full = np.concatenate([
@@ -1848,7 +1882,7 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                     xi_grad_b.transpose(2, 0, 1)
                 ], axis=0)
 
-                w_batch = wfxc_real[:, :, g_start:g_end]  # (4, 4, B) — already numpy
+                w_batch = w_batch_cpu
 
                 # Vectorized: no loops over y/x.
                 # weighted_xi[y,x,m,g] = xi_full[y,m,g] * w_batch[y,x,g]
@@ -1863,9 +1897,9 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                 tb = time.time()
 
                 _t = time.time()
-                xi_phi_b  = jax.device_put(jnp.array(f['xi_phi'][:, g_start:g_end]))
-                xi_grad_b = jax.device_put(jnp.array(f['xi_grad'][:, g_start:g_end, :]))
-                # xi_phi_b.block_until_ready(); xi_grad_b.block_until_ready()
+                xi_phi_b  = jax.device_put(jnp.array(xi_phi_b_cpu))
+                xi_grad_b = jax.device_put(jnp.array(xi_grad_b_cpu))
+                # host-to-device transfer time (disk read is hidden)
                 t_h5 = time.time() - _t; _tt['h5'] += t_h5
 
                 _t = time.time()
@@ -1873,8 +1907,7 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                 t_xi = time.time() - _t; _tt['xi'] += 0.0 # kept 0.0 to not break print output
 
                 _t = time.time()
-                w_batch = jax.device_put(jnp.array(wfxc_real[:, :, g_start:g_end]))
-                # w_batch.block_until_ready()
+                w_batch = jax.device_put(jnp.array(w_batch_cpu))
                 t_w = time.time() - _t; _tt['w'] += t_w
 
                 _t = time.time()
@@ -1891,10 +1924,10 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
 
                 t_batch = time.time() - tb
                 print(f"  batch {g_start:6d}-{g_end:6d}: "
-                      f"h5={t_h5:.3f}s  xi={t_xi:.3f}s  w={t_w:.3f}s  "
+                      f"h5/D2H={t_h5:.3f}s  xi={t_xi:.3f}s  w={t_w:.3f}s  "
                       f"einsum={t_einsum:.3f}s  copy={t_copy:.3f}s  | total={t_batch:.3f}s")
 
-                del xi_phi_b, xi_grad_b, w_batch, update
+                del xi_phi_b, xi_grad_b, w_batch, update, xi_phi_b_cpu, xi_grad_b_cpu, w_batch_cpu
                 jax.clear_caches()
 
     t_total = time.time() - t0

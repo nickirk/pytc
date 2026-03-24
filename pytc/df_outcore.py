@@ -656,17 +656,39 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
         print(f'[{backend}] Passed prepare_normal_equations_solver. Took: {t1-t0:0.2f}')
         # --- 4. Solve Normal Equations in Batches ---
         t0 = time.time()
-        with h5py.File(output_stream_path, 'w') as f_out:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch_batch(start_idx, end_idx):
+            p_cpu = np.array(h5_phi[:, start_idx:end_idx])
+            g_cpu = np.array(h5_grad[:, start_idx:end_idx, :])
+            return p_cpu, g_cpu
+
+        with h5py.File(output_stream_path, 'w') as f_out, ThreadPoolExecutor(max_workers=1) as executor:
             xi_p = f_out.create_dataset('xi_phi', (len(pivots_final), n_grid), dtype='f8')
             xi_g = f_out.create_dataset('xi_grad', (len(pivots_final), n_grid, 3), dtype='f8')
             f_out.create_dataset('pivots', data=pivots_final)
+
+            # Start prefetching the first batch
+            next_future = None
+            if n_grid > 0:
+                first_end = min(grid_batch_size, n_grid)
+                next_future = executor.submit(fetch_batch, 0, first_end)
 
             for i in range(0, n_grid, grid_batch_size):
                 t0 = time.time()
                 end = min(i + grid_batch_size, n_grid)
 
+                # Get the pre-fetched data for the current batch
+                p_batch_cpu, g_batch_cpu = next_future.result()
+
+                # Start prefetching the next batch if there is one
+                next_start = i + grid_batch_size
+                if next_start < n_grid:
+                    next_end = min(next_start + grid_batch_size, n_grid)
+                    next_future = executor.submit(fetch_batch, next_start, next_end)
+
                 if use_numpy:
-                    p_batch = np.array(h5_phi[:, i:end])  # (n_orb, batch)
+                    p_batch = p_batch_cpu  # (n_orb, batch)
 
                     # Solve Phi
                     res_p = _solve_normal_equations_batch_prepared_numpy(
@@ -676,16 +698,16 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
 
                     # Solve Grad
                     for c in range(3):
-                        g_batch = np.array(h5_grad[:, i:end, c])  # (n_orb, batch)
+                        g_batch = g_batch_cpu[:, :, c]  # (n_orb, batch)
                         res_g = _solve_normal_equations_batch_prepared_numpy(
                             g_chol[c], grad_piv[:, :, c], phi_piv, g_batch, p_batch)
                         xi_g[:, i:end, c] = res_g
                         del g_batch, res_g
 
-                    del p_batch
+                    del p_batch, p_batch_cpu, g_batch_cpu
                     gc.collect()
                 else:
-                    p_batch = jax.device_put(jnp.array(h5_phi[:, i:end]))
+                    p_batch = jax.device_put(jnp.array(p_batch_cpu))
 
                     # Solve Phi
                     res_p = solve_normal_equations_batch_prepared(
@@ -696,14 +718,14 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
 
                     # Solve Grad
                     for c in range(3):
-                        g_batch = jax.device_put(jnp.array(h5_grad[:, i:end, c]))
+                        g_batch = jax.device_put(jnp.array(g_batch_cpu[:, :, c]))
                         res_g = solve_normal_equations_batch_prepared(
                             g_chol[c], g_low[c], grad_piv[:, :, c], phi_piv, g_batch, p_batch)
                         res_g.block_until_ready()
                         xi_g[:, i:end, c] = np.array(res_g)
                         del g_batch, res_g
 
-                    del p_batch
+                    del p_batch, p_batch_cpu, g_batch_cpu
 
                     # Periodic cache clearing for very large grids
                     if (i // grid_batch_size) % 20 == 0:
