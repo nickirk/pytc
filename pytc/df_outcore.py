@@ -590,7 +590,7 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
 
             gc.collect()
         else:
-            phi_sub = jnp.array(h5_phi[:, sub_idx_phi])
+            phi_sub = jax.device_put(jnp.array(h5_phi[:, sub_idx_phi]))
             w_sqrt_phi = jnp.sqrt(jnp.abs(weights[sub_idx_phi]))
 
             phi_weighted = phi_sub * w_sqrt_phi
@@ -604,8 +604,8 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
             if skip_grad_pivots:
                 pivots_grad_local = np.array([], dtype=np.int32)
             else:
-                grad_sub = jnp.array(h5_grad[:, sub_idx_grad, :])
-                phi_sub_g = jnp.array(h5_phi[:, sub_idx_grad])
+                grad_sub = jax.device_put(jnp.array(h5_grad[:, sub_idx_grad, :]))
+                phi_sub_g = jax.device_put(jnp.array(h5_phi[:, sub_idx_grad]))
                 w_sqrt_grad = jnp.sqrt(jnp.abs(weights[sub_idx_grad]))
                 phi_weighted_g = phi_sub_g * w_sqrt_grad
                 grad_phi_weighted = grad_sub * w_sqrt_grad[:, None]
@@ -642,8 +642,8 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
                 c_h, _ = _prepare_normal_equations_solver_numpy(grad_piv[:, :, c], phi_piv, rcond=rcond)
                 g_chol.append(c_h)
         else:
-            phi_piv = jnp.array(h5_phi[:, pivots_final])
-            grad_piv = jnp.array(h5_grad[:, pivots_final, :])
+            phi_piv = jax.device_put(jnp.array(h5_phi[:, pivots_final]))
+            grad_piv = jax.device_put(jnp.array(h5_grad[:, pivots_final, :]))
 
             phi_chol, phi_lower = prepare_normal_equations_solver(phi_piv, phi_piv, rcond=rcond)
 
@@ -685,7 +685,7 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
                     del p_batch
                     gc.collect()
                 else:
-                    p_batch = jnp.array(h5_phi[:, i:end])
+                    p_batch = jax.device_put(jnp.array(h5_phi[:, i:end]))
 
                     # Solve Phi
                     res_p = solve_normal_equations_batch_prepared(
@@ -696,7 +696,7 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
 
                     # Solve Grad
                     for c in range(3):
-                        g_batch = jnp.array(h5_grad[:, i:end, c])
+                        g_batch = jax.device_put(jnp.array(h5_grad[:, i:end, c]))
                         res_g = solve_normal_equations_batch_prepared(
                             g_chol[c], g_low[c], grad_piv[:, :, c], phi_piv, g_batch, p_batch)
                         res_g.block_until_ready()
