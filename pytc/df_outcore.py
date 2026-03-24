@@ -352,46 +352,30 @@ def get_max_orbital_importance_numpy(input_stream_path, weights=None, batch_size
     return max_phi, max_grad_norm
 
 
-def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift, cd_sample_factor=None, cd_seed=42):
+def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift):
     """
     NumPy version of _pivoted_cholesky_phi (from df.py).
-    Uses a plain Python for loop instead of jax.lax.fori_loop.
+    Operates on whatever grid phi_weighted contains; returns local pivot indices.
 
     Args:
-        phi_weighted: (n_orb, n_grid) np.ndarray
+        phi_weighted: (n_orb, n_grid) np.ndarray  (may already be a subsampled view)
         n_rank: int
         shift: float
-        cd_sample_factor: float or None. Subset grid points to min(n_grid, int(n_orb * cd_sample_factor))
-        cd_seed: int. Random seed for reproducible sampling
 
     Returns:
-        pivots: (n_rank,) np.ndarray of int
+        pivots: (n_rank,) np.ndarray of int  (local indices into phi_weighted columns)
     """
-    n_orb = phi_weighted.shape[0]
-    n_grid_full = phi_weighted.shape[1]
-    
-    if cd_sample_factor is not None:
-        num_samples = min(n_grid_full, int(n_orb * cd_sample_factor))
-        # sample without replacement
-        rng = np.random.RandomState(cd_seed)
-        grid_idx = rng.choice(n_grid_full, num_samples, replace=False)
-        phi_weighted_sub = phi_weighted[:, grid_idx]
-    else:
-        grid_idx = np.arange(n_grid_full)
-        phi_weighted_sub = phi_weighted
-
-    n_grid = phi_weighted_sub.shape[1]
-    diag_err = np.sum(phi_weighted_sub**2, axis=0)**2 + shift  # (n_grid,)
+    n_grid = phi_weighted.shape[1]
+    diag_err = np.sum(phi_weighted**2, axis=0)**2 + shift  # (n_grid,)
     L = np.zeros((n_grid, n_rank))
     pivots = np.zeros(n_rank, dtype=np.int32)
 
     for step in range(n_rank):
         pivot = int(np.argmax(diag_err))
-        pivots[step] = grid_idx[pivot]
+        pivots[step] = pivot
         pivot_val = diag_err[pivot]
 
-        # Gram column: dot(phi_weighted_sub.T, phi_weighted_sub[:, pivot])^2
-        dot = phi_weighted_sub.T @ phi_weighted_sub[:, pivot]  # (n_grid,)
+        dot = phi_weighted.T @ phi_weighted[:, pivot]  # (n_grid,)
         S_col = dot**2
         S_col[pivot] += shift
 
@@ -412,52 +396,36 @@ def _pivoted_cholesky_phi_numpy(phi_weighted, n_rank, shift, cd_sample_factor=No
     return pivots
 
 
-def _pivoted_cholesky_grad_numpy(phi_weighted, grad_phi_weighted, n_rank, shift, cd_sample_factor=None, cd_seed=42):
+def _pivoted_cholesky_grad_numpy(phi_weighted, grad_phi_weighted, n_rank, shift):
     """
     NumPy version of _pivoted_cholesky_grad (from df.py).
-    Uses a plain Python for loop instead of jax.lax.fori_loop.
+    Operates on whatever grid the inputs contain; returns local pivot indices.
 
     Args:
-        phi_weighted: (n_orb, n_grid) np.ndarray
+        phi_weighted: (n_orb, n_grid) np.ndarray  (may already be a subsampled view)
         grad_phi_weighted: (n_orb, n_grid, 3) np.ndarray
         n_rank: int
         shift: float
-        cd_sample_factor: float or None. Subset grid points to min(n_grid, int(n_orb * cd_sample_factor))
-        cd_seed: int. Random seed for reproducible sampling
 
     Returns:
-        pivots: (n_rank,) np.ndarray of int
+        pivots: (n_rank,) np.ndarray of int  (local indices into the input columns)
     """
-    n_orb = phi_weighted.shape[0]
-    n_grid_full = phi_weighted.shape[1]
-    
-    if cd_sample_factor is not None:
-        num_samples = min(n_grid_full, int(n_orb * cd_sample_factor))
-        rng = np.random.RandomState(cd_seed)
-        grid_idx = rng.choice(n_grid_full, num_samples, replace=False)
-        phi_weighted_sub = phi_weighted[:, grid_idx]
-        grad_phi_weighted_sub = grad_phi_weighted[:, grid_idx, :]
-    else:
-        grid_idx = np.arange(n_grid_full)
-        phi_weighted_sub = phi_weighted
-        grad_phi_weighted_sub = grad_phi_weighted
-
-    n_grid = phi_weighted_sub.shape[1]
-    A_diag = np.sum(phi_weighted_sub**2, axis=0)
-    B_diag = np.sum(np.sum(grad_phi_weighted_sub**2, axis=2), axis=0)
+    n_grid = phi_weighted.shape[1]
+    A_diag = np.sum(phi_weighted**2, axis=0)
+    B_diag = np.sum(np.sum(grad_phi_weighted**2, axis=2), axis=0)
     diag_err = A_diag * B_diag + shift
     L = np.zeros((n_grid, n_rank))
     pivots = np.zeros(n_rank, dtype=np.int32)
 
     for step in range(n_rank):
         pivot = int(np.argmax(diag_err))
-        pivots[step] = grid_idx[pivot]
+        pivots[step] = pivot
         pivot_val = diag_err[pivot]
 
-        A_col = phi_weighted_sub.T @ phi_weighted_sub[:, pivot]  # (n_grid,)
+        A_col = phi_weighted.T @ phi_weighted[:, pivot]  # (n_grid,)
         B_col = np.zeros(n_grid)
         for c in range(3):
-            B_col += grad_phi_weighted_sub[:, :, c].T @ grad_phi_weighted_sub[:, pivot, c]
+            B_col += grad_phi_weighted[:, :, c].T @ grad_phi_weighted[:, pivot, c]
         S_col = A_col * B_col
         S_col[pivot] += shift
 
@@ -551,7 +519,8 @@ def _solve_normal_equations_batch_prepared_numpy(chol, phi_piv_p, phi_piv_q,
 
 def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_rank_grad,
                     grid_coords, weights, grid_batch_size=4096, rcond=1e-14,
-                    backend='jax', cd_sample_factor=None, cd_seed=42):
+                    backend='jax', cd_sample_factor=None, cd_seed=42,
+                    skip_grad_pivots=False):
     """
     Full Out-of-Core ISDF for Phi and Grad_Phi with aggressive memory cleanup.
 
@@ -566,6 +535,8 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
         rcond: Regularisation strength for normal equations solver.
         backend: 'jax' (default) or 'numpy'. When 'numpy', all JAX operations
                  are replaced with pure NumPy/SciPy equivalents for CPU-only execution.
+        skip_grad_pivots: if True, skip grad Cholesky pivot selection entirely and
+                 use only the phi pivots. Faster but may reduce accuracy for GGA functionals.
     """
     if backend not in ('jax', 'numpy'):
         raise ValueError(f"backend must be 'jax' or 'numpy', got {backend!r}")
@@ -577,64 +548,84 @@ def isdf_decompose_outcore(input_stream_path, output_stream_path, n_rank_phi, n_
         h5_grad = f_in['grad_phi']
         n_orb, n_grid = h5_phi.shape
 
-        # --- 1. Pivoted Cholesky ---
+        # --- 1. Subsampling — independent draws for phi and grad ---
         t0 = time.time()
-        initial_pivs = np.arange(n_grid)
+        if cd_sample_factor is not None:
+            n_samples = min(n_grid, int(n_orb * cd_sample_factor))
+            sub_idx_phi  = np.sort(np.random.RandomState(cd_seed    ).choice(n_grid, n_samples, replace=False))
+            sub_idx_grad = np.sort(np.random.RandomState(cd_seed + 1).choice(n_grid, n_samples, replace=False))
+        else:
+            sub_idx_phi = sub_idx_grad = np.arange(n_grid)
 
+        # --- 2. Pivoted Cholesky on (possibly subsampled) grid ---
         if use_numpy:
-            phi_sub = np.array(h5_phi[:, initial_pivs])          # (n_orb, n_sub)
-            grad_sub = np.array(h5_grad[:, initial_pivs, :])      # (n_orb, n_sub, 3)
-            w_sqrt = np.sqrt(np.abs(np.array(weights)[initial_pivs]))
+            phi_sub = np.array(h5_phi[:, sub_idx_phi])          # (n_orb, n_sub)
+            w_sqrt_phi = np.sqrt(np.abs(np.array(weights)[sub_idx_phi]))
 
-            phi_weighted = phi_sub * w_sqrt
+            phi_weighted = phi_sub * w_sqrt_phi
             diag_phi = np.sum(phi_weighted**2, axis=0)**2
             shift_phi = float(1e-12 * np.max(np.abs(diag_phi)))
 
-            pivots_phi_idx = _pivoted_cholesky_phi_numpy(
-                phi_weighted, n_rank_phi, shift_phi, cd_sample_factor, cd_seed
+            pivots_phi_local = _pivoted_cholesky_phi_numpy(
+                phi_weighted, n_rank_phi, shift_phi
             )
+            del phi_sub, phi_weighted
 
-            grad_phi_weighted = grad_sub * w_sqrt[:, None]
-            A_diag = np.sum(phi_weighted**2, axis=0)
-            B_diag = np.sum(np.sum(grad_phi_weighted**2, axis=2), axis=0)
-            diag_grad = A_diag * B_diag
-            shift_grad = float(1e-12 * np.max(np.abs(diag_grad)))
+            if skip_grad_pivots:
+                pivots_grad_local = np.array([], dtype=np.int32)
+            else:
+                grad_sub = np.array(h5_grad[:, sub_idx_grad, :])   # (n_orb, n_sub, 3)
+                phi_sub_g = np.array(h5_phi[:, sub_idx_grad])
+                w_sqrt_grad = np.sqrt(np.abs(np.array(weights)[sub_idx_grad]))
+                phi_weighted_g = phi_sub_g * w_sqrt_grad
+                grad_phi_weighted = grad_sub * w_sqrt_grad[:, None]
+                A_diag = np.sum(phi_weighted_g**2, axis=0)
+                B_diag = np.sum(np.sum(grad_phi_weighted**2, axis=2), axis=0)
+                diag_grad = A_diag * B_diag
+                shift_grad = float(1e-12 * np.max(np.abs(diag_grad)))
+                pivots_grad_local = _pivoted_cholesky_grad_numpy(
+                    phi_weighted_g, grad_phi_weighted, n_rank_grad, shift_grad
+                )
+                del grad_sub, phi_sub_g, phi_weighted_g, grad_phi_weighted
 
-            pivots_grad_idx = _pivoted_cholesky_grad_numpy(
-                phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad, cd_sample_factor, cd_seed
-            )
-
-            del phi_sub, grad_sub, phi_weighted, grad_phi_weighted
             gc.collect()
         else:
-            phi_sub = jnp.array(h5_phi[:, initial_pivs])
-            grad_sub = jnp.array(h5_grad[:, initial_pivs, :])
-            w_sqrt = jnp.sqrt(jnp.abs(weights[initial_pivs]))
+            phi_sub = jnp.array(h5_phi[:, sub_idx_phi])
+            w_sqrt_phi = jnp.sqrt(jnp.abs(weights[sub_idx_phi]))
 
-            phi_weighted = phi_sub * w_sqrt
+            phi_weighted = phi_sub * w_sqrt_phi
             diag_phi = jnp.sum(phi_weighted**2, axis=0)**2
             shift_phi = 1e-12 * jnp.max(jnp.abs(diag_phi))
 
-            pivots_phi_idx = _pivoted_cholesky_phi(phi_weighted, n_rank_phi, shift_phi)
-            pivots_phi_idx.block_until_ready()
+            pivots_phi_local = _pivoted_cholesky_phi(phi_weighted, n_rank_phi, shift_phi)
+            pivots_phi_local.block_until_ready()
+            del phi_sub, phi_weighted
 
-            grad_phi_weighted = grad_sub * w_sqrt[:, None]
-            A_diag = jnp.sum(phi_weighted**2, axis=0)
-            B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
-            diag_grad = A_diag * B_diag
-            shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
+            if skip_grad_pivots:
+                pivots_grad_local = np.array([], dtype=np.int32)
+            else:
+                grad_sub = jnp.array(h5_grad[:, sub_idx_grad, :])
+                phi_sub_g = jnp.array(h5_phi[:, sub_idx_grad])
+                w_sqrt_grad = jnp.sqrt(jnp.abs(weights[sub_idx_grad]))
+                phi_weighted_g = phi_sub_g * w_sqrt_grad
+                grad_phi_weighted = grad_sub * w_sqrt_grad[:, None]
+                A_diag = jnp.sum(phi_weighted_g**2, axis=0)
+                B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
+                diag_grad = A_diag * B_diag
+                shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
+                pivots_grad_local = _pivoted_cholesky_grad(phi_weighted_g, grad_phi_weighted, n_rank_grad, shift_grad)
+                pivots_grad_local.block_until_ready()
+                del grad_sub, phi_sub_g, phi_weighted_g, grad_phi_weighted
 
-            pivots_grad_idx = _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad)
-            pivots_grad_idx.block_until_ready()
-
-            del phi_sub, grad_sub, phi_weighted, grad_phi_weighted
             gc.collect()
             jax.clear_caches()
 
+        # Remap local indices back to global grid and take union
         pivots_final = np.unique(np.concatenate([
-            initial_pivs[np.array(pivots_phi_idx)],
-            initial_pivs[np.array(pivots_grad_idx)]
+            sub_idx_phi[np.array(pivots_phi_local)],
+            sub_idx_grad[np.array(pivots_grad_local)]
         ]))
+
         t1 = time.time()
         print(f'[{backend}] Passed select_pivots. Final Rank: {len(pivots_final)}. Took: {t1-t0:0.2f}')
 

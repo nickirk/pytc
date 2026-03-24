@@ -369,7 +369,7 @@ def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25,
     J_munu = _compute_J_jax_core(R_gpu, weights_gpu, xi_phi_gpu, J_PQ_gpu, rcond)
 
     # Block until finished to get accurate timing (JAX is asynchronous)
-    J_munu.block_until_ready()
+    # J_munu.block_until_ready()
     print(f"JAX GPU Kernel: {time.time() - t_jax:.4f}s")
     
     
@@ -1812,6 +1812,7 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
     """
     print(f"Streaming GGA fxc compression [{backend.upper()}]...")
     t0 = time.time()
+    _tt = {'h5': 0.0, 'xi': 0.0, 'w': 0.0, 'einsum': 0.0, 'copy': 0.0}
 
     with h5py.File(h5_path, 'r') as f:
         n_aux, n_grid = f['xi_phi'].shape
@@ -1842,26 +1843,52 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                 wfxc_cpu += update
                 del xi_phi_b, xi_grad_b, xi_full, w_batch, weighted_xi, update
             else:
-                # JAX path
+                # JAX path — detailed timing
+                tb = time.time()
+
+                _t = time.time()
                 xi_phi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])
                 xi_grad_b = jnp.array(f['xi_grad'][:, g_start:g_end, :])
+                # xi_phi_b.block_until_ready(); xi_grad_b.block_until_ready()
+                t_h5 = time.time() - _t; _tt['h5'] += t_h5
 
-                # Shape: (4, naux, B)
+                _t = time.time()
                 xi_full = jnp.concatenate([
                     xi_phi_b[None, :, :],
                     xi_grad_b.transpose(2, 0, 1)
                 ], axis=0)
+                xi_full.block_until_ready()
+                t_xi = time.time() - _t; _tt['xi'] += t_xi
 
-                w_batch = jnp.array(wfxc_real[:, :, g_start:g_end])  # (4, 4, B)
+                _t = time.time()
+                w_batch = jnp.array(wfxc_real[:, :, g_start:g_end])
+                w_batch.block_until_ready()
+                t_w = time.time() - _t; _tt['w'] += t_w
 
-                update = jnp.einsum('ymg, xng, yxg -> yxmn', xi_full, xi_full, w_batch)
-                update.block_until_ready()
+                _t = time.time()
+                # update = jnp.einsum('ymg, xng, yxg -> yxmn', xi_full, xi_full, w_batch)
+                tmp = jnp.einsum('ymg,yxg->yxmg', xi_full, w_batch)   # (Y,X,M,G)
+                update =  jnp.einsum('yxmg,xng->yxmn', tmp, xi_full)
+                # update.block_until_ready()
+                t_einsum = time.time() - _t; _tt['einsum'] += t_einsum
+
+                _t = time.time()
                 wfxc_cpu += np.array(update)
+                t_copy = time.time() - _t; _tt['copy'] += t_copy
+
+                t_batch = time.time() - tb
+                print(f"  batch {g_start:6d}-{g_end:6d}: "
+                      f"h5={t_h5:.3f}s  xi={t_xi:.3f}s  w={t_w:.3f}s  "
+                      f"einsum={t_einsum:.3f}s  copy={t_copy:.3f}s  | total={t_batch:.3f}s")
 
                 del xi_phi_b, xi_grad_b, xi_full, w_batch, update
                 jax.clear_caches()
 
-    print(f"  => wfxc shape {wfxc_cpu.shape}, took {time.time()-t0:.2f} s")
+    t_total = time.time() - t0
+    print(f"  => wfxc shape {wfxc_cpu.shape}, took {t_total:.2f} s")
+    if backend == 'jax':
+        print(f"  [timing totals]  h5={_tt['h5']:.2f}s  xi={_tt['xi']:.2f}s  "
+              f"w={_tt['w']:.2f}s  einsum={_tt['einsum']:.2f}s  copy={_tt['copy']:.2f}s")
     return wfxc_cpu
 
 
@@ -1884,6 +1911,7 @@ class TDDFT(lib.StreamObject):
         isdf_backend = 'numpy',
         isdf_cd_sample_factor = None,
         isdf_cd_seed = 42,
+        isdf_skip_grad_pivots = False,
         verbose=5,
         # options
         TDA=False,
@@ -1956,6 +1984,7 @@ class TDDFT(lib.StreamObject):
         self.isdf_backend = isdf_backend  # 'jax' or 'numpy' for isdf_decompose_outcore
         self.isdf_cd_sample_factor = isdf_cd_sample_factor
         self.isdf_cd_seed = isdf_cd_seed
+        self.isdf_skip_grad_pivots = isdf_skip_grad_pivots
         self.mf.grids.level = self.isdf_grid_level
         self.mf.grids.build(with_non0tab=False)
 
@@ -2025,9 +2054,17 @@ class TDDFT(lib.StreamObject):
         self.C_o_gga = []
         self.C_v_gga = []
         
-        # Determine Ranks (Using default conservative heuristics, customize as needed)
-        n_rank_phi = self.isdf_naux_factor * self.nmo
-        n_rank_grad = self.isdf_naux_factor * self.nmo
+        # Determine Ranks — isdf_naux_factor can be a scalar (same for phi and grad)
+        # or a list/tuple [factor_phi, factor_grad]; factor_grad=0 skips grad pivots.
+        _nf = self.isdf_naux_factor
+        if hasattr(_nf, '__len__'):
+            _nf_phi, _nf_grad = _nf[0], _nf[1]
+        else:
+            _nf_phi, _nf_grad = _nf, _nf
+        n_rank_phi = int(_nf_phi * self.nmo)
+        n_rank_grad = int(_nf_grad * self.nmo)
+        _skip_grad = (n_rank_grad == 0) or self.isdf_skip_grad_pivots
+
 
         # We need a unified J kernel across spins (it's solely spatial)
         # We will decompose the spatial orbitals if Restricted, or alpha/beta if Unrestricted
@@ -2089,7 +2126,8 @@ class TDDFT(lib.StreamObject):
                     _gc, _wt, grid_batch_size=self.isdf_grid_batch_size,
                     rcond=self.isdf_rcond, backend=self.isdf_backend,
                     cd_sample_factor=self.isdf_cd_sample_factor,
-                    cd_seed=self.isdf_cd_seed
+                    cd_seed=self.isdf_cd_seed,
+                    skip_grad_pivots=_skip_grad
                 )
             else:
                 stream_h5 = None  # sentinel: non-streaming
@@ -2536,7 +2574,7 @@ if __name__ == '__main__':
     print('---values in eV---')
     print('pyscf exci:', pyscf_ref*HARTREE2EV)
 
-    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-14, isdf_grid_level = 2, isdf_naux_factor = 8, isdf_gammas = [0.1, 0.4], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False, isdf_backend = 'numpy', isdf_grid_batch_size = 8192, isdf_cd_sample_factor = 100)
+    mytd = TDDFT(mf = mf, nroot = 10, max_vec = 150, residue_thresh = 1.0e-8, isdf_rcond = 1e-14, isdf_grid_level = 2, isdf_naux_factor = [8, 4], isdf_gammas = [0.1, 0.4], isdf_stream_path = './my_isdf_tmp.h5', isdf_exact_J=False, isdf_backend = 'jax', isdf_grid_batch_size = 8192, isdf_cd_sample_factor = 500)
     exci_new = np.sort(mytd.kernel(multi = 's')[0])
     
     print('Davidson exci:', exci_new*HARTREE2EV)

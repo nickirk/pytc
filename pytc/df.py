@@ -117,13 +117,16 @@ def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
 def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
     """Specialized pivoted Cholesky for phi decomposition."""
     n_grid = phi_weighted.shape[1]
+    _dtype = phi_weighted.dtype
+    _s = _dtype.type  # scalar constructor for Python literals, e.g. np.float32
+    _shift = jnp.asarray(shift, dtype=_dtype)  # JAX-safe cast of traced shift
     
     # Initialize diagonal
-    diag_err = jnp.sum(phi_weighted**2, axis=0)**2 + shift
+    diag_err = jnp.sum(phi_weighted**2, axis=0).astype(_dtype)**2 + _shift
     
     # Storage for L factor (N_grid, n_rank)
-    L = jnp.zeros((n_grid, n_rank))
-    pivots = jnp.zeros(n_rank, dtype=int)
+    L = jnp.zeros((n_grid, n_rank), dtype=_dtype)
+    pivots = jnp.zeros(n_rank, dtype=jnp.int32)
     
     def body_fn(step, state):
         diag_err, L, pivots = state
@@ -134,18 +137,18 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
         # gram_col_phi logic
         dot = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
         S_col = dot**2
-        S_col = S_col.at[pivot].add(shift)
+        S_col = S_col.at[pivot].add(_shift)
         
         dot_prod = jnp.dot(L, L[pivot])
-        is_small = pivot_val < 1e-12
-        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
+        is_small = pivot_val < _s(1e-12)
+        safe_pivot = jnp.where(is_small, _s(1.0), pivot_val)
         inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
         
         l_col = (S_col - dot_prod) * inv_sqrt_pivot
-        l_col = jnp.where(is_small, 0.0, l_col)
+        l_col = jnp.where(is_small, _s(0.0), l_col)
         L = L.at[:, step].set(l_col)
-        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        diag_err = jnp.maximum(diag_err - l_col**2, _s(0.0))
+        diag_err = jnp.where(is_small, diag_err.at[pivot].set(_s(0.0)), diag_err)
         
         return diag_err, L, pivots
 
@@ -157,15 +160,18 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
 def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
     """Specialized pivoted Cholesky for gradient decomposition."""
     n_grid = phi_weighted.shape[1]
+    _dtype = phi_weighted.dtype
+    _s = _dtype.type  # scalar constructor for Python literals, e.g. np.float32
+    _shift = jnp.asarray(shift, dtype=_dtype)  # JAX-safe cast of traced shift
     
     # Initialize diagonal
-    A_diag = jnp.sum(phi_weighted**2, axis=0)
-    B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
-    diag_err = A_diag * B_diag + shift
+    A_diag = jnp.sum(phi_weighted**2, axis=0).astype(_dtype)
+    B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0).astype(_dtype)
+    diag_err = A_diag * B_diag + _shift
     
     # Storage for L factor (N_grid, n_rank)
-    L = jnp.zeros((n_grid, n_rank))
-    pivots = jnp.zeros(n_rank, dtype=int)
+    L = jnp.zeros((n_grid, n_rank), dtype=_dtype)
+    pivots = jnp.zeros(n_rank, dtype=jnp.int32)
     
     def body_fn(step, state):
         diag_err, L, pivots = state
@@ -175,22 +181,22 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
         
         # gram_col_grad logic
         A_col = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
-        B_col = jnp.zeros(n_grid)
+        B_col = jnp.zeros(n_grid, dtype=_dtype)
         for c in range(3):
             B_col += jnp.dot(grad_phi_weighted[:, :, c].T, grad_phi_weighted[:, pivot, c])
         S_col = A_col * B_col
-        S_col = S_col.at[pivot].add(shift)
+        S_col = S_col.at[pivot].add(_shift)
         
         dot_prod = jnp.dot(L, L[pivot])
-        is_small = pivot_val < 1e-12
-        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
+        is_small = pivot_val < _s(1e-12)
+        safe_pivot = jnp.where(is_small, _s(1.0), pivot_val)
         inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
         
         l_col = (S_col - dot_prod) * inv_sqrt_pivot
-        l_col = jnp.where(is_small, 0.0, l_col)
+        l_col = jnp.where(is_small, _s(0.0), l_col)
         L = L.at[:, step].set(l_col)
-        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        diag_err = jnp.maximum(diag_err - l_col**2, _s(0.0))
+        diag_err = jnp.where(is_small, diag_err.at[pivot].set(_s(0.0)), diag_err)
         
         return diag_err, L, pivots
 
