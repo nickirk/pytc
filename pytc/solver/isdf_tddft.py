@@ -1651,6 +1651,13 @@ def _tddft_contraction(multi, nocc, mo_energy, C_o, C_v, J, tri_vec, TDA=False, 
 # Streaming helpers: build J_munu and wfxc without holding full xi_phi/xi_grad
 # ---------------------------------------------------------------------------
 
+@jax.jit
+def update_df_kernels(aux_b, xi_b, w_b):
+    w_aux_b = (aux_b * w_b[:, None]).T
+    S = w_aux_b @ aux_b
+    V = w_aux_b @ xi_b.T
+    return S, V
+
 def compute_ISDF_J_kernels_DF_streaming(
     h5_path, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12,
     batch_size=4096, backend='jax'
@@ -1714,10 +1721,10 @@ def compute_ISDF_J_kernels_DF_streaming(
                 aux_b  = jax.device_put(jnp.array(aux_b_np))
                 xi_b   = jax.device_put(jnp.array(f['xi_phi'][:, g_start:g_end]))
                 w_b    = jax.device_put(jnp.array(weights_b))
-                w_aux_b = (aux_b * w_b[:, None]).T             # (naux_df, B)
-                S_PQ  += np.array(jnp.matmul(w_aux_b, aux_b))
-                V_Pmu += np.array(jnp.matmul(w_aux_b, xi_b.T))
-                del aux_b, xi_b, w_b, w_aux_b
+                spq_batch, vpm_batch = update_df_kernels(aux_b, xi_b, w_b)
+                S_PQ  += np.array(spq_batch)
+                V_Pmu += np.array(vpm_batch)
+                del aux_b, xi_b, w_b, spq_batch, vpm_batch
 
     gc.collect()
     if backend == 'jax':
@@ -1791,6 +1798,15 @@ def compress_isdf_lda_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
     print(f"  => wfxc shape {wfxc.shape}, took {time.time()-t0:.2f} s")
     return wfxc
 
+@jax.jit
+def update_df_gga_kernels(xi_phi, xi_grad, w_batch):
+    xi_full = jnp.concatenate([
+        xi_phi[None, :, :],
+        xi_grad.transpose(2, 0, 1)
+    ], axis=0)
+    tmp = jnp.einsum('ymg,yxg->yxmg', xi_full, w_batch)   # (Y,X,M,G)
+    return jnp.einsum('yxmg,xng->yxmn', tmp, xi_full)
+
 def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, backend='jax'):
     """
     Streaming GGA fxc compression.
@@ -1847,33 +1863,30 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                 tb = time.time()
 
                 _t = time.time()
-                xi_phi_b  = jnp.array(f['xi_phi'][:, g_start:g_end])
-                xi_grad_b = jnp.array(f['xi_grad'][:, g_start:g_end, :])
+                xi_phi_b  = jax.device_put(jnp.array(f['xi_phi'][:, g_start:g_end]))
+                xi_grad_b = jax.device_put(jnp.array(f['xi_grad'][:, g_start:g_end, :]))
                 # xi_phi_b.block_until_ready(); xi_grad_b.block_until_ready()
                 t_h5 = time.time() - _t; _tt['h5'] += t_h5
 
                 _t = time.time()
-                xi_full = jnp.concatenate([
-                    xi_phi_b[None, :, :],
-                    xi_grad_b.transpose(2, 0, 1)
-                ], axis=0)
-                xi_full.block_until_ready()
-                t_xi = time.time() - _t; _tt['xi'] += t_xi
+                # Concatenation is now inside the JIT compiled function
+                t_xi = time.time() - _t; _tt['xi'] += 0.0 # kept 0.0 to not break print output
 
                 _t = time.time()
-                w_batch = jnp.array(wfxc_real[:, :, g_start:g_end])
-                w_batch.block_until_ready()
+                w_batch = jax.device_put(jnp.array(wfxc_real[:, :, g_start:g_end]))
+                # w_batch.block_until_ready()
                 t_w = time.time() - _t; _tt['w'] += t_w
 
                 _t = time.time()
-                # update = jnp.einsum('ymg, xng, yxg -> yxmn', xi_full, xi_full, w_batch)
-                tmp = jnp.einsum('ymg,yxg->yxmg', xi_full, w_batch)   # (Y,X,M,G)
-                update =  jnp.einsum('yxmg,xng->yxmn', tmp, xi_full)
-                # update.block_until_ready()
+                update = update_df_gga_kernels(xi_phi_b, xi_grad_b, w_batch)
+                update.block_until_ready()  # UNCOMMENTED: So einsum takes the timing
                 t_einsum = time.time() - _t; _tt['einsum'] += t_einsum
 
                 _t = time.time()
-                wfxc_cpu += np.array(update)
+                # Fast Device-to-Host transfer and in-place accumulate
+                # Note: `np.add` is already perfectly optimized for straight layout (ijkl -> ijkl).
+                # No transposition is needed.
+                np.add(wfxc_cpu, jax.device_get(update), out=wfxc_cpu)
                 t_copy = time.time() - _t; _tt['copy'] += t_copy
 
                 t_batch = time.time() - tb
@@ -1881,7 +1894,7 @@ def compress_isdf_gga_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                       f"h5={t_h5:.3f}s  xi={t_xi:.3f}s  w={t_w:.3f}s  "
                       f"einsum={t_einsum:.3f}s  copy={t_copy:.3f}s  | total={t_batch:.3f}s")
 
-                del xi_phi_b, xi_grad_b, xi_full, w_batch, update
+                del xi_phi_b, xi_grad_b, w_batch, update
                 jax.clear_caches()
 
     t_total = time.time() - t0
