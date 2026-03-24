@@ -335,7 +335,7 @@ def _compute_J_jax_core(aux_eval, weights, xi_phi, J_PQ, rcond):
     return J_munu
 
 
-def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12):
+def compute_ISDF_J_kernels_DF_incore(xi_phi, weights, coords, pivots, gammas=[0.25, 0.5], omega=0, rcond=1e-12):
     import time
     from pyscf import gto
     
@@ -357,16 +357,16 @@ def compute_ISDF_J_kernels_DF_gpu(xi_phi, weights, coords, pivots, gammas=[0.25,
     # --- DEVICE TRANSFER ---
     # Move everything to GPU memory
     t_transfer = time.time()
-    R_gpu = jax.device_put(jnp.array(R_cpu))
-    J_PQ_gpu = jax.device_put(jnp.array(J_PQ_cpu))
-    xi_phi_gpu = jax.device_put(jnp.array(xi_phi))
-    weights_gpu = jax.device_put(jnp.array(weights))
+    R_incore = jax.device_put(jnp.array(R_cpu))
+    J_PQ_incore = jax.device_put(jnp.array(J_PQ_cpu))
+    xi_phi_incore = jax.device_put(jnp.array(xi_phi))
+    weights_incore = jax.device_put(jnp.array(weights))
     print(f"Host-to-Device Transfer: {time.time() - t_transfer:.4f}s")
     
 
     # --- JAX KERNEL EXECUTION ---
     t_jax = time.time()
-    J_munu = _compute_J_jax_core(R_gpu, weights_gpu, xi_phi_gpu, J_PQ_gpu, rcond)
+    J_munu = _compute_J_jax_core(R_incore, weights_incore, xi_phi_incore, J_PQ_incore, rcond)
 
     # Block until finished to get accurate timing (JAX is asynchronous)
     # J_munu.block_until_ready()
@@ -1711,9 +1711,9 @@ def compute_ISDF_J_kernels_DF_streaming(
                 del xi_b_np, w_aux_b
             else:
                 # JAX path — push batch to device (GPU if available)
-                aux_b  = jnp.array(aux_b_np)
-                xi_b   = jnp.array(f['xi_phi'][:, g_start:g_end])
-                w_b    = jnp.array(weights_b)
+                aux_b  = jax.device_put(jnp.array(aux_b_np))
+                xi_b   = jax.device_put(jnp.array(f['xi_phi'][:, g_start:g_end]))
+                w_b    = jax.device_put(jnp.array(weights_b))
                 w_aux_b = (aux_b * w_b[:, None]).T             # (naux_df, B)
                 S_PQ  += np.array(jnp.matmul(w_aux_b, aux_b))
                 V_Pmu += np.array(jnp.matmul(w_aux_b, xi_b.T))
@@ -1783,8 +1783,8 @@ def compress_isdf_lda_kernel_streaming(h5_path, wfxc_real, batch_size=4096, back
                 wfxc += np.matmul(xi_b * w_b, xi_b.T)           # (naux, naux)
                 del xi_b, w_b
             else:
-                xi_b = jnp.array(f['xi_phi'][:, g_start:g_end])  # (naux, B) GPU
-                w_b  = jnp.array(wfxc_real[g_start:g_end])       # (B,)      GPU
+                xi_b = jax.device_put(jnp.array(f['xi_phi'][:, g_start:g_end]))  # (naux, B) GPU
+                w_b  = jax.device_put(jnp.array(wfxc_real[g_start:g_end]))       # (B,)      GPU
                 wfxc += np.array(jnp.matmul(xi_b * w_b, xi_b.T)) # (naux, naux)
                 del xi_b, w_b
 
@@ -2263,11 +2263,11 @@ class TDDFT(lib.StreamObject):
                             else:
                                 self.J_rsh = None
                     else:
-                        self.J = np.array(compute_ISDF_J_kernels_DF_gpu(
+                        self.J = np.array(compute_ISDF_J_kernels_DF_incore(
                             self.xi_phi, weights, grid_coords, pivot_coords, gammas=self.isdf_gammas
                         ))
                         if getattr(self, 'omega', 0.0) > 0:
-                            self.J_rsh = np.array(compute_ISDF_J_kernels_DF_gpu(
+                            self.J_rsh = np.array(compute_ISDF_J_kernels_DF_incore(
                                 self.xi_phi, weights, grid_coords, pivot_coords,
                                 gammas=self.isdf_gammas, omega=self.omega
                             ))
