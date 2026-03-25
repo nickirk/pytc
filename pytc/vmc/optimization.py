@@ -214,12 +214,20 @@ def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_op
     def training_step(ansatz, walkers, params, opt_state, key, global_step):
         # Pattern 1: Multiple MCMC steps before optimization (energy minimization)
         if n_mcmc_per_opt > 1:
-            pmove_list = []
-            for _ in range(n_mcmc_per_opt):
-                key, subkey = random.split(key)
-                walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
-                pmove_list.append(pmove)
-            pmove = pmove_list[-1]
+            def mcmc_scan_fn(carry, _):
+                walkers_carry, key_carry, params_carry = carry
+                key_carry, subkey = random.split(key_carry)
+                walkers_carry, pmove_carry = mcmc_step(ansatz, walkers_carry, subkey, params_carry)
+                return (walkers_carry, key_carry, params_carry), pmove_carry
+            
+            # Run MCMC loop
+            (walkers, key, _), pmoves = jax.lax.scan(
+                mcmc_scan_fn,
+                (walkers, key, params),
+                None,
+                length=n_mcmc_per_opt
+            )
+            pmove = pmoves[-1]
             
             # Single optimization step
             key, subkey = random.split(key)

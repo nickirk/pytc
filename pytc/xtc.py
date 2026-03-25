@@ -12,6 +12,7 @@ from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 import h5py
 from flax import struct
+from collections import OrderedDict
 from .tc import TC, ISDFTC
 from . import tc_helper
 from . import kmat as kmat_jax
@@ -27,36 +28,41 @@ logger = logging.getLogger(__name__)
 # (p, q) orbital indices vary.  Caching the last-read X slice avoids
 # re-reading tens of GB from HDF5 per block.
 #
-# The cache holds at most one slice.  When the phase changes (and the
-# (slice_r, slice_s) key changes), the old slice is replaced.
+# The cache holds at most two slices.
 # ---------------------------------------------------------------------------
-_X_HDF5_CACHE: dict = {"key": None, "data": None}
+_X_HDF5_CACHE = OrderedDict()
 
 
 def _read_X_slice(X, slice_r, slice_s):
     """Read ``X[slice_r, slice_s]``, reusing a host-side cache when possible.
 
-    If *X* is an HDF5 dataset and the requested slice matches the
-    previous call, the cached numpy array is returned directly — no I/O.
+    If *X* is an HDF5 dataset and the requested slice matches a
+    recently read slice, the cached numpy array is returned directly — no I/O.
     """
     if isinstance(X, h5py.Dataset):
         key = (id(X), _slice_key(slice_r), _slice_key(slice_s))
-        if _X_HDF5_CACHE["key"] == key:
+        if key in _X_HDF5_CACHE:
             logger.debug("X slice cache HIT  (%s, %s)", slice_r, slice_s)
-            return _X_HDF5_CACHE["data"]
+            data = _X_HDF5_CACHE.pop(key)
+            _X_HDF5_CACHE[key] = data  # Move to end (most recently used)
+            return data
+            
         logger.debug("X slice cache MISS (%s, %s) — reading from HDF5", slice_r, slice_s)
         data = X[slice_r, slice_s]
-        _X_HDF5_CACHE["key"] = key
-        _X_HDF5_CACHE["data"] = data
+        
+        if len(_X_HDF5_CACHE) >= 2:
+            _X_HDF5_CACHE.popitem(last=False)  # Remove least recently used
+            
+        _X_HDF5_CACHE[key] = data
         return data
+        
     # In-memory array: just slice directly.
     return X[slice_r, slice_s]
 
 
 def invalidate_X_cache():
     """Explicitly free the cached X slice (e.g., at end of CCSD iteration)."""
-    _X_HDF5_CACHE["key"] = None
-    _X_HDF5_CACHE["data"] = None
+    _X_HDF5_CACHE.clear()
 
 
 def _slice_key(sl):

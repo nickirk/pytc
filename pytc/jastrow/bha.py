@@ -53,15 +53,16 @@ class BoysHandyAnalytical(BoysHandy):
         diff = r_ref - r_target
         dist = self._safe_norm(diff)
         denom = 1.0 + scale * dist
-        scaled = scale * dist / denom
-
-        d1 = scale / (denom**2)
-        d2 = -2.0 * (scale**2) / (denom**3)
+        f = scale * dist / denom
+        
+        f_d1 = scale / (denom**2)
+        f_d2 = -2.0 * (scale**2) / (denom**3)
+        
         unit = diff / dist[..., None]
-        grad = d1[..., None] * unit
+        grad = f_d1[..., None] * unit
         grad_sq = jnp.sum(grad**2, axis=-1)
-        lap = d2 + 2.0 * d1 / dist
-        return scaled, grad, grad_sq, lap
+        lap = f_d2 + 2.0 * f_d1 / dist
+        return f, grad, grad_sq, lap
 
     def _compute_forward(self, r1, r2, params):
         b = nn.softplus(params['b_raw'])
@@ -105,6 +106,7 @@ class BoysHandyAnalytical(BoysHandy):
         powers = jnp.power(scalar_expanded, exponents)
 
         grad_coeff = jnp.where(exponents > 0, exponents * jnp.power(scalar_expanded, exponents - 1), 0.0)
+        
         lap_coeff_1 = jnp.where(
             exponents > 1,
             exponents * (exponents - 1) * jnp.power(scalar_expanded, exponents - 2),
@@ -121,7 +123,8 @@ class BoysHandyAnalytical(BoysHandy):
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
-        c = jnp.where(self._cusp_mask, 0.5, c_raw)
+        # Divide by natom so that sum over atoms gives exactly 0.5
+        c = jnp.where(self._cusp_mask, 0.5 / self.natom, c_raw)
         nuclei = self.padded_nuclei_by_type
         nuclei_mask = self.nuclei_mask_by_type
         degree_exponents = jnp.arange(self.max_degree + 1, dtype=r1.dtype)
@@ -194,3 +197,9 @@ class BoysHandyAnalytical(BoysHandy):
 
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
+
+    def grad_r(self, r1, r2, params):
+        return self.get_log_grads_r1(r1, r2, params)[0]
+
+    def laplacian_r(self, r1, r2, params):
+        return self.get_log_grads_r1(r1, r2, params)[1]

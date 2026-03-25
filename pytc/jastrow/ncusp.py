@@ -301,9 +301,6 @@ class NuclearCusp(Jastrow):
         
         return total/(self.nelectron - 1)
     
-    def grad_r(self, r1, r2, params):
-        return super().grad_r(r1, r2, params)/2.*(self.nelectron - 1)/self.nelectron
-    
     def get_log_grads_r1(self, r1, r2, params):
         """Compute ∇u and ∇²u w.r.t r1, hoisting poly_coeffs out of the pair loop.
 
