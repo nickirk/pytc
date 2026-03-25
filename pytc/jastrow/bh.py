@@ -46,7 +46,7 @@ class BoysHandy(Jastrow):
     name: str = struct.field(pytree_node=False, default=None)
 
     @classmethod
-    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-8, name=None):
+    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None):
         nelectron = mol.nelectron
         nuclear_pos = jnp.array(mol.atom_coords())
         nuclear_charges = jnp.array(mol.atom_charges())
@@ -59,7 +59,7 @@ class BoysHandy(Jastrow):
         for i, charge in enumerate(nuclear_charges):
             type_idx = jnp.where(unique_charges == charge)[0][0].astype(jnp.int32)
             atom_type_map = atom_type_map.at[i].set(type_idx)
-        
+            
         if terms_per_nucleus is None:
             d_cusp = 0.5
             default_terms_for_one_nucleus = [
@@ -125,7 +125,7 @@ class BoysHandy(Jastrow):
             mask_np = jnp.array(atom_type_map) == i
             nuclei_group = nuclear_pos[jnp.array(mask_np)]
             nuclei_by_type.append(nuclei_group)
-
+            
         return cls(
             nuclear_pos=nuclear_pos,
             nuclear_charges=nuclear_charges,
@@ -152,11 +152,11 @@ class BoysHandy(Jastrow):
     
     def _scaled_r_en(self, r_electron, r_nuclear, b):
         r = self._safe_norm(r_electron - r_nuclear)
-        return r * b / (1.0 + r * b) 
+        return r * b / (1.0 + r * b)
         
     def _scaled_r_ee(self, r1, r2, d):
         r = self._safe_norm(r1 - r2)
-        return r * d / (1.0 + r * d) 
+        return r * d / (1.0 + r * d)
         
     def init_params(self, **kwargs):
         b_raw = jnp.ones(self.n_types)   
@@ -179,7 +179,8 @@ class BoysHandy(Jastrow):
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
         
-        c = jnp.where(self._cusp_mask, 0.5, c_raw)
+        # Divide by natom so that sum over atoms gives exactly 0.5
+        c = jnp.where(self._cusp_mask, 0.5 / self.natom, c_raw)
 
         def compute_term(atom_idx):
             type_idx = self.atom_type_map[atom_idx]
@@ -203,10 +204,7 @@ class BoysHandy(Jastrow):
             
             def get_powers(x, degree):
                 exponents = jnp.arange(degree + 1)
-                safe_x = jnp.where(x == 0.0, 1.0, x)
-                powers = jnp.power(safe_x[..., None], exponents)
-                mask = (x == 0.0)[..., None] & (exponents > 0)
-                return jnp.where(mask, 0.0, powers)
+                return jnp.power(x[..., None], exponents)
             
             p_r1I = get_powers(r1I, self.max_degree)
             p_r2I = get_powers(r2I, self.max_degree)
@@ -240,10 +238,8 @@ class BoysHandy(Jastrow):
         return self._compute_forward(r1, r2, params)
 
     def get_param_count(self):
-        count = 2 * self.n_types
-        for type_terms in self.terms_per_atom_type:
-            count += len(type_terms)
-        return count
+        # b_raw (n_types), d_raw (n_types), c_raw (n_types * n_terms)
+        return self.n_types * 2 + self.n_types * self.n_terms
 
     def flatten_params(self, params):
         return jnp.concatenate([
@@ -254,21 +250,16 @@ class BoysHandy(Jastrow):
 
     def unflatten_params(self, flat_params):
         idx = 0
-        b_size = self.n_types
-        b_raw = flat_params[idx:idx+b_size]
-        idx += b_size
         
-        d_size = self.n_types
-        d_raw = flat_params[idx:idx+d_size]
-        idx += d_size
+        b_raw = flat_params[idx:idx+self.n_types]
+        idx += self.n_types
         
-        c_raw = []
-        for type_terms in self.terms_per_atom_type:
-            c_size = len(type_terms)
-            c_type = flat_params[idx:idx+c_size]
-            c_raw.append(c_type)
-            idx += c_size
-        c_raw = jnp.array(c_raw)
+        d_raw = flat_params[idx:idx+self.n_types]
+        idx += self.n_types
+        
+        c_size = self.n_types * self.n_terms
+        c_raw = flat_params[idx:idx+c_size].reshape(self.n_types, self.n_terms)
+        idx += c_size
         
         return {
             'b_raw': b_raw,

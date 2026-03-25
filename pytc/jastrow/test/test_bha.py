@@ -65,6 +65,18 @@ class TestBoysHandyAnalytical(unittest.TestCase):
         np.testing.assert_allclose(np.array(grad_new), np.array(grad_ref), rtol=1e-8, atol=1e-8)
         np.testing.assert_allclose(np.array(lap_new), np.array(lap_ref), rtol=1e-7, atol=1e-7)
 
+    def test_parameter_gradient_nan_check(self):
+        """Test that optimizing parameters beyond cutoff does not yield NaNs."""
+        r1 = jnp.array([10.0, 10.0, 10.0])
+        r2 = jnp.array([-10.0, -10.0, -10.0])
+        def energy_fn(params):
+            g, l = self.bha.get_log_grads_r1(r1, r2, params)
+            return jnp.sum(g) + l
+            
+        grads = jax.grad(energy_fn)(self.params)
+        for key in grads:
+            self.assertFalse(jnp.any(jnp.isnan(grads[key])), f"NaN found in parameter gradient for {key}")
+
 
 if __name__ == "__main__":
     unittest.main()

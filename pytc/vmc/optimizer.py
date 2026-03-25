@@ -107,7 +107,7 @@ class NewtonOptimizer:
         )
 
     def init(self, params, rng, batch):
-        return 0  # step count
+        return jnp.array(0, dtype=jnp.int32)  # step count
 
     def step(self, params, state, rng, batch, global_step_int=None):
         walkers, ansatz = batch

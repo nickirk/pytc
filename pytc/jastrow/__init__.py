@@ -7,8 +7,9 @@ from .nn import NeuralEN, NeuralEE, NeuralEEN
 from .ncusp import NuclearCusp
 from .bh import BoysHandy
 from .bha import BoysHandyAnalytical
+from .dtn import DTN
 from .composite import CompositeJastrow
 
 __all__ = ['Jastrow', 'Poly', 'REXP', 'BoysHandy', 'BoysHandyAnalytical',
-           'NeuralEN', 'NeuralEE', 'NeuralEEN', 
+           'DTN', 'NeuralEN', 'NeuralEE', 'NeuralEEN', 
            'NuclearCusp', 'CompositeJastrow']

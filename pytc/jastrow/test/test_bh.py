@@ -8,7 +8,7 @@ from jax import random
 from pyscf import gto
 
 from pytc.jastrow.bh import BoysHandy, BHTerm
-from pytc.jastrow.sm7 import SM7
+from pytc.legacy.jastrow.sm7 import SM7
 
 # Enable float64 support
 jax.config.update("jax_enable_x64", True)
@@ -62,6 +62,7 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         bh_terms = sm7_coeffs_to_bh_terms(atom_symbol)
         
         # Create BH Jastrow with single nucleus, so terms_per_nucleus is a list with one element
+        # (It naturally has no cutoffs now as we removed them)
         bh = BoysHandy.create(mol, terms_per_nucleus=[bh_terms])
         
         # Initialize parameters
@@ -272,13 +273,13 @@ class TestBoysHandy(unittest.TestCase):
              BHTerm(1, 0, 0, -0.1), # e-n term (attractive)
              BHTerm(2, 0, 0, -0.1)] # higher order term (attractive)
         ]
-        self.jastrow = BoysHandy.create(self.mol, terms_per_nucleus=terms)
+        self.jastrow = BoysHandy.create(self.mol, terms_per_nucleus=terms, epsilon=1e-16)
         self.params = self.jastrow.init_params(key=self.key)
 
     def test_init(self):
         """Test initialization."""
         # Test default initialization
-        jastrow = BoysHandy.create(self.mol)
+        jastrow = BoysHandy.create(self.mol, epsilon=1e-16)
         params = jastrow.init_params()
         
         # Check parameter structure
@@ -314,22 +315,48 @@ class TestBoysHandy(unittest.TestCase):
 
     def test_electron_cusp(self):
         """Test electron-electron cusp condition."""
-        r1 = jnp.array([0., 0., 0.])
-        eps = 1e-5
-        r2 = jnp.array([eps, 0., 0.])
+        # Shift electrons far from nuclei (at origin) to minimize e-n slope interference
+        r1 = jnp.array([10.0, 10.0, 0.0])
+        eps = 1e-3
+        r2_a = r1 + jnp.array([eps, 0.0, 0.0])
+        r2_b = r1 + jnp.array([2.0*eps, 0.0, 0.0])
         
-        # Compute numerical gradient at small separation
-        # The cusp term should dominate at small separations
-        grad_fn = jax.grad(lambda x: self.jastrow._compute(r1, x, self.params))
-        grad_val = grad_fn(r2)[0]  # x-component of gradient at r2=(eps,0,0)
+        ua = float(self.jastrow._compute(r1, r2_a, self.params))
+        ub = float(self.jastrow._compute(r1, r2_b, self.params))
         
-        # For unlike-spin electrons, the cusp term (0,0,1) with c=0.5 contributes to the gradient
-        # With atom-type parameterization, both H atoms use the same parameters
-        # The exact value depends on the scaling and number of nuclei, but should be positive
-        # and reasonably close to the theoretical cusp value
-        self.assertGreater(grad_val, 0.0, "Gradient should be positive at small separation")
-        # Just verify it's in a reasonable range (not too far from cusp expectations)
-        self.assertLess(grad_val, 1.0, "Gradient should be less than 1.0")
+        du = (ub - ua) / eps
+        
+        np.testing.assert_allclose(
+            du, 0.5, rtol=0.03,
+            err_msg=f"EE cusp should be exactly 0.5, got {du:.6f}"
+        )
+
+    def test_electron_cusp_h2o(self):
+        """Test electron-electron cusp condition for a molecule with multiple atom types."""
+        from pyscf import gto
+        mol = gto.M(
+            atom='O 0 0 0; H 0 1 1; H 0 -1 1',
+            basis='sto-3g',
+            unit='bohr'
+        )
+        jastrow = BoysHandy.create(mol, epsilon=1e-16)
+        params = jastrow.init_params()
+
+        # Shift electrons far from nuclei to minimize e-n slope interference
+        r1 = jnp.array([10.0, 10.0, 0.0])
+        eps = 1e-6
+        r2_a = r1 + jnp.array([eps, 0.0, 0.0])
+        r2_b = r1 + jnp.array([2.0*eps, 0.0, 0.0])
+
+        ua = float(jastrow._compute(r1, r2_a, params))
+        ub = float(jastrow._compute(r1, r2_b, params))
+
+        du = (ub - ua) / eps
+
+        np.testing.assert_allclose(
+            du, 0.5, rtol=0.03,
+            err_msg=f"EE cusp should be exactly 0.5 for H2O, got {du:.6f}"
+        )
 
     def test_nuclear_decay(self):
         """Test decay of correlation with nuclear distance."""
