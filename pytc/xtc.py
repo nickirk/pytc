@@ -2099,42 +2099,49 @@ class ISDFXTC(XTC, ISDFTC):
             kernels, ranges, device=device, panel_size=panel_size)
 
         slice_p, slice_q, slice_r, slice_s = ranges
+        if panel_size is not None:
+            if slice_p == slice_r and slice_q == slice_s:
+                return -(direct + direct.transpose(2, 3, 0, 1))
+
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            tmp = self._get_delta_u_direct_tile(
+                kernels, ranges_T, device=device, panel_size=panel_size)
+            return -(direct + tmp.transpose(2, 3, 0, 1))
+
         if slice_p == slice_r and slice_q == slice_s:
             return -(direct + direct.transpose(2, 3, 0, 1))
 
         result_np = -np.asarray(direct)
         del direct
-        if panel_size is not None:
-            ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            tmp = self._get_delta_u_direct_tile(
-                kernels, ranges_T, device=device, panel_size=panel_size)
-            result_np -= np.asarray(tmp.transpose(2, 3, 0, 1))
+        nmo = self.phi_isdf.shape[0]
+        r_start = slice_r.start if slice_r.start is not None else 0
+        r_stop = slice_r.stop if slice_r.stop is not None else nmo
+        r_len = r_stop - r_start
+        n_sub = 2
+        chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+        for i0 in range(0, r_len, chunk_size):
+            i1 = min(i0 + chunk_size, r_len)
+            sub_ranges = (slice(r_start + i0, r_start + i1),
+                          slice_s, slice_p, slice_q)
+            tmp = self._get_delta_u_direct_tile(kernels, sub_ranges, device=device)
+            chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
             del tmp
-        else:
-            nmo = self.phi_isdf.shape[0]
-            r_start = slice_r.start if slice_r.start is not None else 0
-            r_stop = slice_r.stop if slice_r.stop is not None else nmo
-            r_len = r_stop - r_start
-            n_sub = 2
-            chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
-            for i0 in range(0, r_len, chunk_size):
-                i1 = min(i0 + chunk_size, r_len)
-                sub_ranges = (slice(r_start + i0, r_start + i1),
-                              slice_s, slice_p, slice_q)
-                tmp = self._get_delta_u_direct_tile(kernels, sub_ranges, device=device)
-                chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
-                del tmp
-                result_np[:, :, i0:i1, :] -= chunk_np
-                del chunk_np
+            result_np[:, :, i0:i1, :] -= chunk_np
+            del chunk_np
         return jnp.asarray(result_np)
 
     def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None, panel_size=None):
         """Assemble a finished ISDF-XTC 2-body tile from TC and Delta U parts."""
         del jastrow_params  # Reserved for future per-tile kernel refresh logic.
-        tc_tile = np.array(super()._assemble_tc_tile(
-            kernels, ranges, device=device, panel_size=panel_size))
-        delta_u_tile = np.array(self._assemble_delta_u_tile(
-            kernels, ranges, device=device, panel_size=panel_size))
-        tc_tile += delta_u_tile
+        tc_tile = super()._assemble_tc_tile(
+            kernels, ranges, device=device, panel_size=panel_size)
+        delta_u_tile = self._assemble_delta_u_tile(
+            kernels, ranges, device=device, panel_size=panel_size)
+
+        if panel_size is not None:
+            return tc_tile + delta_u_tile
+
+        tc_tile = np.array(tc_tile)
+        tc_tile += np.array(delta_u_tile)
         return jnp.asarray(tc_tile)
     

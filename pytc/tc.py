@@ -1154,6 +1154,11 @@ class ISDFTC(TC):
                 k12 = kmat_jax.contract_K1_minus_K2_isdf_jit(
                     phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs)
 
+            if panel_size is not None:
+                k3 = kmat_jax.contract_K3_isdf_jit(
+                    phi_p, phi_q, phi_r, phi_s, u3, rbs)
+                return 0.5 * (k12 + k3)
+
             result_np = np.array(k12)
             del k12
             k3 = kmat_jax.contract_K3_isdf_jit(
@@ -1167,6 +1172,17 @@ class ISDFTC(TC):
         """Assemble and symmetrize one finished TC tile."""
         direct = self._get_tc_direct_tile(
             kernels, ranges, device=device, panel_size=panel_size)
+
+        if panel_size is not None:
+            slice_p, slice_q, slice_r, slice_s = ranges
+            if slice_p == slice_r and slice_q == slice_s:
+                return -(direct + direct.transpose(2, 3, 0, 1))
+
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            tmp = self._get_tc_direct_tile(
+                kernels, ranges_T, device=device, panel_size=panel_size)
+            return -(direct + tmp.transpose(2, 3, 0, 1))
+
         result_np = np.array(direct)
         del direct
 
