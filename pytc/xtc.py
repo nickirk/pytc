@@ -1594,7 +1594,33 @@ class ISDFXTC(XTC, ISDFTC):
         else:
             kernels = self.isdf_kernels
 
-        result = self._assemble_delta_u_tile(kernels, ranges)
+        result = self._contract_delta_U_kernels(kernels, ranges)
+
+        # Public get_delta_U is a generic block API, not the solver tile path.
+        # Keep its original chunk-aware symmetrization so large pq/rs blocks do
+        # not route through the fixed-size tile executor.
+        slice_p, slice_q, slice_r, slice_s = ranges
+        if slice_p == slice_r and slice_q == slice_s:
+            result = -(result + result.transpose(2, 3, 0, 1))
+        else:
+            result_np = -np.asarray(result)
+            del result
+            nmo = self.phi_isdf.shape[0]
+            r_start = slice_r.start if slice_r.start is not None else 0
+            r_stop = slice_r.stop if slice_r.stop is not None else nmo
+            r_len = r_stop - r_start
+            n_sub = 2
+            chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+            for i0 in range(0, r_len, chunk_size):
+                i1 = min(i0 + chunk_size, r_len)
+                sub_ranges = (slice(r_start + i0, r_start + i1),
+                              slice_s, slice_p, slice_q)
+                tmp = self._contract_delta_U_kernels(kernels, sub_ranges)
+                chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
+                del tmp
+                result_np[:, :, i0:i1, :] -= chunk_np
+                del chunk_np
+            result = jnp.asarray(result_np)
 
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFXTC.get_delta_U completed in {total_time:.4f} s")
@@ -1766,13 +1792,23 @@ class ISDFXTC(XTC, ISDFTC):
             return len(idx), idx
 
         Np, _ = get_info(slice_p, self.n_orb)
+        # Check size of X_sliced vs available GPU memory
+        from pytc.utils.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
         Nq, _ = get_info(slice_q, self.n_orb)
         Nr, r_idx = get_info(slice_r, self.n_orb)
         Ns, s_idx = get_info(slice_s, self.n_orb)
         N_rank = X.shape[2]
-        
-        # Check size of X_sliced vs available GPU memory
-        from pytc.utils.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
+        phi_p = self.phi_isdf[slice_p]
+        phi_q = self.phi_isdf[slice_q]
+
+        # Use fixed rank_block_size (worst-case over all phases) to avoid
+        # JIT recompilation when (Np, Nq) changes across CCSD blocks.
+        _rbs = self._get_fixed_rank_block_size()
+        if _rbs is None:
+            _rbs = adaptive_rank_block_size(
+                Np, Nq, N_rank,
+                gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
+
         gpu_free_bytes = _get_gpu_free_bytes()
         
         # Estimate total GPU memory needed for delta_U calculation.
@@ -1805,19 +1841,19 @@ class ISDFXTC(XTC, ISDFTC):
         )
         
         if total_needed_bytes < threshold_bytes:
-            return self._get_delta_u_direct_tile(kernels, ranges)
+            phi_r = self.phi_isdf[slice_r]
+            phi_s = self.phi_isdf[slice_s]
+            X_full = _read_X_slice(X, slice_r, slice_s)
+            return _contract_delta_U_kernels_jit(
+                D,
+                jnp.asarray(X_full),
+                jnp.asarray(phi_p),
+                jnp.asarray(phi_q),
+                jnp.asarray(phi_r),
+                jnp.asarray(phi_s),
+                _rbs,
+            )
 
-        phi_p = self.phi_isdf[slice_p]
-        phi_q = self.phi_isdf[slice_q]
-
-        # Use fixed rank_block_size (worst-case over all phases) to avoid
-        # JIT recompilation when (Np, Nq) changes across CCSD blocks.
-        _rbs = self._get_fixed_rank_block_size()
-        if _rbs is None:
-            _rbs = adaptive_rank_block_size(
-                Np, Nq, N_rank,
-                gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None))
-        
         # Chunking strategy to avoid VRAM exhaustion. Stream only the X panel
         # needed for each chunk instead of first materializing the full X slice.
         logger.warning(
