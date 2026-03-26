@@ -986,7 +986,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                      tc_blk = await_read(pending_tc)
                      pending_tc = None
                  else:
-                     tc_blk = np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, ranges))
+                     tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
 
                  # Kick off NEXT block's get_2b in background
                  next_p0 = p0 + blksize
@@ -995,7 +995,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                      next_ranges = (slice(0, nocc), slice(nocc, nmo),
                                     slice(nocc+next_p0, nocc+next_p1), slice(nocc, nmo))
                      pending_tc = async_read(
-                         lambda r=next_ranges: np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, r)))
+                         lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
                      pending_key = (next_p0, next_p1)
 
                  ds[:, :, p0:p1, :] = std_blk + tc_blk
@@ -1021,7 +1021,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                     tc_blk = await_read(pending_tc)
                     pending_tc = None
                 else:
-                    tc_blk = np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, ranges))
+                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
 
                 # Kick off NEXT block's get_2b in background
                 next_p0 = p0 + blksize
@@ -1030,7 +1030,7 @@ def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshap
                     next_ranges = (slice(nocc+next_p0, nocc+next_p1),
                                    slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
                     pending_tc = async_read(
-                        lambda r=next_ranges: np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, r)))
+                        lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
                     pending_key = (next_p0, next_p1)
 
                 ds[p0:p1, :, :, :] = std_blk + tc_blk
@@ -1137,7 +1137,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
             tc_blk = await_read(pending_tc)
             pending_tc = None
         else:
-            tc_blk = np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, ranges))
+            tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
 
         # Kick off NEXT block's get_2b in background
         next_p0 = p0 + blksize
@@ -1146,7 +1146,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
             next_ranges = (slice(nocc+next_p0, nocc+next_p1),
                            slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
             pending_tc = async_read(
-                lambda r=next_ranges: np.asarray(xtc_mod.compute_2b_tile(xtc_obj, jastrow_params, r)))
+                lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
             pending_key = (next_p0, next_p1)
 
         ds[p0:p1, :, :, :] = std_blk + tc_blk
