@@ -800,7 +800,7 @@ class ISDFTC(TC):
             for r0 in range(0, n_grid, host_grid_block_size):
                 r1 = min(r0 + host_grid_block_size, n_grid)
                 n_eval = r1 - r0
-                logger.debug(f"_compute_L_aux: Processing evaluation block [{r0}:{r1}]...")
+                logger.info(f"_compute_L_aux: Processing block [{r0}:{r1}]...")
                 
                 remainder = n_eval % n_devices
                 padding = (n_devices - remainder) if remainder != 0 else 0
