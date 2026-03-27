@@ -15,6 +15,7 @@ from pytc.utils.gpu_memory import (
     resolve_vvvv_panel_block_sizes,
     enable_xla_compilation_cache,
 )
+import h5py
 from pytc import xtc as xtc_mod
 
 logger = logging.getLogger(__name__)
@@ -1084,6 +1085,19 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         (nvir + r_blksize - 1) // r_blksize,
     )
 
+    # If X is an HDF5 dataset, preload it into RAM to avoid 15k+ per-tile
+    # GPFS reads (outer-p × inner-r loop would re-read every r-slice per p-slab).
+    kernels = xtc_obj.isdf_kernels
+    X = kernels.get('X')
+    if isinstance(X, h5py.Dataset):
+        x_gb = X.size * 8 / 1e9
+        logger.info("Preloading X into RAM before VVVV write (%.2f GB) ...", x_gb)
+        t_x = time.perf_counter()
+        kernels = dict(kernels)
+        kernels['X'] = X[:]
+        xtc_obj = xtc_obj.replace(isdf_kernels=kernels)
+        logger.info("X preload done in %.1f s", time.perf_counter() - t_x)
+
     ds = eris.vvvv
     devices = _solver_local_devices()
     for p0, p1 in lib.prange(0, nvir, p_blksize):
@@ -1095,7 +1109,12 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             for r0 in range(0, nvir, r_blksize)
         ]
 
-        def issue_tile(spec, device):
+        _t_issue = [0.0]
+        _t_gpu_wait = [0.0]
+        _t_tensordot = [0.0]
+        _t_assign = [0.0]
+
+        def issue_tile(spec, device, _t=_t_issue):
             _, _, r0, r1 = spec
             ranges = (
                 slice(nocc + p0, nocc + p1),
@@ -1103,21 +1122,39 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
                 slice(nocc + r0, nocc + r1),
                 slice(nocc, nmo),
             )
-            return xtc_mod.compute_2b_tile(
+            t0 = time.perf_counter()
+            result = xtc_mod.compute_2b_tile(
                 xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
+            _t[0] += time.perf_counter() - t0
+            return result
 
-        def consume_tile(spec, device, tile_handle):
+        def consume_tile(spec, device, tile_handle,
+                         _tw=_t_gpu_wait, _tt=_t_tensordot, _ta=_t_assign):
             _, _, r0, r1 = spec
             p_len = p1 - p0
             r_len = r1 - r0
-            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]
+            t0 = time.perf_counter()
+            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # blocks on GPU
+            t1 = time.perf_counter()
             std_tile = np.tensordot(L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
+            t2 = time.perf_counter()
             vvvv_slab[:, :, r0:r1, :] = std_tile + tc_tile
+            _tw[0] += t1 - t0
+            _tt[0] += t2 - t1
+            _ta[0] += time.perf_counter() - t2
 
         _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
 
+        t_write_start = time.perf_counter()
         ds[p0:p1, :, :, :] = vvvv_slab
-        logger.debug("VVVV slab %d:%d written to disk", p0, p1)
+        t_write = time.perf_counter() - t_write_start
+
+        logger.debug(
+            "VVVV slab %3d:%3d | dispatch=%.2fs  gpu_wait=%.2fs  "
+            "tensordot=%.2fs  assign=%.2fs  hdf5_write=%.2fs",
+            p0, p1,
+            _t_issue[0], _t_gpu_wait[0], _t_tensordot[0], _t_assign[0], t_write,
+        )
     logger.info("    VVVV disk write complete")
 
 

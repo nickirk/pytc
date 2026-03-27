@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
 _ISDF_DEVICE_CACHE: dict = {}
+_TC_DIRECT_TILE_PROFILED: bool = False  # log first tile's phase breakdown once
 
 
 def _array_nbytes(arr):
@@ -1101,6 +1102,12 @@ class ISDFTC(TC):
 
     def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
+        global _TC_DIRECT_TILE_PROFILED
+        _profile = not _TC_DIRECT_TILE_PROFILED and panel_size is not None
+        if _profile:
+            _TC_DIRECT_TILE_PROFILED = True
+            _t0 = time.perf_counter()
+
         U1 = kernels['K1_kernel']
         U3 = kernels['K3_kernel']
         slice_p, slice_q, slice_r, slice_s = ranges
@@ -1108,6 +1115,19 @@ class ISDFTC(TC):
         rbs = self._get_fixed_rank_block_size()
         u1 = jax.device_put(U1, device) if device is not None else U1
         u3 = jax.device_put(U3, device) if device is not None else U3
+
+        if _profile:
+            jax.block_until_ready((u1, u3))
+            _t_put = time.perf_counter()
+            logger.debug(
+                "_get_tc_direct_tile first-tile profile: K1+K3 device_put %.3fs "
+                "(K1=%.1fMB, K3=%.1fMB, device=%s)",
+                _t_put - _t0,
+                getattr(U1, 'nbytes', 0) / 1e6,
+                getattr(U3, 'nbytes', 0) / 1e6,
+                getattr(device, 'id', 'default'),
+            )
+
         device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
 
         cache_getter = getattr(self, "_get_isdf_device_cache", None)
@@ -1155,8 +1175,18 @@ class ISDFTC(TC):
                     phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs)
 
             if panel_size is not None:
+                if _profile:
+                    jax.block_until_ready(k12)
+                    _t_k1 = time.perf_counter()
+                    logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
+                                 _t_k1 - _t_put)
                 k3 = kmat_jax.contract_K3_isdf_jit(
                     phi_p, phi_q, phi_r, phi_s, u3, rbs)
+                if _profile:
+                    jax.block_until_ready(k3)
+                    _t_k3 = time.perf_counter()
+                    logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
+                                 "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
                 return 0.5 * (k12 + k3)
 
             result_np = np.array(k12)
