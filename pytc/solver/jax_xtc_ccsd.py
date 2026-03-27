@@ -770,7 +770,8 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             p0, p1, r0, r1, getattr(device, "id", "host"), time.perf_counter() - t0_trans,
         )
 
-    xtc_ccsd._round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+    xtc_ccsd._round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices,
+                                   device_key=lambda spec: spec[0])
 
     if L_vv_full_host is not None:
         del L_vv_full_host

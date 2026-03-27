@@ -2078,6 +2078,8 @@ class ISDFXTC(XTC, ISDFTC):
                 phi_q = jax.device_put(phi_q, device)
                 phi_r = jax.device_put(phi_r, device)
                 phi_s = jax.device_put(phi_s, device)
+        else:
+            D = jnp.asarray(D)
         device_ctx = (
             jax.default_device(device)
             if device is not None
@@ -2085,12 +2087,7 @@ class ISDFXTC(XTC, ISDFTC):
         )
         with device_ctx:
             return _contract_delta_u_direct_tile_jit(
-                jnp.asarray(D),
-                jnp.asarray(X_sliced),
-                jnp.asarray(phi_p),
-                jnp.asarray(phi_q),
-                jnp.asarray(phi_r),
-                jnp.asarray(phi_s),
+                D, X_sliced, phi_p, phi_q, phi_r, phi_s,
             )
 
     def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None):

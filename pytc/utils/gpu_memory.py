@@ -87,9 +87,9 @@ def get_gpu_budget_bytes(gpu_max_memory_mb=None):
     """Return the total usable GPU memory budget in bytes.
 
     If *gpu_max_memory_mb* is provided and > 0 it is treated as the
-    authoritative limit (no runtime query).  Otherwise we try
-    ``jax.devices()[0].memory_stats()`` and fall back to a conservative
-    16 GiB default.
+    authoritative limit (no runtime query).  Otherwise the minimum
+    ``bytes_limit`` across all local devices is used, falling back to a
+    conservative 16 GiB default.
 
     Returns
     -------
@@ -101,49 +101,53 @@ def get_gpu_budget_bytes(gpu_max_memory_mb=None):
 
     try:
         import jax
-        stats = jax.devices()[0].memory_stats()
-        return int(stats['bytes_limit'])
+        limits = [int(d.memory_stats()['bytes_limit'])
+                  for d in jax.local_devices()]
+        return min(limits) if limits else 16 * 1024 ** 3
     except Exception:
         return 16 * 1024 ** 3  # 16 GiB fallback
 
 
 def _get_gpu_physical_bytes():
-    """Return the physical GPU memory capacity in bytes.
+    """Return the minimum GPU pool limit across all local devices.
 
-    Queries the actual hardware limit (total device memory), which is
-    independent of JAX's pre-allocation fraction.
+    Uses ``bytes_limit`` (JAX's pre-allocation pool) as a conservative proxy
+    for physical capacity.  Taking the minimum ensures that block-size
+    estimates are safe for the most memory-constrained device.
     """
     try:
         import jax
-        stats = jax.devices()[0].memory_stats()
-        # bytes_limit is JAX's pool limit (fraction of physical).
-        # For the *physical* capacity we want the pool limit divided by
-        # the pre-allocation fraction — but that's tricky to get.
-        # Instead, return bytes_limit as a conservative proxy.
-        return int(stats['bytes_limit'])
+        limits = [int(d.memory_stats()['bytes_limit'])
+                  for d in jax.local_devices()]
+        return min(limits) if limits else 80 * 1024 ** 3
     except Exception:
         return 80 * 1024 ** 3  # 80 GiB fallback (A100)
 
 
 def _get_gpu_free_bytes():
-    """Return the *currently free* GPU memory inside JAX's pre-allocated pool.
+    """Return the *currently free* GPU memory of the most-constrained local device.
 
-    This accounts for JAX's pre-allocation fraction (default 75% of physical)
-    AND any tensors that are already resident on the device.  Much safer than
-    ``bytes_limit`` which ignores current allocations.
+    Takes the minimum across all local devices so that tile sizing is
+    conservative for every GPU in the job, not just device 0.
 
     Falls back to ``_get_gpu_physical_bytes() * 0.75`` if stats are unavailable.
     """
     try:
         import jax
-        stats = jax.devices()[0].memory_stats()
-        pool_limit = int(stats['bytes_limit'])
-        in_use = int(stats.get('bytes_in_use', 0))
-        free = pool_limit - in_use
-        logger.debug(
-            "_get_gpu_free_bytes: pool_limit=%.2f GB, in_use=%.2f GB, free=%.2f GB",
-            pool_limit / 1e9, in_use / 1e9, free / 1e9)
-        return max(free, 0)
+        min_free = None
+        for d in jax.local_devices():
+            stats = d.memory_stats()
+            pool_limit = int(stats['bytes_limit'])
+            in_use = int(stats.get('bytes_in_use', 0))
+            free = max(pool_limit - in_use, 0)
+            logger.debug(
+                "_get_gpu_free_bytes: device=%s pool_limit=%.2f GB, "
+                "in_use=%.2f GB, free=%.2f GB",
+                getattr(d, 'id', repr(d)),
+                pool_limit / 1e9, in_use / 1e9, free / 1e9)
+            if min_free is None or free < min_free:
+                min_free = free
+        return min_free if min_free is not None else int(_get_gpu_physical_bytes() * 0.75)
     except Exception:
         return int(_get_gpu_physical_bytes() * 0.75)
 

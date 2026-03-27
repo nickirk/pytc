@@ -1191,15 +1191,9 @@ class ISDFTC(TC):
             result_np += result_np.transpose(2, 3, 0, 1)
         else:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            if panel_size is not None:
-                tmp = self._get_tc_direct_tile(
-                    kernels, ranges_T, device=device, panel_size=panel_size)
-                result_np += np.asarray(tmp.transpose(2, 3, 0, 1))
-                del tmp
-            else:
-                self._accumulate_transpose_block(
-                    result_np, kernels['K1_kernel'], kernels['K3_kernel'],
-                    ranges_T, scale=0.5, n_sub=2, device=device)
+            self._accumulate_transpose_block(
+                result_np, kernels['K1_kernel'], kernels['K3_kernel'],
+                ranges_T, scale=0.5, n_sub=2, device=device)
 
         return jnp.asarray(-result_np)
 

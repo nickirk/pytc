@@ -205,12 +205,14 @@ class TestSolverRoundRobin(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
-            cwd="/Users/keliao/Work/project/pytc",
+            cwd="/Users/kl2252/Work/src/pytc",
             env=env,
         )
         payload = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(payload["n_devices"], 2)
-        self.assertEqual(payload["calls"], [0, 1, 0, 1])
+        # device_key=lambda spec: spec[0] sends all r-tiles within a p-block
+        # to the same device, so the 2×2 tile grid maps as: p0→d0, p1→d1.
+        self.assertEqual(payload["calls"], [0, 0, 1, 1])
 
 
 class TestVVVVPaneling(unittest.TestCase):

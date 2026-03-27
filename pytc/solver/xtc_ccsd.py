@@ -173,16 +173,36 @@ def _solver_local_devices():
     return devices if devices else (None,)
 
 
-def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None):
-    """Issue one tile per device and harvest results in round-robin order."""
+def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
+                          device_key=None):
+    """Issue tiles to devices in round-robin order and harvest results.
+
+    Parameters
+    ----------
+    device_key : callable(spec) -> hashable, optional
+        When provided, all tiles that share the same key are sent to the same
+        device.  Keys are assigned to devices in first-seen order round-robin.
+        Default (None) assigns tiles by sequential tile index.
+
+    Pipeline depth is 2×n_devices so each GPU can have two tiles in flight
+    while the oldest tile's result is being transferred / accumulated on host.
+    """
     devices = devices or _solver_local_devices()
     n_devices = len(devices)
+    pipeline_depth = 2 * n_devices
     pending = deque()
+    _key_to_device = {}
 
     for tile_id, spec in enumerate(tile_specs):
-        device = devices[tile_id % n_devices]
+        if device_key is not None:
+            k = device_key(spec)
+            if k not in _key_to_device:
+                _key_to_device[k] = devices[len(_key_to_device) % n_devices]
+            device = _key_to_device[k]
+        else:
+            device = devices[tile_id % n_devices]
         pending.append((spec, device, issue_tile(spec, device)))
-        if len(pending) >= n_devices:
+        if len(pending) >= pipeline_depth:
             ready_spec, ready_device, handle = pending.popleft()
             consume_tile(ready_spec, ready_device, handle)
 
@@ -502,9 +522,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         include_accumulators=False,
     )
     panel_size = p_blksize
-    panel_size = p_blksize
-    panel_size = p_blksize
-    
+
     # Pre-unpack L_vv_full if using density fitting to avoid repeated IO/unpacking
     
     L_vv_full = None
@@ -570,8 +588,9 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             p0, p1, r0, r1, time.perf_counter() - t0,
         )
 
-    _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
-    
+    _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices,
+                          device_key=lambda spec: spec[0])
+
     if L_vv_full is not None:
         del L_vv_full
         
