@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
 _ISDF_DEVICE_CACHE: dict = {}
-_TC_DIRECT_TILE_PROFILED: bool = False  # log first tile's phase breakdown once
+_TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device
 
 
 def _array_nbytes(arr):
@@ -1129,9 +1129,10 @@ class ISDFTC(TC):
     def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
         global _TC_DIRECT_TILE_PROFILED
-        _profile = not _TC_DIRECT_TILE_PROFILED and panel_size is not None
+        _device_key = getattr(device, "id", "host")
+        _profile = panel_size is not None and _device_key not in _TC_DIRECT_TILE_PROFILED
         if _profile:
-            _TC_DIRECT_TILE_PROFILED = True
+            _TC_DIRECT_TILE_PROFILED.add(_device_key)
             _t0 = time.perf_counter()
 
         U1 = kernels['K1_kernel']
@@ -1160,7 +1161,7 @@ class ISDFTC(TC):
                 _t_put - _t0,
                 getattr(U1, 'nbytes', 0) / 1e6,
                 getattr(U3, 'nbytes', 0) / 1e6,
-                getattr(device, 'id', 'default'),
+                _device_key,
             )
 
         device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()

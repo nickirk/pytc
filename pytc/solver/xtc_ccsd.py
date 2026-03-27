@@ -1113,6 +1113,8 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         _t_gpu_wait = [0.0]
         _t_tensordot = [0.0]
         _t_assign = [0.0]
+        _issued_devices = set()
+        _consumed_devices = set()
 
         def issue_tile(spec, device, _t=_t_issue):
             _, _, r0, r1 = spec
@@ -1122,6 +1124,13 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
                 slice(nocc + r0, nocc + r1),
                 slice(nocc, nmo),
             )
+            device_key = getattr(device, "id", "host")
+            if device_key not in _issued_devices:
+                _issued_devices.add(device_key)
+                logger.debug(
+                    "VVVV first issue on device %s: p=%d:%d r=%d:%d panel=%d",
+                    device_key, p0, p1, r0, r1, panel_size,
+                )
             t0 = time.perf_counter()
             result = xtc_mod.compute_2b_tile(
                 xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
@@ -1133,6 +1142,7 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             _, _, r0, r1 = spec
             p_len = p1 - p0
             r_len = r1 - r0
+            device_key = getattr(device, "id", "host")
             t0 = time.perf_counter()
             tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # blocks on GPU
             t1 = time.perf_counter()
@@ -1142,6 +1152,12 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             _tw[0] += t1 - t0
             _tt[0] += t2 - t1
             _ta[0] += time.perf_counter() - t2
+            if device_key not in _consumed_devices:
+                _consumed_devices.add(device_key)
+                logger.debug(
+                    "VVVV first consume on device %s: gpu_wait=%.3fs tensordot=%.3fs assign=%.3fs",
+                    device_key, t1 - t0, t2 - t1, time.perf_counter() - t2,
+                )
 
         _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
 

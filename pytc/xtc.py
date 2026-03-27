@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 # The cache holds at most two slices.
 # ---------------------------------------------------------------------------
 _X_HDF5_CACHE = OrderedDict()
+_DELTA_U_DIRECT_TILE_PROFILED = set()
+_ASSEMBLE_2B_TILE_PROFILED = set()
 
 
 def _read_X_slice(X, slice_r, slice_s):
@@ -2020,9 +2022,15 @@ class ISDFXTC(XTC, ISDFTC):
 
     def _get_delta_u_direct_tile(self, kernels, ranges, device=None, panel_size=None):
         """Compute one unsymmetrized Delta U tile from prepared kernel panels."""
+        global _DELTA_U_DIRECT_TILE_PROFILED
         D = kernels['D']
         X = kernels['X']
         slice_p, slice_q, slice_r, slice_s = ranges
+        device_key = getattr(device, "id", "host")
+        profile = panel_size is not None and device_key not in _DELTA_U_DIRECT_TILE_PROFILED
+        if profile:
+            _DELTA_U_DIRECT_TILE_PROFILED.add(device_key)
+            t0 = time.perf_counter()
 
         cache_getter = getattr(self, "_get_isdf_device_cache", None)
         cache = (
@@ -2060,6 +2068,16 @@ class ISDFXTC(XTC, ISDFTC):
             )
 
         X_sliced = _read_X_slice(X, slice_r, slice_s)
+        if profile:
+            t_read = time.perf_counter()
+            logger.debug(
+                "_get_delta_u_direct_tile first-tile profile: X read %.3fs "
+                "(device=%s, X=%.1fMB, tile=(%d,%d,%d,%d))",
+                t_read - t0,
+                device_key,
+                getattr(X_sliced, "nbytes", 0) / 1e6,
+                Np, Nq, Nr, Ns,
+            )
         if panel_size is not None:
             phi_p = _pad_leading_axis(phi_p, panel_size)
             phi_r = _pad_leading_axis(phi_r, panel_size)
@@ -2080,15 +2098,36 @@ class ISDFXTC(XTC, ISDFTC):
                 phi_s = jax.device_put(phi_s, device)
         else:
             D = jnp.asarray(D)
+        if profile:
+            jax.block_until_ready((D, X_sliced, phi_p, phi_q, phi_r, phi_s))
+            t_put = time.perf_counter()
+            logger.debug(
+                "_get_delta_u_direct_tile first-tile profile: operands ready %.3fs "
+                "(device=%s, D_cached=%s)",
+                t_put - t_read,
+                device_key,
+                D_resident is not None,
+            )
         device_ctx = (
             jax.default_device(device)
             if device is not None
             else contextlib.nullcontext()
         )
         with device_ctx:
-            return _contract_delta_u_direct_tile_jit(
+            result = _contract_delta_u_direct_tile_jit(
                 D, X_sliced, phi_p, phi_q, phi_r, phi_s,
             )
+            if profile:
+                jax.block_until_ready(result)
+                t_kernel = time.perf_counter()
+                logger.debug(
+                    "_get_delta_u_direct_tile first-tile profile: kernel %.3fs, total %.3fs "
+                    "(device=%s)",
+                    t_kernel - t_put,
+                    t_kernel - t0,
+                    device_key,
+                )
+            return result
 
     def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None):
         """Assemble and symmetrize one finished Delta U tile."""
@@ -2129,14 +2168,47 @@ class ISDFXTC(XTC, ISDFTC):
 
     def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None, panel_size=None):
         """Assemble a finished ISDF-XTC 2-body tile from TC and Delta U parts."""
+        global _ASSEMBLE_2B_TILE_PROFILED
         del jastrow_params  # Reserved for future per-tile kernel refresh logic.
+        device_key = getattr(device, "id", "host")
+        profile = panel_size is not None and device_key not in _ASSEMBLE_2B_TILE_PROFILED
+        if profile:
+            _ASSEMBLE_2B_TILE_PROFILED.add(device_key)
+            t0 = time.perf_counter()
         tc_tile = super()._assemble_tc_tile(
             kernels, ranges, device=device, panel_size=panel_size)
+        if profile:
+            jax.block_until_ready(tc_tile)
+            t_tc = time.perf_counter()
+            logger.debug(
+                "_assemble_2b_tile first-tile profile: TC assemble %.3fs (device=%s)",
+                t_tc - t0,
+                device_key,
+            )
         delta_u_tile = self._assemble_delta_u_tile(
             kernels, ranges, device=device, panel_size=panel_size)
+        if profile:
+            jax.block_until_ready(delta_u_tile)
+            t_du = time.perf_counter()
+            logger.debug(
+                "_assemble_2b_tile first-tile profile: delta_U assemble %.3fs (device=%s)",
+                t_du - t_tc,
+                device_key,
+            )
 
         if panel_size is not None:
-            return tc_tile + delta_u_tile
+            result = tc_tile + delta_u_tile
+            if profile:
+                jax.block_until_ready(result)
+                t_sum = time.perf_counter()
+                logger.debug(
+                    "_assemble_2b_tile first-tile profile: final sum %.3fs, total %.3fs "
+                    "(device=%s)",
+                    t_sum - t_du,
+                    t_sum - t0,
+                    device_key,
+                )
+            return result
 
         tc_tile = np.array(tc_tile)
         tc_tile += np.array(delta_u_tile)
