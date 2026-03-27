@@ -167,6 +167,24 @@ class TestISDFXTCPanelization(unittest.TestCase):
         self.assertIs(cache_a["grad_phi_isdf"], cache_b["grad_phi_isdf"])
         self.assertIs(cache_a["D"], cache_b["D"])
 
+    def test_isdf_device_cache_reuses_tc_kernels(self):
+        isdf_xtc = self.isdf_xtc.isdf(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        kernels = isdf_xtc.isdf_kernels
+        device = jax.devices("cpu")[0]
+        cache_a = isdf_xtc._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_tc=True
+        )
+        cache_b = isdf_xtc._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_tc=True
+        )
+        self.assertIs(cache_a["K1_kernel"], cache_b["K1_kernel"])
+        self.assertIs(cache_a["K3_kernel"], cache_b["K3_kernel"])
+
     def test_2b_tile_assembly_matches_public_api(self):
         isdf_xtc = self.isdf_xtc.isdf(
             self.jparams,

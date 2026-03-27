@@ -5,6 +5,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -205,7 +206,7 @@ class TestSolverRoundRobin(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
-            cwd="/Users/kl2252/Work/src/pytc",
+            cwd=str(Path(__file__).resolve().parents[2]),
             env=env,
         )
         payload = json.loads(proc.stdout.strip().splitlines()[-1])

@@ -56,6 +56,12 @@ def _cache_d_on_device(device, arr, *, fraction=0.35):
     return _array_nbytes(arr) <= int(_get_local_device_free_bytes(device) * fraction)
 
 
+def _cache_tc_kernels_on_device(device, u1, u3, *, fraction=0.30):
+    """Whether persistent TC kernels should be cached on one device."""
+    total = _array_nbytes(u1) + _array_nbytes(u3)
+    return total <= int(_get_local_device_free_bytes(device) * fraction)
+
+
 def _pad_leading_axis(arr, target):
     """Pad the leading axis of an array with zeros up to ``target``."""
     cur = arr.shape[0]
@@ -569,7 +575,8 @@ class ISDFTC(TC):
 
     def _get_isdf_device_cache(self, kernels=None, device=None, *,
                                include_grad=False,
-                               include_delta_u=False):
+                               include_delta_u=False,
+                               include_tc=False):
         """Return persistent ISDF operands resident on one device."""
         if device is None:
             return None
@@ -584,6 +591,25 @@ class ISDFTC(TC):
 
         if include_grad and "grad_phi_isdf" not in cache:
             cache["grad_phi_isdf"] = jax.device_put(np.asarray(self.grad_phi_isdf), device)
+
+        if include_tc and kernels is not None:
+            need_u1 = "K1_kernel" in kernels and "K1_kernel" not in cache
+            need_u3 = "K3_kernel" in kernels and "K3_kernel" not in cache
+            if need_u1 or need_u3:
+                if _cache_tc_kernels_on_device(
+                    device, kernels["K1_kernel"], kernels["K3_kernel"]
+                ):
+                    logger.debug(
+                        "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB)",
+                        getattr(device, "id", "host"),
+                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                    )
+                    cache["K1_kernel"] = jax.device_put(np.asarray(kernels["K1_kernel"]), device)
+                    cache["K3_kernel"] = jax.device_put(np.asarray(kernels["K3_kernel"]), device)
+                else:
+                    cache["K1_kernel"] = None
+                    cache["K3_kernel"] = None
 
         if include_delta_u and kernels is not None and "D" in kernels and "D" not in cache:
             if _cache_d_on_device(device, kernels["D"]):
@@ -1113,8 +1139,17 @@ class ISDFTC(TC):
         slice_p, slice_q, slice_r, slice_s = ranges
 
         rbs = self._get_fixed_rank_block_size()
-        u1 = jax.device_put(U1, device) if device is not None else U1
-        u3 = jax.device_put(U3, device) if device is not None else U3
+        cache_getter = getattr(self, "_get_isdf_device_cache", None)
+        cache = (
+            cache_getter(kernels, device=device, include_grad=True, include_tc=True)
+            if callable(cache_getter) else None
+        )
+        u1 = cache.get("K1_kernel") if cache is not None else None
+        u3 = cache.get("K3_kernel") if cache is not None else None
+        if u1 is None:
+            u1 = jax.device_put(U1, device) if device is not None else U1
+        if u3 is None:
+            u3 = jax.device_put(U3, device) if device is not None else U3
 
         if _profile:
             jax.block_until_ready((u1, u3))
@@ -1130,11 +1165,6 @@ class ISDFTC(TC):
 
         device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
 
-        cache_getter = getattr(self, "_get_isdf_device_cache", None)
-        cache = (
-            cache_getter(device=device, include_grad=True)
-            if callable(cache_getter) else None
-        )
         phi_src = cache["phi_isdf"] if cache is not None else self.phi_isdf
         grad_src = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
 

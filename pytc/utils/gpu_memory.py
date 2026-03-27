@@ -511,8 +511,12 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
     usable = max(min(max(gpu_budget - persistent, 0), gpu_free), 0)
 
     Nf = n_fused if n_fused is not None else 0
+    nmo = O + V
     d_constant = Nf * Nf * B
-    target = max(int(max(usable - d_constant, 0) * safety_factor), 0)
+    tc_kernel_constant = 4 * Nf * Nf * B if Nf > 0 else 0
+    phi_constant = 4 * nmo * Nf * B if Nf > 0 else 0
+    resident_constants = d_constant + tc_kernel_constant + phi_constant
+    target = max(int(max(usable - resident_constants, 0) * safety_factor), 0)
 
     def tile_bytes(blk):
         tile = blk * V * blk * V * B
@@ -541,9 +545,11 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
 
     best = max(1, min(best, nvir))
     logger.debug(
-        "estimate_vvvv_panel_blksize: usable=%.2f GB, D=%.2f GB, "
-        "target=%.2f GB, naux=%s, n_fused=%s -> blk=%d",
-        usable / 1e9, d_constant / 1e9, target / 1e9,
+        "estimate_vvvv_panel_blksize: usable=%.2f GB, resident=%.2f GB "
+        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), target=%.2f GB, "
+        "naux=%s, n_fused=%s -> blk=%d",
+        usable / 1e9, resident_constants / 1e9,
+        d_constant / 1e9, tc_kernel_constant / 1e9, phi_constant / 1e9, target / 1e9,
         naux, n_fused, best,
     )
     return best, usable
