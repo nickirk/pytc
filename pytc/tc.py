@@ -1,6 +1,7 @@
 """JAX implementation of Transcorrelated method."""
 
 from typing import Any
+import hashlib
 import numpy as np
 import os
 import logging
@@ -25,6 +26,42 @@ logger = logging.getLogger(__name__)
 # during CCSD iterations.  This eliminates JIT recompilation from
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
+
+
+def _hash_jastrow_params(jastrow_params):
+    """Create a deterministic hash for a jastrow parameter PyTree."""
+    if jastrow_params is None:
+        return None
+
+    def _as_array(x):
+        arr = np.asarray(x)
+        return arr
+
+    h = hashlib.sha256()
+    if isinstance(jastrow_params, dict):
+        for key in sorted(jastrow_params.keys()):
+            arr = _as_array(jastrow_params[key])
+            h.update(key.encode("utf-8"))
+            h.update(str(arr.dtype).encode("utf-8"))
+            h.update(str(arr.shape).encode("utf-8"))
+            h.update(arr.tobytes())
+    else:
+        arr = _as_array(jastrow_params)
+        h.update(b"param")
+        h.update(str(arr.dtype).encode("utf-8"))
+        h.update(str(arr.shape).encode("utf-8"))
+        h.update(arr.tobytes())
+    return h.hexdigest()
+
+
+def _read_hash_attr(attr_val):
+    """Normalize an HDF5 attribute into a string hash or None."""
+    if attr_val is None:
+        return None
+    if isinstance(attr_val, bytes):
+        attr_val = attr_val.decode()
+    attr_val = str(attr_val)
+    return attr_val or None
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for one device shard."""
@@ -898,13 +935,16 @@ class ISDFTC(TC):
         
         # Use save_path if provided, otherwise use self.save_path
         out_path = save_path if save_path else self.save_path
+        param_hash = _hash_jastrow_params(jastrow_params)
         
         # Check if kernels already exist in HDF5
         kernels = {}
         if out_path and os.path.exists(out_path):
             try:
                 f = h5py.File(out_path, 'r')
-                if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
+                stored_hash = _read_hash_attr(f.attrs.get('tc_jastrow_hash'))
+                hash_match = stored_hash is not None and stored_hash == param_hash
+                if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f and hash_match:
                     logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
                     logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
                     kernels['K1_kernel'] = f['K1_kernel'][:]
@@ -922,6 +962,8 @@ class ISDFTC(TC):
                     return self.replace(isdf_kernels=kernels)
                 
                 # If we are here, keys are missing. Close the file!
+                if not hash_match:
+                    logger.info(f"  Cached TC ISDF kernels in {out_path} use different Jastrow parameters. Recomputing.")
                 f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
@@ -956,6 +998,8 @@ class ISDFTC(TC):
                     if k == 'L_aux': continue # Already saved
                     if k in f: del f[k]
                     f.create_dataset(k, data=np.array(v))
+                if param_hash is not None:
+                    f.attrs['tc_jastrow_hash'] = param_hash
                 # Basics are already saved by isdf_decompose, but let's ensure they are there
                 if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))

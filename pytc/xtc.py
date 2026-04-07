@@ -13,7 +13,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 import h5py
 from flax import struct
 from collections import OrderedDict
-from .tc import TC, ISDFTC
+from .tc import TC, ISDFTC, _hash_jastrow_params, _read_hash_attr
 from . import tc_helper
 from . import kmat as kmat_jax
 from .utils import sharding_core
@@ -791,6 +791,7 @@ class ISDFXTC(XTC, ISDFTC):
         
         # Use save_path if provided, otherwise use self.save_path
         out_path = save_path if save_path else self.save_path
+        param_hash = _hash_jastrow_params(jastrow_params)
         
         # 1. Compute TC kernels (K1, K3, L_aux) using base class
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size, host_grid_block_size=host_grid_block_size)
@@ -801,7 +802,9 @@ class ISDFXTC(XTC, ISDFTC):
         if out_path and os.path.exists(out_path):
             try:
                 f = h5py.File(out_path, 'r')
-                if 'D' in f and 'X' in f:
+                stored_hash = _read_hash_attr(f.attrs.get('delta_u_jastrow_hash'))
+                hash_match = stored_hash is not None and stored_hash == param_hash
+                if 'D' in f and 'X' in f and hash_match:
                     logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
                     logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
                     kernels['D'] = f['D'][:]
@@ -817,6 +820,9 @@ class ISDFXTC(XTC, ISDFTC):
                         kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
+                if not hash_match:
+                    logger.info(f"  Cached Delta U kernels in {out_path} use different Jastrow parameters. Recomputing.")
+                f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
 
@@ -828,6 +834,7 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             x_s_panel_blocks=x_s_panel_blocks,
             d_reduce_group_blocks=d_reduce_group_blocks,
+            param_hash=param_hash,
         )
         kernels.update(delta_u_kernels)
         
@@ -857,6 +864,7 @@ class ISDFXTC(XTC, ISDFTC):
         host_grid_block_size=None,
         x_s_panel_blocks=1,
         d_reduce_group_blocks=1,
+        param_hash=None,
     ):
         """Compute D, X kernels for Delta U with orbital and grid batching."""
         if L_aux is None:
@@ -913,6 +921,8 @@ class ISDFXTC(XTC, ISDFTC):
             f.create_dataset('D', data=np.array(D))
             if 'X' in f: del f['X']
             X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
+            if param_hash is not None:
+                f.attrs['delta_u_jastrow_hash'] = param_hash
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
