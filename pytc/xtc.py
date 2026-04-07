@@ -14,7 +14,13 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 import h5py
 from flax import struct
 from collections import OrderedDict
-from .tc import TC, ISDFTC
+from .tc import (
+    TC,
+    ISDFTC,
+    _normalize_panel_layout,
+    _transpose_panel_layout,
+    _pad_axis,
+)
 from . import tc_helper
 from . import kmat as kmat_jax
 from .utils import sharding_core
@@ -153,7 +159,8 @@ def _get_device_free_bytes(device=None):
     return _get_gpu_free_bytes()
 
 
-def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=None):
+def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=None,
+                    panel_layout="pr"):
     """Execute one XTC 2-body tile using the internal tile API only."""
     if not hasattr(xtc_obj, "_assemble_2b_tile"):
         raise TypeError(
@@ -170,7 +177,8 @@ def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=Non
         )
 
     return xtc_obj._assemble_2b_tile(
-        jastrow_params, kernels, ranges, device=device, panel_size=panel_size
+        jastrow_params, kernels, ranges, device=device,
+        panel_size=panel_size, panel_layout=panel_layout
     )
 
 
@@ -2020,16 +2028,19 @@ class ISDFXTC(XTC, ISDFTC):
                 
         return jnp.asarray(result)
 
-    def _get_delta_u_direct_tile(self, kernels, ranges, device=None, panel_size=None):
+    def _get_delta_u_direct_tile(self, kernels, ranges, device=None, panel_size=None,
+                                 panel_layout="pr"):
         """Compute one unsymmetrized Delta U tile from prepared kernel panels."""
         global _DELTA_U_DIRECT_TILE_PROFILED
         D = kernels['D']
         X = kernels['X']
         slice_p, slice_q, slice_r, slice_s = ranges
         device_key = getattr(device, "id", "host")
-        profile = panel_size is not None and device_key not in _DELTA_U_DIRECT_TILE_PROFILED
+        panel_layout = _normalize_panel_layout(panel_layout)
+        profile_key = (device_key, panel_layout)
+        profile = panel_size is not None and profile_key not in _DELTA_U_DIRECT_TILE_PROFILED
         if profile:
-            _DELTA_U_DIRECT_TILE_PROFILED.add(device_key)
+            _DELTA_U_DIRECT_TILE_PROFILED.add(profile_key)
             t0 = time.perf_counter()
 
         cache_getter = getattr(self, "_get_isdf_device_cache", None)
@@ -2052,19 +2063,21 @@ class ISDFXTC(XTC, ISDFTC):
         r_len = phi_r.shape[0]
         Ns = phi_s.shape[0]
         N_rank = D.shape[0]
-        Np = panel_size or p_len
-        Nr = panel_size or r_len
+        Np = panel_size if panel_size is not None and "p" in panel_layout else p_len
+        Nq_eff = panel_size if panel_size is not None and "q" in panel_layout else Nq
+        Nr = panel_size if panel_size is not None and "r" in panel_layout else r_len
+        Ns_eff = panel_size if panel_size is not None and "s" in panel_layout else Ns
 
-        mem = _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank)
+        mem = _estimate_delta_u_direct_tile_bytes(Np, Nq_eff, Nr, Ns_eff, N_rank)
         total_needed_bytes = mem["total"]
         threshold_bytes = int(_get_device_free_bytes(device) * 0.5)
         if total_needed_bytes >= threshold_bytes:
             raise RuntimeError(
                 "Delta U direct tile exceeds available device memory: "
                 f"need ~{total_needed_bytes / (1024.0 ** 3):.2f} GiB for "
-                f"tile ({Np}, {Nq}, {Nr}, {Ns}), have "
+                f"tile ({Np}, {Nq_eff}, {Nr}, {Ns_eff}), have "
                 f"~{threshold_bytes / (1024.0 ** 3):.2f} GiB usable. "
-                "Reduce the solver VVVV panel size."
+                "Reduce the solver tile panel size."
             )
 
         X_sliced = _read_X_slice(X, slice_r, slice_s)
@@ -2076,18 +2089,23 @@ class ISDFXTC(XTC, ISDFTC):
                 t_read - t0,
                 device_key,
                 getattr(X_sliced, "nbytes", 0) / 1e6,
-                Np, Nq, Nr, Ns,
+                Np, Nq_eff, Nr, Ns_eff,
             )
         if panel_size is not None:
-            phi_p = _pad_leading_axis(phi_p, panel_size)
-            phi_r = _pad_leading_axis(phi_r, panel_size)
-            X_sliced = _pad_leading_axis(X_sliced, panel_size)
+            phi_p = _pad_axis(phi_p, 0, Np) if Np != p_len else jnp.asarray(phi_p)
+            phi_q = _pad_axis(phi_q, 0, Nq_eff) if Nq_eff != Nq else jnp.asarray(phi_q)
+            phi_r = _pad_axis(phi_r, 0, Nr) if Nr != r_len else jnp.asarray(phi_r)
+            phi_s = _pad_axis(phi_s, 0, Ns_eff) if Ns_eff != Ns else jnp.asarray(phi_s)
+            if Nr != r_len:
+                X_sliced = _pad_axis(X_sliced, 0, Nr)
+            if Ns_eff != Ns:
+                X_sliced = _pad_axis(X_sliced, 1, Ns_eff)
         else:
             phi_p = jnp.asarray(phi_p)
+            phi_q = jnp.asarray(phi_q)
             phi_r = jnp.asarray(phi_r)
+            phi_s = jnp.asarray(phi_s)
             X_sliced = jnp.asarray(X_sliced)
-        phi_q = jnp.asarray(phi_q)
-        phi_s = jnp.asarray(phi_s)
         if device is not None:
             D = D_resident if D_resident is not None else jax.device_put(np.asarray(D), device)
             X_sliced = jax.device_put(X_sliced, device)
@@ -2129,10 +2147,13 @@ class ISDFXTC(XTC, ISDFTC):
                 )
             return result
 
-    def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None):
+    def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None,
+                               panel_layout="pr"):
         """Assemble and symmetrize one finished Delta U tile."""
+        panel_layout = _normalize_panel_layout(panel_layout)
         direct = self._get_delta_u_direct_tile(
-            kernels, ranges, device=device, panel_size=panel_size)
+            kernels, ranges, device=device, panel_size=panel_size,
+            panel_layout=panel_layout)
 
         slice_p, slice_q, slice_r, slice_s = ranges
         if panel_size is not None:
@@ -2141,7 +2162,8 @@ class ISDFXTC(XTC, ISDFTC):
 
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             tmp = self._get_delta_u_direct_tile(
-                kernels, ranges_T, device=device, panel_size=panel_size)
+                kernels, ranges_T, device=device, panel_size=panel_size,
+                panel_layout=_transpose_panel_layout(panel_layout))
             return -(direct + tmp.transpose(2, 3, 0, 1))
 
         if slice_p == slice_r and slice_q == slice_s:
@@ -2166,17 +2188,21 @@ class ISDFXTC(XTC, ISDFTC):
             del chunk_np
         return jnp.asarray(result_np)
 
-    def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None, panel_size=None):
+    def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None,
+                          panel_size=None, panel_layout="pr"):
         """Assemble a finished ISDF-XTC 2-body tile from TC and Delta U parts."""
         global _ASSEMBLE_2B_TILE_PROFILED
         del jastrow_params  # Reserved for future per-tile kernel refresh logic.
         device_key = getattr(device, "id", "host")
-        profile = panel_size is not None and device_key not in _ASSEMBLE_2B_TILE_PROFILED
+        panel_layout = _normalize_panel_layout(panel_layout)
+        profile_key = (device_key, panel_layout)
+        profile = panel_size is not None and profile_key not in _ASSEMBLE_2B_TILE_PROFILED
         if profile:
-            _ASSEMBLE_2B_TILE_PROFILED.add(device_key)
+            _ASSEMBLE_2B_TILE_PROFILED.add(profile_key)
             t0 = time.perf_counter()
         tc_tile = super()._assemble_tc_tile(
-            kernels, ranges, device=device, panel_size=panel_size)
+            kernels, ranges, device=device, panel_size=panel_size,
+            panel_layout=panel_layout)
         if profile:
             jax.block_until_ready(tc_tile)
             t_tc = time.perf_counter()
@@ -2186,7 +2212,8 @@ class ISDFXTC(XTC, ISDFTC):
                 device_key,
             )
         delta_u_tile = self._assemble_delta_u_tile(
-            kernels, ranges, device=device, panel_size=panel_size)
+            kernels, ranges, device=device, panel_size=panel_size,
+            panel_layout=panel_layout)
         if profile:
             jax.block_until_ready(delta_u_tile)
             t_du = time.perf_counter()

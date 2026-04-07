@@ -43,8 +43,9 @@ class _FakeXTC:
             return jnp.asarray(block)
         return np.asarray(block)
 
-    def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None, panel_size=None):
-        del jastrow_params, kernels
+    def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None,
+                          panel_size=None, panel_layout="pr"):
+        del jastrow_params, kernels, panel_layout
         block = np.asarray(self.get_2b(None, ranges))
         if panel_size is not None:
             padded = np.zeros((panel_size, block.shape[1], panel_size, block.shape[3]))

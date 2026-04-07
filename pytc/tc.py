@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
 _ISDF_DEVICE_CACHE: dict = {}
-_TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device
+_TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device/layout
 
 
 def _array_nbytes(arr):
@@ -71,6 +71,36 @@ def _pad_leading_axis(arr, target):
         raise ValueError(f"cannot pad axis-0 from {cur} down to {target}")
     pad_cfg = [(0, target - cur)] + [(0, 0)] * (arr.ndim - 1)
     return jnp.pad(jnp.asarray(arr), pad_cfg)
+
+
+def _pad_axis(arr, axis, target):
+    """Pad one axis of an array with zeros up to ``target``."""
+    cur = arr.shape[axis]
+    if cur == target:
+        return jnp.asarray(arr)
+    if cur > target:
+        raise ValueError(f"cannot pad axis-{axis} from {cur} down to {target}")
+    pad_cfg = [(0, 0)] * arr.ndim
+    pad_cfg[axis] = (0, target - cur)
+    return jnp.pad(jnp.asarray(arr), pad_cfg)
+
+
+def _normalize_panel_layout(panel_layout):
+    """Normalize the internal tiled-axis layout selector."""
+    layout = "pr" if panel_layout is None else str(panel_layout)
+    if layout not in ("pr", "qr", "ps"):
+        raise ValueError(f"unsupported panel_layout={layout!r}")
+    return layout
+
+
+def _transpose_panel_layout(panel_layout):
+    """Return the layout required for the transpose partner tile."""
+    layout = _normalize_panel_layout(panel_layout)
+    if layout == "qr":
+        return "ps"
+    if layout == "ps":
+        return "qr"
+    return layout
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for one device shard."""
@@ -1126,13 +1156,16 @@ class ISDFTC(TC):
             result_np[:, :, i0:i1, :] += chunk_np * scale
             del chunk_np
 
-    def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None):
+    def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None,
+                            panel_layout="pr"):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
         global _TC_DIRECT_TILE_PROFILED
         _device_key = getattr(device, "id", "host")
-        _profile = panel_size is not None and _device_key not in _TC_DIRECT_TILE_PROFILED
+        panel_layout = _normalize_panel_layout(panel_layout)
+        _profile_key = (_device_key, panel_layout)
+        _profile = panel_size is not None and _profile_key not in _TC_DIRECT_TILE_PROFILED
         if _profile:
-            _TC_DIRECT_TILE_PROFILED.add(_device_key)
+            _TC_DIRECT_TILE_PROFILED.add(_profile_key)
             _t0 = time.perf_counter()
 
         U1 = kernels['K1_kernel']
@@ -1177,17 +1210,33 @@ class ISDFTC(TC):
         grad_phi_q = grad_src[slice_q]
 
         if panel_size is not None:
-            phi_p = _pad_leading_axis(phi_p, panel_size)
-            phi_r = _pad_leading_axis(phi_r, panel_size)
-            grad_phi_p = _pad_leading_axis(grad_phi_p, panel_size)
+            if "p" in panel_layout:
+                phi_p = _pad_axis(phi_p, 0, panel_size)
+                grad_phi_p = _pad_axis(grad_phi_p, 0, panel_size)
+            else:
+                phi_p = jnp.asarray(phi_p)
+                grad_phi_p = jnp.asarray(grad_phi_p)
+            if "q" in panel_layout:
+                phi_q = _pad_axis(phi_q, 0, panel_size)
+                grad_phi_q = _pad_axis(grad_phi_q, 0, panel_size)
+            else:
+                phi_q = jnp.asarray(phi_q)
+                grad_phi_q = jnp.asarray(grad_phi_q)
+            if "r" in panel_layout:
+                phi_r = _pad_axis(phi_r, 0, panel_size)
+            else:
+                phi_r = jnp.asarray(phi_r)
+            if "s" in panel_layout:
+                phi_s = _pad_axis(phi_s, 0, panel_size)
+            else:
+                phi_s = jnp.asarray(phi_s)
         else:
             phi_p = jnp.asarray(phi_p)
+            phi_q = jnp.asarray(phi_q)
             phi_r = jnp.asarray(phi_r)
+            phi_s = jnp.asarray(phi_s)
             grad_phi_p = jnp.asarray(grad_phi_p)
-
-        phi_q = jnp.asarray(phi_q)
-        phi_s = jnp.asarray(phi_s)
-        grad_phi_q = jnp.asarray(grad_phi_q)
+            grad_phi_q = jnp.asarray(grad_phi_q)
         if device is not None and cache is None:
             phi_p = jax.device_put(phi_p, device)
             phi_q = jax.device_put(phi_q, device)
@@ -1229,10 +1278,13 @@ class ISDFTC(TC):
             result_np *= 0.5
             return jnp.asarray(result_np)
 
-    def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None):
+    def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None,
+                          panel_layout="pr"):
         """Assemble and symmetrize one finished TC tile."""
+        panel_layout = _normalize_panel_layout(panel_layout)
         direct = self._get_tc_direct_tile(
-            kernels, ranges, device=device, panel_size=panel_size)
+            kernels, ranges, device=device, panel_size=panel_size,
+            panel_layout=panel_layout)
 
         if panel_size is not None:
             slice_p, slice_q, slice_r, slice_s = ranges
@@ -1241,7 +1293,8 @@ class ISDFTC(TC):
 
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             tmp = self._get_tc_direct_tile(
-                kernels, ranges_T, device=device, panel_size=panel_size)
+                kernels, ranges_T, device=device, panel_size=panel_size,
+                panel_layout=_transpose_panel_layout(panel_layout))
             return -(direct + tmp.transpose(2, 3, 0, 1))
 
         result_np = np.array(direct)

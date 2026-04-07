@@ -587,6 +587,106 @@ def resolve_vvvv_panel_block_sizes(nocc, nvir, *,
     return panel_blk, panel_blk
 
 
+def estimate_v3o_panel_blksize(nocc, nvir, *,
+                               gpu_max_memory_mb=None,
+                               host_max_memory_mb=None,
+                               include_eris=False,
+                               include_accumulators=False,
+                               naux=None,
+                               n_fused=None,
+                               safety_factor=0.5):
+    """Estimate a safe square virtual tile size for balanced 3V1O builds."""
+    O, V, B = nocc, nvir, 8
+
+    gpu_budget = get_gpu_budget_bytes(gpu_max_memory_mb)
+    persistent = estimate_persistent_gpu_bytes(
+        nocc, nvir,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+    )
+    gpu_free = _get_gpu_free_bytes()
+    usable = max(min(max(gpu_budget - persistent, 0), gpu_free), 0)
+
+    Nf = n_fused if n_fused is not None else 0
+    nmo = O + V
+    d_constant = Nf * Nf * B
+    tc_kernel_constant = 4 * Nf * Nf * B if Nf > 0 else 0
+    phi_constant = 4 * nmo * Nf * B if Nf > 0 else 0
+    resident_constants = d_constant + tc_kernel_constant + phi_constant
+    gpu_target = max(int(max(usable - resident_constants, 0) * safety_factor), 0)
+
+    host_target = None
+    if host_max_memory_mb is not None and host_max_memory_mb > 0:
+        host_budget = int(host_max_memory_mb * 1e6)
+        host_target = int(host_budget * 0.25)
+
+    def tile_bytes(blk):
+        out_tile = blk * O * blk * V * B
+        x_panels = 0
+        if Nf > 0:
+            x_panels = 4 * blk * (O + V) * Nf * B
+        df_operands = 0
+        if naux is not None and naux > 0:
+            df_operands = 2 * blk * (O + V) * naux * B
+        return x_panels + df_operands + 4 * out_tile
+
+    def slab_bytes(blk):
+        return O * V * V * blk * B
+
+    lo = 1
+    hi = max(1, nvir)
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        fits_gpu = tile_bytes(mid) <= gpu_target
+        fits_host = True if host_target is None else slab_bytes(mid) <= host_target
+        if fits_gpu and fits_host:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    best = max(1, min(best, nvir))
+    logger.debug(
+        "estimate_v3o_panel_blksize: usable=%.2f GB, resident=%.2f GB "
+        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
+        "host_target=%s GB, naux=%s, n_fused=%s -> blk=%d",
+        usable / 1e9, resident_constants / 1e9,
+        d_constant / 1e9, tc_kernel_constant / 1e9, phi_constant / 1e9,
+        gpu_target / 1e9,
+        "None" if host_target is None else f"{host_target / 1e9:.2f}",
+        naux, n_fused, best,
+    )
+    return best, usable
+
+
+def resolve_v3o_panel_block_size(nocc, nvir, *,
+                                 block_size=None,
+                                 gpu_max_memory_mb=None,
+                                 host_max_memory_mb=None,
+                                 include_eris=False,
+                                 include_accumulators=False,
+                                 naux=None,
+                                 n_fused=None):
+    """Resolve one square virtual panel size for balanced 3V1O tile builds."""
+    auto_blk, _ = estimate_v3o_panel_blksize(
+        nocc, nvir,
+        gpu_max_memory_mb=gpu_max_memory_mb,
+        host_max_memory_mb=host_max_memory_mb,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+        naux=naux,
+        n_fused=n_fused,
+    )
+    panel_blk = block_size or auto_blk
+    panel_blk = max(1, min(int(panel_blk), nvir))
+    logger.debug(
+        "Resolved square V3O panel block: panel_blk=%d (auto=%d)",
+        panel_blk, auto_blk,
+    )
+    return panel_blk
+
+
 def adaptive_rank_block_size(Np, Nq, N_fused, *,
                               gpu_max_memory_mb=None,
                               min_block=64, max_block=2048):

@@ -13,6 +13,7 @@ from pyscf.ao2mo import _ao2mo
 from pytc.utils.gpu_memory import (
     estimate_blksize,
     resolve_vvvv_panel_block_sizes,
+    resolve_v3o_panel_block_size,
     enable_xla_compilation_cache,
 )
 import h5py
@@ -346,18 +347,35 @@ def _make_xtc_eris(cc, mo_coeff=None):
         L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
         Lov_reshaped = Lov.reshape(naux, nocc, nvir)
         
+        _n_fused = None
+        if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
+            _n_fused = xtc_obj.phi_isdf.shape[1]
+        panel_blk = resolve_v3o_panel_block_size(
+            nocc, nvir,
+            gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+            host_max_memory_mb=getattr(cc, 'max_memory', None),
+            naux=naux,
+            n_fused=_n_fused,
+            include_eris=False,
+            include_accumulators=False,
+        )
+
         # Create HDF5 datasets for large blocks
         eris_blocks = {
-            'ovvv': (nocc, nvir, nvir, nvir),
-            'vovv': (nvir, nocc, nvir, nvir),
+            'ovvv': ((nocc, nvir, nvir, nvir),
+                     (nocc, min(32, nvir), panel_blk, min(64, nvir))),
+            'vovv': ((nvir, nocc, nvir, nvir),
+                     (panel_blk, nocc, min(32, nvir), min(64, nvir))),
         }
-        for name, shape in eris_blocks.items():
+        for name, (shape, chunks) in eris_blocks.items():
             if name in eris.feri:
                 del eris.feri[name]
-            setattr(eris, name, eris.feri.create_dataset(name, shape, 'f8'))
+            setattr(eris, name, eris.feri.create_dataset(name, shape, 'f8', chunks=chunks))
 
         logger.info("Computing large blocks...")
-        _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full, nocc, nvir, nmo)
+        _compute_large_blocks(
+            eris, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full,
+            nocc, nvir, nmo, panel_blk)
         
         # Medium blocks (keep in memory as per user request < 3 virtuals)
         eris.oovv = get_block_df('oovv') # 2 vir (11 GB)
@@ -974,86 +992,80 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     Lov = Lov.reshape(naux, nocc*nvir)
     return Loo, Lov
 
-def _compute_large_blocks(eris, eris_blocks, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full, nocc, nvir, nmo):
-    """Compute and write ovvv and vovv blocks to HDF5."""
-    # N_fused = ISDF rank, needed for GPU memory estimation in estimate_blksize
-    _n_fused = None
-    if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
-        _n_fused = xtc_obj.phi_isdf.shape[1]
-    for name, shape in eris_blocks.items():
-        ds = getattr(eris, name)
-        
-        if name == 'ovvv': # (k, c, a, d) - iterate 'a' (idx 2)
-            blksize, _ = estimate_blksize(
-                nocc, nvir, 'ovvv_eri_build',
-                gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
-                host_max_memory_mb=getattr(eris, 'max_memory', None),
-                n_fused=_n_fused)
-            blksize = max(4, blksize)
-            logger.debug(f"Blksize for ovvv: {blksize}")
+def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
+                          L_vv_full, nocc, nvir, nmo, panel_blk):
+    """Compute and write balanced tiled ovvv / vovv blocks to HDF5."""
+    devices = _solver_local_devices()
 
-            # Prefetch: overlap the GPU get_2b of the NEXT block with the
-            # current block's CPU tensordot + HDF5 write.
-            from pytc.utils.prefetch import async_read, await_read
-            pending_tc = None
-            pending_key = None
-            for p0, p1 in lib.prange(0, nvir, blksize):
-                 L_vv_slice = L_vv_full[p0:p1] 
-                 std_blk = np.tensordot(Lov_reshaped, L_vv_slice, axes=((0), (2)))
-                 
-                 ranges = (slice(0, nocc), slice(nocc, nmo), slice(nocc+p0, nocc+p1), slice(nocc, nmo))
-                 if pending_tc is not None and pending_key == (p0, p1):
-                     tc_blk = await_read(pending_tc)
-                     pending_tc = None
-                 else:
-                     tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+    vovv_ds = eris.vovv
+    for p0, p1 in lib.prange(0, nvir, panel_blk):
+        p_len = p1 - p0
+        Lov_p = Lov_reshaped[:, :, p0:p1]
+        slab = np.empty((p_len, nocc, nvir, nvir), dtype=np.float64)
+        tile_specs = [
+            (p0, p1, r0, min(r0 + panel_blk, nvir))
+            for r0 in range(0, nvir, panel_blk)
+        ]
 
-                 # Kick off NEXT block's get_2b in background
-                 next_p0 = p0 + blksize
-                 if next_p0 < nvir:
-                     next_p1 = min(next_p0 + blksize, nvir)
-                     next_ranges = (slice(0, nocc), slice(nocc, nmo),
-                                    slice(nocc+next_p0, nocc+next_p1), slice(nocc, nmo))
-                     pending_tc = async_read(
-                         lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
-                     pending_key = (next_p0, next_p1)
+        def issue_tile(spec, device):
+            _, _, r0, r1 = spec
+            ranges = (
+                slice(nocc + p0, nocc + p1),
+                slice(0, nocc),
+                slice(nocc + r0, nocc + r1),
+                slice(nocc, nmo),
+            )
+            return xtc_mod.compute_2b_tile(
+                xtc_obj, jastrow_params, ranges,
+                device=device, panel_size=panel_blk, panel_layout="pr")
 
-                 ds[:, :, p0:p1, :] = std_blk + tc_blk
+        def consume_tile(spec, device, tile_handle):
+            del device
+            _, _, r0, r1 = spec
+            r_len = r1 - r0
+            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]
+            std_tile = np.tensordot(Lov_p, L_vv_full[r0:r1], axes=((0,), (2,)))
+            std_tile = std_tile.transpose(1, 0, 2, 3)
+            slab[:, :, r0:r1, :] = std_tile + tc_tile
 
-        elif name == 'vovv': # (c, k, a, d) - iterate 'c' (idx 0)
-            blksize, _ = estimate_blksize(
-                nocc, nvir, 'vovv_eri_build',
-                gpu_max_memory_mb=getattr(eris, 'gpu_max_memory', None),
-                host_max_memory_mb=getattr(eris, 'max_memory', None),
-                n_fused=_n_fused)
-            blksize = max(4, blksize)
-            logger.debug(f"Blksize for vovv: {blksize}")
+        _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+        vovv_ds[p0:p1, :, :, :] = slab
 
-            from pytc.utils.prefetch import async_read, await_read
-            pending_tc = None
-            pending_key = None
-            for p0, p1 in lib.prange(0, nvir, blksize):
-                Lov_slice = Lov_reshaped[:, :, p0:p1]
-                std_blk = np.tensordot(Lov_slice, L_vv_full, axes=((0), (2)))
-                std_blk = std_blk.transpose(1, 0, 2, 3) 
-                ranges = (slice(nocc+p0, nocc+p1), slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
-                if pending_tc is not None and pending_key == (p0, p1):
-                    tc_blk = await_read(pending_tc)
-                    pending_tc = None
-                else:
-                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+    ovvv_ds = eris.ovvv
+    occ_all = slice(0, nocc)
+    vir_all = slice(nocc, nmo)
+    for r0, r1 in lib.prange(0, nvir, panel_blk):
+        r_len = r1 - r0
+        L_r = L_vv_full[r0:r1]
+        slab = np.empty((nocc, nvir, r_len, nvir), dtype=np.float64)
+        tile_specs = [
+            (q0, min(q0 + panel_blk, nvir), r0, r1)
+            for q0 in range(0, nvir, panel_blk)
+        ]
 
-                # Kick off NEXT block's get_2b in background
-                next_p0 = p0 + blksize
-                if next_p0 < nvir:
-                    next_p1 = min(next_p0 + blksize, nvir)
-                    next_ranges = (slice(nocc+next_p0, nocc+next_p1),
-                                   slice(0, nocc), slice(nocc, nmo), slice(nocc, nmo))
-                    pending_tc = async_read(
-                        lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
-                    pending_key = (next_p0, next_p1)
+        def issue_tile(spec, device):
+            q0, q1, _, _ = spec
+            ranges = (
+                occ_all,
+                slice(nocc + q0, nocc + q1),
+                slice(nocc + r0, nocc + r1),
+                vir_all,
+            )
+            return xtc_mod.compute_2b_tile(
+                xtc_obj, jastrow_params, ranges,
+                device=device, panel_size=panel_blk, panel_layout="qr")
 
-                ds[p0:p1, :, :, :] = std_blk + tc_blk
+        def consume_tile(spec, device, tile_handle):
+            del device
+            q0, q1, _, _ = spec
+            q_len = q1 - q0
+            tc_tile = np.asarray(tile_handle)[:, :q_len, :r_len, :]
+            Lov_q = Lov_reshaped[:, :, q0:q1]
+            std_tile = np.tensordot(Lov_q, L_r, axes=((0,), (2,)))
+            slab[:, q0:q1, :, :] = std_tile + tc_tile
+
+        _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+        ovvv_ds[:, :, r0:r1, :] = slab
 
 
 def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir, nmo, cc):
