@@ -136,23 +136,25 @@ class TestXTCCCSDLargeBlocks(unittest.TestCase):
         )
 
     def test_large_block_build_uses_expected_panel_layouts(self):
-        saw_ovvv_qr = False
-        saw_vovv_pr = False
+        # Balanced tiling: ovvv uses (occ_all, vir_all, r_blk, vir_all) with "pr",
+        # vovv uses (vir_all, occ_all, r_blk, vir_all) with "qr".
+        saw_ovvv_pr = False
+        saw_vovv_qr = False
         for ranges, layout in self.recorded_layouts:
             p, q, _, _ = ranges
-            p_len = p.stop - p.start
-            q_len = q.stop - q.start
             if p.start == 0 and p.stop == self.nocc and q.start == self.nocc:
-                saw_ovvv_qr |= (layout == "qr")
+                saw_ovvv_pr |= (layout == "pr")
             if p.start >= self.nocc and q.start == 0 and q.stop == self.nocc:
-                saw_vovv_pr |= (layout == "pr")
-        self.assertTrue(saw_ovvv_qr, "ovvv builder never used panel_layout='qr'")
-        self.assertTrue(saw_vovv_pr, "vovv builder never used panel_layout='pr'")
+                saw_vovv_qr |= (layout == "qr")
+        self.assertTrue(saw_ovvv_pr, "ovvv builder never used panel_layout='pr'")
+        self.assertTrue(saw_vovv_qr, "vovv builder never used panel_layout='qr'")
 
     def test_large_block_datasets_are_chunked(self):
+        # Both tensors are written as [:, :, r0:r1, :] with r_blk=nocc,
+        # so chunks are aligned on axis 2 at size nocc.
         self.assertIsNotNone(self.eris.ovvv.chunks)
         self.assertIsNotNone(self.eris.vovv.chunks)
         self.assertEqual(self.eris.ovvv.chunks[0], self.nocc)
-        self.assertEqual(self.eris.ovvv.chunks[2], 2)
-        self.assertEqual(self.eris.vovv.chunks[0], 2)
+        self.assertEqual(self.eris.ovvv.chunks[2], self.nocc)
         self.assertEqual(self.eris.vovv.chunks[1], self.nocc)
+        self.assertEqual(self.eris.vovv.chunks[2], self.nocc)

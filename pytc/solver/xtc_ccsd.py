@@ -360,12 +360,14 @@ def _make_xtc_eris(cc, mo_coeff=None):
             include_accumulators=False,
         )
 
-        # Create HDF5 datasets for large blocks
+        # Create HDF5 datasets for large blocks.
+        # Both are written as [:, :, r0:r1, :] with r_blk=nocc (balanced tiling),
+        # so chunks are aligned on axis 2.
         eris_blocks = {
             'ovvv': ((nocc, nvir, nvir, nvir),
-                     (nocc, min(32, nvir), panel_blk, min(64, nvir))),
+                     (nocc, min(32, nvir), nocc, min(64, nvir))),
             'vovv': ((nvir, nocc, nvir, nvir),
-                     (panel_blk, nocc, min(32, nvir), min(64, nvir))),
+                     (min(32, nvir), nocc, nocc, min(64, nvir))),
         }
         for name, (shape, chunks) in eris_blocks.items():
             if name in eris.feri:
@@ -761,13 +763,13 @@ def _update_amps(cc, t1, t2, eris):
         blksize_t2 = min(nvir, blksize_t2)
         logger.debug("Starting vovv loop (blksize=%d, prefetched)", blksize_t2)
         t_loop = time.perf_counter()
-        chunks = [(p0, min(p0 + blksize_t2, nvir))
-                  for p0 in range(0, nvir, blksize_t2)]
-        loader = hdf5_slice_loader(eris.vovv, axis=0)
+        chunks = [(b0, min(b0 + blksize_t2, nvir))
+                  for b0 in range(0, nvir, blksize_t2)]
+        loader = hdf5_slice_loader(eris.vovv, axis=2)
         with PrefetchIterator(chunks, loader) as pit:
-            for (p0, p1), vovv_slice in pit:
+            for (b0, b1), vovv_slice in pit:
                 _process_vovv_block_prefetched(
-                    vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
+                    vovv_slice, eris_oovv, t1, t2, t2new, b0, b1)
         # Symmetrize the accumulated t2new from vovv blocks
         t2new = t2new + t2new.transpose(1, 0, 3, 2)
         logger.debug("vovv loop done in %.3f s", time.perf_counter()-t_loop)
@@ -918,36 +920,39 @@ def _process_ovvv_block_prefetched(ovvv_blk, t1, t2, tau, t1new, Lvv,
     tmp_b[:, p0:p1, :, :] += lib.einsum('kcbd,ijcd->kbij', ovvv_blk, tau)
     logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
 
-def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, p0, p1):
+def _process_vovv_block(eris, eris_oovv, t1, t2, t2new, b0, b1):
     """Process a chunk of vovv block for t2 updates."""
-    # vovv shape is (a, i, b, c) - slice along axis 0 (a)
-    logger.debug("_process_vovv_block chunk %d:%d", p0, p1)
+    # vovv shape is (a, i, b, c) - slice along axis 2 (b)
+    logger.debug("_process_vovv_block chunk %d:%d", b0, b1)
     t0 = time.perf_counter()
-    vovv_slice = _get_slice(eris.vovv, slice(p0, p1), axis=0)  # (a_blk, i, b, c)
-    _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1)
-    logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    vovv_slice = _get_slice(eris.vovv, slice(b0, b1), axis=2)  # (a, i, b_blk, c)
+    _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, b0, b1)
+    logger.debug("chunk %d:%d done in %.3f s", b0, b1, time.perf_counter()-t0)
 
 
-def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, p0, p1):
-    """Process an already-loaded vovv block (used by PrefetchIterator path)."""
+def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, b0, b1):
+    """Process an already-loaded vovv block (used by PrefetchIterator path).
+
+    vovv_slice shape: (nvir, nocc, b_blk, nvir)  — vovv[:, :, b0:b1, :]
+    Accumulates into t2new[:, :, :, b0:b1].
+    """
     t0 = time.perf_counter()
-    
-    # For tmp2 = -oovv.ka + vovv, we need the contribution for a in [p0:p1]
-    # oovv is (k, i, b, c), t1 is (k, a)
-    # einsum('kibc,ka->abic') with t1[:, p0:p1] gives (a_blk, b, i, c)
-    t1_slice = t1[:, p0:p1]  # (k, a_blk)
-    tmp2_blk = lib.einsum('kibc,ka->abic', eris_oovv, -t1_slice)
-    
-    # vovv_slice is (a_blk, i, b, c), transpose to (a_blk, b, i, c)
+
+    # oovv is (k, i, b_blk, c) for this b-slice, t1 is (k, a)
+    # einsum('kibc,ka->abic') gives (a, b_blk, i, c)
+    oovv_b_blk = eris_oovv[:, :, b0:b1, :]
+    tmp2_blk = lib.einsum('kibc,ka->abic', oovv_b_blk, -t1)
+
+    # vovv_slice is (a, i, b_blk, c), transpose to (a, b_blk, i, c)
     tmp2_blk += vovv_slice.transpose(0, 2, 1, 3)
-    
-    # Contract: tmp2(a_blk, b, i, c) * t1(j, c) -> (a_blk, b, i, j) -> transpose to (i, j, a_blk, b)
-    term = lib.einsum('abic,jc->ijab', tmp2_blk, t1)
-    
-    # Only add to the a_blk slice, symmetrization will be handled by the caller
-    t2new[:, :, p0:p1, :] += term
 
-    logger.debug("chunk %d:%d done in %.3f s", p0, p1, time.perf_counter()-t0)
+    # Contract: tmp2(a, b_blk, i, c) * t1(j, c) -> (i, j, a, b_blk)
+    term = lib.einsum('abic,jc->ijab', tmp2_blk, t1)
+
+    # Accumulate into b_blk slice; caller symmetrizes after full loop
+    t2new[:, :, :, b0:b1] += term
+
+    logger.debug("chunk %d:%d done in %.3f s", b0, b1, time.perf_counter()-t0)
 
 def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     """Initialize DF tensors and HDF5 file."""
@@ -994,78 +999,96 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
 
 def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
                           L_vv_full, nocc, nvir, nmo, panel_blk):
-    """Compute and write balanced tiled ovvv / vovv blocks to HDF5."""
+    """Compute and write balanced tiled ovvv / vovv blocks to HDF5.
+
+    Balanced tiling: the free virtual index is held at its full vir_all extent
+    on the left side of every tile, and the remaining (r) virtual index is
+    sliced in chunks of nocc.  This gives equal pair counts (nocc×nvir) on
+    both sides of every tile, eliminating the nocc:nvir imbalance.
+
+    Both tensors are written as [:, :, r0:r1, :] slabs on axis 2.
+
+      ovvv tile: (occ_all, vir_all, vir_r_blk, vir_all)  panel_layout="pr"
+      vovv tile: (vir_all, occ_all, vir_r_blk, vir_all)  panel_layout="qr"
+
+    panel_size=nocc pads only the small, potentially-variable-sized dimensions
+    (p=occ and r=vir_r_blk for ovvv; q=occ and r=vir_r_blk for vovv) for JIT
+    shape stability.  The large vir_all dimensions are compiled at their actual
+    size and remain fixed across all tiles.
+    """
     devices = _solver_local_devices()
+    blk = nocc  # r-slice size: gives nocc×nvir pairs on each side
 
+    n_tiles = -(-nvir // blk)  # ceil division
+    logger.info(
+        "Computing large blocks (balanced tiling: blk=%d, n_tiles=%d per tensor)...",
+        blk, n_tiles,
+    )
+
+    tile_specs = [(r0, min(r0 + blk, nvir)) for r0 in range(0, nvir, blk)]
+
+    # --- vovv: shape (nvir, nocc, nvir, nvir) = (a, i, b, c) ---
+    # Tile: (vir_all, occ_all, vir_r_blk, vir_all) — left pairs nvir×nocc = right pairs nocc×nvir.
+    # panel_layout="qr": pads q=occ (no-op) and r=vir_r_blk for JIT stability.
+    # Write vovv[:, :, r0:r1, :].
     vovv_ds = eris.vovv
-    for p0, p1 in lib.prange(0, nvir, panel_blk):
-        p_len = p1 - p0
-        Lov_p = Lov_reshaped[:, :, p0:p1]
-        slab = np.empty((p_len, nocc, nvir, nvir), dtype=np.float64)
-        tile_specs = [
-            (p0, p1, r0, min(r0 + panel_blk, nvir))
-            for r0 in range(0, nvir, panel_blk)
-        ]
 
-        def issue_tile(spec, device):
-            _, _, r0, r1 = spec
-            ranges = (
-                slice(nocc + p0, nocc + p1),
-                slice(0, nocc),
-                slice(nocc + r0, nocc + r1),
-                slice(nocc, nmo),
-            )
-            return xtc_mod.compute_2b_tile(
-                xtc_obj, jastrow_params, ranges,
-                device=device, panel_size=panel_blk, panel_layout="pr")
+    def issue_vovv(spec, device):
+        r0, r1 = spec
+        ranges = (
+            slice(nocc, nmo),                    # p = vir_all
+            slice(0, nocc),                      # q = occ_all
+            slice(nocc + r0, nocc + r1),         # r = vir_r_blk
+            slice(nocc, nmo),                    # s = vir_all
+        )
+        return xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, ranges,
+            device=device, panel_size=blk, panel_layout="qr")
 
-        def consume_tile(spec, device, tile_handle):
-            del device
-            _, _, r0, r1 = spec
-            r_len = r1 - r0
-            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]
-            std_tile = np.tensordot(Lov_p, L_vv_full[r0:r1], axes=((0,), (2,)))
-            std_tile = std_tile.transpose(1, 0, 2, 3)
-            slab[:, :, r0:r1, :] = std_tile + tc_tile
-
-        _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
-        vovv_ds[p0:p1, :, :, :] = slab
-
-    ovvv_ds = eris.ovvv
-    occ_all = slice(0, nocc)
-    vir_all = slice(nocc, nmo)
-    for r0, r1 in lib.prange(0, nvir, panel_blk):
+    def consume_vovv(spec, device, tile_handle):
+        del device
+        r0, r1 = spec
         r_len = r1 - r0
-        L_r = L_vv_full[r0:r1]
-        slab = np.empty((nocc, nvir, r_len, nvir), dtype=np.float64)
-        tile_specs = [
-            (q0, min(q0 + panel_blk, nvir), r0, r1)
-            for q0 in range(0, nvir, panel_blk)
-        ]
+        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # (nvir, nocc, r_len, nvir)
+        # DF: vovv[a,i,b,c] = sum_L Lov[L,i,a] * Lvv[L,b,c]
+        # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
+        # transpose(1,0,2,3) -> (nvir, nocc, r_len, nvir)
+        std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,))).transpose(1, 0, 2, 3)
+        np.add(std, tc, out=std)
+        vovv_ds[:, :, r0:r1, :] = std
 
-        def issue_tile(spec, device):
-            q0, q1, _, _ = spec
-            ranges = (
-                occ_all,
-                slice(nocc + q0, nocc + q1),
-                slice(nocc + r0, nocc + r1),
-                vir_all,
-            )
-            return xtc_mod.compute_2b_tile(
-                xtc_obj, jastrow_params, ranges,
-                device=device, panel_size=panel_blk, panel_layout="qr")
+    _round_robin_pipeline(tile_specs, issue_vovv, consume_vovv, devices=devices)
 
-        def consume_tile(spec, device, tile_handle):
-            del device
-            q0, q1, _, _ = spec
-            q_len = q1 - q0
-            tc_tile = np.asarray(tile_handle)[:, :q_len, :r_len, :]
-            Lov_q = Lov_reshaped[:, :, q0:q1]
-            std_tile = np.tensordot(Lov_q, L_r, axes=((0,), (2,)))
-            slab[:, q0:q1, :, :] = std_tile + tc_tile
+    # --- ovvv: shape (nocc, nvir, nvir, nvir) = (k, d, a, c) ---
+    # Tile: (occ_all, vir_all, vir_r_blk, vir_all) — left pairs nocc×nvir = right pairs nocc×nvir.
+    # panel_layout="pr": pads p=occ (no-op) and r=vir_r_blk for JIT stability.
+    # Write ovvv[:, :, r0:r1, :].
+    ovvv_ds = eris.ovvv
 
-        _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
-        ovvv_ds[:, :, r0:r1, :] = slab
+    def issue_ovvv(spec, device):
+        r0, r1 = spec
+        ranges = (
+            slice(0, nocc),                      # p = occ_all
+            slice(nocc, nmo),                    # q = vir_all
+            slice(nocc + r0, nocc + r1),         # r = vir_r_blk
+            slice(nocc, nmo),                    # s = vir_all
+        )
+        return xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, ranges,
+            device=device, panel_size=blk, panel_layout="pr")
+
+    def consume_ovvv(spec, device, tile_handle):
+        del device
+        r0, r1 = spec
+        r_len = r1 - r0
+        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # (nocc, nvir, r_len, nvir)
+        # DF: ovvv[k,d,a,c] = sum_L Lov[L,k,d] * Lvv[L,a,c]
+        # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
+        std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,)))
+        np.add(std, tc, out=std)
+        ovvv_ds[:, :, r0:r1, :] = std
+
+    _round_robin_pipeline(tile_specs, issue_ovvv, consume_ovvv, devices=devices)
 
 
 def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir, nmo, cc):
