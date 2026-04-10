@@ -177,7 +177,7 @@ def _solver_local_devices():
 
 def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
                           device_key=None):
-    """Issue tiles to devices in round-robin order and harvest results.
+    """Issue tiles to devices in round-robin; run consume callbacks in a thread pool.
 
     Parameters
     ----------
@@ -186,31 +186,58 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
         device.  Keys are assigned to devices in first-seen order round-robin.
         Default (None) assigns tiles by sequential tile index.
 
-    Pipeline depth is 2×n_devices so each GPU can have two tiles in flight
-    while the oldest tile's result is being transferred / accumulated on host.
+    GPU dispatch (issue_tile) runs on the main thread so JAX sees a clean
+    per-device dispatch order.  consume_tile callbacks run off the main thread
+    so that GPU→CPU transfers, CPU contractions, and I/O all overlap with the
+    next round of GPU dispatches, keeping all GPUs continuously fed.
+
+    A semaphore caps tiles in-flight at 2×n_devices to bound peak host memory.
+    consume_tile is responsible for its own thread safety — callers that write
+    to shared state (e.g. HDF5 datasets) should guard those writes with a
+    threading.Lock in their closure.
     """
+    import concurrent.futures
+    import threading
+
     devices = devices or _solver_local_devices()
     n_devices = len(devices)
-    pipeline_depth = 2 * n_devices
-    pending = deque()
+    max_in_flight = 2 * n_devices
     _key_to_device = {}
 
-    for tile_id, spec in enumerate(tile_specs):
-        if device_key is not None:
-            k = device_key(spec)
-            if k not in _key_to_device:
-                _key_to_device[k] = devices[len(_key_to_device) % n_devices]
-            device = _key_to_device[k]
-        else:
-            device = devices[tile_id % n_devices]
-        pending.append((spec, device, issue_tile(spec, device)))
-        if len(pending) >= pipeline_depth:
-            ready_spec, ready_device, handle = pending.popleft()
-            consume_tile(ready_spec, ready_device, handle)
+    semaphore = threading.Semaphore(max_in_flight)
+    first_error = [None]
+    error_lock = threading.Lock()
 
-    while pending:
-        ready_spec, ready_device, handle = pending.popleft()
-        consume_tile(ready_spec, ready_device, handle)
+    def _run_consume(spec, device, handle):
+        try:
+            consume_tile(spec, device, handle)
+        except Exception as exc:
+            with error_lock:
+                if first_error[0] is None:
+                    first_error[0] = exc
+        finally:
+            semaphore.release()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+        futures = []
+        for tile_id, spec in enumerate(tile_specs):
+            if first_error[0] is not None:
+                break
+            if device_key is not None:
+                k = device_key(spec)
+                if k not in _key_to_device:
+                    _key_to_device[k] = devices[len(_key_to_device) % n_devices]
+                device = _key_to_device[k]
+            else:
+                device = devices[tile_id % n_devices]
+            semaphore.acquire()  # blocks until a consume slot is free
+            handle = issue_tile(spec, device)
+            futures.append(pool.submit(_run_consume, spec, device, handle))
+        for f in futures:
+            f.result()  # re-raises first consume-thread exception
+
+    if first_error[0] is not None:
+        raise first_error[0]
 
 
 class _ChemistsERIs(rccsd._ChemistsERIs):
@@ -1016,6 +1043,8 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
     shape stability.  The large vir_all dimensions are compiled at their actual
     size and remain fixed across all tiles.
     """
+    import threading
+
     devices = _solver_local_devices()
     blk = nocc  # r-slice size: gives nocc×nvir pairs on each side
 
@@ -1026,6 +1055,10 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
     )
 
     tile_specs = [(r0, min(r0 + blk, nvir)) for r0 in range(0, nvir, blk)]
+
+    # HDF5 is not thread-safe for concurrent writes; serialize with a lock.
+    # The GPU→CPU transfer and CPU tensordot in each consume run in parallel.
+    hdf5_lock = threading.Lock()
 
     # --- vovv: shape (nvir, nocc, nvir, nvir) = (a, i, b, c) ---
     # Tile: (vir_all, occ_all, vir_r_blk, vir_all) — left pairs nvir×nocc = right pairs nocc×nvir.
@@ -1049,13 +1082,14 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
         del device
         r0, r1 = spec
         r_len = r1 - r0
-        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # (nvir, nocc, r_len, nvir)
+        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # GPU→CPU (parallel across tiles)
         # DF: vovv[a,i,b,c] = sum_L Lov[L,i,a] * Lvv[L,b,c]
         # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
         # transpose(1,0,2,3) -> (nvir, nocc, r_len, nvir)
         std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,))).transpose(1, 0, 2, 3)
         np.add(std, tc, out=std)
-        vovv_ds[:, :, r0:r1, :] = std
+        with hdf5_lock:
+            vovv_ds[:, :, r0:r1, :] = std
 
     _round_robin_pipeline(tile_specs, issue_vovv, consume_vovv, devices=devices)
 
@@ -1081,12 +1115,13 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
         del device
         r0, r1 = spec
         r_len = r1 - r0
-        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # (nocc, nvir, r_len, nvir)
+        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # GPU→CPU (parallel across tiles)
         # DF: ovvv[k,d,a,c] = sum_L Lov[L,k,d] * Lvv[L,a,c]
         # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
         std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,)))
         np.add(std, tc, out=std)
-        ovvv_ds[:, :, r0:r1, :] = std
+        with hdf5_lock:
+            ovvv_ds[:, :, r0:r1, :] = std
 
     _round_robin_pipeline(tile_specs, issue_ovvv, consume_ovvv, devices=devices)
 
@@ -1144,12 +1179,14 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             for r0 in range(0, nvir, r_blksize)
         ]
 
+        import threading as _threading
         _t_issue = [0.0]
         _t_gpu_wait = [0.0]
         _t_tensordot = [0.0]
         _t_assign = [0.0]
-        _issued_devices = set()
-        _consumed_devices = set()
+        _timing_lock = _threading.Lock()
+        _issued_devices = set()  # only mutated from main thread (issue_tile)
+        _logged_devices = set()  # guarded by _timing_lock (consume_tile threads)
 
         def issue_tile(spec, device, _t=_t_issue):
             _, _, r0, r1 = spec
@@ -1172,27 +1209,29 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             _t[0] += time.perf_counter() - t0
             return result
 
-        def consume_tile(spec, device, tile_handle,
-                         _tw=_t_gpu_wait, _tt=_t_tensordot, _ta=_t_assign):
+        def consume_tile(spec, device, tile_handle):
             _, _, r0, r1 = spec
             p_len = p1 - p0
             r_len = r1 - r0
             device_key = getattr(device, "id", "host")
             t0 = time.perf_counter()
-            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # blocks on GPU
+            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # GPU→CPU transfer
             t1 = time.perf_counter()
             std_tile = np.tensordot(L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
             t2 = time.perf_counter()
+            # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed
             vvvv_slab[:, :, r0:r1, :] = std_tile + tc_tile
-            _tw[0] += t1 - t0
-            _tt[0] += t2 - t1
-            _ta[0] += time.perf_counter() - t2
-            if device_key not in _consumed_devices:
-                _consumed_devices.add(device_key)
-                logger.debug(
-                    "VVVV first consume on device %s: gpu_wait=%.3fs tensordot=%.3fs assign=%.3fs",
-                    device_key, t1 - t0, t2 - t1, time.perf_counter() - t2,
-                )
+            t3 = time.perf_counter()
+            with _timing_lock:
+                _t_gpu_wait[0] += t1 - t0
+                _t_tensordot[0] += t2 - t1
+                _t_assign[0] += t3 - t2
+                if device_key not in _logged_devices:
+                    _logged_devices.add(device_key)
+                    logger.debug(
+                        "VVVV first consume on device %s: gpu_wait=%.3fs tensordot=%.3fs assign=%.3fs",
+                        device_key, t1 - t0, t2 - t1, t3 - t2,
+                    )
 
         _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
 
