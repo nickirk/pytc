@@ -401,6 +401,25 @@ def _make_xtc_eris(cc, mo_coeff=None):
                 del eris.feri[name]
             setattr(eris, name, eris.feri.create_dataset(name, shape, 'f8', chunks=chunks))
 
+        # Preload X into RAM before the large-block / VVVV pipelines. Every
+        # tile in _compute_large_blocks and _compute_vvvv_block_df calls
+        # _get_delta_u_direct_tile, which slices X per tile; if X is still an
+        # HDF5 dataset, those slice reads happen on the main dispatch thread
+        # and serialize issue_tile, preventing multi-GPU overlap.
+        _kernels = xtc_obj.isdf_kernels
+        _X_kernel = _kernels.get('X') if _kernels is not None else None
+        if isinstance(_X_kernel, h5py.Dataset):
+            _x_gb = _X_kernel.size * 8 / 1e9
+            logger.info(
+                "Preloading X into RAM before large-block build (%.2f GB) ...",
+                _x_gb,
+            )
+            _t_x = time.perf_counter()
+            _kernels = dict(_kernels)
+            _kernels['X'] = _X_kernel[:]
+            xtc_obj = xtc_obj.replace(isdf_kernels=_kernels)
+            logger.info("X preload done in %.1f s", time.perf_counter() - _t_x)
+
         logger.info("Computing large blocks...")
         _compute_large_blocks(
             eris, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full,
