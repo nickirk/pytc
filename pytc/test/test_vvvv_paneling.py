@@ -119,13 +119,17 @@ class TestVVVVPanelSizing(unittest.TestCase):
 class TestSolverRoundRobin(unittest.TestCase):
     def test_round_robin_pipeline_cycles_devices(self):
         seen = []
+        seen_lock = __import__("threading").Lock()
 
         def issue(spec, device):
-            seen.append(("issue", spec, device))
+            with seen_lock:
+                seen.append(("issue", spec, device))
             return spec * 10
 
-        def consume(spec, device, handle):
-            seen.append(("consume", spec, device, handle))
+        def consume(spec, device, handle, release_gpu_slot):
+            release_gpu_slot()
+            with seen_lock:
+                seen.append(("consume", spec, device, handle))
 
         xtc_ccsd._round_robin_pipeline(
             [0, 1, 2, 3, 4],
@@ -134,10 +138,16 @@ class TestSolverRoundRobin(unittest.TestCase):
             devices=("d0", "d1"),
         )
 
+        # Issue order is deterministic (main thread); consume order may vary
+        # because consumes now run concurrently in a thread pool.
         issue_devices = [entry[2] for entry in seen if entry[0] == "issue"]
-        consume_devices = [entry[2] for entry in seen if entry[0] == "consume"]
         self.assertEqual(issue_devices, ["d0", "d1", "d0", "d1", "d0"])
-        self.assertEqual(consume_devices, ["d0", "d1", "d0", "d1", "d0"])
+        consume_entries = [entry for entry in seen if entry[0] == "consume"]
+        self.assertEqual(len(consume_entries), 5)
+        self.assertEqual(
+            sorted((entry[1], entry[2]) for entry in consume_entries),
+            sorted([(0, "d0"), (1, "d1"), (2, "d0"), (3, "d1"), (4, "d0")]),
+        )
 
     def test_forced_two_local_devices_drive_jax_vvvv_scheduler(self):
         script = textwrap.dedent(

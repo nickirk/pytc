@@ -176,7 +176,7 @@ def _solver_local_devices():
 
 
 def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
-                          device_key=None):
+                          device_key=None, gpu_slots=None, host_slots=None):
     """Issue tiles to devices in round-robin; run consume callbacks in a thread pool.
 
     Parameters
@@ -185,13 +185,30 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
         When provided, all tiles that share the same key are sent to the same
         device.  Keys are assigned to devices in first-seen order round-robin.
         Default (None) assigns tiles by sequential tile index.
+    gpu_slots : int, optional
+        Number of tiles allowed to be in flight on the GPU pipeline before the
+        main dispatch thread must wait.  Defaults to ``2 * n_devices``.  A
+        GPU slot is released the moment ``consume_tile`` calls
+        ``release_gpu_slot`` (typically right after the GPU→CPU readback),
+        freeing the main thread to issue the next tile even while CPU post-
+        processing and disk writes for earlier tiles are still in flight.
+    host_slots : int, optional
+        Number of tiles allowed to hold host-side buffers concurrently.
+        Defaults to ``4 * n_devices``.  Bounds peak host memory for in-flight
+        CPU contractions and HDF5 writes.  Must be ``>= gpu_slots``.
 
     GPU dispatch (issue_tile) runs on the main thread so JAX sees a clean
     per-device dispatch order.  consume_tile callbacks run off the main thread
     so that GPU→CPU transfers, CPU contractions, and I/O all overlap with the
     next round of GPU dispatches, keeping all GPUs continuously fed.
 
-    A semaphore caps tiles in-flight at 2×n_devices to bound peak host memory.
+    ``consume_tile`` is called as ``consume_tile(spec, device, handle,
+    release_gpu_slot)``.  It MUST call ``release_gpu_slot()`` as soon as the
+    tile is drained from the GPU (typically immediately after
+    ``np.asarray(handle)``) so the main thread can issue the next GPU tile
+    while CPU-only work continues.  ``release_gpu_slot`` is idempotent and is
+    also called automatically at the end of the consume task as a safety net.
+
     consume_tile is responsible for its own thread safety — callers that write
     to shared state (e.g. HDF5 datasets) should guard those writes with a
     threading.Lock in their closure.
@@ -201,24 +218,41 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
 
     devices = devices or _solver_local_devices()
     n_devices = len(devices)
-    max_in_flight = 2 * n_devices
+    if gpu_slots is None:
+        gpu_slots = 2 * n_devices
+    if host_slots is None:
+        host_slots = max(gpu_slots, 4 * n_devices)
+    if host_slots < gpu_slots:
+        host_slots = gpu_slots
     _key_to_device = {}
 
-    semaphore = threading.Semaphore(max_in_flight)
+    gpu_sem = threading.Semaphore(gpu_slots)
+    host_sem = threading.Semaphore(host_slots)
     first_error = [None]
     error_lock = threading.Lock()
 
     def _run_consume(spec, device, handle):
+        released = [False]
+        release_lock = threading.Lock()
+
+        def release_gpu_slot():
+            with release_lock:
+                if released[0]:
+                    return
+                released[0] = True
+            gpu_sem.release()
+
         try:
-            consume_tile(spec, device, handle)
+            consume_tile(spec, device, handle, release_gpu_slot)
         except Exception as exc:
             with error_lock:
                 if first_error[0] is None:
                     first_error[0] = exc
         finally:
-            semaphore.release()
+            release_gpu_slot()  # safety net if consume forgot
+            host_sem.release()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=host_slots) as pool:
         futures = []
         for tile_id, spec in enumerate(tile_specs):
             if first_error[0] is not None:
@@ -230,7 +264,8 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
                 device = _key_to_device[k]
             else:
                 device = devices[tile_id % n_devices]
-            semaphore.acquire()  # blocks until a consume slot is free
+            host_sem.acquire()  # bound host-side memory
+            gpu_sem.acquire()   # bound GPU pipeline depth
             handle = issue_tile(spec, device)
             futures.append(pool.submit(_run_consume, spec, device, handle))
         for f in futures:
@@ -624,7 +659,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         return xtc_mod.compute_2b_tile(
             xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
 
-    def consume_tile(spec, device, tile_handle):
+    def consume_tile(spec, device, tile_handle, release_gpu_slot):
         p0, p1, r0, r1 = spec
         p_len = p1 - p0
         r_len = r1 - r0
@@ -634,6 +669,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         )
         t0 = time.perf_counter()
         vvvv_tile = np.asarray(tile_handle)
+        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
         if with_df is not None:
             std_tile = np.tensordot(L_vv_full[p0:p1], L_vv_full[r0:r1], axes=((2,), (2,)))
             vvvv_tile = vvvv_tile[:p_len, :, :r_len, :] + std_tile
@@ -1047,30 +1083,35 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
                           L_vv_full, nocc, nvir, nmo, panel_blk):
     """Compute and write balanced tiled ovvv / vovv blocks to HDF5.
 
-    Balanced tiling: the free virtual index is held at its full vir_all extent
-    on the left side of every tile, and the remaining (r) virtual index is
-    sliced in chunks of nocc.  This gives equal pair counts (nocc×nvir) on
-    both sides of every tile, eliminating the nocc:nvir imbalance.
+    The r virtual index is sliced in chunks of ``panel_blk`` (GPU-memory-aware,
+    from ``resolve_v3o_panel_block_size``).  Larger tiles mean fewer GPU kernel
+    launches, fewer HDF5 slab writes, and larger BLAS calls in the DF
+    tensordot step — exactly what vvvv already does.
 
     Both tensors are written as [:, :, r0:r1, :] slabs on axis 2.
 
       ovvv tile: (occ_all, vir_all, vir_r_blk, vir_all)  panel_layout="pr"
       vovv tile: (vir_all, occ_all, vir_r_blk, vir_all)  panel_layout="qr"
 
-    panel_size=nocc pads only the small, potentially-variable-sized dimensions
-    (p=occ and r=vir_r_blk for ovvv; q=occ and r=vir_r_blk for vovv) for JIT
-    shape stability.  The large vir_all dimensions are compiled at their actual
-    size and remain fixed across all tiles.
+    panel_size=panel_blk pads the variable-sized dimensions (p=occ for ovvv,
+    q=occ for vovv, and r=vir_r_blk) to a fixed size for JIT shape stability.
+    The large vir_all dimensions are compiled at their actual size and remain
+    fixed across all tiles.
     """
     import threading
 
     devices = _solver_local_devices()
-    blk = nocc  # r-slice size: gives nocc×nvir pairs on each side
+    blk = panel_blk  # r-slice size: GPU-memory-aware, from resolve_v3o_panel_block_size
+    # panel_size pads both the occ dimension (always nocc) and the r dimension
+    # (up to blk).  Must be >= max(nocc, blk) so padding never shrinks a dim.
+    # In production panel_blk >> nocc so this equals panel_blk; in small test
+    # cases where panel_blk < nocc this floors at nocc.
+    panel_size = max(nocc, blk)
 
     n_tiles = -(-nvir // blk)  # ceil division
     logger.info(
-        "Computing large blocks (balanced tiling: blk=%d, n_tiles=%d per tensor)...",
-        blk, n_tiles,
+        "Computing large blocks (blk=%d, panel_size=%d, n_tiles=%d per tensor)...",
+        blk, panel_size, n_tiles,
     )
 
     tile_specs = [(r0, min(r0 + blk, nvir)) for r0 in range(0, nvir, blk)]
@@ -1081,7 +1122,7 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
 
     # --- vovv: shape (nvir, nocc, nvir, nvir) = (a, i, b, c) ---
     # Tile: (vir_all, occ_all, vir_r_blk, vir_all) — left pairs nvir×nocc = right pairs nocc×nvir.
-    # panel_layout="qr": pads q=occ (no-op) and r=vir_r_blk for JIT stability.
+    # panel_layout="qr": pads q=occ and r=vir_r_blk to panel_size for JIT stability.
     # Write vovv[:, :, r0:r1, :].
     vovv_ds = eris.vovv
 
@@ -1095,13 +1136,14 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
         )
         return xtc_mod.compute_2b_tile(
             xtc_obj, jastrow_params, ranges,
-            device=device, panel_size=blk, panel_layout="qr")
+            device=device, panel_size=panel_size, panel_layout="qr")
 
-    def consume_vovv(spec, device, tile_handle):
+    def consume_vovv(spec, device, tile_handle, release_gpu_slot):
         del device
         r0, r1 = spec
         r_len = r1 - r0
         tc = np.asarray(tile_handle)[:, :, :r_len, :]  # GPU→CPU (parallel across tiles)
+        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
         # DF: vovv[a,i,b,c] = sum_L Lov[L,i,a] * Lvv[L,b,c]
         # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
         # transpose(1,0,2,3) -> (nvir, nocc, r_len, nvir)
@@ -1114,7 +1156,7 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
 
     # --- ovvv: shape (nocc, nvir, nvir, nvir) = (k, d, a, c) ---
     # Tile: (occ_all, vir_all, vir_r_blk, vir_all) — left pairs nocc×nvir = right pairs nocc×nvir.
-    # panel_layout="pr": pads p=occ (no-op) and r=vir_r_blk for JIT stability.
+    # panel_layout="pr": pads p=occ and r=vir_r_blk to panel_size for JIT stability.
     # Write ovvv[:, :, r0:r1, :].
     ovvv_ds = eris.ovvv
 
@@ -1128,13 +1170,14 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
         )
         return xtc_mod.compute_2b_tile(
             xtc_obj, jastrow_params, ranges,
-            device=device, panel_size=blk, panel_layout="pr")
+            device=device, panel_size=panel_size, panel_layout="pr")
 
-    def consume_ovvv(spec, device, tile_handle):
+    def consume_ovvv(spec, device, tile_handle, release_gpu_slot):
         del device
         r0, r1 = spec
         r_len = r1 - r0
         tc = np.asarray(tile_handle)[:, :, :r_len, :]  # GPU→CPU (parallel across tiles)
+        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
         # DF: ovvv[k,d,a,c] = sum_L Lov[L,k,d] * Lvv[L,a,c]
         # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
         std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,)))
@@ -1228,7 +1271,7 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             _t[0] += time.perf_counter() - t0
             return result
 
-        def consume_tile(spec, device, tile_handle):
+        def consume_tile(spec, device, tile_handle, release_gpu_slot):
             _, _, r0, r1 = spec
             p_len = p1 - p0
             r_len = r1 - r0
@@ -1236,6 +1279,7 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             t0 = time.perf_counter()
             tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # GPU→CPU transfer
             t1 = time.perf_counter()
+            release_gpu_slot()  # GPU pipeline is now free to issue the next tile
             std_tile = np.tensordot(L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
             t2 = time.perf_counter()
             # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed
