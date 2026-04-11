@@ -314,13 +314,28 @@ def _make_xtc_eris(cc, mo_coeff=None):
         )
 
         # Create HDF5 datasets for large blocks.
-        # Both are written as [:, :, r0:r1, :] with r_blk=nocc (balanced tiling),
-        # so chunks are aligned on axis 2.
+        #
+        # Both ovvv and vovv are WRITTEN as [:, :, r0:r1, :] slabs in chunks
+        # of panel_blk along axis 2 (the r virtual index), and READ as
+        # [:, :, p0:p1, :] slabs along the same axis during CCSD iterations.
+        # Chunking axis-2 at panel_blk makes every write slab exactly cover
+        # an integer number of chunks on that axis — no read-modify-write
+        # of boundary chunks, which was the main write amplifier that made
+        # HDF5 writes the pipeline bottleneck (consume threads held the
+        # acc_lock for the full RMW, blocking all other consume threads and
+        # eventually stalling the main dispatch thread on host_sem).
+        #
+        # Axes 1 and 3 are chunked at 64 each so a single chunk is ~15 MB
+        # for typical (nocc, nvir, panel_blk) — a good HDF5 compromise
+        # between per-chunk overhead (favours bigger) and chunk cache hit
+        # rate (favours smaller).
+        _ax13 = min(64, nvir)
+        _ax2  = min(panel_blk, nvir)
         eris_blocks = {
             'ovvv': ((nocc, nvir, nvir, nvir),
-                     (nocc, min(32, nvir), nocc, min(64, nvir))),
+                     (nocc, _ax13, _ax2, _ax13)),
             'vovv': ((nvir, nocc, nvir, nvir),
-                     (min(32, nvir), nocc, nocc, min(64, nvir))),
+                     (_ax13, nocc, _ax2, _ax13)),
         }
         for name, (shape, chunks) in eris_blocks.items():
             if name in eris.feri:
