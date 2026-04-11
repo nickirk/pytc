@@ -19,6 +19,13 @@ from pytc.utils.gpu_memory import (
     resolve_v3o_panel_block_size,
     enable_xla_compilation_cache,
 )
+from pytc.utils.gpu_pipeline import (
+    _solver_local_devices,
+    broadcast_to_devices,
+    _gpu_slot_ctx,
+    _round_robin_pipeline,
+    _AsyncHDF5Writer,
+)
 import h5py
 from pytc import xtc as xtc_mod
 
@@ -174,13 +181,10 @@ def _next_vvvv_panel_key(p0, p_blksize, r0, r_blksize, nvir):
         )
     return None
 
-# GPU pipeline primitives live in utils for reuse across solvers.
-from pytc.utils.gpu_pipeline import (
-    _solver_local_devices,
-    broadcast_to_devices,
-    _gpu_slot_ctx,
-    _round_robin_pipeline,
-)
+
+# GPU pipeline primitives are imported at the top of the module (see
+# pytc.utils.gpu_pipeline) and include _AsyncHDF5Writer used by the
+# large-blocks / vvvv write paths below.
 
 
 class _ChemistsERIs(rccsd._ChemistsERIs):
@@ -1038,7 +1042,8 @@ class _TiledBlockSpec:
 
 
 def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
-                               xtc_obj, jastrow_params, devices):
+                               xtc_obj, jastrow_params, devices,
+                               writer=None):
     """Run a single multi-GPU tiled pipeline over one or more ERI blocks.
 
     All ``blocks`` are interleaved in one ``_round_robin_pipeline`` call so
@@ -1054,15 +1059,57 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
         Passed through to ``compute_2b_tile``.
     devices : sequence
         Local devices for round-robin dispatch.
+    writer : _AsyncHDF5Writer, optional
+        When provided, tile writes are submitted to this background writer
+        instead of running on the pipeline consumer thread under a local
+        lock.  This is the desired mode for HDF5-backed ``write_fn`` (e.g.
+        ovvv/vovv in ``_compute_large_blocks``) because:
+
+          * a single writer thread inherently serialises HDF5 access
+            (the library is not thread-safe), replacing the previous
+            ``acc_lock`` without adding contention;
+          * the consume thread returns to the ``host_sem`` pool in
+            microseconds, so the dispatch thread never stalls on slot
+            availability, keeping all GPUs continuously fed even when
+            the backing store is slow.
+
+        When ``writer`` is ``None`` (the default — used by the in-memory
+        medium-blocks path) writes run inline under a per-pipeline lock;
+        for NumPy target arrays this is fast and avoids spawning an
+        unnecessary background thread.
     """
     panel_size = max(nocc, panel_blk)
-    acc_lock   = threading.Lock()
+    acc_lock   = threading.Lock() if writer is None else None
 
     tile_specs = [
         (blk, i0, min(i0 + panel_blk, nvir))
         for blk in blocks
         for i0 in range(0, nvir, panel_blk)
     ]
+
+    # --- Per-stage consume timers ---------------------------------------
+    # Accumulated across all tiles (and all consume threads).  Together
+    # with ``_round_robin_pipeline``'s main-thread stats and the
+    # ``_AsyncHDF5Writer`` stats this gives a full picture of where each
+    # tile's wall-clock seconds went:
+    #
+    #   gpu2cpu_s : np.asarray(handle) — GPU→CPU DMA
+    #   df_s      : blk.df_fn()        — CPU DF contraction (tensordot)
+    #   add_s     : np.add(tile, tc_view, out=tile)  — in-place accumulate
+    #               (or np.ascontiguousarray(tc_view) on the no-DF branch)
+    #   submit_s  : writer.submit(...) — should be ~0; nonzero means the
+    #               writer queue is full (writer is the bottleneck)
+    #   writefn_s : blk.write_fn(...)  — inline-write path only (writer=None)
+    stage_stats = {
+        "gpu2cpu_s": 0.0,
+        "df_s":      0.0,
+        "add_s":     0.0,
+        "submit_s":  0.0,
+        "writefn_s": 0.0,
+        "n_tiles":   0,
+        "bytes":     0,
+    }
+    stage_lock = threading.Lock()
 
     def issue(spec, device):
         blk, i0, i1 = spec
@@ -1074,7 +1121,9 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
     def consume(spec, device, handle, release_gpu_slot):
         blk, i0, i1 = spec
         i_len     = i1 - i0
+        t0 = time.perf_counter()
         tc_raw    = np.asarray(handle)             # GPU→CPU transfer
+        t1 = time.perf_counter()
         release_gpu_slot()                          # free GPU slot immediately
         tc_view   = blk.trim_fn(tc_raw, i_len)     # strip JIT padding (view)
         if blk.df_fn is not None:
@@ -1083,16 +1132,77 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
             # per tile (which was the main cause of the 50 % host RAM blow-up
             # vs. the pre-refactoring path).
             tile = blk.df_fn(i0, i1)               # fresh contiguous alloc
+            t2 = time.perf_counter()
             np.add(tile, tc_view, out=tile)        # tile += tc_view
+            t3 = time.perf_counter()
+            df_s  = t2 - t1
+            add_s = t3 - t2
         else:
             # No DF contribution: materialise a contiguous copy of the view
             # so the padded tc_raw can be freed before the write.
             tile = np.ascontiguousarray(tc_view)
+            t3 = time.perf_counter()
+            df_s  = 0.0
+            add_s = t3 - t1
         del tc_view, tc_raw                        # release padded buffer ASAP
-        with acc_lock:
-            blk.write_fn(i0, i1, tile)             # write / accumulate
+        tile_bytes = tile.nbytes
+        if writer is not None:
+            # Hand the finished tile off to the background writer and
+            # return immediately — the HDF5 write then runs in parallel
+            # with the next tiles' GPU→CPU readbacks and DF contractions.
+            t_sub0 = time.perf_counter()
+            writer.submit(blk.write_fn, i0, i1, tile, _bytes=tile_bytes)
+            t_sub1 = time.perf_counter()
+            submit_s  = t_sub1 - t_sub0
+            writefn_s = 0.0
+        else:
+            submit_s = 0.0
+            t_wf0 = time.perf_counter()
+            with acc_lock:
+                blk.write_fn(i0, i1, tile)
+            t_wf1 = time.perf_counter()
+            writefn_s = t_wf1 - t_wf0
+        with stage_lock:
+            stage_stats["n_tiles"]   += 1
+            stage_stats["gpu2cpu_s"] += (t1 - t0)
+            stage_stats["df_s"]      += df_s
+            stage_stats["add_s"]     += add_s
+            stage_stats["submit_s"]  += submit_s
+            stage_stats["writefn_s"] += writefn_s
+            stage_stats["bytes"]     += tile_bytes
 
-    _round_robin_pipeline(tile_specs, issue, consume, devices=devices)
+    pipeline_stats = _round_robin_pipeline(
+        tile_specs, issue, consume, devices=devices, return_stats=True)
+
+    # --- Summary log -----------------------------------------------------
+    # Everything needed to answer the three diagnostic questions:
+    #   Q1 (is the writer saturated?)     → writer.log_summary() below
+    #   Q2 (is HDF5 the bandwidth cap?)   → busy_BW / effective_BW fields
+    #   Q3 (where do tile seconds go?)    → gpu2cpu/df/add/submit/writefn
+    #                                       + main-thread host_wait/gpu_wait/issue
+    block_names = "/".join(b.name for b in blocks)
+    n_tiles = stage_stats["n_tiles"]
+    total_gb = stage_stats["bytes"] / 1e9
+    wall = pipeline_stats["wall_s"]
+    logger.info(
+        "[tiled-pipeline:%s] n_tiles=%d  wall=%.2fs  total=%.2f GB  "
+        "main:{host_wait=%.2fs gpu_wait=%.2fs issue=%.2fs}  "
+        "consume_sum:{gpu2cpu=%.2fs df=%.2fs add=%.2fs submit=%.2fs writefn=%.2fs}",
+        block_names, n_tiles, wall, total_gb,
+        pipeline_stats["host_wait_s"], pipeline_stats["gpu_wait_s"],
+        pipeline_stats["issue_s"],
+        stage_stats["gpu2cpu_s"], stage_stats["df_s"], stage_stats["add_s"],
+        stage_stats["submit_s"], stage_stats["writefn_s"],
+    )
+    # host_wait ≈ the smoking gun: if it's a big fraction of ``wall``,
+    # the main thread spent most of its time waiting for host_sem slots,
+    # which means a downstream stage (writer / disk) is the bottleneck.
+    if wall > 0 and pipeline_stats["host_wait_s"] / wall > 0.20:
+        logger.info(
+            "[tiled-pipeline:%s] host_wait is %.0f%% of wall — downstream "
+            "stage (writer/disk) is throttling GPU dispatch",
+            block_names, 100.0 * pipeline_stats["host_wait_s"] / wall,
+        )
 
 
 def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
@@ -1169,10 +1279,24 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
             (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
     )
 
-    _run_tiled_block_pipeline(
-        [vovv_spec, ovvv_spec], nvir, panel_blk, nocc,
-        xtc_obj, jastrow_params, devices,
-    )
+    # Offload all ovvv/vovv tile writes to a dedicated background thread.
+    # The queue depth is intentionally generous (larger than host_sem) so
+    # back-pressure comes from host_sem in _round_robin_pipeline, not from
+    # the writer; this keeps the GPU pipeline saturated whenever the disk
+    # can keep up, and degrades gracefully to backpressure-limited mode
+    # only when the disk is the true bottleneck.  See _AsyncHDF5Writer
+    # docstring for the full motivation.
+    with _AsyncHDF5Writer(max_pending=16, name="ovvv-vovv-writer") as writer:
+        _run_tiled_block_pipeline(
+            [vovv_spec, ovvv_spec], nvir, panel_blk, nocc,
+            xtc_obj, jastrow_params, devices,
+            writer=writer,
+        )
+        # Explicit drain here (even though __exit__ does it) so the
+        # writer summary reflects the full run, including any writes
+        # still in flight when the pipeline returned.
+        writer.drain()
+        writer.log_summary(logger.info)
 
 
 def _compute_medium_blocks_tiled(
@@ -1369,81 +1493,133 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
 
     ds = eris.vvvv
     devices = _solver_local_devices()
-    for p0, p1 in lib.prange(0, nvir, p_blksize):
-        L_p = L_vv_full[p0:p1]
-        vvvv_slab = np.empty((p1 - p0, nvir, nvir, nvir), dtype=np.float64)
 
-        tile_specs = [
-            (p0, p1, r0, min(r0 + r_blksize, nvir))
-            for r0 in range(0, nvir, r_blksize)
-        ]
+    # --- Async HDF5 slab writer ----------------------------------------
+    # Each vvvv slab is up to tens of GB, so we cannot afford the
+    # "queue a bunch of slabs and let them drain later" pattern used for
+    # the ovvv/vovv small-tile path.  We instead cap the number of slabs
+    # alive at any instant to 2 (one being written, one being built) via
+    # a dedicated semaphore, and route the write itself through
+    # ``_AsyncHDF5Writer`` so the main loop can immediately start
+    # allocating + computing the NEXT slab while the previous one is
+    # streaming to disk.  The writer thread releases ``slab_sem`` in a
+    # ``finally`` after the ``ds[...] = slab`` assignment, so the next
+    # ``slab_sem.acquire()`` unblocks as soon as the prior write lands.
+    #
+    # ``max_pending=2`` for the writer queue is a safety margin — the
+    # real back-pressure is ``slab_sem``, which caps total live slabs at
+    # 2 (one queued/writing + one being built).
+    slab_sem = threading.Semaphore(2)
 
-        _t_issue = [0.0]
-        _t_gpu_wait = [0.0]
-        _t_tensordot = [0.0]
-        _t_assign = [0.0]
-        _timing_lock = threading.Lock()
-        _issued_devices = set()  # only mutated from main thread (issue_tile)
-        _logged_devices = set()  # guarded by _timing_lock (consume_tile threads)
+    def _write_vvvv_slab(slab, p0_local, p1_local, sem=slab_sem):
+        try:
+            ds[p0_local:p1_local, :, :, :] = slab
+        finally:
+            sem.release()
 
-        def issue_tile(spec, device, _t=_t_issue):
-            _, _, r0, r1 = spec
-            ranges = (
-                slice(nocc + p0, nocc + p1),
-                slice(nocc, nmo),
-                slice(nocc + r0, nocc + r1),
-                slice(nocc, nmo),
-            )
-            device_key = getattr(device, "id", "host")
-            if device_key not in _issued_devices:
-                _issued_devices.add(device_key)
-                logger.debug(
-                    "VVVV first issue on device %s: p=%d:%d r=%d:%d panel=%d",
-                    device_key, p0, p1, r0, r1, panel_size,
-                )
-            t0 = time.perf_counter()
-            result = xtc_mod.compute_2b_tile(
-                xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
-            _t[0] += time.perf_counter() - t0
-            return result
+    with _AsyncHDF5Writer(max_pending=2, name="vvvv-writer") as writer:
+        for p0, p1 in lib.prange(0, nvir, p_blksize):
+            # Bound live slabs at 2: blocks here if the previous slab is
+            # still waiting in (or being drained from) the writer queue.
+            slab_sem.acquire()
+            try:
+                L_p = L_vv_full[p0:p1]
+                vvvv_slab = np.empty((p1 - p0, nvir, nvir, nvir), dtype=np.float64)
 
-        def consume_tile(spec, device, tile_handle, release_gpu_slot):
-            _, _, r0, r1 = spec
-            p_len = p1 - p0
-            r_len = r1 - r0
-            device_key = getattr(device, "id", "host")
-            t0 = time.perf_counter()
-            tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # GPU→CPU transfer
-            t1 = time.perf_counter()
-            release_gpu_slot()  # GPU pipeline is now free to issue the next tile
-            std_tile = np.tensordot(L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
-            t2 = time.perf_counter()
-            # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed
-            vvvv_slab[:, :, r0:r1, :] = std_tile + tc_tile
-            t3 = time.perf_counter()
-            with _timing_lock:
-                _t_gpu_wait[0] += t1 - t0
-                _t_tensordot[0] += t2 - t1
-                _t_assign[0] += t3 - t2
-                if device_key not in _logged_devices:
-                    _logged_devices.add(device_key)
-                    logger.debug(
-                        "VVVV first consume on device %s: gpu_wait=%.3fs tensordot=%.3fs assign=%.3fs",
-                        device_key, t1 - t0, t2 - t1, t3 - t2,
+                tile_specs = [
+                    (p0, p1, r0, min(r0 + r_blksize, nvir))
+                    for r0 in range(0, nvir, r_blksize)
+                ]
+
+                _t_issue = [0.0]
+                _t_gpu_wait = [0.0]
+                _t_tensordot = [0.0]
+                _t_assign = [0.0]
+                _timing_lock = threading.Lock()
+                _issued_devices = set()  # only mutated from main thread (issue_tile)
+                _logged_devices = set()  # guarded by _timing_lock (consume_tile threads)
+
+                def issue_tile(spec, device, _t=_t_issue,
+                               _p0=p0, _p1=p1):
+                    _, _, r0, r1 = spec
+                    ranges = (
+                        slice(nocc + _p0, nocc + _p1),
+                        slice(nocc, nmo),
+                        slice(nocc + r0, nocc + r1),
+                        slice(nocc, nmo),
                     )
+                    device_key = getattr(device, "id", "host")
+                    if device_key not in _issued_devices:
+                        _issued_devices.add(device_key)
+                        logger.debug(
+                            "VVVV first issue on device %s: p=%d:%d r=%d:%d panel=%d",
+                            device_key, _p0, _p1, r0, r1, panel_size,
+                        )
+                    t0 = time.perf_counter()
+                    result = xtc_mod.compute_2b_tile(
+                        xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size)
+                    _t[0] += time.perf_counter() - t0
+                    return result
 
-        _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+                def consume_tile(spec, device, tile_handle, release_gpu_slot,
+                                 _slab=vvvv_slab, _L_p=L_p, _p0=p0, _p1=p1):
+                    _, _, r0, r1 = spec
+                    p_len = _p1 - _p0
+                    r_len = r1 - r0
+                    device_key = getattr(device, "id", "host")
+                    t0 = time.perf_counter()
+                    tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # GPU→CPU transfer
+                    t1 = time.perf_counter()
+                    release_gpu_slot()  # GPU pipeline is now free to issue the next tile
+                    std_tile = np.tensordot(_L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
+                    t2 = time.perf_counter()
+                    # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed
+                    _slab[:, :, r0:r1, :] = std_tile + tc_tile
+                    t3 = time.perf_counter()
+                    with _timing_lock:
+                        _t_gpu_wait[0] += t1 - t0
+                        _t_tensordot[0] += t2 - t1
+                        _t_assign[0] += t3 - t2
+                        if device_key not in _logged_devices:
+                            _logged_devices.add(device_key)
+                            logger.debug(
+                                "VVVV first consume on device %s: gpu_wait=%.3fs tensordot=%.3fs assign=%.3fs",
+                                device_key, t1 - t0, t2 - t1, t3 - t2,
+                            )
 
-        t_write_start = time.perf_counter()
-        ds[p0:p1, :, :, :] = vvvv_slab
-        t_write = time.perf_counter() - t_write_start
+                _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices)
+            except BaseException:
+                # If tile compute fails before we hand ownership of the
+                # slab to the writer, release the semaphore ourselves so
+                # we do not wedge the next iteration (or drain) forever.
+                slab_sem.release()
+                raise
 
-        logger.debug(
-            "VVVV slab %3d:%3d | dispatch=%.2fs  gpu_wait=%.2fs  "
-            "tensordot=%.2fs  assign=%.2fs  hdf5_write=%.2fs",
-            p0, p1,
-            _t_issue[0], _t_gpu_wait[0], _t_tensordot[0], _t_assign[0], t_write,
-        )
+            # Hand the fully-built slab to the writer thread; the writer
+            # owns it from here and will release ``slab_sem`` in its
+            # finally after the HDF5 assignment lands.  ``_bytes`` feeds
+            # the writer's throughput counters so the end-of-run
+            # ``log_summary`` can report effective GB/s.
+            writer.submit(
+                _write_vvvv_slab, vvvv_slab, p0, p1,
+                _bytes=vvvv_slab.nbytes,
+            )
+            # Drop our local reference so only the writer queue pins the
+            # slab — otherwise the next-iteration np.empty allocation
+            # would transiently hold 3 slabs.
+            del vvvv_slab, L_p
+
+            logger.debug(
+                "VVVV slab %3d:%3d | dispatch=%.2fs  gpu_wait=%.2fs  "
+                "tensordot=%.2fs  assign=%.2fs  (write queued)",
+                p0, p1,
+                _t_issue[0], _t_gpu_wait[0], _t_tensordot[0], _t_assign[0],
+            )
+        # Flush any in-flight writes before closing the context so that
+        # the "write complete" log line is truthful and so any latched
+        # writer error is re-raised on the main thread.
+        writer.drain()
+        writer.log_summary(logger.info)
     logger.info("    VVVV disk write complete")
 
 
@@ -1471,29 +1647,63 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
     mo_v = mo_coeff[:, nocc:]
     pending_tc = None
     pending_key = None
-    for p0, p1 in lib.prange(0, nvir, blksize):
-        # Compute only the needed block of standard integrals
-        std_blk = ao2mo.general(mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-        std_blk = std_blk.reshape(p1-p0, nvir, nvir, nvir)
 
-        ranges = (slice(nocc+p0, nocc+p1), slice(nocc, nmo),
-                  slice(nocc, nmo), slice(nocc, nmo))
-        if pending_tc is not None and pending_key == (p0, p1):
-            tc_blk = await_read(pending_tc)
-            pending_tc = None
-        else:
-            tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+    # --- Async HDF5 slab writer (see _compute_vvvv_block_df for rationale) -
+    # Each slab is up to tens of GB; bound alive slabs at 2 so that the
+    # next-iteration ao2mo + TC compute can overlap with the previous
+    # slab's HDF5 write without ballooning host memory.
+    slab_sem = threading.Semaphore(2)
 
-        # Kick off NEXT block's get_2b in background
-        next_p0 = p0 + blksize
-        if next_p0 < nvir:
-            next_p1 = min(next_p0 + blksize, nvir)
-            next_ranges = (slice(nocc+next_p0, nocc+next_p1),
-                           slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
-            pending_tc = async_read(
-                lambda r=next_ranges: np.asarray(xtc_obj.get_2b(jastrow_params, ranges=r)))
-            pending_key = (next_p0, next_p1)
+    def _write_vvvv_slab(slab, p0_local, p1_local, sem=slab_sem):
+        try:
+            ds[p0_local:p1_local, :, :, :] = slab
+        finally:
+            sem.release()
 
-        ds[p0:p1, :, :, :] = std_blk + tc_blk
-        logger.debug(f"VVVV block {p0}:{p1} written to disk")
+    with _AsyncHDF5Writer(max_pending=2, name="vvvv-writer") as writer:
+        for p0, p1 in lib.prange(0, nvir, blksize):
+            slab_sem.acquire()
+            try:
+                # Compute only the needed block of standard integrals
+                std_blk = ao2mo.general(
+                    mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
+                std_blk = std_blk.reshape(p1-p0, nvir, nvir, nvir)
+
+                ranges = (slice(nocc+p0, nocc+p1), slice(nocc, nmo),
+                          slice(nocc, nmo), slice(nocc, nmo))
+                if pending_tc is not None and pending_key == (p0, p1):
+                    tc_blk = await_read(pending_tc)
+                    pending_tc = None
+                else:
+                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+                # Kick off NEXT block's get_2b in background
+                next_p0 = p0 + blksize
+                if next_p0 < nvir:
+                    next_p1 = min(next_p0 + blksize, nvir)
+                    next_ranges = (slice(nocc+next_p0, nocc+next_p1),
+                                   slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
+                    pending_tc = async_read(
+                        lambda r=next_ranges: np.asarray(
+                            xtc_obj.get_2b(jastrow_params, ranges=r)))
+                    pending_key = (next_p0, next_p1)
+
+                # Fuse std + tc into the slab that will be handed to the writer.
+                # Use += on std_blk to avoid one extra slab-sized allocation.
+                std_blk += tc_blk
+                del tc_blk
+                slab = std_blk
+                del std_blk
+            except BaseException:
+                slab_sem.release()
+                raise
+
+            writer.submit(
+                _write_vvvv_slab, slab, p0, p1,
+                _bytes=slab.nbytes,
+            )
+            del slab
+            logger.debug(f"VVVV block {p0}:{p1} write queued")
+        writer.drain()
+        writer.log_summary(logger.info)
     logger.info("    VVVV disk write complete")
