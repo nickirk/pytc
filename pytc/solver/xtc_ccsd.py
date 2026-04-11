@@ -1,6 +1,7 @@
 import contextlib
 import concurrent.futures
 import logging
+import threading
 import time
 from collections import deque
 import numpy as np
@@ -177,6 +178,39 @@ def _solver_local_devices():
     return devices if devices else (None,)
 
 
+@contextlib.contextmanager
+def _gpu_slot_ctx(gpu_sem):
+    """Context manager that yields an idempotent GPU-slot release callable.
+
+    The yielded ``release()`` function releases *gpu_sem* exactly once no
+    matter how many times it is called (subsequent calls are no-ops).  On
+    exit the context manager calls ``release()`` itself as a safety net, so
+    the slot is never leaked even if the consumer forgets to call it.
+
+    Typical usage inside a consume callback::
+
+        with _gpu_slot_ctx(gpu_sem) as release_gpu_slot:
+            data = np.asarray(handle)   # GPU→CPU readback
+            release_gpu_slot()          # free GPU slot immediately
+            ... CPU post-processing ...
+    """
+    _released = False
+    _lock = threading.Lock()
+
+    def release():
+        nonlocal _released
+        with _lock:
+            if _released:
+                return
+            _released = True
+        gpu_sem.release()
+
+    try:
+        yield release
+    finally:
+        release()  # safety net — idempotent, so harmless if already called
+
+
 def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
                           device_key=None, gpu_slots=None, host_slots=None):
     """Issue tiles to devices in round-robin; run consume callbacks in a thread pool.
@@ -208,16 +242,13 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
     release_gpu_slot)``.  It MUST call ``release_gpu_slot()`` as soon as the
     tile is drained from the GPU (typically immediately after
     ``np.asarray(handle)``) so the main thread can issue the next GPU tile
-    while CPU-only work continues.  ``release_gpu_slot`` is idempotent and is
-    also called automatically at the end of the consume task as a safety net.
+    while CPU-only work continues.  ``release_gpu_slot`` is idempotent and
+    guaranteed to be called on exit even if consume_tile raises.
 
     consume_tile is responsible for its own thread safety — callers that write
     to shared state (e.g. HDF5 datasets) should guard those writes with a
     threading.Lock in their closure.
     """
-    import concurrent.futures
-    import threading
-
     devices = devices or _solver_local_devices()
     n_devices = len(devices)
     if gpu_slots is None:
@@ -228,37 +259,19 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
         host_slots = gpu_slots
     _key_to_device = {}
 
-    gpu_sem = threading.Semaphore(gpu_slots)
+    gpu_sem  = threading.Semaphore(gpu_slots)
     host_sem = threading.Semaphore(host_slots)
-    first_error = [None]
-    error_lock = threading.Lock()
 
     def _run_consume(spec, device, handle):
-        released = [False]
-        release_lock = threading.Lock()
-
-        def release_gpu_slot():
-            with release_lock:
-                if released[0]:
-                    return
-                released[0] = True
-            gpu_sem.release()
-
         try:
-            consume_tile(spec, device, handle, release_gpu_slot)
-        except Exception as exc:
-            with error_lock:
-                if first_error[0] is None:
-                    first_error[0] = exc
+            with _gpu_slot_ctx(gpu_sem) as release_gpu_slot:
+                consume_tile(spec, device, handle, release_gpu_slot)
         finally:
-            release_gpu_slot()  # safety net if consume forgot
             host_sem.release()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=host_slots) as pool:
         futures = []
         for tile_id, spec in enumerate(tile_specs):
-            if first_error[0] is not None:
-                break
             if device_key is not None:
                 k = device_key(spec)
                 if k not in _key_to_device:
@@ -271,10 +284,7 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
             handle = issue_tile(spec, device)
             futures.append(pool.submit(_run_consume, spec, device, handle))
         for f in futures:
-            f.result()  # re-raises first consume-thread exception
-
-    if first_error[0] is not None:
-        raise first_error[0]
+            f.result()  # re-raises first consume-thread exception on the main thread
 
 
 class _ChemistsERIs(rccsd._ChemistsERIs):
@@ -1163,8 +1173,6 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
     devices : sequence
         Local devices for round-robin dispatch.
     """
-    import threading
-
     panel_size = max(nocc, panel_blk)
     acc_lock   = threading.Lock()
 
@@ -1478,12 +1486,11 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
             for r0 in range(0, nvir, r_blksize)
         ]
 
-        import threading as _threading
         _t_issue = [0.0]
         _t_gpu_wait = [0.0]
         _t_tensordot = [0.0]
         _t_assign = [0.0]
-        _timing_lock = _threading.Lock()
+        _timing_lock = threading.Lock()
         _issued_devices = set()  # only mutated from main thread (issue_tile)
         _logged_devices = set()  # guarded by _timing_lock (consume_tile threads)
 
