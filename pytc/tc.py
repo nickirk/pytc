@@ -1287,8 +1287,26 @@ class ISDFTC(TC):
             grad_phi_p = jax.device_put(grad_phi_p, device)
             grad_phi_q = jax.device_put(grad_phi_q, device)
 
+        # Caller-expected p/q extents (before any symmetrization re-padding).
+        p_len_out = phi_p.shape[0]
+        q_len_out = phi_q.shape[0]
+
         with device_ctx:
             if slice_p == slice_q:
+                # The antisymmetrization ``k12 - k12.T(1,0,2,3)`` requires
+                # ``phi_p.shape[0] == phi_q.shape[0]``.  Panel padding can
+                # violate that when ``nocc < panel_blk`` and the layout
+                # pads only one of p/q (e.g. "pr" for oovv): phi_p → panel_size,
+                # phi_q stays at nocc.  Match the shorter side to the longer
+                # before the contract; we slice axes 0/1 back to ``p_len_out``
+                # / ``q_len_out`` after combining with K3 so the returned tile
+                # still follows the panel_layout convention.
+                match_len = max(phi_p.shape[0], phi_q.shape[0])
+                if phi_p.shape[0] < match_len:
+                    phi_p      = _pad_axis(phi_p, 0, match_len)
+                    grad_phi_p = _pad_axis(grad_phi_p, 0, match_len)
+                if phi_q.shape[0] < match_len:
+                    phi_q      = _pad_axis(phi_q, 0, match_len)
                 k12 = kmat_jax.contract_K1_isdf_jit(
                     phi_p, phi_q, phi_r, phi_s, grad_phi_p, u1, rbs)
                 k12 = k12 - k12.transpose(1, 0, 2, 3)
@@ -1309,7 +1327,15 @@ class ISDFTC(TC):
                     _t_k3 = time.perf_counter()
                     logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
                                  "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
-                return 0.5 * (k12 + k3)
+                result = 0.5 * (k12 + k3)
+                # If the slice_p==slice_q branch re-padded phi_p/phi_q to
+                # equalise them, slice axes 0/1 back to the caller-expected
+                # extents so the tile matches the panel_layout convention.
+                if result.shape[0] != p_len_out:
+                    result = result[:p_len_out, :, :, :]
+                if result.shape[1] != q_len_out:
+                    result = result[:, :q_len_out, :, :]
+                return result
 
             result_np = np.array(k12)
             del k12
@@ -1318,6 +1344,10 @@ class ISDFTC(TC):
             result_np += np.asarray(k3)
             del k3
             result_np *= 0.5
+            # Match caller-expected shape when symmetrization re-padding
+            # widened axes 0/1 beyond the original slice extents.
+            if result_np.shape[0] != p_len_out or result_np.shape[1] != q_len_out:
+                result_np = result_np[:p_len_out, :q_len_out, :, :]
             return jnp.asarray(result_np)
 
     def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None,
@@ -1365,7 +1395,15 @@ class ISDFTC(TC):
         logger.debug("Starting ISDFTC.get_2b")
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
-            
+        # Full-tensor fallback: when no block/ranges requested, build the
+        # entire (n_orb, n_orb, n_orb, n_orb) TC correction.  Prior to the
+        # ec4a6ea refactor this was handled inline; the extraction of
+        # ``_assemble_tc_tile`` dropped the fallback, so without it callers
+        # like ``get_2b_fock(T=None)`` crash on ``ranges=None``.
+        if ranges is None:
+            full = slice(None)
+            ranges = (full, full, full, full)
+
         # Check if kernels are available, if not compute them
         if self.isdf_kernels is None:
             kernels = self.compute_kmat_kernels(jastrow_params, batch_size)

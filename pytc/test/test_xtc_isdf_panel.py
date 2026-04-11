@@ -185,6 +185,62 @@ class TestISDFXTCPanelization(unittest.TestCase):
         self.assertIs(cache_a["K1_kernel"], cache_b["K1_kernel"])
         self.assertIs(cache_a["K3_kernel"], cache_b["K3_kernel"])
 
+    def test_tc_direct_tile_panel_padding_slice_p_eq_slice_q(self):
+        """Regression: ``_get_tc_direct_tile`` must tolerate panel padding
+        on only one of p/q when ``slice_p == slice_q``.
+
+        Before the fix, the antisymmetrization shortcut
+        ``k12 - k12.transpose(1, 0, 2, 3)`` crashed with
+        ``sub got incompatible shapes for broadcasting`` whenever the
+        panel_layout padded one side of the (p, q) pair but not the
+        other — which happens in the oovv medium block when
+        ``nocc < panel_blk`` (layout ``"pr"`` pads p → panel_size while
+        q stays at nocc).  The slice length must be ≥ 2 to turn the bug
+        into a hard crash instead of a silent NumPy broadcast.
+        """
+        isdf_xtc = self.isdf_xtc.isdf(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        kernels = isdf_xtc.isdf_kernels
+
+        # slice_p == slice_q → antisymmetrization branch.  Use a length-2
+        # slice so panel_size=3 is strictly larger AND the transposed
+        # shape (2, 3, ...) does not broadcast against (3, 2, ...) — this
+        # is the actual bug mode seen in production (nocc=21, panel=22).
+        pq_slice = slice(0, 2)
+        r_slice  = slice(0, 2)
+        s_slice  = slice(0, 2)
+        ranges = (pq_slice, pq_slice, r_slice, s_slice)
+        ref = isdf_xtc._get_tc_direct_tile(kernels, ranges)
+
+        # --- "pr" layout: pads p (axis 0) and r (axis 2) only ------------
+        # Before the fix this call raised TypeError from k12 - k12.T with
+        # shapes (3, 2, 3, 2) vs (2, 3, 3, 2).
+        pr_padded = isdf_xtc._get_tc_direct_tile(
+            kernels, ranges, panel_size=3, panel_layout="pr")
+        # Convention: axes listed in the layout are padded, others are not.
+        self.assertEqual(np.asarray(pr_padded).shape, (3, 2, 3, 2))
+        np.testing.assert_allclose(
+            np.asarray(pr_padded)[:2, :2, :2, :],
+            np.asarray(ref),
+            atol=1e-10, rtol=1e-10,
+        )
+
+        # --- "qr" layout: pads q (axis 1) and r (axis 2) only ------------
+        # Symmetric case — exercises the branch where phi_q is the padded
+        # side and phi_p gets re-padded inside the fix.
+        qr_padded = isdf_xtc._get_tc_direct_tile(
+            kernels, ranges, panel_size=3, panel_layout="qr")
+        self.assertEqual(np.asarray(qr_padded).shape, (2, 3, 3, 2))
+        np.testing.assert_allclose(
+            np.asarray(qr_padded)[:2, :2, :2, :],
+            np.asarray(ref),
+            atol=1e-10, rtol=1e-10,
+        )
+
     def test_2b_tile_assembly_matches_public_api(self):
         isdf_xtc = self.isdf_xtc.isdf(
             self.jparams,
