@@ -1106,113 +1106,173 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     Lov = Lov.reshape(naux, nocc*nvir)
     return Loo, Lov
 
+
+# ---------------------------------------------------------------------------
+# Generic tiled ERI block builder
+# ---------------------------------------------------------------------------
+
+class _TiledBlockSpec:
+    """Describes one ERI block built tile-by-tile via the multi-GPU pipeline.
+
+    All per-block logic (index ranges, padding trim, DF contribution, output
+    accumulation) lives here so ``_run_tiled_block_pipeline`` contains only
+    the device-dispatch boilerplate.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable block name used in log messages.
+    ranges_fn : callable (i0, i1) -> tuple[slice, ...]
+        Returns the four MO-index slices for tile ``[i0:i1]``.
+    panel_layout : str
+        ``"pr"`` or ``"qr"`` — which axes are JIT-padded to ``panel_size``.
+    trim_fn : callable (tc_raw, i_len) -> ndarray
+        Strips XTC padding to the actual tile shape.
+    df_fn : callable (i0, i1) -> ndarray or None
+        CPU DF contribution for the tile (same shape as trimmed XTC result).
+        Pass ``None`` to skip the DF addition.
+    write_fn : callable (i0, i1, tile) -> None
+        Accumulates / writes the finished tile.  Called under ``acc_lock``.
+    """
+    __slots__ = ("name", "ranges_fn", "panel_layout", "trim_fn", "df_fn", "write_fn")
+
+    def __init__(self, name, ranges_fn, panel_layout, trim_fn, df_fn, write_fn):
+        self.name        = name
+        self.ranges_fn   = ranges_fn
+        self.panel_layout = panel_layout
+        self.trim_fn     = trim_fn
+        self.df_fn       = df_fn
+        self.write_fn    = write_fn
+
+
+def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
+                               xtc_obj, jastrow_params, devices):
+    """Run a single multi-GPU tiled pipeline over one or more ERI blocks.
+
+    All ``blocks`` are interleaved in one ``_round_robin_pipeline`` call so
+    GPUs stay continuously occupied across block boundaries.
+
+    Parameters
+    ----------
+    blocks : list[_TiledBlockSpec]
+        Blocks to compute, in the order their tiles should be scheduled.
+    nvir, panel_blk, nocc : int
+        Virtual dimension size, tile size, and occupied dimension size.
+    xtc_obj, jastrow_params : XTC object and parameters
+        Passed through to ``compute_2b_tile``.
+    devices : sequence
+        Local devices for round-robin dispatch.
+    """
+    import threading
+
+    panel_size = max(nocc, panel_blk)
+    acc_lock   = threading.Lock()
+
+    tile_specs = [
+        (blk, i0, min(i0 + panel_blk, nvir))
+        for blk in blocks
+        for i0 in range(0, nvir, panel_blk)
+    ]
+
+    def issue(spec, device):
+        blk, i0, i1 = spec
+        return xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, blk.ranges_fn(i0, i1),
+            device=device, panel_size=panel_size, panel_layout=blk.panel_layout,
+        )
+
+    def consume(spec, device, handle, release_gpu_slot):
+        blk, i0, i1 = spec
+        i_len     = i1 - i0
+        tc_raw    = np.asarray(handle)             # GPU→CPU transfer
+        release_gpu_slot()                          # free GPU slot immediately
+        tile      = blk.trim_fn(tc_raw, i_len)     # strip JIT padding
+        if blk.df_fn is not None:
+            tile = tile + blk.df_fn(i0, i1)        # add DF contribution (CPU)
+        with acc_lock:
+            blk.write_fn(i0, i1, tile)             # write / accumulate
+
+    _round_robin_pipeline(tile_specs, issue, consume, devices=devices)
+
+
 def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
                           L_vv_full, nocc, nvir, nmo, panel_blk):
     """Compute and write balanced tiled ovvv / vovv blocks to HDF5.
 
     The r virtual index is sliced in chunks of ``panel_blk`` (GPU-memory-aware,
-    from ``resolve_v3o_panel_block_size``).  Larger tiles mean fewer GPU kernel
-    launches, fewer HDF5 slab writes, and larger BLAS calls in the DF
-    tensordot step — exactly what vvvv already does.
+    from ``resolve_v3o_panel_block_size``).  Both tensors are tiled in a single
+    interleaved ``_run_tiled_block_pipeline`` call so GPUs stay occupied across
+    block boundaries.
 
     Both tensors are written as [:, :, r0:r1, :] slabs on axis 2.
 
       ovvv tile: (occ_all, vir_all, vir_r_blk, vir_all)  panel_layout="pr"
       vovv tile: (vir_all, occ_all, vir_r_blk, vir_all)  panel_layout="qr"
 
-    panel_size=panel_blk pads the variable-sized dimensions (p=occ for ovvv,
-    q=occ for vovv, and r=vir_r_blk) to a fixed size for JIT shape stability.
-    The large vir_all dimensions are compiled at their actual size and remain
-    fixed across all tiles.
+    panel_size=max(nocc, panel_blk) pads the variable-sized dimensions (p=occ
+    for ovvv, q=occ for vovv, and r=vir_r_blk) to a fixed size for JIT shape
+    stability.  The large vir_all dimensions remain fixed across all tiles.
     """
-    import threading
-
-    devices = _solver_local_devices()
-    blk = panel_blk  # r-slice size: GPU-memory-aware, from resolve_v3o_panel_block_size
-    # panel_size pads both the occ dimension (always nocc) and the r dimension
-    # (up to blk).  Must be >= max(nocc, blk) so padding never shrinks a dim.
-    # In production panel_blk >> nocc so this equals panel_blk; in small test
-    # cases where panel_blk < nocc this floors at nocc.
-    panel_size = max(nocc, blk)
-
-    n_tiles = -(-nvir // blk)  # ceil division
+    devices  = _solver_local_devices()
+    n_tiles  = -(-nvir // panel_blk)
     logger.info(
         "Computing large blocks (blk=%d, panel_size=%d, n_tiles=%d per tensor)...",
-        blk, panel_size, n_tiles,
+        panel_blk, max(nocc, panel_blk), n_tiles,
     )
 
-    tile_specs = [(r0, min(r0 + blk, nvir)) for r0 in range(0, nvir, blk)]
-
-    # HDF5 is not thread-safe for concurrent writes; serialize with a lock.
-    # The GPU→CPU transfer and CPU tensordot in each consume run in parallel.
-    hdf5_lock = threading.Lock()
-
-    # --- vovv: shape (nvir, nocc, nvir, nvir) = (a, i, b, c) ---
-    # Tile: (vir_all, occ_all, vir_r_blk, vir_all) — left pairs nvir×nocc = right pairs nocc×nvir.
-    # panel_layout="qr": pads q=occ and r=vir_r_blk to panel_size for JIT stability.
-    # Write vovv[:, :, r0:r1, :].
     vovv_ds = eris.vovv
-
-    def issue_vovv(spec, device):
-        r0, r1 = spec
-        ranges = (
-            slice(nocc, nmo),                    # p = vir_all
-            slice(0, nocc),                      # q = occ_all
-            slice(nocc + r0, nocc + r1),         # r = vir_r_blk
-            slice(nocc, nmo),                    # s = vir_all
-        )
-        return xtc_mod.compute_2b_tile(
-            xtc_obj, jastrow_params, ranges,
-            device=device, panel_size=panel_size, panel_layout="qr")
-
-    def consume_vovv(spec, device, tile_handle, release_gpu_slot):
-        del device
-        r0, r1 = spec
-        r_len = r1 - r0
-        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # GPU→CPU (parallel across tiles)
-        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
-        # DF: vovv[a,i,b,c] = sum_L Lov[L,i,a] * Lvv[L,b,c]
-        # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
-        # transpose(1,0,2,3) -> (nvir, nocc, r_len, nvir)
-        std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,))).transpose(1, 0, 2, 3)
-        np.add(std, tc, out=std)
-        with hdf5_lock:
-            vovv_ds[:, :, r0:r1, :] = std
-
-    _round_robin_pipeline(tile_specs, issue_vovv, consume_vovv, devices=devices)
-
-    # --- ovvv: shape (nocc, nvir, nvir, nvir) = (k, d, a, c) ---
-    # Tile: (occ_all, vir_all, vir_r_blk, vir_all) — left pairs nocc×nvir = right pairs nocc×nvir.
-    # panel_layout="pr": pads p=occ and r=vir_r_blk to panel_size for JIT stability.
-    # Write ovvv[:, :, r0:r1, :].
     ovvv_ds = eris.ovvv
 
-    def issue_ovvv(spec, device):
-        r0, r1 = spec
-        ranges = (
-            slice(0, nocc),                      # p = occ_all
-            slice(nocc, nmo),                    # q = vir_all
-            slice(nocc + r0, nocc + r1),         # r = vir_r_blk
-            slice(nocc, nmo),                    # s = vir_all
-        )
-        return xtc_mod.compute_2b_tile(
-            xtc_obj, jastrow_params, ranges,
-            device=device, panel_size=panel_size, panel_layout="pr")
+    # vovv: shape (nvir, nocc, nvir, nvir) = (a, i, b, c)
+    # panel_layout="qr": q=occ and r=vir_r_blk padded to panel_size
+    # DF: vovv[a,i,b,c] = sum_L Lov[L,i,a] * Lvv[L,b,c]
+    #   tensordot (naux,nocc,nvir) x (i_len,nvir,naux) -> (nocc,nvir,i_len,nvir)
+    #   .transpose(1,0,2,3) -> (nvir, nocc, i_len, nvir)
+    def _vovv_df(i0, i1):
+        return (np.tensordot(Lov_reshaped, L_vv_full[i0:i1], axes=((0,), (2,)))
+                .transpose(1, 0, 2, 3))
 
-    def consume_ovvv(spec, device, tile_handle, release_gpu_slot):
-        del device
-        r0, r1 = spec
-        r_len = r1 - r0
-        tc = np.asarray(tile_handle)[:, :, :r_len, :]  # GPU→CPU (parallel across tiles)
-        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
-        # DF: ovvv[k,d,a,c] = sum_L Lov[L,k,d] * Lvv[L,a,c]
-        # tensordot: (naux,nocc,nvir) x (r_len,nvir,naux) -> (nocc,nvir,r_len,nvir)
-        std = np.tensordot(Lov_reshaped, L_vv_full[r0:r1], axes=((0,), (2,)))
-        np.add(std, tc, out=std)
-        with hdf5_lock:
-            ovvv_ds[:, :, r0:r1, :] = std
+    vovv_spec = _TiledBlockSpec(
+        name="vovv",
+        ranges_fn=lambda i0, i1: (
+            slice(nocc, nmo),
+            slice(0, nocc),
+            slice(nocc + i0, nocc + i1),
+            slice(nocc, nmo),
+        ),
+        panel_layout="qr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:, :nocc, :i_len, :],
+        df_fn=_vovv_df,
+        write_fn=lambda i0, i1, tile: vovv_ds.__setitem__(
+            (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
+    )
 
-    _round_robin_pipeline(tile_specs, issue_ovvv, consume_ovvv, devices=devices)
+    # ovvv: shape (nocc, nvir, nvir, nvir) = (k, d, a, c)
+    # panel_layout="pr": p=occ and r=vir_r_blk padded to panel_size
+    # DF: ovvv[k,d,a,c] = sum_L Lov[L,k,d] * Lvv[L,a,c]
+    #   tensordot (naux,nocc,nvir) x (i_len,nvir,naux) -> (nocc,nvir,i_len,nvir)
+    def _ovvv_df(i0, i1):
+        return np.tensordot(Lov_reshaped, L_vv_full[i0:i1], axes=((0,), (2,)))
+
+    ovvv_spec = _TiledBlockSpec(
+        name="ovvv",
+        ranges_fn=lambda i0, i1: (
+            slice(0, nocc),
+            slice(nocc, nmo),
+            slice(nocc + i0, nocc + i1),
+            slice(nocc, nmo),
+        ),
+        panel_layout="pr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:nocc, :, :i_len, :],
+        df_fn=_ovvv_df,
+        write_fn=lambda i0, i1, tile: ovvv_ds.__setitem__(
+            (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
+    )
+
+    _run_tiled_block_pipeline(
+        [vovv_spec, ovvv_spec], nvir, panel_blk, nocc,
+        xtc_obj, jastrow_params, devices,
+    )
 
 
 def _compute_medium_blocks_tiled(
@@ -1221,8 +1281,9 @@ def _compute_medium_blocks_tiled(
     """Compute oovv/vvoo/ovov/ovvo/vovo via a single tiled multi-GPU pipeline.
 
     Each block is sliced over one virtual dimension in chunks of ``panel_blk``.
-    All five blocks' tiles are batched into a single ``_round_robin_pipeline``
-    call so both GPUs stay continuously occupied across block boundaries.
+    All five blocks are represented as ``_TiledBlockSpec`` objects and passed
+    to ``_run_tiled_block_pipeline``, which interleaves their tiles in one
+    ``_round_robin_pipeline`` call so GPUs stay occupied across block boundaries.
 
     Panel layout and tile shape per block (``ps = max(nocc, panel_blk)``):
       oovv (nocc,nocc,nvir,nvir) — tile dim-2 (vir): layout="pr" → JIT (ps,nocc,ps,nvir)
@@ -1231,13 +1292,10 @@ def _compute_medium_blocks_tiled(
       ovvo (nocc,nvir,nvir,nocc) — tile dim-2 (vir): layout="pr" → JIT (ps,nvir,ps,nocc)
       vovo (nvir,nocc,nvir,nocc) — tile dim-2 (vir): layout="qr" → JIT (nvir,ps,ps,nocc)
     """
-    import threading
-
-    naux = Loo.shape[0]
-    panel_size = max(nocc, panel_blk)
+    naux     = Loo.shape[0]
     Lov_flat = Lov_reshaped.reshape(naux, nocc * nvir)  # (naux, nocc*nvir) for ddot
 
-    # Pre-allocate host result arrays
+    # Pre-allocate host result arrays (tiles are non-overlapping; write_fn uses =)
     results = {
         'oovv': np.zeros((nocc, nocc, nvir, nvir), dtype=np.float64),
         'vvoo': np.zeros((nvir, nvir, nocc, nocc), dtype=np.float64),
@@ -1245,113 +1303,124 @@ def _compute_medium_blocks_tiled(
         'ovvo': np.zeros((nocc, nvir, nvir, nocc), dtype=np.float64),
         'vovo': np.zeros((nvir, nocc, nvir, nocc), dtype=np.float64),
     }
-    acc_lock = threading.Lock()
 
-    tile_specs = [
-        (blk_name, i0, min(i0 + panel_blk, nvir))
-        for blk_name in ('oovv', 'vvoo', 'ovov', 'ovvo', 'vovo')
-        for i0 in range(0, nvir, panel_blk)
-    ]
-    n_tiles_per_block = -(-nvir // panel_blk)  # ceil division
+    n_tiles_per_block = -(-nvir // panel_blk)
     logger.info(
         "Computing medium blocks (oovv/vvoo/ovov/ovvo/vovo): "
         "blk=%d, panel_size=%d, %d tiles/block × 5 blocks = %d tiles total",
-        panel_blk, panel_size, n_tiles_per_block, len(tile_specs),
+        panel_blk, max(nocc, panel_blk), n_tiles_per_block, 5 * n_tiles_per_block,
     )
 
-    def issue(spec, device):
-        blk_name, i0, i1 = spec
-        if blk_name == 'oovv':
-            # Tile r (dim 2, first vir); p=occ fixed, q=occ fixed, s=vir_all fixed
-            ranges = (slice(0, nocc), slice(0, nocc),
-                      slice(nocc + i0, nocc + i1), slice(nocc, nmo))
-            layout = "pr"
-        elif blk_name == 'vvoo':
-            # Tile p (dim 0, first vir); q=vir_all fixed, r=occ fixed, s=occ fixed
-            ranges = (slice(nocc + i0, nocc + i1), slice(nocc, nmo),
-                      slice(0, nocc), slice(0, nocc))
-            layout = "pr"
-        elif blk_name == 'ovov':
-            # Tile q (dim 1, first vir); p=occ fixed, r=occ fixed, s=vir_all fixed
-            ranges = (slice(0, nocc), slice(nocc + i0, nocc + i1),
-                      slice(0, nocc), slice(nocc, nmo))
-            layout = "qr"
-        elif blk_name == 'ovvo':
-            # Tile r (dim 2, second vir); p=occ fixed, q=vir_all fixed, s=occ fixed
-            ranges = (slice(0, nocc), slice(nocc, nmo),
-                      slice(nocc + i0, nocc + i1), slice(0, nocc))
-            layout = "pr"
-        elif blk_name == 'vovo':
-            # Tile r (dim 2, second vir); p=vir_all fixed, q=occ fixed, s=occ fixed
-            ranges = (slice(nocc, nmo), slice(0, nocc),
-                      slice(nocc + i0, nocc + i1), slice(0, nocc))
-            layout = "qr"
-        else:
-            raise AssertionError(f"Unknown block name: {blk_name}")
-        return xtc_mod.compute_2b_tile(
-            xtc_obj, jastrow_params, ranges,
-            device=device, panel_size=panel_size, panel_layout=layout,
-        )
+    # ---- oovv: tile r (dim 2), layout="pr" → JIT shape (ps, nocc, ps, nvir) ----
+    # DF: (ij|a_tile b) = Loo[L,ij] ⋅ L_vv[L,a_tile,b]
+    def _oovv_df(i0, i1):
+        i_len  = i1 - i0
+        L_tile = L_vv_full[i0:i1].reshape(i_len * nvir, naux)
+        return lib.ddot(Loo.T, L_tile.T).reshape(nocc, nocc, i_len, nvir)
 
-    def consume(spec, device, handle, release_gpu_slot):
-        blk_name, i0, i1 = spec
-        i_len = i1 - i0
-        tc_raw = np.asarray(handle)   # GPU→CPU; releases the JAX buffer
-        release_gpu_slot()            # free the GPU slot immediately
+    oovv_spec = _TiledBlockSpec(
+        name="oovv",
+        ranges_fn=lambda i0, i1: (
+            slice(0, nocc), slice(0, nocc),
+            slice(nocc + i0, nocc + i1), slice(nocc, nmo),
+        ),
+        panel_layout="pr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:nocc, :, :i_len, :],
+        df_fn=_oovv_df,
+        write_fn=lambda i0, i1, tile: results['oovv'].__setitem__(
+            (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
+    )
 
-        if blk_name == 'oovv':
-            # JIT shape: (ps, nocc, ps, nvir) — trim p and r dims
-            tc = tc_raw[:nocc, :, :i_len, :]            # (nocc, nocc, i_len, nvir)
-            # DF: (ij|a_tile b) = Loo[L,ij] ⋅ L_vv[L,a_tile,b]
-            # L_vv_full[i0:i1] shape (i_len, nvir, naux)
-            L_tile = L_vv_full[i0:i1, :, :].reshape(i_len * nvir, naux)  # (i_len*nvir, naux)
-            df = lib.ddot(Loo.T, L_tile.T).reshape(nocc, nocc, i_len, nvir)
-            with acc_lock:
-                results['oovv'][:, :, i0:i1, :] += tc + df
+    # ---- vvoo: tile p (dim 0), layout="pr" → JIT shape (ps, nvir, ps, nocc) ----
+    # DF: (a_tile b|ij) = L_vv[L,a_tile,b] ⋅ Loo[L,ij]
+    def _vvoo_df(i0, i1):
+        i_len  = i1 - i0
+        L_tile = L_vv_full[i0:i1].reshape(i_len * nvir, naux)
+        return lib.ddot(L_tile, Loo).reshape(i_len, nvir, nocc, nocc)
 
-        elif blk_name == 'vvoo':
-            # JIT shape: (ps, nvir, ps, nocc) — trim p and r dims
-            tc = tc_raw[:i_len, :, :nocc, :]            # (i_len, nvir, nocc, nocc)
-            # DF: (a_tile b|ij) = L_vv[L,a_tile,b] ⋅ Loo[L,ij]
-            L_tile = L_vv_full[i0:i1, :, :].reshape(i_len * nvir, naux)  # (i_len*nvir, naux)
-            df = lib.ddot(L_tile, Loo).reshape(i_len, nvir, nocc, nocc)
-            with acc_lock:
-                results['vvoo'][i0:i1, :, :, :] += tc + df
+    vvoo_spec = _TiledBlockSpec(
+        name="vvoo",
+        ranges_fn=lambda i0, i1: (
+            slice(nocc + i0, nocc + i1), slice(nocc, nmo),
+            slice(0, nocc), slice(0, nocc),
+        ),
+        panel_layout="pr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:i_len, :, :nocc, :],
+        df_fn=_vvoo_df,
+        write_fn=lambda i0, i1, tile: results['vvoo'].__setitem__(
+            (slice(i0, i1), slice(None), slice(None), slice(None)), tile),
+    )
 
-        elif blk_name == 'ovov':
-            # JIT shape: (nocc, ps, ps, nvir) — trim q and r dims
-            tc = tc_raw[:, :i_len, :nocc, :]            # (nocc, i_len, nocc, nvir)
-            # DF: (i a_tile|j b) = Lov[L,i,a_tile] ⋅ Lov[L,j,b]
-            Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)  # (naux, nocc*i_len)
-            df = lib.ddot(Lov_tile.T, Lov_flat).reshape(nocc, i_len, nocc, nvir)
-            with acc_lock:
-                results['ovov'][:, i0:i1, :, :] += tc + df
+    # ---- ovov: tile q (dim 1), layout="qr" → JIT shape (nocc, ps, ps, nvir) ----
+    # DF: (i a_tile|j b) = Lov[L,i,a_tile] ⋅ Lov[L,j,b]
+    def _ovov_df(i0, i1):
+        i_len    = i1 - i0
+        Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)
+        return lib.ddot(Lov_tile.T, Lov_flat).reshape(nocc, i_len, nocc, nvir)
 
-        elif blk_name == 'ovvo':
-            # JIT shape: (ps, nvir, ps, nocc) — trim p and r dims
-            tc = tc_raw[:nocc, :, :i_len, :]            # (nocc, nvir, i_len, nocc)
-            # DF: (i a|b_tile j) = Lov[L,i,a] ⋅ Lov[L,j,b_tile]
-            # result[i,a,j,b_tile] → .transpose(0,1,3,2) → [i,a,b_tile,j]
-            Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)  # (naux, nocc*i_len)
-            df = (lib.ddot(Lov_flat.T, Lov_tile)
-                  .reshape(nocc, nvir, nocc, i_len)
-                  .transpose(0, 1, 3, 2))              # → (nocc, nvir, i_len, nocc)
-            with acc_lock:
-                results['ovvo'][:, :, i0:i1, :] += tc + df
+    ovov_spec = _TiledBlockSpec(
+        name="ovov",
+        ranges_fn=lambda i0, i1: (
+            slice(0, nocc), slice(nocc + i0, nocc + i1),
+            slice(0, nocc), slice(nocc, nmo),
+        ),
+        panel_layout="qr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:, :i_len, :nocc, :],
+        df_fn=_ovov_df,
+        write_fn=lambda i0, i1, tile: results['ovov'].__setitem__(
+            (slice(None), slice(i0, i1), slice(None), slice(None)), tile),
+    )
 
-        elif blk_name == 'vovo':
-            # JIT shape: (nvir, ps, ps, nocc) — trim q and r dims
-            tc = tc_raw[:, :nocc, :i_len, :]            # (nvir, nocc, i_len, nocc)
-            # DF: (a i|b_tile j) = Lov[L,i,a] ⋅ Lov[L,j,b_tile]
-            # result[i,a,j,b_tile] → .transpose(1,0,3,2) → [a,i,b_tile,j]
-            Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)  # (naux, nocc*i_len)
-            df = (lib.ddot(Lov_flat.T, Lov_tile)
-                  .reshape(nocc, nvir, nocc, i_len)
-                  .transpose(1, 0, 3, 2))              # → (nvir, nocc, i_len, nocc)
-            with acc_lock:
-                results['vovo'][:, :, i0:i1, :] += tc + df
+    # ---- ovvo: tile r (dim 2), layout="pr" → JIT shape (ps, nvir, ps, nocc) ----
+    # DF: (i a|b_tile j) = Lov[L,i,a] ⋅ Lov[L,j,b_tile]
+    #   ddot → (nocc,nvir,nocc,i_len) → .transpose(0,1,3,2) → (nocc,nvir,i_len,nocc)
+    def _ovvo_df(i0, i1):
+        i_len    = i1 - i0
+        Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)
+        return (lib.ddot(Lov_flat.T, Lov_tile)
+                .reshape(nocc, nvir, nocc, i_len)
+                .transpose(0, 1, 3, 2))
 
-    _round_robin_pipeline(tile_specs, issue, consume, devices=devices)
+    ovvo_spec = _TiledBlockSpec(
+        name="ovvo",
+        ranges_fn=lambda i0, i1: (
+            slice(0, nocc), slice(nocc, nmo),
+            slice(nocc + i0, nocc + i1), slice(0, nocc),
+        ),
+        panel_layout="pr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:nocc, :, :i_len, :],
+        df_fn=_ovvo_df,
+        write_fn=lambda i0, i1, tile: results['ovvo'].__setitem__(
+            (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
+    )
+
+    # ---- vovo: tile r (dim 2), layout="qr" → JIT shape (nvir, ps, ps, nocc) ----
+    # DF: (a i|b_tile j) = Lov[L,i,a] ⋅ Lov[L,j,b_tile]
+    #   ddot → (nocc,nvir,nocc,i_len) → .transpose(1,0,3,2) → (nvir,nocc,i_len,nocc)
+    def _vovo_df(i0, i1):
+        i_len    = i1 - i0
+        Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)
+        return (lib.ddot(Lov_flat.T, Lov_tile)
+                .reshape(nocc, nvir, nocc, i_len)
+                .transpose(1, 0, 3, 2))
+
+    vovo_spec = _TiledBlockSpec(
+        name="vovo",
+        ranges_fn=lambda i0, i1: (
+            slice(nocc, nmo), slice(0, nocc),
+            slice(nocc + i0, nocc + i1), slice(0, nocc),
+        ),
+        panel_layout="qr",
+        trim_fn=lambda tc_raw, i_len: tc_raw[:, :nocc, :i_len, :],
+        df_fn=_vovo_df,
+        write_fn=lambda i0, i1, tile: results['vovo'].__setitem__(
+            (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
+    )
+
+    _run_tiled_block_pipeline(
+        [oovv_spec, vvoo_spec, ovov_spec, ovvo_spec, vovo_spec],
+        nvir, panel_blk, nocc, xtc_obj, jastrow_params, devices,
+    )
     logger.info("Medium blocks done.")
     return results
 
