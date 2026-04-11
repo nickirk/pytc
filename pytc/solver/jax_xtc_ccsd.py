@@ -86,35 +86,68 @@ def _jax_cc_Woooo(t1, t2, eris_oooo, eris_ovov, eris_ovoo):
 @jax.jit
 def kernel_process_ovvv_block(ovvv_blk, t1, t2, tau):
     """
-    JIT-compiled kernel for processing ovvv block contributions to t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b.
-    ovvv_blk: (nocc, nvir, blk, nvir) - sliced along axis 2 ('a')
-    """
-    # 1. Update t1new (ia) partial -> accumulating into (ia)
-    # 2*einsum('kdac,ikcd->ia') - einsum('kcad,ikcd->ia')
-    t1_upd =  2 * jnp.einsum('kdac,ikcd->ia', ovvv_blk, t2)
-    t1_upd -=     jnp.einsum('kcad,ikcd->ia', ovvv_blk, t2)
-    
-    t1_upd += 2 * jnp.einsum('kdac,kd,ic->ia', ovvv_blk, t1, t1)
-    t1_upd -=     jnp.einsum('kcad,kd,ic->ia', ovvv_blk, t1, t1)
+    JIT-compiled kernel for processing ovvv block contributions to
+    t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b.
 
-    # 2. Update Lvv (ac) partial -> accumulating into (ac)
-    # Note: ovvv_blk corresponds to 'ac' slice [p0:p1, :]
-    Lvv_blk =  2 * jnp.einsum('kdac,kd->ac', ovvv_blk, t1)
-    Lvv_blk -=     jnp.einsum('kcad,kd->ac', ovvv_blk, t1)
-    
-    # 3. Update Wvoov (akic) partial -> accumulating into slice [p0:p1]
-    Wvoov_blk = jnp.einsum('kcad,id->akic', ovvv_blk, t1)
-    
-    # 4. Update Wvovo (akci) partial -> accumulating into slice [p0:p1]
-    Wvovo_blk = jnp.einsum('kdac,id->akci', ovvv_blk, t1)
-    
-    # 5. Update tmp_a (kaij) partial -> accumulating into slice [:, p0:p1, :, :]
-    tmp_a_blk = jnp.einsum('kdac,ijcd->kaij', ovvv_blk, tau)
-    
-    # 6. Update tmp_b (kbij) partial -> accumulating into slice [:, p0:p1, :, :]
-    # 'kcbd' with ovvv (k,d,a,c) -> k=0, c=3, b=2(a), d=1
-    tmp_b_blk = jnp.einsum('kcbd,ijcd->kbij', ovvv_blk, tau)
-    
+    ``ovvv_blk`` has shape ``(nocc, nvir, blk, nvir)`` with logical axes
+    ``(k, d, a, c)``; the sliced dimension is axis 2 (``a``).
+
+    Implementation note
+    -------------------
+    The textbook form of this kernel uses paired einsums with ``'kdac'``
+    vs ``'kcad'`` subscripts against the same ``ovvv_blk`` tensor. That
+    asks XLA to produce an axis-1↔axis-3 transpose of a ~30 GB f64 block
+    and then fuse the transpose into several downstream contractions
+    (``input_transpose_fusion`` HLOs). For the shapes we actually hit
+    at pCV5Z-class calculations (e.g. ``f64[1179, 3070116]`` ≈ 27 GB with
+    a 1179-long minor axis) the XLA autotuner runs out of viable tile
+    configurations and aborts with::
+
+        INTERNAL: Autotuning failed for HLO: %input_transpose_fusion ...
+                  NOT_FOUND: No valid config found!
+
+    We eliminate every ``'kcad'``/``'kcbd'``-style binding by materializing
+    ``ovvv_swap = transpose(ovvv_blk, (0, 3, 2, 1))`` once as a single
+    standalone transpose HLO (which the autotuner handles comfortably),
+    and rewriting every contraction in the native ``'kdac'`` form against
+    either ``ovvv_blk``, ``ovvv_swap``, or the linear combination
+    ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` that folds the
+    ``2*native - swap`` T1 / Lvv pattern into a single einsum.
+
+    The output of this kernel is bit-for-bit equivalent to the textbook
+    version up to floating-point reassociation inside the contractions;
+    see ``pytc/test/test_kernel_process_ovvv_block.py`` for the
+    regression test.
+    """
+    # Axes swap of (d, c) computed exactly once as a standalone HLO.
+    ovvv_swap = jnp.transpose(ovvv_blk, (0, 3, 2, 1))
+    # Linear combination absorbing the "2*native - swap" pattern that
+    # appears in the T1 and Lvv contributions.
+    ovvv_t1sym = 2 * ovvv_blk - ovvv_swap
+
+    # 1. t1_upd (ia): fused 2*native - swap against t2 and (t1, t1).
+    t1_upd  = jnp.einsum('kdac,ikcd->ia',    ovvv_t1sym, t2)
+    t1_upd += jnp.einsum('kdac,kd,ic->ia',   ovvv_t1sym, t1, t1)
+
+    # 2. Lvv_blk (ac): fused 2*native - swap against t1.
+    Lvv_blk = jnp.einsum('kdac,kd->ac',      ovvv_t1sym, t1)
+
+    # 3. Wvoov_blk (akic): the original was 'kcad,id->akic' on ovvv_blk,
+    #    i.e. the pure swap branch — compute it on ovvv_swap.
+    Wvoov_blk = jnp.einsum('kdac,id->akic',  ovvv_swap, t1)
+
+    # 4. Wvovo_blk (akci): native branch, unchanged.
+    Wvovo_blk = jnp.einsum('kdac,id->akci',  ovvv_blk,  t1)
+
+    # 5. tmp_a_blk (kaij): native branch, unchanged.
+    tmp_a_blk = jnp.einsum('kdac,ijcd->kaij', ovvv_blk,  tau)
+
+    # 6. tmp_b_blk (kbij): the original was 'kcbd,ijcd->kbij' on ovvv_blk,
+    #    which is the swap branch. On ovvv_swap this is the native
+    #    'kdac,ijcd->kaij' pattern (the output letter is just renamed
+    #    'a' -> 'b' to match the original's output labeling).
+    tmp_b_blk = jnp.einsum('kdbc,ijcd->kbij', ovvv_swap, tau)
+
     return t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk
 
 @jax.jit
