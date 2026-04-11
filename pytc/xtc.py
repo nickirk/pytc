@@ -107,29 +107,27 @@ def _estimate_delta_u_contraction_bytes(Np, Nq, Nr, Ns, N_rank):
 
 
 def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
-    """Estimate device memory for the balanced direct Delta U tile kernel."""
+    """Estimate device memory for the balanced direct Delta U tile kernel.
+
+    Delegates to the canonical formula in
+    :func:`pytc.utils.tile_memory.isdf_tile_peak_bytes` so that the runtime
+    memory guard and the build-phase estimators in ``gpu_memory.py`` always
+    agree.
+    """
+    from pytc.utils.tile_memory import isdf_tile_peak_bytes as _peak
     B = 8
-    d_size_bytes = int(N_rank * N_rank * B)
-    x_sliced_size_bytes = int(Nr * Ns * N_rank * B)
+    d_size_bytes   = int(N_rank * N_rank * B)
+    x_size_bytes   = int(Nr * Ns * N_rank * B)
     cpq_size_bytes = int(Np * Nq * N_rank * B)
-    crs_size_bytes = int(Nr * Ns * N_rank * B)
     out_size_bytes = int(Np * Nq * Nr * Ns * B)
-    # Conservative peak: D + X + two orbital panels + transformed panel + output + X term.
-    total_needed_bytes = (
-        d_size_bytes
-        + x_sliced_size_bytes
-        + cpq_size_bytes
-        + crs_size_bytes
-        + cpq_size_bytes
-        + 2 * out_size_bytes
-    )
+    total = _peak(Np, Nq, Nr, Ns, N_rank, include_d=True)
     return {
-        "D": d_size_bytes,
-        "X": x_sliced_size_bytes,
+        "D":   d_size_bytes,
+        "X":   x_size_bytes,
         "Cpq": cpq_size_bytes,
-        "Crs": crs_size_bytes,
+        "Crs": x_size_bytes,    # same shape as X
         "out": out_size_bytes,
-        "total": total_needed_bytes,
+        "total": total,
     }
 
 

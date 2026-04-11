@@ -18,6 +18,7 @@ from pyscf import lib
 from pytc import xtc as xtc_mod
 from pytc.solver import jax_xtc_ccsd, xtc_ccsd
 from pytc.utils import gpu_memory
+from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize
 
 
 jax.config.update("jax_enable_x64", True)
@@ -114,6 +115,91 @@ class TestVVVVPanelSizing(unittest.TestCase):
                 p_block_size=cc.vvvv_p_block_size,
                 r_block_size=cc.vvvv_r_block_size,
                 gpu_max_memory_mb=cc.gpu_max_memory)
+
+
+class TestTileMemory(unittest.TestCase):
+    """Unit tests for pytc.utils.tile_memory — the canonical ISDF memory model."""
+
+    def test_isdf_tile_peak_bytes_zero_nfused(self):
+        """Without ISDF (n_fused=0) the formula returns 0."""
+        self.assertEqual(isdf_tile_peak_bytes(10, 10, 10, 10, 0), 0)
+
+    def test_isdf_tile_peak_bytes_include_d(self):
+        """include_d adds the D matrix cost."""
+        without = isdf_tile_peak_bytes(4, 4, 4, 4, 100)
+        with_d  = isdf_tile_peak_bytes(4, 4, 4, 4, 100, include_d=True)
+        self.assertEqual(with_d - without, 100 * 100 * 8)
+
+    def test_isdf_tile_peak_bytes_formula(self):
+        """Verify the individual term breakdown matches _estimate_delta_u_direct_tile_bytes."""
+        from pytc.xtc import _estimate_delta_u_direct_tile_bytes
+        for Np, Nq, Nr, Ns, Nf in [(5, 10, 5, 10, 200), (21, 21, 21, 1179, 500)]:
+            ref = _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, Nf)
+            got = isdf_tile_peak_bytes(Np, Nq, Nr, Ns, Nf, include_d=True)
+            self.assertEqual(got, ref["total"], msg=f"mismatch for ({Np},{Nq},{Nr},{Ns},{Nf})")
+
+    def test_find_max_blksize_basic(self):
+        """find_max_blksize returns the largest blk where tile_bytes ≤ target."""
+        blk = find_max_blksize(lambda b: b * b, lo=1, hi=100, gpu_target=50)
+        self.assertEqual(blk, 7)   # 7²=49 ≤ 50 < 64=8²
+
+    def test_find_max_blksize_nothing_fits(self):
+        """Returns lo when even the smallest tile exceeds budget."""
+        blk = find_max_blksize(lambda b: b * 1000, lo=5, hi=100, gpu_target=1)
+        self.assertEqual(blk, 5)
+
+    def test_find_max_blksize_with_host_constraint(self):
+        """Host constraint is respected independently of GPU constraint."""
+        # GPU fits up to b=10, host fits up to b=5 → should return 5
+        blk = find_max_blksize(
+            lambda b: b,          # GPU: fits for any b ≤ 100
+            lo=1, hi=100,
+            gpu_target=100,
+            host_target=5,
+            host_bytes_fn=lambda b: b,
+        )
+        self.assertEqual(blk, 5)
+
+
+class TestV3OPanelSizing(unittest.TestCase):
+    """Regression tests for estimate_v3o_panel_blksize to guard against OOM bugs."""
+
+    def test_production_scale_does_not_return_oom_blk(self):
+        """For benzene cc-pCV5Z parameters the old formula returned blk=59 (OOM).
+        The corrected formula must return blk ≤ 30 for an 82 GB GPU.
+
+        Parameters from the production run that crashed:
+          nocc=21, nvir=1179, N_rank=25961, gpu=82 GB
+        """
+        with (
+            mock.patch.object(gpu_memory, "_get_gpu_free_bytes", return_value=80 * 10**9),
+            mock.patch.object(gpu_memory, "_get_gpu_physical_bytes", return_value=82 * 10**9),
+        ):
+            blk, _ = gpu_memory.estimate_v3o_panel_blksize(
+                nocc=21, nvir=1179,
+                gpu_max_memory_mb=82_000,
+                naux=2000,
+                n_fused=25961,
+            )
+        # Old formula gave 59 → OOM; correct formula should stay ≤ nocc=21 for this budget
+        self.assertLessEqual(blk, 30,
+            f"blk={blk} is too large and would OOM a 82 GB GPU at N_rank=25961")
+        self.assertGreaterEqual(blk, 21, "blk must be at least nocc=21")
+
+    def test_small_system_gets_large_blk(self):
+        """A small system should auto-select a large block that covers all virtuals."""
+        with (
+            mock.patch.object(gpu_memory, "_get_gpu_free_bytes", return_value=16 * 10**9),
+            mock.patch.object(gpu_memory, "_get_gpu_physical_bytes", return_value=16 * 10**9),
+        ):
+            blk, _ = gpu_memory.estimate_v3o_panel_blksize(
+                nocc=5, nvir=50,
+                gpu_max_memory_mb=16_000,
+                naux=200,
+                n_fused=500,
+            )
+        # For a tiny system the full nvir should fit in one tile
+        self.assertEqual(blk, 50, f"Expected blk=nvir=50, got {blk}")
 
 
 class TestSolverRoundRobin(unittest.TestCase):

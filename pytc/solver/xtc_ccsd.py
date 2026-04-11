@@ -1,3 +1,5 @@
+import contextlib
+import concurrent.futures
 import logging
 import time
 from collections import deque
@@ -344,10 +346,28 @@ def _make_xtc_eris(cc, mo_coeff=None):
     
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params, orb_block_size=128))
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
-    # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections only
-    h2e_pqii_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(None), slice(0, nocc), slice(0, nocc))))
-    h2e_piiq_corr = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=(slice(None), slice(0, nocc), slice(0, nocc), slice(None))))
-    
+    # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
+    # Dispatch the two independent get_2b calls to different GPUs in parallel.
+    _fock_devices = _solver_local_devices()
+    _fock_results = [None, None]
+
+    def _fock_worker(idx, ranges, device):
+        _ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
+        with _ctx:
+            return idx, np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _pool:
+        _f0 = _pool.submit(_fock_worker, 0,
+                           (slice(None), slice(None), slice(0, nocc), slice(0, nocc)),
+                           _fock_devices[0])
+        _f1 = _pool.submit(_fock_worker, 1,
+                           (slice(None), slice(0, nocc), slice(0, nocc), slice(None)),
+                           _fock_devices[-1])
+        for _f in (_f0, _f1):
+            _idx, _val = _f.result()
+            _fock_results[_idx] = _val
+    h2e_pqii_corr, h2e_piiq_corr = _fock_results
+
     fock_corr = h1e_corr + 2 * np.einsum('pqii->pq', h2e_pqii_corr) - np.einsum('piiq->pq', h2e_piiq_corr)
     eris.fock = fock_std + fock_corr
     eris.fvo = eris.fock[nocc:, :nocc].copy()
@@ -459,10 +479,18 @@ def _make_xtc_eris(cc, mo_coeff=None):
         _compute_large_blocks(
             eris, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full,
             nocc, nvir, nmo, panel_blk)
-        
-        # Medium blocks (keep in memory as per user request < 3 virtuals)
-        eris.oovv = get_block_df('oovv') # 2 vir (11 GB)
-        eris.vvoo = get_block_df('vvoo') # 2 vir (11 GB)
+
+        # Medium blocks: tiled multi-GPU pipeline (same approach as ovvv/vovv).
+        # oovv/vvoo/ovov/ovvo/vovo each have two virtual indices; we tile over
+        # one virtual dimension in chunks of panel_blk and dispatch across all
+        # local GPUs via _round_robin_pipeline.
+        _medium_devices = _solver_local_devices()
+        _medium_results = _compute_medium_blocks_tiled(
+            xtc_obj, jastrow_params, Loo, Lov_reshaped, L_vv_full,
+            nocc, nvir, nmo, panel_blk, _medium_devices,
+        )
+        eris.oovv = _medium_results['oovv']
+        eris.vvoo = _medium_results['vvoo']
         
         # --- VVVV handling (must run before L_vv_full is freed) ---
         vvvv_bytes = float(nvir)**4 * 8
@@ -485,20 +513,19 @@ def _make_xtc_eris(cc, mo_coeff=None):
 
         # Free L_vv_full after we are done with all blocks needing it
         del L_vv_full
-        
-        eris.ovvo = get_block_df('ovvo') # 2 vir
-        eris.ovov = get_block_df('ovov') # 2 vir
-        
-        # Small blocks
+
+        # Assign remaining medium blocks from the tiled pipeline results
+        eris.ovvo = _medium_results['ovvo']
+        eris.ovov = _medium_results['ovov']
+        eris.vovo = _medium_results['vovo']
+        del _medium_results
+
+        # Small blocks (all-occupied or one-virtual indices — tiny, no tiling needed)
         eris.oooo = get_block_df('oooo')
         eris.ovoo = get_block_df('ovoo')
         eris.ooov = get_block_df('ooov')
         eris.vooo = get_block_df('vooo')
-        
-        # Handle vovo, voov if needed.
-        eris.vovo = get_block_df('vovo') 
-        # eris.voov = get_block_df('voov') # Unused?
-        
+
         del Loo, Lov, Lov_reshaped
 
         # Keep eris.vvL for on-the-fly vvvv contraction if needed
@@ -1186,6 +1213,147 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
             ovvv_ds[:, :, r0:r1, :] = std
 
     _round_robin_pipeline(tile_specs, issue_ovvv, consume_ovvv, devices=devices)
+
+
+def _compute_medium_blocks_tiled(
+        xtc_obj, jastrow_params, Loo, Lov_reshaped, L_vv_full,
+        nocc, nvir, nmo, panel_blk, devices):
+    """Compute oovv/vvoo/ovov/ovvo/vovo via a single tiled multi-GPU pipeline.
+
+    Each block is sliced over one virtual dimension in chunks of ``panel_blk``.
+    All five blocks' tiles are batched into a single ``_round_robin_pipeline``
+    call so both GPUs stay continuously occupied across block boundaries.
+
+    Panel layout and tile shape per block (``ps = max(nocc, panel_blk)``):
+      oovv (nocc,nocc,nvir,nvir) — tile dim-2 (vir): layout="pr" → JIT (ps,nocc,ps,nvir)
+      vvoo (nvir,nvir,nocc,nocc) — tile dim-0 (vir): layout="pr" → JIT (ps,nvir,ps,nocc)
+      ovov (nocc,nvir,nocc,nvir) — tile dim-1 (vir): layout="qr" → JIT (nocc,ps,ps,nvir)
+      ovvo (nocc,nvir,nvir,nocc) — tile dim-2 (vir): layout="pr" → JIT (ps,nvir,ps,nocc)
+      vovo (nvir,nocc,nvir,nocc) — tile dim-2 (vir): layout="qr" → JIT (nvir,ps,ps,nocc)
+    """
+    import threading
+
+    naux = Loo.shape[0]
+    panel_size = max(nocc, panel_blk)
+    Lov_flat = Lov_reshaped.reshape(naux, nocc * nvir)  # (naux, nocc*nvir) for ddot
+
+    # Pre-allocate host result arrays
+    results = {
+        'oovv': np.zeros((nocc, nocc, nvir, nvir), dtype=np.float64),
+        'vvoo': np.zeros((nvir, nvir, nocc, nocc), dtype=np.float64),
+        'ovov': np.zeros((nocc, nvir, nocc, nvir), dtype=np.float64),
+        'ovvo': np.zeros((nocc, nvir, nvir, nocc), dtype=np.float64),
+        'vovo': np.zeros((nvir, nocc, nvir, nocc), dtype=np.float64),
+    }
+    acc_lock = threading.Lock()
+
+    tile_specs = [
+        (blk_name, i0, min(i0 + panel_blk, nvir))
+        for blk_name in ('oovv', 'vvoo', 'ovov', 'ovvo', 'vovo')
+        for i0 in range(0, nvir, panel_blk)
+    ]
+    n_tiles_per_block = -(-nvir // panel_blk)  # ceil division
+    logger.info(
+        "Computing medium blocks (oovv/vvoo/ovov/ovvo/vovo): "
+        "blk=%d, panel_size=%d, %d tiles/block × 5 blocks = %d tiles total",
+        panel_blk, panel_size, n_tiles_per_block, len(tile_specs),
+    )
+
+    def issue(spec, device):
+        blk_name, i0, i1 = spec
+        if blk_name == 'oovv':
+            # Tile r (dim 2, first vir); p=occ fixed, q=occ fixed, s=vir_all fixed
+            ranges = (slice(0, nocc), slice(0, nocc),
+                      slice(nocc + i0, nocc + i1), slice(nocc, nmo))
+            layout = "pr"
+        elif blk_name == 'vvoo':
+            # Tile p (dim 0, first vir); q=vir_all fixed, r=occ fixed, s=occ fixed
+            ranges = (slice(nocc + i0, nocc + i1), slice(nocc, nmo),
+                      slice(0, nocc), slice(0, nocc))
+            layout = "pr"
+        elif blk_name == 'ovov':
+            # Tile q (dim 1, first vir); p=occ fixed, r=occ fixed, s=vir_all fixed
+            ranges = (slice(0, nocc), slice(nocc + i0, nocc + i1),
+                      slice(0, nocc), slice(nocc, nmo))
+            layout = "qr"
+        elif blk_name == 'ovvo':
+            # Tile r (dim 2, second vir); p=occ fixed, q=vir_all fixed, s=occ fixed
+            ranges = (slice(0, nocc), slice(nocc, nmo),
+                      slice(nocc + i0, nocc + i1), slice(0, nocc))
+            layout = "pr"
+        elif blk_name == 'vovo':
+            # Tile r (dim 2, second vir); p=vir_all fixed, q=occ fixed, s=occ fixed
+            ranges = (slice(nocc, nmo), slice(0, nocc),
+                      slice(nocc + i0, nocc + i1), slice(0, nocc))
+            layout = "qr"
+        else:
+            raise AssertionError(f"Unknown block name: {blk_name}")
+        return xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, ranges,
+            device=device, panel_size=panel_size, panel_layout=layout,
+        )
+
+    def consume(spec, device, handle, release_gpu_slot):
+        blk_name, i0, i1 = spec
+        i_len = i1 - i0
+        tc_raw = np.asarray(handle)   # GPU→CPU; releases the JAX buffer
+        release_gpu_slot()            # free the GPU slot immediately
+
+        if blk_name == 'oovv':
+            # JIT shape: (ps, nocc, ps, nvir) — trim p and r dims
+            tc = tc_raw[:nocc, :, :i_len, :]            # (nocc, nocc, i_len, nvir)
+            # DF: (ij|a_tile b) = Loo[L,ij] ⋅ L_vv[L,a_tile,b]
+            # L_vv_full[i0:i1] shape (i_len, nvir, naux)
+            L_tile = L_vv_full[i0:i1, :, :].reshape(i_len * nvir, naux)  # (i_len*nvir, naux)
+            df = lib.ddot(Loo.T, L_tile.T).reshape(nocc, nocc, i_len, nvir)
+            with acc_lock:
+                results['oovv'][:, :, i0:i1, :] += tc + df
+
+        elif blk_name == 'vvoo':
+            # JIT shape: (ps, nvir, ps, nocc) — trim p and r dims
+            tc = tc_raw[:i_len, :, :nocc, :]            # (i_len, nvir, nocc, nocc)
+            # DF: (a_tile b|ij) = L_vv[L,a_tile,b] ⋅ Loo[L,ij]
+            L_tile = L_vv_full[i0:i1, :, :].reshape(i_len * nvir, naux)  # (i_len*nvir, naux)
+            df = lib.ddot(L_tile, Loo).reshape(i_len, nvir, nocc, nocc)
+            with acc_lock:
+                results['vvoo'][i0:i1, :, :, :] += tc + df
+
+        elif blk_name == 'ovov':
+            # JIT shape: (nocc, ps, ps, nvir) — trim q and r dims
+            tc = tc_raw[:, :i_len, :nocc, :]            # (nocc, i_len, nocc, nvir)
+            # DF: (i a_tile|j b) = Lov[L,i,a_tile] ⋅ Lov[L,j,b]
+            Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)  # (naux, nocc*i_len)
+            df = lib.ddot(Lov_tile.T, Lov_flat).reshape(nocc, i_len, nocc, nvir)
+            with acc_lock:
+                results['ovov'][:, i0:i1, :, :] += tc + df
+
+        elif blk_name == 'ovvo':
+            # JIT shape: (ps, nvir, ps, nocc) — trim p and r dims
+            tc = tc_raw[:nocc, :, :i_len, :]            # (nocc, nvir, i_len, nocc)
+            # DF: (i a|b_tile j) = Lov[L,i,a] ⋅ Lov[L,j,b_tile]
+            # result[i,a,j,b_tile] → .transpose(0,1,3,2) → [i,a,b_tile,j]
+            Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)  # (naux, nocc*i_len)
+            df = (lib.ddot(Lov_flat.T, Lov_tile)
+                  .reshape(nocc, nvir, nocc, i_len)
+                  .transpose(0, 1, 3, 2))              # → (nocc, nvir, i_len, nocc)
+            with acc_lock:
+                results['ovvo'][:, :, i0:i1, :] += tc + df
+
+        elif blk_name == 'vovo':
+            # JIT shape: (nvir, ps, ps, nocc) — trim q and r dims
+            tc = tc_raw[:, :nocc, :i_len, :]            # (nvir, nocc, i_len, nocc)
+            # DF: (a i|b_tile j) = Lov[L,i,a] ⋅ Lov[L,j,b_tile]
+            # result[i,a,j,b_tile] → .transpose(1,0,3,2) → [a,i,b_tile,j]
+            Lov_tile = Lov_reshaped[:, :, i0:i1].reshape(naux, nocc * i_len)  # (naux, nocc*i_len)
+            df = (lib.ddot(Lov_flat.T, Lov_tile)
+                  .reshape(nocc, nvir, nocc, i_len)
+                  .transpose(1, 0, 3, 2))              # → (nvir, nocc, i_len, nocc)
+            with acc_lock:
+                results['vovo'][:, :, i0:i1, :] += tc + df
+
+    _round_robin_pipeline(tile_specs, issue, consume, devices=devices)
+    logger.info("Medium blocks done.")
+    return results
 
 
 def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir, nmo, cc):
