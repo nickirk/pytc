@@ -250,6 +250,67 @@ class TestV3OPanelSizing(unittest.TestCase):
         self.assertEqual(blk, 50, f"Expected blk=nvir=50, got {blk}")
 
 
+class TestBroadcastToDevices(unittest.TestCase):
+    """Unit tests for xtc_ccsd.broadcast_to_devices."""
+
+    def test_none_device_returns_original(self):
+        """For device=None the original array is returned unchanged."""
+        arr = np.array([1.0, 2.0, 3.0])
+        result = xtc_ccsd.broadcast_to_devices(arr, [None])
+        self.assertIs(result[None], arr)
+
+    def test_all_devices_present(self):
+        """Every device in the input list appears as a key in the output."""
+        arr = np.ones((3, 4))
+        devices = ["gpu0", "gpu1", None]
+        # Patch jax.device_put to return a sentinel so we don't need real devices.
+        with mock.patch("jax.device_put", side_effect=lambda a, d: f"put({d})"):
+            result = xtc_ccsd.broadcast_to_devices(arr, devices)
+        self.assertEqual(set(result.keys()), {"gpu0", "gpu1", None})
+
+    def test_real_device_uses_device_put(self):
+        """For a non-None device, jax.device_put is called with the numpy form."""
+        arr_jax = jnp.array([1.0, 2.0])
+        fake_device = object()
+        captured = {}
+
+        def fake_put(a, d):
+            captured['arr'] = a
+            captured['dev'] = d
+            return a  # return the array itself as the "result"
+
+        with mock.patch("jax.device_put", side_effect=fake_put):
+            result = xtc_ccsd.broadcast_to_devices(arr_jax, [fake_device])
+
+        self.assertIs(captured['dev'], fake_device)
+        # The array passed to device_put must be a NumPy array (not JAX)
+        self.assertIsInstance(captured['arr'], np.ndarray)
+
+    def test_numpy_materialised_once(self):
+        """np.asarray is called once regardless of the number of real devices."""
+        arr = np.arange(6.0)
+        call_count = [0]
+        original_asarray = np.asarray
+
+        def counting_asarray(a, *args, **kwargs):
+            if a is arr:
+                call_count[0] += 1
+            return original_asarray(a, *args, **kwargs)
+
+        devices = ["d0", "d1", "d2"]
+        with mock.patch("numpy.asarray", side_effect=counting_asarray), \
+             mock.patch("jax.device_put", side_effect=lambda a, d: a):
+            xtc_ccsd.broadcast_to_devices(arr, devices)
+
+        self.assertEqual(call_count[0], 1)
+
+    def test_empty_devices(self):
+        """Empty device list returns an empty dict."""
+        arr = np.zeros(5)
+        result = xtc_ccsd.broadcast_to_devices(arr, [])
+        self.assertEqual(result, {})
+
+
 class TestSolverRoundRobin(unittest.TestCase):
     def test_round_robin_pipeline_cycles_devices(self):
         seen = []

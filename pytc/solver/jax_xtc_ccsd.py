@@ -382,22 +382,9 @@ def _update_amps(cc, t1, t2, eris):
 
         # Cache t1, t2, tau on each device so kernel launches don't pay
         # a host→device transfer for these shared inputs every tile.
-        t1_np = np.asarray(t1_jax)
-        t2_np = np.asarray(t2_jax)
-        tau_np = np.asarray(tau_jax)
-        ovvv_t1_by_dev = {}
-        ovvv_t2_by_dev = {}
-        ovvv_tau_by_dev = {}
-        for _dev in ovvv_devices:
-            if _dev is None:
-                ovvv_t1_by_dev[None] = t1_jax
-                ovvv_t2_by_dev[None] = t2_jax
-                ovvv_tau_by_dev[None] = tau_jax
-            else:
-                ovvv_t1_by_dev[_dev] = jax.device_put(t1_np, _dev)
-                ovvv_t2_by_dev[_dev] = jax.device_put(t2_np, _dev)
-                ovvv_tau_by_dev[_dev] = jax.device_put(tau_np, _dev)
-        del t1_np, t2_np, tau_np
+        ovvv_t1_by_dev  = xtc_ccsd.broadcast_to_devices(t1_jax,  ovvv_devices)
+        ovvv_t2_by_dev  = xtc_ccsd.broadcast_to_devices(t2_jax,  ovvv_devices)
+        ovvv_tau_by_dev = xtc_ccsd.broadcast_to_devices(tau_jax, ovvv_devices)
 
         ovvv_tile_specs = [
             (p0, min(p0 + blksize, nvir))
@@ -516,19 +503,10 @@ def _update_amps(cc, t1, t2, eris):
 
         vovv_devices = xtc_ccsd._solver_local_devices()
 
-        # Cache t1, t1 as (nocc, nvir) and eris_oovv on each device so
-        # issue_tile does not pay a host→device transfer per tile.
-        t1_np = np.asarray(t1_jax)
-        oovv_np = np.asarray(eris_oovv)
-        vovv_t1_by_dev = {}
-        vovv_oovv_by_dev = {}
-        for _dev in vovv_devices:
-            if _dev is None:
-                vovv_t1_by_dev[None] = t1_jax
-                vovv_oovv_by_dev[None] = eris_oovv
-            else:
-                vovv_t1_by_dev[_dev] = jax.device_put(t1_np, _dev)
-                vovv_oovv_by_dev[_dev] = jax.device_put(oovv_np, _dev)
+        # Cache t1 and eris_oovv on each device so issue_tile does not
+        # pay a host→device transfer per tile.
+        vovv_t1_by_dev   = xtc_ccsd.broadcast_to_devices(t1_jax,   vovv_devices)
+        vovv_oovv_by_dev = xtc_ccsd.broadcast_to_devices(eris_oovv, vovv_devices)
 
         vovv_tile_specs = [
             (p0, min(p0 + blksize_t2, nvir))
@@ -820,13 +798,8 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         vvvv_tile = xtc_tile + std_tile
         return jnp.einsum('abcd,ijcd->ijab', vvvv_tile.transpose(0, 2, 1, 3), t2)
 
-    devices = xtc_ccsd._solver_local_devices()
-    t2_by_device = {}
-    for device in devices:
-        if device is None:
-            t2_by_device[None] = t2_jax
-        else:
-            t2_by_device[device] = jax.device_put(t2_jax, device)
+    devices      = xtc_ccsd._solver_local_devices()
+    t2_by_device = xtc_ccsd.broadcast_to_devices(t2_jax, devices)
 
     mo_v = None if with_df is not None else cc.mo_coeff[:, nocc:]
     tile_specs = []

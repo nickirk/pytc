@@ -178,6 +178,41 @@ def _solver_local_devices():
     return devices if devices else (None,)
 
 
+def broadcast_to_devices(arr, devices):
+    """Copy *arr* to every device in *devices*; return a ``{device: copy}`` dict.
+
+    For ``device=None`` (CPU-only / no local accelerator) the original *arr*
+    is stored unchanged.  For each real device, *arr* is materialised to
+    NumPy once and sent with ``jax.device_put``.  A single NumPy copy is
+    reused across all ``device_put`` calls so there is no redundant host
+    allocation.
+
+    Parameters
+    ----------
+    arr : array-like
+        Array to broadcast.  May be a NumPy array, a JAX array, or any
+        object accepted by ``np.asarray``.
+    devices : iterable
+        Local devices returned by ``_solver_local_devices()``.
+
+    Returns
+    -------
+    dict
+        ``{device: arr_on_device}`` — values are on-device JAX arrays
+        for real devices, or *arr* unchanged for ``None``.
+
+    Examples
+    --------
+    >>> t1_by_dev = broadcast_to_devices(t1_jax, _solver_local_devices())
+    >>> t1_on_this_device = t1_by_dev[device]
+    """
+    arr_np = np.asarray(arr)   # materialise once; no-op if already NumPy
+    return {
+        device: arr if device is None else jax.device_put(arr_np, device)
+        for device in devices
+    }
+
+
 @contextlib.contextmanager
 def _gpu_slot_ctx(gpu_sem):
     """Context manager that yields an idempotent GPU-slot release callable.
