@@ -172,8 +172,8 @@ def _next_vvvv_panel_key(p0, p_blksize, r0, r_blksize, nvir):
         )
     return None
 
-# GPU pipeline primitives live in their own module for reuse across solvers.
-from pytc.solver._gpu_pipeline import (   # noqa: E402
+# GPU pipeline primitives live in utils for reuse across solvers.
+from pytc.utils.gpu_pipeline import (
     _solver_local_devices,
     broadcast_to_devices,
     _gpu_slot_ctx,
