@@ -161,6 +161,54 @@ class TestTileMemory(unittest.TestCase):
         self.assertEqual(blk, 5)
 
 
+class TestTrimPanel(unittest.TestCase):
+    """Unit tests for xtc_mod.trim_panel (defined in pytc.tc)."""
+
+    def _padded(self, shape):
+        """Return an arange array of the given shape for easy index inspection."""
+        return np.arange(int(np.prod(shape)), dtype=np.float64).reshape(shape)
+
+    def test_pr_trims_axes_0_and_2(self):
+        """panel_layout='pr': axes 0 and 2 are trimmed to actual_a and actual_b."""
+        tc = self._padded((8, 4, 8, 5))   # padded shape
+        got = xtc_mod.trim_panel(tc, "pr", 3, 6)
+        self.assertEqual(got.shape, (3, 4, 6, 5))
+        np.testing.assert_array_equal(got, tc[:3, :, :6, :])
+
+    def test_qr_trims_axes_1_and_2(self):
+        """panel_layout='qr': axes 1 and 2 are trimmed to actual_a and actual_b."""
+        tc = self._padded((5, 8, 8, 6))
+        got = xtc_mod.trim_panel(tc, "qr", 3, 5)
+        self.assertEqual(got.shape, (5, 3, 5, 6))
+        np.testing.assert_array_equal(got, tc[:, :3, :5, :])
+
+    def test_ps_trims_axes_0_and_3(self):
+        """panel_layout='ps': axes 0 and 3 are trimmed to actual_a and actual_b."""
+        tc = self._padded((8, 4, 5, 8))
+        got = xtc_mod.trim_panel(tc, "ps", 3, 6)
+        self.assertEqual(got.shape, (3, 4, 5, 6))
+        np.testing.assert_array_equal(got, tc[:3, :, :, :6])
+
+    def test_no_trim_needed(self):
+        """When actual extents equal the padded size, result is the full array."""
+        tc = self._padded((4, 3, 5, 6))
+        got = xtc_mod.trim_panel(tc, "pr", 4, 5)
+        self.assertEqual(got.shape, tc.shape)
+        np.testing.assert_array_equal(got, tc)
+
+    def test_invalid_layout_raises(self):
+        """An unrecognised layout string raises ValueError."""
+        tc = self._padded((4, 4, 4, 4))
+        with self.assertRaises(ValueError):
+            xtc_mod.trim_panel(tc, "xy", 2, 2)
+
+    def test_returns_view_not_copy(self):
+        """trim_panel should return a view (NumPy slice), not a copy."""
+        tc = np.zeros((6, 4, 6, 5))
+        got = xtc_mod.trim_panel(tc, "pr", 3, 4)
+        self.assertTrue(np.shares_memory(got, tc))
+
+
 class TestV3OPanelSizing(unittest.TestCase):
     """Regression tests for estimate_v3o_panel_blksize to guard against OOM bugs."""
 

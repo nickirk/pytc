@@ -1241,7 +1241,7 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
             slice(nocc, nmo),
         ),
         panel_layout="qr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:, :nocc, :i_len, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "qr", nocc, i_len),
         df_fn=_vovv_df,
         write_fn=lambda i0, i1, tile: vovv_ds.__setitem__(
             (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
@@ -1263,7 +1263,7 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
             slice(nocc, nmo),
         ),
         panel_layout="pr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:nocc, :, :i_len, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "pr", nocc, i_len),
         df_fn=_ovvv_df,
         write_fn=lambda i0, i1, tile: ovvv_ds.__setitem__(
             (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
@@ -1325,7 +1325,7 @@ def _compute_medium_blocks_tiled(
             slice(nocc + i0, nocc + i1), slice(nocc, nmo),
         ),
         panel_layout="pr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:nocc, :, :i_len, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "pr", nocc, i_len),
         df_fn=_oovv_df,
         write_fn=lambda i0, i1, tile: results['oovv'].__setitem__(
             (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
@@ -1345,7 +1345,7 @@ def _compute_medium_blocks_tiled(
             slice(0, nocc), slice(0, nocc),
         ),
         panel_layout="pr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:i_len, :, :nocc, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "pr", i_len, nocc),
         df_fn=_vvoo_df,
         write_fn=lambda i0, i1, tile: results['vvoo'].__setitem__(
             (slice(i0, i1), slice(None), slice(None), slice(None)), tile),
@@ -1365,7 +1365,7 @@ def _compute_medium_blocks_tiled(
             slice(0, nocc), slice(nocc, nmo),
         ),
         panel_layout="qr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:, :i_len, :nocc, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "qr", i_len, nocc),
         df_fn=_ovov_df,
         write_fn=lambda i0, i1, tile: results['ovov'].__setitem__(
             (slice(None), slice(i0, i1), slice(None), slice(None)), tile),
@@ -1388,7 +1388,7 @@ def _compute_medium_blocks_tiled(
             slice(nocc + i0, nocc + i1), slice(0, nocc),
         ),
         panel_layout="pr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:nocc, :, :i_len, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "pr", nocc, i_len),
         df_fn=_ovvo_df,
         write_fn=lambda i0, i1, tile: results['ovvo'].__setitem__(
             (slice(None), slice(None), slice(i0, i1), slice(None)), tile),
@@ -1411,7 +1411,7 @@ def _compute_medium_blocks_tiled(
             slice(nocc + i0, nocc + i1), slice(0, nocc),
         ),
         panel_layout="qr",
-        trim_fn=lambda tc_raw, i_len: tc_raw[:, :nocc, :i_len, :],
+        trim_fn=lambda tc_raw, i_len: xtc_mod.trim_panel(tc_raw, "qr", nocc, i_len),
         df_fn=_vovo_df,
         write_fn=lambda i0, i1, tile: results['vovo'].__setitem__(
             (slice(None), slice(None), slice(i0, i1), slice(None)), tile),

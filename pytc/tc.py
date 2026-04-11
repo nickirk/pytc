@@ -102,6 +102,48 @@ def _transpose_panel_layout(panel_layout):
         return "qr"
     return layout
 
+
+def trim_panel(tc, panel_layout, actual_a, actual_b):
+    """Strip JIT padding from the two variable axes of a tile.
+
+    When ``panel_size`` is used to stabilise XLA shapes, the raw kernel
+    output may be larger than the true data on the padded axes.  This
+    function returns a sliced view with those axes trimmed back to their
+    actual extents.
+
+    Parameters
+    ----------
+    tc : array-like
+        Raw tile of shape ``(Np_pad, Nq_pad, Nr_pad, Ns_pad)`` — only the
+        axes listed in *panel_layout* may exceed the actual data.
+    panel_layout : str
+        Which pair of axes was JIT-padded:
+
+        * ``"pr"`` — axes 0 (p) and 2 (r)
+        * ``"qr"`` — axes 1 (q) and 2 (r)
+        * ``"ps"`` — axes 0 (p) and 3 (s)
+    actual_a : int
+        True extent of the *first* padded axis (p for ``"pr"``/``"ps"``,
+        q for ``"qr"``).
+    actual_b : int
+        True extent of the *second* padded axis (r for ``"pr"``/``"qr"``,
+        s for ``"ps"``).
+
+    Returns
+    -------
+    ndarray
+        View of *tc* with the padded axes sliced to *actual_a* and
+        *actual_b* respectively; all other axes are untouched.
+    """
+    layout = _normalize_panel_layout(panel_layout)
+    if layout == "pr":
+        return tc[:actual_a, :, :actual_b, :]
+    if layout == "qr":
+        return tc[:, :actual_a, :actual_b, :]
+    # layout == "ps"
+    return tc[:actual_a, :, :, :actual_b]
+
+
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for one device shard."""
     # Helper to calculate size from tuple (start, stop, step)

@@ -20,6 +20,7 @@ from .tc import (
     _normalize_panel_layout,
     _transpose_panel_layout,
     _pad_axis,
+    trim_panel,
 )
 from . import tc_helper
 from . import kmat as kmat_jax
