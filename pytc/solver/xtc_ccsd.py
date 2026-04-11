@@ -31,19 +31,21 @@ class RCCSD(rccsd.RCCSD):
         self.on_the_fly_vvvv = kwargs.pop('on_the_fly_vvvv', False)
         self.vvvv_p_block_size = kwargs.pop('vvvv_p_block_size', None)
         self.vvvv_r_block_size = kwargs.pop('vvvv_r_block_size', None)
+        self.v3o_block_size = kwargs.pop('v3o_block_size', None)
         max_memory = kwargs.pop('max_memory', None)
         rccsd.RCCSD.__init__(self, mf, **kwargs)
         self.xtc_obj = xtc_obj
         self.jastrow_params = jastrow_params
-        
+
         if max_memory is not None:
             self.max_memory = max_memory
         if getattr(self, 'max_memory', None) is None:
             self.max_memory = getattr(mf, 'max_memory', 4000)
-            
+
         self._keys = self._keys.union([
             'xtc_obj', 'jastrow_params', 'gpu_max_memory',
             'on_the_fly_vvvv', 'vvvv_p_block_size', 'vvvv_r_block_size',
+            'v3o_block_size',
         ])
 
         # Enable XLA persistent compilation cache so compiled HLO programs
@@ -302,6 +304,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
             _n_fused = xtc_obj.phi_isdf.shape[1]
         panel_blk = resolve_v3o_panel_block_size(
             nocc, nvir,
+            block_size=getattr(cc, 'v3o_block_size', None),
             gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
             host_max_memory_mb=getattr(cc, 'max_memory', None),
             naux=naux,
@@ -1058,9 +1061,19 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
         i_len     = i1 - i0
         tc_raw    = np.asarray(handle)             # GPU→CPU transfer
         release_gpu_slot()                          # free GPU slot immediately
-        tile      = blk.trim_fn(tc_raw, i_len)     # strip JIT padding
+        tc_view   = blk.trim_fn(tc_raw, i_len)     # strip JIT padding (view)
         if blk.df_fn is not None:
-            tile = tile + blk.df_fn(i0, i1)        # add DF contribution (CPU)
+            # IN-PLACE add: allocate the DF buffer once, then accumulate the
+            # TC view into it.  This avoids a 3rd host-side 5 GB allocation
+            # per tile (which was the main cause of the 50 % host RAM blow-up
+            # vs. the pre-refactoring path).
+            tile = blk.df_fn(i0, i1)               # fresh contiguous alloc
+            np.add(tile, tc_view, out=tile)        # tile += tc_view
+        else:
+            # No DF contribution: materialise a contiguous copy of the view
+            # so the padded tc_raw can be freed before the write.
+            tile = np.ascontiguousarray(tc_view)
+        del tc_view, tc_raw                        # release padded buffer ASAP
         with acc_lock:
             blk.write_fn(i0, i1, tile)             # write / accumulate
 
