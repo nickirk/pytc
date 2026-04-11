@@ -504,6 +504,118 @@ class TestSmallOccBlockFormulas(unittest.TestCase):
         np.testing.assert_allclose(oooo, oooo.transpose(2, 3, 0, 1), atol=1e-12)
 
 
+class TestComputeMediumBlocksTiled(unittest.TestCase):
+    """Integration / correctness test for _compute_medium_blocks_tiled.
+
+    Verifies that the tiled multi-GPU pipeline produces results numerically
+    identical to direct np.einsum reference computations for all five blocks:
+    oovv / vvoo / ovov / ovvo / vovo.
+
+    A _FakeMOXTC object stores the XTC "tc" contribution as a dense
+    (nmo, nmo, nmo, nmo) array in MO-index space and returns properly
+    padded tiles from _assemble_2b_tile, supporting all panel_layout values.
+    """
+
+    class _FakeMOXTC:
+        """Fake XTC returning tc_full[p,q,r,s] for any MO-space ranges."""
+        def __init__(self, tc_full, nmo):
+            self._tc = np.asarray(tc_full)
+            self.phi_isdf = np.zeros((nmo, 8))
+            self.isdf_kernels = {"K1_kernel": 0, "K3_kernel": 0, "D": 0, "X": 0}
+
+        def _assemble_2b_tile(self, jastrow_params, kernels, ranges,
+                               device=None, panel_size=None, panel_layout="pr"):
+            from pytc.tc import _normalize_panel_layout
+            layout = _normalize_panel_layout(panel_layout)
+            sp, sq, sr, ss = ranges
+            block = self._tc[sp, sq, sr, ss].copy()
+            p, q, r, s = block.shape
+            if panel_size is not None:
+                ps = panel_size
+                if layout == "pr":
+                    padded = np.zeros((ps, q, ps, s))
+                    padded[:p, :, :r, :] = block
+                elif layout == "qr":
+                    padded = np.zeros((p, ps, ps, s))
+                    padded[:, :q, :r, :] = block
+                else:   # "ps"
+                    padded = np.zeros((ps, q, r, ps))
+                    padded[:p, :, :, :s] = block
+                block = padded
+            return jnp.asarray(block)
+
+    def setUp(self):
+        rng = np.random.default_rng(0xC0FFEE)
+        self.nocc, self.nvir, self.naux = 3, 6, 7
+        self.nmo = self.nocc + self.nvir
+        O, V, L = self.nocc, self.nvir, self.naux
+        self.Loo          = rng.standard_normal((L, O * O))          # flat (naux, O²)
+        self.Lov_reshaped = rng.standard_normal((L, O, V))           # (naux, O, V)
+        self.L_vv_full    = rng.standard_normal((V, V, L))           # (V, V, naux)
+        # Dense tc in full MO space; each block's tc slice comes from here
+        self._tc_full     = rng.standard_normal((self.nmo,) * 4)
+
+    def _reference_blocks(self):
+        """Dense einsum references for all 5 blocks: tc_part + df_part."""
+        nocc, nvir, naux, nmo = self.nocc, self.nvir, self.naux, self.nmo
+        Loo3 = self.Loo.reshape(naux, nocc, nocc)      # (L, i, j)
+        Lov  = self.Lov_reshaped                        # (L, i, a)
+        Lvv  = self.L_vv_full.transpose(2, 0, 1)       # (L, a, b)
+        O, V = slice(None, nocc), slice(nocc, nmo)
+        tc   = self._tc_full
+
+        df_oovv = np.einsum('Lij,Lab->ijab', Loo3, Lvv)
+        df_vvoo = np.einsum('Lab,Lij->abij', Lvv, Loo3)
+        df_ovov = np.einsum('Lia,Ljb->iajb', Lov,  Lov)
+        df_ovvo = np.einsum('Lia,Ljb->iabj', Lov,  Lov)
+        df_vovo = np.einsum('Lia,Ljb->aibj', Lov,  Lov)
+
+        return {
+            'oovv': tc[O, O, V, V] + df_oovv,
+            'vvoo': tc[V, V, O, O] + df_vvoo,
+            'ovov': tc[O, V, O, V] + df_ovov,
+            'ovvo': tc[O, V, V, O] + df_ovvo,
+            'vovo': tc[V, O, V, O] + df_vovo,
+        }
+
+    def _run_tiled(self, panel_blk):
+        xtc_obj = self._FakeMOXTC(self._tc_full, self.nmo)
+        return xtc_ccsd._compute_medium_blocks_tiled(
+            xtc_obj, None,
+            self.Loo, self.Lov_reshaped, self.L_vv_full,
+            self.nocc, self.nvir, self.nmo,
+            panel_blk,
+            devices=(None,),   # single CPU device — no real GPU needed
+        )
+
+    def test_single_tile_matches_reference(self):
+        """panel_blk=nvir → one tile per block covers all virtuals at once."""
+        results = self._run_tiled(self.nvir)
+        refs    = self._reference_blocks()
+        for blk in ('oovv', 'vvoo', 'ovov', 'ovvo', 'vovo'):
+            np.testing.assert_allclose(
+                results[blk], refs[blk], atol=1e-11,
+                err_msg=f"Block {blk}: single-tile result does not match reference")
+
+    def test_multi_tile_matches_reference(self):
+        """panel_blk=2 < nvir=6 → 3 tiles per block, exercises the tiling path."""
+        results = self._run_tiled(2)
+        refs    = self._reference_blocks()
+        for blk in ('oovv', 'vvoo', 'ovov', 'ovvo', 'vovo'):
+            np.testing.assert_allclose(
+                results[blk], refs[blk], atol=1e-11,
+                err_msg=f"Block {blk}: multi-tile result does not match reference")
+
+    def test_odd_nvir_panel_blk_matches_reference(self):
+        """panel_blk=4 with nvir=6 → tiles of sizes [4, 2] (last tile smaller)."""
+        results = self._run_tiled(4)
+        refs    = self._reference_blocks()
+        for blk in ('oovv', 'vvoo', 'ovov', 'ovvo', 'vovo'):
+            np.testing.assert_allclose(
+                results[blk], refs[blk], atol=1e-11,
+                err_msg=f"Block {blk}: uneven-tile result does not match reference")
+
+
 class TestVVVVPaneling(unittest.TestCase):
     def setUp(self):
         rng = np.random.default_rng(7)
