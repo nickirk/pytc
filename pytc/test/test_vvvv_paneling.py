@@ -361,6 +361,88 @@ class TestSolverRoundRobin(unittest.TestCase):
         self.assertEqual(payload["calls"], [0, 0, 1, 1])
 
 
+class TestSmallOccBlockFormulas(unittest.TestCase):
+    """Unit tests for the four small all-occupied block DF formulas.
+
+    These formulas live in the inline loop inside _make_xtc_eris
+    (oooo / ovoo / ooov / vooo).  We verify shapes and numerical
+    correctness against explicit einsum references without needing the
+    full ERI-build pipeline.
+
+    Loo shape: (naux, nocc*nocc)   flat form returned by _init_df_eris
+    Lov shape: (naux, nocc*nvir)   flat form returned by _init_df_eris
+    """
+
+    def setUp(self):
+        rng = np.random.default_rng(0xCAFE)
+        self.nocc, self.nvir, self.naux = 4, 6, 9
+        O, V, L = self.nocc, self.nvir, self.naux
+        self.Loo = rng.standard_normal((L, O * O))   # (naux, nocc²)
+        self.Lov = rng.standard_normal((L, O * V))   # (naux, nocc×nvir)
+
+    def _df_blocks(self):
+        """Replicate the inline loop from _make_xtc_eris."""
+        nocc, nvir = self.nocc, self.nvir
+        Loo, Lov = self.Loo, self.Lov
+        return {
+            'oooo': lib.ddot(Loo.T, Loo).reshape(nocc, nocc, nocc, nocc),
+            'ovoo': lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc),
+            'ooov': lib.ddot(Loo.T, Lov).reshape(nocc, nocc, nocc, nvir),
+            'vooo': lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc).transpose(1, 0, 2, 3),
+        }
+
+    def test_shapes(self):
+        """Each block has the expected shape."""
+        nocc, nvir = self.nocc, self.nvir
+        blks = self._df_blocks()
+        self.assertEqual(blks['oooo'].shape, (nocc, nocc, nocc, nocc))
+        self.assertEqual(blks['ovoo'].shape, (nocc, nvir, nocc, nocc))
+        self.assertEqual(blks['ooov'].shape, (nocc, nocc, nocc, nvir))
+        self.assertEqual(blks['vooo'].shape, (nvir, nocc, nocc, nocc))
+
+    def test_oooo_matches_einsum(self):
+        """oooo[i,j,k,l] = sum_L Loo[L,ij] * Loo[L,kl]."""
+        nocc, naux = self.nocc, self.naux
+        Loo3 = self.Loo.reshape(naux, nocc, nocc)          # (L, i, j)
+        ref  = np.einsum('Lij,Lkl->ijkl', Loo3, Loo3)
+        np.testing.assert_allclose(self._df_blocks()['oooo'], ref, atol=1e-11)
+
+    def test_ovoo_matches_einsum(self):
+        """ovoo[i,a,k,l] = sum_L Lov[L,ia] * Loo[L,kl]."""
+        nocc, nvir, naux = self.nocc, self.nvir, self.naux
+        Lov3 = self.Lov.reshape(naux, nocc, nvir)
+        Loo3 = self.Loo.reshape(naux, nocc, nocc)
+        ref  = np.einsum('Lia,Lkl->iakl', Lov3, Loo3)
+        np.testing.assert_allclose(self._df_blocks()['ovoo'], ref, atol=1e-11)
+
+    def test_ooov_matches_einsum(self):
+        """ooov[i,j,k,a] = sum_L Loo[L,ij] * Lov[L,ka]."""
+        nocc, nvir, naux = self.nocc, self.nvir, self.naux
+        Loo3 = self.Loo.reshape(naux, nocc, nocc)
+        Lov3 = self.Lov.reshape(naux, nocc, nvir)
+        ref  = np.einsum('Lij,Lka->ijka', Loo3, Lov3)
+        np.testing.assert_allclose(self._df_blocks()['ooov'], ref, atol=1e-11)
+
+    def test_vooo_matches_einsum(self):
+        """vooo[a,i,k,l] = sum_L Lov[L,ia] * Loo[L,kl] — transpose of ovoo."""
+        nocc, nvir, naux = self.nocc, self.nvir, self.naux
+        Lov3 = self.Lov.reshape(naux, nocc, nvir)
+        Loo3 = self.Loo.reshape(naux, nocc, nocc)
+        ref  = np.einsum('Lia,Lkl->aikl', Lov3, Loo3)
+        np.testing.assert_allclose(self._df_blocks()['vooo'], ref, atol=1e-11)
+
+    def test_vooo_is_ovoo_transposed(self):
+        """vooo[a,i,k,l] = ovoo[i,a,k,l].transpose(1,0,2,3)."""
+        blks = self._df_blocks()
+        np.testing.assert_allclose(
+            blks['vooo'], blks['ovoo'].transpose(1, 0, 2, 3), atol=1e-14)
+
+    def test_oooo_has_pq_rs_symmetry(self):
+        """oooo[i,j,k,l] = oooo[k,l,i,j] (exchange of electron pairs)."""
+        oooo = self._df_blocks()['oooo']
+        np.testing.assert_allclose(oooo, oooo.transpose(2, 3, 0, 1), atol=1e-12)
+
+
 class TestVVVVPaneling(unittest.TestCase):
     def setUp(self):
         rng = np.random.default_rng(7)

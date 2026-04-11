@@ -398,42 +398,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
         naux = with_df.get_naoaux()
         Loo, Lov = _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff)
         
-        def get_block_df(block_str):
-            logger.debug(f"Computing block {block_str}")
-            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
-            
-            if block_str == 'oooo':
-                std = lib.ddot(Loo.T, Loo).reshape(nocc, nocc, nocc, nocc)
-            elif block_str == 'ovoo':
-                std = lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc)
-            elif block_str == 'ooov':
-                std = lib.ddot(Loo.T, Lov).reshape(nocc, nocc, nocc, nvir)
-            elif block_str == 'ovov':
-                std = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir)
-            elif block_str == 'ovvo':
-                # (kc|al) -> (k, c, a, l)
-                tmp = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir)
-                std = tmp.transpose(0, 1, 3, 2)
-            elif block_str == 'oovv':
-                # (kl|cd). Loo (kl, L). Lvv (cd, L).
-                Lvv_flat = L_vv_full.reshape(nvir*nvir, naux).T
-                std = lib.ddot(Loo.T, Lvv_flat).reshape(nocc, nocc, nvir, nvir)
-            elif block_str == 'vvoo':
-                # (cd|kl). Lvv (cd, L). Loo (kl, L).
-                Lvv_flat = L_vv_full.reshape(nvir*nvir, naux).T
-                std = lib.ddot(Lvv_flat.T, Loo).reshape(nvir, nvir, nocc, nocc)
-            elif block_str == 'vooo':
-                # (ck|li). Lvo? Lov is (L, kc).
-                tmp = lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc)
-                std = tmp.transpose(1, 0, 2, 3)
-            elif block_str == 'vovo':
-                # (ak|cl) -> (a, k, c, l). From ovov (kacl) transpose to (a, k, c, l)
-                tmp = lib.ddot(Lov.T, Lov).reshape(nocc, nvir, nocc, nvir)
-                std = tmp.transpose(1, 0, 3, 2)
-            else:
-                raise NotImplementedError(f"Block {block_str} not supported in get_block_df")
-                
-            return std + tc_part
 
         # Unpack Lvv to RAM if possible (approx 5-10GB for 800 orbitals)
         L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
@@ -530,11 +494,17 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vovo = _medium_results['vovo']
         del _medium_results
 
-        # Small blocks (all-occupied or one-virtual indices — tiny, no tiling needed)
-        eris.oooo = get_block_df('oooo')
-        eris.ovoo = get_block_df('ovoo')
-        eris.ooov = get_block_df('ooov')
-        eris.vooo = get_block_df('vooo')
+        # Small all-occupied blocks — full-block get_2b + DF, no tiling needed
+        # Loo: (naux, nocc²), Lov: (naux, nocc×nvir) — both flat for lib.ddot
+        for _blk_str, _std in [
+            ('oooo', lib.ddot(Loo.T, Loo).reshape(nocc, nocc, nocc, nocc)),
+            ('ovoo', lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc)),
+            ('ooov', lib.ddot(Loo.T, Lov).reshape(nocc, nocc, nocc, nvir)),
+            ('vooo', lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc).transpose(1, 0, 2, 3)),
+        ]:
+            logger.debug("Computing block %s", _blk_str)
+            _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str))
+            setattr(eris, _blk_str, _std + _tc)
 
         del Loo, Lov, Lov_reshaped
 
