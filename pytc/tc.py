@@ -1360,7 +1360,24 @@ class ISDFTC(TC):
 
         if panel_size is not None:
             slice_p, slice_q, slice_r, slice_s = ranges
-            if slice_p == slice_r and slice_q == slice_s:
+            # The ``direct + direct.transpose(2, 3, 0, 1)`` shortcut fuses
+            # the (p↔r, q↔s) symmetrisation into a single tile compute.
+            # It is only valid when the shape of ``direct`` is invariant
+            # under that axis swap — i.e. when the panel-padded axis set
+            # is itself symmetric under (0↔2, 1↔3).  Of the three
+            # panel_layouts only ``"pr"`` satisfies this (pads axes 0 and
+            # 2 identically, leaves 1 and 3 untouched).  ``"qr"`` pads
+            # axis 2 but not 0, and ``"ps"`` pads axis 0 but not 2 —
+            # so ``direct.transpose(2, 3, 0, 1)`` comes out with a
+            # different shape from ``direct`` and the broadcast add
+            # crashes (e.g. ``(nocc, ps, ps, nvir) + (ps, nvir, nocc, ps)``
+            # on an ovov single-tile).  For the asymmetric layouts we
+            # fall through to the explicit-``tmp`` branch, which uses
+            # ``_transpose_panel_layout()`` to produce a partner tile
+            # whose shape matches ``direct`` after the (2, 3, 0, 1)
+            # transpose.
+            if (slice_p == slice_r and slice_q == slice_s
+                    and panel_layout == "pr"):
                 return -(direct + direct.transpose(2, 3, 0, 1))
 
             ranges_T = (slice_r, slice_s, slice_p, slice_q)

@@ -2156,7 +2156,21 @@ class ISDFXTC(XTC, ISDFTC):
 
         slice_p, slice_q, slice_r, slice_s = ranges
         if panel_size is not None:
-            if slice_p == slice_r and slice_q == slice_s:
+            # The ``direct + direct.transpose(2, 3, 0, 1)`` shortcut is
+            # only valid when the panel padding is invariant under the
+            # ``(p↔r, q↔s)`` axis swap — i.e. when ``panel_layout == "pr"``
+            # (pads axes 0 and 2 symmetrically, leaves 1 and 3 alone).
+            # ``"qr"`` and ``"ps"`` pad asymmetrically so ``direct`` and
+            # ``direct.transpose(2, 3, 0, 1)`` come out with different
+            # shapes that cannot broadcast — e.g. an ovov single-tile
+            # under ``"qr"`` would try to add ``(nocc, ps, ps, nvir)``
+            # to ``(ps, nvir, nocc, ps)``.  For the asymmetric layouts
+            # we fall through to the explicit-``tmp`` branch, which uses
+            # ``_transpose_panel_layout()`` to build a partner tile whose
+            # shape matches ``direct`` after the (2, 3, 0, 1) transpose.
+            # See the parallel guard in ``_assemble_tc_tile``.
+            if (slice_p == slice_r and slice_q == slice_s
+                    and panel_layout == "pr"):
                 return -(direct + direct.transpose(2, 3, 0, 1))
 
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
