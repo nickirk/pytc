@@ -1071,23 +1071,42 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             r1 = min(r0 + r_blksize, nvir)
             tile_specs.append((p0, p1, r0, r1))
 
+    # Fine-grained per-stage timing.  Every line below is a wall-clock
+    # marker that can be cross-referenced against ``nvidia-smi dmon -s pu
+    # -d 1 -o DT`` (which writes ``YYYYMMDD HH:MM:SS`` per row, matching
+    # the Python logger's ``%(asctime)s``).  Use:
+    #
+    #   grep '\[VVVV-(issue|consume) d[01]\]' ben_*.out
+    #
+    # to extract just the markers, then overlay with the dmon log to see
+    # which sub-stage of which device's tile was running at every second.
+    # Each marker is tagged ``[VVVV-issue dN]`` or ``[VVVV-consume dN]``
+    # so the device producing it is unambiguous.
+
     def issue_tile(spec, device):
         p0, p1, r0, r1 = spec
         p_len = p1 - p0
         r_len = r1 - r0
+        dev_id = getattr(device, "id", "host")
         ranges = (
             slice(nocc + p0, nocc + p1),
             slice(nocc, cc.nmo),
             slice(nocc + r0, nocc + r1),
             slice(nocc, cc.nmo),
         )
-        t0 = time.perf_counter()
+        logger.debug(
+            "[VVVV-issue d%s] BEGIN tile p[%d:%d] r[%d:%d]",
+            dev_id, p0, p1, r0, r1,
+        )
+        t_xtc_0 = time.perf_counter()
         vvvv_tile_jax = xtc_mod.compute_2b_tile(
             xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size
         )
+        t_xtc_1 = time.perf_counter()
         logger.debug(
-            "get_2b (tile p[%d:%d] r[%d:%d] on device %s) issued in %.4f s",
-            p0, p1, r0, r1, getattr(device, "id", "host"), time.perf_counter() - t0,
+            "[VVVV-issue d%s] xtc_2b_tile RETURN +%.4fs (returned future: %s)",
+            dev_id, t_xtc_1 - t_xtc_0,
+            "blocking-call" if (t_xtc_1 - t_xtc_0) > 0.5 else "async",
         )
         dev_key = device if device is not None else None
         device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
@@ -1097,6 +1116,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                 # panel_size) this is a zero-copy view; only the last tile
                 # needs padding.  Avoids per-tile np.zeros(panel_size, nvir,
                 # naux) allocations that dominated issue_tile overhead.
+                t_lpr_0 = time.perf_counter()
                 L_p_raw = L_vv_full_host[p0:p1]   # (p_len, nvir, naux)
                 L_r_raw = L_vv_full_host[r0:r1]   # (r_len, nvir, naux)
                 if p_len < panel_size:
@@ -1113,11 +1133,24 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                 else:
                     L_p_tile_jax = jnp.asarray(L_p_raw)
                     L_r_tile_jax = jnp.asarray(L_r_raw)
+                t_lpr_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] L_p/L_r device_put RETURN +%.4fs",
+                    dev_id, t_lpr_1 - t_lpr_0,
+                )
+                t_einsum_0 = time.perf_counter()
                 term = contract_df_tile_kernel(
                     t2_by_device[dev_key], vvvv_tile_jax,
                     L_p_tile_jax, L_r_tile_jax
                 )
+                t_einsum_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] contract_df_tile RETURN +%.4fs (returned future: %s)",
+                    dev_id, t_einsum_1 - t_einsum_0,
+                    "blocking-call" if (t_einsum_1 - t_einsum_0) > 0.5 else "async",
+                )
             else:
+                t_std_0 = time.perf_counter()
                 std_tile = ao2mo.general(
                     cc.mol,
                     (mo_v[:, p0:p1], mo_v, mo_v[:, r0:r1], mo_v),
@@ -1129,22 +1162,70 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                     std_tile_jax = jax.device_put(std_tile_pad, device)
                 else:
                     std_tile_jax = jnp.asarray(std_tile_pad)
+                t_std_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] std_tile ao2mo+device_put RETURN +%.4fs",
+                    dev_id, t_std_1 - t_std_0,
+                )
+                t_einsum_0 = time.perf_counter()
                 term = contract_tc_tile_kernel(
                     t2_by_device[dev_key], vvvv_tile_jax + std_tile_jax
                 )
+                t_einsum_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] contract_tc_tile RETURN +%.4fs (returned future: %s)",
+                    dev_id, t_einsum_1 - t_einsum_0,
+                    "blocking-call" if (t_einsum_1 - t_einsum_0) > 0.5 else "async",
+                )
+        logger.debug(
+            "[VVVV-issue d%s] END tile p[%d:%d] r[%d:%d]",
+            dev_id, p0, p1, r0, r1,
+        )
+        # Keep the legacy summary log so existing log-grep tools still work.
+        logger.debug(
+            "get_2b (tile p[%d:%d] r[%d:%d] on device %s) issued in %.4f s",
+            p0, p1, r0, r1, dev_id, t_xtc_1 - t_xtc_0,
+        )
         return term
 
     def consume_tile(spec, device, term, release_gpu_slot):
         p0, p1, r0, r1 = spec
         p_len = p1 - p0
         r_len = r1 - r0
-        t0_trans = time.perf_counter()
+        dev_id = getattr(device, "id", "host")
+        logger.debug(
+            "[VVVV-consume d%s] BEGIN tile p[%d:%d] r[%d:%d] (waiting on np.asarray)",
+            dev_id, p0, p1, r0, r1,
+        )
+        t_asarray_0 = time.perf_counter()
+        # ``np.asarray(term)`` blocks until the GPU has finished every op
+        # that produced ``term``.  Wall time here = time waiting for the
+        # tile's K1 / K3 / ΔU / contract kernels on this device to drain
+        # PLUS the GPU→CPU DMA of the result.  This is the most direct
+        # measurement of how long this device's tile actually took on the
+        # silicon, independent of what ``issue_tile`` reported.
         term_host = np.asarray(term)[:, :, :p_len, :r_len]
+        t_asarray_1 = time.perf_counter()
+        logger.debug(
+            "[VVVV-consume d%s] np.asarray RETURN +%.4fs (GPU done + DMA copied)",
+            dev_id, t_asarray_1 - t_asarray_0,
+        )
         release_gpu_slot()  # GPU pipeline is now free to issue the next tile
+        t_accum_0 = time.perf_counter()
         t2new_host[:, :, p0:p1, r0:r1] += term_host
+        t_accum_1 = time.perf_counter()
+        logger.debug(
+            "[VVVV-consume d%s] host accum RETURN +%.4fs",
+            dev_id, t_accum_1 - t_accum_0,
+        )
+        logger.debug(
+            "[VVVV-consume d%s] END tile p[%d:%d] r[%d:%d] total=%.4fs",
+            dev_id, p0, p1, r0, r1, t_accum_1 - t_asarray_0,
+        )
+        # Keep the legacy summary log so existing log-grep tools still work.
         logger.debug(
             "VVVV tile p[%d:%d] r[%d:%d] on device %s accumulated in %.4fs",
-            p0, p1, r0, r1, getattr(device, "id", "host"), time.perf_counter() - t0_trans,
+            p0, p1, r0, r1, dev_id, t_accum_1 - t_asarray_0,
         )
 
     # Tile-id round-robin across local devices.  We intentionally do NOT
