@@ -912,15 +912,43 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     if with_df is not None:
          L_vv_full_host = lib.unpack_tril(eris.vvL[:], axis=0)
 
+    # VVVV on-the-fly contraction tile kernels.
+    #
+    # The raw VVVV tile (from compute_2b_tile / the DF outer product)
+    # lives in layout ``(p=a, q=c, r=b, s=d)`` with the two virtual-
+    # contraction axes ``(c, d)`` at positions 1 and 3 — non-adjacent.
+    # Writing the einsum directly as ``'acbd,ijcd->ijab'`` would put
+    # XLA into the same failure mode as ``kernel_process_ovvv_block``:
+    # its natural GEMM plan materialises a reshape-after-transpose of
+    # the tile as scratch.  At pCV5Z-class tile sizes that scratch is
+    # big enough to blow the BFC allocator and blow the autotuner
+    # (``NOT_FOUND: No valid config found!``).
+    #
+    # The ``.transpose(0, 2, 1, 3)`` before the einsum pre-arranges the
+    # tile into ``(a, b, c, d)`` so the contraction axes ``(c, d)`` are
+    # adjacent and at the end on both operands — a clean GEMM pattern.
+    # However XLA's fusion passes can re-fold that transpose into the
+    # einsum's tile config, negating the benefit.  We wrap the
+    # pre-transpose in ``jax.lax.optimization_barrier`` to pin it as a
+    # standalone HLO, guaranteeing that the downstream einsum sees an
+    # already-permuted input and compiles to a straight GEMM — the same
+    # defensive pattern we apply to ``ovvv_swap`` / ``tau_swap`` in
+    # ``kernel_process_ovvv_block``.
     @jax.jit
     def contract_tc_tile_kernel(t2, xtc_tile):
-        return jnp.einsum('abcd,ijcd->ijab', xtc_tile.transpose(0, 2, 1, 3), t2)
+        xtc_tile_p = jax.lax.optimization_barrier(
+            xtc_tile.transpose(0, 2, 1, 3)
+        )
+        return jnp.einsum('abcd,ijcd->ijab', xtc_tile_p, t2)
 
     @jax.jit
     def contract_df_tile_kernel(t2, xtc_tile, L_p_tile, L_r_tile):
         std_tile = jnp.tensordot(L_p_tile, L_r_tile, axes=((2,), (2,)))
         vvvv_tile = xtc_tile + std_tile
-        return jnp.einsum('abcd,ijcd->ijab', vvvv_tile.transpose(0, 2, 1, 3), t2)
+        vvvv_tile_p = jax.lax.optimization_barrier(
+            vvvv_tile.transpose(0, 2, 1, 3)
+        )
+        return jnp.einsum('abcd,ijcd->ijab', vvvv_tile_p, t2)
 
     devices      = xtc_ccsd._solver_local_devices()
     t2_by_device = xtc_ccsd.broadcast_to_devices(t2_jax, devices)
