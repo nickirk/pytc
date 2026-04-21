@@ -38,17 +38,22 @@ logger = logging.getLogger(__name__)
 # For medium blocks that call is ``compute_2b_tile`` → a chain of
 # ``_get_tc_direct_tile`` + ``_get_delta_u_direct_tile`` + a final
 # ``tc_tile + delta_u_tile`` add.  To attribute ``issue_s`` to the
-# three stages we maintain a thread-local float-accumulator dict
+# three stages we maintain a process-wide float-accumulator dict
 # that the assembler updates from within its own ``@jax.jit``
 # boundary.
 #
-# The mechanism is strictly opt-in — if ``_ISSUE_STAGE_STATS.stats``
-# is unset (the common case, including the stand-alone
+# The mechanism is strictly opt-in — if ``_ISSUE_STAGE_STATS["current"]``
+# is ``None`` (the common case, including the stand-alone
 # ``get_2b`` / test-fake paths), the assembler takes no cost at all.
-# Callers that want timing (currently only the ``_run_tiled_block_
-# pipeline``'s ``issue`` closure) set ``_ISSUE_STAGE_STATS.stats`` to
-# a dict before the call and read it after.  Main-thread writes only,
-# so no lock is needed.
+# Callers that want timing (currently only the
+# ``_run_tiled_block_pipeline``'s ``issue`` closure) open
+# ``issue_stage_stats_scope()`` before the call and read the dict after.
+#
+# IMPORTANT: this is process-wide rather than ``threading.local()`` so
+# that the issue worker threads spawned by ``_round_robin_pipeline``
+# (each running on its own thread, post-parallel-issue refactor) can
+# all see and update the parent pipeline's stats dict.  The lock around
+# accumulation is held only briefly (one ``dict.get`` + add).
 #
 # We intentionally do NOT change the signature of ``_assemble_2b_tile``
 # / ``_assemble_tc_tile`` / ``_assemble_delta_u_tile``: several test
@@ -56,14 +61,20 @@ logger = logging.getLogger(__name__)
 # ``test_vvvv_paneling.py``) and would silently ignore a new ``**kwargs``
 # slot, giving the false impression that instrumentation is active.
 # ------------------------------------------------------------------
-_ISSUE_STAGE_STATS = threading.local()
+_ISSUE_STAGE_STATS = {"current": None, "lock": threading.Lock()}
 
 
 def _accum_issue_stage(name, dt):
-    """Add ``dt`` seconds to ``name`` if a pipeline stats scope is active."""
-    stats = getattr(_ISSUE_STAGE_STATS, "stats", None)
+    """Add ``dt`` seconds to ``name`` if a pipeline stats scope is active.
+
+    Process-wide; called concurrently from multiple issue worker threads
+    in ``_round_robin_pipeline``'s parallel-issue mode.  The lock window
+    is a single dict ``get`` + add, so contention is negligible.
+    """
+    stats = _ISSUE_STAGE_STATS["current"]
     if stats is not None:
-        stats[name] = stats.get(name, 0.0) + dt
+        with _ISSUE_STAGE_STATS["lock"]:
+            stats[name] = stats.get(name, 0.0) + dt
 
 
 @contextlib.contextmanager
@@ -72,18 +83,17 @@ def issue_stage_stats_scope():
 
     Yields a dict that subsequent ``_accum_issue_stage`` calls will
     mutate.  Nested scopes are supported — the outer scope is restored
-    on ``__exit__`` — so it is safe for the scheduler to enter a scope
-    even if callees might also enter scopes of their own.  Main-thread
-    use only; the thread-local binding is not shared with worker
-    threads.
+    on ``__exit__``.  Visible from ALL threads (process-wide), so it
+    works correctly when ``_round_robin_pipeline`` runs ``issue_tile``
+    on per-device worker threads.
     """
-    prev = getattr(_ISSUE_STAGE_STATS, "stats", None)
+    prev = _ISSUE_STAGE_STATS["current"]
     fresh: dict = {}
-    _ISSUE_STAGE_STATS.stats = fresh
+    _ISSUE_STAGE_STATS["current"] = fresh
     try:
         yield fresh
     finally:
-        _ISSUE_STAGE_STATS.stats = prev
+        _ISSUE_STAGE_STATS["current"] = prev
 
 # ---------------------------------------------------------------------------
 # Host-side cache for X orbital slices read from HDF5.
@@ -2277,7 +2287,7 @@ class ISDFXTC(XTC, ISDFTC):
         # which sub-call is blocking the main dispatch thread under normal
         # async JAX semantics — adding an explicit barrier would
         # manufacture the very stall we're trying to detect.
-        _stage_timing = getattr(_ISSUE_STAGE_STATS, "stats", None) is not None
+        _stage_timing = _ISSUE_STAGE_STATS["current"] is not None
         if _stage_timing:
             _t_stage_tc0 = time.perf_counter()
         tc_tile = super()._assemble_tc_tile(

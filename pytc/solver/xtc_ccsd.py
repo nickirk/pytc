@@ -24,6 +24,7 @@ from pytc.utils.gpu_pipeline import (
     broadcast_to_devices,
     _gpu_slot_ctx,
     _round_robin_pipeline,
+    partition_round_robin,
     _AsyncHDF5Writer,
 )
 import h5py

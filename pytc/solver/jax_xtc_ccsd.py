@@ -494,15 +494,31 @@ def _update_amps(cc, t1, t2, eris):
             for p0 in range(0, nvir, blksize)
         ]
 
-        # 1-ahead HDF5 prefetch state, shared by closure (main thread only).
-        _ovvv_prefetch = {'future': None, 'spec': None, 'next_idx': 0}
-        if ovvv_tile_specs:
-            first_spec = ovvv_tile_specs[0]
-            _ovvv_prefetch['future'] = async_read(
-                xtc_ccsd._get_slice, eris.ovvv, slice(first_spec[0], first_spec[1]), 2
-            )
-            _ovvv_prefetch['spec'] = first_spec
-            _ovvv_prefetch['next_idx'] = 1
+        # ``_round_robin_pipeline`` runs one issue thread per device.
+        # Each thread enters ``issue_ovvv`` concurrently for tiles
+        # assigned to its device, so the previous "single shared
+        # prefetch dict" pattern would race.  Instead, partition tiles
+        # up front and give each device its own prefetch chain — each
+        # issue thread only reads/writes its own state, no locks needed.
+        ovvv_tiles_by_dev = xtc_ccsd.partition_round_robin(
+            ovvv_tile_specs, ovvv_devices,
+        )
+        # Per-device 1-ahead HDF5 prefetch.  ``_specs`` is the device's
+        # private tile sub-list; ``_next_idx`` is the index within that
+        # sub-list (NOT within the global ``ovvv_tile_specs``).
+        _ovvv_prefetch_by_dev = {}
+        for _d in ovvv_devices:
+            _specs = ovvv_tiles_by_dev[_d]
+            _pf = {"specs": _specs, "future": None, "spec": None, "next_idx": 0}
+            if _specs:
+                _first = _specs[0]
+                _pf["future"] = async_read(
+                    xtc_ccsd._get_slice, eris.ovvv,
+                    slice(_first[0], _first[1]), 2,
+                )
+                _pf["spec"] = _first
+                _pf["next_idx"] = 1
+            _ovvv_prefetch_by_dev[_d] = _pf
 
         ovvv_acc_lock = threading.Lock()
 
@@ -510,8 +526,9 @@ def _update_amps(cc, t1, t2, eris):
         # parent ``_round_robin_pipeline`` reports total ``issue_s`` but
         # that is a single number — we need to decompose it to see which
         # sub-step (HDF5 await, H→D copy, JAX kernel dispatch) is
-        # actually blocking the main thread each tile.  Main-thread only,
-        # no lock needed.
+        # actually blocking the main thread each tile.  Two issue
+        # threads now write to it concurrently, so guard with a lock
+        # (held only briefly to apply per-tile deltas).
         ovvv_issue_stats = {
             "n_calls":        0,
             "await_read_s":   0.0,
@@ -520,29 +537,34 @@ def _update_amps(cc, t1, t2, eris):
             "kernel_s":       0.0,
             "total_s":        0.0,
         }
+        ovvv_stats_lock = threading.Lock()
 
         def issue_ovvv(spec, device):
             p0, p1 = spec
             _t_total0 = time.perf_counter()
-            # Pick up the HDF5 read queued by the previous call.
-            assert _ovvv_prefetch['spec'] == spec, (
-                f"OVVV prefetch spec mismatch: expected {spec}, got {_ovvv_prefetch['spec']}"
+            pf = _ovvv_prefetch_by_dev[device]
+            # Pick up the HDF5 read queued by the previous call FOR THIS DEVICE.
+            assert pf['spec'] == spec, (
+                f"OVVV prefetch spec mismatch on device {getattr(device, 'id', 'host')}: "
+                f"expected {spec}, got {pf['spec']}"
             )
             _t_ar0 = time.perf_counter()
-            blk_np = await_read(_ovvv_prefetch['future'])
+            blk_np = await_read(pf['future'])
             _t_ar1 = time.perf_counter()
-            # Kick off HDF5 read for the NEXT tile so I/O overlaps GPU work.
-            nidx = _ovvv_prefetch['next_idx']
-            if nidx < len(ovvv_tile_specs):
-                next_spec = ovvv_tile_specs[nidx]
-                _ovvv_prefetch['future'] = async_read(
-                    xtc_ccsd._get_slice, eris.ovvv, slice(next_spec[0], next_spec[1]), 2
+            # Kick off HDF5 read for the NEXT tile assigned to THIS device
+            # so I/O overlaps GPU work on the same device.
+            nidx = pf['next_idx']
+            if nidx < len(pf['specs']):
+                next_spec = pf['specs'][nidx]
+                pf['future'] = async_read(
+                    xtc_ccsd._get_slice, eris.ovvv,
+                    slice(next_spec[0], next_spec[1]), 2,
                 )
-                _ovvv_prefetch['spec'] = next_spec
-                _ovvv_prefetch['next_idx'] = nidx + 1
+                pf['spec'] = next_spec
+                pf['next_idx'] = nidx + 1
             else:
-                _ovvv_prefetch['future'] = None
-                _ovvv_prefetch['spec'] = None
+                pf['future'] = None
+                pf['spec'] = None
             _t_pf1 = time.perf_counter()
 
             dev_key = device if device is not None else None
@@ -567,12 +589,13 @@ def _update_amps(cc, t1, t2, eris):
                 _t_k1 = time.perf_counter()
             _t_total1 = time.perf_counter()
 
-            ovvv_issue_stats["n_calls"]         += 1
-            ovvv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
-            ovvv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
-            ovvv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
-            ovvv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
-            ovvv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
+            with ovvv_stats_lock:
+                ovvv_issue_stats["n_calls"]         += 1
+                ovvv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
+                ovvv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
+                ovvv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
+                ovvv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
+                ovvv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
             return result
 
         def consume_ovvv(spec, device, result, release_gpu_slot):
@@ -677,21 +700,32 @@ def _update_amps(cc, t1, t2, eris):
             for p0 in range(0, nvir, blksize_t2)
         ]
 
-        # 1-ahead async HDF5 prefetch, shared by closure (main thread only).
-        _vovv_prefetch = {'future': None, 'spec': None, 'next_idx': 0}
-        if vovv_tile_specs:
-            first_spec = vovv_tile_specs[0]
-            _vovv_prefetch['future'] = async_read(
-                xtc_ccsd._get_slice, eris.vovv, slice(first_spec[0], first_spec[1]), 0
-            )
-            _vovv_prefetch['spec'] = first_spec
-            _vovv_prefetch['next_idx'] = 1
+        # Per-device prefetch chain — see the parallel OVVV block above
+        # for why we partition the prefetch state per device rather than
+        # sharing a single dict across the parallel issue threads.
+        vovv_tiles_by_dev = xtc_ccsd.partition_round_robin(
+            vovv_tile_specs, vovv_devices,
+        )
+        _vovv_prefetch_by_dev = {}
+        for _d in vovv_devices:
+            _specs = vovv_tiles_by_dev[_d]
+            _pf = {"specs": _specs, "future": None, "spec": None, "next_idx": 0}
+            if _specs:
+                _first = _specs[0]
+                _pf["future"] = async_read(
+                    xtc_ccsd._get_slice, eris.vovv,
+                    slice(_first[0], _first[1]), 0,
+                )
+                _pf["spec"] = _first
+                _pf["next_idx"] = 1
+            _vovv_prefetch_by_dev[_d] = _pf
 
         vovv_acc_lock = threading.Lock()
 
         # Per-stage issue-time decomposition for VOVV, mirroring the
         # one above for OVVV.  See the comment next to ``ovvv_issue_stats``
-        # for the intended diagnostic use.
+        # for the intended diagnostic use.  Locked because two issue
+        # threads update concurrently.
         vovv_issue_stats = {
             "n_calls":         0,
             "await_read_s":    0.0,
@@ -700,30 +734,34 @@ def _update_amps(cc, t1, t2, eris):
             "kernel_s":        0.0,
             "total_s":         0.0,
         }
+        vovv_stats_lock = threading.Lock()
 
         def issue_vovv(spec, device):
             p0, p1 = spec
             _t_total0 = time.perf_counter()
-            # Pick up the block whose HDF5 read was kicked off last call.
-            assert _vovv_prefetch['spec'] == spec, (
-                f"VOVV prefetch spec mismatch: expected {spec}, got {_vovv_prefetch['spec']}"
+            pf = _vovv_prefetch_by_dev[device]
+            # Pick up the block whose HDF5 read was kicked off last call
+            # FOR THIS DEVICE.
+            assert pf['spec'] == spec, (
+                f"VOVV prefetch spec mismatch on device {getattr(device, 'id', 'host')}: "
+                f"expected {spec}, got {pf['spec']}"
             )
             _t_ar0 = time.perf_counter()
-            blk_np = await_read(_vovv_prefetch['future'])
+            blk_np = await_read(pf['future'])
             _t_ar1 = time.perf_counter()
-            # Kick off HDF5 read for the NEXT tile immediately, before the
-            # (potentially slower) GPU dispatch, so I/O overlaps GPU compute.
-            nidx = _vovv_prefetch['next_idx']
-            if nidx < len(vovv_tile_specs):
-                next_spec = vovv_tile_specs[nidx]
-                _vovv_prefetch['future'] = async_read(
-                    xtc_ccsd._get_slice, eris.vovv, slice(next_spec[0], next_spec[1]), 0
+            # Kick off HDF5 read for THIS device's next tile.
+            nidx = pf['next_idx']
+            if nidx < len(pf['specs']):
+                next_spec = pf['specs'][nidx]
+                pf['future'] = async_read(
+                    xtc_ccsd._get_slice, eris.vovv,
+                    slice(next_spec[0], next_spec[1]), 0,
                 )
-                _vovv_prefetch['spec'] = next_spec
-                _vovv_prefetch['next_idx'] = nidx + 1
+                pf['spec'] = next_spec
+                pf['next_idx'] = nidx + 1
             else:
-                _vovv_prefetch['future'] = None
-                _vovv_prefetch['spec'] = None
+                pf['future'] = None
+                pf['spec'] = None
             _t_pf1 = time.perf_counter()
 
             dev_key = device if device is not None else None
@@ -748,12 +786,13 @@ def _update_amps(cc, t1, t2, eris):
                 _t_k1 = time.perf_counter()
             _t_total1 = time.perf_counter()
 
-            vovv_issue_stats["n_calls"]         += 1
-            vovv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
-            vovv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
-            vovv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
-            vovv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
-            vovv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
+            with vovv_stats_lock:
+                vovv_issue_stats["n_calls"]         += 1
+                vovv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
+                vovv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
+                vovv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
+                vovv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
+                vovv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
             return term
 
         def consume_vovv(spec, device, term, release_gpu_slot):

@@ -350,65 +350,105 @@ def _gpu_slot_ctx(gpu_sem):
         release()  # safety net — idempotent, so harmless if already called
 
 
-def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
-                          device_key=None, gpu_slots=None, host_slots=None,
-                          return_stats=False):
-    """Issue tiles to devices in round-robin; run consume callbacks in a thread pool.
+def partition_round_robin(tile_specs, devices, device_key=None):
+    """Partition ``tile_specs`` across ``devices`` round-robin.
+
+    Returns a dict ``{device: [specs assigned to this device]}`` in the same
+    assignment order ``_round_robin_pipeline`` will use.  Useful for callers
+    that need to set up per-device state (e.g. HDF5 prefetch chains) before
+    handing off to the pipeline.
 
     Parameters
     ----------
     device_key : callable(spec) -> hashable, optional
-        When provided, all tiles that share the same key are sent to the same
-        device.  Keys are assigned to devices in first-seen order round-robin.
-        Default (None) assigns tiles by sequential tile index.
+        When provided, all tiles sharing the same key go to the same device
+        (first-seen-key round-robin), exactly matching the pipeline's
+        internal assignment.  Default: tile-index round-robin.
+    """
+    n_devices = len(devices)
+    out = {d: [] for d in devices}
+    if device_key is None:
+        for tile_id, spec in enumerate(tile_specs):
+            out[devices[tile_id % n_devices]].append(spec)
+    else:
+        key_to_device = {}
+        for spec in tile_specs:
+            k = device_key(spec)
+            if k not in key_to_device:
+                key_to_device[k] = devices[len(key_to_device) % n_devices]
+            out[key_to_device[k]].append(spec)
+    return out
+
+
+def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
+                          device_key=None, gpu_slots=None, host_slots=None,
+                          return_stats=False):
+    """Per-device parallel issue + thread-pool consume.
+
+    Each device gets its own *issue thread* that drains its assigned tile
+    sub-list.  Both threads call ``issue_tile`` concurrently — so even if
+    ``issue_tile`` blocks synchronously on GPU work for the duration of
+    the tile (which is empirically what ``compute_2b_tile`` does — see the
+    ``[VVVV-issue dN] xtc_2b_tile RETURN ... blocking-call`` markers in
+    ``jax_xtc_ccsd._contract_vvvv_t2``), both GPUs can be busy at the
+    same time instead of alternating.
+
+    Tile assignment
+    ---------------
+    * Default (``device_key=None``): tile-id round-robin.  Tile ``k``
+      goes to ``devices[k % n_devices]``.
+    * ``device_key=callable(spec) -> hashable``: tiles sharing a key
+      go to the same device, keys assigned first-seen round-robin.
+
+    Parameters
+    ----------
+    issue_tile : callable(spec, device) -> jax.Array (future)
+        **Must be thread-safe.**  Two threads will call it concurrently
+        with different ``device`` arguments.  Closures that mutate
+        shared state (e.g. an HDF5 prefetch chain) must either lock or,
+        cleaner, use ``partition_round_robin`` to set up per-device
+        state up front.
+    consume_tile : callable(spec, device, handle, release_gpu_slot)
+        Called from a separate consume thread pool.  See bottom for the
+        ``release_gpu_slot`` contract.
+    devices : sequence
+        Local devices.  Default: ``_solver_local_devices()``.
     gpu_slots : int, optional
-        Number of tiles allowed to be in flight on the GPU pipeline before the
-        main dispatch thread must wait.  Defaults to ``2 * n_devices``.  A
-        GPU slot is released the moment ``consume_tile`` calls
-        ``release_gpu_slot`` (typically right after the GPU→CPU readback),
-        freeing the main thread to issue the next tile even while CPU post-
-        processing and disk writes for earlier tiles are still in flight.
+        Total in-flight tiles allowed across all devices.  Default
+        ``2 * n_devices``.  Each ``issue_tile`` call acquires one slot;
+        ``release_gpu_slot`` (called inside ``consume_tile``) releases
+        it.  This bounds peak GPU memory residency.
     host_slots : int, optional
-        Number of tiles allowed to hold host-side buffers concurrently.
-        Defaults to ``4 * n_devices``.  Bounds peak host memory for in-flight
-        CPU contractions and HDF5 writes.  Must be ``>= gpu_slots``.
+        Total in-flight tiles holding host-side buffers.  Default
+        ``max(gpu_slots, 4 * n_devices)``.  Bounds peak host memory
+        for tiles whose GPU work has finished but whose CPU
+        accumulate / write hasn't completed yet.
     return_stats : bool, optional
-        When True, return a stats dict with main-thread timing counters:
+        When True, return a stats dict:
 
-        * ``n_tiles`` — total tiles dispatched.
-        * ``wall_s`` — wall time from first-issue to last-future-result.
-        * ``host_wait_s`` — cumulative wall time the main thread spent
-          blocked in ``host_sem.acquire()``.  Nonzero means
-          host-side back-pressure is throttling GPU dispatch
-          (either host memory is the cap, or a downstream stage such
-          as the HDF5 writer can't keep up).
-        * ``gpu_wait_s`` — cumulative wall time blocked in
-          ``gpu_sem.acquire()``.  Nonzero means the GPU pipeline
-          depth is the cap.
-        * ``issue_s`` — cumulative wall time spent inside
-          ``issue_tile()`` on the main thread.  This is JAX dispatch
-          + any CPU-side prep done in the main thread.
+        * ``n_tiles`` — total tiles processed.
+        * ``wall_s`` — wall time from first issue dispatch to last
+          consume completion.
+        * ``host_wait_s`` — cumulative seconds *summed across issue
+          threads* spent in ``host_sem.acquire()``.  Nonzero means
+          host-side back-pressure (writer / host memory) is throttling.
+        * ``gpu_wait_s`` — cumulative seconds in ``gpu_sem.acquire()``.
+          Nonzero means the GPU-residency cap is binding.
+        * ``issue_s`` — cumulative seconds spent inside
+          ``issue_tile()``.  In the parallel-issue model this is the
+          *sum across issue threads* — divide by ``n_devices`` to
+          estimate per-device average.
 
-        Together these tell you where the main dispatch thread's time
-        went: stalled on host slots (writer too slow / host memory
-        too small), stalled on GPU slots (GPUs behind), or busy
-        issuing (normal operation).
-
-    GPU dispatch (issue_tile) runs on the main thread so JAX sees a clean
-    per-device dispatch order.  consume_tile callbacks run off the main thread
-    so that GPU→CPU transfers, CPU contractions, and I/O all overlap with the
-    next round of GPU dispatches, keeping all GPUs continuously fed.
-
-    ``consume_tile`` is called as ``consume_tile(spec, device, handle,
-    release_gpu_slot)``.  It MUST call ``release_gpu_slot()`` as soon as the
-    tile is drained from the GPU (typically immediately after
-    ``np.asarray(handle)``) so the main thread can issue the next GPU tile
-    while CPU-only work continues.  ``release_gpu_slot`` is idempotent and
-    guaranteed to be called on exit even if consume_tile raises.
-
-    consume_tile is responsible for its own thread safety — callers that write
-    to shared state (e.g. HDF5 datasets) should guard those writes with a
-    threading.Lock in their closure.
+    consume_tile contract
+    ---------------------
+    ``consume_tile(spec, device, handle, release_gpu_slot)`` MUST call
+    ``release_gpu_slot()`` as soon as the tile is drained from the GPU
+    (typically right after ``np.asarray(handle)``), freeing one issue
+    thread to dispatch its next tile while CPU work continues.
+    ``release_gpu_slot`` is idempotent and guaranteed to be called on
+    exit even if consume raises.  Consume callbacks must be thread-safe
+    — protect any shared mutable state (HDF5 datasets, host
+    accumulators, etc.) with a ``threading.Lock`` in the closure.
     """
     devices = devices or _solver_local_devices()
     n_devices = len(devices)
@@ -418,7 +458,11 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
         host_slots = max(gpu_slots, 4 * n_devices)
     if host_slots < gpu_slots:
         host_slots = gpu_slots
-    _key_to_device = {}
+
+    # Pre-partition tile_specs across devices so each issue thread has a
+    # clean private work-list.  This is the same partition exposed
+    # publicly via ``partition_round_robin``.
+    tiles_by_device = partition_round_robin(tile_specs, devices, device_key)
 
     gpu_sem  = threading.Semaphore(gpu_slots)
     host_sem = threading.Semaphore(host_slots)
@@ -437,30 +481,57 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
         "gpu_wait_s": 0.0,
         "issue_s": 0.0,
     }
+    stats_lock = threading.Lock()
+
     wall_t0 = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=host_slots) as pool:
-        futures = []
-        for tile_id, spec in enumerate(tile_specs):
-            if device_key is not None:
-                k = device_key(spec)
-                if k not in _key_to_device:
-                    _key_to_device[k] = devices[len(_key_to_device) % n_devices]
-                device = _key_to_device[k]
-            else:
-                device = devices[tile_id % n_devices]
-            t_a = time.perf_counter()
-            host_sem.acquire()  # bound host-side memory
-            t_b = time.perf_counter()
-            gpu_sem.acquire()   # bound GPU pipeline depth
-            t_c = time.perf_counter()
-            handle = issue_tile(spec, device)
-            t_d = time.perf_counter()
-            stats["host_wait_s"] += (t_b - t_a)
-            stats["gpu_wait_s"]  += (t_c - t_b)
-            stats["issue_s"]     += (t_d - t_c)
-            stats["n_tiles"]     += 1
-            futures.append(pool.submit(_run_consume, spec, device, handle))
-        for f in futures:
-            f.result()  # re-raises first consume-thread exception on the main thread
+    with concurrent.futures.ThreadPoolExecutor(max_workers=host_slots) as consume_pool, \
+         concurrent.futures.ThreadPoolExecutor(max_workers=n_devices) as issue_pool:
+
+        consume_futures = []
+        consume_futures_lock = threading.Lock()
+
+        def _issue_worker(device, my_specs):
+            """One per device.  Drains ``my_specs`` calling ``issue_tile``
+            and submitting the resulting handle to the consume pool."""
+            local = {"host_wait_s": 0.0, "gpu_wait_s": 0.0,
+                     "issue_s": 0.0, "n_tiles": 0}
+            for spec in my_specs:
+                t_a = time.perf_counter()
+                host_sem.acquire()
+                t_b = time.perf_counter()
+                gpu_sem.acquire()
+                t_c = time.perf_counter()
+                handle = issue_tile(spec, device)
+                t_d = time.perf_counter()
+                local["host_wait_s"] += (t_b - t_a)
+                local["gpu_wait_s"]  += (t_c - t_b)
+                local["issue_s"]     += (t_d - t_c)
+                local["n_tiles"]     += 1
+                fut = consume_pool.submit(_run_consume, spec, device, handle)
+                with consume_futures_lock:
+                    consume_futures.append(fut)
+            with stats_lock:
+                for k, v in local.items():
+                    stats[k] += v
+
+        # Launch one issue thread per device.  Skip devices with no work
+        # (e.g. n_tiles < n_devices).
+        issue_futures = []
+        for device in devices:
+            specs = tiles_by_device.get(device, [])
+            if specs:
+                issue_futures.append(issue_pool.submit(_issue_worker, device, specs))
+
+        # Wait for all issue threads to finish dispatching.  This will
+        # re-raise the first issue-thread exception (e.g. an XLA error
+        # during compute_2b_tile) on the main thread.
+        for f in issue_futures:
+            f.result()
+
+        # Then wait for all consume futures.  Re-raises the first
+        # consume-thread exception.
+        for f in consume_futures:
+            f.result()
+
     stats["wall_s"] = time.perf_counter() - wall_t0
     return stats if return_stats else None

@@ -417,14 +417,15 @@ class TestSolverRoundRobin(unittest.TestCase):
         )
         payload = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(payload["n_devices"], 2)
-        # The VVVV on-the-fly scheduler uses tile-id round-robin across
-        # the 2 local devices (no ``device_key`` override — per-p-block
-        # locality was redundant once ``_get_isdf_device_cache`` made the
-        # ISDF kernels fully device-resident, and at ``p_blksize=1`` it
-        # would have idled every device except the first).  With a 2×2
-        # tile grid (p0=0, p0=2, each with r0=0 and r0=2) the default
-        # ``tile_id % n_devices`` assignment produces ``[0, 1, 0, 1]``.
-        self.assertEqual(payload["calls"], [0, 1, 0, 1])
+        # ``_round_robin_pipeline`` runs one issue thread per device in
+        # parallel.  Tile-id round-robin still partitions a 2×2 tile
+        # grid as ``d0 = [tile 0, tile 2]`` and ``d1 = [tile 1, tile 3]``
+        # — so each device should receive exactly its 2 tiles — but the
+        # *order* in which the two threads append to ``calls`` is
+        # non-deterministic (they race on the shared list).  Assert the
+        # multiset, not the ordered list.
+        self.assertEqual(len(payload["calls"]), 4)
+        self.assertEqual(sorted(payload["calls"]), [0, 0, 1, 1])
 
 
 class TestSmallOccBlockFormulas(unittest.TestCase):
