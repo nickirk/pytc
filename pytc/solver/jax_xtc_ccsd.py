@@ -506,13 +506,31 @@ def _update_amps(cc, t1, t2, eris):
 
         ovvv_acc_lock = threading.Lock()
 
+        # Per-stage wall-time accumulator for the OVVV issue path.  The
+        # parent ``_round_robin_pipeline`` reports total ``issue_s`` but
+        # that is a single number — we need to decompose it to see which
+        # sub-step (HDF5 await, H→D copy, JAX kernel dispatch) is
+        # actually blocking the main thread each tile.  Main-thread only,
+        # no lock needed.
+        ovvv_issue_stats = {
+            "n_calls":        0,
+            "await_read_s":   0.0,
+            "prefetch_next_s": 0.0,
+            "device_put_s":   0.0,
+            "kernel_s":       0.0,
+            "total_s":        0.0,
+        }
+
         def issue_ovvv(spec, device):
             p0, p1 = spec
+            _t_total0 = time.perf_counter()
             # Pick up the HDF5 read queued by the previous call.
             assert _ovvv_prefetch['spec'] == spec, (
                 f"OVVV prefetch spec mismatch: expected {spec}, got {_ovvv_prefetch['spec']}"
             )
+            _t_ar0 = time.perf_counter()
             blk_np = await_read(_ovvv_prefetch['future'])
+            _t_ar1 = time.perf_counter()
             # Kick off HDF5 read for the NEXT tile so I/O overlaps GPU work.
             nidx = _ovvv_prefetch['next_idx']
             if nidx < len(ovvv_tile_specs):
@@ -525,6 +543,7 @@ def _update_amps(cc, t1, t2, eris):
             else:
                 _ovvv_prefetch['future'] = None
                 _ovvv_prefetch['spec'] = None
+            _t_pf1 = time.perf_counter()
 
             dev_key = device if device is not None else None
             device_ctx = (
@@ -532,16 +551,29 @@ def _update_amps(cc, t1, t2, eris):
                 if device is not None else contextlib.nullcontext()
             )
             with device_ctx:
+                _t_dp0 = time.perf_counter()
                 if device is not None:
                     blk_dev = jax.device_put(blk_np, device)
                 else:
                     blk_dev = jnp.asarray(blk_np)
-                return kernel_process_ovvv_block(
+                _t_dp1 = time.perf_counter()
+                _t_k0 = time.perf_counter()
+                result = kernel_process_ovvv_block(
                     blk_dev,
                     ovvv_t1_by_dev[dev_key],
                     ovvv_t2_by_dev[dev_key],
                     ovvv_tau_by_dev[dev_key],
                 )
+                _t_k1 = time.perf_counter()
+            _t_total1 = time.perf_counter()
+
+            ovvv_issue_stats["n_calls"]         += 1
+            ovvv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
+            ovvv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
+            ovvv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
+            ovvv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
+            ovvv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
+            return result
 
         def consume_ovvv(spec, device, result, release_gpu_slot):
             p0, p1 = spec
@@ -574,6 +606,35 @@ def _update_amps(cc, t1, t2, eris):
         xtc_ccsd._round_robin_pipeline(
             ovvv_tile_specs, issue_ovvv, consume_ovvv, devices=ovvv_devices
         )
+
+        # --- issue-stage decomposition summary -----------------------
+        # Answers the follow-on question the parent pipeline's
+        # ``issue=X.Xs`` line cannot: WHICH stage inside issue_ovvv is
+        # blocking the main dispatch thread.  Look at which fraction
+        # dominates ``total_s``:
+        #   * await_read  ≫ others → HDF5 prefetch isn't keeping up.
+        #   * device_put  ≫ others → H→D copy is sync (pinned memory /
+        #                             memory pressure on the target GPU).
+        #   * kernel      ≫ others → the JIT call is materialising
+        #                             instead of returning a future.
+        _n = ovvv_issue_stats["n_calls"]
+        if _n > 0:
+            _tot   = ovvv_issue_stats["total_s"]
+            _other = _tot - (ovvv_issue_stats["await_read_s"]
+                             + ovvv_issue_stats["prefetch_next_s"]
+                             + ovvv_issue_stats["device_put_s"]
+                             + ovvv_issue_stats["kernel_s"])
+            logger.info(
+                "[issue-ovvv] n_calls=%d  total=%.2fs  "
+                "await_read=%.2fs  prefetch_next=%.2fs  "
+                "device_put=%.2fs  kernel_dispatch=%.2fs  (other=%.2fs)",
+                _n, _tot,
+                ovvv_issue_stats["await_read_s"],
+                ovvv_issue_stats["prefetch_next_s"],
+                ovvv_issue_stats["device_put_s"],
+                ovvv_issue_stats["kernel_s"],
+                _other,
+            )
 
         # Drop per-device caches now that the OVVV phase is complete.
         del ovvv_t1_by_dev, ovvv_t2_by_dev, ovvv_tau_by_dev
@@ -628,13 +689,28 @@ def _update_amps(cc, t1, t2, eris):
 
         vovv_acc_lock = threading.Lock()
 
+        # Per-stage issue-time decomposition for VOVV, mirroring the
+        # one above for OVVV.  See the comment next to ``ovvv_issue_stats``
+        # for the intended diagnostic use.
+        vovv_issue_stats = {
+            "n_calls":         0,
+            "await_read_s":    0.0,
+            "prefetch_next_s": 0.0,
+            "device_put_s":    0.0,
+            "kernel_s":        0.0,
+            "total_s":         0.0,
+        }
+
         def issue_vovv(spec, device):
             p0, p1 = spec
+            _t_total0 = time.perf_counter()
             # Pick up the block whose HDF5 read was kicked off last call.
             assert _vovv_prefetch['spec'] == spec, (
                 f"VOVV prefetch spec mismatch: expected {spec}, got {_vovv_prefetch['spec']}"
             )
+            _t_ar0 = time.perf_counter()
             blk_np = await_read(_vovv_prefetch['future'])
+            _t_ar1 = time.perf_counter()
             # Kick off HDF5 read for the NEXT tile immediately, before the
             # (potentially slower) GPU dispatch, so I/O overlaps GPU compute.
             nidx = _vovv_prefetch['next_idx']
@@ -648,6 +724,7 @@ def _update_amps(cc, t1, t2, eris):
             else:
                 _vovv_prefetch['future'] = None
                 _vovv_prefetch['spec'] = None
+            _t_pf1 = time.perf_counter()
 
             dev_key = device if device is not None else None
             device_ctx = (
@@ -655,16 +732,28 @@ def _update_amps(cc, t1, t2, eris):
                 if device is not None else contextlib.nullcontext()
             )
             with device_ctx:
+                _t_dp0 = time.perf_counter()
                 if device is not None:
                     blk_dev = jax.device_put(blk_np, device)
                 else:
                     blk_dev = jnp.asarray(blk_np)
+                _t_dp1 = time.perf_counter()
                 t1_dev = vovv_t1_by_dev[dev_key]
                 oovv_dev = vovv_oovv_by_dev[dev_key]
                 t1_slice_dev = t1_dev[:, p0:p1]
+                _t_k0 = time.perf_counter()
                 term = kernel_process_vovv_block(
                     blk_dev, oovv_dev, t1_slice_dev, t1_dev
                 )
+                _t_k1 = time.perf_counter()
+            _t_total1 = time.perf_counter()
+
+            vovv_issue_stats["n_calls"]         += 1
+            vovv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
+            vovv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
+            vovv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
+            vovv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
+            vovv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
             return term
 
         def consume_vovv(spec, device, term, release_gpu_slot):
@@ -689,6 +778,27 @@ def _update_amps(cc, t1, t2, eris):
         xtc_ccsd._round_robin_pipeline(
             vovv_tile_specs, issue_vovv, consume_vovv, devices=vovv_devices
         )
+
+        # Issue-stage decomposition summary (see OVVV block above for
+        # the diagnostic interpretation).
+        _n = vovv_issue_stats["n_calls"]
+        if _n > 0:
+            _tot   = vovv_issue_stats["total_s"]
+            _other = _tot - (vovv_issue_stats["await_read_s"]
+                             + vovv_issue_stats["prefetch_next_s"]
+                             + vovv_issue_stats["device_put_s"]
+                             + vovv_issue_stats["kernel_s"])
+            logger.info(
+                "[issue-vovv] n_calls=%d  total=%.2fs  "
+                "await_read=%.2fs  prefetch_next=%.2fs  "
+                "device_put=%.2fs  kernel_dispatch=%.2fs  (other=%.2fs)",
+                _n, _tot,
+                vovv_issue_stats["await_read_s"],
+                vovv_issue_stats["prefetch_next_s"],
+                vovv_issue_stats["device_put_s"],
+                vovv_issue_stats["kernel_s"],
+                _other,
+            )
 
         # Drop per-device caches as soon as the VOVV phase is done.
         del vovv_t1_by_dev, vovv_oovv_by_dev

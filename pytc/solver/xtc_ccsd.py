@@ -1171,8 +1171,15 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
             stage_stats["writefn_s"] += writefn_s
             stage_stats["bytes"]     += tile_bytes
 
-    pipeline_stats = _round_robin_pipeline(
-        tile_specs, issue, consume, devices=devices, return_stats=True)
+    # Open a pipeline-level issue-stage accumulator so ``_assemble_2b_tile``
+    # records its tc_assemble / delta_u_assemble / final_sum per-tile
+    # timings.  The scheduler's ``issue_s`` is already wall-time-total for
+    # the ``issue(...)`` call itself; this decomposition tells us WHICH
+    # sub-call inside the assembler is blocking the main thread tile
+    # after tile (the signature that drives ``issue_s ≈ wall``).
+    with xtc_mod.issue_stage_stats_scope() as _issue_stage_stats:
+        pipeline_stats = _round_robin_pipeline(
+            tile_specs, issue, consume, devices=devices, return_stats=True)
 
     # --- Summary log -----------------------------------------------------
     # Everything needed to answer the three diagnostic questions:
@@ -1194,6 +1201,24 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
         stage_stats["gpu2cpu_s"], stage_stats["df_s"], stage_stats["add_s"],
         stage_stats["submit_s"], stage_stats["writefn_s"],
     )
+    # Issue-stage decomposition (only present when ``_assemble_2b_tile`` is
+    # the body of ``issue`` — i.e. medium blocks or any future caller that
+    # routes through the assembler).  If every stage is tiny the scheduler's
+    # issue cost came from somewhere OTHER than the assembler (e.g. a
+    # ``compute_2b_tile`` setup cost, host-side kernel prep) — that
+    # discrepancy is itself diagnostic.
+    tc_s  = _issue_stage_stats.get("tc_assemble_s",     0.0)
+    du_s  = _issue_stage_stats.get("delta_u_assemble_s", 0.0)
+    sum_s = _issue_stage_stats.get("final_sum_s",        0.0)
+    n_ta  = int(_issue_stage_stats.get("n_tiles",        0))
+    if n_ta > 0:
+        other_s = pipeline_stats["issue_s"] - (tc_s + du_s + sum_s)
+        logger.info(
+            "[tiled-pipeline:%s] issue-stage: n_tiles_timed=%d  "
+            "tc_assemble=%.2fs  delta_u_assemble=%.2fs  final_sum=%.2fs  "
+            "(other_in_issue=%.2fs)",
+            block_names, n_ta, tc_s, du_s, sum_s, other_s,
+        )
     # host_wait ≈ the smoking gun: if it's a big fraction of ``wall``,
     # the main thread spent most of its time waiting for host_sem slots,
     # which means a downstream stage (writer / disk) is the bottleneck.

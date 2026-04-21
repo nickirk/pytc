@@ -6,6 +6,7 @@ import numpy as np
 import os
 import gc
 import logging
+import threading
 import time
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,62 @@ from . import kmat as kmat_jax
 from .utils import sharding_core
 
 logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# Opt-in issue-stage decomposition for ``_assemble_2b_tile``.
+#
+# The ``_run_tiled_block_pipeline`` scheduler (in ``xtc_ccsd.py``)
+# reports ``issue_s`` = total wall time spent inside ``issue_tile``.
+# For medium blocks that call is ``compute_2b_tile`` → a chain of
+# ``_get_tc_direct_tile`` + ``_get_delta_u_direct_tile`` + a final
+# ``tc_tile + delta_u_tile`` add.  To attribute ``issue_s`` to the
+# three stages we maintain a thread-local float-accumulator dict
+# that the assembler updates from within its own ``@jax.jit``
+# boundary.
+#
+# The mechanism is strictly opt-in — if ``_ISSUE_STAGE_STATS.stats``
+# is unset (the common case, including the stand-alone
+# ``get_2b`` / test-fake paths), the assembler takes no cost at all.
+# Callers that want timing (currently only the ``_run_tiled_block_
+# pipeline``'s ``issue`` closure) set ``_ISSUE_STAGE_STATS.stats`` to
+# a dict before the call and read it after.  Main-thread writes only,
+# so no lock is needed.
+#
+# We intentionally do NOT change the signature of ``_assemble_2b_tile``
+# / ``_assemble_tc_tile`` / ``_assemble_delta_u_tile``: several test
+# doubles implement those methods (e.g. the ``_FakeMOXTC`` fixture in
+# ``test_vvvv_paneling.py``) and would silently ignore a new ``**kwargs``
+# slot, giving the false impression that instrumentation is active.
+# ------------------------------------------------------------------
+_ISSUE_STAGE_STATS = threading.local()
+
+
+def _accum_issue_stage(name, dt):
+    """Add ``dt`` seconds to ``name`` if a pipeline stats scope is active."""
+    stats = getattr(_ISSUE_STAGE_STATS, "stats", None)
+    if stats is not None:
+        stats[name] = stats.get(name, 0.0) + dt
+
+
+@contextlib.contextmanager
+def issue_stage_stats_scope():
+    """Establish a per-pipeline accumulator for ``_accum_issue_stage``.
+
+    Yields a dict that subsequent ``_accum_issue_stage`` calls will
+    mutate.  Nested scopes are supported — the outer scope is restored
+    on ``__exit__`` — so it is safe for the scheduler to enter a scope
+    even if callees might also enter scopes of their own.  Main-thread
+    use only; the thread-local binding is not shared with worker
+    threads.
+    """
+    prev = getattr(_ISSUE_STAGE_STATS, "stats", None)
+    fresh: dict = {}
+    _ISSUE_STAGE_STATS.stats = fresh
+    try:
+        yield fresh
+    finally:
+        _ISSUE_STAGE_STATS.stats = prev
 
 # ---------------------------------------------------------------------------
 # Host-side cache for X orbital slices read from HDF5.
@@ -2213,9 +2270,22 @@ class ISDFXTC(XTC, ISDFTC):
         if profile:
             _ASSEMBLE_2B_TILE_PROFILED.add(profile_key)
             t0 = time.perf_counter()
+        # Per-tile stage timing (only active when a pipeline has opened an
+        # ``issue_stage_stats_scope`` — see the comment near the top of
+        # this file).  We measure pure Python-return time here, *without*
+        # forcing ``block_until_ready``, because the goal is to pin down
+        # which sub-call is blocking the main dispatch thread under normal
+        # async JAX semantics — adding an explicit barrier would
+        # manufacture the very stall we're trying to detect.
+        _stage_timing = getattr(_ISSUE_STAGE_STATS, "stats", None) is not None
+        if _stage_timing:
+            _t_stage_tc0 = time.perf_counter()
         tc_tile = super()._assemble_tc_tile(
             kernels, ranges, device=device, panel_size=panel_size,
             panel_layout=panel_layout)
+        if _stage_timing:
+            _t_stage_tc1 = time.perf_counter()
+            _accum_issue_stage("tc_assemble_s", _t_stage_tc1 - _t_stage_tc0)
         if profile:
             jax.block_until_ready(tc_tile)
             t_tc = time.perf_counter()
@@ -2224,9 +2294,14 @@ class ISDFXTC(XTC, ISDFTC):
                 t_tc - t0,
                 device_key,
             )
+        if _stage_timing:
+            _t_stage_du0 = time.perf_counter()
         delta_u_tile = self._assemble_delta_u_tile(
             kernels, ranges, device=device, panel_size=panel_size,
             panel_layout=panel_layout)
+        if _stage_timing:
+            _t_stage_du1 = time.perf_counter()
+            _accum_issue_stage("delta_u_assemble_s", _t_stage_du1 - _t_stage_du0)
         if profile:
             jax.block_until_ready(delta_u_tile)
             t_du = time.perf_counter()
@@ -2237,7 +2312,13 @@ class ISDFXTC(XTC, ISDFTC):
             )
 
         if panel_size is not None:
+            if _stage_timing:
+                _t_stage_sum0 = time.perf_counter()
             result = tc_tile + delta_u_tile
+            if _stage_timing:
+                _t_stage_sum1 = time.perf_counter()
+                _accum_issue_stage("final_sum_s", _t_stage_sum1 - _t_stage_sum0)
+                _accum_issue_stage("n_tiles", 1)
             if profile:
                 jax.block_until_ready(result)
                 t_sum = time.perf_counter()
