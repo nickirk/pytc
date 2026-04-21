@@ -1147,8 +1147,24 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             p0, p1, r0, r1, getattr(device, "id", "host"), time.perf_counter() - t0_trans,
         )
 
-    xtc_ccsd._round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices,
-                                   device_key=lambda spec: spec[0])
+    # Tile-id round-robin across local devices.  We intentionally do NOT
+    # pass ``device_key=lambda spec: spec[0]`` (p-block locality) here:
+    # the Apr-7 ``_get_isdf_device_cache`` refactor made phi_isdf /
+    # grad_phi_isdf / K1 / K3 / D fully device-resident, so there is no
+    # longer any locality benefit from keeping r-tiles of a given p on
+    # one device.  With ``device_key`` on, ``_round_robin_pipeline``
+    # would assign the first-seen p-block to device 0, the second to
+    # device 1, etc.  At small ``p_blksize`` that is fine, but at the
+    # degenerate ``p_blksize=1`` the scheduler must drain all ``n_r``
+    # tiles of ``p=0`` before dispatching ``p=1`` to device 1, leaving
+    # every other device idle for roughly ``n_r * per_tile_gpu_time``
+    # (observed on QZ: device 0 finished 1306 tiles while device 1 had
+    # only started 64).  Default tile-id round-robin avoids that:
+    # ``(p=0,r=0)→d0, (p=0,r=1)→d1, (p=0,r=2)→d0, ...`` so every device
+    # gets work on tile 0/1 and the staggering is bounded by a single
+    # tile's latency.
+    xtc_ccsd._round_robin_pipeline(tile_specs, issue_tile, consume_tile,
+                                   devices=devices)
 
     if L_vv_full_host is not None:
         del L_vv_full_host

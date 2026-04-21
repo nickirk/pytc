@@ -614,8 +614,13 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             p0, p1, r0, r1, time.perf_counter() - t0,
         )
 
-    _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=devices,
-                          device_key=lambda spec: spec[0])
+    # Tile-id round-robin; see the parallel call site in
+    # ``jax_xtc_ccsd._contract_vvvv_t2`` for why we no longer pass
+    # ``device_key=lambda spec: spec[0]`` — the original locality benefit
+    # is now redundant (post Apr-7 per-device ISDF kernel caching) and
+    # at ``p_blksize=1`` the p-block grouping monopolises device 0.
+    _round_robin_pipeline(tile_specs, issue_tile, consume_tile,
+                          devices=devices)
 
     if L_vv_full is not None:
         del L_vv_full

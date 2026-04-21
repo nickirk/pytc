@@ -417,9 +417,14 @@ class TestSolverRoundRobin(unittest.TestCase):
         )
         payload = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(payload["n_devices"], 2)
-        # device_key=lambda spec: spec[0] sends all r-tiles within a p-block
-        # to the same device, so the 2×2 tile grid maps as: p0→d0, p1→d1.
-        self.assertEqual(payload["calls"], [0, 0, 1, 1])
+        # The VVVV on-the-fly scheduler uses tile-id round-robin across
+        # the 2 local devices (no ``device_key`` override — per-p-block
+        # locality was redundant once ``_get_isdf_device_cache`` made the
+        # ISDF kernels fully device-resident, and at ``p_blksize=1`` it
+        # would have idled every device except the first).  With a 2×2
+        # tile grid (p0=0, p0=2, each with r0=0 and r0=2) the default
+        # ``tile_id % n_devices`` assignment produces ``[0, 1, 0, 1]``.
+        self.assertEqual(payload["calls"], [0, 1, 0, 1])
 
 
 class TestSmallOccBlockFormulas(unittest.TestCase):
