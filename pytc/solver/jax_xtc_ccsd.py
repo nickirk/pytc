@@ -203,6 +203,31 @@ class RCCSD(xtc_ccsd.RCCSD):
         return np.array(_jax_energy(t1_jax, t2_jax, fock_jax, ovov_jax)).item()
 
 
+def _should_force_host_accumulators(eris, n_devices_local):
+    """Whether the OVVV/VOVV pipelines must use host-side accumulators.
+
+    GPU-resident accumulators are only viable when *all three* of the
+    following hold:
+
+      * exactly one local device (the round-robin pipeline accumulates
+        per-tile outputs into a single buffer; multiple devices require
+        a host-side buffer guarded by a lock);
+      * ``eris.ovvv`` is an in-RAM ``np.ndarray`` (the HDF5-streamed
+        path always accumulates on host inside ``consume_ovvv``);
+      * ``eris.vovv`` is an in-RAM ``np.ndarray`` (same reason for the
+        VOVV pipeline below).
+
+    This helper is the single source of truth for that decision so the
+    inline override in :func:`_update_amps` and the regression tests in
+    ``pytc/solver/test/test_jax_xtc_ccsd.py`` stay in sync.
+    """
+    return (
+        n_devices_local > 1
+        or not isinstance(eris.ovvv, np.ndarray)
+        or not isinstance(eris.vovv, np.ndarray)
+    )
+
+
 def _update_amps(cc, t1, t2, eris):
     """
     JAX-Recovered Restricted CCSD amplitude update with hybrid memory strategy.
@@ -265,15 +290,22 @@ def _update_amps(cc, t1, t2, eris):
         nocc, nvir, 'acc_decision', gpu_max_memory_mb=_gpu_max)
     use_gpu_acc = bool(use_gpu_acc_flag)
 
-    # Force host accumulation when multiple devices are present: the
-    # OVVV/VOVV multi-GPU pipelines below accumulate per-tile outputs into
-    # a single host-side buffer under a lock.  GPU-resident accumulators
-    # only work for a single device.
+    # Force host accumulation whenever the OVVV/VOVV pipeline below cannot
+    # keep accumulators GPU-resident.  See ``_should_force_host_accumulators``
+    # for the exact predicate (multi-GPU OR HDF5-backed ovvv OR HDF5-backed
+    # vovv).  Previously the override only checked the multi-GPU case, so a
+    # single-GPU run with HDF5-backed ovvv (large systems where ovvv was
+    # spilled to disk regardless of device count) hit a misleading
+    # AssertionError further down complaining that the multi-GPU check
+    # "above" had failed to set use_gpu_acc=False.
     _n_devices_local = len(xtc_ccsd._solver_local_devices())
-    if _n_devices_local > 1 and use_gpu_acc:
+    if _should_force_host_accumulators(eris, _n_devices_local) and use_gpu_acc:
         logger.debug(
-            "Multi-GPU mode (%d devices): forcing host-side accumulators for OVVV/VOVV",
+            "Forcing host-side accumulators for OVVV/VOVV "
+            "(n_devices=%d, ovvv_in_ram=%s, vovv_in_ram=%s)",
             _n_devices_local,
+            isinstance(eris.ovvv, np.ndarray),
+            isinstance(eris.vovv, np.ndarray),
         )
         use_gpu_acc = False
 
@@ -406,9 +438,14 @@ def _update_amps(cc, t1, t2, eris):
         from pytc.utils.prefetch import async_read, await_read
 
         if use_gpu_acc:
+            # Should be unreachable: the early ``_force_host_acc`` override
+            # forces ``use_gpu_acc = False`` whenever ``eris.ovvv`` is not
+            # an in-RAM ndarray (i.e. exactly when this branch runs).
             raise AssertionError(
-                "use_gpu_acc must be False for the HDF5-backed OVVV multi-GPU path; "
-                "set by _n_devices_local > 1 check above"
+                "use_gpu_acc must be False for the HDF5-backed OVVV pipeline "
+                "(in-RAM accumulators are not supported when streaming ovvv "
+                "tiles from disk); the early _force_host_acc override should "
+                "have set use_gpu_acc=False."
             )
 
         ovvv_devices = xtc_ccsd._solver_local_devices()
