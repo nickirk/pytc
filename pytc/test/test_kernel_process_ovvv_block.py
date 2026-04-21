@@ -1,20 +1,27 @@
 """Numerical regression test for ``kernel_process_ovvv_block``.
 
-The production kernel was refactored to avoid paired ``'kdac'`` vs
-``'kcad'`` einsum subscripts against the same ``ovvv_blk`` tensor. That
-pattern forces XLA to fuse an axis-1↔axis-3 transpose of a large f64
-tensor into several downstream contractions (``input_transpose_fusion``)
-and, at pCV5Z-class shapes, can blow the autotuner:
+The production kernel has been rewritten three times in response to
+XLA failures on pCV5Z-class (≈30 GB f64 ``ovvv_blk``) inputs:
 
-    INTERNAL: Autotuning failed for HLO: %input_transpose_fusion ...
-              NOT_FOUND: No valid config found!
+* v1 (textbook) — paired ``'kdac'``/``'kcad'`` einsums.  XLA fused the
+  axis-1↔3 transpose into downstream HLOs and the autotuner aborted
+  with ``NOT_FOUND: No valid config found!`` on
+  ``f64[1179, 3070116]``.
 
-The refactor materializes ``ovvv_swap = transpose(ovvv_blk, (0,3,2,1))``
-once and rewrites every contraction in the native ``'kdac'`` form. That
-is supposed to be *numerically* identical (up to floating-point
-reassociation inside the contractions) to the textbook kernel. This
-test pins that equivalence so future edits to the kernel cannot
-silently drift.
+* v2 (commit ``eeb39b2``) — precompute ``ovvv_swap`` and
+  ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` inside ``@jax.jit``.  XLA
+  re-fused the transpose into a different downstream GEMM
+  (``tmp_a``/``tmp_b`` against ``tau``) and blew the BFC allocator on a
+  27 GB scratch tensor (``f64[21, 146196, 1179]``).
+
+* v3 (current) — barrier-wrap ``ovvv_swap`` to prevent re-fusion, drop
+  the ``ovvv_t1sym`` intermediate (save 30 GB), and pre-transpose
+  ``tau_swap`` so the ``tmp_a``/``tmp_b`` contractions don't require a
+  reshape-after-transpose of ``ovvv_blk``.
+
+This test pins numerical equivalence against the textbook form so
+every future rewrite (including further XLA-workaround tweaks) cannot
+silently drift from the CCSD amplitude update's defined output.
 """
 
 import unittest

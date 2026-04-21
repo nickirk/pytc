@@ -92,61 +92,94 @@ def kernel_process_ovvv_block(ovvv_blk, t1, t2, tau):
     ``ovvv_blk`` has shape ``(nocc, nvir, blk, nvir)`` with logical axes
     ``(k, d, a, c)``; the sliced dimension is axis 2 (``a``).
 
-    Implementation note
-    -------------------
-    The textbook form of this kernel uses paired einsums with ``'kdac'``
-    vs ``'kcad'`` subscripts against the same ``ovvv_blk`` tensor. That
-    asks XLA to produce an axis-1↔axis-3 transpose of a ~30 GB f64 block
-    and then fuse the transpose into several downstream contractions
-    (``input_transpose_fusion`` HLOs). For the shapes we actually hit
-    at pCV5Z-class calculations (e.g. ``f64[1179, 3070116]`` ≈ 27 GB with
-    a 1179-long minor axis) the XLA autotuner runs out of viable tile
-    configurations and aborts with::
+    Implementation notes
+    --------------------
+    This kernel has been rewritten three times in response to production
+    XLA failures on pCV5Z-class (≈30 GB f64 ``ovvv_blk``) inputs:
 
-        INTERNAL: Autotuning failed for HLO: %input_transpose_fusion ...
-                  NOT_FOUND: No valid config found!
+    * v1 (textbook): paired ``'kdac'``/``'kcad'`` einsums against the
+      same ``ovvv_blk``.  XLA fused an axis-1↔3 transpose of the 30 GB
+      tile into several downstream contractions (``input_transpose_fusion``
+      HLOs) and the autotuner aborted with ``NOT_FOUND: No valid config
+      found!`` on shapes like ``f64[1179, 3070116]``.
 
-    We eliminate every ``'kcad'``/``'kcbd'``-style binding by materializing
-    ``ovvv_swap = transpose(ovvv_blk, (0, 3, 2, 1))`` once as a single
-    standalone transpose HLO (which the autotuner handles comfortably),
-    and rewriting every contraction in the native ``'kdac'`` form against
-    either ``ovvv_blk``, ``ovvv_swap``, or the linear combination
-    ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` that folds the
-    ``2*native - swap`` T1 / Lvv pattern into a single einsum.
+    * v2 (commit ``eeb39b2``): precomputed ``ovvv_swap`` and
+      ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` inside this ``@jax.jit``.
+      XLA's common-subexpression / fusion passes still re-fused the
+      transpose into the downstream GEMMs that contract ``(c, d)``
+      against ``tau`` in ``tmp_a`` and ``tmp_b``.  The natural GEMM plan
+      for ``einsum('kdac,ijcd->kaij', ovvv_blk, tau)`` wants
+      ``(k*a, d*c) @ (d*c, i*j)``, which requires reshape-after-transpose
+      of ``ovvv_blk`` into layout ``(k, a, c, d)``.  At
+      ``(nocc=21, nvir=1179, blk=124)`` that scratch is 27 GB, and the
+      BFC allocator could not fit it alongside ``ovvv_blk`` +
+      ``ovvv_swap`` + ``ovvv_t1sym`` + t1/t2/tau → OOM → autotuner
+      reports "NOT_FOUND" (no config can allocate its scratch).
 
-    The output of this kernel is bit-for-bit equivalent to the textbook
-    version up to floating-point reassociation inside the contractions;
-    see ``pytc/test/test_kernel_process_ovvv_block.py`` for the
-    regression test.
+    * v3 (current): two targeted changes.
+
+      1. Materialise ``ovvv_swap`` with an ``optimization_barrier`` so
+         XLA cannot re-fuse the transpose into any downstream tile
+         config.  The single standalone transpose HLO is trivially
+         handled by the autotuner.
+      2. Drop the separate ``ovvv_t1sym`` intermediate (saving a third
+         30 GB tensor) and split the ``2*native - swap`` pattern into
+         two explicit einsums at each use site.
+      3. Precompute ``tau_swap = transpose(tau, (0, 1, 3, 2))`` (≈5 GB,
+         also barrier-wrapped) so the contraction in ``tmp_a`` and
+         ``tmp_b`` is written as ``'...dc'`` on the RHS — matching the
+         ``(d, c)`` order on the LHS and removing the ordering mismatch
+         that was pushing XLA toward the failing transpose plan.
+
+    Memory budget inside this kernel at pCV5Z scale:
+    ``ovvv_blk (29 GB) + ovvv_swap (29 GB) + tau (5 GB) + tau_swap (5 GB)
+    + small = ~68 GB``, leaving comfortable headroom on a 80 GB H100 for
+    per-einsum GEMM scratch.
+
+    The output is numerically equivalent to v1/v2 up to floating-point
+    reassociation; see ``pytc/test/test_kernel_process_ovvv_block.py``
+    for the regression test.
     """
-    # Axes swap of (d, c) computed exactly once as a standalone HLO.
-    ovvv_swap = jnp.transpose(ovvv_blk, (0, 3, 2, 1))
-    # Linear combination absorbing the "2*native - swap" pattern that
-    # appears in the T1 and Lvv contributions.
-    ovvv_t1sym = 2 * ovvv_blk - ovvv_swap
+    # Pre-materialise the axis-1↔3 swap of ovvv_blk once, with a barrier
+    # to prevent XLA from re-fusing the transpose into downstream GEMMs.
+    ovvv_swap = jax.lax.optimization_barrier(
+        jnp.transpose(ovvv_blk, (0, 3, 2, 1))
+    )
+    # Pre-materialise tau with its last two axes swapped.  Writing the
+    # tmp_a / tmp_b contractions as ``'...dc'`` against this tensor
+    # gives XLA a GEMM plan whose natural layout does not require a
+    # reshape-after-transpose of the 30 GB ``ovvv_blk``.
+    tau_swap = jax.lax.optimization_barrier(
+        jnp.transpose(tau, (0, 1, 3, 2))
+    )
 
-    # 1. t1_upd (ia): fused 2*native - swap against t2 and (t1, t1).
-    t1_upd  = jnp.einsum('kdac,ikcd->ia',    ovvv_t1sym, t2)
-    t1_upd += jnp.einsum('kdac,kd,ic->ia',   ovvv_t1sym, t1, t1)
+    # 1. t1_upd (ia): 2*native - swap split into two einsums rather than
+    #    via a pre-computed ``ovvv_t1sym`` (which would cost a third 30
+    #    GB resident tensor).
+    t1_upd  = 2 * jnp.einsum('kdac,ikcd->ia',    ovvv_blk,  t2)
+    t1_upd -=     jnp.einsum('kdac,ikcd->ia',    ovvv_swap, t2)
+    t1_upd += 2 * jnp.einsum('kdac,kd,ic->ia',   ovvv_blk,  t1, t1)
+    t1_upd -=     jnp.einsum('kdac,kd,ic->ia',   ovvv_swap, t1, t1)
 
-    # 2. Lvv_blk (ac): fused 2*native - swap against t1.
-    Lvv_blk = jnp.einsum('kdac,kd->ac',      ovvv_t1sym, t1)
+    # 2. Lvv_blk (ac): same 2*native - swap split.
+    Lvv_blk  = 2 * jnp.einsum('kdac,kd->ac',     ovvv_blk,  t1)
+    Lvv_blk -=     jnp.einsum('kdac,kd->ac',     ovvv_swap, t1)
 
-    # 3. Wvoov_blk (akic): the original was 'kcad,id->akic' on ovvv_blk,
-    #    i.e. the pure swap branch — compute it on ovvv_swap.
-    Wvoov_blk = jnp.einsum('kdac,id->akic',  ovvv_swap, t1)
+    # 3. Wvoov_blk (akic): pure swap branch.
+    Wvoov_blk = jnp.einsum('kdac,id->akic',      ovvv_swap, t1)
 
-    # 4. Wvovo_blk (akci): native branch, unchanged.
-    Wvovo_blk = jnp.einsum('kdac,id->akci',  ovvv_blk,  t1)
+    # 4. Wvovo_blk (akci): native branch.
+    Wvovo_blk = jnp.einsum('kdac,id->akci',      ovvv_blk,  t1)
 
-    # 5. tmp_a_blk (kaij): native branch, unchanged.
-    tmp_a_blk = jnp.einsum('kdac,ijcd->kaij', ovvv_blk,  tau)
+    # 5. tmp_a_blk (kaij): rewritten against ``tau_swap`` so the RHS
+    #    contraction axes appear as ``'ijdc'`` — aligned with the LHS
+    #    ``'kdac'``.  Numerically identical to
+    #    ``einsum('kdac,ijcd->kaij', ovvv_blk, tau)`` because
+    #    ``tau_swap[i, j, d, c] == tau[i, j, c, d]``.
+    tmp_a_blk = jnp.einsum('kdac,ijdc->kaij',    ovvv_blk,  tau_swap)
 
-    # 6. tmp_b_blk (kbij): the original was 'kcbd,ijcd->kbij' on ovvv_blk,
-    #    which is the swap branch. On ovvv_swap this is the native
-    #    'kdac,ijcd->kaij' pattern (the output letter is just renamed
-    #    'a' -> 'b' to match the original's output labeling).
-    tmp_b_blk = jnp.einsum('kdbc,ijcd->kbij', ovvv_swap, tau)
+    # 6. tmp_b_blk (kbij): swap branch, same tau_swap rewrite.
+    tmp_b_blk = jnp.einsum('kdbc,ijdc->kbij',    ovvv_swap, tau_swap)
 
     return t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk
 
@@ -790,7 +823,23 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
 
             @jax.jit
             def contract_disk_kernel(t2, vvvv_block):
-                return jnp.einsum('acbd,ijcd->ijab', vvvv_block, t2)
+                # ``vvvv_block`` is laid out (a, c, b, d); the contraction
+                # axes (c, d) are at positions 1 and 3 (non-adjacent) on
+                # the LHS while tau/t2 has them at 2, 3 (adjacent).  XLA's
+                # natural GEMM plan for this mismatch wants to materialise
+                # a ~27 GB reshape-after-transpose of vvvv_block, which
+                # blows the BFC allocator at cc-pCV5Z scale.  We precompute
+                # ``t2_swap`` with the last two axes swapped (≈5 GB, one-
+                # shot, barrier-wrapped so XLA cannot re-fuse it) and
+                # rewrite the contraction as ``'acbd,ijdc->ijab'``, which
+                # aligns the RHS contraction axes with the LHS and lets
+                # XLA pick a plan that keeps vvvv_block in its original
+                # storage layout.  See the parallel rewrite in
+                # ``kernel_process_ovvv_block`` for the full argument.
+                t2_swap = jax.lax.optimization_barrier(
+                    jnp.transpose(t2, (0, 1, 3, 2))
+                )
+                return jnp.einsum('acbd,ijdc->ijab', vvvv_block, t2_swap)
 
             from pytc.utils.prefetch import async_read, await_read
             pending = None
