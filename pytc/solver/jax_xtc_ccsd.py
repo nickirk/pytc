@@ -635,7 +635,12 @@ def _update_amps(cc, t1, t2, eris):
             return term
 
         def consume_vovv(spec, device, term, release_gpu_slot):
-            del device
+            # Capture the device tag up front; ``device`` itself is no
+            # longer needed once the kernel has produced ``term``.
+            # (A prior refactor accidentally introduced ``del device``
+            # while the format string below still referenced it, causing
+            # ``UnboundLocalError`` on every VOVV tile.)
+            device_key = getattr(device, "id", "host")
             p0, p1 = spec
             t0_trans = time.perf_counter()
             term_host = np.asarray(term)  # GPU→CPU readback
@@ -644,7 +649,7 @@ def _update_amps(cc, t1, t2, eris):
                 t2new_host[:, :, p0:p1, :] += term_host
             logger.debug(
                 "VOVV block %d:%d on device %s accumulated in %.4fs",
-                p0, p1, getattr(device, "id", "host"),
+                p0, p1, device_key,
                 time.perf_counter() - t0_trans,
             )
 
