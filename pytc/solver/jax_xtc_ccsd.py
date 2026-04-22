@@ -1,4 +1,6 @@
+import contextlib
 import logging
+import threading
 import time
 import numpy as np
 import jax
@@ -7,6 +9,8 @@ from pyscf import lib
 from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
+from pytc import xtc as xtc_mod
+from pytc.utils.gpu_memory import resolve_vvvv_panel_block_sizes
 from pytc.utils.gpu_memory import estimate_blksize
 
 # JAX config
@@ -82,35 +86,101 @@ def _jax_cc_Woooo(t1, t2, eris_oooo, eris_ovov, eris_ovoo):
 @jax.jit
 def kernel_process_ovvv_block(ovvv_blk, t1, t2, tau):
     """
-    JIT-compiled kernel for processing ovvv block contributions to t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b.
-    ovvv_blk: (nocc, nvir, blk, nvir) - sliced along axis 2 ('a')
-    """
-    # 1. Update t1new (ia) partial -> accumulating into (ia)
-    # 2*einsum('kdac,ikcd->ia') - einsum('kcad,ikcd->ia')
-    t1_upd =  2 * jnp.einsum('kdac,ikcd->ia', ovvv_blk, t2)
-    t1_upd -=     jnp.einsum('kcad,ikcd->ia', ovvv_blk, t2)
-    
-    t1_upd += 2 * jnp.einsum('kdac,kd,ic->ia', ovvv_blk, t1, t1)
-    t1_upd -=     jnp.einsum('kcad,kd,ic->ia', ovvv_blk, t1, t1)
+    JIT-compiled kernel for processing ovvv block contributions to
+    t1new, Lvv, Wvoov, Wvovo, tmp_a, tmp_b.
 
-    # 2. Update Lvv (ac) partial -> accumulating into (ac)
-    # Note: ovvv_blk corresponds to 'ac' slice [p0:p1, :]
-    Lvv_blk =  2 * jnp.einsum('kdac,kd->ac', ovvv_blk, t1)
-    Lvv_blk -=     jnp.einsum('kcad,kd->ac', ovvv_blk, t1)
-    
-    # 3. Update Wvoov (akic) partial -> accumulating into slice [p0:p1]
-    Wvoov_blk = jnp.einsum('kcad,id->akic', ovvv_blk, t1)
-    
-    # 4. Update Wvovo (akci) partial -> accumulating into slice [p0:p1]
-    Wvovo_blk = jnp.einsum('kdac,id->akci', ovvv_blk, t1)
-    
-    # 5. Update tmp_a (kaij) partial -> accumulating into slice [:, p0:p1, :, :]
-    tmp_a_blk = jnp.einsum('kdac,ijcd->kaij', ovvv_blk, tau)
-    
-    # 6. Update tmp_b (kbij) partial -> accumulating into slice [:, p0:p1, :, :]
-    # 'kcbd' with ovvv (k,d,a,c) -> k=0, c=3, b=2(a), d=1
-    tmp_b_blk = jnp.einsum('kcbd,ijcd->kbij', ovvv_blk, tau)
-    
+    ``ovvv_blk`` has shape ``(nocc, nvir, blk, nvir)`` with logical axes
+    ``(k, d, a, c)``; the sliced dimension is axis 2 (``a``).
+
+    Implementation notes
+    --------------------
+    This kernel has been rewritten three times in response to production
+    XLA failures on pCV5Z-class (≈30 GB f64 ``ovvv_blk``) inputs:
+
+    * v1 (textbook): paired ``'kdac'``/``'kcad'`` einsums against the
+      same ``ovvv_blk``.  XLA fused an axis-1↔3 transpose of the 30 GB
+      tile into several downstream contractions (``input_transpose_fusion``
+      HLOs) and the autotuner aborted with ``NOT_FOUND: No valid config
+      found!`` on shapes like ``f64[1179, 3070116]``.
+
+    * v2 (commit ``eeb39b2``): precomputed ``ovvv_swap`` and
+      ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` inside this ``@jax.jit``.
+      XLA's common-subexpression / fusion passes still re-fused the
+      transpose into the downstream GEMMs that contract ``(c, d)``
+      against ``tau`` in ``tmp_a`` and ``tmp_b``.  The natural GEMM plan
+      for ``einsum('kdac,ijcd->kaij', ovvv_blk, tau)`` wants
+      ``(k*a, d*c) @ (d*c, i*j)``, which requires reshape-after-transpose
+      of ``ovvv_blk`` into layout ``(k, a, c, d)``.  At
+      ``(nocc=21, nvir=1179, blk=124)`` that scratch is 27 GB, and the
+      BFC allocator could not fit it alongside ``ovvv_blk`` +
+      ``ovvv_swap`` + ``ovvv_t1sym`` + t1/t2/tau → OOM → autotuner
+      reports "NOT_FOUND" (no config can allocate its scratch).
+
+    * v3 (current): two targeted changes.
+
+      1. Materialise ``ovvv_swap`` with an ``optimization_barrier`` so
+         XLA cannot re-fuse the transpose into any downstream tile
+         config.  The single standalone transpose HLO is trivially
+         handled by the autotuner.
+      2. Drop the separate ``ovvv_t1sym`` intermediate (saving a third
+         30 GB tensor) and split the ``2*native - swap`` pattern into
+         two explicit einsums at each use site.
+      3. Precompute ``tau_swap = transpose(tau, (0, 1, 3, 2))`` (≈5 GB,
+         also barrier-wrapped) so the contraction in ``tmp_a`` and
+         ``tmp_b`` is written as ``'...dc'`` on the RHS — matching the
+         ``(d, c)`` order on the LHS and removing the ordering mismatch
+         that was pushing XLA toward the failing transpose plan.
+
+    Memory budget inside this kernel at pCV5Z scale:
+    ``ovvv_blk (29 GB) + ovvv_swap (29 GB) + tau (5 GB) + tau_swap (5 GB)
+    + small = ~68 GB``, leaving comfortable headroom on a 80 GB H100 for
+    per-einsum GEMM scratch.
+
+    The output is numerically equivalent to v1/v2 up to floating-point
+    reassociation; see ``pytc/test/test_kernel_process_ovvv_block.py``
+    for the regression test.
+    """
+    # Pre-materialise the axis-1↔3 swap of ovvv_blk once, with a barrier
+    # to prevent XLA from re-fusing the transpose into downstream GEMMs.
+    ovvv_swap = jax.lax.optimization_barrier(
+        jnp.transpose(ovvv_blk, (0, 3, 2, 1))
+    )
+    # Pre-materialise tau with its last two axes swapped.  Writing the
+    # tmp_a / tmp_b contractions as ``'...dc'`` against this tensor
+    # gives XLA a GEMM plan whose natural layout does not require a
+    # reshape-after-transpose of the 30 GB ``ovvv_blk``.
+    tau_swap = jax.lax.optimization_barrier(
+        jnp.transpose(tau, (0, 1, 3, 2))
+    )
+
+    # 1. t1_upd (ia): 2*native - swap split into two einsums rather than
+    #    via a pre-computed ``ovvv_t1sym`` (which would cost a third 30
+    #    GB resident tensor).
+    t1_upd  = 2 * jnp.einsum('kdac,ikcd->ia',    ovvv_blk,  t2)
+    t1_upd -=     jnp.einsum('kdac,ikcd->ia',    ovvv_swap, t2)
+    t1_upd += 2 * jnp.einsum('kdac,kd,ic->ia',   ovvv_blk,  t1, t1)
+    t1_upd -=     jnp.einsum('kdac,kd,ic->ia',   ovvv_swap, t1, t1)
+
+    # 2. Lvv_blk (ac): same 2*native - swap split.
+    Lvv_blk  = 2 * jnp.einsum('kdac,kd->ac',     ovvv_blk,  t1)
+    Lvv_blk -=     jnp.einsum('kdac,kd->ac',     ovvv_swap, t1)
+
+    # 3. Wvoov_blk (akic): pure swap branch.
+    Wvoov_blk = jnp.einsum('kdac,id->akic',      ovvv_swap, t1)
+
+    # 4. Wvovo_blk (akci): native branch.
+    Wvovo_blk = jnp.einsum('kdac,id->akci',      ovvv_blk,  t1)
+
+    # 5. tmp_a_blk (kaij): rewritten against ``tau_swap`` so the RHS
+    #    contraction axes appear as ``'ijdc'`` — aligned with the LHS
+    #    ``'kdac'``.  Numerically identical to
+    #    ``einsum('kdac,ijcd->kaij', ovvv_blk, tau)`` because
+    #    ``tau_swap[i, j, d, c] == tau[i, j, c, d]``.
+    tmp_a_blk = jnp.einsum('kdac,ijdc->kaij',    ovvv_blk,  tau_swap)
+
+    # 6. tmp_b_blk (kbij): swap branch, same tau_swap rewrite.
+    tmp_b_blk = jnp.einsum('kdbc,ijdc->kbij',    ovvv_swap, tau_swap)
+
     return t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk
 
 @jax.jit
@@ -164,6 +234,31 @@ class RCCSD(xtc_ccsd.RCCSD):
         ovov_jax = jnp.asarray(eris.ovov)
         
         return np.array(_jax_energy(t1_jax, t2_jax, fock_jax, ovov_jax)).item()
+
+
+def _should_force_host_accumulators(eris, n_devices_local):
+    """Whether the OVVV/VOVV pipelines must use host-side accumulators.
+
+    GPU-resident accumulators are only viable when *all three* of the
+    following hold:
+
+      * exactly one local device (the round-robin pipeline accumulates
+        per-tile outputs into a single buffer; multiple devices require
+        a host-side buffer guarded by a lock);
+      * ``eris.ovvv`` is an in-RAM ``np.ndarray`` (the HDF5-streamed
+        path always accumulates on host inside ``consume_ovvv``);
+      * ``eris.vovv`` is an in-RAM ``np.ndarray`` (same reason for the
+        VOVV pipeline below).
+
+    This helper is the single source of truth for that decision so the
+    inline override in :func:`_update_amps` and the regression tests in
+    ``pytc/solver/test/test_jax_xtc_ccsd.py`` stay in sync.
+    """
+    return (
+        n_devices_local > 1
+        or not isinstance(eris.ovvv, np.ndarray)
+        or not isinstance(eris.vovv, np.ndarray)
+    )
 
 
 def _update_amps(cc, t1, t2, eris):
@@ -227,7 +322,26 @@ def _update_amps(cc, t1, t2, eris):
     use_gpu_acc_flag, _ = estimate_blksize(
         nocc, nvir, 'acc_decision', gpu_max_memory_mb=_gpu_max)
     use_gpu_acc = bool(use_gpu_acc_flag)
-        
+
+    # Force host accumulation whenever the OVVV/VOVV pipeline below cannot
+    # keep accumulators GPU-resident.  See ``_should_force_host_accumulators``
+    # for the exact predicate (multi-GPU OR HDF5-backed ovvv OR HDF5-backed
+    # vovv).  Previously the override only checked the multi-GPU case, so a
+    # single-GPU run with HDF5-backed ovvv (large systems where ovvv was
+    # spilled to disk regardless of device count) hit a misleading
+    # AssertionError further down complaining that the multi-GPU check
+    # "above" had failed to set use_gpu_acc=False.
+    _n_devices_local = len(xtc_ccsd._solver_local_devices())
+    if _should_force_host_accumulators(eris, _n_devices_local) and use_gpu_acc:
+        logger.debug(
+            "Forcing host-side accumulators for OVVV/VOVV "
+            "(n_devices=%d, ovvv_in_ram=%s, vovv_in_ram=%s)",
+            _n_devices_local,
+            isinstance(eris.ovvv, np.ndarray),
+            isinstance(eris.vovv, np.ndarray),
+        )
+        use_gpu_acc = False
+
     logger.debug(f"Accumulators need {total_acc_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
 
     # Initialize accumulators with non-ovvv terms
@@ -343,65 +457,210 @@ def _update_amps(cc, t1, t2, eris):
              tmp_a_acc += np.asarray(tmp_a_p)
              tmp_b_acc += np.asarray(tmp_b_p)
     else:
-        # Double-buffered: prefetch next block in background thread while GPU computes
+        # Multi-GPU OVVV block loop via _round_robin_pipeline.
+        # Each tile reads `ovvv[:, :, p0:p1, :]` from HDF5, runs the 6-output
+        # kernel on the chosen device, and accumulates the per-block outputs
+        # into host-side buffers under a lock.  Non-ovvv slices (t1new,
+        # Lvv_acc, Wvoov_acc, Wvovo_acc, tmp_a_acc, tmp_b_acc) are all
+        # non-overlapping across different p0 ranges, but we use a single
+        # lock for simplicity and future-proofing.
+        #
+        # HDF5 reads stay on the main dispatch thread (h5py isn't safe for
+        # concurrent reads) but are one-block-ahead prefetched via async_read
+        # so reads overlap GPU compute.
         from pytc.utils.prefetch import async_read, await_read
 
-        # Pre-load first block synchronously
-        p0 = 0
-        p1 = min(blksize, nvir)
-        ovvv_blk_jax = jnp.asarray(xtc_ccsd._get_slice(eris.ovvv, slice(p0, p1), axis=2))
-        next_future = None
-        
-        for p0 in range(0, nvir, blksize):
-            p1 = min(p0 + blksize, nvir)
-            # Current block is already on GPU (prefetched)
-            cur_blk_jax = ovvv_blk_jax
-            
-            t0_comp = time.perf_counter()
-            t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk = kernel_process_ovvv_block(
-                cur_blk_jax, t1_jax, t2_jax, tau_jax
+        if use_gpu_acc:
+            # Should be unreachable: the early ``_force_host_acc`` override
+            # forces ``use_gpu_acc = False`` whenever ``eris.ovvv`` is not
+            # an in-RAM ndarray (i.e. exactly when this branch runs).
+            raise AssertionError(
+                "use_gpu_acc must be False for the HDF5-backed OVVV pipeline "
+                "(in-RAM accumulators are not supported when streaming ovvv "
+                "tiles from disk); the early _force_host_acc override should "
+                "have set use_gpu_acc=False."
             )
-            
-            # Kick off HDF5 read for next block in background thread
-            # so I/O overlaps with the GPU kernel above.
-            next_p0 = p0 + blksize
-            if next_p0 < nvir:
-                next_p1 = min(next_p0 + blksize, nvir)
-                next_future = async_read(
-                    xtc_ccsd._get_slice, eris.ovvv, slice(next_p0, next_p1), 2)
-            
-            # Accumulate on Host
-            t1new_host[:, p0:p1] += np.asarray(t1_upd)
-            
-            if use_gpu_acc:
-                # In-place JAX accumulation
-                Lvv_acc = Lvv_acc.at[p0:p1, :].add(Lvv_blk)
-                Wvoov_acc = Wvoov_acc.at[p0:p1].add(Wvoov_blk)
-                Wvovo_acc = Wvovo_acc.at[p0:p1].add(Wvovo_blk)
-                tmp_a_acc = tmp_a_acc.at[:, p0:p1].add(tmp_a_blk)
-                tmp_b_acc = tmp_b_acc.at[:, p0:p1].add(tmp_b_blk)
-                
-            else:
-                # Ensure JAX arrays are ready
-                jax.block_until_ready([t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk])
-                t_comp_blk = time.perf_counter() - t0_comp
-                
-                t0_trans = time.perf_counter()
-                # Accumulate on Host
-                Lvv_acc[p0:p1, :] += np.asarray(Lvv_blk)
-                Wvoov_acc[p0:p1] += np.asarray(Wvoov_blk)
-                Wvovo_acc[p0:p1] += np.asarray(Wvovo_blk)
-                tmp_a_acc[:, p0:p1] += np.asarray(tmp_a_blk)
-                tmp_b_acc[:, p0:p1] += np.asarray(tmp_b_blk)
-                t_trans_blk = time.perf_counter() - t0_trans
-                logger.debug(f"OVVV block {p0}:{p1}: Comp {t_comp_blk:.4f}s, Host accum {t_trans_blk:.4f}s")
-            
-            # Await the background read and transfer to GPU for the next iteration
-            if next_future is not None and next_p0 < nvir:
-                ovvv_blk_jax = jnp.asarray(await_read(next_future))
-                next_future = None
 
-            del cur_blk_jax, t1_upd, Lvv_blk
+        ovvv_devices = xtc_ccsd._solver_local_devices()
+
+        # Cache t1, t2, tau on each device so kernel launches don't pay
+        # a host→device transfer for these shared inputs every tile.
+        ovvv_t1_by_dev  = xtc_ccsd.broadcast_to_devices(t1_jax,  ovvv_devices)
+        ovvv_t2_by_dev  = xtc_ccsd.broadcast_to_devices(t2_jax,  ovvv_devices)
+        ovvv_tau_by_dev = xtc_ccsd.broadcast_to_devices(tau_jax, ovvv_devices)
+
+        ovvv_tile_specs = [
+            (p0, min(p0 + blksize, nvir))
+            for p0 in range(0, nvir, blksize)
+        ]
+
+        # ``_round_robin_pipeline`` runs one issue thread per device.
+        # Each thread enters ``issue_ovvv`` concurrently for tiles
+        # assigned to its device, so the previous "single shared
+        # prefetch dict" pattern would race.  Instead, partition tiles
+        # up front and give each device its own prefetch chain — each
+        # issue thread only reads/writes its own state, no locks needed.
+        ovvv_tiles_by_dev = xtc_ccsd.partition_round_robin(
+            ovvv_tile_specs, ovvv_devices,
+        )
+        # Per-device 1-ahead HDF5 prefetch.  ``_specs`` is the device's
+        # private tile sub-list; ``_next_idx`` is the index within that
+        # sub-list (NOT within the global ``ovvv_tile_specs``).
+        _ovvv_prefetch_by_dev = {}
+        for _d in ovvv_devices:
+            _specs = ovvv_tiles_by_dev[_d]
+            _pf = {"specs": _specs, "future": None, "spec": None, "next_idx": 0}
+            if _specs:
+                _first = _specs[0]
+                _pf["future"] = async_read(
+                    xtc_ccsd._get_slice, eris.ovvv,
+                    slice(_first[0], _first[1]), 2,
+                )
+                _pf["spec"] = _first
+                _pf["next_idx"] = 1
+            _ovvv_prefetch_by_dev[_d] = _pf
+
+        ovvv_acc_lock = threading.Lock()
+
+        # Per-stage wall-time accumulator for the OVVV issue path.  The
+        # parent ``_round_robin_pipeline`` reports total ``issue_s`` but
+        # that is a single number — we need to decompose it to see which
+        # sub-step (HDF5 await, H→D copy, JAX kernel dispatch) is
+        # actually blocking the main thread each tile.  Two issue
+        # threads now write to it concurrently, so guard with a lock
+        # (held only briefly to apply per-tile deltas).
+        ovvv_issue_stats = {
+            "n_calls":        0,
+            "await_read_s":   0.0,
+            "prefetch_next_s": 0.0,
+            "device_put_s":   0.0,
+            "kernel_s":       0.0,
+            "total_s":        0.0,
+        }
+        ovvv_stats_lock = threading.Lock()
+
+        def issue_ovvv(spec, device):
+            p0, p1 = spec
+            _t_total0 = time.perf_counter()
+            pf = _ovvv_prefetch_by_dev[device]
+            # Pick up the HDF5 read queued by the previous call FOR THIS DEVICE.
+            assert pf['spec'] == spec, (
+                f"OVVV prefetch spec mismatch on device {getattr(device, 'id', 'host')}: "
+                f"expected {spec}, got {pf['spec']}"
+            )
+            _t_ar0 = time.perf_counter()
+            blk_np = await_read(pf['future'])
+            _t_ar1 = time.perf_counter()
+            # Kick off HDF5 read for the NEXT tile assigned to THIS device
+            # so I/O overlaps GPU work on the same device.
+            nidx = pf['next_idx']
+            if nidx < len(pf['specs']):
+                next_spec = pf['specs'][nidx]
+                pf['future'] = async_read(
+                    xtc_ccsd._get_slice, eris.ovvv,
+                    slice(next_spec[0], next_spec[1]), 2,
+                )
+                pf['spec'] = next_spec
+                pf['next_idx'] = nidx + 1
+            else:
+                pf['future'] = None
+                pf['spec'] = None
+            _t_pf1 = time.perf_counter()
+
+            dev_key = device if device is not None else None
+            device_ctx = (
+                jax.default_device(device)
+                if device is not None else contextlib.nullcontext()
+            )
+            with device_ctx:
+                _t_dp0 = time.perf_counter()
+                if device is not None:
+                    blk_dev = jax.device_put(blk_np, device)
+                else:
+                    blk_dev = jnp.asarray(blk_np)
+                _t_dp1 = time.perf_counter()
+                _t_k0 = time.perf_counter()
+                result = kernel_process_ovvv_block(
+                    blk_dev,
+                    ovvv_t1_by_dev[dev_key],
+                    ovvv_t2_by_dev[dev_key],
+                    ovvv_tau_by_dev[dev_key],
+                )
+                _t_k1 = time.perf_counter()
+            _t_total1 = time.perf_counter()
+
+            with ovvv_stats_lock:
+                ovvv_issue_stats["n_calls"]         += 1
+                ovvv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
+                ovvv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
+                ovvv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
+                ovvv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
+                ovvv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
+            return result
+
+        def consume_ovvv(spec, device, result, release_gpu_slot):
+            p0, p1 = spec
+            device_key = getattr(device, "id", "host")
+            t0_comp_blk = time.perf_counter()
+            t1_upd, Lvv_blk, Wvoov_blk, Wvovo_blk, tmp_a_blk, tmp_b_blk = result
+            # Batch GPU→CPU readbacks before releasing the GPU slot.
+            t1_upd_np = np.asarray(t1_upd)
+            Lvv_blk_np = np.asarray(Lvv_blk)
+            Wvoov_blk_np = np.asarray(Wvoov_blk)
+            Wvovo_blk_np = np.asarray(Wvovo_blk)
+            tmp_a_blk_np = np.asarray(tmp_a_blk)
+            tmp_b_blk_np = np.asarray(tmp_b_blk)
+            t1_readback = time.perf_counter()
+            release_gpu_slot()  # GPU pipeline is now free for the next tile
+            with ovvv_acc_lock:
+                t1new_host[:, p0:p1] += t1_upd_np
+                Lvv_acc[p0:p1, :] += Lvv_blk_np
+                Wvoov_acc[p0:p1] += Wvoov_blk_np
+                Wvovo_acc[p0:p1] += Wvovo_blk_np
+                tmp_a_acc[:, p0:p1] += tmp_a_blk_np
+                tmp_b_acc[:, p0:p1] += tmp_b_blk_np
+            logger.debug(
+                "OVVV block %d:%d on device %s: readback=%.4fs accum=%.4fs",
+                p0, p1, device_key,
+                t1_readback - t0_comp_blk,
+                time.perf_counter() - t1_readback,
+            )
+
+        xtc_ccsd._round_robin_pipeline(
+            ovvv_tile_specs, issue_ovvv, consume_ovvv, devices=ovvv_devices
+        )
+
+        # --- issue-stage decomposition summary -----------------------
+        # Answers the follow-on question the parent pipeline's
+        # ``issue=X.Xs`` line cannot: WHICH stage inside issue_ovvv is
+        # blocking the main dispatch thread.  Look at which fraction
+        # dominates ``total_s``:
+        #   * await_read  ≫ others → HDF5 prefetch isn't keeping up.
+        #   * device_put  ≫ others → H→D copy is sync (pinned memory /
+        #                             memory pressure on the target GPU).
+        #   * kernel      ≫ others → the JIT call is materialising
+        #                             instead of returning a future.
+        _n = ovvv_issue_stats["n_calls"]
+        if _n > 0:
+            _tot   = ovvv_issue_stats["total_s"]
+            _other = _tot - (ovvv_issue_stats["await_read_s"]
+                             + ovvv_issue_stats["prefetch_next_s"]
+                             + ovvv_issue_stats["device_put_s"]
+                             + ovvv_issue_stats["kernel_s"])
+            logger.info(
+                "[issue-ovvv] n_calls=%d  total=%.2fs  "
+                "await_read=%.2fs  prefetch_next=%.2fs  "
+                "device_put=%.2fs  kernel_dispatch=%.2fs  (other=%.2fs)",
+                _n, _tot,
+                ovvv_issue_stats["await_read_s"],
+                ovvv_issue_stats["prefetch_next_s"],
+                ovvv_issue_stats["device_put_s"],
+                ovvv_issue_stats["kernel_s"],
+                _other,
+            )
+
+        # Drop per-device caches now that the OVVV phase is complete.
+        del ovvv_t1_by_dev, ovvv_t2_by_dev, ovvv_tau_by_dev
     t_t2 = time.perf_counter()
             
     # --- T2 Updates ---
@@ -410,56 +669,179 @@ def _update_amps(cc, t1, t2, eris):
     if isinstance(eris.vovv, np.ndarray):
         vovv = jnp.asarray(eris.vovv)
         tmp2 = jnp.einsum('kibc,ka->abic', eris_oovv, -t1_jax)
-        tmp2 += vovv.transpose(0, 2, 1, 3) 
+        tmp2 += vovv.transpose(0, 2, 1, 3)
         tmp = jnp.einsum('abic,jc->ijab', tmp2, t1_jax)
         t2new_jax += (tmp + tmp.transpose(1, 0, 3, 2))
     else:
-        mem_host = cc.max_memory * 1e6
         blksize_t2, _ = estimate_blksize(
             nocc, nvir, 'vovv',
             gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
             host_max_memory_mb=getattr(cc, 'max_memory', None),
             include_accumulators=use_gpu_acc)
-        
-        # Double-buffered: prefetch next block in background thread
+
+        # Multi-GPU VOVV block loop via _round_robin_pipeline.
+        # Each tile reads a slab `vovv[p0:p1, :, :, :]` from HDF5, runs the
+        # kernel on the chosen device, and accumulates the (nocc, nocc, p_len,
+        # nvir) result into the non-overlapping slice `t2new_host[:, :, p0:p1, :]`.
+        # HDF5 reads stay on the main dispatch thread (h5py is not safe for
+        # concurrent reads) but are one-block-ahead prefetched via async_read
+        # so they overlap GPU compute.
         from pytc.utils.prefetch import async_read, await_read
 
-        # Pre-load first block synchronously
-        p0_first = 0
-        p1_first = min(blksize_t2, nvir)
-        vovv_slice_jax = jnp.asarray(xtc_ccsd._get_slice(eris.vovv, slice(p0_first, p1_first), axis=0))
-        next_future = None
-        
-        for p0 in range(0, nvir, blksize_t2):
-            p1 = min(p0 + blksize_t2, nvir)
-            cur_vovv_jax = vovv_slice_jax
-            t1_slice_jax = t1_jax[:, p0:p1]
-            
-            t0_comp = time.perf_counter()
-            term = kernel_process_vovv_block(cur_vovv_jax, eris_oovv, t1_slice_jax, t1_jax)
-            
-            # Kick off HDF5 read for next block in background thread
-            next_p0 = p0 + blksize_t2
-            if next_p0 < nvir:
-                next_p1 = min(next_p0 + blksize_t2, nvir)
-                next_future = async_read(
-                    xtc_ccsd._get_slice, eris.vovv, slice(next_p0, next_p1), 0)
-            
-            term.block_until_ready()
-            t_comp = time.perf_counter() - t0_comp
-            
+        vovv_devices = xtc_ccsd._solver_local_devices()
+
+        # Cache t1 and eris_oovv on each device so issue_tile does not
+        # pay a host→device transfer per tile.
+        vovv_t1_by_dev   = xtc_ccsd.broadcast_to_devices(t1_jax,   vovv_devices)
+        vovv_oovv_by_dev = xtc_ccsd.broadcast_to_devices(eris_oovv, vovv_devices)
+
+        vovv_tile_specs = [
+            (p0, min(p0 + blksize_t2, nvir))
+            for p0 in range(0, nvir, blksize_t2)
+        ]
+
+        # Per-device prefetch chain — see the parallel OVVV block above
+        # for why we partition the prefetch state per device rather than
+        # sharing a single dict across the parallel issue threads.
+        vovv_tiles_by_dev = xtc_ccsd.partition_round_robin(
+            vovv_tile_specs, vovv_devices,
+        )
+        _vovv_prefetch_by_dev = {}
+        for _d in vovv_devices:
+            _specs = vovv_tiles_by_dev[_d]
+            _pf = {"specs": _specs, "future": None, "spec": None, "next_idx": 0}
+            if _specs:
+                _first = _specs[0]
+                _pf["future"] = async_read(
+                    xtc_ccsd._get_slice, eris.vovv,
+                    slice(_first[0], _first[1]), 0,
+                )
+                _pf["spec"] = _first
+                _pf["next_idx"] = 1
+            _vovv_prefetch_by_dev[_d] = _pf
+
+        vovv_acc_lock = threading.Lock()
+
+        # Per-stage issue-time decomposition for VOVV, mirroring the
+        # one above for OVVV.  See the comment next to ``ovvv_issue_stats``
+        # for the intended diagnostic use.  Locked because two issue
+        # threads update concurrently.
+        vovv_issue_stats = {
+            "n_calls":         0,
+            "await_read_s":    0.0,
+            "prefetch_next_s": 0.0,
+            "device_put_s":    0.0,
+            "kernel_s":        0.0,
+            "total_s":         0.0,
+        }
+        vovv_stats_lock = threading.Lock()
+
+        def issue_vovv(spec, device):
+            p0, p1 = spec
+            _t_total0 = time.perf_counter()
+            pf = _vovv_prefetch_by_dev[device]
+            # Pick up the block whose HDF5 read was kicked off last call
+            # FOR THIS DEVICE.
+            assert pf['spec'] == spec, (
+                f"VOVV prefetch spec mismatch on device {getattr(device, 'id', 'host')}: "
+                f"expected {spec}, got {pf['spec']}"
+            )
+            _t_ar0 = time.perf_counter()
+            blk_np = await_read(pf['future'])
+            _t_ar1 = time.perf_counter()
+            # Kick off HDF5 read for THIS device's next tile.
+            nidx = pf['next_idx']
+            if nidx < len(pf['specs']):
+                next_spec = pf['specs'][nidx]
+                pf['future'] = async_read(
+                    xtc_ccsd._get_slice, eris.vovv,
+                    slice(next_spec[0], next_spec[1]), 0,
+                )
+                pf['spec'] = next_spec
+                pf['next_idx'] = nidx + 1
+            else:
+                pf['future'] = None
+                pf['spec'] = None
+            _t_pf1 = time.perf_counter()
+
+            dev_key = device if device is not None else None
+            device_ctx = (
+                jax.default_device(device)
+                if device is not None else contextlib.nullcontext()
+            )
+            with device_ctx:
+                _t_dp0 = time.perf_counter()
+                if device is not None:
+                    blk_dev = jax.device_put(blk_np, device)
+                else:
+                    blk_dev = jnp.asarray(blk_np)
+                _t_dp1 = time.perf_counter()
+                t1_dev = vovv_t1_by_dev[dev_key]
+                oovv_dev = vovv_oovv_by_dev[dev_key]
+                t1_slice_dev = t1_dev[:, p0:p1]
+                _t_k0 = time.perf_counter()
+                term = kernel_process_vovv_block(
+                    blk_dev, oovv_dev, t1_slice_dev, t1_dev
+                )
+                _t_k1 = time.perf_counter()
+            _t_total1 = time.perf_counter()
+
+            with vovv_stats_lock:
+                vovv_issue_stats["n_calls"]         += 1
+                vovv_issue_stats["await_read_s"]    += (_t_ar1  - _t_ar0)
+                vovv_issue_stats["prefetch_next_s"] += (_t_pf1  - _t_ar1)
+                vovv_issue_stats["device_put_s"]    += (_t_dp1  - _t_dp0)
+                vovv_issue_stats["kernel_s"]        += (_t_k1   - _t_k0)
+                vovv_issue_stats["total_s"]         += (_t_total1 - _t_total0)
+            return term
+
+        def consume_vovv(spec, device, term, release_gpu_slot):
+            # Capture the device tag up front; ``device`` itself is no
+            # longer needed once the kernel has produced ``term``.
+            # (A prior refactor accidentally introduced ``del device``
+            # while the format string below still referenced it, causing
+            # ``UnboundLocalError`` on every VOVV tile.)
+            device_key = getattr(device, "id", "host")
+            p0, p1 = spec
             t0_trans = time.perf_counter()
-            t2new_host[:, :, p0:p1, :] += np.asarray(term)
-            t_trans = time.perf_counter() - t0_trans
-            logger.debug(f"VOVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
+            term_host = np.asarray(term)  # GPU→CPU readback
+            release_gpu_slot()  # GPU pipeline is now free for the next tile
+            with vovv_acc_lock:
+                t2new_host[:, :, p0:p1, :] += term_host
+            logger.debug(
+                "VOVV block %d:%d on device %s accumulated in %.4fs",
+                p0, p1, device_key,
+                time.perf_counter() - t0_trans,
+            )
 
-            # Await background read and transfer for next iteration
-            if next_future is not None and next_p0 < nvir:
-                vovv_slice_jax = jnp.asarray(await_read(next_future))
-                next_future = None
+        xtc_ccsd._round_robin_pipeline(
+            vovv_tile_specs, issue_vovv, consume_vovv, devices=vovv_devices
+        )
 
-            del cur_vovv_jax
-        
+        # Issue-stage decomposition summary (see OVVV block above for
+        # the diagnostic interpretation).
+        _n = vovv_issue_stats["n_calls"]
+        if _n > 0:
+            _tot   = vovv_issue_stats["total_s"]
+            _other = _tot - (vovv_issue_stats["await_read_s"]
+                             + vovv_issue_stats["prefetch_next_s"]
+                             + vovv_issue_stats["device_put_s"]
+                             + vovv_issue_stats["kernel_s"])
+            logger.info(
+                "[issue-vovv] n_calls=%d  total=%.2fs  "
+                "await_read=%.2fs  prefetch_next=%.2fs  "
+                "device_put=%.2fs  kernel_dispatch=%.2fs  (other=%.2fs)",
+                _n, _tot,
+                vovv_issue_stats["await_read_s"],
+                vovv_issue_stats["prefetch_next_s"],
+                vovv_issue_stats["device_put_s"],
+                vovv_issue_stats["kernel_s"],
+                _other,
+            )
+
+        # Drop per-device caches as soon as the VOVV phase is done.
+        del vovv_t1_by_dev, vovv_oovv_by_dev
+
         t2new_host = t2new_host + t2new_host.transpose(1, 0, 3, 2)
         
     t2new_host += np.asarray(t2new_jax)
@@ -590,7 +972,23 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
 
             @jax.jit
             def contract_disk_kernel(t2, vvvv_block):
-                return jnp.einsum('acbd,ijcd->ijab', vvvv_block, t2)
+                # ``vvvv_block`` is laid out (a, c, b, d); the contraction
+                # axes (c, d) are at positions 1 and 3 (non-adjacent) on
+                # the LHS while tau/t2 has them at 2, 3 (adjacent).  XLA's
+                # natural GEMM plan for this mismatch wants to materialise
+                # a ~27 GB reshape-after-transpose of vvvv_block, which
+                # blows the BFC allocator at cc-pCV5Z scale.  We precompute
+                # ``t2_swap`` with the last two axes swapped (≈5 GB, one-
+                # shot, barrier-wrapped so XLA cannot re-fuse it) and
+                # rewrite the contraction as ``'acbd,ijdc->ijab'``, which
+                # aligns the RHS contraction axes with the LHS and lets
+                # XLA pick a plan that keeps vvvv_block in its original
+                # storage layout.  See the parallel rewrite in
+                # ``kernel_process_ovvv_block`` for the full argument.
+                t2_swap = jax.lax.optimization_barrier(
+                    jnp.transpose(t2, (0, 1, 3, 2))
+                )
+                return jnp.einsum('acbd,ijdc->ijab', vvvv_block, t2_swap)
 
             from pytc.utils.prefetch import async_read, await_read
             pending = None
@@ -641,87 +1039,252 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
 
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv_gpu',
+    p_blksize, r_blksize = resolve_vvvv_panel_block_sizes(
+        nocc, nvir,
+        p_block_size=getattr(cc, 'vvvv_p_block_size', None),
+        r_block_size=getattr(cc, 'vvvv_r_block_size', None),
         gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
         naux=_naux,
-        n_fused=_n_fused)
-    logger.debug(f"VVVV on-the-fly contraction: blksize={blksize}, n_blocks={(nvir+blksize-1)//blksize}")
-    
-    L_vv_full_jax = None
+        n_fused=_n_fused,
+        include_eris=True,
+        include_accumulators=False,
+    )
+    panel_size = p_blksize
+    logger.debug(
+        "VVVV on-the-fly contraction: p_blksize=%d, r_blksize=%d, n_p_blocks=%d, n_r_blocks=%d",
+        p_blksize, r_blksize,
+        (nvir + p_blksize - 1) // p_blksize,
+        (nvir + r_blksize - 1) // r_blksize,
+    )
+
+    L_vv_full_host = None
     if with_df is not None:
-         L_vv_full_jax = jnp.asarray(lib.unpack_tril(eris.vvL[:], axis=0))
+         L_vv_full_host = lib.unpack_tril(eris.vvL[:], axis=0)
+
+    # VVVV on-the-fly contraction tile kernels.
+    #
+    # The raw VVVV tile (from compute_2b_tile / the DF outer product)
+    # lives in layout ``(p=a, q=c, r=b, s=d)`` with the two virtual-
+    # contraction axes ``(c, d)`` at positions 1 and 3 — non-adjacent.
+    # Writing the einsum directly as ``'acbd,ijcd->ijab'`` would put
+    # XLA into the same failure mode as ``kernel_process_ovvv_block``:
+    # its natural GEMM plan materialises a reshape-after-transpose of
+    # the tile as scratch.  At pCV5Z-class tile sizes that scratch is
+    # big enough to blow the BFC allocator and blow the autotuner
+    # (``NOT_FOUND: No valid config found!``).
+    #
+    # The ``.transpose(0, 2, 1, 3)`` before the einsum pre-arranges the
+    # tile into ``(a, b, c, d)`` so the contraction axes ``(c, d)`` are
+    # adjacent and at the end on both operands — a clean GEMM pattern.
+    # However XLA's fusion passes can re-fold that transpose into the
+    # einsum's tile config, negating the benefit.  We wrap the
+    # pre-transpose in ``jax.lax.optimization_barrier`` to pin it as a
+    # standalone HLO, guaranteeing that the downstream einsum sees an
+    # already-permuted input and compiles to a straight GEMM — the same
+    # defensive pattern we apply to ``ovvv_swap`` / ``tau_swap`` in
+    # ``kernel_process_ovvv_block``.
+    @jax.jit
+    def contract_tc_tile_kernel(t2, xtc_tile):
+        xtc_tile_p = jax.lax.optimization_barrier(
+            xtc_tile.transpose(0, 2, 1, 3)
+        )
+        return jnp.einsum('abcd,ijcd->ijab', xtc_tile_p, t2)
 
     @jax.jit
-    def contract_block_kernel(t2, xtc_block, L_ab_sub, L_vv_full):
-        if L_ab_sub is not None:
-            vvvv_jax = xtc_block + jnp.tensordot(L_ab_sub, L_vv_full, axes=((2), (2)))
-        else:
-            vvvv_jax = xtc_block
-        return jnp.einsum('acbd,ijcd->ijab', vvvv_jax, t2)
+    def contract_df_tile_kernel(t2, xtc_tile, L_p_tile, L_r_tile):
+        std_tile = jnp.tensordot(L_p_tile, L_r_tile, axes=((2,), (2,)))
+        vvvv_tile = xtc_tile + std_tile
+        vvvv_tile_p = jax.lax.optimization_barrier(
+            vvvv_tile.transpose(0, 2, 1, 3)
+        )
+        return jnp.einsum('abcd,ijcd->ijab', vvvv_tile_p, t2)
 
-    # Prefetch: overlap get_2b(n+1) GPU compute with contract_block_kernel(n)
-    from pytc.utils.prefetch import async_read, await_read
+    devices      = xtc_ccsd._solver_local_devices()
+    t2_by_device = xtc_ccsd.broadcast_to_devices(t2_jax, devices)
 
-    pending_tc = None
-    pending_key = None
+    mo_v = None if with_df is not None else cc.mo_coeff[:, nocc:]
+    tile_specs = []
+    for p0 in range(0, nvir, p_blksize):
+        p1 = min(p0 + p_blksize, nvir)
+        for r0 in range(0, nvir, r_blksize):
+            r1 = min(r0 + r_blksize, nvir)
+            tile_specs.append((p0, p1, r0, r1))
 
-    for p0 in range(0, nvir, blksize):
-        p1 = min(p0 + blksize, nvir)
-        ranges = (slice(nocc + p0, nocc + p1), slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
-        
-        t_get_2b = time.perf_counter()
-        # Await prefetched result if available
-        if pending_tc is not None and pending_key == (p0, p1):
-            vvvv_block_jax = await_read(pending_tc)
-            pending_tc = None
-        else:
-            vvvv_block_jax = xtc_obj.get_2b(jastrow_params, ranges=ranges)
-            if hasattr(vvvv_block_jax, 'block_until_ready'):
-                vvvv_block_jax.block_until_ready()
-        logger.debug(f"get_2b (block {p0}:{p1}) took {time.perf_counter()-t_get_2b:.4f} s")
-        
-        L_ab_sub_jax = L_vv_full_jax[p0:p1] if with_df is not None else None
-        
-        if with_df is None:
-             t_ao2mo = time.perf_counter()
-             mo_v = cc.mo_coeff[:, nocc:]
-             std_block = ao2mo.general(cc.mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
-             logger.debug(f"ao2mo (std integrals) took {time.perf_counter()-t_ao2mo:.4f} s")
-             
-             t_transfer = time.perf_counter()
-             std_jax = jnp.asarray(std_block.reshape(p1-p0, nvir, nvir, nvir))
-             if hasattr(std_jax, 'block_until_ready'):
-                 std_jax.block_until_ready()
-             logger.debug(f"Host->Device transfer of std integrals took {time.perf_counter()-t_transfer:.4f} s")
-             
-             t_add = time.perf_counter()
-             vvvv_block_jax = vvvv_block_jax + std_jax
-             if hasattr(vvvv_block_jax, 'block_until_ready'):
-                 vvvv_block_jax.block_until_ready()
-             logger.debug(f"Element-wise addition (vvvv + std) took {time.perf_counter()-t_add:.4f} s")
-             
-        t0_comp = time.perf_counter()
-        term = contract_block_kernel(t2_jax, vvvv_block_jax, L_ab_sub_jax, L_vv_full_jax)
+    # Fine-grained per-stage timing.  Every line below is a wall-clock
+    # marker that can be cross-referenced against ``nvidia-smi dmon -s pu
+    # -d 1 -o DT`` (which writes ``YYYYMMDD HH:MM:SS`` per row, matching
+    # the Python logger's ``%(asctime)s``).  Use:
+    #
+    #   grep '\[VVVV-(issue|consume) d[01]\]' ben_*.out
+    #
+    # to extract just the markers, then overlay with the dmon log to see
+    # which sub-stage of which device's tile was running at every second.
+    # Each marker is tagged ``[VVVV-issue dN]`` or ``[VVVV-consume dN]``
+    # so the device producing it is unambiguous.
 
-        # While GPU runs contract_block_kernel, kick off NEXT block's get_2b
-        next_p0 = p0 + blksize
-        if next_p0 < nvir:
-            next_p1 = min(next_p0 + blksize, nvir)
-            next_ranges = (slice(nocc + next_p0, nocc + next_p1),
-                           slice(nocc, cc.nmo), slice(nocc, cc.nmo), slice(nocc, cc.nmo))
-            pending_tc = async_read(
-                lambda r=next_ranges: xtc_obj.get_2b(jastrow_params, ranges=r))
-            pending_key = (next_p0, next_p1)
+    def issue_tile(spec, device):
+        p0, p1, r0, r1 = spec
+        p_len = p1 - p0
+        r_len = r1 - r0
+        dev_id = getattr(device, "id", "host")
+        ranges = (
+            slice(nocc + p0, nocc + p1),
+            slice(nocc, cc.nmo),
+            slice(nocc + r0, nocc + r1),
+            slice(nocc, cc.nmo),
+        )
+        logger.debug(
+            "[VVVV-issue d%s] BEGIN tile p[%d:%d] r[%d:%d]",
+            dev_id, p0, p1, r0, r1,
+        )
+        t_xtc_0 = time.perf_counter()
+        vvvv_tile_jax = xtc_mod.compute_2b_tile(
+            xtc_obj, jastrow_params, ranges, device=device, panel_size=panel_size
+        )
+        t_xtc_1 = time.perf_counter()
+        logger.debug(
+            "[VVVV-issue d%s] xtc_2b_tile RETURN +%.4fs (returned future: %s)",
+            dev_id, t_xtc_1 - t_xtc_0,
+            "blocking-call" if (t_xtc_1 - t_xtc_0) > 0.5 else "async",
+        )
+        dev_key = device if device is not None else None
+        device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
+        with device_ctx:
+            if with_df is not None:
+                # Slice L_vv_full_host directly.  On full tiles (p_len ==
+                # panel_size) this is a zero-copy view; only the last tile
+                # needs padding.  Avoids per-tile np.zeros(panel_size, nvir,
+                # naux) allocations that dominated issue_tile overhead.
+                t_lpr_0 = time.perf_counter()
+                L_p_raw = L_vv_full_host[p0:p1]   # (p_len, nvir, naux)
+                L_r_raw = L_vv_full_host[r0:r1]   # (r_len, nvir, naux)
+                if p_len < panel_size:
+                    pad = np.zeros((panel_size - p_len, nvir, L_vv_full_host.shape[2]),
+                                   dtype=L_vv_full_host.dtype)
+                    L_p_raw = np.concatenate([L_p_raw, pad], axis=0)
+                if r_len < panel_size:
+                    pad = np.zeros((panel_size - r_len, nvir, L_vv_full_host.shape[2]),
+                                   dtype=L_vv_full_host.dtype)
+                    L_r_raw = np.concatenate([L_r_raw, pad], axis=0)
+                if device is not None:
+                    L_p_tile_jax = jax.device_put(L_p_raw, device)
+                    L_r_tile_jax = jax.device_put(L_r_raw, device)
+                else:
+                    L_p_tile_jax = jnp.asarray(L_p_raw)
+                    L_r_tile_jax = jnp.asarray(L_r_raw)
+                t_lpr_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] L_p/L_r device_put RETURN +%.4fs",
+                    dev_id, t_lpr_1 - t_lpr_0,
+                )
+                t_einsum_0 = time.perf_counter()
+                term = contract_df_tile_kernel(
+                    t2_by_device[dev_key], vvvv_tile_jax,
+                    L_p_tile_jax, L_r_tile_jax
+                )
+                t_einsum_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] contract_df_tile RETURN +%.4fs (returned future: %s)",
+                    dev_id, t_einsum_1 - t_einsum_0,
+                    "blocking-call" if (t_einsum_1 - t_einsum_0) > 0.5 else "async",
+                )
+            else:
+                t_std_0 = time.perf_counter()
+                std_tile = ao2mo.general(
+                    cc.mol,
+                    (mo_v[:, p0:p1], mo_v, mo_v[:, r0:r1], mo_v),
+                    compact=False,
+                )
+                std_tile_pad = np.zeros((panel_size, nvir, panel_size, nvir))
+                std_tile_pad[:p_len, :, :r_len, :] = std_tile.reshape(p_len, nvir, r_len, nvir)
+                if device is not None:
+                    std_tile_jax = jax.device_put(std_tile_pad, device)
+                else:
+                    std_tile_jax = jnp.asarray(std_tile_pad)
+                t_std_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] std_tile ao2mo+device_put RETURN +%.4fs",
+                    dev_id, t_std_1 - t_std_0,
+                )
+                t_einsum_0 = time.perf_counter()
+                term = contract_tc_tile_kernel(
+                    t2_by_device[dev_key], vvvv_tile_jax + std_tile_jax
+                )
+                t_einsum_1 = time.perf_counter()
+                logger.debug(
+                    "[VVVV-issue d%s] contract_tc_tile RETURN +%.4fs (returned future: %s)",
+                    dev_id, t_einsum_1 - t_einsum_0,
+                    "blocking-call" if (t_einsum_1 - t_einsum_0) > 0.5 else "async",
+                )
+        logger.debug(
+            "[VVVV-issue d%s] END tile p[%d:%d] r[%d:%d]",
+            dev_id, p0, p1, r0, r1,
+        )
+        # Keep the legacy summary log so existing log-grep tools still work.
+        logger.debug(
+            "get_2b (tile p[%d:%d] r[%d:%d] on device %s) issued in %.4f s",
+            p0, p1, r0, r1, dev_id, t_xtc_1 - t_xtc_0,
+        )
+        return term
 
-        term.block_until_ready()
-        t_comp = time.perf_counter() - t0_comp
-        
-        t0_trans = time.perf_counter()
-        t2new_host[:, :, p0:p1, :] += np.asarray(term)
-        t_trans = time.perf_counter() - t0_trans
-        logger.debug(f"VVVV block {p0}:{p1}: Comp {t_comp:.4f}s, Host accum {t_trans:.4f}s")
-    
-    if L_vv_full_jax is not None:
-        del L_vv_full_jax
+    def consume_tile(spec, device, term, release_gpu_slot):
+        p0, p1, r0, r1 = spec
+        p_len = p1 - p0
+        r_len = r1 - r0
+        dev_id = getattr(device, "id", "host")
+        logger.debug(
+            "[VVVV-consume d%s] BEGIN tile p[%d:%d] r[%d:%d] (waiting on np.asarray)",
+            dev_id, p0, p1, r0, r1,
+        )
+        t_asarray_0 = time.perf_counter()
+        # ``np.asarray(term)`` blocks until the GPU has finished every op
+        # that produced ``term``.  Wall time here = time waiting for the
+        # tile's K1 / K3 / ΔU / contract kernels on this device to drain
+        # PLUS the GPU→CPU DMA of the result.  This is the most direct
+        # measurement of how long this device's tile actually took on the
+        # silicon, independent of what ``issue_tile`` reported.
+        term_host = np.asarray(term)[:, :, :p_len, :r_len]
+        t_asarray_1 = time.perf_counter()
+        logger.debug(
+            "[VVVV-consume d%s] np.asarray RETURN +%.4fs (GPU done + DMA copied)",
+            dev_id, t_asarray_1 - t_asarray_0,
+        )
+        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
+        t_accum_0 = time.perf_counter()
+        t2new_host[:, :, p0:p1, r0:r1] += term_host
+        t_accum_1 = time.perf_counter()
+        logger.debug(
+            "[VVVV-consume d%s] host accum RETURN +%.4fs",
+            dev_id, t_accum_1 - t_accum_0,
+        )
+        logger.debug(
+            "[VVVV-consume d%s] END tile p[%d:%d] r[%d:%d] total=%.4fs",
+            dev_id, p0, p1, r0, r1, t_accum_1 - t_asarray_0,
+        )
+        # Keep the legacy summary log so existing log-grep tools still work.
+        logger.debug(
+            "VVVV tile p[%d:%d] r[%d:%d] on device %s accumulated in %.4fs",
+            p0, p1, r0, r1, dev_id, t_accum_1 - t_asarray_0,
+        )
+
+    # Tile-id round-robin across local devices.  We intentionally do NOT
+    # pass ``device_key=lambda spec: spec[0]`` (p-block locality) here:
+    # the Apr-7 ``_get_isdf_device_cache`` refactor made phi_isdf /
+    # grad_phi_isdf / K1 / K3 / D fully device-resident, so there is no
+    # longer any locality benefit from keeping r-tiles of a given p on
+    # one device.  With ``device_key`` on, ``_round_robin_pipeline``
+    # would assign the first-seen p-block to device 0, the second to
+    # device 1, etc.  At small ``p_blksize`` that is fine, but at the
+    # degenerate ``p_blksize=1`` the scheduler must drain all ``n_r``
+    # tiles of ``p=0`` before dispatching ``p=1`` to device 1, leaving
+    # every other device idle for roughly ``n_r * per_tile_gpu_time``
+    # (observed on QZ: device 0 finished 1306 tiles while device 1 had
+    # only started 64).  Default tile-id round-robin avoids that:
+    # ``(p=0,r=0)→d0, (p=0,r=1)→d1, (p=0,r=2)→d0, ...`` so every device
+    # gets work on tile 0/1 and the staggering is bounded by a single
+    # tile's latency.
+    xtc_ccsd._round_robin_pipeline(tile_specs, issue_tile, consume_tile,
+                                   devices=devices)
+
+    if L_vv_full_host is not None:
+        del L_vv_full_host

@@ -1,5 +1,8 @@
 """JAX implementation of Transcorrelated method."""
 
+import contextlib
+import threading
+import weakref
 from typing import Any
 import numpy as np
 import os
@@ -25,6 +28,172 @@ logger = logging.getLogger(__name__)
 # during CCSD iterations.  This eliminates JIT recompilation from
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
+
+# ----------------------------------------------------------------------
+# Per-(ISDFTC instance, device) cache of device-resident phi_isdf /
+# grad_phi_isdf / TC kernels / D so the per-tile dispatch path doesn't
+# re-upload them.
+#
+# The cache is process-wide (rather than per-instance) so that multiple
+# code paths sharing the same ISDFTC instance can both benefit from a
+# single upload.  Keys are ``(id(self), device_id)`` for fast lookup.
+#
+# Lifecycle (Codex P1 fix)
+# ------------------------
+# Without explicit cleanup the cache leaks both ways:
+#   1. Memory: an ISDFTC instance that is GC'd leaves its multi-GB
+#      device-resident phi/kernels / D entries permanently in the
+#      cache, so VRAM monotonically grows across runs in a long-lived
+#      process (notebook, REPL, sweep script).
+#   2. Correctness: ``id()`` is reused after object destruction, so a
+#      *new* ISDFTC that happens to receive a recycled id() would
+#      silently inherit the *old* instance's stale device buffers.
+#
+# Both are addressed by registering a ``weakref.finalize`` the first
+# time we cache anything for an instance: the finaliser drops every
+# ``(id(self), *)`` entry the moment ``self`` is GC'd, which both frees
+# VRAM and prevents id-reuse hits.  ``invalidate_isdf_device_cache``
+# remains available for callers that want explicit eviction without
+# relying on GC.
+# ----------------------------------------------------------------------
+_ISDF_DEVICE_CACHE: dict = {}
+_ISDF_DEVICE_CACHE_LOCK = threading.Lock()
+_ISDF_DEVICE_CACHE_FINALISED: set = set()  # ids we've already attached a finaliser to
+
+
+def _evict_isdf_device_cache_for_id(self_id):
+    """Drop all cache entries for an ISDFTC instance (called from GC)."""
+    with _ISDF_DEVICE_CACHE_LOCK:
+        keys_to_drop = [k for k in _ISDF_DEVICE_CACHE if k[0] == self_id]
+        for k in keys_to_drop:
+            _ISDF_DEVICE_CACHE.pop(k, None)
+        _ISDF_DEVICE_CACHE_FINALISED.discard(self_id)
+
+
+def invalidate_isdf_device_cache(instance=None):
+    """Manually evict ISDFTC device-cache entries.
+
+    Without arguments, clears the entire cache (every instance, every
+    device).  With an ISDFTC instance, evicts only that instance's
+    entries — useful for releasing a known-stale set of buffers ahead
+    of GC.
+
+    Equivalent to the automatic ``weakref.finalize`` path, but
+    available for callers that want explicit lifecycle control.
+    """
+    if instance is None:
+        with _ISDF_DEVICE_CACHE_LOCK:
+            _ISDF_DEVICE_CACHE.clear()
+            _ISDF_DEVICE_CACHE_FINALISED.clear()
+    else:
+        _evict_isdf_device_cache_for_id(id(instance))
+
+
+_TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device/layout
+
+
+def _array_nbytes(arr):
+    """Return the byte size of an array-like object without copying."""
+    shape = getattr(arr, "shape", None)
+    dtype = getattr(arr, "dtype", None)
+    if shape is None or dtype is None:
+        arr_np = np.asarray(arr)
+        return int(arr_np.size * arr_np.dtype.itemsize)
+    return int(np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize)
+
+
+def _get_local_device_free_bytes(device):
+    """Return free bytes for one local device when available."""
+    try:
+        stats = device.memory_stats()
+        pool_limit = int(stats["bytes_limit"])
+        in_use = int(stats.get("bytes_in_use", 0))
+        return max(pool_limit - in_use, 0)
+    except Exception:
+        return 1 << 60
+
+
+def _cache_d_on_device(device, arr, *, fraction=0.35):
+    """Whether a persistent device cache should keep ``arr`` resident."""
+    return _array_nbytes(arr) <= int(_get_local_device_free_bytes(device) * fraction)
+
+
+def _cache_tc_kernels_on_device(device, u1, u3, *, fraction=0.30):
+    """Whether persistent TC kernels should be cached on one device."""
+    total = _array_nbytes(u1) + _array_nbytes(u3)
+    return total <= int(_get_local_device_free_bytes(device) * fraction)
+
+
+def _pad_axis(arr, axis, target):
+    """Pad one axis of an array with zeros up to ``target``."""
+    cur = arr.shape[axis]
+    if cur == target:
+        return jnp.asarray(arr)
+    if cur > target:
+        raise ValueError(f"cannot pad axis-{axis} from {cur} down to {target}")
+    pad_cfg = [(0, 0)] * arr.ndim
+    pad_cfg[axis] = (0, target - cur)
+    return jnp.pad(jnp.asarray(arr), pad_cfg)
+
+
+def _normalize_panel_layout(panel_layout):
+    """Normalize the internal tiled-axis layout selector."""
+    layout = "pr" if panel_layout is None else str(panel_layout)
+    if layout not in ("pr", "qr", "ps"):
+        raise ValueError(f"unsupported panel_layout={layout!r}")
+    return layout
+
+
+def _transpose_panel_layout(panel_layout):
+    """Return the layout required for the transpose partner tile."""
+    layout = _normalize_panel_layout(panel_layout)
+    if layout == "qr":
+        return "ps"
+    if layout == "ps":
+        return "qr"
+    return layout
+
+
+def trim_panel(tc, panel_layout, actual_a, actual_b):
+    """Strip JIT padding from the two variable axes of a tile.
+
+    When ``panel_size`` is used to stabilise XLA shapes, the raw kernel
+    output may be larger than the true data on the padded axes.  This
+    function returns a sliced view with those axes trimmed back to their
+    actual extents.
+
+    Parameters
+    ----------
+    tc : array-like
+        Raw tile of shape ``(Np_pad, Nq_pad, Nr_pad, Ns_pad)`` — only the
+        axes listed in *panel_layout* may exceed the actual data.
+    panel_layout : str
+        Which pair of axes was JIT-padded:
+
+        * ``"pr"`` — axes 0 (p) and 2 (r)
+        * ``"qr"`` — axes 1 (q) and 2 (r)
+        * ``"ps"`` — axes 0 (p) and 3 (s)
+    actual_a : int
+        True extent of the *first* padded axis (p for ``"pr"``/``"ps"``,
+        q for ``"qr"``).
+    actual_b : int
+        True extent of the *second* padded axis (r for ``"pr"``/``"qr"``,
+        s for ``"ps"``).
+
+    Returns
+    -------
+    ndarray
+        View of *tc* with the padded axes sliced to *actual_a* and
+        *actual_b* respectively; all other axes are untouched.
+    """
+    layout = _normalize_panel_layout(panel_layout)
+    if layout == "pr":
+        return tc[:actual_a, :, :actual_b, :]
+    if layout == "qr":
+        return tc[:, :actual_a, :actual_b, :]
+    # layout == "ps"
+    return tc[:actual_a, :, :, :actual_b]
+
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for one device shard."""
@@ -527,6 +696,78 @@ class ISDFTC(TC):
             _FIXED_RBS_CACHE[key] = rbs
         return _FIXED_RBS_CACHE[key]
 
+    def _get_isdf_device_cache(self, kernels=None, device=None, *,
+                               include_grad=False,
+                               include_delta_u=False,
+                               include_tc=False):
+        """Return persistent ISDF operands resident on one device.
+
+        The first call for a given ``(self, device)`` materialises
+        ``phi_isdf`` (and optionally grad/TC/D) on ``device`` and stores
+        them in the process-wide ``_ISDF_DEVICE_CACHE``.  A
+        ``weakref.finalize`` is attached to ``self`` the first time we
+        cache anything for it, so the moment ``self`` is GC'd the
+        finaliser drops every ``(id(self), *)`` cache entry — releasing
+        the device-resident buffers and preventing a recycled ``id()``
+        from silently inheriting the old instance's cache.  See the
+        ``_ISDF_DEVICE_CACHE`` docstring at module top.
+        """
+        if device is None:
+            return None
+
+        self_id = id(self)
+        key = (self_id, getattr(device, "id", repr(device)))
+
+        with _ISDF_DEVICE_CACHE_LOCK:
+            cache = _ISDF_DEVICE_CACHE.get(key)
+            if cache is None:
+                cache = {
+                    "phi_isdf": jax.device_put(np.asarray(self.phi_isdf), device),
+                }
+                _ISDF_DEVICE_CACHE[key] = cache
+                # Register the finaliser exactly once per instance,
+                # not per (instance, device) pair.
+                if self_id not in _ISDF_DEVICE_CACHE_FINALISED:
+                    _ISDF_DEVICE_CACHE_FINALISED.add(self_id)
+                    weakref.finalize(
+                        self, _evict_isdf_device_cache_for_id, self_id,
+                    )
+
+        if include_grad and "grad_phi_isdf" not in cache:
+            cache["grad_phi_isdf"] = jax.device_put(np.asarray(self.grad_phi_isdf), device)
+
+        if include_tc and kernels is not None:
+            need_u1 = "K1_kernel" in kernels and "K1_kernel" not in cache
+            need_u3 = "K3_kernel" in kernels and "K3_kernel" not in cache
+            if need_u1 or need_u3:
+                if _cache_tc_kernels_on_device(
+                    device, kernels["K1_kernel"], kernels["K3_kernel"]
+                ):
+                    logger.debug(
+                        "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB)",
+                        getattr(device, "id", "host"),
+                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                    )
+                    cache["K1_kernel"] = jax.device_put(np.asarray(kernels["K1_kernel"]), device)
+                    cache["K3_kernel"] = jax.device_put(np.asarray(kernels["K3_kernel"]), device)
+                else:
+                    cache["K1_kernel"] = None
+                    cache["K3_kernel"] = None
+
+        if include_delta_u and kernels is not None and "D" in kernels and "D" not in cache:
+            if _cache_d_on_device(device, kernels["D"]):
+                logger.debug(
+                    "Caching Delta U D kernel on device %s (%.2f GiB)",
+                    getattr(device, "id", "host"),
+                    _array_nbytes(kernels["D"]) / (1024.0 ** 3),
+                )
+                cache["D"] = jax.device_put(np.asarray(kernels["D"]), device)
+            else:
+                cache["D"] = None
+
+        return cache
+
     @classmethod
     def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
         """Initialize ISDFTC object from TC object.
@@ -966,7 +1207,7 @@ class ISDFTC(TC):
         return self.replace(isdf_kernels=kernels, save_path=out_path)
 
     def _accumulate_transpose_block(self, result_np, U1, U3, ranges_T,
-                                    scale, n_sub=2):
+                                    scale, n_sub=2, device=None):
         """Compute transpose block in sub-chunks on GPU, accumulate on host.
 
         Each sub-chunk is computed on GPU, transferred to host via np.asarray(),
@@ -994,31 +1235,242 @@ class ISDFTC(TC):
 
         # Determine chunk boundaries
         chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
+        cache_getter = getattr(self, "_get_isdf_device_cache", None)
+        cache = (
+            cache_getter(device=device, include_grad=True)
+            if callable(cache_getter) else None
+        )
+        phi_full = cache["phi_isdf"] if cache is not None else self.phi_isdf
+        grad_full = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
+        u1 = jax.device_put(U1, device) if device is not None else U1
+        u3 = jax.device_put(U3, device) if device is not None else U3
+        device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
         for i0 in range(0, r_len, chunk_size):
             i1 = min(i0 + chunk_size, r_len)
             sub_slice_r = slice(r_start + i0, r_start + i1)
             sub_ranges = (sub_slice_r, slice_s_T, slice_p_T, slice_q_T)
 
             # K1-K2 sub-chunk on GPU
-            if sub_slice_r == slice_s_T:
-                tmp = kmat_jax.contract_K1_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges,
-                    rank_block_size=rbs)
-                tmp = tmp - tmp.transpose(1, 0, 2, 3)
-            else:
-                tmp = kmat_jax.contract_K1_minus_K2_isdf(
-                    self.phi_isdf, self.grad_phi_isdf, U1, sub_ranges,
-                    rank_block_size=rbs)
+            with device_ctx:
+                if sub_slice_r == slice_s_T:
+                    tmp = kmat_jax.contract_K1_isdf(
+                        phi_full, grad_full, u1, sub_ranges, rank_block_size=rbs)
+                    tmp = tmp - tmp.transpose(1, 0, 2, 3)
+                else:
+                    tmp = kmat_jax.contract_K1_minus_K2_isdf(
+                        phi_full, grad_full, u1, sub_ranges, rank_block_size=rbs)
 
-            # K3 sub-chunk on GPU
-            tmp = tmp + kmat_jax.contract_K3_isdf(
-                self.phi_isdf, U3, sub_ranges, rank_block_size=rbs)
+                # K3 sub-chunk on GPU
+                tmp = tmp + kmat_jax.contract_K3_isdf(
+                    phi_full, u3, sub_ranges, rank_block_size=rbs)
 
             # Transfer to host and accumulate — frees GPU memory for next chunk
             chunk_np = np.asarray(tmp.transpose(2, 3, 0, 1))
             del tmp
             result_np[:, :, i0:i1, :] += chunk_np * scale
             del chunk_np
+
+    def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None,
+                            panel_layout="pr"):
+        """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
+        global _TC_DIRECT_TILE_PROFILED
+        _device_key = getattr(device, "id", "host")
+        panel_layout = _normalize_panel_layout(panel_layout)
+        _profile_key = (_device_key, panel_layout)
+        _profile = panel_size is not None and _profile_key not in _TC_DIRECT_TILE_PROFILED
+        if _profile:
+            _TC_DIRECT_TILE_PROFILED.add(_profile_key)
+            _t0 = time.perf_counter()
+
+        U1 = kernels['K1_kernel']
+        U3 = kernels['K3_kernel']
+        slice_p, slice_q, slice_r, slice_s = ranges
+
+        rbs = self._get_fixed_rank_block_size()
+        cache_getter = getattr(self, "_get_isdf_device_cache", None)
+        cache = (
+            cache_getter(kernels, device=device, include_grad=True, include_tc=True)
+            if callable(cache_getter) else None
+        )
+        u1 = cache.get("K1_kernel") if cache is not None else None
+        u3 = cache.get("K3_kernel") if cache is not None else None
+        if u1 is None:
+            u1 = jax.device_put(U1, device) if device is not None else U1
+        if u3 is None:
+            u3 = jax.device_put(U3, device) if device is not None else U3
+
+        if _profile:
+            jax.block_until_ready((u1, u3))
+            _t_put = time.perf_counter()
+            logger.debug(
+                "_get_tc_direct_tile first-tile profile: K1+K3 device_put %.3fs "
+                "(K1=%.1fMB, K3=%.1fMB, device=%s)",
+                _t_put - _t0,
+                getattr(U1, 'nbytes', 0) / 1e6,
+                getattr(U3, 'nbytes', 0) / 1e6,
+                _device_key,
+            )
+
+        device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
+
+        phi_src = cache["phi_isdf"] if cache is not None else self.phi_isdf
+        grad_src = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
+
+        phi_p = phi_src[slice_p]
+        phi_q = phi_src[slice_q]
+        phi_r = phi_src[slice_r]
+        phi_s = phi_src[slice_s]
+        grad_phi_p = grad_src[slice_p]
+        grad_phi_q = grad_src[slice_q]
+
+        if panel_size is not None:
+            if "p" in panel_layout:
+                phi_p = _pad_axis(phi_p, 0, panel_size)
+                grad_phi_p = _pad_axis(grad_phi_p, 0, panel_size)
+            else:
+                phi_p = jnp.asarray(phi_p)
+                grad_phi_p = jnp.asarray(grad_phi_p)
+            if "q" in panel_layout:
+                phi_q = _pad_axis(phi_q, 0, panel_size)
+                grad_phi_q = _pad_axis(grad_phi_q, 0, panel_size)
+            else:
+                phi_q = jnp.asarray(phi_q)
+                grad_phi_q = jnp.asarray(grad_phi_q)
+            if "r" in panel_layout:
+                phi_r = _pad_axis(phi_r, 0, panel_size)
+            else:
+                phi_r = jnp.asarray(phi_r)
+            if "s" in panel_layout:
+                phi_s = _pad_axis(phi_s, 0, panel_size)
+            else:
+                phi_s = jnp.asarray(phi_s)
+        else:
+            phi_p = jnp.asarray(phi_p)
+            phi_q = jnp.asarray(phi_q)
+            phi_r = jnp.asarray(phi_r)
+            phi_s = jnp.asarray(phi_s)
+            grad_phi_p = jnp.asarray(grad_phi_p)
+            grad_phi_q = jnp.asarray(grad_phi_q)
+        if device is not None and cache is None:
+            phi_p = jax.device_put(phi_p, device)
+            phi_q = jax.device_put(phi_q, device)
+            phi_r = jax.device_put(phi_r, device)
+            phi_s = jax.device_put(phi_s, device)
+            grad_phi_p = jax.device_put(grad_phi_p, device)
+            grad_phi_q = jax.device_put(grad_phi_q, device)
+
+        # Caller-expected p/q extents (before any symmetrization re-padding).
+        p_len_out = phi_p.shape[0]
+        q_len_out = phi_q.shape[0]
+
+        with device_ctx:
+            if slice_p == slice_q:
+                # The antisymmetrization ``k12 - k12.T(1,0,2,3)`` requires
+                # ``phi_p.shape[0] == phi_q.shape[0]``.  Panel padding can
+                # violate that when ``nocc < panel_blk`` and the layout
+                # pads only one of p/q (e.g. "pr" for oovv): phi_p → panel_size,
+                # phi_q stays at nocc.  Match the shorter side to the longer
+                # before the contract; we slice axes 0/1 back to ``p_len_out``
+                # / ``q_len_out`` after combining with K3 so the returned tile
+                # still follows the panel_layout convention.
+                match_len = max(phi_p.shape[0], phi_q.shape[0])
+                if phi_p.shape[0] < match_len:
+                    phi_p      = _pad_axis(phi_p, 0, match_len)
+                    grad_phi_p = _pad_axis(grad_phi_p, 0, match_len)
+                if phi_q.shape[0] < match_len:
+                    phi_q      = _pad_axis(phi_q, 0, match_len)
+                k12 = kmat_jax.contract_K1_isdf_jit(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, u1, rbs)
+                k12 = k12 - k12.transpose(1, 0, 2, 3)
+            else:
+                k12 = kmat_jax.contract_K1_minus_K2_isdf_jit(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs)
+
+            if panel_size is not None:
+                if _profile:
+                    jax.block_until_ready(k12)
+                    _t_k1 = time.perf_counter()
+                    logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
+                                 _t_k1 - _t_put)
+                k3 = kmat_jax.contract_K3_isdf_jit(
+                    phi_p, phi_q, phi_r, phi_s, u3, rbs)
+                if _profile:
+                    jax.block_until_ready(k3)
+                    _t_k3 = time.perf_counter()
+                    logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
+                                 "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
+                result = 0.5 * (k12 + k3)
+                # If the slice_p==slice_q branch re-padded phi_p/phi_q to
+                # equalise them, slice axes 0/1 back to the caller-expected
+                # extents so the tile matches the panel_layout convention.
+                if result.shape[0] != p_len_out:
+                    result = result[:p_len_out, :, :, :]
+                if result.shape[1] != q_len_out:
+                    result = result[:, :q_len_out, :, :]
+                return result
+
+            result_np = np.array(k12)
+            del k12
+            k3 = kmat_jax.contract_K3_isdf_jit(
+                phi_p, phi_q, phi_r, phi_s, u3, rbs)
+            result_np += np.asarray(k3)
+            del k3
+            result_np *= 0.5
+            # Match caller-expected shape when symmetrization re-padding
+            # widened axes 0/1 beyond the original slice extents.
+            if result_np.shape[0] != p_len_out or result_np.shape[1] != q_len_out:
+                result_np = result_np[:p_len_out, :q_len_out, :, :]
+            return jnp.asarray(result_np)
+
+    def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None,
+                          panel_layout="pr"):
+        """Assemble and symmetrize one finished TC tile."""
+        panel_layout = _normalize_panel_layout(panel_layout)
+        direct = self._get_tc_direct_tile(
+            kernels, ranges, device=device, panel_size=panel_size,
+            panel_layout=panel_layout)
+
+        if panel_size is not None:
+            slice_p, slice_q, slice_r, slice_s = ranges
+            # The ``direct + direct.transpose(2, 3, 0, 1)`` shortcut fuses
+            # the (p↔r, q↔s) symmetrisation into a single tile compute.
+            # It is only valid when the shape of ``direct`` is invariant
+            # under that axis swap — i.e. when the panel-padded axis set
+            # is itself symmetric under (0↔2, 1↔3).  Of the three
+            # panel_layouts only ``"pr"`` satisfies this (pads axes 0 and
+            # 2 identically, leaves 1 and 3 untouched).  ``"qr"`` pads
+            # axis 2 but not 0, and ``"ps"`` pads axis 0 but not 2 —
+            # so ``direct.transpose(2, 3, 0, 1)`` comes out with a
+            # different shape from ``direct`` and the broadcast add
+            # crashes (e.g. ``(nocc, ps, ps, nvir) + (ps, nvir, nocc, ps)``
+            # on an ovov single-tile).  For the asymmetric layouts we
+            # fall through to the explicit-``tmp`` branch, which uses
+            # ``_transpose_panel_layout()`` to produce a partner tile
+            # whose shape matches ``direct`` after the (2, 3, 0, 1)
+            # transpose.
+            if (slice_p == slice_r and slice_q == slice_s
+                    and panel_layout == "pr"):
+                return -(direct + direct.transpose(2, 3, 0, 1))
+
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            tmp = self._get_tc_direct_tile(
+                kernels, ranges_T, device=device, panel_size=panel_size,
+                panel_layout=_transpose_panel_layout(panel_layout))
+            return -(direct + tmp.transpose(2, 3, 0, 1))
+
+        result_np = np.array(direct)
+        del direct
+
+        slice_p, slice_q, slice_r, slice_s = ranges
+        if slice_p == slice_r and slice_q == slice_s:
+            result_np += result_np.transpose(2, 3, 0, 1)
+        else:
+            ranges_T = (slice_r, slice_s, slice_p, slice_q)
+            self._accumulate_transpose_block(
+                result_np, kernels['K1_kernel'], kernels['K3_kernel'],
+                ranges_T, scale=0.5, n_sub=2, device=device)
+
+        return jnp.asarray(-result_np)
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support.
@@ -1032,57 +1484,25 @@ class ISDFTC(TC):
         logger.debug("Starting ISDFTC.get_2b")
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
-            
+        # Full-tensor fallback: when no block/ranges requested, build the
+        # entire (n_orb, n_orb, n_orb, n_orb) TC correction.  Prior to the
+        # ec4a6ea refactor this was handled inline; the extraction of
+        # ``_assemble_tc_tile`` dropped the fallback, so without it callers
+        # like ``get_2b_fock(T=None)`` crash on ``ranges=None``.
+        if ranges is None:
+            full = slice(None)
+            ranges = (full, full, full, full)
+
         # Check if kernels are available, if not compute them
         if self.isdf_kernels is None:
             kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
         else:
             kernels = self.isdf_kernels
-            
-        U1 = kernels['K1_kernel']
-        U3 = kernels['K3_kernel']
-        
-        slice_p, slice_q, slice_r, slice_s = ranges if ranges else (slice(None), slice(None), slice(None), slice(None))
 
-        # Use a fixed rank_block_size for all kmat calls to avoid
-        # JIT recompilation when (Np, Nq) changes across CCSD phases.
-        rbs = self._get_fixed_rank_block_size()
-        
-        # --- Direct block: (K1 - K2 + K3)[pqrs] * 0.5 ---
-        # Compute K1-K2, transfer to host, then K3, transfer to host.
-        # Never hold two output-sized tensors on GPU simultaneously.
-        if slice_p == slice_q:
-            k12 = kmat_jax.contract_K1_isdf(
-                self.phi_isdf, self.grad_phi_isdf, U1, ranges,
-                rank_block_size=rbs)
-            k12 = k12 - k12.transpose(1, 0, 2, 3)
-        else:
-            k12 = kmat_jax.contract_K1_minus_K2_isdf(
-                self.phi_isdf, self.grad_phi_isdf, U1, ranges,
-                rank_block_size=rbs)
-        
-        result_np = np.array(k12)  # writable host copy
-        del k12
-
-        k3 = kmat_jax.contract_K3_isdf(
-            self.phi_isdf, U3, ranges, rank_block_size=rbs)
-        result_np += np.asarray(k3)
-        del k3
-        result_np *= 0.5
-        
-        # --- Transpose block: (K1 - K2 + K3)[rspq] * 0.5, transposed to (pqrs) ---
-        if slice_p == slice_r and slice_q == slice_s:
-            result_np += result_np.transpose(2, 3, 0, 1)
-        else:
-            ranges_T = (slice_r, slice_s, slice_p, slice_q)
-            # Sub-chunk the transpose block on GPU, accumulate on host.
-            # GPU only holds one sub-chunk at a time.
-            self._accumulate_transpose_block(
-                result_np, U1, U3, ranges_T, scale=0.5, n_sub=2)
-        
+        result = self._assemble_tc_tile(kernels, ranges)
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
-        return jnp.asarray(-result_np)
+        return result
 
     def get_3b_fock(self, jastrow_params, dm1, L_aux=None):
         """Get 3-body Fock matrix correction using ISDF.
