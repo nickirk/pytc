@@ -721,7 +721,7 @@ class ISDFXTC(XTC, ISDFTC):
     @classmethod
     def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
         """Initialize ISDFXTC object from XTC object.
-        
+
         Args:
             xtc_obj: XTC object
             n_rank: Number of ISDF ranks
@@ -730,17 +730,42 @@ class ISDFXTC(XTC, ISDFTC):
             ls_grid_batch_size: Batch size for grid evaluation in linear solver in ISDF decomposition (default: 16384)
         """
         from . import df
-        
+        from .utils import cache_state
+
         if n_rank is None:
             n_rank = xtc_obj.grid_points.shape[0] // 4
-            
+
+        # Warn early if the caller built xtc_obj from a fresh mf whose mo_coeff
+        # has a different gauge than the cache.  Mixing a fresh-SCF mo_coeff
+        # with cached xi_phi / phi_isdf silently corrupts transcorrelated
+        # integrals (SCF gauge non-determinism; see pytc.utils.cache_state).
+        if save_path is not None and cache_state.cache_has_mf_state(save_path):
+            cache_state.check_mo_coeff_matches_cache(xtc_obj.mo_coeff, save_path)
+
         # Perform ISDF decomposition
         logger.info("ISDFXTC.from_xtc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
             is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
         )
-        
+
+        # On the first compute (cache didn't already have mf state), persist
+        # xtc_obj's mo_coeff / mo_occ so subsequent runs that reuse this cache
+        # can lock the orbital gauge via
+        # ``pytc.utils.cache_state.sync_mf_from_cache(mf, save_path)``.
+        if actual_save_path is not None and not cache_state.cache_has_mf_state(actual_save_path):
+            try:
+                cache_state.save_orbital_state_to_cache(
+                    actual_save_path,
+                    mo_coeff=xtc_obj.mo_coeff,
+                    mo_occ=xtc_obj.mo_occ,
+                )
+            except Exception as exc:  # pragma: no cover — non-fatal diagnostic
+                logger.warning(
+                    "Could not persist orbital state to %s: %r",
+                    actual_save_path, exc,
+                )
+
         return cls(
             grid_points=xtc_obj.grid_points,
             weights=xtc_obj.weights,
