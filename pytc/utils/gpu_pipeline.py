@@ -495,24 +495,60 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
             and submitting the resulting handle to the consume pool."""
             local = {"host_wait_s": 0.0, "gpu_wait_s": 0.0,
                      "issue_s": 0.0, "n_tiles": 0}
-            for spec in my_specs:
-                t_a = time.perf_counter()
-                host_sem.acquire()
-                t_b = time.perf_counter()
-                gpu_sem.acquire()
-                t_c = time.perf_counter()
-                handle = issue_tile(spec, device)
-                t_d = time.perf_counter()
-                local["host_wait_s"] += (t_b - t_a)
-                local["gpu_wait_s"]  += (t_c - t_b)
-                local["issue_s"]     += (t_d - t_c)
-                local["n_tiles"]     += 1
-                fut = consume_pool.submit(_run_consume, spec, device, handle)
-                with consume_futures_lock:
-                    consume_futures.append(fut)
-            with stats_lock:
-                for k, v in local.items():
-                    stats[k] += v
+            try:
+                for spec in my_specs:
+                    # Acquire-then-issue is the hot path.  We must
+                    # guarantee that the semaphores get released even
+                    # if ``issue_tile`` raises (e.g. an XLA OOM /
+                    # autotuner failure inside ``compute_2b_tile``);
+                    # otherwise the leaked counts permanently shrink
+                    # the in-flight budget and the other issue threads
+                    # — plus this ``ThreadPoolExecutor.__exit__``
+                    # waiting on consume futures — can deadlock.
+                    #
+                    # We hand ownership of both semaphore tokens off
+                    # to ``_run_consume`` (via ``consume_pool.submit``)
+                    # only after the submit succeeds.  Until then, this
+                    # worker still owns them and is responsible for
+                    # releasing on any failure path.
+                    host_acquired = False
+                    gpu_acquired = False
+                    submitted = False
+                    t_a = time.perf_counter()
+                    try:
+                        host_sem.acquire()
+                        host_acquired = True
+                        t_b = time.perf_counter()
+                        gpu_sem.acquire()
+                        gpu_acquired = True
+                        t_c = time.perf_counter()
+                        handle = issue_tile(spec, device)
+                        t_d = time.perf_counter()
+                        local["host_wait_s"] += (t_b - t_a)
+                        local["gpu_wait_s"]  += (t_c - t_b)
+                        local["issue_s"]     += (t_d - t_c)
+                        local["n_tiles"]     += 1
+                        fut = consume_pool.submit(
+                            _run_consume, spec, device, handle,
+                        )
+                        submitted = True
+                        with consume_futures_lock:
+                            consume_futures.append(fut)
+                    finally:
+                        if not submitted:
+                            # The tile never reached the consume pool,
+                            # so neither semaphore will be released
+                            # there — release them here.  Order
+                            # mirrors release order in ``_run_consume``
+                            # (gpu first, then host).
+                            if gpu_acquired:
+                                gpu_sem.release()
+                            if host_acquired:
+                                host_sem.release()
+            finally:
+                with stats_lock:
+                    for k, v in local.items():
+                        stats[k] += v
 
         # Launch one issue thread per device.  Skip devices with no work
         # (e.g. n_tiles < n_devices).

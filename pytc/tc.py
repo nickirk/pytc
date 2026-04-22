@@ -1,6 +1,8 @@
 """JAX implementation of Transcorrelated method."""
 
 import contextlib
+import threading
+import weakref
 from typing import Any
 import numpy as np
 import os
@@ -26,7 +28,67 @@ logger = logging.getLogger(__name__)
 # during CCSD iterations.  This eliminates JIT recompilation from
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
+
+# ----------------------------------------------------------------------
+# Per-(ISDFTC instance, device) cache of device-resident phi_isdf /
+# grad_phi_isdf / TC kernels / D so the per-tile dispatch path doesn't
+# re-upload them.
+#
+# The cache is process-wide (rather than per-instance) so that multiple
+# code paths sharing the same ISDFTC instance can both benefit from a
+# single upload.  Keys are ``(id(self), device_id)`` for fast lookup.
+#
+# Lifecycle (Codex P1 fix)
+# ------------------------
+# Without explicit cleanup the cache leaks both ways:
+#   1. Memory: an ISDFTC instance that is GC'd leaves its multi-GB
+#      device-resident phi/kernels / D entries permanently in the
+#      cache, so VRAM monotonically grows across runs in a long-lived
+#      process (notebook, REPL, sweep script).
+#   2. Correctness: ``id()`` is reused after object destruction, so a
+#      *new* ISDFTC that happens to receive a recycled id() would
+#      silently inherit the *old* instance's stale device buffers.
+#
+# Both are addressed by registering a ``weakref.finalize`` the first
+# time we cache anything for an instance: the finaliser drops every
+# ``(id(self), *)`` entry the moment ``self`` is GC'd, which both frees
+# VRAM and prevents id-reuse hits.  ``invalidate_isdf_device_cache``
+# remains available for callers that want explicit eviction without
+# relying on GC.
+# ----------------------------------------------------------------------
 _ISDF_DEVICE_CACHE: dict = {}
+_ISDF_DEVICE_CACHE_LOCK = threading.Lock()
+_ISDF_DEVICE_CACHE_FINALISED: set = set()  # ids we've already attached a finaliser to
+
+
+def _evict_isdf_device_cache_for_id(self_id):
+    """Drop all cache entries for an ISDFTC instance (called from GC)."""
+    with _ISDF_DEVICE_CACHE_LOCK:
+        keys_to_drop = [k for k in _ISDF_DEVICE_CACHE if k[0] == self_id]
+        for k in keys_to_drop:
+            _ISDF_DEVICE_CACHE.pop(k, None)
+        _ISDF_DEVICE_CACHE_FINALISED.discard(self_id)
+
+
+def invalidate_isdf_device_cache(instance=None):
+    """Manually evict ISDFTC device-cache entries.
+
+    Without arguments, clears the entire cache (every instance, every
+    device).  With an ISDFTC instance, evicts only that instance's
+    entries — useful for releasing a known-stale set of buffers ahead
+    of GC.
+
+    Equivalent to the automatic ``weakref.finalize`` path, but
+    available for callers that want explicit lifecycle control.
+    """
+    if instance is None:
+        with _ISDF_DEVICE_CACHE_LOCK:
+            _ISDF_DEVICE_CACHE.clear()
+            _ISDF_DEVICE_CACHE_FINALISED.clear()
+    else:
+        _evict_isdf_device_cache_for_id(id(instance))
+
+
 _TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device/layout
 
 
@@ -60,17 +122,6 @@ def _cache_tc_kernels_on_device(device, u1, u3, *, fraction=0.30):
     """Whether persistent TC kernels should be cached on one device."""
     total = _array_nbytes(u1) + _array_nbytes(u3)
     return total <= int(_get_local_device_free_bytes(device) * fraction)
-
-
-def _pad_leading_axis(arr, target):
-    """Pad the leading axis of an array with zeros up to ``target``."""
-    cur = arr.shape[0]
-    if cur == target:
-        return arr
-    if cur > target:
-        raise ValueError(f"cannot pad axis-0 from {cur} down to {target}")
-    pad_cfg = [(0, target - cur)] + [(0, 0)] * (arr.ndim - 1)
-    return jnp.pad(jnp.asarray(arr), pad_cfg)
 
 
 def _pad_axis(arr, axis, target):
@@ -649,17 +700,38 @@ class ISDFTC(TC):
                                include_grad=False,
                                include_delta_u=False,
                                include_tc=False):
-        """Return persistent ISDF operands resident on one device."""
+        """Return persistent ISDF operands resident on one device.
+
+        The first call for a given ``(self, device)`` materialises
+        ``phi_isdf`` (and optionally grad/TC/D) on ``device`` and stores
+        them in the process-wide ``_ISDF_DEVICE_CACHE``.  A
+        ``weakref.finalize`` is attached to ``self`` the first time we
+        cache anything for it, so the moment ``self`` is GC'd the
+        finaliser drops every ``(id(self), *)`` cache entry — releasing
+        the device-resident buffers and preventing a recycled ``id()``
+        from silently inheriting the old instance's cache.  See the
+        ``_ISDF_DEVICE_CACHE`` docstring at module top.
+        """
         if device is None:
             return None
 
-        key = (id(self), getattr(device, "id", repr(device)))
-        cache = _ISDF_DEVICE_CACHE.get(key)
-        if cache is None:
-            cache = {
-                "phi_isdf": jax.device_put(np.asarray(self.phi_isdf), device),
-            }
-            _ISDF_DEVICE_CACHE[key] = cache
+        self_id = id(self)
+        key = (self_id, getattr(device, "id", repr(device)))
+
+        with _ISDF_DEVICE_CACHE_LOCK:
+            cache = _ISDF_DEVICE_CACHE.get(key)
+            if cache is None:
+                cache = {
+                    "phi_isdf": jax.device_put(np.asarray(self.phi_isdf), device),
+                }
+                _ISDF_DEVICE_CACHE[key] = cache
+                # Register the finaliser exactly once per instance,
+                # not per (instance, device) pair.
+                if self_id not in _ISDF_DEVICE_CACHE_FINALISED:
+                    _ISDF_DEVICE_CACHE_FINALISED.add(self_id)
+                    weakref.finalize(
+                        self, _evict_isdf_device_cache_for_id, self_id,
+                    )
 
         if include_grad and "grad_phi_isdf" not in cache:
             cache["grad_phi_isdf"] = jax.device_put(np.asarray(self.grad_phi_isdf), device)

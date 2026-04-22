@@ -150,11 +150,19 @@ class TestXTCCCSDLargeBlocks(unittest.TestCase):
         self.assertTrue(saw_vovv_qr, "vovv builder never used panel_layout='qr'")
 
     def test_large_block_datasets_are_chunked(self):
-        # Both tensors are written as [:, :, r0:r1, :] with r_blk=nocc,
-        # so chunks are aligned on axis 2 at size nocc.
+        # Each tile is written as ``[:, :, r0:r1, :]`` with r-extent
+        # equal to ``panel_blk``.  Commit 5366fed aligned the axis-2
+        # HDF5 chunk size with ``panel_blk`` (rather than ``nocc``)
+        # so every slab write lands on chunk boundaries — eliminating
+        # the read-modify-write tax HDF5 was paying when the previous
+        # ``nocc``-aligned chunks straddled tile boundaries.
+        # The fixture patches ``resolve_v3o_panel_block_size`` to
+        # return 2, so the expected axis-2 chunk size is
+        # ``min(panel_blk, nvir)``.
+        expected_panel_chunk = min(2, self.nvir)
         self.assertIsNotNone(self.eris.ovvv.chunks)
         self.assertIsNotNone(self.eris.vovv.chunks)
         self.assertEqual(self.eris.ovvv.chunks[0], self.nocc)
-        self.assertEqual(self.eris.ovvv.chunks[2], self.nocc)
+        self.assertEqual(self.eris.ovvv.chunks[2], expected_panel_chunk)
         self.assertEqual(self.eris.vovv.chunks[1], self.nocc)
-        self.assertEqual(self.eris.vovv.chunks[2], self.nocc)
+        self.assertEqual(self.eris.vovv.chunks[2], expected_panel_chunk)

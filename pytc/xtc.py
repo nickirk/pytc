@@ -61,7 +61,12 @@ logger = logging.getLogger(__name__)
 # ``test_vvvv_paneling.py``) and would silently ignore a new ``**kwargs``
 # slot, giving the false impression that instrumentation is active.
 # ------------------------------------------------------------------
-_ISSUE_STAGE_STATS = {"current": None, "lock": threading.Lock()}
+_ISSUE_STAGE_STATS = {
+    "current": None,
+    "lock": threading.Lock(),
+    "scope_lock": threading.Lock(),
+    "owner_thread": None,
+}
 
 
 def _accum_issue_stage(name, dt):
@@ -82,18 +87,49 @@ def issue_stage_stats_scope():
     """Establish a per-pipeline accumulator for ``_accum_issue_stage``.
 
     Yields a dict that subsequent ``_accum_issue_stage`` calls will
-    mutate.  Nested scopes are supported — the outer scope is restored
-    on ``__exit__``.  Visible from ALL threads (process-wide), so it
-    works correctly when ``_round_robin_pipeline`` runs ``issue_tile``
-    on per-device worker threads.
+    mutate.  The accumulator is process-wide (visible from all threads)
+    so that the per-device issue worker threads spawned by
+    ``_round_robin_pipeline`` can read it; ``threading.local`` would
+    isolate the parent's scope from the workers and lose every timer.
+
+    Concurrency contract
+    --------------------
+    Only ONE pipeline-level scope may be active at a time.  Two
+    pipelines running concurrently on different threads would both
+    overwrite ``_ISSUE_STAGE_STATS["current"]`` and silently mix /
+    lose timer attribution.  The scheduler is single-pipeline today
+    so this never happens in practice, but the contract is enforced
+    explicitly here to fail fast if a future caller violates it.
+
+    Nested scopes from the SAME thread are allowed — the outer scope
+    is restored on ``__exit__`` — so it's safe for the scheduler to
+    enter a scope even if a callee under the same thread might also
+    enter one.
     """
-    prev = _ISSUE_STAGE_STATS["current"]
-    fresh: dict = {}
-    _ISSUE_STAGE_STATS["current"] = fresh
+    cur_thread = threading.get_ident()
+    with _ISSUE_STAGE_STATS["scope_lock"]:
+        owner = _ISSUE_STAGE_STATS["owner_thread"]
+        if owner is not None and owner != cur_thread:
+            raise RuntimeError(
+                "issue_stage_stats_scope() does not support concurrent "
+                f"pipelines from different threads — already owned by "
+                f"thread {owner}, attempted entry from thread "
+                f"{cur_thread}.  If you need per-pipeline timing, "
+                "either serialise the pipelines or replace this "
+                "process-wide accumulator with a per-pipeline dict "
+                "passed explicitly through the call chain."
+            )
+        prev = _ISSUE_STAGE_STATS["current"]
+        prev_owner = owner
+        fresh: dict = {}
+        _ISSUE_STAGE_STATS["current"] = fresh
+        _ISSUE_STAGE_STATS["owner_thread"] = cur_thread
     try:
         yield fresh
     finally:
-        _ISSUE_STAGE_STATS["current"] = prev
+        with _ISSUE_STAGE_STATS["scope_lock"]:
+            _ISSUE_STAGE_STATS["current"] = prev
+            _ISSUE_STAGE_STATS["owner_thread"] = prev_owner
 
 # ---------------------------------------------------------------------------
 # Host-side cache for X orbital slices read from HDF5.
@@ -197,17 +233,6 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
         "out": out_size_bytes,
         "total": total,
     }
-
-
-def _pad_leading_axis(arr, target):
-    """Pad the leading axis of an array with zeros up to ``target``."""
-    cur = arr.shape[0]
-    if cur == target:
-        return jnp.asarray(arr)
-    if cur > target:
-        raise ValueError(f"cannot pad axis-0 from {cur} down to {target}")
-    pad_cfg = [(0, target - cur)] + [(0, 0)] * (arr.ndim - 1)
-    return jnp.pad(jnp.asarray(arr), pad_cfg)
 
 
 def _get_device_free_bytes(device=None):
@@ -2162,16 +2187,41 @@ class ISDFXTC(XTC, ISDFTC):
             phi_q = _pad_axis(phi_q, 0, Nq_eff) if Nq_eff != Nq else jnp.asarray(phi_q)
             phi_r = _pad_axis(phi_r, 0, Nr) if Nr != r_len else jnp.asarray(phi_r)
             phi_s = _pad_axis(phi_s, 0, Ns_eff) if Ns_eff != Ns else jnp.asarray(phi_s)
-            if Nr != r_len:
-                X_sliced = _pad_axis(X_sliced, 0, Nr)
-            if Ns_eff != Ns:
-                X_sliced = _pad_axis(X_sliced, 1, Ns_eff)
+            # Pad ``X_sliced`` on host (NumPy) so the multi-GB slab does
+            # NOT get materialised on the JAX default device (typically
+            # GPU 0) before being copied to the actual target device.
+            # The earlier ``_pad_axis`` path used ``jnp.pad(jnp.asarray(arr))``
+            # which placed the padded result on whichever device was
+            # default at that moment — causing transient OOM / imbalance
+            # on GPU 0 in multi-GPU runs.  Keeping ``X_sliced`` as a
+            # NumPy array until the explicit ``jax.device_put`` below
+            # gives a single, correctly-targeted host→device copy.
+            if isinstance(X_sliced, np.ndarray):
+                if Nr != r_len or Ns_eff != Ns:
+                    pad_cfg = [(0, 0)] * X_sliced.ndim
+                    if Nr != r_len:
+                        pad_cfg[0] = (0, Nr - X_sliced.shape[0])
+                    if Ns_eff != Ns:
+                        pad_cfg[1] = (0, Ns_eff - X_sliced.shape[1])
+                    X_sliced = np.pad(X_sliced, pad_cfg)
+            else:
+                # ``X_sliced`` is already a JAX array (e.g. from a per-
+                # device cache).  Pad with the JAX helper, which keeps
+                # it on its current device.
+                if Nr != r_len:
+                    X_sliced = _pad_axis(X_sliced, 0, Nr)
+                if Ns_eff != Ns:
+                    X_sliced = _pad_axis(X_sliced, 1, Ns_eff)
         else:
             phi_p = jnp.asarray(phi_p)
             phi_q = jnp.asarray(phi_q)
             phi_r = jnp.asarray(phi_r)
             phi_s = jnp.asarray(phi_s)
-            X_sliced = jnp.asarray(X_sliced)
+            # Don't ``jnp.asarray(X_sliced)`` here — that would land the
+            # multi-GB slab on the default device (GPU 0) before the
+            # explicit ``device_put`` copies it to the target device.
+            # Leaving it as NumPy keeps the host→device transfer
+            # single-step.
         if device is not None:
             D = D_resident if D_resident is not None else jax.device_put(np.asarray(D), device)
             X_sliced = jax.device_put(X_sliced, device)
@@ -2182,6 +2232,7 @@ class ISDFXTC(XTC, ISDFTC):
                 phi_s = jax.device_put(phi_s, device)
         else:
             D = jnp.asarray(D)
+            X_sliced = jnp.asarray(X_sliced)
         if profile:
             jax.block_until_ready((D, X_sliced, phi_p, phi_q, phi_r, phi_s))
             t_put = time.perf_counter()

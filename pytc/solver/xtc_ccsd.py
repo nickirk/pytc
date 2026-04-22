@@ -258,26 +258,43 @@ def _make_xtc_eris(cc, mo_coeff=None):
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params, orb_block_size=128))
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
-    # Dispatch the two independent get_2b calls to different GPUs in parallel.
     _fock_devices = _solver_local_devices()
-    _fock_results = [None, None]
+    _fock_ranges = (
+        (slice(None), slice(None), slice(0, nocc), slice(0, nocc)),
+        (slice(None), slice(0, nocc), slice(0, nocc), slice(None)),
+    )
 
-    def _fock_worker(idx, ranges, device):
+    def _fock_worker(ranges, device):
         _ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
         with _ctx:
-            return idx, np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+            return np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _pool:
-        _f0 = _pool.submit(_fock_worker, 0,
-                           (slice(None), slice(None), slice(0, nocc), slice(0, nocc)),
-                           _fock_devices[0])
-        _f1 = _pool.submit(_fock_worker, 1,
-                           (slice(None), slice(0, nocc), slice(0, nocc), slice(None)),
-                           _fock_devices[-1])
-        for _f in (_f0, _f1):
-            _idx, _val = _f.result()
-            _fock_results[_idx] = _val
-    h2e_pqii_corr, h2e_piiq_corr = _fock_results
+    if len(_fock_devices) >= 2:
+        # Genuinely independent GPUs available — dispatch the two
+        # ``get_2b`` calls to distinct devices in parallel.  Each
+        # call materialises a (nmo, nmo, nocc, nocc) intermediate
+        # which can be multi-GB at production scale, so on a single-
+        # device run putting both in flight at once would roughly
+        # double the peak device memory and trip OOM.  See the else
+        # branch for the safe single-GPU fallback.
+        _fock_results = [None, None]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _pool:
+            futs = [
+                _pool.submit(_fock_worker, _fock_ranges[i], _fock_devices[i % len(_fock_devices)])
+                for i in range(2)
+            ]
+            for i, _f in enumerate(futs):
+                _fock_results[i] = _f.result()
+        h2e_pqii_corr, h2e_piiq_corr = _fock_results
+    else:
+        # Single-device (or CPU) run — issue serially so the two big
+        # intermediates do not coexist on the same GPU.  Codex P1
+        # observation: dispatching both to the same accelerator
+        # concurrently doubles peak VRAM in the 1-GPU path and was
+        # the dominant OOM trigger before this guard.
+        _device = _fock_devices[0] if _fock_devices else None
+        h2e_pqii_corr = _fock_worker(_fock_ranges[0], _device)
+        h2e_piiq_corr = _fock_worker(_fock_ranges[1], _device)
 
     fock_corr = h1e_corr + 2 * np.einsum('pqii->pq', h2e_pqii_corr) - np.einsum('piiq->pq', h2e_piiq_corr)
     eris.fock = fock_std + fock_corr
