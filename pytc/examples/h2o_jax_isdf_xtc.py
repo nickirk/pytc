@@ -51,7 +51,13 @@ def run_autodiff_isdf_example():
     else:
         print("Running reference RHF...")
         mf.kernel()
-    print(f"RHF energy: {mf.e_tot:.8f} Hartree")
+    # mf.e_tot may be unset on the reload path when the cache was written
+    # by ISDFXTC.from_xtc's auto-save (which persists mo_coeff/mo_occ but
+    # not e_tot).  Guard the print.
+    if mf.e_tot is not None:
+        print(f"RHF energy: {mf.e_tot:.8f} Hartree")
+    else:
+        print("RHF energy: not stored in cache (mo_coeff gauge locked but SCF not rerun).")
 
     # --- 2. Initialize JAX XTC ---
     # Jastrow factor with initial parameter alpha=1.0

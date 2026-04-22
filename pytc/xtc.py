@@ -742,6 +742,18 @@ class ISDFXTC(XTC, ISDFTC):
         if save_path is not None and cache_state.cache_has_mf_state(save_path):
             cache_state.check_mo_coeff_matches_cache(xtc_obj.mo_coeff, save_path)
 
+        # Remember whether the cache already contained ISDF kernels *before*
+        # we call isdf_decompose — that call will write xi_phi etc. if the
+        # cache is empty, so after the call we can no longer distinguish
+        # "kernels pre-existed (legacy cache)" from "we just wrote them
+        # (fresh compute)".  We need the distinction to decide whether it
+        # is safe to persist the current xtc_obj.mo_coeff (below).
+        _legacy_kernels_present = (
+            save_path is not None
+            and cache_state.cache_has_isdf_kernels(save_path)
+            and not cache_state.cache_has_mf_state(save_path)
+        )
+
         # Perform ISDF decomposition
         logger.info("ISDFXTC.from_xtc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
@@ -749,22 +761,44 @@ class ISDFXTC(XTC, ISDFTC):
             is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
         )
 
-        # On the first compute (cache didn't already have mf state), persist
-        # xtc_obj's mo_coeff / mo_occ so subsequent runs that reuse this cache
-        # can lock the orbital gauge via
+        # Persist xtc_obj's mo_coeff / mo_occ so subsequent runs that reuse
+        # this cache can lock the orbital gauge via
         # ``pytc.utils.cache_state.sync_mf_from_cache(mf, save_path)``.
-        if actual_save_path is not None and not cache_state.cache_has_mf_state(actual_save_path):
-            try:
-                cache_state.save_orbital_state_to_cache(
-                    actual_save_path,
-                    mo_coeff=xtc_obj.mo_coeff,
-                    mo_occ=xtc_obj.mo_occ,
-                )
-            except Exception as exc:  # pragma: no cover — non-fatal diagnostic
+        #
+        # Only do this on a *fresh* compute.  If the cache already held ISDF
+        # kernels but no mo_coeff (legacy cache written before this feature
+        # existed), those kernels were built from some *other* mo_coeff
+        # gauge; writing the current mo_coeff would silently lock later
+        # reloads to the wrong orbitals and, worse, suppress the
+        # `check_mo_coeff_matches_cache` warning.  In that case refuse to
+        # write and advise the user to regenerate the cache.
+        if (
+            actual_save_path is not None
+            and not cache_state.cache_has_mf_state(actual_save_path)
+        ):
+            if _legacy_kernels_present:
                 logger.warning(
-                    "Could not persist orbital state to %s: %r",
-                    actual_save_path, exc,
+                    "Legacy ISDF cache at %s already has kernels but no "
+                    "cached mo_coeff. Not persisting the current mo_coeff "
+                    "because those kernels were built from a possibly "
+                    "different orbital gauge; auto-saving now would lock "
+                    "future reloads to the wrong gauge. Delete the cache "
+                    "file to regenerate it with gauge-safe mo_coeff "
+                    "persistence enabled.",
+                    actual_save_path,
                 )
+            else:
+                try:
+                    cache_state.save_orbital_state_to_cache(
+                        actual_save_path,
+                        mo_coeff=xtc_obj.mo_coeff,
+                        mo_occ=xtc_obj.mo_occ,
+                    )
+                except Exception as exc:  # pragma: no cover — non-fatal diagnostic
+                    logger.warning(
+                        "Could not persist orbital state to %s: %r",
+                        actual_save_path, exc,
+                    )
 
         return cls(
             grid_points=xtc_obj.grid_points,

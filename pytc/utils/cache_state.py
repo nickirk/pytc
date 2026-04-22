@@ -14,17 +14,21 @@ produces ~mHa-scale errors in transcorrelated CCSD.
 
 Recommended usage (driver scripts)::
 
-    from pytc.utils.cache_state import sync_mf_from_cache
+    from pytc.utils.cache_state import cache_has_mf_state, sync_mf_from_cache
 
     mf = scf.RHF(mol).density_fit()
-    mf.kernel()
-    sync_mf_from_cache(mf, save_path)   # no-op if no cache yet
+    if cache_has_mf_state(save_path):
+        mf = sync_mf_from_cache(mf, save_path)   # skip mf.kernel()
+    else:
+        mf.kernel()                              # first compute
     my_xtc = XTC.from_pyscf(mf, jastrow, grid_lvl=2)
     isdf_xtc = ISDFXTC.from_xtc(my_xtc, n_rank=n_rank, save_path=save_path)
-    isdf_xtc = isdf_xtc.isdf(jastrow_params, ...)   # first call writes state
+    isdf_xtc = isdf_xtc.isdf(jastrow_params, ...)
 
-The first run (compute) populates the cached state.  Subsequent runs (load)
-adopt that state and become bit-reproducible regardless of BLAS thread count.
+The first (compute) run populates the cached mf-state datasets inside
+``ISDFXTC.from_xtc``, right after ``df.isdf_decompose`` returns.  Subsequent
+(load) runs adopt that state and become bit-reproducible regardless of BLAS
+thread count.
 """
 from __future__ import annotations
 
@@ -44,12 +48,37 @@ _KEY_E_TOT = "e_tot_cached"
 
 
 def cache_has_mf_state(save_path: Optional[str]) -> bool:
-    """Return True iff *save_path* is a readable h5 that already stores mf state."""
+    """Return True iff *save_path* has a usable cached mf state.
+
+    A usable state must include at least both cached ``mo_coeff`` and
+    ``mo_occ`` — otherwise callers like :func:`prepare_mf` could skip SCF
+    based on a partial orbital cache and leave ``mf.mo_occ`` unset, which
+    would crash downstream ``XTC.from_pyscf`` when it computes ``nocc``.
+    """
     if not save_path or not os.path.exists(save_path):
         return False
     try:
         with h5py.File(save_path, "r") as f:
-            return _KEY_MO_COEFF in f
+            return _KEY_MO_COEFF in f and _KEY_MO_OCC in f
+    except Exception:
+        return False
+
+
+def cache_has_isdf_kernels(save_path: Optional[str]) -> bool:
+    """Return True iff *save_path* already holds ISDF decomposition tensors.
+
+    Used to detect "legacy" caches that were written before this module
+    existed: they contain ``xi_phi`` / ``phi_isdf`` / etc. built from some
+    specific ``mo_coeff`` gauge, but lack the ``mo_coeff_cached`` dataset
+    that pins that gauge down.  In that situation we must NOT overwrite
+    the cache with a fresh ``mo_coeff`` — that could lock later reloads to
+    the wrong orbital gauge.
+    """
+    if not save_path or not os.path.exists(save_path):
+        return False
+    try:
+        with h5py.File(save_path, "r") as f:
+            return "xi_phi" in f
     except Exception:
         return False
 
@@ -192,21 +221,32 @@ def sync_mf_from_cache(mf, save_path: Optional[str]):
 
 
 def prepare_mf(mf, save_path: Optional[str]):
-    """One-shot convenience: skip ``mf.kernel()`` when the cache has mf state,
-    otherwise run ``mf.kernel()`` normally.
+    """One-shot convenience: restore cached mf state when possible, otherwise
+    run ``mf.kernel()`` normally.
 
     Equivalent to::
 
         if cache_has_mf_state(save_path):
             mf = sync_mf_from_cache(mf, save_path)
-        else:
-            mf.kernel()
+            if getattr(mf, "mo_coeff", None) is not None:
+                return mf
+        mf.kernel()
+        return mf
 
-    Useful for driver scripts that want a single call that does the right thing
-    on both the first (compute) run and all subsequent (reload) runs.
+    Useful for driver scripts that want a single call doing the right thing
+    on both the first (compute) run and all subsequent (reload) runs.  If the
+    cache exists but cannot be applied (e.g. basis/AO-count mismatch caught
+    by :func:`sync_mf_from_cache`), this falls back to a normal SCF solve
+    rather than returning an unsolved mf.
     """
     if cache_has_mf_state(save_path):
-        return sync_mf_from_cache(mf, save_path)
+        mf = sync_mf_from_cache(mf, save_path)
+        if getattr(mf, "mo_coeff", None) is not None:
+            return mf
+        logger.info(
+            "prepare_mf: sync_mf_from_cache did not populate mo_coeff "
+            "(cache present but rejected); falling back to mf.kernel()."
+        )
     mf.kernel()
     return mf
 
@@ -238,7 +278,10 @@ def check_mo_coeff_matches_cache(
             cached.shape, fresh.shape,
         )
         return False
-    if np.allclose(cached, fresh, atol=atol):
+    # rtol=0 so the tolerance behaviour matches the advertised ``atol``;
+    # np.allclose defaults to rtol=1e-5 which would let a visibly different
+    # mo_coeff pass as "matching" and silently suppress the warning.
+    if np.allclose(cached, fresh, atol=atol, rtol=0.0):
         return True
     diff = float(np.linalg.norm(cached - fresh))
     logger.warning(
