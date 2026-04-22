@@ -11,35 +11,53 @@ jax.config.update("jax_enable_x64", True)
 
 from pytc.xtc import XTC, ISDFXTC
 from pytc.jastrow.rexp import REXP
+from pytc.utils.cache_state import cache_has_mf_state, sync_mf_from_cache
 
 def run_autodiff_isdf_example():
     """
-    Example demonstrating the JAX/autodiff implementation of 
+    Example demonstrating the JAX/autodiff implementation of
     Interpolative Density Fitting (ISDF) for Transcorrelated (TC) methods.
-    
+
     This script showcases:
     1. Using the JAX/autodiff API for TC calculations.
     2. Out-of-core storage of ISDF kernels using HDF5.
     3. RAM and VRAM management using batching and blocking.
+    4. Gauge-safe reuse of an existing ISDF cache across processes.
     """
-    
+
     # --- 1. Setup Molecule & Mean-Field ---
     # We use H2O with cc-pVDZ basis for a realistic demonstration.
     mol = gto.M(
-        atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587', 
-        basis='cc-pvdz', 
+        atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+        basis='cc-pvdz',
         verbose=0
     )
     mf = scf.RHF(mol)
-    print("Running reference RHF...")
-    mf.kernel()
+
+    # --- Cache setup: reuse an existing ISDF cache if present ---
+    # Multi-threaded LAPACK dsyev can return unitarily-equivalent mo_coeff
+    # with different column signs / subspace mixings across runs.  The ISDF
+    # kernels (xi_phi, phi_isdf, K1, D, X, ...) are built from one specific
+    # mo_coeff, so combining cached kernels with a fresh-SCF mo_coeff of a
+    # different gauge silently corrupts the transcorrelated integrals.
+    # ISDFXTC.from_xtc persists mo_coeff/mo_occ into the cache on the first
+    # compute; subsequent runs should adopt that cached orbital gauge via
+    # sync_mf_from_cache BEFORE calling XTC.from_pyscf.
+    save_path = "h2o_isdf_kernels.h5"
+    if cache_has_mf_state(save_path):
+        # Reload path — skip SCF entirely and adopt the cached orbital gauge.
+        mf = sync_mf_from_cache(mf, save_path)
+        print("Reusing existing ISDF cache; SCF skipped (mo_coeff locked from cache).")
+    else:
+        print("Running reference RHF...")
+        mf.kernel()
     print(f"RHF energy: {mf.e_tot:.8f} Hartree")
 
     # --- 2. Initialize JAX XTC ---
     # Jastrow factor with initial parameter alpha=1.0
     jastrow = REXP()
     jastrow_params = {'alpha': jnp.array([1.0])}
-    
+
     # Initialize the standard XTC object
     # grid_lvl=2 is a good balance between speed and accuracy
     my_xtc = XTC.from_pyscf(mf, jastrow, grid_lvl=2)
@@ -49,12 +67,6 @@ def run_autodiff_isdf_example():
     print("\n--- ISDF Decomposition ---")
     n_mo = mf.mo_coeff.shape[1]
     n_rank = 10 * n_mo  # Typical rank: 8-12 times number of orbitals
-    
-    # Specify a path to save ISDF kernels to disk (HDF5)
-    # This enables out-of-core processing for large systems.
-    save_path = "h2o_isdf_kernels.h5"
-    if os.path.exists(save_path):
-        os.remove(save_path) # Start fresh
         
     start_time = time.time()
     # ls_grid_batch_size controls memory usage during ISDF linear solver
@@ -106,10 +118,11 @@ def run_autodiff_isdf_example():
     e_tc_hf = get_tc_hf_energy(eris_isdf, nocc)
     print(f"\nISDF TC-HF energy: {e_tc_hf:.8f} Hartree")
     
-    # Clean up
-    if os.path.exists(save_path):
-        os.remove(save_path)
+    # Cache is left in place so a subsequent invocation can reuse it via
+    # sync_mf_from_cache (see top of this script).  Delete the file manually
+    # to force a fresh compute on the next run.
     print("\nExample completed successfully.")
+    print(f"ISDF cache retained at {save_path}; delete it to force a fresh compute.")
 
 if __name__ == "__main__":
     run_autodiff_isdf_example()
