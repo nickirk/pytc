@@ -2,6 +2,7 @@
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 from functools import partial
 import os
@@ -330,6 +331,23 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         chol_c, lower_c = prepare_normal_equations_solver(grad_phi_piv[:, :, c], phi_piv, rcond=rcond)
         grad_chol.append(chol_c)
         grad_lower.append(lower_c)
+
+    # Multi-GPU: shard the grid axis of each batch across devices; replicate factors.
+    gpu_devices = [d for d in jax.devices() if d.platform == 'gpu']
+    n_devices = len(gpu_devices)
+    use_sharding = n_devices > 1
+    if use_sharding:
+        mesh = Mesh(np.array(gpu_devices), ('g',))
+        grid_shard = NamedSharding(mesh, P(None, 'g'))
+        repl = NamedSharding(mesh, P())
+        phi_chol = jax.device_put(phi_chol, repl)
+        phi_piv_d = jax.device_put(phi_piv, repl)
+        grad_chol = [jax.device_put(c, repl) for c in grad_chol]
+        grad_phi_piv_d = jax.device_put(grad_phi_piv, repl)
+        logger.info(f"  Multi-GPU sharding enabled across {n_devices} devices (grid axis)")
+    else:
+        phi_piv_d = phi_piv
+        grad_phi_piv_d = grad_phi_piv
     
     # Setup storage
     h5_file = None
@@ -363,21 +381,37 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         for batch_idx in range(n_batches):
             g_start = batch_idx * grid_batch_size
             g_end = min(g_start + grid_batch_size, n_grid)
-            
+            bs = g_end - g_start
+
+            # Pad batch width to a multiple of n_devices so the grid axis shards evenly.
+            pad = (-bs) % n_devices if use_sharding else 0
+
             # 1. Xi_phi
             phi_batch = phi[:, g_start:g_end]
+            if pad:
+                phi_batch = jnp.pad(phi_batch, ((0, 0), (0, pad)))
+            if use_sharding:
+                phi_batch = jax.device_put(phi_batch, grid_shard)
             xi_phi_batch = solve_normal_equations_batch_prepared(
-                phi_chol, phi_lower, phi_piv, phi_piv, phi_batch, phi_batch
+                phi_chol, phi_lower, phi_piv_d, phi_piv_d, phi_batch, phi_batch
             )
+            if pad:
+                xi_phi_batch = xi_phi_batch[:, :bs]
             xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
-            
+
             # 2. Xi_grad
             for c in range(3):
                 grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
+                if pad:
+                    grad_phi_batch_c = jnp.pad(grad_phi_batch_c, ((0, 0), (0, pad)))
+                if use_sharding:
+                    grad_phi_batch_c = jax.device_put(grad_phi_batch_c, grid_shard)
                 xi_grad_batch = solve_normal_equations_batch_prepared(
-                    grad_chol[c], grad_lower[c], grad_phi_piv[:, :, c], phi_piv,
+                    grad_chol[c], grad_lower[c], grad_phi_piv_d[:, :, c], phi_piv_d,
                     grad_phi_batch_c, phi_batch
                 )
+                if pad:
+                    xi_grad_batch = xi_grad_batch[:, :bs]
                 xi_grad_storage[:, g_start:g_end, c] = np.array(xi_grad_batch)
             
             if batch_idx % 4 == 0 and batch_idx > 0:
