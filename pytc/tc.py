@@ -816,30 +816,34 @@ class ISDFTC(TC):
 
     def compute_kmat_kernels(self, jastrow_params, batch_size=1024, host_grid_block_size=None):
         """Compute K1 and K3 kernels with multi-GPU support.
-        
+
+        The n_fused (k) axis of the r1 inputs is sharded across devices so the
+        per-device K1/K3 footprint scales as n_rank/n_devices * n_rank rather
+        than n_rank^2 (as would be the case with replicated outputs reduced by
+        psum). The r2 grid is replicated on every device; this is cheaper than
+        replicating K1 (which has an extra factor of n_rank).
+
         Returns:
             dict: {'K1_kernel': K1_kernel, 'K3_kernel': K3_kernel}
         """
         n_devices = jax.local_device_count()
         n_grid = self.grid_points.shape[0]
         n_rank = self.phi_isdf.shape[1]
-        
-        # Pad grid to be divisible by n_devices
-        logger.debug(f"compute_kmat_kernels: Padding grid to be divisible by {n_devices} devices...")
+
         devices = jax.local_devices()
         mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
         rep_sharding = sharding_core.get_replicated_sharding(mesh)
-        r2_grid_sharding = NamedSharding(mesh, P('devices', None))
-        r2_weights_sharding = NamedSharding(mesh, P('devices'))
-        r2_xi_sharding = NamedSharding(mesh, P(None, 'devices'))
-        
+        r1_xi_phi_sharding = NamedSharding(mesh, P('devices', None))
+        r1_xi_grad_sharding = NamedSharding(mesh, P('devices', None, None))
+
+        # Pad n_rank to be divisible by n_devices so k-sharding is even.
+        n_rank_per_dev = (n_rank + n_devices - 1) // n_devices
+        n_rank_padded = n_rank_per_dev * n_devices
+        pad_k = n_rank_padded - n_rank
+
         if host_grid_block_size is None:
             host_grid_block_size = n_grid
-            
-        # Initialize kernels on host
-        K1_kernel = np.zeros((n_rank, n_rank, 3))
-        K3_kernel = np.zeros((n_rank, n_rank))
-        
+
         # Open datasets if needed
         xi_phi_ds = None
         xi_grad_ds = None
@@ -851,56 +855,37 @@ class ISDFTC(TC):
 
         from pytc.utils.prefetch import safe_hdf5_read
 
-        # Build r2-sharded arrays once (persistent across r1 host blocks).
-        n_per_dev_r2 = (n_grid + n_devices - 1) // n_devices
-        n_grid_r2_padded = n_per_dev_r2 * n_devices
-        grid_r2_parts = []
-        weights_r2_parts = []
-        xi_phi_r2_parts = []
-        for d in range(n_devices):
-            g0 = d * n_per_dev_r2
-            g1 = min(g0 + n_per_dev_r2, n_grid)
-            cur_len = g1 - g0
+        # r2 side: replicate the full grid on every device once. This is
+        # memory-cheaper than replicating K1 (size n_rank^2*3) because xi_phi_r2
+        # has size n_rank * n_grid.
+        grid_r2_full = np.asarray(self.grid_points)
+        weights_r2_full = np.asarray(self.weights)
+        if self.xi_phi is not None:
+            xi_phi_r2_full = safe_hdf5_read(self.xi_phi, (slice(None), slice(None)))
+        else:
+            xi_phi_r2_full = safe_hdf5_read(xi_phi_ds, (slice(None), slice(None)))
 
-            grid_d = np.asarray(self.grid_points[g0:g1])
-            weights_d = np.asarray(self.weights[g0:g1])
-            if self.xi_phi is not None:
-                xi_phi_d = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0, g1)))
-            else:
-                xi_phi_d = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0, g1)))
-
-            if cur_len < n_per_dev_r2:
-                pad = n_per_dev_r2 - cur_len
-                grid_d = np.pad(grid_d, ((0, pad), (0, 0)))
-                weights_d = np.pad(weights_d, ((0, pad),))
-                xi_phi_d = np.pad(xi_phi_d, ((0, 0), (0, pad)))
-
-            grid_r2_parts.append(jax.device_put(grid_d, devices[d]))
-            weights_r2_parts.append(jax.device_put(weights_d, devices[d]))
-            xi_phi_r2_parts.append(jax.device_put(xi_phi_d, devices[d]))
-
-        sharded_grid_r2 = jax.make_array_from_single_device_arrays(
-            (n_grid_r2_padded, 3), r2_grid_sharding, grid_r2_parts
-        )
-        sharded_weights_r2 = jax.make_array_from_single_device_arrays(
-            (n_grid_r2_padded,), r2_weights_sharding, weights_r2_parts
-        )
-        sharded_xi_phi_r2 = jax.make_array_from_single_device_arrays(
-            (n_rank, n_grid_r2_padded), r2_xi_sharding, xi_phi_r2_parts
-        )
+        rep_grid_r2 = jax.device_put(np.asarray(grid_r2_full), rep_sharding)
+        rep_weights_r2 = jax.device_put(np.asarray(weights_r2_full), rep_sharding)
+        rep_xi_phi_r2 = jax.device_put(np.asarray(xi_phi_r2_full), rep_sharding)
+        del grid_r2_full, weights_r2_full, xi_phi_r2_full
+        gc.collect()
 
         jastrow_factor = self.jastrow_factor
 
         @shard_map(
             mesh=mesh,
-            in_specs=(P(), P(), P(), P(), P('devices', None), P('devices'), P(None, 'devices'), P()),
-            out_specs=(P(), P()),
+            in_specs=(P(), P(), P('devices', None), P('devices', None, None), P(), P(), P(), P()),
+            out_specs=(P('devices', None, None), P('devices', None)),
             check_vma=False,
         )
         def sharded_compute(
             grid_r1_block, weights_r1_block, xi_phi_r1_block, xi_grad_r1_block,
             grid_r2, weights_r2, xi_phi_r2, params
         ):
+            # Each device produces its own k-slice of K1/K3; no cross-device
+            # reduction needed because r2 is fully replicated and r1-grid is
+            # also replicated (integration sum is complete per device).
             k1_local = kmat_jax.calc_K1_kernel(
                 xi_grad_r1_block, xi_phi_r2, weights_r1_block, weights_r2,
                 jastrow_factor, params, grid_r1_block, grid_r2, batch_size
@@ -909,12 +894,17 @@ class ISDFTC(TC):
                 xi_phi_r1_block, xi_phi_r2, weights_r1_block, weights_r2,
                 jastrow_factor, params, grid_r1_block, grid_r2, batch_size
             )
-            return jax.lax.psum(k1_local, 'devices'), jax.lax.psum(k3_local, 'devices')
+            return k1_local, k3_local
 
         params_rep = jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params)
 
+        # Accumulate host-side K1/K3 over r1 host blocks. Keep the k-axis padded
+        # and strip at the end.
+        K1_kernel_padded = np.zeros((n_rank_padded, n_rank, 3))
+        K3_kernel_padded = np.zeros((n_rank_padded, n_rank))
+
         def _prepare_kmat_block(g0_loc):
-            """Prepare replicated r1 block data for one host block."""
+            """Load the r1 host block; k-shard xi_phi / xi_grad, replicate the rest."""
             g1_loc = min(g0_loc + host_grid_block_size, n_grid)
             cur_len = g1_loc - g0_loc
             grid_block = self.grid_points[g0_loc:g1_loc]
@@ -934,16 +924,36 @@ class ISDFTC(TC):
                 xi_phi_block = np.pad(xi_phi_block, ((0, 0), (0, pad)))
                 xi_grad_block = np.pad(xi_grad_block, ((0, 0), (0, pad), (0, 0)))
 
+            # Pad the k axis to n_rank_padded; the tail rows are zero and will
+            # contribute zeros to the output, which we strip after the loop.
+            if pad_k > 0:
+                xi_phi_block = np.pad(xi_phi_block, ((0, pad_k), (0, 0)))
+                xi_grad_block = np.pad(xi_grad_block, ((0, pad_k), (0, 0), (0, 0)))
+
             r_grid = jax.device_put(np.asarray(grid_block), rep_sharding)
             r_weights = jax.device_put(np.asarray(weights_block), rep_sharding)
-            r_xi_phi = jax.device_put(np.asarray(xi_phi_block), rep_sharding)
-            r_xi_grad = jax.device_put(np.asarray(xi_grad_block), rep_sharding)
-            return r_grid, r_weights, r_xi_phi, r_xi_grad
+
+            xi_phi_parts = []
+            xi_grad_parts = []
+            for d in range(n_devices):
+                k0 = d * n_rank_per_dev
+                k1 = k0 + n_rank_per_dev
+                xi_phi_parts.append(jax.device_put(np.asarray(xi_phi_block[k0:k1]), devices[d]))
+                xi_grad_parts.append(jax.device_put(np.asarray(xi_grad_block[k0:k1]), devices[d]))
+
+            sharded_xi_phi = jax.make_array_from_single_device_arrays(
+                (n_rank_padded, host_grid_block_size), r1_xi_phi_sharding, xi_phi_parts
+            )
+            sharded_xi_grad = jax.make_array_from_single_device_arrays(
+                (n_rank_padded, host_grid_block_size, 3), r1_xi_grad_sharding, xi_grad_parts
+            )
+            return r_grid, r_weights, sharded_xi_phi, sharded_xi_grad
 
         try:
             logger.info(
                 f"  compute_kmat_kernels: Starting shard_map for K-kernels "
-                f"(n_fused={n_rank}, n_grid={n_grid}, n_devices={n_devices})..."
+                f"(n_fused={n_rank}, n_rank_padded={n_rank_padded}, "
+                f"n_grid={n_grid}, n_devices={n_devices}, k-axis sharded)..."
             )
             for g0 in range(0, n_grid, host_grid_block_size):
                 g1 = min(g0 + host_grid_block_size, n_grid)
@@ -951,19 +961,23 @@ class ISDFTC(TC):
                 r_grid, r_weights, r_xi_phi, r_xi_grad = _prepare_kmat_block(g0)
                 K1_block, K3_block = sharded_compute(
                     r_grid, r_weights, r_xi_phi, r_xi_grad,
-                    sharded_grid_r2, sharded_weights_r2, sharded_xi_phi_r2,
+                    rep_grid_r2, rep_weights_r2, rep_xi_phi_r2,
                     params_rep
                 )
-                K1_kernel += np.asarray(K1_block)
-                K3_kernel += np.asarray(K3_block)
-                
-                # Explicitly clear memory
+                # K1_block is k-sharded (n_rank_padded, n_rank, 3); pulling to
+                # host materialises a single (already correct) array.
+                K1_kernel_padded += np.asarray(K1_block)
+                K3_kernel_padded += np.asarray(K3_block)
+
                 del r_grid, r_weights, r_xi_phi, r_xi_grad, K1_block, K3_block
                 gc.collect()
-                
+
         finally:
             if f_xi: f_xi.close()
-            
+
+        # Strip k-axis padding rows (they are zero by construction).
+        K1_kernel = K1_kernel_padded[:n_rank]
+        K3_kernel = K3_kernel_padded[:n_rank]
         return {'K1_kernel': jnp.asarray(K1_kernel), 'K3_kernel': jnp.asarray(K3_kernel)}
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None, host_grid_block_size=None):
