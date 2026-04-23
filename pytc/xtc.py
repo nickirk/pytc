@@ -677,8 +677,12 @@ class XTC(TC):
         delta_h = -0.5 * (term1 - term2)
         return delta_h
 
-    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=256, batch_size=1000):
-        """Get one-body operator correction."""
+    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=None, batch_size=1000):
+        """Get one-body operator correction.
+
+        ``orb_block_size=None`` lets :meth:`get_delta_h` pick adaptively based on
+        available GPU memory.
+        """
         return self.get_delta_h(jastrow_params, dm1, block_str, ranges, orb_block_size, batch_size)
 
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -1787,9 +1791,9 @@ class ISDFXTC(XTC, ISDFTC):
         return result
 
 
-    def get_delta_h(self, jastrow_params, dm1=None, 
-                    block_str=None, ranges=None, 
-                    orb_block_size=256,
+    def get_delta_h(self, jastrow_params, dm1=None,
+                    block_str=None, ranges=None,
+                    orb_block_size=None,
                     batch_size=1000):
         r"""Get or compute delta_h using ISDF kernels efficiently.
         
@@ -1821,16 +1825,30 @@ class ISDFXTC(XTC, ISDFTC):
         D = kernels['D']
         X = kernels['X']
         phi = self.phi_isdf
-        
+
         slice_p = slice(None)
         slice_q = slice(None)
         if ranges is not None:
              slice_p, slice_q = ranges[0], ranges[1]
-             
+
+        # Adaptive orb_block_size: each HDF5 chunk is
+        # (orb_block_size, n_orb, n_fused) * 8 bytes. For cc-pCV5Z-class
+        # n_fused (~25k) the historical default 128/256 asks for ~30-60 GiB
+        # per chunk and OOMs any single-device allocation.
+        if orb_block_size is None:
+            from pytc.utils.gpu_memory import choose_orb_block_size
+            orb_block_size = choose_orb_block_size(
+                n_orb=phi.shape[0], n_fused=phi.shape[1],
+            )
+            logger.debug(
+                "get_delta_h: auto orb_block_size=%d (n_orb=%d, n_fused=%d)",
+                orb_block_size, phi.shape[0], phi.shape[1],
+            )
+
         Gb = jnp.einsum('rb,sb,rs->b', phi, phi, dm1)
         P_phi = jnp.linalg.multi_dot([phi.T, dm1, phi])
         phi_tilde = jnp.dot(dm1, phi)
-        
+
         # Check if X is HDF5 dataset
         is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File))
         

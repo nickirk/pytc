@@ -241,6 +241,56 @@ def solve_tile_sizes(
     }
 
 
+def choose_orb_block_size(
+    n_orb: int,
+    n_fused: int,
+    *,
+    bytes_per_elem: int = 8,
+    budget_fraction: float = 0.15,
+    min_block: int = 1,
+    max_block: int = 256,
+) -> int:
+    """Choose ``orb_block_size`` so one HDF5 chunk of ``X`` fits a device.
+
+    ``get_delta_h`` (in :mod:`pytc.xtc`) streams ``X`` from HDF5 in chunks of
+    shape ``(orb_block_size, n_orb, n_fused)`` and then does einsums that
+    materialise the chunk on device. Per-chunk bytes are
+    ``orb_block_size * n_orb * n_fused * bytes_per_elem`` and grow linearly
+    with ``n_fused``. For modest bases this is a few GiB; for cc-pCV5Z-class
+    n_fused (~25k) the default ``orb_block_size=128`` alone asks for ~30 GiB
+    per chunk — larger than any single A100 partition.
+
+    Rather than hard-coding a per-system block, solve for it: read the probed
+    free memory, apportion ``budget_fraction`` of it to X_chunk, and floor.
+
+    Parameters
+    ----------
+    n_orb, n_fused : int
+        Shapes of the chunk's non-block axes.
+    bytes_per_elem : int
+        8 for float64 (default), 4 for float32.
+    budget_fraction : float
+        Fraction of the probed free memory that X_chunk is allowed to
+        consume. 0.15 leaves room for P_phi (~n_fused^2 * 8), einsum
+        scratch, other resident tensors, and XLA fragmentation.
+    min_block, max_block : int
+        Clamp the chosen block to this range.
+
+    Returns
+    -------
+    int
+        Chosen ``orb_block_size``, clamped to ``[min_block, min(n_orb, max_block)]``.
+    """
+    if n_orb <= 0 or n_fused <= 0:
+        return max_block
+    free = _get_gpu_free_bytes()
+    budget = max(int(free * budget_fraction), 0)
+    per_block_bytes = n_orb * n_fused * bytes_per_elem
+    max_block_for_mem = max(1, budget // per_block_bytes)
+    cap = min(n_orb, max_block)
+    return int(max(min_block, min(cap, max_block_for_mem)))
+
+
 def _get_gpu_free_bytes():
     """Return the *currently free* GPU memory of the most-constrained local device.
 

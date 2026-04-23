@@ -255,7 +255,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
     fock_std = reduce(np.dot, (mo_coeff.T, fock_std, mo_coeff))
 
     
-    h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params, orb_block_size=128))
+    # orb_block_size=None → get_delta_h auto-picks from probed GPU free memory.
+    h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
     _fock_devices = _solver_local_devices()
