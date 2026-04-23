@@ -880,17 +880,22 @@ class ISDFTC(TC):
         # shard_map'd K-kernel scan. Summed they give the "fixed" footprint
         # (independent of tile sizes); r1/r2 tile sizes add on top per-element.
         #
-        # Terminology: the "carry" is the scan accumulator; the "transient"
-        # is the new carry allocated during .at[:,:,c].add() before the old
-        # carry is freed. psum_buf appears only when m_g > 1.
+        # Peak occurs inside the shard_map while the scan is running, because
+        # the on-device K1_accum / K3_accum stay resident across r1 blocks.
+        # The post-shard_map accumulation (K1_accum = K1_accum + K1_contrib)
+        # has a smaller peak because the scan-internal buffers are freed.
         def _k_kernel_fixed_bytes(m_k, m_g):
             k1_carry      = 3.0 * n_rank * n_rank / m_k * 8.0  # (n/m_k, n, 3)
-            k1_transient  = k1_carry                           # same shape during .at.add
-            k1_c_interm   = n_rank * n_rank / m_k * 8.0        # (n/m_k, n)
+            k1_transient  = k1_carry                           # .at.add transient inside scan
+            k1_c_interm   = n_rank * n_rank / m_k * 8.0        # (n/m_k, n) matmul output per c
             k3_carry      = n_rank * n_rank / m_k * 8.0
             k3_transient  = k3_carry
+            # Persistent on-device accumulators carried across r1 blocks:
+            k1_accum      = 3.0 * n_rank * n_rank / m_k * 8.0
+            k3_accum      = n_rank * n_rank / m_k * 8.0
             psum_buf      = k1_carry if m_g > 1 else 0.0
-            return (k1_carry + k1_transient + k1_c_interm
+            return (k1_accum + k3_accum
+                    + k1_carry + k1_transient + k1_c_interm
                     + k3_carry + k3_transient + psum_buf)
 
         # Per-unit elemental costs (bytes per grid point):
@@ -993,26 +998,46 @@ class ISDFTC(TC):
             gpu_memory.K_KERNEL_SINGLE_INPUT_MAX_FRACTION * 100,
         )
 
-        # --- HDF5 handles ---------------------------------------------------
-        xi_phi_ds = None
-        xi_grad_ds = None
-        f_xi = None
-        if self.xi_phi is None and self.save_path:
-            f_xi = h5py.File(self.save_path, 'r')
-            xi_phi_ds = f_xi['xi_phi']
-            xi_grad_ds = f_xi['xi_grad']
+        # --- Preload ISDF intermediates into host RAM once ------------------
+        # The inner r1 / r2 loops each want a slice of xi_phi and xi_grad. If
+        # those live in HDF5 on network storage, each loop iteration stalled
+        # the GPU ~30-45 s reading from disk. Host RAM on typical nodes
+        # (>= 400 GiB) easily absorbs the full (n_fused, n_grid) and
+        # (n_fused, n_grid, 3) arrays (here ~20 GiB + ~60 GiB), so we pay the
+        # I/O once and slice from RAM thereafter.
+        if self.xi_phi is not None:
+            xi_phi_host = np.asarray(self.xi_phi)
+            xi_grad_host = np.asarray(self.xi_grad)
+        elif self.save_path:
+            t_io = time.perf_counter()
+            with h5py.File(self.save_path, 'r') as f_xi:
+                xi_phi_bytes = int(np.prod(f_xi['xi_phi'].shape)) * 8
+                xi_grad_bytes = int(np.prod(f_xi['xi_grad'].shape)) * 8
+                logger.info(
+                    "  compute_kmat_kernels: preloading xi_phi (%.1f GiB) "
+                    "and xi_grad (%.1f GiB) from %s into host RAM",
+                    xi_phi_bytes / (1024 ** 3),
+                    xi_grad_bytes / (1024 ** 3),
+                    self.save_path,
+                )
+                xi_phi_host = np.asarray(f_xi['xi_phi'][:])
+                xi_grad_host = np.asarray(f_xi['xi_grad'][:])
+            logger.info(
+                "  compute_kmat_kernels: preload done in %.1fs",
+                time.perf_counter() - t_io,
+            )
+        else:
+            raise RuntimeError(
+                "compute_kmat_kernels: xi_phi/xi_grad not in-core and no save_path set"
+            )
 
         # --- Helpers for loading + sharding ---------------------------------
         def _load_r1_block(g0, g1):
             cur_len = g1 - g0
             grid_block = np.asarray(self.grid_points[g0:g1])
             weights_block = np.asarray(self.weights[g0:g1])
-            if self.xi_phi is not None:
-                xi_phi_block = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0, g1)))
-                xi_grad_block = safe_hdf5_read(self.xi_grad, (slice(None), slice(g0, g1), slice(None)))
-            else:
-                xi_phi_block = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0, g1)))
-                xi_grad_block = safe_hdf5_read(xi_grad_ds, (slice(None), slice(g0, g1), slice(None)))
+            xi_phi_block = xi_phi_host[:, g0:g1]
+            xi_grad_block = xi_grad_host[:, g0:g1, :]
 
             if cur_len < host_grid_block_size:
                 pad = host_grid_block_size - cur_len
@@ -1030,10 +1055,7 @@ class ISDFTC(TC):
             cur_len = g1 - g0
             grid_tile = np.asarray(self.grid_points[g0:g1])
             weights_tile = np.asarray(self.weights[g0:g1])
-            if self.xi_phi is not None:
-                xi_phi_tile = safe_hdf5_read(self.xi_phi, (slice(None), slice(g0, g1)))
-            else:
-                xi_phi_tile = safe_hdf5_read(xi_phi_ds, (slice(None), slice(g0, g1)))
+            xi_phi_tile = xi_phi_host[:, g0:g1]
 
             if cur_len < r2_tile_size:
                 pad = r2_tile_size - cur_len
@@ -1117,56 +1139,75 @@ class ISDFTC(TC):
             lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
         )
 
-        # --- Host accumulators ----------------------------------------------
-        K1_kernel_padded = np.zeros((n_rank_padded, n_rank, 3))
-        K3_kernel_padded = np.zeros((n_rank_padded, n_rank))
+        # --- On-device k-sharded accumulators -------------------------------
+        # Kept resident across all (r1_block, r2_tile) iterations. Per-block
+        # contributions are added on-device via JAX; nothing is pulled to host
+        # until the very end. This eliminates ~4 GB + ~1.3 GB of D2H traffic
+        # per r1 block and the associated host numpy += pass (which was the
+        # dominant idle-gap phase on the nvidia-smi timeline).
+        def _make_k_sharded_zeros(shape):
+            per_dev_shape = (shape[0] // m_k,) + tuple(shape[1:])
+            single_dev_arrays = []
+            for i_k in range(m_k):
+                for i_g in range(m_g):
+                    single_dev_arrays.append(
+                        jax.device_put(
+                            np.zeros(per_dev_shape), device_grid[i_k, i_g]
+                        )
+                    )
+            spec = P('k_ax', *([None] * (len(shape) - 1)))
+            sharding = NamedSharding(mesh, spec)
+            return jax.make_array_from_single_device_arrays(
+                shape, sharding, single_dev_arrays
+            )
+
+        K1_accum = _make_k_sharded_zeros((n_rank_padded, n_rank, 3))
+        K3_accum = _make_k_sharded_zeros((n_rank_padded, n_rank))
 
         n_r2_tiles = (n_grid + r2_tile_size - 1) // r2_tile_size
         n_r1_blocks = (n_grid + host_grid_block_size - 1) // host_grid_block_size
 
-        try:
-            for j, g_r2_0 in enumerate(range(0, n_grid, r2_tile_size)):
-                g_r2_1 = min(g_r2_0 + r2_tile_size, n_grid)
-                logger.info(
-                    "    r2 tile %d/%d [%d:%d]",
-                    j + 1, n_r2_tiles, g_r2_0, g_r2_1
+        for j, g_r2_0 in enumerate(range(0, n_grid, r2_tile_size)):
+            g_r2_1 = min(g_r2_0 + r2_tile_size, n_grid)
+            logger.info(
+                "    r2 tile %d/%d [%d:%d]",
+                j + 1, n_r2_tiles, g_r2_0, g_r2_1
+            )
+            grid_r2_np, weights_r2_np, xi_phi_r2_np = _load_r2_tile(g_r2_0, g_r2_1)
+            sh_grid_r2 = _build_g_sharded(grid_r2_np, axis=0)
+            sh_weights_r2 = _build_g_sharded(weights_r2_np, axis=0)
+            sh_xi_phi_r2 = _build_g_sharded(xi_phi_r2_np, axis=1)
+
+            for i, g_r1_0 in enumerate(range(0, n_grid, host_grid_block_size)):
+                g_r1_1 = min(g_r1_0 + host_grid_block_size, n_grid)
+                logger.debug(
+                    "      r1 block %d/%d [%d:%d]",
+                    i + 1, n_r1_blocks, g_r1_0, g_r1_1
                 )
-                grid_r2_np, weights_r2_np, xi_phi_r2_np = _load_r2_tile(g_r2_0, g_r2_1)
-                sh_grid_r2 = _build_g_sharded(grid_r2_np, axis=0)
-                sh_weights_r2 = _build_g_sharded(weights_r2_np, axis=0)
-                sh_xi_phi_r2 = _build_g_sharded(xi_phi_r2_np, axis=1)
+                grid_r1_np, weights_r1_np, xi_phi_r1_np, xi_grad_r1_np = \
+                    _load_r1_block(g_r1_0, g_r1_1)
+                sh_grid_r1 = jax.device_put(grid_r1_np, rep_sharding)
+                sh_weights_r1 = jax.device_put(weights_r1_np, rep_sharding)
+                sh_xi_phi_r1 = _build_k_sharded(xi_phi_r1_np)
+                sh_xi_grad_r1 = _build_k_sharded(xi_grad_r1_np)
 
-                for i, g_r1_0 in enumerate(range(0, n_grid, host_grid_block_size)):
-                    g_r1_1 = min(g_r1_0 + host_grid_block_size, n_grid)
-                    logger.debug(
-                        "      r1 block %d/%d [%d:%d]",
-                        i + 1, n_r1_blocks, g_r1_0, g_r1_1
-                    )
-                    grid_r1_np, weights_r1_np, xi_phi_r1_np, xi_grad_r1_np = \
-                        _load_r1_block(g_r1_0, g_r1_1)
-                    sh_grid_r1 = jax.device_put(grid_r1_np, rep_sharding)
-                    sh_weights_r1 = jax.device_put(weights_r1_np, rep_sharding)
-                    sh_xi_phi_r1 = _build_k_sharded(xi_phi_r1_np)
-                    sh_xi_grad_r1 = _build_k_sharded(xi_grad_r1_np)
+                K1_contrib, K3_contrib = sharded_compute(
+                    sh_grid_r1, sh_weights_r1,
+                    sh_xi_phi_r1, sh_xi_grad_r1,
+                    sh_grid_r2, sh_weights_r2, sh_xi_phi_r2,
+                    params_rep,
+                )
+                K1_accum = K1_accum + K1_contrib
+                K3_accum = K3_accum + K3_contrib
+                del K1_contrib, K3_contrib
+                del sh_grid_r1, sh_weights_r1, sh_xi_phi_r1, sh_xi_grad_r1
 
-                    K1_contrib, K3_contrib = sharded_compute(
-                        sh_grid_r1, sh_weights_r1,
-                        sh_xi_phi_r1, sh_xi_grad_r1,
-                        sh_grid_r2, sh_weights_r2, sh_xi_phi_r2,
-                        params_rep,
-                    )
-                    K1_kernel_padded += np.asarray(K1_contrib)
-                    K3_kernel_padded += np.asarray(K3_contrib)
+            del sh_grid_r2, sh_weights_r2, sh_xi_phi_r2
 
-                    del sh_grid_r1, sh_weights_r1, sh_xi_phi_r1, sh_xi_grad_r1
-                    del K1_contrib, K3_contrib
-                    gc.collect()
-
-                del sh_grid_r2, sh_weights_r2, sh_xi_phi_r2
-                gc.collect()
-        finally:
-            if f_xi:
-                f_xi.close()
+        # Final D2H gather — single materialisation at the end of the loop.
+        K1_kernel_padded = np.asarray(K1_accum)
+        K3_kernel_padded = np.asarray(K3_accum)
+        del K1_accum, K3_accum
 
         # Strip k-axis padding (zero by construction).
         K1_kernel = K1_kernel_padded[:n_rank]
