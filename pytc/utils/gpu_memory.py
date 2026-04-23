@@ -126,6 +126,121 @@ def _get_gpu_physical_bytes():
         return 80 * 1024 ** 3  # 80 GiB fallback (A100)
 
 
+# ---------------------------------------------------------------------------
+# Generic memory-constrained tile-size solver (used by K-kernel construction)
+# ---------------------------------------------------------------------------
+
+# Reserve this fraction of the probed free budget for XLA workspace, alignment
+# padding, and BFC allocator fragmentation overhead.  Raise if OOMs persist
+# despite the analytical model saying otherwise; lower if the model is proven
+# too conservative.  Documented here (not at the call site) so there is one
+# place to audit the slack.
+K_KERNEL_SAFETY_FRACTION = 0.30
+
+# Largest fraction of the budget that any single replicated/partially-sharded
+# *input* tensor is allowed to occupy on a device.  Without this, a huge
+# replicated ``xi_phi_r2`` can eat the budget and the peak-memory solver will
+# still say "it fits" — but one of the K1 carry transients then has nowhere
+# to land.  Enforcing a ceiling on the biggest input forces host tiling when
+# replication gets pathological, independent of the specific system size.
+#
+# 0.20 is a physically motivated choice: XLA's BFC allocator observably eats
+# 20–30 % of a pool near full occupancy via fragmentation and alignment, so
+# no single input should claim more than about one fifth of the budget —
+# otherwise the remaining headroom is too small to absorb one K1-carry
+# transient (~ 3 n² / m_k * 8 bytes) on top of everything else.
+K_KERNEL_SINGLE_INPUT_MAX_FRACTION = 0.20
+
+
+def solve_tile_sizes(
+    *,
+    budget_bytes: int,
+    fixed_bytes: int,
+    r1_elem_bytes_per_unit: float,
+    r2_elem_bytes_per_unit: float,
+    r1_upper: int,
+    r2_upper: int,
+    r2_single_input_bytes_per_unit: float = None,
+    safety_fraction: float = K_KERNEL_SAFETY_FRACTION,
+    r2_single_input_max_fraction: float = K_KERNEL_SINGLE_INPUT_MAX_FRACTION,
+    r1_floor: int = 1024,
+    r2_floor: int = 1024,
+):
+    """Solve for r1/r2 host tile sizes under an explicit peak-memory model.
+
+    The caller declares:
+
+    * ``budget_bytes`` — total per-device budget (usually the probed free pool).
+    * ``fixed_bytes`` — sum of resident + transient per-device tensors whose
+      size does *not* depend on the tile sizes (carries, scratch, psum bufs).
+    * ``r1_elem_bytes_per_unit`` — how many bytes of per-device memory grow
+      by 1 when ``B_r1`` grows by 1 (typically ``4 * n_rank / m_k * 8`` for
+      K-kernels: xi_phi_r1 + 3 * xi_grad_r1 components, k-sharded).
+    * ``r2_elem_bytes_per_unit`` — same for ``B_r2``.
+    * ``r1_upper``, ``r2_upper`` — absolute caps (usually ``n_grid``).
+    * ``r2_single_input_bytes_per_unit`` — if provided, cap B_r2 so the
+      single biggest r2-side input (e.g. xi_phi_r2 shard) occupies at
+      most ``r2_single_input_max_fraction * budget_bytes``.
+
+    Returns
+    -------
+    dict with ``B_r1``, ``B_r2``, and a ``predicted_peak_bytes`` estimate
+    that is ``fixed_bytes + B_r1 * r1_elem_bytes_per_unit + B_r2 *
+    r2_elem_bytes_per_unit``.  The returned tile sizes satisfy
+    ``predicted_peak_bytes <= budget_bytes * (1 - safety_fraction)``.
+
+    Raises ``RuntimeError`` if ``fixed_bytes`` alone already exceeds the
+    safety-adjusted budget.
+    """
+    if budget_bytes <= 0:
+        raise ValueError(f"budget_bytes must be positive, got {budget_bytes}")
+    usable = budget_bytes * (1.0 - safety_fraction)
+    if fixed_bytes >= usable:
+        raise RuntimeError(
+            f"solve_tile_sizes: fixed-cost {fixed_bytes / 1024 ** 3:.2f} GiB "
+            f"already exceeds safety-adjusted budget "
+            f"{usable / 1024 ** 3:.2f} GiB "
+            f"(budget {budget_bytes / 1024 ** 3:.2f} GiB, "
+            f"safety {safety_fraction:.0%}). "
+            "Use more devices, increase m_k, or lower safety_fraction."
+        )
+
+    remaining = usable - fixed_bytes
+
+    # r1 gets a fixed small slice (it is typically tiny compared to r2).  Start
+    # with a generous r1 cap; r2 gets everything left.
+    # We bound r1 by the remaining headroom / 5 to leave most for r2.
+    r1_frac = 0.2
+    r1_cap_bytes = remaining * r1_frac
+    B_r1 = int(r1_cap_bytes / max(r1_elem_bytes_per_unit, 1.0))
+    B_r1 = max(min(B_r1, r1_upper), r1_floor)
+    # Clamp B_r1 to upper since that is n_grid; never need more.
+    B_r1 = min(B_r1, r1_upper)
+
+    r2_avail = remaining - B_r1 * r1_elem_bytes_per_unit
+    B_r2 = int(r2_avail / max(r2_elem_bytes_per_unit, 1.0))
+
+    if r2_single_input_bytes_per_unit is not None:
+        single_input_cap_bytes = budget_bytes * r2_single_input_max_fraction
+        B_r2_input_cap = int(single_input_cap_bytes
+                             / max(r2_single_input_bytes_per_unit, 1.0))
+        B_r2 = min(B_r2, B_r2_input_cap)
+
+    B_r2 = max(min(B_r2, r2_upper), r2_floor)
+
+    predicted_peak = (
+        fixed_bytes
+        + B_r1 * r1_elem_bytes_per_unit
+        + B_r2 * r2_elem_bytes_per_unit
+    )
+    return {
+        "B_r1": int(B_r1),
+        "B_r2": int(B_r2),
+        "predicted_peak_bytes": int(predicted_peak),
+        "usable_bytes": int(usable),
+    }
+
+
 def _get_gpu_free_bytes():
     """Return the *currently free* GPU memory of the most-constrained local device.
 

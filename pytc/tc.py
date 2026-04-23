@@ -875,60 +875,97 @@ class ISDFTC(TC):
                 gpu_budget_bytes = 50 * (1024 ** 3)
         gpu_budget_bytes = max(int(gpu_budget_bytes), 1)
 
-        # --- Auto-pick mesh_shape, tile sizes --------------------------------
-        # Scratch inflation for K1 output (K1 + 3 K1_slices scratch + psum buf).
-        ALPHA_K1 = 5.0
+        # --- Per-device peak-memory model (bytes, float64) -------------------
+        # Each line item maps to a specific tensor or transient inside the
+        # shard_map'd K-kernel scan. Summed they give the "fixed" footprint
+        # (independent of tile sizes); r1/r2 tile sizes add on top per-element.
+        #
+        # Terminology: the "carry" is the scan accumulator; the "transient"
+        # is the new carry allocated during .at[:,:,c].add() before the old
+        # carry is freed. psum_buf appears only when m_g > 1.
+        def _k_kernel_fixed_bytes(m_k, m_g):
+            k1_carry      = 3.0 * n_rank * n_rank / m_k * 8.0  # (n/m_k, n, 3)
+            k1_transient  = k1_carry                           # same shape during .at.add
+            k1_c_interm   = n_rank * n_rank / m_k * 8.0        # (n/m_k, n)
+            k3_carry      = n_rank * n_rank / m_k * 8.0
+            k3_transient  = k3_carry
+            psum_buf      = k1_carry if m_g > 1 else 0.0
+            return (k1_carry + k1_transient + k1_c_interm
+                    + k3_carry + k3_transient + psum_buf)
 
-        def _k_cost_bytes(m_k):
-            return ALPHA_K1 * 3.0 * n_rank * n_rank / m_k * 8.0
+        # Per-unit elemental costs (bytes per grid point):
+        #   r1 side: xi_phi_r1 + 3 xi_grad_r1 components, k-sharded.
+        #   r2 side: xi_phi_r2 shard, g-sharded on axis 1.
+        def _r1_bytes_per_unit(m_k):
+            return 4.0 * n_rank / m_k * 8.0
 
+        def _r2_bytes_per_unit(m_g):
+            return n_rank / m_g * 8.0
+
+        # --- Auto-pick mesh_shape --------------------------------------------
         if mesh_shape is None:
+            usable = gpu_budget_bytes * (1.0 - gpu_memory.K_KERNEL_SAFETY_FRACTION)
             divisors = [d for d in range(1, n_devices + 1) if n_devices % d == 0]
-            best = None  # (m_k, m_g, k_cost)
+            best = None  # (m_k, m_g, fixed_cost)
             for m_k_try in divisors:
-                k_cost = _k_cost_bytes(m_k_try)
-                # Require at least ~25% of the budget left for r1/r2 tiles.
-                if k_cost >= gpu_budget_bytes * 0.75:
-                    continue
                 m_g_try = n_devices // m_k_try
-                # Rank by (m_g ascending, m_k ascending); m_g=1 means no
-                # cross-device psum on K1, which is strictly cheaper.
+                fixed = _k_kernel_fixed_bytes(m_k_try, m_g_try)
+                # Require the fixed cost alone to leave room for at least
+                # some r1/r2 tiles within the safety-adjusted budget.
+                if fixed >= usable * 0.85:
+                    continue
+                # Rank by (m_g ascending, m_k ascending); m_g=1 avoids a
+                # psum and an extra K1-sized buffer.
                 key = (m_g_try, m_k_try)
                 if best is None or key < (best[1], best[0]):
-                    best = (m_k_try, m_g_try, k_cost)
+                    best = (m_k_try, m_g_try, fixed)
             if best is None:
+                fixed_max = _k_kernel_fixed_bytes(n_devices, 1)
                 raise RuntimeError(
-                    f"compute_kmat_kernels: K1 footprint "
-                    f"({_k_cost_bytes(n_devices) / 1024 ** 3:.1f} GiB at m_k={n_devices}) "
-                    f"exceeds per-device budget "
-                    f"({gpu_budget_bytes / 1024 ** 3:.1f} GiB). "
-                    f"Use more devices or increase gpu_budget_bytes."
+                    f"compute_kmat_kernels: fixed K1/K3 footprint "
+                    f"({fixed_max / 1024 ** 3:.1f} GiB at m_k={n_devices}) "
+                    f"exceeds safety-adjusted budget "
+                    f"({usable / 1024 ** 3:.1f} GiB = "
+                    f"{gpu_budget_bytes / 1024 ** 3:.1f} GiB × "
+                    f"(1 - {gpu_memory.K_KERNEL_SAFETY_FRACTION:.0%})). "
+                    f"Use more devices, or lower K_KERNEL_SAFETY_FRACTION."
                 )
-            m_k, m_g, k_cost = best
+            m_k, m_g, fixed_cost = best
         else:
             m_k, m_g = mesh_shape
             assert m_k * m_g == n_devices, (m_k, m_g, n_devices)
-            k_cost = _k_cost_bytes(m_k)
+            fixed_cost = _k_kernel_fixed_bytes(m_k, m_g)
 
-        remaining = max(gpu_budget_bytes - k_cost, 0.0)
-        # Split the remainder 80/20 between r2 tile and r1 block.
-        r2_budget = 0.8 * remaining
-        r1_budget = 0.2 * remaining
+        # --- Solve for host tile sizes --------------------------------------
+        # xi_phi_r2 is by far the largest single r2-side input; enforce the
+        # K_KERNEL_SINGLE_INPUT_MAX_FRACTION cap on it so one replicated input
+        # cannot eat the whole budget (forces host tiling when replication
+        # becomes pathological, independently of the specific system size).
+        tile_solve = gpu_memory.solve_tile_sizes(
+            budget_bytes=gpu_budget_bytes,
+            fixed_bytes=int(fixed_cost),
+            r1_elem_bytes_per_unit=_r1_bytes_per_unit(m_k),
+            r2_elem_bytes_per_unit=_r2_bytes_per_unit(m_g),
+            r2_single_input_bytes_per_unit=_r2_bytes_per_unit(m_g),
+            r1_upper=n_grid,
+            r2_upper=n_grid,
+        )
+        if host_grid_block_size is None:
+            host_grid_block_size = tile_solve["B_r1"]
+        host_grid_block_size = min(host_grid_block_size, n_grid)
 
         if r2_tile_size is None:
-            # n_rank * r2_tile_size / m_g * 8 <= r2_budget
-            tile_max = int(r2_budget * m_g / (n_rank * 8))
-            r2_tile_size = min(max(tile_max, 1024), n_grid)
+            r2_tile_size = tile_solve["B_r2"]
         r2_tile_size = min(r2_tile_size, n_grid)
         # r2_tile_size must be divisible by m_g (round up).
         if r2_tile_size % m_g != 0:
             r2_tile_size = ((r2_tile_size + m_g - 1) // m_g) * m_g
 
-        if host_grid_block_size is None:
-            # 4 * n_rank * host_grid_block_size / m_k * 8 <= r1_budget
-            r1_max = int(r1_budget * m_k / (4 * n_rank * 8))
-            host_grid_block_size = min(max(r1_max, 1024), n_grid)
-        host_grid_block_size = min(host_grid_block_size, n_grid)
+        predicted_peak = (
+            fixed_cost
+            + host_grid_block_size * _r1_bytes_per_unit(m_k)
+            + r2_tile_size * _r2_bytes_per_unit(m_g)
+        )
 
         # --- Mesh, shardings -------------------------------------------------
         mesh = sharding_core.create_2d_mesh(
@@ -944,10 +981,16 @@ class ISDFTC(TC):
         logger.info(
             "  compute_kmat_kernels: mesh=(m_k=%d, m_g=%d), n_fused=%d, "
             "n_rank_padded=%d, n_grid=%d, host_grid_block_size=%d, "
-            "r2_tile_size=%d, budget=%.1f GiB",
+            "r2_tile_size=%d, budget=%.1f GiB, fixed=%.1f GiB, "
+            "predicted_peak=%.1f GiB (safety=%.0f%%, "
+            "single_input_max=%.0f%%)",
             m_k, m_g, n_rank, n_rank_padded, n_grid,
             host_grid_block_size, r2_tile_size,
             gpu_budget_bytes / (1024 ** 3),
+            fixed_cost / (1024 ** 3),
+            predicted_peak / (1024 ** 3),
+            gpu_memory.K_KERNEL_SAFETY_FRACTION * 100,
+            gpu_memory.K_KERNEL_SINGLE_INPUT_MAX_FRACTION * 100,
         )
 
         # --- HDF5 handles ---------------------------------------------------
