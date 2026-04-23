@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -71,6 +72,391 @@ class TestISDFXTCPanelization(unittest.TestCase):
             atol=1e-9,
             rtol=1e-9,
         )
+
+    def test_delta_u_tile_assembly_matches_public_api(self):
+        kernels = self.isdf_xtc.compute_delta_u_kernels(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        ranges = (slice(0, 2), slice(1, 3), slice(0, 2), slice(1, 3))
+        assembled = self.isdf_xtc._assemble_delta_u_tile(kernels, ranges)
+        public = self.isdf_xtc.get_delta_U(self.jparams, ranges=ranges, batch_size=64)
+        np.testing.assert_allclose(
+            np.asarray(assembled),
+            np.asarray(public),
+            atol=1e-10,
+            rtol=1e-10,
+        )
+
+    def test_delta_u_direct_tile_is_not_chunk_wrapper_for_fitting_tile(self):
+        kernels = self.isdf_xtc.compute_delta_u_kernels(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        ranges = (slice(0, 2), slice(1, 3), slice(0, 2), slice(1, 3))
+        ref = ISDFXTC._contract_delta_U_kernels(self.isdf_xtc, kernels, ranges)
+
+        with mock.patch("pytc.utils.gpu_memory._get_gpu_free_bytes", return_value=10**12):
+            with mock.patch.object(
+                ISDFXTC,
+                "_contract_delta_U_kernels",
+                side_effect=AssertionError("direct tile should not route through chunk scheduler"),
+            ):
+                got = self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges)
+
+        np.testing.assert_allclose(
+            np.asarray(got),
+            np.asarray(ref),
+            atol=1e-10,
+            rtol=1e-10,
+        )
+
+    def test_delta_u_direct_tile_raises_cleanly_when_tile_is_too_large(self):
+        kernels = self.isdf_xtc.compute_delta_u_kernels(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        ranges = (slice(0, 2), slice(1, 3), slice(0, 2), slice(1, 3))
+        with mock.patch.object(
+            ISDFXTC,
+            "_contract_delta_U_kernels",
+            side_effect=AssertionError("direct tile should not route through chunk scheduler"),
+        ):
+            with mock.patch("pytc.xtc._get_device_free_bytes", return_value=1):
+                with self.assertRaises(RuntimeError):
+                    self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges)
+
+    def test_delta_u_direct_tile_padding_trims_back_to_reference(self):
+        kernels = self.isdf_xtc.compute_delta_u_kernels(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        ranges = (slice(0, 1), slice(1, 3), slice(0, 1), slice(1, 3))
+        ref = self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges)
+        padded = self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges, panel_size=2)
+        np.testing.assert_allclose(
+            np.asarray(padded)[:1, :, :1, :],
+            np.asarray(ref),
+            atol=1e-10,
+            rtol=1e-10,
+        )
+
+    def test_isdf_device_cache_reuses_phi_grad_and_d(self):
+        kernels = self.isdf_xtc.compute_delta_u_kernels(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        device = jax.devices("cpu")[0]
+        cache_a = self.isdf_xtc._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_delta_u=True
+        )
+        cache_b = self.isdf_xtc._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_delta_u=True
+        )
+        self.assertIs(cache_a["phi_isdf"], cache_b["phi_isdf"])
+        self.assertIs(cache_a["grad_phi_isdf"], cache_b["grad_phi_isdf"])
+        self.assertIs(cache_a["D"], cache_b["D"])
+
+    def test_isdf_device_cache_reuses_tc_kernels(self):
+        isdf_xtc = self.isdf_xtc.isdf(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        kernels = isdf_xtc.isdf_kernels
+        device = jax.devices("cpu")[0]
+        cache_a = isdf_xtc._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_tc=True
+        )
+        cache_b = isdf_xtc._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_tc=True
+        )
+        self.assertIs(cache_a["K1_kernel"], cache_b["K1_kernel"])
+        self.assertIs(cache_a["K3_kernel"], cache_b["K3_kernel"])
+
+    def test_tc_direct_tile_panel_padding_slice_p_eq_slice_q(self):
+        """Regression: ``_get_tc_direct_tile`` must tolerate panel padding
+        on only one of p/q when ``slice_p == slice_q``.
+
+        Before the fix, the antisymmetrization shortcut
+        ``k12 - k12.transpose(1, 0, 2, 3)`` crashed with
+        ``sub got incompatible shapes for broadcasting`` whenever the
+        panel_layout padded one side of the (p, q) pair but not the
+        other — which happens in the oovv medium block when
+        ``nocc < panel_blk`` (layout ``"pr"`` pads p → panel_size while
+        q stays at nocc).  The slice length must be ≥ 2 to turn the bug
+        into a hard crash instead of a silent NumPy broadcast.
+        """
+        isdf_xtc = self.isdf_xtc.isdf(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        kernels = isdf_xtc.isdf_kernels
+
+        # slice_p == slice_q → antisymmetrization branch.  Use a length-2
+        # slice so panel_size=3 is strictly larger AND the transposed
+        # shape (2, 3, ...) does not broadcast against (3, 2, ...) — this
+        # is the actual bug mode seen in production (nocc=21, panel=22).
+        pq_slice = slice(0, 2)
+        r_slice  = slice(0, 2)
+        s_slice  = slice(0, 2)
+        ranges = (pq_slice, pq_slice, r_slice, s_slice)
+        ref = isdf_xtc._get_tc_direct_tile(kernels, ranges)
+
+        # --- "pr" layout: pads p (axis 0) and r (axis 2) only ------------
+        # Before the fix this call raised TypeError from k12 - k12.T with
+        # shapes (3, 2, 3, 2) vs (2, 3, 3, 2).
+        pr_padded = isdf_xtc._get_tc_direct_tile(
+            kernels, ranges, panel_size=3, panel_layout="pr")
+        # Convention: axes listed in the layout are padded, others are not.
+        self.assertEqual(np.asarray(pr_padded).shape, (3, 2, 3, 2))
+        np.testing.assert_allclose(
+            np.asarray(pr_padded)[:2, :2, :2, :],
+            np.asarray(ref),
+            atol=1e-10, rtol=1e-10,
+        )
+
+        # --- "qr" layout: pads q (axis 1) and r (axis 2) only ------------
+        # Symmetric case — exercises the branch where phi_q is the padded
+        # side and phi_p gets re-padded inside the fix.
+        qr_padded = isdf_xtc._get_tc_direct_tile(
+            kernels, ranges, panel_size=3, panel_layout="qr")
+        self.assertEqual(np.asarray(qr_padded).shape, (2, 3, 3, 2))
+        np.testing.assert_allclose(
+            np.asarray(qr_padded)[:2, :2, :2, :],
+            np.asarray(ref),
+            atol=1e-10, rtol=1e-10,
+        )
+
+    def test_2b_tile_assembly_matches_public_api(self):
+        isdf_xtc = self.isdf_xtc.isdf(
+            self.jparams,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        kernels = isdf_xtc.isdf_kernels
+        ranges = (slice(0, 2), slice(1, 3), slice(0, 2), slice(1, 3))
+        assembled = isdf_xtc._assemble_2b_tile(self.jparams, kernels, ranges)
+        public = isdf_xtc.get_2b(self.jparams, ranges=ranges, batch_size=64)
+        np.testing.assert_allclose(
+            np.asarray(assembled),
+            np.asarray(public),
+            atol=1e-10,
+            rtol=1e-10,
+        )
+
+
+class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
+    """Regression tests for the ``direct + direct.transpose(2,3,0,1)``
+    shortcut in ``_assemble_tc_tile`` and ``_assemble_delta_u_tile``.
+
+    The shortcut is taken when ``slice_p == slice_r and slice_q == slice_s``
+    and was assumed always safe.  It is **only** safe when the panel
+    padding is invariant under the ``(p↔r, q↔s)`` axis swap — i.e. when
+    padded-axis set equals ``{0, 2}`` (``"pr"``).  For ``"qr"`` (pads
+    ``{1, 2}``) and ``"ps"`` (pads ``{0, 3}``) the shortcut broadcast-adds
+    mis-shaped tensors.
+
+    Production manifestation (collaborator's aug-cc-pVDZ benzene run,
+    nocc=14, nvir=114, panel_blk=114)::
+
+        add got incompatible shapes for broadcasting:
+            (14, 114, 114, 114), (114, 114, 14, 114)
+
+    which is exactly the ovov single-tile case (``slice_q == slice_s``
+    when ``i_len == nvir``) with panel_layout ``"qr"``.
+
+    To trigger the crash (not a silent size-1 broadcast) the test fixture
+    needs ``nocc >= 2`` **and** ``nvir >= 2``.  H2/sto-3g (nocc=nvir=1)
+    silently broadcasts size-1 axes; LiH/sto-3g (nocc=2, nvir=4) forces
+    a hard broadcast failure and distinct numerical checks.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        mol = gto.M(
+            atom="Li 0 0 0; H 0 0 1.595",
+            basis="sto-3g",
+            unit="Angstrom",
+            verbose=0,
+        )
+        mf = scf.RHF(mol)
+        mf.kernel()
+
+        jastrow = REXP()
+        cls.jparams = {"alpha": jnp.array([1.0])}
+
+        xtc = XTC.from_pyscf(mf, jastrow, grid_lvl=0)
+        n_rank = max(8, 3 * xtc.n_orb)
+        base_isdf_xtc = ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
+        cls.isdf_xtc = base_isdf_xtc.isdf(
+            cls.jparams, batch_size=64, orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        cls.kernels = cls.isdf_xtc.isdf_kernels
+
+        nmo = int(cls.isdf_xtc.phi_isdf.shape[0])
+        nocc = int(cls.isdf_xtc.nocc)
+        cls.nocc = nocc
+        cls.nvir = nmo - nocc
+        cls.nmo  = nmo
+        # Sanity: need both nocc and nvir >= 2 for hard-failure coverage.
+        assert cls.nocc >= 2 and cls.nvir >= 2, (
+            f"fixture must have nocc>=2 and nvir>=2, got "
+            f"nocc={cls.nocc} nvir={cls.nvir}"
+        )
+
+    # ---------- helpers -------------------------------------------------
+
+    def _ovov_ranges(self):
+        """ovov single-tile ranges: ``slice_p==slice_r``, ``slice_q==slice_s``."""
+        return (
+            slice(0, self.nocc), slice(self.nocc, self.nmo),
+            slice(0, self.nocc), slice(self.nocc, self.nmo),
+        )
+
+    def _vovo_ranges(self):
+        """vovo single-tile ranges: same slice-symmetry pattern."""
+        return (
+            slice(self.nocc, self.nmo), slice(0, self.nocc),
+            slice(self.nocc, self.nmo), slice(0, self.nocc),
+        )
+
+    def _trim_padded(self, padded, layout, p_len, q_len, r_len, s_len):
+        """Slice a padded tile back to its natural (unpadded) extents."""
+        padded = np.asarray(padded)
+        if layout == "pr":
+            return padded[:p_len, :q_len, :r_len, :s_len]
+        if layout == "qr":
+            return padded[:p_len, :q_len, :r_len, :s_len]
+        # "ps"
+        return padded[:p_len, :q_len, :r_len, :s_len]
+
+    def _padded_tile_shape(self, layout, p_len, q_len, r_len, s_len, ps):
+        if layout == "pr":
+            return (ps,    q_len, ps,    s_len)
+        if layout == "qr":
+            return (p_len, ps,    ps,    s_len)
+        return     (ps,    q_len, r_len, ps)   # "ps"
+
+    # ---------- _assemble_tc_tile shortcut ------------------------------
+
+    def _check_assemble_tc_tile_all_layouts(self, ranges, tag):
+        p_len = ranges[0].stop - ranges[0].start
+        q_len = ranges[1].stop - ranges[1].start
+        r_len = ranges[2].stop - ranges[2].start
+        s_len = ranges[3].stop - ranges[3].start
+        ps = self.nmo  # strictly larger than every natural extent
+
+        ref = np.asarray(self.isdf_xtc._assemble_tc_tile(self.kernels, ranges))
+        self.assertEqual(ref.shape, (p_len, q_len, r_len, s_len))
+
+        for layout in ("pr", "qr", "ps"):
+            padded = self.isdf_xtc._assemble_tc_tile(
+                self.kernels, ranges, panel_size=ps, panel_layout=layout,
+            )
+            self.assertEqual(
+                np.asarray(padded).shape,
+                self._padded_tile_shape(layout, p_len, q_len, r_len, s_len, ps),
+                f"{tag}/_assemble_tc_tile: unexpected padded shape for "
+                f"layout={layout!r}",
+            )
+            trimmed = self._trim_padded(padded, layout, p_len, q_len, r_len, s_len)
+            np.testing.assert_allclose(
+                trimmed, ref, atol=1e-10, rtol=1e-10,
+                err_msg=f"{tag}/_assemble_tc_tile mismatch for layout={layout!r}",
+            )
+
+    def test_assemble_tc_tile_ovov_single_tile_all_layouts(self):
+        self._check_assemble_tc_tile_all_layouts(self._ovov_ranges(), "ovov")
+
+    def test_assemble_tc_tile_vovo_single_tile_all_layouts(self):
+        self._check_assemble_tc_tile_all_layouts(self._vovo_ranges(), "vovo")
+
+    # ---------- _assemble_delta_u_tile shortcut -------------------------
+
+    def _check_assemble_delta_u_tile_all_layouts(self, ranges, tag):
+        p_len = ranges[0].stop - ranges[0].start
+        q_len = ranges[1].stop - ranges[1].start
+        r_len = ranges[2].stop - ranges[2].start
+        s_len = ranges[3].stop - ranges[3].start
+        ps = self.nmo
+
+        ref = np.asarray(
+            self.isdf_xtc._assemble_delta_u_tile(self.kernels, ranges)
+        )
+        self.assertEqual(ref.shape, (p_len, q_len, r_len, s_len))
+
+        for layout in ("pr", "qr", "ps"):
+            padded = self.isdf_xtc._assemble_delta_u_tile(
+                self.kernels, ranges, panel_size=ps, panel_layout=layout,
+            )
+            self.assertEqual(
+                np.asarray(padded).shape,
+                self._padded_tile_shape(layout, p_len, q_len, r_len, s_len, ps),
+                f"{tag}/_assemble_delta_u_tile: unexpected padded shape for "
+                f"layout={layout!r}",
+            )
+            trimmed = self._trim_padded(padded, layout, p_len, q_len, r_len, s_len)
+            np.testing.assert_allclose(
+                trimmed, ref, atol=1e-10, rtol=1e-10,
+                err_msg=f"{tag}/_assemble_delta_u_tile mismatch for "
+                        f"layout={layout!r}",
+            )
+
+    def test_assemble_delta_u_tile_ovov_single_tile_all_layouts(self):
+        self._check_assemble_delta_u_tile_all_layouts(
+            self._ovov_ranges(), "ovov")
+
+    def test_assemble_delta_u_tile_vovo_single_tile_all_layouts(self):
+        self._check_assemble_delta_u_tile_all_layouts(
+            self._vovo_ranges(), "vovo")
+
+    # ---------- End-to-end _assemble_2b_tile (TC + ΔU together) --------
+
+    def test_assemble_2b_tile_ovov_single_tile_all_layouts(self):
+        ranges = self._ovov_ranges()
+        p_len, q_len, r_len, s_len = (self.nocc, self.nvir, self.nocc, self.nvir)
+        ps = self.nmo
+
+        ref = np.asarray(
+            self.isdf_xtc._assemble_2b_tile(
+                self.jparams, self.kernels, ranges,
+            )
+        )
+        self.assertEqual(ref.shape, (p_len, q_len, r_len, s_len))
+
+        for layout in ("pr", "qr", "ps"):
+            padded = self.isdf_xtc._assemble_2b_tile(
+                self.jparams, self.kernels, ranges,
+                panel_size=ps, panel_layout=layout,
+            )
+            self.assertEqual(
+                np.asarray(padded).shape,
+                self._padded_tile_shape(layout, p_len, q_len, r_len, s_len, ps),
+                f"ovov/_assemble_2b_tile: unexpected padded shape for "
+                f"layout={layout!r}",
+            )
+            trimmed = self._trim_padded(padded, layout, p_len, q_len, r_len, s_len)
+            np.testing.assert_allclose(
+                trimmed, ref, atol=1e-10, rtol=1e-10,
+                err_msg=f"ovov/_assemble_2b_tile mismatch for "
+                        f"layout={layout!r}",
+            )
 
 
 if __name__ == "__main__":

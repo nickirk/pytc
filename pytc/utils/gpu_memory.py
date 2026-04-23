@@ -22,6 +22,8 @@ Usage
 import logging
 import numpy as np
 
+from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize  # noqa: F401 (re-exported)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -87,9 +89,9 @@ def get_gpu_budget_bytes(gpu_max_memory_mb=None):
     """Return the total usable GPU memory budget in bytes.
 
     If *gpu_max_memory_mb* is provided and > 0 it is treated as the
-    authoritative limit (no runtime query).  Otherwise we try
-    ``jax.devices()[0].memory_stats()`` and fall back to a conservative
-    16 GiB default.
+    authoritative limit (no runtime query).  Otherwise the minimum
+    ``bytes_limit`` across all local devices is used, falling back to a
+    conservative 16 GiB default.
 
     Returns
     -------
@@ -101,49 +103,53 @@ def get_gpu_budget_bytes(gpu_max_memory_mb=None):
 
     try:
         import jax
-        stats = jax.devices()[0].memory_stats()
-        return int(stats['bytes_limit'])
+        limits = [int(d.memory_stats()['bytes_limit'])
+                  for d in jax.local_devices()]
+        return min(limits) if limits else 16 * 1024 ** 3
     except Exception:
         return 16 * 1024 ** 3  # 16 GiB fallback
 
 
 def _get_gpu_physical_bytes():
-    """Return the physical GPU memory capacity in bytes.
+    """Return the minimum GPU pool limit across all local devices.
 
-    Queries the actual hardware limit (total device memory), which is
-    independent of JAX's pre-allocation fraction.
+    Uses ``bytes_limit`` (JAX's pre-allocation pool) as a conservative proxy
+    for physical capacity.  Taking the minimum ensures that block-size
+    estimates are safe for the most memory-constrained device.
     """
     try:
         import jax
-        stats = jax.devices()[0].memory_stats()
-        # bytes_limit is JAX's pool limit (fraction of physical).
-        # For the *physical* capacity we want the pool limit divided by
-        # the pre-allocation fraction — but that's tricky to get.
-        # Instead, return bytes_limit as a conservative proxy.
-        return int(stats['bytes_limit'])
+        limits = [int(d.memory_stats()['bytes_limit'])
+                  for d in jax.local_devices()]
+        return min(limits) if limits else 80 * 1024 ** 3
     except Exception:
         return 80 * 1024 ** 3  # 80 GiB fallback (A100)
 
 
 def _get_gpu_free_bytes():
-    """Return the *currently free* GPU memory inside JAX's pre-allocated pool.
+    """Return the *currently free* GPU memory of the most-constrained local device.
 
-    This accounts for JAX's pre-allocation fraction (default 75% of physical)
-    AND any tensors that are already resident on the device.  Much safer than
-    ``bytes_limit`` which ignores current allocations.
+    Takes the minimum across all local devices so that tile sizing is
+    conservative for every GPU in the job, not just device 0.
 
     Falls back to ``_get_gpu_physical_bytes() * 0.75`` if stats are unavailable.
     """
     try:
         import jax
-        stats = jax.devices()[0].memory_stats()
-        pool_limit = int(stats['bytes_limit'])
-        in_use = int(stats.get('bytes_in_use', 0))
-        free = pool_limit - in_use
-        logger.debug(
-            "_get_gpu_free_bytes: pool_limit=%.2f GB, in_use=%.2f GB, free=%.2f GB",
-            pool_limit / 1e9, in_use / 1e9, free / 1e9)
-        return max(free, 0)
+        min_free = None
+        for d in jax.local_devices():
+            stats = d.memory_stats()
+            pool_limit = int(stats['bytes_limit'])
+            in_use = int(stats.get('bytes_in_use', 0))
+            free = max(pool_limit - in_use, 0)
+            logger.debug(
+                "_get_gpu_free_bytes: device=%s pool_limit=%.2f GB, "
+                "in_use=%.2f GB, free=%.2f GB",
+                getattr(d, 'id', repr(d)),
+                pool_limit / 1e9, in_use / 1e9, free / 1e9)
+            if min_free is None or free < min_free:
+                min_free = free
+        return min_free if min_free is not None else int(_get_gpu_physical_bytes() * 0.75)
     except Exception:
         return int(_get_gpu_physical_bytes() * 0.75)
 
@@ -474,6 +480,238 @@ def estimate_blksize(nocc, nvir, phase, *,
         available / 1e9, per_blk / 1e6, blksize)
 
     return blksize, budget
+
+
+def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
+                            include_eris, include_accumulators,
+                            n_fused, safety_factor):
+    """Return ``(usable, gpu_target, resident_gb_parts)`` for panel estimators.
+
+    Shared boilerplate extracted from ``estimate_vvvv_panel_blksize`` and
+    ``estimate_v3o_panel_blksize`` so the two never drift apart.
+
+    Returns
+    -------
+    usable : int
+        Bytes available after subtracting persistent CCSD residents.
+    gpu_target : int
+        ``(usable - resident_isdf_constants) * safety_factor`` — the budget
+        a single tile must fit within.
+    log_parts : dict
+        Intermediate values for debug logging (resident breakdown).
+    """
+    O, V, B = nocc, nvir, 8
+    Nf = n_fused if n_fused is not None else 0
+
+    gpu_budget = get_gpu_budget_bytes(gpu_max_memory_mb)
+    persistent = estimate_persistent_gpu_bytes(
+        nocc, nvir,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+    )
+    gpu_free = _get_gpu_free_bytes()
+    usable = max(min(max(gpu_budget - persistent, 0), gpu_free), 0)
+
+    nmo = O + V
+    d_bytes   = Nf * Nf * B
+    tc_bytes  = 4 * Nf * Nf * B if Nf > 0 else 0   # K1, K3, D, X kernel matrices
+    phi_bytes = 4 * nmo * Nf * B if Nf > 0 else 0   # phi panels (4 copies)
+    resident_isdf = d_bytes + tc_bytes + phi_bytes
+
+    gpu_target = max(int(max(usable - resident_isdf, 0) * safety_factor), 0)
+
+    log_parts = dict(
+        usable=usable,
+        resident_isdf=resident_isdf,
+        d_bytes=d_bytes,
+        tc_bytes=tc_bytes,
+        phi_bytes=phi_bytes,
+        gpu_target=gpu_target,
+        Nf=Nf,
+    )
+    return usable, gpu_target, log_parts
+
+
+def estimate_vvvv_panel_blksize(nocc, nvir, *,
+                                gpu_max_memory_mb=None,
+                                include_eris=False,
+                                include_accumulators=False,
+                                naux=None,
+                                n_fused=None,
+                                safety_factor=0.5):
+    """Estimate a safe square ``(p, r)`` tile size for panelised VVVV work.
+
+    Tile shape is ``(blk, nvir, blk, nvir)`` — both the p and r virtual
+    indices are sliced.  Peak device memory per tile:
+
+    - ISDF kernel cost for tile ``(blk, V, blk, V)`` via
+      :func:`~pytc.utils.tile_memory.isdf_tile_peak_bytes`
+    - DF operands ``L_p`` and ``L_r``: ``2 × blk × V × naux``
+    - CCSD contraction output ``t2new[:, :, blk, blk]``: ``O² × blk²``
+    """
+    O, V, B = nocc, nvir, 8
+    Nf = n_fused if n_fused is not None else 0
+
+    usable, gpu_target, lp = _budget_for_tile_sizing(
+        nocc, nvir, gpu_max_memory_mb,
+        include_eris, include_accumulators, n_fused, safety_factor,
+    )
+
+    def tile_bytes(blk):
+        isdf   = isdf_tile_peak_bytes(blk, V, blk, V, Nf) if Nf > 0 else 2 * blk * V * blk * V * B
+        df     = 2 * blk * V * naux * B if (naux is not None and naux > 0) else 0
+        ccsd   = O * O * blk * blk * B   # t2new slice on GPU
+        return isdf + df + ccsd
+
+    best = find_max_blksize(tile_bytes, lo=1, hi=max(1, nvir),
+                            gpu_target=gpu_target)
+    best = max(1, min(best, nvir))
+
+    logger.debug(
+        "estimate_vvvv_panel_blksize: usable=%.2f GB, resident=%.2f GB "
+        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
+        "naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
+        usable / 1e9, lp["resident_isdf"] / 1e9,
+        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["phi_bytes"] / 1e9,
+        lp["gpu_target"] / 1e9, naux, n_fused, best, tile_bytes(best) / 1e9,
+    )
+    return best, usable
+
+
+def resolve_vvvv_panel_block_sizes(nocc, nvir, *,
+                                   p_block_size=None,
+                                   r_block_size=None,
+                                   gpu_max_memory_mb=None,
+                                   include_eris=False,
+                                   include_accumulators=False,
+                                   naux=None,
+                                   n_fused=None):
+    """Resolve one square VVVV panel size from overrides or a VRAM estimate."""
+    auto_blk, _ = estimate_vvvv_panel_blksize(
+        nocc, nvir,
+        gpu_max_memory_mb=gpu_max_memory_mb,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+        naux=naux,
+        n_fused=n_fused,
+    )
+    if p_block_size is not None and r_block_size is not None and int(p_block_size) != int(r_block_size):
+        raise ValueError(
+            "Balanced VVVV tiling requires vvvv_p_block_size == vvvv_r_block_size. "
+            "Set only one override or use the same value for both."
+        )
+
+    panel_blk = p_block_size or r_block_size or auto_blk
+    panel_blk = max(1, min(int(panel_blk), nvir))
+    logger.debug(
+        "Resolved square VVVV panel block: panel_blk=%d (auto=%d)",
+        panel_blk, auto_blk,
+    )
+    return panel_blk, panel_blk
+
+
+def estimate_v3o_panel_blksize(nocc, nvir, *,
+                               gpu_max_memory_mb=None,
+                               host_max_memory_mb=None,
+                               include_eris=False,
+                               include_accumulators=False,
+                               naux=None,
+                               n_fused=None,
+                               safety_factor=0.5):
+    """Estimate a safe virtual tile size for balanced 3V1O (ovvv/vovv) builds.
+
+    Both ovvv and vovv tiles are padded to shape ``(nvir, ps, ps, nvir)``
+    where ``ps = max(nocc, blk)``.  Peak device memory per tile:
+
+    - ISDF kernel cost for ``(V, ps, ps, V)`` via
+      :func:`~pytc.utils.tile_memory.isdf_tile_peak_bytes`
+    - DF L_vv slabs: ``2 × blk × V × naux``
+
+    The minimum viable ``blk`` is ``nocc`` because ``panel_size`` is floored
+    at ``nocc`` in ``_compute_large_blocks``.
+    """
+    O, V, B = nocc, nvir, 8
+    Nf = n_fused if n_fused is not None else 0
+
+    usable, gpu_target, lp = _budget_for_tile_sizing(
+        nocc, nvir, gpu_max_memory_mb,
+        include_eris, include_accumulators, n_fused, safety_factor,
+    )
+
+    host_target = None
+    if host_max_memory_mb is not None and host_max_memory_mb > 0:
+        host_budget = int(host_max_memory_mb * 1e6)
+        host_target = int(host_budget * 0.25)
+
+    def tile_bytes(blk):
+        # panel_size is the actual JIT-compiled shape: max(nocc, blk).
+        # Both ovvv (layout="pr") and vovv (layout="qr") tiles are padded to
+        # (V, ps, ps, V) — see _compute_large_blocks.
+        ps = max(nocc, blk)
+        isdf = isdf_tile_peak_bytes(V, ps, ps, V, Nf) if Nf > 0 else 2 * V * ps * ps * V * B
+        df   = 2 * blk * V * naux * B if (naux is not None and naux > 0) else 0
+        return isdf + df
+
+    def host_slab_bytes(blk):
+        # CPU slab written to HDF5 per tile: (nvir, nocc, blk, nvir)
+        return V * O * blk * V * B
+
+    # Start search at nocc: panel_size = max(nocc, blk) is flat below nocc.
+    best = find_max_blksize(
+        tile_bytes,
+        lo=nocc, hi=max(nocc, nvir),
+        gpu_target=gpu_target,
+        host_target=host_target,
+        host_bytes_fn=host_slab_bytes if host_target is not None else None,
+    )
+    best = max(nocc, min(best, nvir))
+
+    if gpu_target > 0 and tile_bytes(nocc) > gpu_target:
+        logger.warning(
+            "estimate_v3o_panel_blksize: minimum tile (blk=%d) needs %.2f GB "
+            "but gpu_target=%.2f GB — returning minimum anyway. "
+            "Consider raising gpu_max_memory or reducing system size.",
+            nocc, tile_bytes(nocc) / 1e9, gpu_target / 1e9,
+        )
+
+    logger.debug(
+        "estimate_v3o_panel_blksize: usable=%.2f GB, resident=%.2f GB "
+        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
+        "host_target=%s GB, naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
+        usable / 1e9, lp["resident_isdf"] / 1e9,
+        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["phi_bytes"] / 1e9,
+        lp["gpu_target"] / 1e9,
+        "None" if host_target is None else f"{host_target / 1e9:.2f}",
+        naux, n_fused, best, tile_bytes(best) / 1e9,
+    )
+    return best, usable
+
+
+def resolve_v3o_panel_block_size(nocc, nvir, *,
+                                 block_size=None,
+                                 gpu_max_memory_mb=None,
+                                 host_max_memory_mb=None,
+                                 include_eris=False,
+                                 include_accumulators=False,
+                                 naux=None,
+                                 n_fused=None):
+    """Resolve one square virtual panel size for balanced 3V1O tile builds."""
+    auto_blk, _ = estimate_v3o_panel_blksize(
+        nocc, nvir,
+        gpu_max_memory_mb=gpu_max_memory_mb,
+        host_max_memory_mb=host_max_memory_mb,
+        include_eris=include_eris,
+        include_accumulators=include_accumulators,
+        naux=naux,
+        n_fused=n_fused,
+    )
+    panel_blk = block_size or auto_blk
+    panel_blk = max(1, min(int(panel_blk), nvir))
+    logger.debug(
+        "Resolved square V3O panel block: panel_blk=%d (auto=%d)",
+        panel_blk, auto_blk,
+    )
+    return panel_blk
 
 
 def adaptive_rank_block_size(Np, Nq, N_fused, *,

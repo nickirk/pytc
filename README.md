@@ -1,4 +1,4 @@
-# pytc
+# PyTC
 
 ![CI](https://github.com/nickirk/pytc/actions/workflows/ci.yml/badge.svg)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
