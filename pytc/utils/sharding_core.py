@@ -24,6 +24,35 @@ def create_1d_mesh(devices=None, axis_name: str = "devices") -> Mesh:
     return Mesh(devices, axis_names=(axis_name,))
 
 
+def create_2d_mesh(devices, shape, axis_names=("k_ax", "g_ax")) -> Mesh:
+    """Create a 2D mesh of the given shape over ``devices``.
+
+    ``shape`` is ``(m_0, m_1)`` with ``m_0 * m_1 == len(devices)``.
+    """
+    m0, m1 = shape
+    assert m0 * m1 == len(devices), (m0, m1, len(devices))
+    device_grid = np.asarray(devices).reshape(m0, m1)
+    return Mesh(device_grid, axis_names=axis_names)
+
+
+def choose_2d_mesh_shape(n_devices: int, n_fused: int, n_grid: int):
+    """Pick (m_k, m_g) factorization of ``n_devices`` that minimises
+    the dominant per-device memory in K-kernel construction.
+
+    Peak per-device cost balances replicated K1 (~3*n_fused^2 / m_k)
+    against replicated-along-k xi_phi_r2 (~n_fused*n_grid / m_g).
+
+    Optimal continuous m_k is sqrt(3*n_fused*n_devices / n_grid); we
+    snap to the nearest divisor of n_devices.
+    """
+    if n_devices <= 1:
+        return (1, 1)
+    divisors = [d for d in range(1, n_devices + 1) if n_devices % d == 0]
+    m_k_opt = (3.0 * float(n_fused) * n_devices / max(float(n_grid), 1.0)) ** 0.5
+    m_k = min(divisors, key=lambda d: (abs(d - m_k_opt), d))
+    return (m_k, n_devices // m_k)
+
+
 def get_partitioned_sharding(mesh: Mesh, axis_name: str = "devices") -> NamedSharding:
     """Return sharding that partitions along one leading logical axis."""
     return NamedSharding(mesh, P(axis_name))
