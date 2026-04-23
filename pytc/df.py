@@ -332,12 +332,14 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         grad_chol.append(chol_c)
         grad_lower.append(lower_c)
 
-    # Multi-device: shard the grid axis of each batch across devices; replicate factors.
-    all_devices = jax.devices()
-    n_devices = len(all_devices)
+    # Multi-device: shard the grid axis of each batch across local devices;
+    # replicate factors. Use local_devices() so this is safe under multi-process
+    # JAX (arrays can only be placed on devices visible to this process).
+    local_devices = jax.local_devices()
+    n_devices = len(local_devices)
     use_sharding = n_devices > 1
     if use_sharding:
-        mesh = Mesh(np.array(all_devices), ('g',))
+        mesh = Mesh(np.array(local_devices), ('g',))
         grid_shard = NamedSharding(mesh, P(None, 'g'))
         repl = NamedSharding(mesh, P())
         phi_chol = jax.device_put(phi_chol, repl)
