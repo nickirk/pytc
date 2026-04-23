@@ -332,19 +332,19 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         grad_chol.append(chol_c)
         grad_lower.append(lower_c)
 
-    # Multi-GPU: shard the grid axis of each batch across devices; replicate factors.
-    gpu_devices = [d for d in jax.devices() if d.platform == 'gpu']
-    n_devices = len(gpu_devices)
+    # Multi-device: shard the grid axis of each batch across devices; replicate factors.
+    all_devices = jax.devices()
+    n_devices = len(all_devices)
     use_sharding = n_devices > 1
     if use_sharding:
-        mesh = Mesh(np.array(gpu_devices), ('g',))
+        mesh = Mesh(np.array(all_devices), ('g',))
         grid_shard = NamedSharding(mesh, P(None, 'g'))
         repl = NamedSharding(mesh, P())
         phi_chol = jax.device_put(phi_chol, repl)
         phi_piv_d = jax.device_put(phi_piv, repl)
         grad_chol = [jax.device_put(c, repl) for c in grad_chol]
         grad_phi_piv_d = jax.device_put(grad_phi_piv, repl)
-        logger.info(f"  Multi-GPU sharding enabled across {n_devices} devices (grid axis)")
+        logger.info(f"  Multi-device sharding enabled across {n_devices} devices (grid axis)")
     else:
         phi_piv_d = phi_piv
         grad_phi_piv_d = grad_phi_piv
