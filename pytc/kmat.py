@@ -285,16 +285,17 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
         G1_init = jnp.zeros((n_fused_r1, batch_size, 3))
         G1, _ = jax.lax.scan(inner_scan, G1_init, jnp.arange(n_batches_r1))
 
-        # Contract r2:
-        # K1_batch_{k,l,c} = sum_b G1_{k,b,c} * xi_phi_batch_{l,b} * w2_batch_{b}
-        # Use matmul per component and stack to avoid copies
-        K1_slices = []
+        # Contract r2 and accumulate each component directly into carry; avoids
+        # holding all three (n_fused_r1, n_fused_r2) slices and a stacked
+        # (n_fused_r1, n_fused_r2, 3) tensor concurrently. XLA can fuse the
+        # scatter-add into the donated scan carry.
+        new_carry = carry
         for c in range(3):
-            G1_w = G1[:, :, c] * w2_batch[None, :]  # (N_fused_r1, batch)
-            K1_slices.append(jnp.matmul(G1_w, xi_phi_batch.T))
-        K1_batch = jnp.stack(K1_slices, axis=-1)
+            G1_w = G1[:, :, c] * w2_batch[None, :]              # (N_fused_r1, batch)
+            K1_c = jnp.matmul(G1_w, xi_phi_batch.T)             # (N_fused_r1, N_fused_r2)
+            new_carry = new_carry.at[:, :, c].add(K1_c)
 
-        return carry + K1_batch, None
+        return new_carry, None
 
     init_val = jnp.zeros((n_fused_r1, n_fused_r2, 3))
     K1_kernel, _ = jax.lax.scan(outer_scan, init_val, jnp.arange(n_batches_r2))
