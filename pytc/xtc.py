@@ -210,13 +210,19 @@ def _estimate_delta_u_contraction_bytes(Np, Nq, Nr, Ns, N_rank):
     return x_sliced_size_bytes, d_size_bytes, scan_carry_bytes, total_needed_bytes
 
 
-def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
+def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank, *, include_d=True):
     """Estimate device memory for the balanced direct Delta U tile kernel.
 
     Delegates to the canonical formula in
     :func:`pytc.utils.tile_memory.isdf_tile_peak_bytes` so that the runtime
     memory guard and the build-phase estimators in ``gpu_memory.py`` always
     agree.
+
+    ``include_d`` should be False when D is already a persistent on-device
+    resident (cached by the per-device cache); otherwise D gets counted both
+    in ``in_use`` (via the free-bytes probe) and again in the total peak —
+    effectively doubling its contribution and triggering spurious "tile
+    exceeds device memory" refusals.
     """
     from pytc.utils.tile_memory import isdf_tile_peak_bytes as _peak
     B = 8
@@ -224,7 +230,7 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
     x_size_bytes   = int(Nr * Ns * N_rank * B)
     cpq_size_bytes = int(Np * Nq * N_rank * B)
     out_size_bytes = int(Np * Nq * Nr * Ns * B)
-    total = _peak(Np, Nq, Nr, Ns, N_rank, include_d=True)
+    total = _peak(Np, Nq, Nr, Ns, N_rank, include_d=include_d)
     return {
         "D":   d_size_bytes,
         "X":   x_size_bytes,
@@ -2236,7 +2242,13 @@ class ISDFXTC(XTC, ISDFTC):
         Nr = panel_size if panel_size is not None and "r" in panel_layout else r_len
         Ns_eff = panel_size if panel_size is not None and "s" in panel_layout else Ns
 
-        mem = _estimate_delta_u_direct_tile_bytes(Np, Nq_eff, Nr, Ns_eff, N_rank)
+        # D is already counted in ``in_use`` when it's resident in the cache,
+        # so don't add it again to the peak estimate — that would double its
+        # contribution and wrongly refuse tiles that actually fit.
+        mem = _estimate_delta_u_direct_tile_bytes(
+            Np, Nq_eff, Nr, Ns_eff, N_rank,
+            include_d=(D_resident is None),
+        )
         total_needed_bytes = mem["total"]
         threshold_bytes = int(_get_device_free_bytes(device) * 0.5)
         if total_needed_bytes >= threshold_bytes:
@@ -2244,7 +2256,8 @@ class ISDFXTC(XTC, ISDFTC):
                 "Delta U direct tile exceeds available device memory: "
                 f"need ~{total_needed_bytes / (1024.0 ** 3):.2f} GiB for "
                 f"tile ({Np}, {Nq_eff}, {Nr}, {Ns_eff}), have "
-                f"~{threshold_bytes / (1024.0 ** 3):.2f} GiB usable. "
+                f"~{threshold_bytes / (1024.0 ** 3):.2f} GiB usable "
+                f"(D_resident={D_resident is not None}). "
                 "Reduce the solver tile panel size."
             )
 
