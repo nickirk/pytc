@@ -26,6 +26,32 @@ from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize  # noq
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Per-tile absolute size ceiling (asymmetric-tile phases only)
+# ---------------------------------------------------------------------------
+# Raising ``gpu_max_memory`` to help one phase (e.g. VVVV, tile ~10 GB
+# symmetric shape) can push another phase's tile across a cuBLAS / XLA
+# autotuning cliff.  Empirically observed on B200 (HBM=180 GB) at benzene
+# cc-pCV5Z (n_fused=25961, nvir=1179):
+#
+#   OVVV (asymmetric ``(blk, V, V, O)`` output fusion):
+#     blksize=89  → tile ≈ 21 GB → succeeds
+#     blksize=193 → tile ≈ 45 GB → "No valid config found!"  (autotuner
+#                                  cannot find a cuBLAS config whose
+#                                  workspace fits alongside the tile).
+#
+#   VVVV / V3O (symmetric ``(blk, V, blk, V)`` / ``(V, ps, ps, V)``):
+#     tile can exceed 50 GB without hitting any autotune cliff.
+#
+# So the cliff is specific to the ASYMMETRIC tile shapes handled by the
+# generic ``estimate_blksize`` path (OVVV / VOVV / similar).  The ceiling
+# below is applied ONLY in that generic path.  ``estimate_vvvv_panel_blksize``
+# and ``estimate_v3o_panel_blksize`` deliberately do NOT cap themselves
+# with this constant — their symmetric tile shapes do not trigger the
+# cuBLAS autotuner cliff at the sizes currently seen in benchmarks.
+SAFE_TILE_BYTES_CEILING = 25 * 10 ** 9  # ~25 GB per tile
+
 # ---------------------------------------------------------------------------
 # Persistent GPU residents
 # ---------------------------------------------------------------------------
@@ -633,16 +659,22 @@ def estimate_blksize(nocc, nvir, phase, *,
     else:
         raise ValueError(f"Unknown phase: {phase!r}")
 
-    # 4. Safety margin (20%) ---------------------------------------------------
+    # 4. Safety margin (20%) + per-tile ceiling -------------------------------
     usable = available * 0.8
-    blksize = max(1, int(usable / per_blk))
+    # Absolute per-tile cap — protects against pushing small-per-blk phases
+    # past the cuBLAS/XLA autotuning cliff when gpu_max_memory is big.
+    capped_usable = min(usable, SAFE_TILE_BYTES_CEILING)
+    blksize = max(1, int(capped_usable / per_blk))
     blksize = min(nvir, blksize)
 
+    bound_by = "ceiling" if capped_usable < usable else "budget"
     logger.debug(
         "estimate_blksize(phase=%s): budget=%.2f GB, persistent=%.2f GB, "
-        "available=%.2f GB, per_blk=%.2f MB → blksize=%d",
+        "available=%.2f GB, per_blk=%.2f MB, ceiling=%.2f GB "
+        "→ blksize=%d (bound by %s)",
         phase, budget / 1e9, persistent / 1e9,
-        available / 1e9, per_blk / 1e6, blksize)
+        available / 1e9, per_blk / 1e6,
+        SAFE_TILE_BYTES_CEILING / 1e9, blksize, bound_by)
 
     return blksize, budget
 
@@ -749,6 +781,11 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
         ccsd   = O * O * blk * blk * B   # t2new slice on GPU
         return isdf + df + ccsd
 
+    # VVVV tile is a symmetric (blk, V, blk, V) shape that empirically does
+    # not hit the cuBLAS autotune cliff even when total tile bytes exceed
+    # SAFE_TILE_BYTES_CEILING — so this path is NOT capped by the ceiling.
+    # (The ceiling is only applied in the generic estimate_blksize path,
+    # which handles the asymmetric OVVV tile that DID hit the cliff.)
     best = find_max_blksize(tile_bytes, lo=1, hi=max(1, nvir),
                             gpu_target=gpu_target)
     best = max(1, min(best, nvir))
@@ -844,6 +881,8 @@ def estimate_v3o_panel_blksize(nocc, nvir, *,
         return V * O * blk * V * B
 
     # Start search at nocc: panel_size = max(nocc, blk) is flat below nocc.
+    # V3O tiles are symmetric (V, ps, ps, V) — same rationale as VVVV for
+    # not applying SAFE_TILE_BYTES_CEILING here.
     best = find_max_blksize(
         tile_bytes,
         lo=nocc, hi=max(nocc, nvir),
