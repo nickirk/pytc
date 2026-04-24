@@ -240,7 +240,7 @@ class TestStreamingContractionParity(unittest.TestCase):
         self.rbs = 16
 
     def _reference_K1_minus_K2(self):
-        from pytc.kmat import contract_K1_minus_K2_isdf_jit
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf_jit
         return np.asarray(contract_K1_minus_K2_isdf_jit(
             self.phi, self.phi, self.phi, self.phi,
             self.grad_phi, self.grad_phi, self.U1, self.rbs,
@@ -253,7 +253,7 @@ class TestStreamingContractionParity(unittest.TestCase):
         ))
 
     def test_K1_minus_K2_resident_fast_path_matches_jit(self):
-        from pytc.kmat import contract_K1_minus_K2_isdf
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf
         ref = self._reference_K1_minus_K2()
         out = np.asarray(contract_K1_minus_K2_isdf(
             self.phi, self.phi, self.phi, self.phi,
@@ -263,7 +263,7 @@ class TestStreamingContractionParity(unittest.TestCase):
         np.testing.assert_allclose(out, ref, atol=1e-14, rtol=0)
 
     def test_K1_minus_K2_streaming_host_matches_jit(self):
-        from pytc.kmat import contract_K1_minus_K2_isdf
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf
         ref = self._reference_K1_minus_K2()
         U1_host = np.asarray(self.U1)  # explicitly on host
         for panel_size in (16, 32, 48):  # none divides n_fused=97 evenly
@@ -278,7 +278,7 @@ class TestStreamingContractionParity(unittest.TestCase):
             )
 
     def test_K1_minus_K2_streaming_device_matches_jit(self):
-        from pytc.kmat import contract_K1_minus_K2_isdf
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf
         ref = self._reference_K1_minus_K2()
         for panel_size in (16, 32, 48):
             out = np.asarray(contract_K1_minus_K2_isdf(

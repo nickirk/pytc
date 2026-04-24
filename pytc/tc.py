@@ -1686,7 +1686,7 @@ class ISDFTC(TC):
                     panel_size=k_panel)
                 k12 = k12 - k12.transpose(1, 0, 2, 3)
             else:
-                k12 = kmat_jax.contract_K1_minus_K2_isdf(
+                k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
                     phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
                     panel_size=k_panel)
 
