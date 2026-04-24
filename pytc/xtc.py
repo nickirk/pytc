@@ -2250,7 +2250,13 @@ class ISDFXTC(XTC, ISDFTC):
             include_d=(D_resident is None),
         )
         total_needed_bytes = mem["total"]
-        threshold_bytes = int(_get_device_free_bytes(device) * 0.5)
+        # Safety factor on top of the analytical peak estimate. 0.7 leaves
+        # ~43 % head-room for XLA workspace / BFC fragmentation on top of
+        # the estimate (which already counts D, X_sliced, C_pq × 2, C_rs,
+        # and 2 × out). 0.5 (the prior value) gave 2× head-room, which
+        # was too conservative — it refused tiles that in practice fit
+        # by a few GiB once the D double-count bug was removed.
+        threshold_bytes = int(_get_device_free_bytes(device) * 0.7)
         if total_needed_bytes >= threshold_bytes:
             raise RuntimeError(
                 "Delta U direct tile exceeds available device memory: "
