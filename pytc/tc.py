@@ -119,9 +119,46 @@ def _cache_d_on_device(device, arr, *, fraction=0.35):
 
 
 def _cache_tc_kernels_on_device(device, u1, u3, *, fraction=0.30):
-    """Whether persistent TC kernels should be cached on one device."""
+    """Whether persistent TC kernels should be cached on one device.
+
+    Kept for API compatibility with call-sites that only want a bool.
+    """
+    return _choose_tc_kernel_strategy(device, u1, u3, fraction=fraction)[0]
+
+
+def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
+    """Decide how TC kernels (K1 + K3) should be kept for tile consumption.
+
+    Returns ``(resident, panel_size)``:
+      * ``(True, None)``   — K1 + K3 fit comfortably on ``device``; keep them
+        resident. Consumers call the streaming wrapper with ``panel_size=None``
+        which delegates to the existing JIT unchanged.
+      * ``(False, int)``   — K1 + K3 would claim too large a share of the
+        device budget, leaving no room for tile transients. Caller should keep
+        the kernels on host; panel_size is the axis-1 slab width the consumer
+        should stream in per call.
+
+    ``fraction`` is the per-device share (of probed free memory) above which
+    we switch to streaming. 0.15 leaves >= 80 % of the budget for tile
+    transients (K1_transient / scratch / D / phi), which matches the scratch
+    profile observed empirically on A100-80G at n_fused ~25k.
+    """
     total = _array_nbytes(u1) + _array_nbytes(u3)
-    return total <= int(_get_local_device_free_bytes(device) * fraction)
+    free_bytes = _get_local_device_free_bytes(device)
+    if total <= int(free_bytes * fraction):
+        return True, None
+
+    # Streaming: pick panel_size so each K1 panel claims at most ~0.08 of
+    # the budget (generous head-room for device_put + padded/scannable
+    # transients inside the JIT, which bloat ~3x per panel).
+    n_fused = u1.shape[1]
+    panel_bytes_cap = int(free_bytes * 0.08)
+    # K1 panel element stride is n_fused * 3 * 8 bytes per axis-1 column;
+    # K3 panel is smaller (no c component) so K1 dominates.
+    bytes_per_axis1 = u1.shape[0] * 3 * 8
+    panel_size = max(1024, panel_bytes_cap // max(bytes_per_axis1, 1))
+    panel_size = min(int(panel_size), n_fused)
+    return False, panel_size
 
 
 def _pad_axis(arr, axis, target):
@@ -740,20 +777,31 @@ class ISDFTC(TC):
             need_u1 = "K1_kernel" in kernels and "K1_kernel" not in cache
             need_u3 = "K3_kernel" in kernels and "K3_kernel" not in cache
             if need_u1 or need_u3:
-                if _cache_tc_kernels_on_device(
-                    device, kernels["K1_kernel"], kernels["K3_kernel"]
-                ):
+                resident, panel_size = _choose_tc_kernel_strategy(
+                    device, kernels["K1_kernel"], kernels["K3_kernel"],
+                )
+                if resident:
                     logger.debug(
-                        "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB)",
+                        "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB, resident)",
                         getattr(device, "id", "host"),
                         _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
                         _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
                     )
                     cache["K1_kernel"] = jax.device_put(np.asarray(kernels["K1_kernel"]), device)
                     cache["K3_kernel"] = jax.device_put(np.asarray(kernels["K3_kernel"]), device)
+                    cache["K_stream_panel"] = None
                 else:
-                    cache["K1_kernel"] = None
-                    cache["K3_kernel"] = None
+                    logger.info(
+                        "Streaming TC kernels from host on device %s "
+                        "(K1=%.2f GiB, K3=%.2f GiB, panel_size=%d)",
+                        getattr(device, "id", "host"),
+                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                        panel_size,
+                    )
+                    cache["K1_kernel"] = np.asarray(kernels["K1_kernel"])
+                    cache["K3_kernel"] = np.asarray(kernels["K3_kernel"])
+                    cache["K_stream_panel"] = int(panel_size)
 
         if include_delta_u and kernels is not None and "D" in kernels and "D" not in cache:
             if _cache_d_on_device(device, kernels["D"]):
@@ -1541,8 +1589,13 @@ class ISDFTC(TC):
             cache_getter(kernels, device=device, include_grad=True, include_tc=True)
             if callable(cache_getter) else None
         )
+        # ``u1`` / ``u3`` may be device jax.Arrays (resident) OR host numpy
+        # arrays (streaming); the downstream contract_* wrappers handle both.
+        # ``k_panel`` is None in the resident case (single JIT call) or an
+        # int in the streaming case (axis-1 panel width).
         u1 = cache.get("K1_kernel") if cache is not None else None
         u3 = cache.get("K3_kernel") if cache is not None else None
+        k_panel = cache.get("K_stream_panel") if cache is not None else None
         if u1 is None:
             u1 = jax.device_put(U1, device) if device is not None else U1
         if u3 is None:
@@ -1628,12 +1681,14 @@ class ISDFTC(TC):
                     grad_phi_p = _pad_axis(grad_phi_p, 0, match_len)
                 if phi_q.shape[0] < match_len:
                     phi_q      = _pad_axis(phi_q, 0, match_len)
-                k12 = kmat_jax.contract_K1_isdf_jit(
-                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, u1, rbs)
+                k12 = kmat_jax.contract_K1_isdf_streaming(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, u1, rbs,
+                    panel_size=k_panel)
                 k12 = k12 - k12.transpose(1, 0, 2, 3)
             else:
-                k12 = kmat_jax.contract_K1_minus_K2_isdf_jit(
-                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs)
+                k12 = kmat_jax.contract_K1_minus_K2_isdf(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
+                    panel_size=k_panel)
 
             if panel_size is not None:
                 if _profile:
@@ -1641,8 +1696,8 @@ class ISDFTC(TC):
                     _t_k1 = time.perf_counter()
                     logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
                                  _t_k1 - _t_put)
-                k3 = kmat_jax.contract_K3_isdf_jit(
-                    phi_p, phi_q, phi_r, phi_s, u3, rbs)
+                k3 = kmat_jax.contract_K3_isdf_streaming(
+                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
                 if _profile:
                     jax.block_until_ready(k3)
                     _t_k3 = time.perf_counter()
@@ -1660,8 +1715,8 @@ class ISDFTC(TC):
 
             result_np = np.array(k12)
             del k12
-            k3 = kmat_jax.contract_K3_isdf_jit(
-                phi_p, phi_q, phi_r, phi_s, u3, rbs)
+            k3 = kmat_jax.contract_K3_isdf_streaming(
+                phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
             result_np += np.asarray(k3)
             del k3
             result_np *= 0.5

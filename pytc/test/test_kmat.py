@@ -291,6 +291,22 @@ class TestStreamingContractionParity(unittest.TestCase):
                 err_msg=f"panel_size={panel_size}",
             )
 
+    def test_K1_isdf_streaming_host_matches_jit(self):
+        from pytc.kmat import contract_K1_isdf_jit, contract_K1_isdf_streaming
+        ref = np.asarray(contract_K1_isdf_jit(
+            self.phi, self.phi, self.phi, self.phi, self.grad_phi, self.U1, self.rbs,
+        ))
+        U1_host = np.asarray(self.U1)
+        for panel_size in (16, 32, 48, None):
+            out = np.asarray(contract_K1_isdf_streaming(
+                self.phi, self.phi, self.phi, self.phi, self.grad_phi,
+                U1_host, self.rbs, panel_size=panel_size,
+            ))
+            np.testing.assert_allclose(
+                out, ref, atol=1e-12, rtol=0,
+                err_msg=f"panel_size={panel_size}",
+            )
+
     def test_K3_streaming_host_matches_jit(self):
         from pytc.kmat import contract_K3_isdf_streaming
         ref = self._reference_K3()

@@ -713,6 +713,31 @@ def _stream_l_panels(U, phi_r, phi_s, panel_size):
         yield U_slice, phi_r_slice, phi_s_slice
 
 
+def contract_K1_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
+                                grad_phi_p, U1,
+                                rank_block_size=128,
+                                panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K1_isdf_jit` (symmetric,
+    p == q case). Same panel-on-axis-1 strategy as
+    :func:`contract_K1_minus_K2_isdf`."""
+    n_fused = U1.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U1, np.ndarray):
+            U1 = jax.device_put(U1)
+        return contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_size)
+
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Nq, Nr, Ns))
+    for U1_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U1, phi_r, phi_s, panel_size):
+        partial = contract_K1_isdf_jit(
+            phi_p, phi_q, phi_r_panel, phi_s_panel, grad_phi_p, U1_panel,
+            rank_block_size,
+        )
+        result = result + partial
+    return result
+
+
 def contract_K1_minus_K2_isdf(phi_p, phi_q, phi_r, phi_s,
                               grad_phi_p, grad_phi_q, U1,
                               rank_block_size=128,
