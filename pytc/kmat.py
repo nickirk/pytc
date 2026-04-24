@@ -2,6 +2,7 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
     r"""Calculate K1 matrix: K1_{pqrs} = \sum_{i,j} w_i w_j \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
@@ -628,13 +629,14 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
     N_fused = U3.shape[0]
-    
-    n_rank = N_fused
-    
-    # Pad rank dimension
+    # ``n_rank`` is the l (axis-1) size, which may differ from N_fused when
+    # streaming passes a panel of axis-1 columns.
+    n_rank = U3.shape[1]
+
+    # Pad rank dimension (axis 1) to a multiple of rank_block_size.
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width = padded_rank - n_rank
-    
+
     # Pad U3 along axis 1 (l index)
     U3_padded = jnp.pad(U3, ((0, 0), (0, pad_width)))
     
@@ -677,6 +679,104 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     K3_final, _ = jax.lax.scan(scan_l_block, K3_init, (U3_scannable, phi_r_scannable, phi_s_scannable))
     
     return K3_final
+
+def _pad_axis(arr, axis, pad):
+    """Pad ``arr`` with zeros by ``pad`` along ``axis``. Works for np or jnp."""
+    if pad <= 0:
+        return arr
+    pad_width = [(0, 0)] * arr.ndim
+    pad_width[axis] = (0, pad)
+    if isinstance(arr, np.ndarray):
+        return np.pad(arr, pad_width)
+    return jnp.pad(arr, pad_width)
+
+
+def _stream_l_panels(U, phi_r, phi_s, panel_size):
+    """Iterate (U_panel, phi_r_panel, phi_s_panel) along axis-1 of U.
+
+    Each yielded panel has axis-1 size exactly ``panel_size`` (last panel is
+    zero-padded to keep a single JIT shape). U panels are moved to device with
+    ``jax.device_put`` when U lives on host.
+    """
+    n_fused = U.shape[1]
+    for l0 in range(0, n_fused, panel_size):
+        l1 = min(l0 + panel_size, n_fused)
+        pad = panel_size - (l1 - l0)
+
+        U_slice = U[:, l0:l1, ...] if U.ndim == 3 else U[:, l0:l1]
+        U_slice = _pad_axis(U_slice, 1, pad)
+        if isinstance(U_slice, np.ndarray):
+            U_slice = jax.device_put(U_slice)
+
+        phi_r_slice = _pad_axis(phi_r[:, l0:l1], 1, pad)
+        phi_s_slice = _pad_axis(phi_s[:, l0:l1], 1, pad)
+        yield U_slice, phi_r_slice, phi_s_slice
+
+
+def contract_K1_minus_K2_isdf(phi_p, phi_q, phi_r, phi_s,
+                              grad_phi_p, grad_phi_q, U1,
+                              rank_block_size=128,
+                              panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K1_minus_K2_isdf_jit`.
+
+    ``U1`` can be a device ``jax.Array`` or a host numpy ndarray.
+
+    * ``panel_size=None`` or ``panel_size >= U1.shape[1]`` → delegate to the
+      JIT once with the full K1; behaviour is bit-identical to the resident
+      fast-path.
+    * Otherwise, iterate over axis-1 (rank-column) panels of ``panel_size``;
+      each panel is ``jax.device_put`` just before its call, phi_r/phi_s
+      sliced to the matching slab, and partial contributions summed on
+      device. Axis 0 of U1 (the k axis) is untouched.
+
+    The last panel is zero-padded to ``panel_size`` so the JIT compiles once
+    for the whole loop. Zero-padded rows/columns contribute 0 to the sum.
+    """
+    n_fused = U1.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U1, np.ndarray):
+            U1 = jax.device_put(U1)
+        return contract_K1_minus_K2_isdf_jit(
+            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1,
+            rank_block_size,
+        )
+
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Nq, Nr, Ns))
+    for U1_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U1, phi_r, phi_s, panel_size):
+        partial = contract_K1_minus_K2_isdf_jit(
+            phi_p, phi_q, phi_r_panel, phi_s_panel,
+            grad_phi_p, grad_phi_q, U1_panel, rank_block_size,
+        )
+        result = result + partial
+    return result
+
+
+def contract_K3_isdf_streaming(phi_p, phi_q, phi_r, phi_s, U3,
+                                rank_block_size=128,
+                                panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K3_isdf_jit`.
+
+    Same panel-on-axis-1 strategy as :func:`contract_K1_minus_K2_isdf`, but
+    U3 is 2-D ``(n_fused, n_fused)`` with no ``c`` component axis.
+    """
+    n_fused = U3.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U3, np.ndarray):
+            U3 = jax.device_put(U3)
+        return contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size)
+
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Nq, Nr, Ns))
+    for U3_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U3, phi_r, phi_s, panel_size):
+        partial = contract_K3_isdf_jit(
+            phi_p, phi_q, phi_r_panel, phi_s_panel, U3_panel, rank_block_size,
+        )
+        result = result + partial
+    return result
+
 
 def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
                      gpu_max_memory_mb=None):
