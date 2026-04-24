@@ -879,9 +879,54 @@ def resolve_v3o_panel_block_size(nocc, nvir, *,
     return panel_blk
 
 
+def estimate_tc_contract_resident_bytes(n_orb, n_fused, *,
+                                        k_stream_panel=None,
+                                        bytes_per_elem=8):
+    """Bytes resident on one device during a TC contract_K1/K3 JIT call,
+    excluding the W scan intermediate (which is what :func:`adaptive_rank_block_size`
+    is sizing).
+
+    Line items:
+      * D                 : n_fused²
+      * phi_isdf          : n_orb * n_fused
+      * grad_phi_isdf     : 3 * n_orb * n_fused
+      * tile accumulator  : small (≤ n_orb² × a few KB worst case) — use an
+                            n_orb² × 1024 upper bound
+      * K1 / K3 effective : resident or streamed + padded/scannable overhead.
+        Observed on A100 grace runs at n_fused ≈ 26k: XLA keeps roughly 1×
+        input + 1× scannable copy of each, i.e. a 2× multiplier on the input
+        bytes. We use 2.0 to be safe against small per-call allocator
+        transients.
+
+    ``k_stream_panel=None`` means K1/K3 stay fully resident across tiles;
+    otherwise they are slabbed per tile at ``k_stream_panel`` rank columns.
+    """
+    B = int(bytes_per_elem)
+    d_bytes = n_fused * n_fused * B
+    phi_bytes = n_orb * n_fused * B
+    grad_phi_bytes = 3 * n_orb * n_fused * B
+    # Generous bound on tile output accumulator without needing panel size.
+    tile_bytes = n_orb * n_orb * 1024 * B
+
+    if k_stream_panel is None:
+        # K1 (n_fused² * 3) + K3 (n_fused²) = 4 n_fused².
+        k_input_bytes = 4 * n_fused * n_fused * B
+    else:
+        k_input_bytes = 4 * n_fused * int(k_stream_panel) * B
+
+    # Padded/scannable overhead inside the JIT; observed ≈ 1× input on top.
+    k_overhead_bytes = k_input_bytes
+
+    return (d_bytes + phi_bytes + grad_phi_bytes + tile_bytes
+            + k_input_bytes + k_overhead_bytes)
+
+
 def adaptive_rank_block_size(Np, Nq, N_fused, *,
+                              resident_bytes=0,
+                              budget_bytes=None,
                               gpu_max_memory_mb=None,
-                              min_block=64, max_block=2048):
+                              budget_fraction=0.25,
+                              min_block=4, max_block=2048):
     """Compute the largest safe ``rank_block_size`` for ISDF scan contractions.
 
     The peak intermediate per scan step in ``contract_K1_isdf_jit`` is::
@@ -893,35 +938,61 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
 
         W: (N_fused, rank_block_size, Nq) × 8 bytes
 
-    This function picks the largest power-of-2 block size that keeps the
-    peak intermediate within 50% of the available GPU budget.
+    Returned rank_block_size satisfies::
+
+        peak_W_bytes ≤ budget_fraction × (budget - resident_bytes)
 
     Parameters
     ----------
     Np, Nq : int
-        Orbital slice sizes for the bra / ket indices.
+        Orbital slice sizes for the bra / ket indices. ``Np`` drives the W
+        peak for K1 contractions; ``Nq`` drives it for the D-term pattern.
     N_fused : int
         ISDF rank (dimension being scanned over).
-    gpu_max_memory_mb : float | None
-        User override for total GPU memory.
+    resident_bytes : int, optional
+        Sum of per-device bytes that will coexist with W during the scan
+        (D, phi, grad_phi, K1/K3 or their panels with XLA overhead, tile
+        accumulator). Default 0 reproduces the old "pool is entirely
+        free" assumption — caller should supply a real estimate whenever
+        possible. :func:`estimate_tc_contract_resident_bytes` helps.
+    budget_bytes : int, optional
+        Explicit budget override (bytes). If not given, falls back to
+        ``gpu_max_memory_mb`` if supplied, otherwise to the runtime-probed
+        ``_get_gpu_free_bytes()``.
+    gpu_max_memory_mb : float, optional
+        Legacy override in MiB; used only when ``budget_bytes`` is not set.
+    budget_fraction : float
+        Fraction of the *available* budget (``budget − resident``) allowed
+        for the W intermediate. 0.25 leaves three quarters for XLA workspace,
+        BFC fragmentation, and scan-carry transients — observed to be a
+        safe margin on A100 at n_fused ≈ 26k.
     min_block, max_block : int
         Clamps on the returned value.
 
     Returns
     -------
     int
-        Power-of-2 block size.
+        Power-of-2 block size, clamped to ``[min_block, min(N_fused, max_block)]``.
     """
-    budget = get_gpu_budget_bytes(gpu_max_memory_mb)
+    if budget_bytes is None:
+        if gpu_max_memory_mb is not None and gpu_max_memory_mb > 0:
+            budget_bytes = int(gpu_max_memory_mb * 1024 ** 2)
+        else:
+            try:
+                budget_bytes = int(_get_gpu_free_bytes())
+            except Exception:
+                budget_bytes = int(get_gpu_budget_bytes())
+
+    available = max(int(budget_bytes) - int(resident_bytes), 0)
     B = 8  # float64
 
-    # Worst-case peak: max of K1-style and delta_U-style intermediates
+    # Worst-case peak per unit of rank_block_size: max of K1-style and
+    # delta_U-style intermediates.
     peak_per_rank_K1 = (Np * N_fused + Np * Nq) * B
     peak_per_rank_DU = (N_fused * Nq + Np * Nq) * B
     peak_per_rank = max(peak_per_rank_K1, peak_per_rank_DU, 1)
 
-    # Use 50% of budget (the rest is for the accumulator + other tensors)
-    max_rank_block = max(min_block, int(budget * 0.5 / peak_per_rank))
+    max_rank_block = max(min_block, int(available * budget_fraction / peak_per_rank))
 
     # Round down to power of 2
     max_rank_block = 2 ** int(np.log2(max(max_rank_block, 1)))
@@ -930,8 +1001,14 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
 
     logger.debug(
         "adaptive_rank_block_size(Np=%d, Nq=%d, N_fused=%d): "
-        "peak_per_rank=%.2f MB → rank_block_size=%d",
-        Np, Nq, N_fused, peak_per_rank / 1e6, max_rank_block)
+        "budget=%.2f GiB, resident=%.2f GiB, peak_per_rank=%.2f MB, "
+        "fraction=%.2f → rank_block_size=%d",
+        Np, Nq, N_fused,
+        budget_bytes / (1024 ** 3),
+        resident_bytes / (1024 ** 3),
+        peak_per_rank / 1e6,
+        budget_fraction,
+        max_rank_block)
 
     return max_rank_block
 

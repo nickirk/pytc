@@ -710,26 +710,76 @@ class ISDFTC(TC):
     def _get_fixed_rank_block_size(self):
         """Return a fixed rank_block_size that is safe for all orbital slices.
 
-        Uses worst-case dimensions ``(n_orb, n_orb)`` so that the resulting
-        power-of-2 block size is the smallest (most conservative) one.  Any
-        smaller ``(Np, Nq)`` combination would yield a larger or equal block
-        size, so this value is safe everywhere and avoids JIT recompilation
-        from changing ``static_argnums`` across CCSD phases.
+        Uses worst-case dimensions ``(n_orb, n_orb)`` so the chosen
+        power-of-2 is the smallest (most conservative) over the CCSD phases,
+        which avoids JIT recompilation when ``(Np, Nq)`` changes across
+        tiles. Resident-state-aware: accounts for K1/K3 being resident or
+        streamed via the same ``_choose_tc_kernel_strategy`` used by the
+        per-device TC cache, plus D + phi + tile accumulator.
 
-        The result is cached at module level keyed by ``(n_orb, N_fused)``
-        so the GPU budget query happens only once per run.
+        Cache key includes the streaming decision so a change in K1/K3
+        residency (e.g. resident on small n_fused, streaming on large
+        n_fused) picks the appropriate rbs without stale-cache issues.
 
         Returns ``None`` when ``phi_isdf`` is not yet available (pre-ISDF).
         """
         if self.phi_isdf is None:
             return None
         N_fused = self.phi_isdf.shape[1]
-        key = (int(self.n_orb), int(N_fused))
+
+        from pytc.utils.gpu_memory import (
+            adaptive_rank_block_size, estimate_tc_contract_resident_bytes,
+            _get_gpu_free_bytes,
+        )
+
+        # Determine streaming decision on the most-constrained local device.
+        streaming = False
+        k_stream_panel = None
+        kernels = getattr(self, "isdf_kernels", None)
+        if kernels is not None and "K1_kernel" in kernels and "K3_kernel" in kernels:
+            try:
+                devices = jax.local_devices()
+                # Pick the device with the smallest free budget so the rbs
+                # is safe on every card.
+                def _free(d):
+                    stats = d.memory_stats()
+                    return int(stats.get('bytes_limit', 0)) - int(stats.get('bytes_in_use', 0))
+                constrained = min(devices, key=_free) if devices else None
+                if constrained is not None:
+                    resident_flag, k_stream_panel = _choose_tc_kernel_strategy(
+                        constrained,
+                        kernels["K1_kernel"], kernels["K3_kernel"],
+                    )
+                    streaming = not resident_flag
+            except Exception:
+                # If probing fails, assume streaming (conservative: larger
+                # resident estimate → smaller, safer rbs).
+                streaming = True
+                k_stream_panel = None
+
+        key = (int(self.n_orb), int(N_fused), bool(streaming), int(k_stream_panel or 0))
         if key not in _FIXED_RBS_CACHE:
-            from pytc.utils.gpu_memory import adaptive_rank_block_size
-            rbs = adaptive_rank_block_size(self.n_orb, self.n_orb, N_fused)
-            logger.info(f"  Fixed rank_block_size = {rbs} "
-                        f"(worst-case n_orb={self.n_orb}, N_fused={N_fused})")
+            resident_bytes = estimate_tc_contract_resident_bytes(
+                n_orb=self.n_orb, n_fused=N_fused,
+                k_stream_panel=k_stream_panel if streaming else None,
+            )
+            rbs = adaptive_rank_block_size(
+                self.n_orb, self.n_orb, N_fused,
+                resident_bytes=resident_bytes,
+            )
+            try:
+                budget_gib = _get_gpu_free_bytes() / (1024 ** 3)
+            except Exception:
+                budget_gib = float('nan')
+            logger.info(
+                "  Fixed rank_block_size = %d "
+                "(n_orb=%d, N_fused=%d, streaming=%s, panel=%s, "
+                "resident=%.1f GiB, free=%.1f GiB)",
+                rbs, self.n_orb, N_fused, streaming,
+                k_stream_panel if streaming else "n/a",
+                resident_bytes / (1024 ** 3),
+                budget_gib,
+            )
             _FIXED_RBS_CACHE[key] = rbs
         return _FIXED_RBS_CACHE[key]
 
