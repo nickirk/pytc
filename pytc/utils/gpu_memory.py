@@ -649,11 +649,24 @@ def estimate_blksize(nocc, nvir, phase, *,
 
 def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
                             include_eris, include_accumulators,
-                            n_fused, safety_factor):
+                            n_fused, safety_factor,
+                            tc_resident=None):
     """Return ``(usable, gpu_target, resident_gb_parts)`` for panel estimators.
 
     Shared boilerplate extracted from ``estimate_vvvv_panel_blksize`` and
     ``estimate_v3o_panel_blksize`` so the two never drift apart.
+
+    Parameters
+    ----------
+    tc_resident : bool or None
+        Whether the TC kernels (K1 + K3, combined size ``4·Nf²·8``) sit
+        resident on device throughout the phase.  ``True`` adds them to
+        the resident budget subtraction (tile gets less room).  ``False``
+        assumes they are streamed in panels per tile call (tile gets more
+        room).  ``None`` auto-detects: K1+K3 resident if they fit in 15 %
+        of probed free memory, streamed otherwise — matching the
+        ``_choose_tc_kernel_strategy`` rule used by the per-device TC
+        cache in ``pytc.tc``.
 
     Returns
     -------
@@ -679,7 +692,14 @@ def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
 
     nmo = O + V
     d_bytes   = Nf * Nf * B
-    tc_bytes  = 4 * Nf * Nf * B if Nf > 0 else 0   # K1, K3, D, X kernel matrices
+    tc_full_bytes = 4 * Nf * Nf * B if Nf > 0 else 0   # K1 (3·Nf²) + K3 (Nf²)
+
+    if tc_resident is None:
+        # Auto: streaming if K1+K3 don't fit resident at the same 15 %
+        # threshold used by ``_choose_tc_kernel_strategy``.
+        tc_resident = tc_full_bytes <= int(gpu_free * 0.15) if Nf > 0 else True
+
+    tc_bytes = tc_full_bytes if tc_resident else 0
     phi_bytes = 4 * nmo * Nf * B if Nf > 0 else 0   # phi panels (4 copies)
     resident_isdf = d_bytes + tc_bytes + phi_bytes
 
@@ -690,6 +710,7 @@ def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
         resident_isdf=resident_isdf,
         d_bytes=d_bytes,
         tc_bytes=tc_bytes,
+        tc_resident=tc_resident,
         phi_bytes=phi_bytes,
         gpu_target=gpu_target,
         Nf=Nf,
@@ -734,10 +755,11 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
 
     logger.debug(
         "estimate_vvvv_panel_blksize: usable=%.2f GB, resident=%.2f GB "
-        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
-        "naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
+        "(D=%.2f GB, TC=%.2f GB [resident=%s], phi=%.2f GB), "
+        "gpu_target=%.2f GB, naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
         usable / 1e9, lp["resident_isdf"] / 1e9,
-        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["phi_bytes"] / 1e9,
+        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["tc_resident"],
+        lp["phi_bytes"] / 1e9,
         lp["gpu_target"] / 1e9, naux, n_fused, best, tile_bytes(best) / 1e9,
     )
     return best, usable
@@ -841,10 +863,12 @@ def estimate_v3o_panel_blksize(nocc, nvir, *,
 
     logger.debug(
         "estimate_v3o_panel_blksize: usable=%.2f GB, resident=%.2f GB "
-        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
-        "host_target=%s GB, naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
+        "(D=%.2f GB, TC=%.2f GB [resident=%s], phi=%.2f GB), "
+        "gpu_target=%.2f GB, host_target=%s GB, naux=%s, "
+        "n_fused=%s -> blk=%d (tile=%.2f GB)",
         usable / 1e9, lp["resident_isdf"] / 1e9,
-        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["phi_bytes"] / 1e9,
+        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["tc_resident"],
+        lp["phi_bytes"] / 1e9,
         lp["gpu_target"] / 1e9,
         "None" if host_target is None else f"{host_target / 1e9:.2f}",
         naux, n_fused, best, tile_bytes(best) / 1e9,
