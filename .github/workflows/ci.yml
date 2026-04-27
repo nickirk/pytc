@@ -30,21 +30,11 @@ jobs:
     - name: Run full tests
       run: |
         python -m unittest discover -v -s pytc/test -t pytc/test
+        python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
+        python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
+        python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
         python -m unittest discover -v -s pytc/legacy/test -t pytc/legacy/test
-        # TODO(folx): the pinned folx commit (47a0e8d) is incompatible with
-        # JAX >= 0.8: the folx interpreter raises
-        #   ValueError: too many values to unpack (expected 2, got 11)
-        # whenever a jaxpr from newer JAX is consumed (broadcast_in_dim, iota,
-        # logistic, etc.). This breaks every test path that calls
-        # folx.forward_laplacian, i.e. anything reaching gto_spherical, the
-        # jastrow factors, VMC sampling, the SJ ansatz, or the JAX XTC solver.
-        # These directories are skipped on hosted CI until folx is updated or
-        # jax is pinned to a compatible version. They still run locally and on
-        # the cluster where the env has compatible versions.
-        # python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
-        # python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
-        # python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
-        # python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
 
   # Smoke tests on intermediate Python versions (quick import + basic tests)
   smoke-test:
