@@ -373,5 +373,92 @@ class TestXTCCCSD(unittest.TestCase):
             if os.path.exists(f):
                 os.remove(f)
 
+class TestShouldForceHostAccumulators(unittest.TestCase):
+    """Regression tests for ``_should_force_host_accumulators``.
+
+    The OVVV/VOVV pipelines below ``_update_amps`` cannot keep
+    accumulators GPU-resident under three independent conditions:
+    multi-GPU, HDF5-backed ovvv, or HDF5-backed vovv.  The original
+    early override only checked the multi-GPU case, so a single-GPU run
+    on a system large enough to spill ovvv to disk hit a misleading
+    AssertionError further down::
+
+        AssertionError: use_gpu_acc must be False for the HDF5-backed
+        OVVV multi-GPU path; set by _n_devices_local > 1 check above
+
+    The helper centralises the predicate so the inline override and
+    these tests stay in sync.  Each combination of
+    ``(n_devices_local, ovvv in RAM, vovv in RAM)`` is checked
+    explicitly so future edits cannot silently weaken any branch.
+    """
+
+    class _StubEris:
+        """Minimal stand-in for ``_ChemistsERIs`` — only the attributes
+        the helper inspects need to be set."""
+        def __init__(self, ovvv, vovv):
+            self.ovvv = ovvv
+            self.vovv = vovv
+
+    def setUp(self):
+        # An in-RAM ndarray and an HDF5-like sentinel that fails the
+        # ``isinstance(_, np.ndarray)`` check.  We don't need a real
+        # ``h5py.Dataset`` — the helper only looks at the type.
+        self._in_ram = np.zeros((2, 2, 2, 2))
+        self._on_disk = object()  # any non-ndarray value triggers the override
+
+    def test_single_gpu_in_ram_keeps_gpu_accumulators(self):
+        """The only configuration where GPU-resident accumulators are safe."""
+        eris = self._StubEris(self._in_ram, self._in_ram)
+        self.assertFalse(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=1)
+        )
+
+    def test_multi_gpu_in_ram_forces_host(self):
+        """Multi-GPU + in-RAM ovvv/vovv: round-robin needs a shared host buffer."""
+        eris = self._StubEris(self._in_ram, self._in_ram)
+        self.assertTrue(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=2)
+        )
+
+    def test_single_gpu_hdf5_ovvv_forces_host(self):
+        """Regression: 1 GPU + HDF5-backed ovvv must force host
+        accumulators.  Before the fix this passed the early check
+        (n_devices_local==1) and crashed at the HDF5-OVVV branch."""
+        eris = self._StubEris(self._on_disk, self._in_ram)
+        self.assertTrue(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=1)
+        )
+
+    def test_single_gpu_hdf5_vovv_forces_host(self):
+        """Same regression on the VOVV side: 1 GPU + HDF5-backed vovv."""
+        eris = self._StubEris(self._in_ram, self._on_disk)
+        self.assertTrue(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=1)
+        )
+
+    def test_single_gpu_both_hdf5_forces_host(self):
+        """The realistic large-system case: both ovvv and vovv on disk."""
+        eris = self._StubEris(self._on_disk, self._on_disk)
+        self.assertTrue(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=1)
+        )
+
+    def test_multi_gpu_hdf5_both_forces_host(self):
+        """Multi-GPU + both HDF5: every condition fires; sanity check the OR."""
+        eris = self._StubEris(self._on_disk, self._on_disk)
+        self.assertTrue(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=4)
+        )
+
+    def test_zero_devices_treated_as_single_device(self):
+        """``n_devices_local == 0`` (CPU-only fallback) is not multi-GPU
+        and must not by itself force host accumulators when ovvv/vovv
+        are in RAM."""
+        eris = self._StubEris(self._in_ram, self._in_ram)
+        self.assertFalse(
+            jax_xtc_ccsd._should_force_host_accumulators(eris, n_devices_local=0)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
