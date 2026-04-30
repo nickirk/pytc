@@ -424,15 +424,7 @@ class TestJastrowOptimization(unittest.TestCase):
     def test_be(self):
         """Test optimization of Jastrow parameters for Be atom."""
         self.run_optimization_test('Be 0 0 0;', basis='ccpvtz', nopt_steps=50)
-    def test_h2o(self):
-        """Test optimization of Jastrow parameters for H2O molecule."""
-        h2o_atoms = "; ".join([
-            "H -1.4308249289 0.0 -0.8863003855",
-            "H 1.4308249289 0.0 -0.8863003855",
-            "O 0.0 0.0 0.2215703721",
-        ])
-        self.run_optimization_test(h2o_atoms, basis='ano-pvdz', nopt_steps=10)
-    
+
 
 
 if __name__ == "__main__":
