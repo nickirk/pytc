@@ -255,7 +255,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
     fock_std = reduce(np.dot, (mo_coeff.T, fock_std, mo_coeff))
 
     
-    h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params, orb_block_size=128))
+    # orb_block_size=None → get_delta_h auto-picks from probed GPU free memory.
+    h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
     _fock_devices = _solver_local_devices()
@@ -381,6 +382,11 @@ def _make_xtc_eris(cc, mo_coeff=None):
             _kernels = dict(_kernels)
             _kernels['X'] = _X_kernel[:]
             xtc_obj = xtc_obj.replace(isdf_kernels=_kernels)
+            # Propagate to cc/eris so the downstream VVVV on-the-fly path
+            # (jax_xtc_ccsd.py:953 reads ``cc.xtc_obj``) sees the preloaded
+            # numpy X and does NOT fall back to HDF5 reads per tile.
+            cc.xtc_obj = xtc_obj
+            eris.xtc_obj = xtc_obj
             logger.info("X preload done in %.1f s", time.perf_counter() - _t_x)
 
         logger.info("Computing large blocks...")
@@ -1537,6 +1543,12 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         kernels = dict(kernels)
         kernels['X'] = X[:]
         xtc_obj = xtc_obj.replace(isdf_kernels=kernels)
+        # Propagate the preloaded X to cc/eris — the same reason as in
+        # _make_xtc_eris above (see note there).  Without this, downstream
+        # consumers that read ``cc.xtc_obj`` or ``eris.xtc_obj`` would still
+        # see the HDF5-backed X and fall back to GPFS reads per tile.
+        cc.xtc_obj = xtc_obj
+        eris.xtc_obj = xtc_obj
         logger.info("X preload done in %.1f s", time.perf_counter() - t_x)
 
     ds = eris.vvvv
