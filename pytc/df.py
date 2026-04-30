@@ -378,6 +378,27 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         xi_phi_storage = h5_file['xi_phi']
         xi_grad_storage = h5_file['xi_grad']
 
+    # Warm up JIT so the sharded-program compile cost doesn't dominate short loops
+    # (on a 7-batch benzene-5Z run the sharded compile otherwise ate the steady-state
+    # speedup from parallel GPUs).
+    if n_batches > 1:
+        t_warm = time.perf_counter()
+        warm_batch = jnp.zeros((n_orb, grid_batch_size), dtype=phi.dtype)
+        if use_sharding:
+            warm_batch = jax.device_put(warm_batch, grid_shard)
+        warm = solve_normal_equations_batch_prepared(
+            phi_chol, phi_lower, phi_piv_d, phi_piv_d, warm_batch, warm_batch
+        )
+        jax.block_until_ready(warm)
+        for c in range(3):
+            warm = solve_normal_equations_batch_prepared(
+                grad_chol[c], grad_lower[c], grad_phi_piv_d[:, :, c], phi_piv_d,
+                warm_batch, warm_batch
+            )
+            jax.block_until_ready(warm)
+        del warm, warm_batch
+        logger.debug(f"  Solve warmup (JIT compile) took {time.perf_counter() - t_warm:.2f} s")
+
     try:
         t_batch_start = time.perf_counter()
         for batch_idx in range(n_batches):

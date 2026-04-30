@@ -1,3 +1,4 @@
+import os
 import unittest
 import numpy as np
 import jax
@@ -9,6 +10,9 @@ from pytc.xtc import XTC, ISDFXTC
 
 jax.config.update("jax_enable_x64", True)
 from pytc.jastrow.rexp import REXP
+
+# Set by GitHub Actions; used to skip tests that exceed the 16 GB hosted-runner RAM.
+_ON_CI = os.environ.get("CI", "").lower() == "true"
 
 class TestISDF(unittest.TestCase):
     def setUp(self):
@@ -96,6 +100,7 @@ class TestISDF(unittest.TestCase):
         # Final assertion for high rank
         self.assertLess(rel_err_dU, 1e-4, f"Final relative error {rel_err_dU} is too high")
 
+    @unittest.skipIf(_ON_CI, "OOMs on 16 GB GitHub-hosted runner; legacy K3 path needs >16 GB on H2O/grid_lvl=2")
     def test_isdf_kmat_accuracy(self):
         """Compare JAX ISDF K matrices directly with JAX Exact K matrices using convergence test."""
         # --- JAX Exact 2-Body Correction with timing ---

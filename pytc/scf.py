@@ -76,9 +76,11 @@ class TCSCF(hf.RHF):
         
         return v_hf + v_tc_2b + v_tc_3b
 
-    def eig(self, h, s):
+    def eig(self, h, s, **kwargs):
         """Solver for generalized eigenvalue problem F C = S C e.
         Overridden to handle non-Hermitian F and orthonormalize orbitals.
+
+        Newer pyscf passes extra kwargs (e.g. x=x_orth); accept and ignore them.
         """
         # Use scipy.linalg.eig for non-Hermitian matrices
         # h is F, s is S
