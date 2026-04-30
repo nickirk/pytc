@@ -63,6 +63,18 @@ def _make_h2():
 # Test utilities
 # ======================================================================
 
+# When this module is imported by a test runner that has already imported jax
+# (e.g. unittest discover walking other test modules first), the XLA_FLAGS
+# setdefault above is too late and we end up with one CPU device. In that case
+# skip the whole multi-device suite — these tests need a fresh process.
+_NEEDS_4_DEVICES = unittest.skipUnless(
+    jax.device_count() >= 4,
+    f"Multi-device tests require 4 simulated devices; got {jax.device_count()}. "
+    "Run this module in its own process so XLA_FLAGS is honoured.",
+)
+
+
+@_NEEDS_4_DEVICES
 class TestShardingUtilities(unittest.TestCase):
     """Test the sharding helper functions."""
 
@@ -158,6 +170,7 @@ class TestShardingUtilities(unittest.TestCase):
 # Test sharded computation correctness
 # ======================================================================
 
+@_NEEDS_4_DEVICES
 class TestShardedComputation(unittest.TestCase):
     """Verify that sharded vmap+reduction gives the same result as single-device."""
 
@@ -320,6 +333,7 @@ class TestShardedComputation(unittest.TestCase):
 # Test Newton optimizer with multi_gpu flag
 # ======================================================================
 
+@_NEEDS_4_DEVICES
 class TestNewtonMultiGPU(unittest.TestCase):
     """Test that NewtonOptimizer with multi_gpu=True gives correct results."""
 
@@ -435,6 +449,7 @@ class TestNewtonMultiGPU(unittest.TestCase):
 # Integration test: full optimize_ref_var with multi_gpu
 # ======================================================================
 
+@_NEEDS_4_DEVICES
 class TestOptimizeRefVarMultiGPU(unittest.TestCase):
     """Integration test: optimize_ref_var with multi_gpu=True."""
 
