@@ -31,7 +31,18 @@ jobs:
       run: |
         python -m unittest discover -v -s pytc/test -t pytc/test
         python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        # The vmc dir contains modules that need XLA_FLAGS set BEFORE jax import
+        # (test_multi_gpu, test_multi_gpu_batched, test_shard_map). When discover
+        # walks the dir it imports other modules first and jax initialises with
+        # 1 device, so those tests skip via @skipUnless. Re-run them in a fresh
+        # process with the flag in the environment so they actually exercise
+        # the multi-device path.
         python -m unittest discover -v -s pytc/vmc/test -t pytc/vmc/test
+        XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+            python -m unittest -v \
+              pytc.vmc.test.test_multi_gpu \
+              pytc.vmc.test.test_multi_gpu_batched \
+              pytc.vmc.test.test_shard_map
         python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
         python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
         python -m unittest discover -v -s pytc/legacy/test -t pytc/legacy/test

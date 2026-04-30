@@ -16,6 +16,15 @@ except ImportError:
         shard_map = None
 import functools
 
+# If a prior test module imported jax first, the XLA_FLAGS setdefault above
+# is too late and we end up with one CPU device. Skip — these tests need their
+# own process to honour the env var (the CI workflow runs them in a separate
+# command with XLA_FLAGS in the environment).
+@unittest.skipUnless(
+    jax.device_count() >= 4,
+    f"shard_map tests require 4 simulated devices; got {jax.device_count()}. "
+    "Run this module in its own process so XLA_FLAGS is honoured.",
+)
 class TestShardMap(unittest.TestCase):
     """Test fundamental shard_map with local batching logic."""
 
