@@ -259,6 +259,20 @@ def solve_tile_sizes(
         + B_r1 * r1_elem_bytes_per_unit
         + B_r2 * r2_elem_bytes_per_unit
     )
+    # The r1/r2 floors can pull B_r1/B_r2 back up after they were sized
+    # against `remaining`; in tight-memory cases that silently violates the
+    # budget contract.  Fail fast instead of returning oversize tiles that
+    # OOM later in K-kernel construction.
+    if predicted_peak > usable:
+        raise RuntimeError(
+            f"solve_tile_sizes: no feasible tile fits the safety-adjusted "
+            f"budget — even at the floors B_r1={B_r1}, B_r2={B_r2} the "
+            f"predicted peak {predicted_peak / 1024 ** 3:.2f} GiB exceeds "
+            f"usable {usable / 1024 ** 3:.2f} GiB "
+            f"(budget {budget_bytes / 1024 ** 3:.2f} GiB, fixed "
+            f"{fixed_bytes / 1024 ** 3:.2f} GiB, safety {safety_fraction:.0%}). "
+            "Use more devices, increase m_k, lower the floors, or lower safety_fraction."
+        )
     return {
         "B_r1": int(B_r1),
         "B_r2": int(B_r2),
@@ -305,7 +319,11 @@ def choose_orb_block_size(
     Returns
     -------
     int
-        Chosen ``orb_block_size``, clamped to ``[min_block, min(n_orb, max_block)]``.
+        Chosen ``orb_block_size``, clamped to
+        ``[min_block, min(n_orb, max_block)]`` for the normal path.
+        Degenerate inputs (``n_orb <= 0`` or ``n_fused <= 0``) bypass the
+        clamp and return ``max_block`` — the caller's chunk loop won't
+        iterate anyway, so the value is a safe no-op default.
     """
     if n_orb <= 0 or n_fused <= 0:
         return max_block
@@ -789,6 +807,17 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
     best = find_max_blksize(tile_bytes, lo=1, hi=max(1, nvir),
                             gpu_target=gpu_target)
     best = max(1, min(best, nvir))
+
+    # find_max_blksize returns ``lo`` (=1 here) even when the minimum tile
+    # already exceeds gpu_target — warn so OOMs in compute_vvvv aren't
+    # surprises.  Mirrors the same guard in estimate_v3o_panel_blksize.
+    if gpu_target > 0 and tile_bytes(best) > gpu_target:
+        logger.warning(
+            "estimate_vvvv_panel_blksize: minimum tile (blk=%d) needs %.2f GB "
+            "but gpu_target=%.2f GB — returning minimum anyway. "
+            "Consider raising gpu_max_memory or reducing system size.",
+            best, tile_bytes(best) / 1e9, gpu_target / 1e9,
+        )
 
     logger.debug(
         "estimate_vvvv_panel_blksize: usable=%.2f GB, resident=%.2f GB "

@@ -197,6 +197,10 @@ def _chunk_selector(idx, start, stop):
     steps = np.diff(sub)
     if np.all(steps == steps[0]):
         step = int(steps[0])
+        # step==0 would make slice(start, stop, 0) raise; fall back to the
+        # explicit index array (degenerate but legal for fancy indexing).
+        if step == 0:
+            return sub
         return slice(int(sub[0]), int(sub[-1] + step), step)
     return sub
 

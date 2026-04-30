@@ -30,7 +30,11 @@ def create_2d_mesh(devices, shape, axis_names=("k_ax", "g_ax")) -> Mesh:
     ``shape`` is ``(m_0, m_1)`` with ``m_0 * m_1 == len(devices)``.
     """
     m0, m1 = shape
-    assert m0 * m1 == len(devices), (m0, m1, len(devices))
+    if m0 * m1 != len(devices):
+        raise ValueError(
+            f"create_2d_mesh: shape {shape} does not match device count "
+            f"{len(devices)} (m0*m1={m0 * m1})."
+        )
     device_grid = np.asarray(devices).reshape(m0, m1)
     return Mesh(device_grid, axis_names=axis_names)
 
