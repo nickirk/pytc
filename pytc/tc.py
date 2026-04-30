@@ -1731,10 +1731,11 @@ class ISDFTC(TC):
                     grad_phi_p = _pad_axis(grad_phi_p, 0, match_len)
                 if phi_q.shape[0] < match_len:
                     phi_q      = _pad_axis(phi_q, 0, match_len)
-                k12 = kmat_jax.contract_K1_isdf_streaming(
-                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, u1, rbs,
+                # In-kernel antisymmetrisation in (p,q) — avoids
+                # materialising k12 and its transposed copy (~36 s/tile at 5z).
+                k12 = kmat_jax.contract_K1_antisym_pq_isdf_streaming(
+                    phi_p, phi_r, phi_s, grad_phi_p, u1, rbs,
                     panel_size=k_panel)
-                k12 = k12 - k12.transpose(1, 0, 2, 3)
             else:
                 k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
                     phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,

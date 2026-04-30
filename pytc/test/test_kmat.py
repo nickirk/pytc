@@ -307,6 +307,26 @@ class TestStreamingContractionParity(unittest.TestCase):
                 err_msg=f"panel_size={panel_size}",
             )
 
+    def test_K1_antisym_pq_matches_legacy_transpose(self):
+        """In-kernel antisym must equal the legacy ``k12 - k12.T(1,0,2,3)``
+        path (resident & all panel sizes, host & device U1)."""
+        from pytc.kmat import (contract_K1_isdf_jit,
+                                contract_K1_antisym_pq_isdf_streaming)
+        k12 = np.asarray(contract_K1_isdf_jit(
+            self.phi, self.phi, self.phi, self.phi, self.grad_phi, self.U1, self.rbs,
+        ))
+        ref = k12 - k12.transpose(1, 0, 2, 3)
+        for U1_in, label in ((self.U1, "device"), (np.asarray(self.U1), "host")):
+            for panel_size in (None, 16, 32, 48):
+                out = np.asarray(contract_K1_antisym_pq_isdf_streaming(
+                    self.phi, self.phi, self.phi, self.grad_phi, U1_in, self.rbs,
+                    panel_size=panel_size,
+                ))
+                np.testing.assert_allclose(
+                    out, ref, atol=1e-12, rtol=0,
+                    err_msg=f"U1={label}, panel_size={panel_size}",
+                )
+
     def test_K3_streaming_host_matches_jit(self):
         from pytc.kmat import contract_K3_isdf_streaming
         ref = self._reference_K3()

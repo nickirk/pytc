@@ -585,6 +585,62 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
     return result
 
 
+@partial(jax.jit, static_argnums=(5,))
+def contract_K1_antisym_pq_isdf_jit(phi_p, phi_r, phi_s, grad_phi_p, U1,
+                                     rank_block_size=128):
+    """Compute ``K1[p,q,r,s] - K1[q,p,r,s]`` for the symmetric case
+    ``phi_p == phi_q`` (and ``grad_phi_p == grad_phi_q``).
+
+    Antisymmetrises the small ``(Np, Np, block)`` T tensor inside the rank
+    scan, then contracts against ``C_rs[r,s,l]``.  This avoids materialising
+    the full ``(Np, Np, Nr, Ns)`` K1 intermediate and its transposed copy
+    (the dominant cost of the legacy ``k12 - k12.T(1,0,2,3)`` path).
+    """
+    Np = phi_p.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_fused = U1.shape[0]
+    n_rank = U1.shape[1]
+
+    padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
+    pad_width = padded_rank - n_rank
+    U1_padded = jnp.pad(U1, ((0, 0), (0, pad_width), (0, 0)))
+    phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width)))
+    phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width)))
+
+    n_blocks = padded_rank // rank_block_size
+    U1_scannable = U1_padded.reshape(N_fused, n_blocks, rank_block_size, 3).transpose(1, 0, 2, 3)
+    phi_r_scannable = phi_r_padded.reshape(Nr, n_blocks, rank_block_size).transpose(1, 0, 2)
+    phi_s_scannable = phi_s_padded.reshape(Ns, n_blocks, rank_block_size).transpose(1, 0, 2)
+
+    def scan_l_block(carry, args):
+        U1_block, phi_r_block, phi_s_block = args
+
+        # T[p,q,l'] = sum_{k,c} grad_phi_p[p,k,c] U1[k,l',c] phi_p[q,k]
+        def process_component(T_acc, c):
+            U1_slice = U1_block[:, :, c]                              # (N_fused, block)
+            W = grad_phi_p[:, :, c][:, :, None] * U1_slice[None, :, :] # (Np, k, block)
+            W_perm = jnp.transpose(W, (0, 2, 1))                       # (Np, block, k)
+            W_2d = W_perm.reshape(Np * rank_block_size, N_fused)
+            T_flat = jnp.matmul(W_2d, phi_p.T)                         # (Np*block, Np)
+            T_c = T_flat.reshape(Np, rank_block_size, Np)
+            T_c = jnp.transpose(T_c, (0, 2, 1))                        # (Np, Np, block)
+            return T_acc + T_c, None
+
+        T_init = jnp.zeros((Np, Np, rank_block_size))
+        T_block, _ = jax.lax.scan(process_component, T_init, jnp.arange(3))
+
+        # Antisymmetrise the small (Np, Np, block) T before the big contraction.
+        T_anti = T_block - jnp.transpose(T_block, (1, 0, 2))
+
+        C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :]        # (Nr, Ns, block)
+        contribution = jnp.einsum('pql,rsl->pqrs', T_anti, C_rs)
+        return carry + contribution, None
+
+    init = jnp.zeros((Np, Np, Nr, Ns))
+    result, _ = jax.lax.scan(scan_l_block, init, (U1_scannable, phi_r_scannable, phi_s_scannable))
+    return result
+
+
 def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
                                rank_block_size=None, gpu_max_memory_mb=None):
     """Compute (K1 - K2)[pqrs] in one pass, halving GPU peak vs separate calls.
@@ -778,6 +834,36 @@ def contract_K1_minus_K2_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
         partial = contract_K1_minus_K2_isdf_jit(
             phi_p, phi_q, phi_r_panel, phi_s_panel,
             grad_phi_p, grad_phi_q, U1_panel, rank_block_size,
+        )
+        result = result + partial
+    return result
+
+
+def contract_K1_antisym_pq_isdf_streaming(phi_p, phi_r, phi_s, grad_phi_p, U1,
+                                           rank_block_size=128,
+                                           panel_size=None):
+    """Streaming wrapper around :func:`contract_K1_antisym_pq_isdf_jit`.
+
+    Mirrors :func:`contract_K1_minus_K2_isdf_streaming` (axis-1 panels of
+    ``U1``, host→device on demand, partial sums accumulated on device);
+    use this in the ``slice_p == slice_q`` tile path where the legacy code
+    materialised ``k12`` and computed ``k12 - k12.T(1, 0, 2, 3)``.
+    """
+    n_fused = U1.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U1, np.ndarray):
+            U1 = jax.device_put(U1)
+        return contract_K1_antisym_pq_isdf_jit(
+            phi_p, phi_r, phi_s, grad_phi_p, U1, rank_block_size,
+        )
+
+    Np = phi_p.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Np, Nr, Ns))
+    for U1_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U1, phi_r, phi_s, panel_size):
+        partial = contract_K1_antisym_pq_isdf_jit(
+            phi_p, phi_r_panel, phi_s_panel, grad_phi_p, U1_panel,
+            rank_block_size,
         )
         result = result + partial
     return result
