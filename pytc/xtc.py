@@ -197,6 +197,10 @@ def _chunk_selector(idx, start, stop):
     steps = np.diff(sub)
     if np.all(steps == steps[0]):
         step = int(steps[0])
+        # step==0 would make slice(start, stop, 0) raise; fall back to the
+        # explicit index array (degenerate but legal for fancy indexing).
+        if step == 0:
+            return sub
         return slice(int(sub[0]), int(sub[-1] + step), step)
     return sub
 
@@ -210,13 +214,19 @@ def _estimate_delta_u_contraction_bytes(Np, Nq, Nr, Ns, N_rank):
     return x_sliced_size_bytes, d_size_bytes, scan_carry_bytes, total_needed_bytes
 
 
-def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
+def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank, *, include_d=True):
     """Estimate device memory for the balanced direct Delta U tile kernel.
 
     Delegates to the canonical formula in
     :func:`pytc.utils.tile_memory.isdf_tile_peak_bytes` so that the runtime
     memory guard and the build-phase estimators in ``gpu_memory.py`` always
     agree.
+
+    ``include_d`` should be False when D is already a persistent on-device
+    resident (cached by the per-device cache); otherwise D gets counted both
+    in ``in_use`` (via the free-bytes probe) and again in the total peak —
+    effectively doubling its contribution and triggering spurious "tile
+    exceeds device memory" refusals.
     """
     from pytc.utils.tile_memory import isdf_tile_peak_bytes as _peak
     B = 8
@@ -224,7 +234,7 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank):
     x_size_bytes   = int(Nr * Ns * N_rank * B)
     cpq_size_bytes = int(Np * Nq * N_rank * B)
     out_size_bytes = int(Np * Nq * Nr * Ns * B)
-    total = _peak(Np, Nq, Nr, Ns, N_rank, include_d=True)
+    total = _peak(Np, Nq, Nr, Ns, N_rank, include_d=include_d)
     return {
         "D":   d_size_bytes,
         "X":   x_size_bytes,
@@ -677,8 +687,12 @@ class XTC(TC):
         delta_h = -0.5 * (term1 - term2)
         return delta_h
 
-    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=256, batch_size=1000):
-        """Get one-body operator correction."""
+    def get_1b(self, jastrow_params, dm1=None, block_str=None, ranges=None, orb_block_size=None, batch_size=1000):
+        """Get one-body operator correction.
+
+        ``orb_block_size=None`` lets :meth:`get_delta_h` pick adaptively based on
+        available GPU memory.
+        """
         return self.get_delta_h(jastrow_params, dm1, block_str, ranges, orb_block_size, batch_size)
 
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -1787,9 +1801,9 @@ class ISDFXTC(XTC, ISDFTC):
         return result
 
 
-    def get_delta_h(self, jastrow_params, dm1=None, 
-                    block_str=None, ranges=None, 
-                    orb_block_size=256,
+    def get_delta_h(self, jastrow_params, dm1=None,
+                    block_str=None, ranges=None,
+                    orb_block_size=None,
                     batch_size=1000):
         r"""Get or compute delta_h using ISDF kernels efficiently.
         
@@ -1821,16 +1835,30 @@ class ISDFXTC(XTC, ISDFTC):
         D = kernels['D']
         X = kernels['X']
         phi = self.phi_isdf
-        
+
         slice_p = slice(None)
         slice_q = slice(None)
         if ranges is not None:
              slice_p, slice_q = ranges[0], ranges[1]
-             
+
+        # Adaptive orb_block_size: each HDF5 chunk is
+        # (orb_block_size, n_orb, n_fused) * 8 bytes. For cc-pCV5Z-class
+        # n_fused (~25k) the historical default 128/256 asks for ~30-60 GiB
+        # per chunk and OOMs any single-device allocation.
+        if orb_block_size is None:
+            from pytc.utils.gpu_memory import choose_orb_block_size
+            orb_block_size = choose_orb_block_size(
+                n_orb=phi.shape[0], n_fused=phi.shape[1],
+            )
+            logger.debug(
+                "get_delta_h: auto orb_block_size=%d (n_orb=%d, n_fused=%d)",
+                orb_block_size, phi.shape[0], phi.shape[1],
+            )
+
         Gb = jnp.einsum('rb,sb,rs->b', phi, phi, dm1)
         P_phi = jnp.linalg.multi_dot([phi.T, dm1, phi])
         phi_tilde = jnp.dot(dm1, phi)
-        
+
         # Check if X is HDF5 dataset
         is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File))
         
@@ -2218,15 +2246,28 @@ class ISDFXTC(XTC, ISDFTC):
         Nr = panel_size if panel_size is not None and "r" in panel_layout else r_len
         Ns_eff = panel_size if panel_size is not None and "s" in panel_layout else Ns
 
-        mem = _estimate_delta_u_direct_tile_bytes(Np, Nq_eff, Nr, Ns_eff, N_rank)
+        # D is already counted in ``in_use`` when it's resident in the cache,
+        # so don't add it again to the peak estimate — that would double its
+        # contribution and wrongly refuse tiles that actually fit.
+        mem = _estimate_delta_u_direct_tile_bytes(
+            Np, Nq_eff, Nr, Ns_eff, N_rank,
+            include_d=(D_resident is None),
+        )
         total_needed_bytes = mem["total"]
-        threshold_bytes = int(_get_device_free_bytes(device) * 0.5)
+        # Safety factor on top of the analytical peak estimate. 0.7 leaves
+        # ~43 % head-room for XLA workspace / BFC fragmentation on top of
+        # the estimate (which already counts D, X_sliced, C_pq × 2, C_rs,
+        # and 2 × out). 0.5 (the prior value) gave 2× head-room, which
+        # was too conservative — it refused tiles that in practice fit
+        # by a few GiB once the D double-count bug was removed.
+        threshold_bytes = int(_get_device_free_bytes(device) * 0.7)
         if total_needed_bytes >= threshold_bytes:
             raise RuntimeError(
                 "Delta U direct tile exceeds available device memory: "
                 f"need ~{total_needed_bytes / (1024.0 ** 3):.2f} GiB for "
                 f"tile ({Np}, {Nq_eff}, {Nr}, {Ns_eff}), have "
-                f"~{threshold_bytes / (1024.0 ** 3):.2f} GiB usable. "
+                f"~{threshold_bytes / (1024.0 ** 3):.2f} GiB usable "
+                f"(D_resident={D_resident is not None}). "
                 "Reduce the solver tile panel size."
             )
 

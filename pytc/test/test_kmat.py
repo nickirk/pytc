@@ -223,6 +223,125 @@ class TestKmat(unittest.TestCase):
 
 
 
+class TestStreamingContractionParity(unittest.TestCase):
+    """contract_K1_minus_K2_isdf / contract_K3_isdf_streaming must match the
+    resident JIT on the same inputs — regardless of whether U is host numpy or
+    device jax, and regardless of panel_size."""
+
+    def setUp(self):
+        rng = np.random.RandomState(123)
+        self.n_fused = 97   # deliberately not a multiple of any panel_size below
+        self.n_orb = 11
+        self.Np = self.Nq = self.Nr = self.Ns = self.n_orb
+        self.phi = jnp.asarray(rng.randn(self.n_orb, self.n_fused))
+        self.grad_phi = jnp.asarray(rng.randn(self.n_orb, self.n_fused, 3))
+        self.U1 = jnp.asarray(rng.randn(self.n_fused, self.n_fused, 3))
+        self.U3 = jnp.asarray(rng.randn(self.n_fused, self.n_fused))
+        self.rbs = 16
+
+    def _reference_K1_minus_K2(self):
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf_jit
+        return np.asarray(contract_K1_minus_K2_isdf_jit(
+            self.phi, self.phi, self.phi, self.phi,
+            self.grad_phi, self.grad_phi, self.U1, self.rbs,
+        ))
+
+    def _reference_K3(self):
+        from pytc.kmat import contract_K3_isdf_jit
+        return np.asarray(contract_K3_isdf_jit(
+            self.phi, self.phi, self.phi, self.phi, self.U3, self.rbs,
+        ))
+
+    def test_K1_minus_K2_resident_fast_path_matches_jit(self):
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf
+        ref = self._reference_K1_minus_K2()
+        out = np.asarray(contract_K1_minus_K2_isdf(
+            self.phi, self.phi, self.phi, self.phi,
+            self.grad_phi, self.grad_phi, self.U1, self.rbs,
+            panel_size=None,
+        ))
+        np.testing.assert_allclose(out, ref, atol=1e-14, rtol=0)
+
+    def test_K1_minus_K2_streaming_host_matches_jit(self):
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf
+        ref = self._reference_K1_minus_K2()
+        U1_host = np.asarray(self.U1)  # explicitly on host
+        for panel_size in (16, 32, 48):  # none divides n_fused=97 evenly
+            out = np.asarray(contract_K1_minus_K2_isdf(
+                self.phi, self.phi, self.phi, self.phi,
+                self.grad_phi, self.grad_phi, U1_host, self.rbs,
+                panel_size=panel_size,
+            ))
+            np.testing.assert_allclose(
+                out, ref, atol=1e-12, rtol=0,
+                err_msg=f"panel_size={panel_size}",
+            )
+
+    def test_K1_minus_K2_streaming_device_matches_jit(self):
+        from pytc.kmat import contract_K1_minus_K2_isdf_streaming as contract_K1_minus_K2_isdf
+        ref = self._reference_K1_minus_K2()
+        for panel_size in (16, 32, 48):
+            out = np.asarray(contract_K1_minus_K2_isdf(
+                self.phi, self.phi, self.phi, self.phi,
+                self.grad_phi, self.grad_phi, self.U1, self.rbs,
+                panel_size=panel_size,
+            ))
+            np.testing.assert_allclose(
+                out, ref, atol=1e-12, rtol=0,
+                err_msg=f"panel_size={panel_size}",
+            )
+
+    def test_K1_isdf_streaming_host_matches_jit(self):
+        from pytc.kmat import contract_K1_isdf_jit, contract_K1_isdf_streaming
+        ref = np.asarray(contract_K1_isdf_jit(
+            self.phi, self.phi, self.phi, self.phi, self.grad_phi, self.U1, self.rbs,
+        ))
+        U1_host = np.asarray(self.U1)
+        for panel_size in (16, 32, 48, None):
+            out = np.asarray(contract_K1_isdf_streaming(
+                self.phi, self.phi, self.phi, self.phi, self.grad_phi,
+                U1_host, self.rbs, panel_size=panel_size,
+            ))
+            np.testing.assert_allclose(
+                out, ref, atol=1e-12, rtol=0,
+                err_msg=f"panel_size={panel_size}",
+            )
+
+    def test_K1_antisym_pq_matches_legacy_transpose(self):
+        """In-kernel antisym must equal the legacy ``k12 - k12.T(1,0,2,3)``
+        path (resident & all panel sizes, host & device U1)."""
+        from pytc.kmat import (contract_K1_isdf_jit,
+                                contract_K1_antisym_pq_isdf_streaming)
+        k12 = np.asarray(contract_K1_isdf_jit(
+            self.phi, self.phi, self.phi, self.phi, self.grad_phi, self.U1, self.rbs,
+        ))
+        ref = k12 - k12.transpose(1, 0, 2, 3)
+        for U1_in, label in ((self.U1, "device"), (np.asarray(self.U1), "host")):
+            for panel_size in (None, 16, 32, 48):
+                out = np.asarray(contract_K1_antisym_pq_isdf_streaming(
+                    self.phi, self.phi, self.phi, self.grad_phi, U1_in, self.rbs,
+                    panel_size=panel_size,
+                ))
+                np.testing.assert_allclose(
+                    out, ref, atol=1e-12, rtol=0,
+                    err_msg=f"U1={label}, panel_size={panel_size}",
+                )
+
+    def test_K3_streaming_host_matches_jit(self):
+        from pytc.kmat import contract_K3_isdf_streaming
+        ref = self._reference_K3()
+        U3_host = np.asarray(self.U3)
+        for panel_size in (16, 32, 48, None):
+            out = np.asarray(contract_K3_isdf_streaming(
+                self.phi, self.phi, self.phi, self.phi,
+                U3_host, self.rbs, panel_size=panel_size,
+            ))
+            np.testing.assert_allclose(
+                out, ref, atol=1e-12, rtol=0,
+                err_msg=f"panel_size={panel_size}",
+            )
+
+
 if __name__ == '__main__':
     unittest.main()
 

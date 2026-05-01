@@ -2,6 +2,7 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
     r"""Calculate K1 matrix: K1_{pqrs} = \sum_{i,j} w_i w_j \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
@@ -230,15 +231,16 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
     """
     N_grid_r1 = grid_r1.shape[0]
     N_grid_r2 = grid_r2.shape[0]
-    n_fused = xi_phi_r2.shape[0]
-    
+    n_fused_r1 = xi_grad_r1.shape[0]
+    n_fused_r2 = xi_phi_r2.shape[0]
+
     # Pad grids for scanning
     def get_padded_size(n):
         return ((n + batch_size - 1) // batch_size) * batch_size
 
     padded_size_r1 = get_padded_size(N_grid_r1)
     padded_size_r2 = get_padded_size(N_grid_r2)
-    
+
     # Pad arrays (on host if they are large)
     if padded_size_r1 > N_grid_r1:
         grid_r1_padded = jnp.pad(grid_r1, ((0, padded_size_r1 - N_grid_r1), (0, 0)))
@@ -246,7 +248,7 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
         xi_grad_r1_padded = jnp.pad(xi_grad_r1, ((0, 0), (0, padded_size_r1 - N_grid_r1), (0, 0)))
     else:
         grid_r1_padded, weights_r1_padded, xi_grad_r1_padded = grid_r1, weights_r1, xi_grad_r1
-        
+
     if padded_size_r2 > N_grid_r2:
         grid_r2_padded = jnp.pad(grid_r2, ((0, padded_size_r2 - N_grid_r2), (0, 0)))
         weights_r2_padded = jnp.pad(weights_r2, ((0, padded_size_r2 - N_grid_r2),))
@@ -261,43 +263,44 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
         # Slice r2 batch from host
         r2_batch = jax.lax.dynamic_slice(grid_r2_padded, (i_batch_r2 * batch_size, 0), (batch_size, 3))
         w2_batch = jax.lax.dynamic_slice(weights_r2_padded, (i_batch_r2 * batch_size,), (batch_size,))
-        xi_phi_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused, batch_size))
-        
+        xi_phi_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused_r2, batch_size))
+
         def inner_scan(inner_carry, i_batch_r1):
             # Slice r1 batch from host
             r1_batch = jax.lax.dynamic_slice(grid_r1_padded, (i_batch_r1 * batch_size, 0), (batch_size, 3))
             w1_batch = jax.lax.dynamic_slice(weights_r1_padded, (i_batch_r1 * batch_size,), (batch_size,))
-            xi_grad_batch = jax.lax.dynamic_slice(xi_grad_r1_padded, (0, i_batch_r1 * batch_size, 0), (n_fused, batch_size, 3))
-            
+            xi_grad_batch = jax.lax.dynamic_slice(xi_grad_r1_padded, (0, i_batch_r1 * batch_size, 0), (n_fused_r1, batch_size, 3))
+
             # Calculate gradients: grad_r1 u(r1, r2)
             # u_grad_batch: (batch_r1, batch_r2, 3)
             u_grad_batch = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
-            
+
             # Contract r1:
             # G1_{k,b,c} = sum_g (xi_grad_{k,g,c} * w1_g) * u_grad_batch_{g,b,c}
-            # (N_fused, batch_r1, 3) * (batch_r1, batch_r2, 3) -> (N_fused, batch_r2, 3)
+            # (N_fused_r1, batch_r1, 3) * (batch_r1, batch_r2, 3) -> (N_fused_r1, batch_r2, 3)
             G1_batch = jnp.einsum('kgc,g,gbc->kbc', xi_grad_batch, w1_batch, u_grad_batch)
-            
+
             return inner_carry + G1_batch, None
 
         # Inner scan over r1 batches
-        G1_init = jnp.zeros((n_fused, batch_size, 3))
+        G1_init = jnp.zeros((n_fused_r1, batch_size, 3))
         G1, _ = jax.lax.scan(inner_scan, G1_init, jnp.arange(n_batches_r1))
-        
-        # Contract r2:
-        # K1_batch_{k,l,c} = sum_b G1_{k,b,c} * xi_phi_batch_{l,b} * w2_batch_{b}
-        # Use matmul per component and stack to avoid copies
-        K1_slices = []
-        for c in range(3):
-            G1_w = G1[:, :, c] * w2_batch[None, :]  # (N_fused, batch)
-            K1_slices.append(jnp.matmul(G1_w, xi_phi_batch.T))
-        K1_batch = jnp.stack(K1_slices, axis=-1)
-        
-        return carry + K1_batch, None
 
-    init_val = jnp.zeros((n_fused, n_fused, 3))
+        # Contract r2 and accumulate each component directly into carry; avoids
+        # holding all three (n_fused_r1, n_fused_r2) slices and a stacked
+        # (n_fused_r1, n_fused_r2, 3) tensor concurrently. XLA can fuse the
+        # scatter-add into the donated scan carry.
+        new_carry = carry
+        for c in range(3):
+            G1_w = G1[:, :, c] * w2_batch[None, :]              # (N_fused_r1, batch)
+            K1_c = jnp.matmul(G1_w, xi_phi_batch.T)             # (N_fused_r1, N_fused_r2)
+            new_carry = new_carry.at[:, :, c].add(K1_c)
+
+        return new_carry, None
+
+    init_val = jnp.zeros((n_fused_r1, n_fused_r2, 3))
     K1_kernel, _ = jax.lax.scan(outer_scan, init_val, jnp.arange(n_batches_r2))
-    
+
     return K1_kernel
 
 
@@ -320,15 +323,16 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     """
     N_grid_r1 = grid_r1.shape[0]
     N_grid_r2 = grid_r2.shape[0]
-    n_fused = xi_phi_r2.shape[0]
-    
+    n_fused_r1 = xi_phi_r1.shape[0]
+    n_fused_r2 = xi_phi_r2.shape[0]
+
     # Pad grids for scanning
     def get_padded_size(n):
         return ((n + batch_size - 1) // batch_size) * batch_size
 
     padded_size_r1 = get_padded_size(N_grid_r1)
     padded_size_r2 = get_padded_size(N_grid_r2)
-    
+
     # Pad arrays
     if padded_size_r1 > N_grid_r1:
         grid_r1_padded = jnp.pad(grid_r1, ((0, padded_size_r1 - N_grid_r1), (0, 0)))
@@ -336,7 +340,7 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
         xi_phi_r1_padded = jnp.pad(xi_phi_r1, ((0, 0), (0, padded_size_r1 - N_grid_r1)))
     else:
         grid_r1_padded, weights_r1_padded, xi_phi_r1_padded = grid_r1, weights_r1, xi_phi_r1
-        
+
     if padded_size_r2 > N_grid_r2:
         grid_r2_padded = jnp.pad(grid_r2, ((0, padded_size_r2 - N_grid_r2), (0, 0)))
         weights_r2_padded = jnp.pad(weights_r2, ((0, padded_size_r2 - N_grid_r2),))
@@ -351,43 +355,43 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
         # Slice r2 batch from host
         r2_batch = jax.lax.dynamic_slice(grid_r2_padded, (i_batch_r2 * batch_size, 0), (batch_size, 3))
         w2_batch = jax.lax.dynamic_slice(weights_r2_padded, (i_batch_r2 * batch_size,), (batch_size,))
-        xi_phi_r2_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused, batch_size))
-        
+        xi_phi_r2_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused_r2, batch_size))
+
         def inner_scan(inner_carry, i_batch_r1):
             # Slice r1 batch from host
             r1_batch = jax.lax.dynamic_slice(grid_r1_padded, (i_batch_r1 * batch_size, 0), (batch_size, 3))
             w1_batch = jax.lax.dynamic_slice(weights_r1_padded, (i_batch_r1 * batch_size,), (batch_size,))
-            xi_phi_r1_batch = jax.lax.dynamic_slice(xi_phi_r1_padded, (0, i_batch_r1 * batch_size), (n_fused, batch_size))
-            
+            xi_phi_r1_batch = jax.lax.dynamic_slice(xi_phi_r1_padded, (0, i_batch_r1 * batch_size), (n_fused_r1, batch_size))
+
             # Calculate gradients: grad_r1 u(r1, r2)
             # u_grad_batch: (batch_r1, batch_r2, 3)
             u_grad_batch = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params)
-            
+
             # Compute squared norm of gradients: (batch_r1, batch_r2)
             u_grad_norm_sq = jnp.sum(u_grad_batch**2, axis=-1)
-            
+
             # Contract r1:
             # G3_{k,b} = sum_g (xi_phi_{k,g} * w1_g) * |grad u(g,b)|^2
-            # (N_fused, batch_r1) * (batch_r1) * (batch_r1, batch_r2) -> (N_fused, batch_r2)
+            # (N_fused_r1, batch_r1) * (batch_r1) * (batch_r1, batch_r2) -> (N_fused_r1, batch_r2)
             G3_batch = jnp.einsum('kg,g,gb->kb', xi_phi_r1_batch, w1_batch, u_grad_norm_sq)
-            
+
             return inner_carry + G3_batch, None
 
         # Inner scan over r1 batches
-        G3_init = jnp.zeros((n_fused, batch_size))
+        G3_init = jnp.zeros((n_fused_r1, batch_size))
         G3, _ = jax.lax.scan(inner_scan, G3_init, jnp.arange(n_batches_r1))
-        
+
         # Contract r2:
         # K3_batch_{k,l} = sum_b G3_{k,b} * xi_phi_r2_batch_{l,b} * w2_batch_{b}
         # Use matmul: (G3 * w) @ xi_phi.T to avoid large intermediate
-        G3_w = G3 * w2_batch[None, :]  # (N_fused, batch)
+        G3_w = G3 * w2_batch[None, :]  # (N_fused_r1, batch)
         K3_batch = jnp.matmul(G3_w, xi_phi_r2_batch.T)
-        
+
         return carry + K3_batch, None
 
-    init_val = jnp.zeros((n_fused, n_fused))
+    init_val = jnp.zeros((n_fused_r1, n_fused_r2))
     K3_kernel, _ = jax.lax.scan(outer_scan, init_val, jnp.arange(n_batches_r2))
-    
+
     return K3_kernel
 
 
@@ -581,6 +585,62 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
     return result
 
 
+@partial(jax.jit, static_argnums=(5,))
+def contract_K1_antisym_pq_isdf_jit(phi_p, phi_r, phi_s, grad_phi_p, U1,
+                                     rank_block_size=128):
+    """Compute ``K1[p,q,r,s] - K1[q,p,r,s]`` for the symmetric case
+    ``phi_p == phi_q`` (and ``grad_phi_p == grad_phi_q``).
+
+    Antisymmetrises the small ``(Np, Np, block)`` T tensor inside the rank
+    scan, then contracts against ``C_rs[r,s,l]``.  This avoids materialising
+    the full ``(Np, Np, Nr, Ns)`` K1 intermediate and its transposed copy
+    (the dominant cost of the legacy ``k12 - k12.T(1,0,2,3)`` path).
+    """
+    Np = phi_p.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_fused = U1.shape[0]
+    n_rank = U1.shape[1]
+
+    padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
+    pad_width = padded_rank - n_rank
+    U1_padded = jnp.pad(U1, ((0, 0), (0, pad_width), (0, 0)))
+    phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width)))
+    phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width)))
+
+    n_blocks = padded_rank // rank_block_size
+    U1_scannable = U1_padded.reshape(N_fused, n_blocks, rank_block_size, 3).transpose(1, 0, 2, 3)
+    phi_r_scannable = phi_r_padded.reshape(Nr, n_blocks, rank_block_size).transpose(1, 0, 2)
+    phi_s_scannable = phi_s_padded.reshape(Ns, n_blocks, rank_block_size).transpose(1, 0, 2)
+
+    def scan_l_block(carry, args):
+        U1_block, phi_r_block, phi_s_block = args
+
+        # T[p,q,l'] = sum_{k,c} grad_phi_p[p,k,c] U1[k,l',c] phi_p[q,k]
+        def process_component(T_acc, c):
+            U1_slice = U1_block[:, :, c]                              # (N_fused, block)
+            W = grad_phi_p[:, :, c][:, :, None] * U1_slice[None, :, :] # (Np, k, block)
+            W_perm = jnp.transpose(W, (0, 2, 1))                       # (Np, block, k)
+            W_2d = W_perm.reshape(Np * rank_block_size, N_fused)
+            T_flat = jnp.matmul(W_2d, phi_p.T)                         # (Np*block, Np)
+            T_c = T_flat.reshape(Np, rank_block_size, Np)
+            T_c = jnp.transpose(T_c, (0, 2, 1))                        # (Np, Np, block)
+            return T_acc + T_c, None
+
+        T_init = jnp.zeros((Np, Np, rank_block_size))
+        T_block, _ = jax.lax.scan(process_component, T_init, jnp.arange(3))
+
+        # Antisymmetrise the small (Np, Np, block) T before the big contraction.
+        T_anti = T_block - jnp.transpose(T_block, (1, 0, 2))
+
+        C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :]        # (Nr, Ns, block)
+        contribution = jnp.einsum('pql,rsl->pqrs', T_anti, C_rs)
+        return carry + contribution, None
+
+    init = jnp.zeros((Np, Np, Nr, Ns))
+    result, _ = jax.lax.scan(scan_l_block, init, (U1_scannable, phi_r_scannable, phi_s_scannable))
+    return result
+
+
 def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
                                rank_block_size=None, gpu_max_memory_mb=None):
     """Compute (K1 - K2)[pqrs] in one pass, halving GPU peak vs separate calls.
@@ -625,13 +685,14 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
     N_fused = U3.shape[0]
-    
-    n_rank = N_fused
-    
-    # Pad rank dimension
+    # ``n_rank`` is the l (axis-1) size, which may differ from N_fused when
+    # streaming passes a panel of axis-1 columns.
+    n_rank = U3.shape[1]
+
+    # Pad rank dimension (axis 1) to a multiple of rank_block_size.
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width = padded_rank - n_rank
-    
+
     # Pad U3 along axis 1 (l index)
     U3_padded = jnp.pad(U3, ((0, 0), (0, pad_width)))
     
@@ -674,6 +735,164 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     K3_final, _ = jax.lax.scan(scan_l_block, K3_init, (U3_scannable, phi_r_scannable, phi_s_scannable))
     
     return K3_final
+
+def _pad_axis(arr, axis, pad):
+    """Pad ``arr`` with zeros by ``pad`` along ``axis``. Works for np or jnp."""
+    if pad <= 0:
+        return arr
+    pad_width = [(0, 0)] * arr.ndim
+    pad_width[axis] = (0, pad)
+    if isinstance(arr, np.ndarray):
+        return np.pad(arr, pad_width)
+    return jnp.pad(arr, pad_width)
+
+
+def _stream_l_panels(U, phi_r, phi_s, panel_size):
+    """Iterate (U_panel, phi_r_panel, phi_s_panel) along axis-1 of U.
+
+    Each yielded panel has axis-1 size exactly ``panel_size`` (last panel is
+    zero-padded to keep a single JIT shape). U panels are moved to device with
+    ``jax.device_put`` when U lives on host.
+    """
+    n_fused = U.shape[1]
+    for l0 in range(0, n_fused, panel_size):
+        l1 = min(l0 + panel_size, n_fused)
+        pad = panel_size - (l1 - l0)
+
+        U_slice = U[:, l0:l1, ...] if U.ndim == 3 else U[:, l0:l1]
+        U_slice = _pad_axis(U_slice, 1, pad)
+        if isinstance(U_slice, np.ndarray):
+            U_slice = jax.device_put(U_slice)
+
+        phi_r_slice = _pad_axis(phi_r[:, l0:l1], 1, pad)
+        phi_s_slice = _pad_axis(phi_s[:, l0:l1], 1, pad)
+        yield U_slice, phi_r_slice, phi_s_slice
+
+
+def contract_K1_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
+                                grad_phi_p, U1,
+                                rank_block_size=128,
+                                panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K1_isdf_jit` (symmetric,
+    p == q case). Same panel-on-axis-1 strategy as
+    :func:`contract_K1_minus_K2_isdf`."""
+    n_fused = U1.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U1, np.ndarray):
+            U1 = jax.device_put(U1)
+        return contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_size)
+
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Nq, Nr, Ns))
+    for U1_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U1, phi_r, phi_s, panel_size):
+        partial = contract_K1_isdf_jit(
+            phi_p, phi_q, phi_r_panel, phi_s_panel, grad_phi_p, U1_panel,
+            rank_block_size,
+        )
+        result = result + partial
+    return result
+
+
+def contract_K1_minus_K2_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
+                                         grad_phi_p, grad_phi_q, U1,
+                                         rank_block_size=128,
+                                         panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K1_minus_K2_isdf_jit`.
+
+    ``U1`` can be a device ``jax.Array`` or a host numpy ndarray.
+
+    * ``panel_size=None`` or ``panel_size >= U1.shape[1]`` → delegate to the
+      JIT once with the full K1; behaviour is bit-identical to the resident
+      fast-path.
+    * Otherwise, iterate over axis-1 (rank-column) panels of ``panel_size``;
+      each panel is ``jax.device_put`` just before its call, phi_r/phi_s
+      sliced to the matching slab, and partial contributions summed on
+      device. Axis 0 of U1 (the k axis) is untouched.
+
+    The last panel is zero-padded to ``panel_size`` so the JIT compiles once
+    for the whole loop. Zero-padded rows/columns contribute 0 to the sum.
+
+    Note: a function named ``contract_K1_minus_K2_isdf`` (without the
+    ``_streaming`` suffix) already exists as a range-based wrapper that
+    slices from a full ``phi_piv`` / ``grad_phi_piv`` — keep the names
+    distinct.
+    """
+    n_fused = U1.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U1, np.ndarray):
+            U1 = jax.device_put(U1)
+        return contract_K1_minus_K2_isdf_jit(
+            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1,
+            rank_block_size,
+        )
+
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Nq, Nr, Ns))
+    for U1_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U1, phi_r, phi_s, panel_size):
+        partial = contract_K1_minus_K2_isdf_jit(
+            phi_p, phi_q, phi_r_panel, phi_s_panel,
+            grad_phi_p, grad_phi_q, U1_panel, rank_block_size,
+        )
+        result = result + partial
+    return result
+
+
+def contract_K1_antisym_pq_isdf_streaming(phi_p, phi_r, phi_s, grad_phi_p, U1,
+                                           rank_block_size=128,
+                                           panel_size=None):
+    """Streaming wrapper around :func:`contract_K1_antisym_pq_isdf_jit`.
+
+    Mirrors :func:`contract_K1_minus_K2_isdf_streaming` (axis-1 panels of
+    ``U1``, host→device on demand, partial sums accumulated on device);
+    use this in the ``slice_p == slice_q`` tile path where the legacy code
+    materialised ``k12`` and computed ``k12 - k12.T(1, 0, 2, 3)``.
+    """
+    n_fused = U1.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U1, np.ndarray):
+            U1 = jax.device_put(U1)
+        return contract_K1_antisym_pq_isdf_jit(
+            phi_p, phi_r, phi_s, grad_phi_p, U1, rank_block_size,
+        )
+
+    Np = phi_p.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Np, Nr, Ns))
+    for U1_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U1, phi_r, phi_s, panel_size):
+        partial = contract_K1_antisym_pq_isdf_jit(
+            phi_p, phi_r_panel, phi_s_panel, grad_phi_p, U1_panel,
+            rank_block_size,
+        )
+        result = result + partial
+    return result
+
+
+def contract_K3_isdf_streaming(phi_p, phi_q, phi_r, phi_s, U3,
+                                rank_block_size=128,
+                                panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K3_isdf_jit`.
+
+    Same panel-on-axis-1 strategy as :func:`contract_K1_minus_K2_isdf`, but
+    U3 is 2-D ``(n_fused, n_fused)`` with no ``c`` component axis.
+    """
+    n_fused = U3.shape[1]
+    if panel_size is None or panel_size >= n_fused:
+        if isinstance(U3, np.ndarray):
+            U3 = jax.device_put(U3)
+        return contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size)
+
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    result = jnp.zeros((Np, Nq, Nr, Ns))
+    for U3_panel, phi_r_panel, phi_s_panel in _stream_l_panels(U3, phi_r, phi_s, panel_size):
+        partial = contract_K3_isdf_jit(
+            phi_p, phi_q, phi_r_panel, phi_s_panel, U3_panel, rank_block_size,
+        )
+        result = result + partial
+    return result
+
 
 def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
                      gpu_max_memory_mb=None):

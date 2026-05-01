@@ -26,6 +26,32 @@ from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize  # noq
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Per-tile absolute size ceiling (asymmetric-tile phases only)
+# ---------------------------------------------------------------------------
+# Raising ``gpu_max_memory`` to help one phase (e.g. VVVV, tile ~10 GB
+# symmetric shape) can push another phase's tile across a cuBLAS / XLA
+# autotuning cliff.  Empirically observed on B200 (HBM=180 GB) at benzene
+# cc-pCV5Z (n_fused=25961, nvir=1179):
+#
+#   OVVV (asymmetric ``(blk, V, V, O)`` output fusion):
+#     blksize=89  → tile ≈ 21 GB → succeeds
+#     blksize=193 → tile ≈ 45 GB → "No valid config found!"  (autotuner
+#                                  cannot find a cuBLAS config whose
+#                                  workspace fits alongside the tile).
+#
+#   VVVV / V3O (symmetric ``(blk, V, blk, V)`` / ``(V, ps, ps, V)``):
+#     tile can exceed 50 GB without hitting any autotune cliff.
+#
+# So the cliff is specific to the ASYMMETRIC tile shapes handled by the
+# generic ``estimate_blksize`` path (OVVV / VOVV / similar).  The ceiling
+# below is applied ONLY in that generic path.  ``estimate_vvvv_panel_blksize``
+# and ``estimate_v3o_panel_blksize`` deliberately do NOT cap themselves
+# with this constant — their symmetric tile shapes do not trigger the
+# cuBLAS autotuner cliff at the sizes currently seen in benchmarks.
+SAFE_TILE_BYTES_CEILING = 25 * 10 ** 9  # ~25 GB per tile
+
 # ---------------------------------------------------------------------------
 # Persistent GPU residents
 # ---------------------------------------------------------------------------
@@ -124,6 +150,189 @@ def _get_gpu_physical_bytes():
         return min(limits) if limits else 80 * 1024 ** 3
     except Exception:
         return 80 * 1024 ** 3  # 80 GiB fallback (A100)
+
+
+# ---------------------------------------------------------------------------
+# Generic memory-constrained tile-size solver (used by K-kernel construction)
+# ---------------------------------------------------------------------------
+
+# Reserve this fraction of the probed free budget for XLA workspace, alignment
+# padding, and BFC allocator fragmentation overhead.  Raise if OOMs persist
+# despite the analytical model saying otherwise; lower if the model is proven
+# too conservative.  Documented here (not at the call site) so there is one
+# place to audit the slack.
+K_KERNEL_SAFETY_FRACTION = 0.30
+
+# Largest fraction of the budget that any single replicated/partially-sharded
+# *input* tensor is allowed to occupy on a device.  Without this, a huge
+# replicated ``xi_phi_r2`` can eat the budget and the peak-memory solver will
+# still say "it fits" — but one of the K1 carry transients then has nowhere
+# to land.  Enforcing a ceiling on the biggest input forces host tiling when
+# replication gets pathological, independent of the specific system size.
+#
+# 0.20 is a physically motivated choice: XLA's BFC allocator observably eats
+# 20–30 % of a pool near full occupancy via fragmentation and alignment, so
+# no single input should claim more than about one fifth of the budget —
+# otherwise the remaining headroom is too small to absorb one K1-carry
+# transient (~ 3 n² / m_k * 8 bytes) on top of everything else.
+K_KERNEL_SINGLE_INPUT_MAX_FRACTION = 0.20
+
+
+def solve_tile_sizes(
+    *,
+    budget_bytes: int,
+    fixed_bytes: int,
+    r1_elem_bytes_per_unit: float,
+    r2_elem_bytes_per_unit: float,
+    r1_upper: int,
+    r2_upper: int,
+    r2_single_input_bytes_per_unit: float = None,
+    safety_fraction: float = K_KERNEL_SAFETY_FRACTION,
+    r2_single_input_max_fraction: float = K_KERNEL_SINGLE_INPUT_MAX_FRACTION,
+    r1_floor: int = 1024,
+    r2_floor: int = 1024,
+):
+    """Solve for r1/r2 host tile sizes under an explicit peak-memory model.
+
+    The caller declares:
+
+    * ``budget_bytes`` — total per-device budget (usually the probed free pool).
+    * ``fixed_bytes`` — sum of resident + transient per-device tensors whose
+      size does *not* depend on the tile sizes (carries, scratch, psum bufs).
+    * ``r1_elem_bytes_per_unit`` — how many bytes of per-device memory grow
+      by 1 when ``B_r1`` grows by 1 (typically ``4 * n_rank / m_k * 8`` for
+      K-kernels: xi_phi_r1 + 3 * xi_grad_r1 components, k-sharded).
+    * ``r2_elem_bytes_per_unit`` — same for ``B_r2``.
+    * ``r1_upper``, ``r2_upper`` — absolute caps (usually ``n_grid``).
+    * ``r2_single_input_bytes_per_unit`` — if provided, cap B_r2 so the
+      single biggest r2-side input (e.g. xi_phi_r2 shard) occupies at
+      most ``r2_single_input_max_fraction * budget_bytes``.
+
+    Returns
+    -------
+    dict with ``B_r1``, ``B_r2``, and a ``predicted_peak_bytes`` estimate
+    that is ``fixed_bytes + B_r1 * r1_elem_bytes_per_unit + B_r2 *
+    r2_elem_bytes_per_unit``.  The returned tile sizes satisfy
+    ``predicted_peak_bytes <= budget_bytes * (1 - safety_fraction)``.
+
+    Raises ``RuntimeError`` if ``fixed_bytes`` alone already exceeds the
+    safety-adjusted budget.
+    """
+    if budget_bytes <= 0:
+        raise ValueError(f"budget_bytes must be positive, got {budget_bytes}")
+    usable = budget_bytes * (1.0 - safety_fraction)
+    if fixed_bytes >= usable:
+        raise RuntimeError(
+            f"solve_tile_sizes: fixed-cost {fixed_bytes / 1024 ** 3:.2f} GiB "
+            f"already exceeds safety-adjusted budget "
+            f"{usable / 1024 ** 3:.2f} GiB "
+            f"(budget {budget_bytes / 1024 ** 3:.2f} GiB, "
+            f"safety {safety_fraction:.0%}). "
+            "Use more devices, increase m_k, or lower safety_fraction."
+        )
+
+    remaining = usable - fixed_bytes
+
+    # r1 gets a fixed small slice (it is typically tiny compared to r2).  Start
+    # with a generous r1 cap; r2 gets everything left.
+    # We bound r1 by the remaining headroom / 5 to leave most for r2.
+    r1_frac = 0.2
+    r1_cap_bytes = remaining * r1_frac
+    B_r1 = int(r1_cap_bytes / max(r1_elem_bytes_per_unit, 1.0))
+    B_r1 = max(min(B_r1, r1_upper), r1_floor)
+    # Clamp B_r1 to upper since that is n_grid; never need more.
+    B_r1 = min(B_r1, r1_upper)
+
+    r2_avail = remaining - B_r1 * r1_elem_bytes_per_unit
+    B_r2 = int(r2_avail / max(r2_elem_bytes_per_unit, 1.0))
+
+    if r2_single_input_bytes_per_unit is not None:
+        single_input_cap_bytes = budget_bytes * r2_single_input_max_fraction
+        B_r2_input_cap = int(single_input_cap_bytes
+                             / max(r2_single_input_bytes_per_unit, 1.0))
+        B_r2 = min(B_r2, B_r2_input_cap)
+
+    B_r2 = max(min(B_r2, r2_upper), r2_floor)
+
+    predicted_peak = (
+        fixed_bytes
+        + B_r1 * r1_elem_bytes_per_unit
+        + B_r2 * r2_elem_bytes_per_unit
+    )
+    # The r1/r2 floors can pull B_r1/B_r2 back up after they were sized
+    # against `remaining`; in tight-memory cases that silently violates the
+    # budget contract.  Fail fast instead of returning oversize tiles that
+    # OOM later in K-kernel construction.
+    if predicted_peak > usable:
+        raise RuntimeError(
+            f"solve_tile_sizes: no feasible tile fits the safety-adjusted "
+            f"budget — even at the floors B_r1={B_r1}, B_r2={B_r2} the "
+            f"predicted peak {predicted_peak / 1024 ** 3:.2f} GiB exceeds "
+            f"usable {usable / 1024 ** 3:.2f} GiB "
+            f"(budget {budget_bytes / 1024 ** 3:.2f} GiB, fixed "
+            f"{fixed_bytes / 1024 ** 3:.2f} GiB, safety {safety_fraction:.0%}). "
+            "Use more devices, increase m_k, lower the floors, or lower safety_fraction."
+        )
+    return {
+        "B_r1": int(B_r1),
+        "B_r2": int(B_r2),
+        "predicted_peak_bytes": int(predicted_peak),
+        "usable_bytes": int(usable),
+    }
+
+
+def choose_orb_block_size(
+    n_orb: int,
+    n_fused: int,
+    *,
+    bytes_per_elem: int = 8,
+    budget_fraction: float = 0.15,
+    min_block: int = 1,
+    max_block: int = 256,
+) -> int:
+    """Choose ``orb_block_size`` so one HDF5 chunk of ``X`` fits a device.
+
+    ``get_delta_h`` (in :mod:`pytc.xtc`) streams ``X`` from HDF5 in chunks of
+    shape ``(orb_block_size, n_orb, n_fused)`` and then does einsums that
+    materialise the chunk on device. Per-chunk bytes are
+    ``orb_block_size * n_orb * n_fused * bytes_per_elem`` and grow linearly
+    with ``n_fused``. For modest bases this is a few GiB; for cc-pCV5Z-class
+    n_fused (~25k) the default ``orb_block_size=128`` alone asks for ~30 GiB
+    per chunk — larger than any single A100 partition.
+
+    Rather than hard-coding a per-system block, solve for it: read the probed
+    free memory, apportion ``budget_fraction`` of it to X_chunk, and floor.
+
+    Parameters
+    ----------
+    n_orb, n_fused : int
+        Shapes of the chunk's non-block axes.
+    bytes_per_elem : int
+        8 for float64 (default), 4 for float32.
+    budget_fraction : float
+        Fraction of the probed free memory that X_chunk is allowed to
+        consume. 0.15 leaves room for P_phi (~n_fused^2 * 8), einsum
+        scratch, other resident tensors, and XLA fragmentation.
+    min_block, max_block : int
+        Clamp the chosen block to this range.
+
+    Returns
+    -------
+    int
+        Chosen ``orb_block_size``, clamped to
+        ``[min_block, min(n_orb, max_block)]`` for the normal path.
+        Degenerate inputs (``n_orb <= 0`` or ``n_fused <= 0``) bypass the
+        clamp and return ``max_block`` — the caller's chunk loop won't
+        iterate anyway, so the value is a safe no-op default.
+    """
+    if n_orb <= 0 or n_fused <= 0:
+        return max_block
+    free = _get_gpu_free_bytes()
+    budget = max(int(free * budget_fraction), 0)
+    per_block_bytes = n_orb * n_fused * bytes_per_elem
+    max_block_for_mem = max(1, budget // per_block_bytes)
+    cap = min(n_orb, max_block)
+    return int(max(min_block, min(cap, max_block_for_mem)))
 
 
 def _get_gpu_free_bytes():
@@ -468,27 +677,46 @@ def estimate_blksize(nocc, nvir, phase, *,
     else:
         raise ValueError(f"Unknown phase: {phase!r}")
 
-    # 4. Safety margin (20%) ---------------------------------------------------
+    # 4. Safety margin (20%) + per-tile ceiling -------------------------------
     usable = available * 0.8
-    blksize = max(1, int(usable / per_blk))
+    # Absolute per-tile cap — protects against pushing small-per-blk phases
+    # past the cuBLAS/XLA autotuning cliff when gpu_max_memory is big.
+    capped_usable = min(usable, SAFE_TILE_BYTES_CEILING)
+    blksize = max(1, int(capped_usable / per_blk))
     blksize = min(nvir, blksize)
 
+    bound_by = "ceiling" if capped_usable < usable else "budget"
     logger.debug(
         "estimate_blksize(phase=%s): budget=%.2f GB, persistent=%.2f GB, "
-        "available=%.2f GB, per_blk=%.2f MB → blksize=%d",
+        "available=%.2f GB, per_blk=%.2f MB, ceiling=%.2f GB "
+        "→ blksize=%d (bound by %s)",
         phase, budget / 1e9, persistent / 1e9,
-        available / 1e9, per_blk / 1e6, blksize)
+        available / 1e9, per_blk / 1e6,
+        SAFE_TILE_BYTES_CEILING / 1e9, blksize, bound_by)
 
     return blksize, budget
 
 
 def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
                             include_eris, include_accumulators,
-                            n_fused, safety_factor):
+                            n_fused, safety_factor,
+                            tc_resident=None):
     """Return ``(usable, gpu_target, resident_gb_parts)`` for panel estimators.
 
     Shared boilerplate extracted from ``estimate_vvvv_panel_blksize`` and
     ``estimate_v3o_panel_blksize`` so the two never drift apart.
+
+    Parameters
+    ----------
+    tc_resident : bool or None
+        Whether the TC kernels (K1 + K3, combined size ``4·Nf²·8``) sit
+        resident on device throughout the phase.  ``True`` adds them to
+        the resident budget subtraction (tile gets less room).  ``False``
+        assumes they are streamed in panels per tile call (tile gets more
+        room).  ``None`` auto-detects: K1+K3 resident if they fit in 15 %
+        of probed free memory, streamed otherwise — matching the
+        ``_choose_tc_kernel_strategy`` rule used by the per-device TC
+        cache in ``pytc.tc``.
 
     Returns
     -------
@@ -514,7 +742,14 @@ def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
 
     nmo = O + V
     d_bytes   = Nf * Nf * B
-    tc_bytes  = 4 * Nf * Nf * B if Nf > 0 else 0   # K1, K3, D, X kernel matrices
+    tc_full_bytes = 4 * Nf * Nf * B if Nf > 0 else 0   # K1 (3·Nf²) + K3 (Nf²)
+
+    if tc_resident is None:
+        # Auto: streaming if K1+K3 don't fit resident at the same 15 %
+        # threshold used by ``_choose_tc_kernel_strategy``.
+        tc_resident = tc_full_bytes <= int(gpu_free * 0.15) if Nf > 0 else True
+
+    tc_bytes = tc_full_bytes if tc_resident else 0
     phi_bytes = 4 * nmo * Nf * B if Nf > 0 else 0   # phi panels (4 copies)
     resident_isdf = d_bytes + tc_bytes + phi_bytes
 
@@ -525,6 +760,7 @@ def _budget_for_tile_sizing(nocc, nvir, gpu_max_memory_mb,
         resident_isdf=resident_isdf,
         d_bytes=d_bytes,
         tc_bytes=tc_bytes,
+        tc_resident=tc_resident,
         phi_bytes=phi_bytes,
         gpu_target=gpu_target,
         Nf=Nf,
@@ -563,16 +799,33 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
         ccsd   = O * O * blk * blk * B   # t2new slice on GPU
         return isdf + df + ccsd
 
+    # VVVV tile is a symmetric (blk, V, blk, V) shape that empirically does
+    # not hit the cuBLAS autotune cliff even when total tile bytes exceed
+    # SAFE_TILE_BYTES_CEILING — so this path is NOT capped by the ceiling.
+    # (The ceiling is only applied in the generic estimate_blksize path,
+    # which handles the asymmetric OVVV tile that DID hit the cliff.)
     best = find_max_blksize(tile_bytes, lo=1, hi=max(1, nvir),
                             gpu_target=gpu_target)
     best = max(1, min(best, nvir))
 
+    # find_max_blksize returns ``lo`` (=1 here) even when the minimum tile
+    # already exceeds gpu_target — warn so OOMs in compute_vvvv aren't
+    # surprises.  Mirrors the same guard in estimate_v3o_panel_blksize.
+    if gpu_target > 0 and tile_bytes(best) > gpu_target:
+        logger.warning(
+            "estimate_vvvv_panel_blksize: minimum tile (blk=%d) needs %.2f GB "
+            "but gpu_target=%.2f GB — returning minimum anyway. "
+            "Consider raising gpu_max_memory or reducing system size.",
+            best, tile_bytes(best) / 1e9, gpu_target / 1e9,
+        )
+
     logger.debug(
         "estimate_vvvv_panel_blksize: usable=%.2f GB, resident=%.2f GB "
-        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
-        "naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
+        "(D=%.2f GB, TC=%.2f GB [resident=%s], phi=%.2f GB), "
+        "gpu_target=%.2f GB, naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
         usable / 1e9, lp["resident_isdf"] / 1e9,
-        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["phi_bytes"] / 1e9,
+        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["tc_resident"],
+        lp["phi_bytes"] / 1e9,
         lp["gpu_target"] / 1e9, naux, n_fused, best, tile_bytes(best) / 1e9,
     )
     return best, usable
@@ -657,6 +910,8 @@ def estimate_v3o_panel_blksize(nocc, nvir, *,
         return V * O * blk * V * B
 
     # Start search at nocc: panel_size = max(nocc, blk) is flat below nocc.
+    # V3O tiles are symmetric (V, ps, ps, V) — same rationale as VVVV for
+    # not applying SAFE_TILE_BYTES_CEILING here.
     best = find_max_blksize(
         tile_bytes,
         lo=nocc, hi=max(nocc, nvir),
@@ -676,10 +931,12 @@ def estimate_v3o_panel_blksize(nocc, nvir, *,
 
     logger.debug(
         "estimate_v3o_panel_blksize: usable=%.2f GB, resident=%.2f GB "
-        "(D=%.2f GB, TC=%.2f GB, phi=%.2f GB), gpu_target=%.2f GB, "
-        "host_target=%s GB, naux=%s, n_fused=%s -> blk=%d (tile=%.2f GB)",
+        "(D=%.2f GB, TC=%.2f GB [resident=%s], phi=%.2f GB), "
+        "gpu_target=%.2f GB, host_target=%s GB, naux=%s, "
+        "n_fused=%s -> blk=%d (tile=%.2f GB)",
         usable / 1e9, lp["resident_isdf"] / 1e9,
-        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["phi_bytes"] / 1e9,
+        lp["d_bytes"] / 1e9, lp["tc_bytes"] / 1e9, lp["tc_resident"],
+        lp["phi_bytes"] / 1e9,
         lp["gpu_target"] / 1e9,
         "None" if host_target is None else f"{host_target / 1e9:.2f}",
         naux, n_fused, best, tile_bytes(best) / 1e9,
@@ -714,9 +971,54 @@ def resolve_v3o_panel_block_size(nocc, nvir, *,
     return panel_blk
 
 
+def estimate_tc_contract_resident_bytes(n_orb, n_fused, *,
+                                        k_stream_panel=None,
+                                        bytes_per_elem=8):
+    """Bytes resident on one device during a TC contract_K1/K3 JIT call,
+    excluding the W scan intermediate (which is what :func:`adaptive_rank_block_size`
+    is sizing).
+
+    Line items:
+      * D                 : n_fused²
+      * phi_isdf          : n_orb * n_fused
+      * grad_phi_isdf     : 3 * n_orb * n_fused
+      * tile accumulator  : small (≤ n_orb² × a few KB worst case) — use an
+                            n_orb² × 1024 upper bound
+      * K1 / K3 effective : resident or streamed + padded/scannable overhead.
+        Observed on A100 grace runs at n_fused ≈ 26k: XLA keeps roughly 1×
+        input + 1× scannable copy of each, i.e. a 2× multiplier on the input
+        bytes. We use 2.0 to be safe against small per-call allocator
+        transients.
+
+    ``k_stream_panel=None`` means K1/K3 stay fully resident across tiles;
+    otherwise they are slabbed per tile at ``k_stream_panel`` rank columns.
+    """
+    B = int(bytes_per_elem)
+    d_bytes = n_fused * n_fused * B
+    phi_bytes = n_orb * n_fused * B
+    grad_phi_bytes = 3 * n_orb * n_fused * B
+    # Generous bound on tile output accumulator without needing panel size.
+    tile_bytes = n_orb * n_orb * 1024 * B
+
+    if k_stream_panel is None:
+        # K1 (n_fused² * 3) + K3 (n_fused²) = 4 n_fused².
+        k_input_bytes = 4 * n_fused * n_fused * B
+    else:
+        k_input_bytes = 4 * n_fused * int(k_stream_panel) * B
+
+    # Padded/scannable overhead inside the JIT; observed ≈ 1× input on top.
+    k_overhead_bytes = k_input_bytes
+
+    return (d_bytes + phi_bytes + grad_phi_bytes + tile_bytes
+            + k_input_bytes + k_overhead_bytes)
+
+
 def adaptive_rank_block_size(Np, Nq, N_fused, *,
+                              resident_bytes=0,
+                              budget_bytes=None,
                               gpu_max_memory_mb=None,
-                              min_block=64, max_block=2048):
+                              budget_fraction=0.25,
+                              min_block=4, max_block=2048):
     """Compute the largest safe ``rank_block_size`` for ISDF scan contractions.
 
     The peak intermediate per scan step in ``contract_K1_isdf_jit`` is::
@@ -728,35 +1030,61 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
 
         W: (N_fused, rank_block_size, Nq) × 8 bytes
 
-    This function picks the largest power-of-2 block size that keeps the
-    peak intermediate within 50% of the available GPU budget.
+    Returned rank_block_size satisfies::
+
+        peak_W_bytes ≤ budget_fraction × (budget - resident_bytes)
 
     Parameters
     ----------
     Np, Nq : int
-        Orbital slice sizes for the bra / ket indices.
+        Orbital slice sizes for the bra / ket indices. ``Np`` drives the W
+        peak for K1 contractions; ``Nq`` drives it for the D-term pattern.
     N_fused : int
         ISDF rank (dimension being scanned over).
-    gpu_max_memory_mb : float | None
-        User override for total GPU memory.
+    resident_bytes : int, optional
+        Sum of per-device bytes that will coexist with W during the scan
+        (D, phi, grad_phi, K1/K3 or their panels with XLA overhead, tile
+        accumulator). Default 0 reproduces the old "pool is entirely
+        free" assumption — caller should supply a real estimate whenever
+        possible. :func:`estimate_tc_contract_resident_bytes` helps.
+    budget_bytes : int, optional
+        Explicit budget override (bytes). If not given, falls back to
+        ``gpu_max_memory_mb`` if supplied, otherwise to the runtime-probed
+        ``_get_gpu_free_bytes()``.
+    gpu_max_memory_mb : float, optional
+        Legacy override in MiB; used only when ``budget_bytes`` is not set.
+    budget_fraction : float
+        Fraction of the *available* budget (``budget − resident``) allowed
+        for the W intermediate. 0.25 leaves three quarters for XLA workspace,
+        BFC fragmentation, and scan-carry transients — observed to be a
+        safe margin on A100 at n_fused ≈ 26k.
     min_block, max_block : int
         Clamps on the returned value.
 
     Returns
     -------
     int
-        Power-of-2 block size.
+        Power-of-2 block size, clamped to ``[min_block, min(N_fused, max_block)]``.
     """
-    budget = get_gpu_budget_bytes(gpu_max_memory_mb)
+    if budget_bytes is None:
+        if gpu_max_memory_mb is not None and gpu_max_memory_mb > 0:
+            budget_bytes = int(gpu_max_memory_mb * 1024 ** 2)
+        else:
+            try:
+                budget_bytes = int(_get_gpu_free_bytes())
+            except Exception:
+                budget_bytes = int(get_gpu_budget_bytes())
+
+    available = max(int(budget_bytes) - int(resident_bytes), 0)
     B = 8  # float64
 
-    # Worst-case peak: max of K1-style and delta_U-style intermediates
+    # Worst-case peak per unit of rank_block_size: max of K1-style and
+    # delta_U-style intermediates.
     peak_per_rank_K1 = (Np * N_fused + Np * Nq) * B
     peak_per_rank_DU = (N_fused * Nq + Np * Nq) * B
     peak_per_rank = max(peak_per_rank_K1, peak_per_rank_DU, 1)
 
-    # Use 50% of budget (the rest is for the accumulator + other tensors)
-    max_rank_block = max(min_block, int(budget * 0.5 / peak_per_rank))
+    max_rank_block = max(min_block, int(available * budget_fraction / peak_per_rank))
 
     # Round down to power of 2
     max_rank_block = 2 ** int(np.log2(max(max_rank_block, 1)))
@@ -765,8 +1093,14 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
 
     logger.debug(
         "adaptive_rank_block_size(Np=%d, Nq=%d, N_fused=%d): "
-        "peak_per_rank=%.2f MB → rank_block_size=%d",
-        Np, Nq, N_fused, peak_per_rank / 1e6, max_rank_block)
+        "budget=%.2f GiB, resident=%.2f GiB, peak_per_rank=%.2f MB, "
+        "fraction=%.2f → rank_block_size=%d",
+        Np, Nq, N_fused,
+        budget_bytes / (1024 ** 3),
+        resident_bytes / (1024 ** 3),
+        peak_per_rank / 1e6,
+        budget_fraction,
+        max_rank_block)
 
     return max_rank_block
 
