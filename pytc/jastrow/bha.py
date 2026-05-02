@@ -68,7 +68,10 @@ class BoysHandyAnalytical(BoysHandy):
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])
         c_raw = params['c_raw']
-        c = jnp.where(self._cusp_mask, 0.5, c_raw)
+        # Divide by natom so that sum over atoms gives exactly 0.5 (matches
+        # bh.py:_compute_forward and bha.py:get_log_grads_r1; commit 7cc4f56
+        # missed this site).
+        c = jnp.where(self._cusp_mask, 0.5 / self.natom, c_raw)
 
         exponents = jnp.arange(self.max_degree + 1)
 

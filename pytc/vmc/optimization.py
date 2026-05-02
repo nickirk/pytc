@@ -266,9 +266,12 @@ def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_op
                 None,
                 length=n_opt_per_mcmc
             )
-            
-            loss = jax.tree_util.tree_map(lambda x: x[-1], stats_history['loss'])
-            aux_data = jax.tree_util.tree_map(lambda x: x[-1], stats_history['aux'])
+
+            # Collapse the per-iteration stack to the trailing entry so the
+            # `stats` variable downstream sees the same shape as patterns 1/3.
+            stats = jax.tree_util.tree_map(lambda x: x[-1], stats_history)
+            loss = stats['loss']
+            aux_data = stats['aux']
             
             # Single MCMC step after optimization
             key, subkey = random.split(key)

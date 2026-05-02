@@ -308,7 +308,9 @@ class TestNewtonMergedGradient(unittest.TestCase):
             jax.tree_util.tree_leaves(batched_params),
             jax.tree_util.tree_leaves(ref_params),
         ):
-            np.testing.assert_allclose(np.array(p_batched), np.array(p_ref), rtol=1e-10)
+            # Slightly looser than the stats check (1e-10) because parameter
+            # updates compound float op-ordering noise from the GN solve.
+            np.testing.assert_allclose(np.array(p_batched), np.array(p_ref), rtol=1e-9)
 
     def test_batched_newton_step_with_jacobian_sampling_is_finite(self):
         """Batched GN accumulation should still work with Jacobian subsampling."""

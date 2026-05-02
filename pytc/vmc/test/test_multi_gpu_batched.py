@@ -11,6 +11,14 @@ from pytc.vmc.walker import initialize_walkers
 from pyscf import gto, scf
 from pytc.ansatz.det import SlaterDet
 
+# If a prior test module imported jax first, the XLA_FLAGS setdefault above is
+# too late and we end up with one CPU device. Skip — these tests need their own
+# process to honour the env var.
+@unittest.skipUnless(
+    jax.device_count() >= 4,
+    f"Multi-device tests require 4 simulated devices; got {jax.device_count()}. "
+    "Run this module in its own process so XLA_FLAGS is honoured.",
+)
 class TestMultiGPUBatched(unittest.TestCase):
     def test_sharded_batched_vmap_preserves_sharding(self):
         """Verify that get_vmap_fn with max_vmap_batch_size > 0 preserves sharding."""
