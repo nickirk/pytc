@@ -284,7 +284,7 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
 
         # Inner scan over r1 batches
         G1_init = jnp.zeros((n_fused_r1, batch_size, 3))
-        G1, _ = jax.lax.scan(inner_scan, G1_init, jnp.arange(n_batches_r1))
+        G1, _ = jax.lax.scan(inner_scan, G1_init, jnp.arange(n_batches_r1), unroll=1)
 
         # Contract r2 and accumulate each component directly into carry; avoids
         # holding all three (n_fused_r1, n_fused_r2) slices and a stacked
@@ -379,7 +379,7 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
 
         # Inner scan over r1 batches
         G3_init = jnp.zeros((n_fused_r1, batch_size))
-        G3, _ = jax.lax.scan(inner_scan, G3_init, jnp.arange(n_batches_r1))
+        G3, _ = jax.lax.scan(inner_scan, G3_init, jnp.arange(n_batches_r1), unroll=1)
 
         # Contract r2:
         # K3_batch_{k,l} = sum_b G3_{k,b} * xi_phi_r2_batch_{l,b} * w2_batch_{b}

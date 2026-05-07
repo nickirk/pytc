@@ -1371,7 +1371,7 @@ class ISDFTC(TC):
                 xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
                 
             init_val = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
-            res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
+            res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches), unroll=1)
             return res
 
         @shard_map(
