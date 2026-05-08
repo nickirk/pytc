@@ -1487,12 +1487,20 @@ class ISDFTC(TC):
         # Use save_path if provided, otherwise use self.save_path
         out_path = save_path if save_path else self.save_path
         
-        # Check if kernels already exist in HDF5
+        # Check if kernels already exist in HDF5. We allow a partial cache where
+        # K1/K3 are persisted but L_aux is missing (e.g. a previous run crashed
+        # during L_aux), so the next run can skip the expensive K-kernel
+        # recomputation and resume directly at L_aux.
         kernels = {}
+        have_k1k3_cached = False
         if out_path and os.path.exists(out_path):
             try:
                 f = h5py.File(out_path, 'r')
-                if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
+                has_k1 = 'K1_kernel' in f
+                has_k3 = 'K3_kernel' in f
+                has_l_aux = 'L_aux' in f
+
+                if has_k1 and has_k3 and has_l_aux:
                     logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
                     logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
                     kernels['K1_kernel'] = f['K1_kernel'][:]
@@ -1504,27 +1512,58 @@ class ISDFTC(TC):
                         f.close()
                     else:
                         logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
-                        kernels['L_aux'] = f['L_aux'] 
+                        kernels['L_aux'] = f['L_aux']
 
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels)
-                
-                # If we are here, keys are missing. Close the file!
+
+                if has_k1 and has_k3:
+                    # Partial cache: K1/K3 already on disk, L_aux missing.
+                    logger.info(
+                        f"  Found cached K1 and K3 in {out_path} but no L_aux; "
+                        f"reusing K1/K3 and only recomputing L_aux."
+                    )
+                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
+                    kernels['K1_kernel'] = f['K1_kernel'][:]
+                    logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
+                    kernels['K3_kernel'] = f['K3_kernel'][:]
+                    have_k1k3_cached = True
+
+                # If we are here, full cache miss or partial cache loaded. Close the file!
                 f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
+                kernels = {}
+                have_k1k3_cached = False
 
-        # 1. Compute K1_kernel and K3_kernel
-        logger.info("  Computing K1 and K3 kernels...")
-        
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size, host_grid_block_size=host_grid_block_size)
-        logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
-        logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
-        
+        # 1. Compute K1_kernel and K3_kernel (skip if cached)
+        if not have_k1k3_cached:
+            logger.info("  Computing K1 and K3 kernels...")
+
+            kernels = self.compute_kmat_kernels(jastrow_params, batch_size, host_grid_block_size=host_grid_block_size)
+            logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
+            logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
+
+            # Persist K1 and K3 immediately so a later L_aux failure does not
+            # force the expensive K-kernel recomputation on the next run.
+            if out_path and not self.is_incore:
+                logger.info(f"  Persisting K1 and K3 to {out_path} before computing L_aux")
+                with h5py.File(out_path, 'a') as f:
+                    for k in ('K1_kernel', 'K3_kernel'):
+                        if k in f: del f[k]
+                        f.create_dataset(k, data=np.array(kernels[k]))
+                    # Basics are already saved by isdf_decompose, but let's ensure they are there
+                    if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
+                    if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
+                    if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
+        else:
+            logger.info(f"   K1 kernel from cache: shape {kernels['K1_kernel'].shape}")
+            logger.info(f"   K3 kernel from cache: shape {kernels['K3_kernel'].shape}")
+
         # 2. Compute L_aux
         logger.info("  Computing L_aux...")
         L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
-        
+
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
         # If it's an HDF5 dataset, we keep it as is.
         if not isinstance(L_aux, (np.ndarray, jnp.ndarray)):
@@ -1537,17 +1576,10 @@ class ISDFTC(TC):
             cpu_device = jax.devices("cpu")[0]
             L_aux = jax.device_put(L_aux, cpu_device)
             kernels['L_aux'] = L_aux
-        
-        if out_path and not self.is_incore:
-            with h5py.File(out_path, 'a') as f:
-                for k, v in kernels.items():
-                    if k == 'L_aux': continue # Already saved
-                    if k in f: del f[k]
-                    f.create_dataset(k, data=np.array(v))
-                # Basics are already saved by isdf_decompose, but let's ensure they are there
-                if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
-                if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
-                if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
+
+        # K1/K3 are already persisted above (before L_aux). L_aux is streamed
+        # to disk inside _compute_L_aux when out-of-core, so nothing further
+        # needs to be written here for the out-of-core path.
                 
         logger.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
         
