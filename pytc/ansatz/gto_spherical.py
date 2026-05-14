@@ -1,75 +1,68 @@
 """
 JAX-compatible spherical GTO implementation.
 
-This implements a pure JAX version of eval_ao for spherical basis sets,
-following the structure of PySCF's internal implementation but optimized for JAX
-by grouping basis functions by angular momentum.
+Spherical (i.e. real solid harmonic × radial Gaussian) basis-function values
+are computed by evaluating Cartesian monomials x^{lx} y^{ly} z^{lz} for
+lx+ly+lz = l and contracting with PySCF's Cartesian→spherical transformation
+matrix ``pyscf.gto.mole.cart2sph(l)``.  This route handles arbitrary l
+(s, p, d, f, g, h, ...) by construction: previous hand-coded spherical
+harmonic formulas only covered l ≤ 3 and silently returned zeros for l ≥ 4,
+producing wrong AO values for any basis set containing g or higher shells
+(e.g. cc-pVQZ on TM atoms, cc-pV5Z on first-row atoms).
+
+The contraction is
+
+    χ_{l, m}(r) = (radial GTO) · Σ_{lx+ly+lz=l} c2s[lx,ly,lz; m] · x^{lx} y^{ly} z^{lz}
+
+where ``r = (x,y,z)`` is electron–center displacement.  Because the
+Cartesian monomials already carry the r^l factor implicitly, no separate
+r^l multiplication is needed (the previous code had to apply it).
+
+PySCF's cart2sph matrix is precomputed once per l at MolGTO_Spherical
+create time, stored on the dataclass, and reused inside the JIT graph as
+a constant array.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple
 from pyscf import gto
 import folx
 from flax import struct
 
-def real_spherical_harmonics_all(l: int, x: jax.Array, y: jax.Array, z: jax.Array, r: jax.Array) -> jax.Array:
-    """
-    Compute all real spherical harmonics Y_lm(x,y,z) for a given l.
-    Returns components in PySCF spherical order.
-    """
-    safe_r = jnp.where(r == 0, 1.0, r)
-    x_norm = x / safe_r
-    y_norm = y / safe_r
-    z_norm = z / safe_r
-    
-    if l == 0:
-        val = jnp.full_like(x, jnp.sqrt(1.0 / (4 * jnp.pi)))
-        return val[..., None]
-        
-    elif l == 1:
-        c = jnp.sqrt(3.0 / (4 * jnp.pi))
-        px = c * x_norm
-        py = c * y_norm
-        pz = c * z_norm
-        return jnp.stack([px, py, pz], axis=-1)
-        
-    elif l == 2:
-        c5 = jnp.sqrt(5.0 / (16 * jnp.pi))
-        c15 = jnp.sqrt(15.0 / (4 * jnp.pi))
-        c15_16 = jnp.sqrt(15.0 / (16 * jnp.pi))
-        
-        dz2 = c5 * (3 * z_norm**2 - 1)
-        dxz = c15 * x_norm * z_norm
-        dyz = c15 * y_norm * z_norm
-        dx2y2 = c15_16 * (x_norm**2 - y_norm**2)
-        dxy = c15 * x_norm * y_norm
-        
-        return jnp.stack([dxy, dyz, dz2, dxz, dx2y2], axis=-1)
-        
-    elif l == 3:
-        c7 = jnp.sqrt(7.0 / (16 * jnp.pi))
-        c21 = jnp.sqrt(21.0 / (32 * jnp.pi))
-        c105_16 = jnp.sqrt(105.0 / (16 * jnp.pi))
-        c105_4 = jnp.sqrt(105.0 / (4 * jnp.pi))
-        c35 = jnp.sqrt(35.0 / (32 * jnp.pi))
-        
-        fz3 = c7 * (5 * z_norm**3 - 3 * z_norm)
-        fxz2 = c21 * (5 * x_norm * z_norm**2 - x_norm)
-        fyz2 = c21 * (5 * y_norm * z_norm**2 - y_norm)
-        fzx2zy2 = c105_16 * z_norm * (x_norm**2 - y_norm**2)
-        fxyz = c105_4 * x_norm * y_norm * z_norm
-        fx33xy2 = c35 * (x_norm**3 - 3 * x_norm * y_norm**2)
-        f3yx2y3 = c35 * (3 * x_norm**2 * y_norm - y_norm**3)
-        
-        return jnp.stack([f3yx2y3, fxyz, fyz2, fz3, fxz2, fzx2zy2, fx33xy2], axis=-1)
-        
-    elif l == 4:
-        return jnp.zeros(x.shape + (9,))
 
-    else:
-        return jnp.zeros(x.shape + (2*l + 1,))
+def _cart_monomial_indices(l: int) -> np.ndarray:
+    """(lx, ly, lz) tuples for Cartesian shell of angular momentum l, in
+    PySCF order.  Same iteration as ``pytc.ansatz.gto.angular_momentum_xyz``.
+    """
+    out = []
+    for lx in reversed(range(l + 1)):
+        for ly in reversed(range(l + 1 - lx)):
+            lz = l - lx - ly
+            out.append((lx, ly, lz))
+    return np.array(out, dtype=np.int32)   # shape (ncart, 3)
+
+
+def real_solid_harmonics_via_cart(
+    l: int,
+    x: jax.Array, y: jax.Array, z: jax.Array,
+    cart_ijk: jax.Array,    # (ncart, 3) int monomial exponents
+    c2s: jax.Array,         # (ncart, 2l+1) PySCF cart→sph matrix
+) -> jax.Array:
+    """Real solid harmonics S_{l,m}(r) = r^l · Y_{l,m}(r̂), m = -l..+l.
+
+    Returns shape (..., 2l+1).
+    """
+    # xyz_pow[..., k, d] = (x,y,z)[d] ** cart_ijk[k, d]; we want product over d.
+    # Broadcasting: r has shape (..., 1, 3), exponents have shape (ncart, 3).
+    r = jnp.stack([x, y, z], axis=-1)                    # (..., 3)
+    r_exp = r[..., None, :]                              # (..., 1, 3)
+    ijk = cart_ijk[None, :, :]                           # (1, ncart, 3) after broadcasting
+    pow_per_axis = r_exp ** ijk                          # (..., ncart, 3)
+    cart = jnp.prod(pow_per_axis, axis=-1)               # (..., ncart)
+    sph = cart @ c2s                                     # (..., 2l+1)
+    return sph
 
 def _eval_shell_group(
     xyz: jax.Array,
@@ -77,20 +70,23 @@ def _eval_shell_group(
     centers: jax.Array,
     expts: jax.Array,
     coeffs: jax.Array,
+    cart_ijk: jax.Array,
+    c2s: jax.Array,
 ) -> jax.Array:
-    """
-    Evaluate a group of shells with same angular momentum l.
+    """Evaluate a group of shells with the same angular momentum l.
+
+    Uses Cartesian monomials + PySCF's cart→sph transformation, which works
+    for any l (see module docstring).
     """
     r_vecs = xyz[None, :] - centers
-    r = jnp.linalg.norm(r_vecs, axis=-1)
-    x, y, z = r_vecs[:, 0], r_vecs[:, 1], r_vecs[:, 2]
-    
-    r2 = r[..., None] ** 2
+    r2 = jnp.sum(r_vecs * r_vecs, axis=-1, keepdims=True)
     gauss = jnp.exp(-expts * r2)
-    radial = jnp.sum(coeffs * gauss, axis=-1) * (r ** l)
-    angular = real_spherical_harmonics_all(l, x, y, z, r)
-    
-    return radial[..., None] * angular
+    radial = jnp.sum(coeffs * gauss, axis=-1)   # (n_shells,) — no r^l here.
+
+    x, y, z = r_vecs[:, 0], r_vecs[:, 1], r_vecs[:, 2]
+    sph = real_solid_harmonics_via_cart(l, x, y, z, cart_ijk, c2s)  # (n_shells, 2l+1)
+
+    return radial[..., None] * sph
 
 @struct.dataclass
 class MolGTO_Spherical:
@@ -105,6 +101,13 @@ class MolGTO_Spherical:
         params_by_l = cls._extract_params(mol)
         return cls(params_by_l, nao=mol.nao_nr())
     
+    @staticmethod
+    def _cart_data(l):
+        """Return JAX (cart_ijk, cart2sph) constants for angular momentum l."""
+        ijk = jnp.asarray(_cart_monomial_indices(l), dtype=jnp.int32)
+        c2s = jnp.asarray(gto.mole.cart2sph(l), dtype=jnp.float64)
+        return ijk, c2s
+
     @staticmethod
     def _extract_params(mol):
         centers = mol.atom_coords()
@@ -154,25 +157,29 @@ class MolGTO_Spherical:
         for ell, data in data_by_l.items():
             centers_arr = jnp.array(data['centers'])
             indices_arr = jnp.array(data['indices'])
-            
+
             es_list = data['expts']
             cs_list = data['coeffs']
             max_prim = max(len(e) for e in es_list)
-            
+
             expts_padded = []
             coeffs_padded = []
             for e, c in zip(es_list, cs_list):
                 pad_len = max_prim - len(e)
                 expts_padded.append(jnp.pad(e, (0, pad_len), constant_values=0.0))
                 coeffs_padded.append(jnp.pad(c, (0, pad_len), constant_values=0.0))
-            
+
+            cart_ijk, c2s = MolGTO_Spherical._cart_data(ell)
+
             params_by_l[ell] = {
                 'centers': centers_arr,
                 'expts': jnp.array(expts_padded),
                 'coeffs': jnp.array(coeffs_padded),
-                'indices': indices_arr
+                'indices': indices_arr,
+                'cart_ijk': cart_ijk,
+                'c2s': c2s,
             }
-            
+
         return params_by_l
 
 def eval_gto_spherical(mol_gto: MolGTO_Spherical, xyz: jax.Array) -> jax.Array:
@@ -189,7 +196,10 @@ def eval_gto_spherical(mol_gto: MolGTO_Spherical, xyz: jax.Array) -> jax.Array:
         coeffs = params['coeffs']
         indices = params['indices']
         
-        vals = _eval_shell_group(xyz, ell, centers, expts, coeffs)
+        vals = _eval_shell_group(
+            xyz, ell, centers, expts, coeffs,
+            params['cart_ijk'], params['c2s'],
+        )
         
         vals_flat = vals.ravel()
         indices_flat = indices.ravel()
