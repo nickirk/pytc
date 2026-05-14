@@ -19,9 +19,15 @@ earlier on this branch.
 Measured result on this branch (256 walkers × 150 opt × 20 mcmc + 4000 sample
 steps / thinning 10, adam @ lr=0.01, step_size=0.3 Bohr):
 
-    HF/UHF/cc-pVDZ   = -195.332178 Ha
-    VMC (pytc, JSD)  = -196.105472(22336) Ha
-    Δ(VMC - HF)      = -773.3 mHa  (correlation recovered)
+    Basis                n_AO   max_l   HF              VMC                Δ(VMC-HF)
+    ccecp-cc-pvdz         38      3    -195.332178    -196.105472(22336)   -773 mHa
+    ccecp-cc-pvtz         63      4    -195.337588    -196.101826(22168)   -764 mHa
+
+VTZ doesn't improve on VDZ for VMC even though HF drops by 5 mHa: the
+BoysHandy Jastrow has a fixed number of parameters and cannot exploit
+the richer orbital basis at fixed Jastrow flexibility (a standard
+Jastrow-VMC plateau effect; closing requires a more flexible Jastrow or
+a second-order optimizer like Newton or linear method).
 
 Compared to Annaberdiyev et al., JCTC 16, 1482 (2020) Table 17 (using
 cc-pCVQZ — a core-valence basis much richer than ours):
@@ -31,11 +37,17 @@ cc-pCVQZ — a core-valence basis much richer than ours):
     CIPSI "exact"               -196.4038(10) Ha
 
 We recover ~73% of the published correlation energy at the smaller cc-pVDZ
-basis.  The 213 mHa gap to single-det DMC is dominated by basis-set
+basis.  The ~213 mHa gap to single-det DMC is dominated by basis-set
 incompleteness — PySCF's bundled ccECP library only ships valence-only
 sets (cc-pVxZ); the literature uses cc-pCVxZ which is not available in
 pyscf without external loading from Basis Set Exchange or
 pseudopotentiallibrary.org.
+
+NB: Cu/cc-pVTZ has g shells (max_l=4) which were silently zeroed by the
+spherical GTO bug fixed in commit 6b1068c.  This re-run is on top of the
+fix; the pre-fix Cu/VTZ run was killed before completing so we have no
+buggy-vs-fixed comparison number, but the H2O/V5Z analogue (commit 520b3e4)
+showed only a 0.13 mHa shift since occupied MOs have tiny g/h coefficients.
 
 Usage:
     python -m pytc.examples.cu_ccecp_vmc_optimization
