@@ -38,13 +38,21 @@ sample steps × thinning 10, adam @ lr=0.01, step_size=0.4 Bohr):
     --------  -----------   ------------   ---------------    ----------
     bfd-vdz   off           -16.944895     -17.207438(5145)    +41 mHa
     bfd-vtz   on            -16.949874     -17.213261(3451)    +35 mHa
-    bfd-v5z   on            -16.956022     -17.221485(2975)    +27 mHa
+    bfd-v5z   on            -16.956022     -17.221359(1803)    +27 mHa
+                  (pre-fix:   -16.956022    -17.221485(2975)    +27 mHa)
 
 At V5Z the basis is essentially complete (HF V5Z->CBS residual ~1-2 mHa).
 The remaining ~27 mHa to Zen et al. -17.24820 Ha is dominated by the
 flexibility of the default 17-term BoysHandy Jastrow.  Closing further
 requires either more polynomial terms or a second-order optimizer
 (Newton / linear method) — separate work item.
+
+NB: the V5Z basis on O has shells up to l=5 (g, h).  Commit 6b1068c fixed
+a silent-zero bug in gto_spherical.py that affected l>=4 shells.  For
+this H2O system the change between pre-fix and post-fix VMC values is
+only ~0.13 mHa (well within stderr) because the occupied MOs have tiny
+g/h coefficients on first-row atoms.  The fix matters more for TM
+systems where g shells overlap the 3d occupied space (e.g. Cu/cc-pVTZ).
 
 Usage:
     python -m pytc.examples.h2o_bfd_vmc_optimization
