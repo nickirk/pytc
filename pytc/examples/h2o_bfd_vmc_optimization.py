@@ -38,12 +38,13 @@ sample steps × thinning 10, adam @ lr=0.01, step_size=0.4 Bohr):
     --------  -----------   ------------   ---------------    ----------
     bfd-vdz   off           -16.944895     -17.207438(5145)    +41 mHa
     bfd-vtz   on            -16.949874     -17.213261(3451)    +35 mHa
+    bfd-v5z   on            -16.956022     -17.221485(2975)    +27 mHa
 
-The remaining gap to Zen et al. -17.24820 Ha is dominated by basis-set
-incompleteness: their "uncontracted" basis is much richer than VTZ.  For
-reference, their own table shows JAGP/best is only 6 mHa below JSD/uncontracted,
-so even with more flexible trial wavefunctions the gain at this basis tier is
-small — VTZ JSD is close to its ceiling.
+At V5Z the basis is essentially complete (HF V5Z->CBS residual ~1-2 mHa).
+The remaining ~27 mHa to Zen et al. -17.24820 Ha is dominated by the
+flexibility of the default 17-term BoysHandy Jastrow.  Closing further
+requires either more polynomial terms or a second-order optimizer
+(Newton / linear method) — separate work item.
 
 Usage:
     python -m pytc.examples.h2o_bfd_vmc_optimization
@@ -97,7 +98,7 @@ def build_water(basis: str = "bfd-vdz"):
 
 
 def main(
-    basis: str = "bfd-vtz",
+    basis: str = "bfd-v5z",
     n_walkers: int = 512,
     burn_in_steps: int = 1500,
     n_opt_steps: int = 200,
