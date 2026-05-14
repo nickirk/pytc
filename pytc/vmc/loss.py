@@ -137,14 +137,16 @@ def make_energy_loss(
             clipped_energies = aux_data.clipped_energies
             diff = aux_data.diff
             
-            # Extract walkers from batch_data
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            # Extract walkers and the active ansatz from batch_data (same
+            # convention as the forward pass — ``ansatz_dynamic`` is a local
+            # closure variable in loss_fn and must be re-derived here).
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg
             else:
                 walkers = batch_data
-            
-         # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
+                ansatz_dynamic = ansatz
+
             # batch_network takes (walkers, params) but we only differentiate params
             # So we curry it to make a function of just params
             def log_psi_fn(p):
