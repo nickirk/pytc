@@ -5,7 +5,8 @@ import jax.numpy as jnp
 from typing import List, Any
 from flax import struct
 
-from pytc.ansatz.det import SlaterDet, value_and_grad, grad 
+from pytc.ansatz.det import SlaterDet, value_and_grad, grad, slater_ratio_single
+from pytc.ecp.parser import EcpData, parse_pyscf_ecp
 
 @struct.dataclass
 class SlaterJastrow:
@@ -14,7 +15,8 @@ class SlaterJastrow:
     atom_coords: jax.Array
     atom_charges: jax.Array
     ion_ion_potential: jax.Array
-    jastrow: Any 
+    jastrow: Any
+    ecp: EcpData
 
     @property
     def n_electrons(self):
@@ -29,25 +31,44 @@ class SlaterJastrow:
         return self.dets[0].n_beta
 
     @classmethod
-    def create(cls, mol, jastrow, dets: List[SlaterDet]):
-        """Initialize the ansatz without storing optimizable parameters."""
+    def create(cls, mol, jastrow, dets: List[SlaterDet], *,
+               ecp_nl_cutoff_tol: float = 1.0e-5):
+        """Initialize the ansatz without storing optimizable parameters.
+
+        If ``mol`` carries an effective-core potential (``mol._ecp`` populated),
+        the ECP parameters are parsed into a padded ``EcpData`` structure and
+        attached to the ansatz.  ``mol.atom_charges()`` already returns the
+        valence charge Z_eff for ECP atoms, so the ion-ion potential remains
+        correct without further adjustment.
+
+        Args:
+            mol: PySCF molecule.
+            jastrow: Jastrow factor object.
+            dets: list of SlaterDet objects.
+            ecp_nl_cutoff_tol: tolerance |V_l(r)| < tol used to define the
+                per-atom non-local cutoff radius (default 1e-5 Ha, QMCPACK
+                convention).
+        """
         atom_coords = jnp.array(mol.atom_coords())
         atom_charges = jnp.array(mol.atom_charges())
-        
-        # Calculate ion-ion potential energy
+
+        # Calculate ion-ion potential energy.  Uses Z_eff for ECP atoms.
         n_atoms = len(atom_charges)
         R_diff = atom_coords[:, None, :] - atom_coords[None, :, :]
         R_dist = jnp.linalg.norm(R_diff, axis=-1)
         charge_products = jnp.outer(atom_charges, atom_charges)
         mask = 1-jnp.eye(n_atoms)
         v_ion_ion = jnp.sum(charge_products * mask / (R_dist+1e-10)) / 2.0
-        
+
+        ecp = parse_pyscf_ecp(mol, nl_cutoff_tol=ecp_nl_cutoff_tol)
+
         return cls(
             dets=dets,
             atom_coords=atom_coords,
             atom_charges=atom_charges,
             ion_ion_potential=v_ion_ion,
-            jastrow=jastrow
+            jastrow=jastrow,
+            ecp=ecp,
         )
 
     # Compatibility method for __call__
@@ -59,6 +80,12 @@ class SlaterJastrow:
     
     def quantum_force(self, walker, params, cutoff=5.0):
         return eval_sj_quantum_force(self, walker, params, cutoff)
+
+    def psi_ratio_single(self, walker, electron_idx, new_pos, params):
+        jastrow_params, _ = params
+        return eval_psi_ratio_single(
+            self, walker, electron_idx, new_pos, jastrow_params
+        )
 
     def init_params(self, key):
         """Initialize parameters for the ansatz."""
@@ -149,6 +176,56 @@ def update_jastrow_one_electron(sj: SlaterJastrow, old_positions, new_positions,
     delta_log_j, _ = jax.lax.scan(scan_body, 0.0, other_indices)
 
     return old_log_jastrow + delta_log_j
+
+
+def eval_psi_ratio_single(sj: SlaterJastrow, walker, electron_idx, new_pos,
+                          jastrow_params):
+    """Return psi(R')/psi(R) when one electron is moved.
+
+    R' differs from the configuration cached on ``walker`` only in
+    ``positions[electron_idx]``, which is replaced by ``new_pos``.  The walker
+    is NOT mutated; cached inverses, Slater matrices, and ``log_jastrow`` are
+    read.  The walker must have been evaluated previously (e.g. via
+    ``ansatz(walker, params)``) so those fields are populated.
+
+    The full ratio factorizes as
+
+        psi(R')/psi(R) = [det(S')/det(S)] * exp(log J(R') - log J(R)),
+
+    where the determinant ratio is a rank-1 column update (O(N_e), no matrix
+    inversion) and the Jastrow log-ratio is a sum over N_e - 1 pair-Jastrow
+    differences involving the moved electron only.
+
+    Used by the ECP non-local local-energy evaluator (and potentially by a
+    future Metropolis refactor).
+
+    Args:
+        sj: SlaterJastrow ansatz.  Must be single-determinant (v1).
+        walker: Walker (unbatched) with populated cache.
+        electron_idx: integer index of the moved electron.
+        new_pos: shape (3,) — proposed new position.
+        jastrow_params: Jastrow parameters only (the linear-determinant
+            coefficient cancels in the single-det ratio and is not needed).
+
+    Returns:
+        Scalar (signed) wavefunction ratio.
+    """
+    if len(sj.dets) != 1:
+        raise NotImplementedError(
+            "psi_ratio_single currently supports only single-determinant ansatzes."
+        )
+
+    det_ratio = slater_ratio_single(sj.dets[0], walker, electron_idx, new_pos)
+
+    old_positions = walker.positions
+    new_positions = old_positions.at[electron_idx].set(new_pos)
+    new_log_jastrow = update_jastrow_one_electron(
+        sj, old_positions, new_positions, electron_idx,
+        jastrow_params, walker.log_jastrow,
+    )
+    jastrow_ratio = jnp.exp(new_log_jastrow - walker.log_jastrow)
+
+    return det_ratio * jastrow_ratio
 
 
 def eval_sj(sj: SlaterJastrow, walker, params):

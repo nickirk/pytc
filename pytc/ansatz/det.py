@@ -378,6 +378,51 @@ def update_inverse_sherman_morrison(inv, new_row, old_row, row_idx, ratio):
     return inv_new
 
 
+def slater_ratio_single(det: SlaterDet, walker, electron_idx, new_pos):
+    """Return det(S')/det(S) when electron `electron_idx` moves to `new_pos`.
+
+    Reads ``walker.inv_up`` / ``walker.inv_down`` (cached) and evaluates AOs
+    at a single new point.  Does NOT mutate the walker — this is the cheap
+    "ratio only" path for the ECP non-local quadrature, where many ratios are
+    queried but none are accepted.
+
+    The unaffected spin channel contributes 1, so the returned scalar is just
+    the ratio of the spin channel containing electron ``electron_idx``.
+
+    Args:
+        det: SlaterDet object with a valid ``walker.inv_up`` / ``walker.inv_down``.
+        walker: Walker (unbatched).  Must have been evaluated previously so
+            the inverses are populated.
+        electron_idx: integer index of the moved electron.
+        new_pos: shape (3,) — proposed new position.
+
+    Returns:
+        Scalar (signed) ratio det(S')/det(S).
+    """
+    n_alpha = det.n_alpha
+
+    # Only the AO values are needed; skip grad/lap to save work.
+    ao_val = det.eval_ao_func(det.mol_gto, new_pos[None, :], deriv=0)[0]
+
+    is_alpha = electron_idx < n_alpha
+    local_idx = jnp.where(is_alpha, electron_idx, electron_idx - n_alpha)
+
+    new_row_up = ao_val @ det.mo_coeff_alpha_occ
+    new_row_dn = ao_val @ det.mo_coeff_beta_occ
+
+    ratio_up = jnp.where(
+        is_alpha,
+        compute_det_ratio_from_row(new_row_up, walker.inv_up, local_idx),
+        1.0,
+    )
+    ratio_dn = jnp.where(
+        is_alpha,
+        1.0,
+        compute_det_ratio_from_row(new_row_dn, walker.inv_down, local_idx),
+    )
+    return ratio_up * ratio_dn
+
+
 def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
     """Rank-1 update of determinant quantities after a single-electron move.
 

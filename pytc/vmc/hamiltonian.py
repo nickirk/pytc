@@ -3,6 +3,9 @@
 import jax
 import jax.numpy as jnp
 
+from pytc.ecp.energy import compute_nonlocal_ecp_energy
+from pytc.ecp.radial import eval_v_loc
+
 
 def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     """Compute ∇J/J and ∇²J/J with explicit parameters."""
@@ -68,13 +71,20 @@ def compute_potential_matrix(sj, elec_coords, slater_alpha, slater_beta):
     
     atom_coords = sj.atom_coords
     atom_charges = sj.atom_charges
-    
+    ecp = sj.ecp
+
     def e_n_potential(r):
         r_reshaped = r[:, jnp.newaxis, :]
         diff = r_reshaped - atom_coords[jnp.newaxis, :, :]
-        dists = jnp.linalg.norm(diff, axis=2)
-        potentials = -atom_charges[jnp.newaxis, :] / (dists + 1e-10)
-        return jnp.sum(potentials, axis=1)
+        dists = jnp.linalg.norm(diff, axis=2)  # (n_e, n_atoms)
+        # Bare Coulomb tail uses Z_eff (mol.atom_charges() already returns
+        # Z - n_core for ECP atoms, so this term is correct for both
+        # all-electron and ECP atoms).
+        coulomb = -atom_charges[jnp.newaxis, :] / (dists + 1e-10)
+        # Local ECP correction V_loc(r); zero on non-ECP atoms because
+        # their loc_c is all zero (see pytc.ecp.parser).
+        v_loc = eval_v_loc(dists, ecp.loc_n, ecp.loc_zeta, ecp.loc_c)
+        return jnp.sum(coulomb + v_loc, axis=1)
     
     alpha_coords = jnp.take(elec_coords, jnp.arange(n_alpha), axis=0)
     beta_coords = jnp.take(elec_coords, jnp.arange(n_alpha, n_electrons), axis=0)
@@ -141,11 +151,15 @@ def compute_single_walker_energy(sj, walker, jastrow_params):
         sj, walker.positions, walker.slater_up, walker.slater_down
     )
     
-    E_L = (jnp.trace(walker.inv_up @ (B_kin_alpha + B_pot_alpha)) + 
+    E_L = (jnp.trace(walker.inv_up @ (B_kin_alpha + B_pot_alpha)) +
            jnp.trace(walker.inv_down @ (B_kin_beta + B_pot_beta)))
-    
+
     E_L = E_L + sj.ion_ion_potential
-    
+
+    # Non-local ECP contribution (zero on molecules without ECPs because
+    # has_ecp[A] = False for every atom, masking all per-pair terms to zero).
+    E_L = E_L + compute_nonlocal_ecp_energy(sj, walker, jastrow_params)
+
     return jnp.real(E_L)
 
 
