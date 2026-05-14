@@ -10,7 +10,23 @@ from typing import Tuple, List
 
 @struct.dataclass
 class NuclearCusp(Jastrow):
-    """Nuclear cusp correction Jastrow factor."""
+    """Nuclear cusp correction Jastrow factor.
+
+    Enforces the Kato electron-nucleus cusp condition
+
+        (dψ̃/dr)|_{r_eI=0} = -Z · ⟨ψ̃⟩|_{r_eI=0}
+
+    at each nucleus.  Atoms carrying an effective core potential (ECP) have no
+    Coulomb singularity at the nucleus and therefore **no Kato cusp**; the
+    standard convention in QMC codes (QMCPACK, CASINO, TurboRVB, QWalk) is to
+    set the cusp coefficient to 0 at ECP centers — equivalently, drop the
+    per-nucleus cusp contribution entirely.  This class implements that gate
+    via a per-atom ``has_ecp_per_atom`` mask, populated from ``mol._ecp`` in
+    :meth:`create`.  Per-atom (not per-species) so that mixed-treatment
+    systems are supported without surgery.
+
+    Reference: Drummond, Towler, Needs, PRB 70, 235119 (2004) §III.C.
+    """
     coords: jax.Array
     charges: jax.Array
     unique_Z: jax.Array
@@ -20,7 +36,8 @@ class NuclearCusp(Jastrow):
     spline_xs: jax.Array
     spline_coeffs: jax.Array
     Z_idx_to_nucleus: jax.Array
-    
+    has_ecp_per_atom: jax.Array
+
     nelectron: int = struct.field(pytree_node=False)
     n_nuclei: int = struct.field(pytree_node=False)
     n_types: int = struct.field(pytree_node=False)
@@ -133,7 +150,17 @@ class NuclearCusp(Jastrow):
             
         Z_idx_to_nucleus = jnp.array(Z_idx_to_nucleus_list)
         X4_range = jnp.array(X4_range_list)
-        
+
+        # Per-atom ECP mask: an atom is ECP'd if its symbol (or pure symbol)
+        # is keyed in mol._ecp.  Cusp contribution is zeroed for ECP atoms.
+        ecp_table = getattr(mol, "_ecp", None) or {}
+        has_ecp_per_atom = []
+        for a in range(n_nuclei):
+            sym = mol.atom_symbol(a)
+            pure = mol.atom_pure_symbol(a)
+            has_ecp_per_atom.append(sym in ecp_table or pure in ecp_table)
+        has_ecp_per_atom = jnp.asarray(has_ecp_per_atom)
+
         return cls(
             name=name,
             coords=coords,
@@ -145,6 +172,7 @@ class NuclearCusp(Jastrow):
             spline_xs=spline_xs,
             spline_coeffs=spline_coeffs,
             Z_idx_to_nucleus=Z_idx_to_nucleus,
+            has_ecp_per_atom=has_ecp_per_atom,
             nelectron=nelectron,
             n_nuclei=n_nuclei,
             n_types=n_types,
@@ -293,7 +321,9 @@ class NuclearCusp(Jastrow):
             
             # Combine using cutoff
             cutoff = self._cutoff_function(r, rc)
-            return jnp.where(r <= rc, log_term * cutoff, 0.0)
+            contribution = jnp.where(r <= rc, log_term * cutoff, 0.0)
+            # Skip ECP atoms: no Kato cusp at non-Coulomb centers.
+            return jnp.where(self.has_ecp_per_atom[nucleus_idx], 0.0, contribution)
 
         # Sum over all nuclei using vmap
         contributions = jax.vmap(compute_nucleus_contribution)(jnp.arange(self.n_nuclei))

@@ -13,21 +13,19 @@ This script reproduces that setup as closely as the pytc primitives allow:
 
   - PySCF basis bfd-vdz / bfd-vtz with ecp='bfd' on O.
   - SlaterDet built from RHF orbitals.
-  - BoysHandy Jastrow with the default term list, which contains the 1-body
-    e-n, 2-body e-e (cusp + polynomial), and 3-body e-e-n components in a
-    single unified Padé-times-polynomial expansion — equivalent to Zen
-    et al.'s "JSD" form.
+  - CompositeJastrow = NuclearCusp + BoysHandy.
+      - NuclearCusp enforces the Kato e-n cusp at *all-electron* atoms only
+        (the per-atom has_ecp gate added in this branch skips ECP centers,
+        following Drummond-Towler-Needs PRB 70, 235119 (2004) §III.C).
+      - BoysHandy carries the 1-body e-n polynomial, 2-body e-e
+        (cusp + polynomial), and 3-body e-e-n terms in a unified expansion.
+    Together these match Zen et al.'s "JSD" form.
   - Adam optimizer, energy minimization (`optimize`).
   - Final sampling at the optimized parameters reports <E_L> with
     between-walker stderr.
 
 Caveats vs the Zen et al. number:
 
-  - We do NOT add the NuclearCusp Jastrow.  The default NuclearCusp uses
-    mol.atom_charges() which under BFD returns Z_eff for O (Coulomb-free
-    centre) and would impose a spurious cusp at the ECP nucleus.  At the
-    H atoms (all-electron) we DO lose the e-n cusp, costing a few mHa.
-    An ECP-aware NuclearCusp is a follow-up — see design_ecp_vmc.md §6.
   - Basis-set incompleteness: Zen et al. used an "uncontracted" basis
     closer to the BFD-V5Z limit.  At BFD-VDZ we are well below their
     correlation budget; even a perfect JSD wf cannot reach -17.248 Ha
@@ -49,7 +47,7 @@ from jax import random
 from pyscf import gto, scf
 
 from pytc.ansatz import SlaterDet, SlaterJastrow
-from pytc.jastrow import BoysHandy
+from pytc.jastrow import BoysHandy, CompositeJastrow, NuclearCusp
 from pytc.vmc import sample, optimize
 
 
@@ -112,13 +110,21 @@ def main(
 
     # ----- Ansatz ----------------------------------------------------------
     det = SlaterDet.create(mol, mf.mo_coeff)
-    jastrow = BoysHandy.create(mol, terms_per_nucleus=None, name="bh")
+    ncusp = NuclearCusp.create(mol, name="ncusp")
+    bh = BoysHandy.create(mol, terms_per_nucleus=None, name="bh")
+    jastrow = CompositeJastrow.create([ncusp, bh])
     jastrow_params = jastrow.init_params()
     linear_coeffs = jnp.ones(1)
     ansatz = SlaterJastrow.create(mol, jastrow, [det])
     params = [jastrow_params, linear_coeffs]
 
-    print(f"BoysHandy param count: {jastrow.get_param_count()}")
+    n_ae_atoms = int((~ncusp.has_ecp_per_atom).sum())
+    n_ecp_atoms = int(ncusp.has_ecp_per_atom.sum())
+    print(
+        f"Jastrow: NuclearCusp (active on {n_ae_atoms} AE atoms, "
+        f"gated off at {n_ecp_atoms} ECP atoms) + "
+        f"BoysHandy ({bh.get_param_count()} params)"
+    )
     print()
 
     # ----- Optimize --------------------------------------------------------
