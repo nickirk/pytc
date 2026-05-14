@@ -45,8 +45,15 @@ class SlaterDet:
             mol_gto = MolGTO_Spherical.create(mol)
             eval_ao_func = eval_ao_spherical
     
-        # Detect if mo_coeff is restricted or unrestricted
-        if isinstance(mo_coeff, (list, tuple)):
+        # Detect if mo_coeff is restricted or unrestricted.
+        # PySCF UHF returns mo_coeff as a 3-D ndarray of shape (2, nao, nmo),
+        # while RHF returns a 2-D ndarray of shape (nao, nmo).  Some callers
+        # may also pass a list/tuple (alpha, beta).
+        is_unrestricted = (
+            isinstance(mo_coeff, (list, tuple))
+            or (hasattr(mo_coeff, 'ndim') and mo_coeff.ndim == 3)
+        )
+        if is_unrestricted:
             # mo_coeff[0] = alpha, mo_coeff[1] = beta
             mo_coeff_alpha = mo_coeff[0]
             mo_coeff_beta = mo_coeff[1]
@@ -97,7 +104,7 @@ class SlaterDet:
 
         atom_coords = jnp.array(mol.atom_coords())
         atom_charges = jnp.array(mol.atom_charges())
-        unrestricted = isinstance(mo_coeff, (list, tuple))
+        unrestricted = is_unrestricted
         
         return cls(
             mo_coeff_alpha_occ=mo_coeff_alpha_occ,

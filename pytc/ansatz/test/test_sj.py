@@ -565,5 +565,53 @@ class TestLocalEnergyWithWalker(unittest.TestCase):
         
         
 
+class TestSlaterDetUHF(unittest.TestCase):
+    """Regression test: SlaterDet.create must correctly interpret a 3-D
+    ndarray ``mo_coeff`` returned by PySCF's UHF solver."""
+
+    def test_uhf_li_atom(self):
+        """Li atom (3 electrons, doublet) with UHF should give finite log|psi|."""
+        mol = gto.M(
+            atom='Li 0 0 0',
+            basis='sto-3g',
+            spin=1,
+            unit='bohr',
+        )
+
+        mf = scf.UHF(mol)
+        mf.kernel()
+
+        # Sanity check: PySCF UHF returns a 3-D ndarray of shape (2, nao, nmo).
+        # If this assertion fails, the rest of the test would not catch the
+        # bug we are guarding against.
+        self.assertEqual(mf.mo_coeff.ndim, 3)
+        self.assertEqual(mf.mo_coeff.shape[0], 2)
+
+        det = SlaterDet.create(mol, mf.mo_coeff)
+
+        # The dataclass field should reflect that this is unrestricted.
+        self.assertTrue(det.unrestricted)
+
+        ansatz = SlaterJastrow.create(mol, Poly(), [det])
+
+        # Test positions: place each electron at a slight offset from the nucleus
+        n_electrons = mol.nelec[0] + mol.nelec[1]
+        positions = jnp.array([
+            [0.1, 0.0, 0.0],
+            [0.0, 0.2, 0.0],
+            [0.0, 0.0, 0.3],
+        ])
+        self.assertEqual(positions.shape, (n_electrons, 3))
+
+        walker = create_test_walker(positions, det)
+
+        params = (jnp.array([0.5]), jnp.array([1.0]))
+        psi_values, _ = ansatz(walker, params)
+        psi_sign, psi_logabs = psi_values
+
+        self.assertTrue(jnp.isfinite(psi_logabs))
+        self.assertNotEqual(float(psi_sign), 0.0)
+
+
 if __name__ == '__main__':
     unittest.main()
