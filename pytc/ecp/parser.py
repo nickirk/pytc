@@ -38,6 +38,9 @@ from flax import struct
 from pytc.ecp import radial as _radial
 
 
+_DEFAULT_QUAD_GRID = "icosahedral_12"
+
+
 @struct.dataclass
 class EcpData:
     """Padded ECP parameters covering every atom in the molecule.
@@ -60,6 +63,10 @@ class EcpData:
     l_mask: jnp.ndarray          # (N_atoms, L_plus_1) bool
     # Per-atom spatial cutoff for the non-local part (see design doc §4.6):
     r_cut: jnp.ndarray           # (N_atoms,) float
+    # Angular-quadrature choice for the non-local locality-approximation
+    # integral.  Static (Python str) so the kernel can switch on it without
+    # re-tracing; resolved to an AngularGrid at compute time.
+    quad_grid_name: str = struct.field(pytree_node=False, default=_DEFAULT_QUAD_GRID)
 
     @property
     def n_atoms(self) -> int:
@@ -128,6 +135,7 @@ def parse_pyscf_ecp(
     nl_cutoff_tol: float = 1.0e-5,
     nl_cutoff_rmax: float = 10.0,
     nl_cutoff_ngrid: int = 4096,
+    quad_grid_name: str = _DEFAULT_QUAD_GRID,
 ) -> EcpData:
     """Parse `mol._ecp` into padded JAX arrays for VMC use.
 
@@ -242,4 +250,5 @@ def parse_pyscf_ecp(
         nl_c=nl_c_j,
         l_mask=l_mask_j,
         r_cut=r_cut,
+        quad_grid_name=quad_grid_name,
     )

@@ -22,7 +22,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from pytc.ecp.quadrature import AngularGrid, icosahedral_12
+from pytc.ecp.quadrature import AngularGrid, get_grid, icosahedral_12
 from pytc.ecp.radial import eval_v_nl
 
 
@@ -63,7 +63,9 @@ def compute_nonlocal_ecp_energy(sj, walker, jastrow_params,
     """
     ecp = sj.ecp
     if quad_grid is None:
-        quad_grid = icosahedral_12()
+        # Honor the choice baked onto the ansatz (set at SlaterJastrow.create
+        # time via ecp_quad_grid).  Explicit caller override still wins.
+        quad_grid = get_grid(ecp.quad_grid_name)
 
     positions = walker.positions                       # (n_e, 3)
     atom_coords = sj.atom_coords                       # (n_a, 3)

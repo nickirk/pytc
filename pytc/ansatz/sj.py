@@ -32,7 +32,8 @@ class SlaterJastrow:
 
     @classmethod
     def create(cls, mol, jastrow, dets: List[SlaterDet], *,
-               ecp_nl_cutoff_tol: float = 1.0e-5):
+               ecp_nl_cutoff_tol: float = 1.0e-5,
+               ecp_quad_grid: str = "icosahedral_12"):
         """Initialize the ansatz without storing optimizable parameters.
 
         If ``mol`` carries an effective-core potential (``mol._ecp`` populated),
@@ -48,6 +49,9 @@ class SlaterJastrow:
             ecp_nl_cutoff_tol: tolerance |V_l(r)| < tol used to define the
                 per-atom non-local cutoff radius (default 1e-5 Ha, QMCPACK
                 convention).
+            ecp_quad_grid: angular quadrature for the non-local locality-
+                approximation integral. Either ``"icosahedral_12"`` (default,
+                exact through l=5) or ``"lebedev_26"`` (exact through l=7).
         """
         atom_coords = jnp.array(mol.atom_coords())
         atom_charges = jnp.array(mol.atom_charges())
@@ -60,7 +64,11 @@ class SlaterJastrow:
         mask = 1-jnp.eye(n_atoms)
         v_ion_ion = jnp.sum(charge_products * mask / (R_dist+1e-10)) / 2.0
 
-        ecp = parse_pyscf_ecp(mol, nl_cutoff_tol=ecp_nl_cutoff_tol)
+        ecp = parse_pyscf_ecp(
+            mol,
+            nl_cutoff_tol=ecp_nl_cutoff_tol,
+            quad_grid_name=ecp_quad_grid,
+        )
 
         return cls(
             dets=dets,
