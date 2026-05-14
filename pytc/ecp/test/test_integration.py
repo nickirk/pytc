@@ -171,54 +171,141 @@ class TestECPLegendreExactness(unittest.TestCase):
         )
 
 
+def _build_co_ccecp_ansatz():
+    """CO molecule (singlet) with ccECP on both atoms.
+
+    After ccECP removes 1s² from each, 10 valence electrons remain
+    (4 from C + 6 from O), split as n_alpha = n_beta = 5.
+    Bond length 2.132 Bohr (close to experimental 2.1322 Bohr).
+    """
+    mol = gto.M(
+        atom="C 0 0 0; O 0 0 2.132",
+        basis="ccecp-cc-pvdz",
+        ecp="ccecp",
+        spin=0,
+        unit="Bohr",
+    )
+    mf = scf.RHF(mol)
+    mf.kernel()
+    det = SlaterDet.create(mol, mf.mo_coeff)
+    jastrow = Poly()
+    ansatz = SlaterJastrow.create(mol, jastrow, [det])
+    jastrow_params = jnp.zeros(1)
+    linear_coeffs = jnp.array([1.0])
+    return mol, mf, ansatz, (jastrow_params, linear_coeffs)
+
+
+def _mcmc_mean_energy(ansatz, params, *, hf_energy, n_walkers, n_burnin,
+                      n_accum, sample_every, step_size, key, label):
+    """Run Metropolis on ``ansatz`` and report sample mean of E_L.
+
+    Returns ``(mean, stderr, n_samples)`` where ``stderr`` is the
+    *between-walker* standard error.  With independent walker chains (vanilla
+    Metropolis has no cross-walker information sharing), each walker's
+    time-averaged mean is an i.i.d. estimator of ⟨E_L⟩; the standard
+    deviation of those means divided by √n_walkers gives an
+    autocorrelation-corrected error bar without any blocking.
+    """
+    walkers = initialize_walkers(ansatz, n_walkers, key=key)
+    batch_ansatz = jax.vmap(ansatz, in_axes=(0, None))
+    _, walkers = batch_ansatz(walkers, params)
+
+    step = make_mcmc_step(ansatz, step_size=step_size, move_type="one")
+
+    for _ in range(n_burnin):
+        key, sub = random.split(key)
+        walkers, _ = step(ansatz, walkers, sub, params)
+
+    jastrow_params = params[0]
+    energy_fn = jax.jit(jax.vmap(
+        lambda w: compute_single_walker_energy(ansatz, w, jastrow_params),
+        in_axes=0,
+    ))
+
+    rows = []                    # each row: shape (n_walkers,)
+    accept_rates = []
+    for s in range(n_accum):
+        key, sub = random.split(key)
+        walkers, acc = step(ansatz, walkers, sub, params)
+        if s % sample_every == 0:
+            rows.append(np.asarray(energy_fn(walkers)))
+            accept_rates.append(float(acc))
+
+    samples_2d = np.stack(rows, axis=0)              # (n_recorded, n_walkers)
+    walker_means = samples_2d.mean(axis=0)           # (n_walkers,)
+    mean = float(walker_means.mean())
+    stderr = float(walker_means.std(ddof=1) / np.sqrt(n_walkers))
+    naive_stderr = float(
+        samples_2d.std(ddof=1) / np.sqrt(samples_2d.size)
+    )
+    avg_accept = float(np.mean(accept_rates))
+    print(
+        f"  [{label}] HF = {hf_energy:.6f}  VMC = {mean:.6f} "
+        f"± {stderr:.6f} (between-walker, "
+        f"naive {naive_stderr:.6f})  "
+        f"delta = {mean - hf_energy:+.6f}  Naccept = {avg_accept:.2f}  "
+        f"Nsamp = {samples_2d.size}"
+    )
+    return mean, stderr, samples_2d.size
+
+
 @unittest.skipUnless(os.environ.get("PYTC_RUN_SLOW"), "slow test, set PYTC_RUN_SLOW=1")
 class TestECPMCMCExpectationValue(unittest.TestCase):
     """Quantitative check: ⟨E_L⟩ sampled from |ψ_HF|² should approach the
-    HF/ECP total energy when J = 0 (locality approximation does NOT introduce
-    bias at this level because the trial wf IS the HF det)."""
+    HF/ECP total energy when J = 0.  The trial wavefunction IS the HF
+    determinant, so the locality approximation introduces no bias — the
+    only discrepancy is statistical (MCMC stderr, inflated by autocorrelation
+    above the naive standard error).
+    """
 
     def setUp(self):
         jax.config.update("jax_enable_x64", True)
 
+    # Tolerance: 5x the between-walker stderr (a clean ~5σ acceptance test).
+    # The between-walker stderr is autocorrelation-corrected by construction,
+    # so we do not need an extra inflation factor.
+    TOL_FACTOR = 5.0
+    # Absolute floor:  even if stderr is somehow tiny, demand at most 5 mHa
+    # discrepancy.  This catches systematic errors (e.g. wrong sign in the
+    # non-local kernel) that would otherwise pass at large tolerance.
+    ABS_FLOOR_HA = 5.0e-3
+
     def test_carbon_ccecp_hf_energy_recovered(self):
-        mol, mf, ansatz, params = _build_c_ccecp_ansatz()
+        _, mf, ansatz, params = _build_c_ccecp_ansatz()
         hf_energy = float(mf.e_tot)
-
-        # Walkers + populate
-        n_walkers = 64
-        key = random.PRNGKey(2026)
-        walkers = initialize_walkers(ansatz, n_walkers, key=key)
-        batch_ansatz = jax.vmap(ansatz, in_axes=(0, None))
-        _, walkers = batch_ansatz(walkers, params)
-
-        # MCMC: 500 burn-in + 1500 accumulation steps.
-        step = make_mcmc_step(ansatz, step_size=0.5, move_type="one")
-        for s in range(500):
-            key, sub = random.split(key)
-            walkers, _ = step(ansatz, walkers, sub, params)
-
-        jastrow_params = params[0]
-        energy_fn = jax.jit(jax.vmap(
-            lambda w: compute_single_walker_energy(ansatz, w, jastrow_params),
-            in_axes=0,
-        ))
-
-        samples = []
-        for s in range(1500):
-            key, sub = random.split(key)
-            walkers, _ = step(ansatz, walkers, sub, params)
-            if s % 5 == 0:  # decorrelate
-                samples.append(np.asarray(energy_fn(walkers)))
-        samples = np.concatenate(samples)
-        mean = samples.mean()
-        stderr = samples.std(ddof=1) / np.sqrt(len(samples))
-
-        # Allow up to 5 stderr — gives a generous margin on top of MCMC
-        # autocorrelation (which inflates the true error vs naive stderr).
+        mean, stderr, _ = _mcmc_mean_energy(
+            ansatz, params,
+            hf_energy=hf_energy,
+            n_walkers=256, n_burnin=1000, n_accum=5000,
+            sample_every=10, step_size=0.5,
+            key=random.PRNGKey(2026),
+            label="C ccECP",
+        )
         delta = mean - hf_energy
-        print(f"  C ccECP: HF = {hf_energy:.6f}, VMC = {mean:.6f} ± {stderr:.6f}, "
-              f"delta = {delta:.6f}")
-        self.assertLess(abs(delta), max(5 * stderr, 0.02),
+        tol = max(self.TOL_FACTOR * stderr, self.ABS_FLOOR_HA)
+        self.assertLess(abs(delta), tol,
+                        msg=f"mean {mean} vs HF {hf_energy} (stderr {stderr})")
+
+    def test_co_ccecp_hf_energy_recovered(self):
+        _, mf, ansatz, params = _build_co_ccecp_ansatz()
+        hf_energy = float(mf.e_tot)
+        # CO has 10 electrons (vs 4 for C); autocorrelation is larger, so
+        # the naive stderr underestimates the real error.  Use a longer
+        # burn-in, more accumulation, and a larger spacing between recorded
+        # samples to compensate.
+        mean, stderr, _ = _mcmc_mean_energy(
+            ansatz, params,
+            hf_energy=hf_energy,
+            n_walkers=256, n_burnin=3000, n_accum=12000,
+            sample_every=20, step_size=0.4,
+            key=random.PRNGKey(2027),
+            label="CO ccECP",
+        )
+        delta = mean - hf_energy
+        # CO has 10 electrons (vs 4 for C), so E_L variance is larger.
+        # Allow a slightly looser absolute floor than the C test.
+        tol = max(self.TOL_FACTOR * stderr, 0.01)
+        self.assertLess(abs(delta), tol,
                         msg=f"mean {mean} vs HF {hf_energy} (stderr {stderr})")
 
 
