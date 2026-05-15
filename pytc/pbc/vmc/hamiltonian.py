@@ -19,6 +19,7 @@ import jax.numpy as jnp
 
 from pytc.vmc.hamiltonian import compute_jastrow_terms
 
+from ..ansatz.kdet import KSlaterDet
 from .ewald import total_coulomb_energy
 
 
@@ -69,6 +70,51 @@ def compute_single_walker_energy(sj, walker, jastrow_params, ewald):
     )
 
     return jnp.real(E_kinetic + V_coulomb)
+
+
+def compute_single_walker_energy_kpts(kdet: KSlaterDet, walker, ewald):
+    """Local energy for one walker with a bare k-point :class:`KSlaterDet`.
+
+    No Jastrow. The kinetic-energy expression collapses to
+
+    .. math::
+
+        E_\\mathrm{kin} = -\\tfrac{1}{2} \\mathrm{Tr}[S_\\uparrow^{-1} \\nabla^2 S_\\uparrow]
+                       - \\tfrac{1}{2} \\mathrm{Tr}[S_\\downarrow^{-1} \\nabla^2 S_\\downarrow],
+
+    evaluated on the complex Slater matrices cached on ``walker``. The
+    potential part is the Ewald-summed total Coulomb energy of the
+    electron and nuclear charges, identical to the existing PBC path.
+    Both pieces are complex (or partially complex); ``Re[...]`` at the
+    end gives the real local energy.
+
+    Args:
+        kdet: PBC k-point SlaterDet (provides ``atom_coords`` /
+            ``atom_charges`` for the Ewald sum).
+        walker: Walker with cached complex ``inv_up/down`` and ``lap_up/down``.
+        ewald: Cached :class:`EwaldParams` for the supercell.
+
+    Returns:
+        Scalar real-valued local energy.
+    """
+    B_kin_alpha = -0.5 * walker.lap_up
+    B_kin_beta = -0.5 * walker.lap_down
+    E_kinetic = (
+        jnp.trace(walker.inv_up @ B_kin_alpha)
+        + jnp.trace(walker.inv_down @ B_kin_beta)
+    )
+    V_coulomb = total_coulomb_energy(
+        walker.positions, kdet.atom_coords, kdet.atom_charges, ewald
+    )
+    return jnp.real(E_kinetic + V_coulomb)
+
+
+def eval_local_energy_kpts(kdet: KSlaterDet, walker, ewald):
+    """Convenience wrapper analogous to :func:`eval_local_energy`.
+
+    Returns ``(energy, walker)`` — the walker is passed through unchanged.
+    """
+    return compute_single_walker_energy_kpts(kdet, walker, ewald), walker
 
 
 def eval_local_energy(sj, walker, params, ewald):

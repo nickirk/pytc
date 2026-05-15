@@ -16,7 +16,12 @@ from .ewald import (
     ewald_cross_energy,
     total_coulomb_energy,
 )
-from .hamiltonian import compute_single_walker_energy, eval_local_energy
+from .hamiltonian import (
+    compute_single_walker_energy,
+    eval_local_energy,
+    compute_single_walker_energy_kpts,
+    eval_local_energy_kpts,
+)
 from .metropolis import metropolis_hastings, make_mcmc_step
 from .sampling import burn_in, sample
 
@@ -34,6 +39,8 @@ __all__ = [
     'total_coulomb_energy',
     'compute_single_walker_energy',
     'eval_local_energy',
+    'compute_single_walker_energy_kpts',
+    'eval_local_energy_kpts',
     'metropolis_hastings',
     'make_mcmc_step',
     'burn_in',
