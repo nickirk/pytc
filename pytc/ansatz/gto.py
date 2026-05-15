@@ -23,28 +23,38 @@ def _cartesian_gto(
     images: jax.Array,
     xyz: jax.Array,
 ) -> jax.Array:
-    """
-    Evaluate Cartesian Gaussian-type orbitals (GTOs).
+    """Evaluate Cartesian Gaussian-type orbitals (GTOs), summed over images.
+
+    The image sum is performed with :func:`jax.lax.scan` rather than a
+    vmap-broadcast — this drops the intermediate tensor footprint from
+    ``(n_ao, n_image, n_prim)`` to ``(n_ao, n_prim)`` per scan iteration.
+
+    Molecular usage has ``images == [[0,0,0]]`` (a single zero-vector
+    image), so the scan is a 1-step no-op and the previous behaviour is
+    preserved. PBC usage with a few hundred lattice images is what made
+    the broadcast pattern OOM at production walker counts; this version
+    fixes that without changing the math.
+
+    TODO (future efficiency): analytical Laplacian to avoid
+    ``jacfwd ∘ jacfwd`` Hessian intermediates; spline interpolation
+    à la CASINO/QMCPACK for the cleanest production scale.
     """
     centers2d = jnp.atleast_2d(centers)
-    ctr_xyz_first = xyz[jnp.newaxis, :] - centers2d  # (N, 3)
-    ctr_xyz = ctr_xyz_first[:, jnp.newaxis, :] + images  # (N, nimages, 3)
-    
-    # Cartesian monomials: x^i y^j z^k
-    xyz_pow = ctr_xyz ** ijk[:, jnp.newaxis, :]
-    xyz_ijk = jnp.prod(xyz_pow, axis=-1) # (N, nimages)
-    xyz_ijk = xyz_ijk[:, :, jnp.newaxis] # (N, nimages, 1)
-    
-    # Radial part: exp(-alpha * r^2)
-    r2 = jnp.sum(ctr_xyz**2, axis=-1) # (N, nimages)
-    gauss = jnp.exp(-expts[:, jnp.newaxis, :] * r2[:, :, jnp.newaxis]) # (N, nimages, M)
-    
-    # Combine
-    all_prod = coeffs[:, jnp.newaxis, :] * gauss * xyz_ijk # (N, nimages, M)
-    
-    # Sum over images then primitives
-    term_sum = jnp.sum(all_prod, axis=(1, 2)) # (N,)
-    return term_sum
+    ctr_xyz_first = xyz[jnp.newaxis, :] - centers2d                       # (n_ao, 3)
+
+    def per_image(carry, image):
+        # carry: (n_ao,) accumulator over the image sum.
+        d = ctr_xyz_first + image                                          # (n_ao, 3)
+        xyz_ijk = jnp.prod(d ** ijk, axis=-1)                              # (n_ao,)
+        r2 = jnp.sum(d * d, axis=-1)                                       # (n_ao,)
+        gauss = jnp.exp(-expts * r2[:, jnp.newaxis])                       # (n_ao, n_prim)
+        contrib = jnp.sum(coeffs * gauss, axis=-1) * xyz_ijk               # (n_ao,)
+        return carry + contrib, None
+
+    n_ao = ijk.shape[0]
+    init = jnp.zeros((n_ao,), dtype=jnp.result_type(centers, ijk, expts, coeffs, xyz))
+    out, _ = jax.lax.scan(per_image, init, images)
+    return out                                                            # (n_ao,)
 
 @struct.dataclass
 class MolGTO:
