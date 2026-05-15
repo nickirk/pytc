@@ -23,7 +23,7 @@ from .hamiltonian import (
     eval_local_energy_kpts,
 )
 from .metropolis import metropolis_hastings, make_mcmc_step
-from .sampling import burn_in, sample
+from .sampling import burn_in, sample, sample_bare
 
 __all__ = [
     'Walker',
@@ -45,4 +45,5 @@ __all__ = [
     'make_mcmc_step',
     'burn_in',
     'sample',
+    'sample_bare',
 ]

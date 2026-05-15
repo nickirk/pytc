@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from jax import random
 
 from .metropolis import make_mcmc_step
-from .hamiltonian import compute_single_walker_energy
+from .hamiltonian import compute_single_walker_energy, compute_single_walker_energy_kpts
 from .walker import initialize_walkers
 
 logger = logging.getLogger(__name__)
@@ -146,6 +146,92 @@ def sample(
             es = np.asarray(batch_local_energy(walker))
             all_energies.append(es)
             n_recorded += 1
+
+    energies = np.concatenate(all_energies)
+    return {
+        'energies': energies,
+        'mean': float(np.mean(energies)),
+        'stderr': float(np.std(energies) / np.sqrt(len(energies))),
+        'acceptance': acc_sum / max(n_steps, 1),
+    }
+
+
+def sample_bare(
+    det,
+    cell,
+    ewald,
+    n_walkers: int = 64,
+    n_steps: int = 500,
+    step_size: float = 0.4,
+    burn_in_steps: int = 200,
+    thinning: int = 1,
+    key=None,
+    log: bool = True,
+) -> Dict[str, Any]:
+    """Sample local energies from a bare (no-Jastrow) PBC determinant.
+
+    Works on either ``SlaterDet`` (Gamma-only) or ``KSlaterDet`` (k-mesh)
+    — the metropolis step dispatches on the determinant type, and the
+    energy function is duck-typed on ``atom_coords`` / ``atom_charges``
+    and the cached complex Slater quantities.
+
+    Args:
+        det: A bare PBC SlaterDet or KSlaterDet.
+        cell: The supercell (for walker init + lattice).
+        ewald: Cached :class:`EwaldParams` for the supercell.
+        Other kwargs analogous to :func:`sample`.
+
+    Returns:
+        Dict with ``energies``, ``mean``, ``stderr``, ``acceptance``.
+    """
+    if key is None:
+        key = random.PRNGKey(int(time.time()))
+
+    lattice = jnp.asarray(cell.lattice_vectors())
+
+    walker = initialize_walkers(
+        det, cell, n_walkers=n_walkers, key=key, log_init=False,
+    )
+    # Prime walker cache. The det's __call__ runs the right eval path
+    # (eval_det_value_and_grad for SlaterDet, eval_kdet_value_and_grad
+    # for KSlaterDet).
+    batch_call = jax.vmap(lambda w: det(w, None))
+    _, walker = batch_call(walker)
+
+    step = make_mcmc_step(det, step_size=step_size, lattice=lattice)
+
+    # Burn-in
+    acc_sum_burn = 0.0
+    report_every = max(1, burn_in_steps // 5)
+    for i in range(burn_in_steps):
+        key, sub = random.split(key)
+        walker, acc = step(det, walker, sub, None)
+        acc_sum_burn += float(acc)
+        if log and (i % report_every == 0 or i == burn_in_steps - 1):
+            logger.info(
+                "Burn-in step %d / %d, running acceptance = %.3f",
+                i, burn_in_steps, acc_sum_burn / (i + 1),
+            )
+
+    if log:
+        logger.info(
+            "Burn-in complete (acceptance %.3f). Beginning production.",
+            acc_sum_burn / max(burn_in_steps, 1),
+        )
+
+    batch_local_energy = jax.jit(jax.vmap(
+        lambda w: compute_single_walker_energy_kpts(det, w, ewald)
+    ))
+
+    all_energies = []
+    acc_sum = 0.0
+    for step_i in range(n_steps):
+        key, sub = random.split(key)
+        walker, acc = step(det, walker, sub, None)
+        acc_sum += float(acc)
+        if step_i % thinning == 0:
+            es = np.asarray(batch_local_energy(walker))
+            all_energies.append(es)
 
     energies = np.concatenate(all_energies)
     return {
