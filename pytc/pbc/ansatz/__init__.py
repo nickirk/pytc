@@ -9,5 +9,9 @@ unchanged from the molecular module.
 from .gto import GTO, default_rcut
 from .kgto import KGTO
 from .det import create_slater_det
+from .kdet import KSlaterDet, create_slater_det_kpts
 
-__all__ = ['GTO', 'KGTO', 'default_rcut', 'create_slater_det']
+__all__ = [
+    'GTO', 'KGTO', 'default_rcut',
+    'create_slater_det', 'KSlaterDet', 'create_slater_det_kpts',
+]
