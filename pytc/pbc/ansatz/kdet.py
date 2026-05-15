@@ -59,6 +59,8 @@ class KSlaterDet:
     alpha_occ_kidx: jax.Array
     beta_occ_bands: jax.Array
     beta_occ_kidx: jax.Array
+    atom_coords: jax.Array = struct.field(pytree_node=False)
+    atom_charges: jax.Array = struct.field(pytree_node=False)
     n_alpha: int = struct.field(pytree_node=False)
     n_beta: int = struct.field(pytree_node=False)
     n_kpts: int = struct.field(pytree_node=False)
@@ -68,6 +70,15 @@ class KSlaterDet:
     @property
     def n_electrons(self):
         return self.n_alpha + self.n_beta
+
+    def __call__(self, walker, params=None):
+        """Evaluate the wavefunction, populating the walker cache.
+
+        Returns ``((sign, log|det|), walker)`` matching the molecular
+        :class:`SlaterDet` call signature. ``params`` is ignored (kept
+        for API parity with :class:`SlaterJastrow`).
+        """
+        return eval_kdet_value_and_grad(self, walker)
 
 
 def _normalize_mf_inputs(mf, mo_coeff, mo_occ, kpts):
@@ -113,6 +124,7 @@ def _build_occupation_lists(mo_occ):
 
 def create_slater_det_kpts(
     mf,
+    supercell=None,
     mo_coeff=None,
     mo_occ=None,
     kpts=None,
@@ -131,7 +143,13 @@ def create_slater_det_kpts(
 
     Args:
         mf: A built mean-field with ``cell``, ``mo_coeff``, ``mo_occ``,
-            and (for KRHF) ``kpts``.
+            and (for KRHF) ``kpts``. The ``cell`` is the primitive cell
+            used for orbital evaluation.
+        supercell: The Nk-replicated supercell. Used to populate
+            ``atom_coords`` / ``atom_charges`` for walker initialisation
+            and downstream Jastrow / Hamiltonian construction. Defaults
+            to ``mf.cell`` (correct only for the Gamma-only case where
+            primitive == supercell).
         mo_coeff, mo_occ, kpts: Optional overrides.
         rcut: Image-summation cutoff for the underlying KGTO.
         precision: Tolerance used to derive ``rcut``.
@@ -175,6 +193,10 @@ def create_slater_det_kpts(
     n_beta = n_alpha
     kgto = KGTO.from_cell(cell, kpts=kpts_arr, rcut=rcut, precision=precision)
 
+    sup = supercell if supercell is not None else cell
+    atom_coords = jnp.asarray(sup.atom_coords())
+    atom_charges = jnp.asarray(sup.atom_charges())
+
     return KSlaterDet(
         mo_coeff_kpts_alpha=mo_coeff_stack,
         mo_coeff_kpts_beta=mo_coeff_stack,
@@ -183,6 +205,8 @@ def create_slater_det_kpts(
         alpha_occ_kidx=alpha_kidx,
         beta_occ_bands=beta_bands,
         beta_occ_kidx=beta_kidx,
+        atom_coords=atom_coords,
+        atom_charges=atom_charges,
         n_alpha=n_alpha,
         n_beta=n_beta,
         n_kpts=Nk,

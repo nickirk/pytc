@@ -13,6 +13,7 @@ from jax import random
 from pytc.ansatz.det import rank1_update_one_electron
 from pytc.ansatz.sj import SlaterJastrow, update_jastrow_one_electron
 
+from ..ansatz.kdet import KSlaterDet, rank1_update_one_electron_kpts
 from ..utils import wrap, mic_displacement
 
 
@@ -93,10 +94,16 @@ def _one_electron_move(ansatz, walker, step_size, key, params, lattice, batch_an
     else:
         det = ansatz
 
+    rank1_fn = (
+        rank1_update_one_electron_kpts
+        if isinstance(det, KSlaterDet)
+        else rank1_update_one_electron
+    )
+
     def _single_walker_rank1(walker_i, new_pos_i, elec_idx):
         proposal_i = walker_i.replace(positions=new_pos_i)
         det_ratio, det_logabs_new, det_sign_new, proposal_updated = \
-            rank1_update_one_electron(det, proposal_i, elec_idx)
+            rank1_fn(det, proposal_i, elec_idx)
         return det_ratio, det_logabs_new, det_sign_new, proposal_updated
 
     det_ratios, det_logabs_new, det_sign_new, proposals = jax.vmap(
