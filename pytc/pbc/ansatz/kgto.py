@@ -42,6 +42,34 @@ logger = logging.getLogger(__name__)
 def _cartesian_gto_kpts(centers, ijk, expts, coeffs, images, kpts, xyz):
     """Bloch-summed Cartesian GTO at a single field point.
 
+    The image sum is performed with :func:`jax.lax.scan` rather than a
+    vmap-broadcast over the image axis. This drops the intermediate
+    tensor footprint from ``(n_ao, n_image, n_prim)`` (and worse after
+    autodiff) to ``(n_ao, n_prim)`` per scan iteration — for diamond
+    cc-pVDZ this saves a factor of ~600 in memory and is what makes
+    diamond k-mesh VMC fit on an 80 GB A100.
+
+    TODO efficiency improvements (future work):
+      * **Analytical Laplacian** — replace the ``jacfwd ∘ jacfwd`` path
+        in ``eval_gto_lap`` with closed-form Gaussian Laplacian
+        formulas. Eliminates the ~9× Hessian intermediate multiplier
+        and the autodiff cache.
+      * **folx.forward_laplacian** — folx propagates
+        ``(value, jacobian, laplacian)`` triples through each op via
+        custom Laplacian rules and avoids materialising the full
+        Hessian. The molecular ``eval_gto_lap`` and our k-point version
+        currently both use ``jacfwd ∘ jacfwd`` for simplicity, but folx
+        would give the same effect at lower memory. Switching requires
+        verifying folx's registry covers the complex-valued ops in this
+        kernel (``jnp.exp(complex)``, complex einsum, complex
+        multiplication) — we already had to patch around ``jnp.round``
+        in ``mic_displacement`` with ``@jax.custom_jvp``.
+      * **Spline interpolation of orbital values** — CASINO / QMCPACK
+        amortise the image sum into a tabulated B-spline on a real-space
+        grid at startup, then bicubic-interpolate per electron at VMC
+        time. Per-step memory becomes ``O(n_pos · n_ao)``, independent
+        of ``n_image``.
+
     Args:
         centers: ``(n_ao, 3)`` orbital centers.
         ijk: ``(n_ao, 3)`` Cartesian angular-momentum exponents.
@@ -56,25 +84,28 @@ def _cartesian_gto_kpts(centers, ijk, expts, coeffs, images, kpts, xyz):
     """
     centers2d = jnp.atleast_2d(centers)
     ctr_xyz_first = xyz[jnp.newaxis, :] - centers2d                       # (n_ao, 3)
-    ctr_xyz = ctr_xyz_first[:, jnp.newaxis, :] + images                   # (n_ao, n_image, 3)
 
-    xyz_pow = ctr_xyz ** ijk[:, jnp.newaxis, :]
-    xyz_ijk = jnp.prod(xyz_pow, axis=-1)                                  # (n_ao, n_image)
+    n_ao = ijk.shape[0]
+    n_kpts = kpts.shape[0]
 
-    r2 = jnp.sum(ctr_xyz ** 2, axis=-1)                                   # (n_ao, n_image)
-    gauss = jnp.exp(-expts[:, jnp.newaxis, :] * r2[:, :, jnp.newaxis])    # (n_ao, n_image, n_prim)
+    def per_image(carry, image):
+        # carry: (Nk, n_ao) complex Bloch-sum accumulator.
+        # image: (3,) lattice translation T_n (sign convention noted
+        #        above: effective translation is -image; phase is
+        #        exp(-i k . image) so the Bloch identity matches
+        #        PySCF's +i k . T).
+        d = ctr_xyz_first + image                                          # (n_ao, 3)
+        xyz_ijk = jnp.prod(d ** ijk, axis=-1)                              # (n_ao,)
+        r2 = jnp.sum(d * d, axis=-1)                                       # (n_ao,)
+        gauss = jnp.exp(-expts * r2[:, jnp.newaxis])                       # (n_ao, n_prim)
+        per_image_val = jnp.sum(coeffs * gauss, axis=-1) * xyz_ijk         # (n_ao,)
+        phase = jnp.exp(-1j * (kpts @ image))                              # (Nk,)
+        contrib = phase[:, jnp.newaxis] * per_image_val.astype(phase.dtype)
+        return carry + contrib, None
 
-    all_prod = coeffs[:, jnp.newaxis, :] * gauss * xyz_ijk[:, :, jnp.newaxis]
-    per_image = jnp.sum(all_prod, axis=2)                                  # (n_ao, n_image)
-
-    # Phase factor for each (k, image): exp(-i k . image). With T = -image
-    # being the effective lattice translation, this realises the
-    # +i k . T convention used by PySCF.
-    k_dot_T = kpts @ images.T                                              # (Nk, n_image)
-    phase = jnp.exp(-1j * k_dot_T)                                         # (Nk, n_image)
-
-    # Bloch sum over images: (Nk, n_ao)
-    return jnp.einsum('ki,ni->kn', phase, per_image.astype(phase.dtype))
+    init = jnp.zeros((n_kpts, n_ao), dtype=jnp.complex128)
+    bloch, _ = jax.lax.scan(per_image, init, images)
+    return bloch                                                          # (Nk, n_ao)
 
 
 @struct.dataclass
