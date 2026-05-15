@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from pyscf.pbc import gto as pbcgto, scf as pbcscf
 
 from pytc.pbc.ansatz import create_slater_det
-from pytc.pbc.ansatz.gto import PBCGTO
+from pytc.pbc.ansatz.gto import GTO
 from pytc.ansatz.det import (
     SlaterDet,
     eval_det_value,
@@ -36,7 +36,7 @@ class TestCreateSlaterDet(unittest.TestCase):
         cell, mf = _h2_pbc_rhf()
         det = create_slater_det(cell, mo_coeff=mf.mo_coeff, rcut=8.0)
         self.assertIsInstance(det, SlaterDet)
-        self.assertIsInstance(det.mol_gto, PBCGTO)
+        self.assertIsInstance(det.mol_gto, GTO)
         self.assertEqual(det.n_alpha, 1)
         self.assertEqual(det.n_beta, 1)
 
@@ -124,7 +124,7 @@ class TestPBCDetValues(unittest.TestCase):
 
 class TestPBCRank1Update(unittest.TestCase):
     """rank1_update_one_electron is generic in the orbital evaluator. With a
-    PBCGTO it should still produce a Slater determinant ratio consistent
+    GTO it should still produce a Slater determinant ratio consistent
     with a full re-evaluation at the new configuration."""
 
     def setUp(self):

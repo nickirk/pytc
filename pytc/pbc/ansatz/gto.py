@@ -55,7 +55,7 @@ def default_rcut(cell, precision: float = 1e-8) -> float:
 
 
 @struct.dataclass
-class PBCGTO(MolGTO):
+class GTO(MolGTO):
     """Cartesian GTO evaluator with image-summed centers.
 
     Same data layout as :class:`MolGTO`; only ``images`` is populated
@@ -75,7 +75,7 @@ class PBCGTO(MolGTO):
         """
         if not cell.cart:
             raise ValueError(
-                "PBCGTO currently only supports Cartesian basis sets. "
+                "GTO currently only supports Cartesian basis sets. "
                 "Build the cell with cell.cart = True before .build()."
             )
 
@@ -87,7 +87,7 @@ class PBCGTO(MolGTO):
         lattice = np.asarray(cell.lattice_vectors())
         images = generate_images(lattice, rcut)
         logger.debug(
-            "PBCGTO: rcut=%.3f Bohr, %d image translations summed", rcut, images.shape[0]
+            "GTO: rcut=%.3f Bohr, %d image translations summed", rcut, images.shape[0]
         )
 
         return cls(

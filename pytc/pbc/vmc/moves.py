@@ -58,7 +58,7 @@ def _one_electron_move(ansatz, walker, step_size, key, params, lattice, batch_an
     Identical algebra to :func:`pytc.vmc.moves._one_electron_move` — only
     the proposed position is wrapped before the rank-1 update is invoked.
     Wrapping is mathematically a no-op when the orbital evaluator is
-    periodic (PBCGTO), but stored positions stay inside the cell so
+    periodic (GTO), but stored positions stay inside the cell so
     subsequent moves and any minimum-image distance computations are
     well-behaved.
 

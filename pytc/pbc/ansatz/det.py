@@ -6,7 +6,7 @@ for everything ``SlaterDet.create`` reads (``cart``, ``nelec``,
 ``atom_coords()``, ``atom_charges()``, ``_basis``, ``atom_symbol``,
 ``atom_pure_symbol``, ``natm``), so a PBC determinant is constructed by
 calling the molecular factory and replacing the orbital evaluator with a
-:class:`PBCGTO` whose ``images`` are populated from the lattice.
+:class:`GTO` whose ``images`` are populated from the lattice.
 
 Downstream functions in :mod:`pytc.ansatz.det` (``eval_det_value``,
 ``eval_det_value_and_grad``, ``rank1_update_one_electron``,
@@ -17,7 +17,7 @@ between molecular and PBC Cartesian basis sets.
 
 from pytc.ansatz.det import SlaterDet
 
-from .gto import PBCGTO
+from .gto import GTO
 
 __all__ = ['SlaterDet', 'create_slater_det']
 
@@ -47,10 +47,10 @@ def create_slater_det(
         precision: Tolerance used to derive ``rcut`` when not given.
 
     Returns:
-        A :class:`SlaterDet` whose ``mol_gto`` is a :class:`PBCGTO`.
+        A :class:`SlaterDet` whose ``mol_gto`` is a :class:`GTO`.
     """
     det = SlaterDet.create(
         cell, mo_coeff=mo_coeff, nelec=nelec, excitations=excitations
     )
-    pbc_gto = PBCGTO.from_cell(cell, rcut=rcut, precision=precision)
+    pbc_gto = GTO.from_cell(cell, rcut=rcut, precision=precision)
     return det.replace(mol_gto=pbc_gto)

@@ -12,7 +12,7 @@ from pytc.ansatz.gto import (
     eval_gto_grad,
     eval_gto_lap,
 )
-from pytc.pbc.ansatz.gto import PBCGTO, default_rcut
+from pytc.pbc.ansatz.gto import GTO, default_rcut
 
 
 def _h2_cell(L=3.0, atom_offset=0.0):
@@ -29,7 +29,7 @@ def _h2_cell(L=3.0, atom_offset=0.0):
 
 def _matching_mol():
     """Open-boundary mol with same atoms as the H2 cell — used to check that
-    a huge cell PBCGTO reduces to the molecular evaluator."""
+    a huge cell GTO reduces to the molecular evaluator."""
     mol = molgto.Mole()
     mol.atom = 'H 0 0 0; H 0 0 0.7'
     mol.basis = 'sto-3g'
@@ -40,7 +40,7 @@ def _matching_mol():
     return mol
 
 
-class TestPBCGTOConstruction(unittest.TestCase):
+class TestGTOConstruction(unittest.TestCase):
     def test_rejects_spherical_basis(self):
         cell = pbcgto.Cell()
         cell.atom = 'H 0 0 0'
@@ -51,11 +51,11 @@ class TestPBCGTOConstruction(unittest.TestCase):
         cell.verbose = 0
         cell.build()
         with self.assertRaises(ValueError):
-            PBCGTO.from_cell(cell)
+            GTO.from_cell(cell)
 
     def test_origin_image_included(self):
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell, rcut=0.5)
+        gto_obj = GTO.from_cell(cell, rcut=0.5)
         images = np.asarray(gto_obj.images)
         # rcut < |a_i| means only the zero image survives
         self.assertEqual(images.shape, (1, 3))
@@ -63,8 +63,8 @@ class TestPBCGTOConstruction(unittest.TestCase):
 
     def test_image_count_grows_with_rcut(self):
         cell = _h2_cell(L=3.0)
-        small = PBCGTO.from_cell(cell, rcut=2.5)
-        large = PBCGTO.from_cell(cell, rcut=6.0)
+        small = GTO.from_cell(cell, rcut=2.5)
+        large = GTO.from_cell(cell, rcut=6.0)
         self.assertGreater(large.images.shape[0], small.images.shape[0])
 
     def test_default_rcut_positive(self):
@@ -76,13 +76,13 @@ class TestPBCGTOConstruction(unittest.TestCase):
         self.assertGreater(rcut, float(jnp.linalg.norm(L.sum(axis=0))))
 
 
-class TestPBCGTOValues(unittest.TestCase):
+class TestGTOValues(unittest.TestCase):
     def test_reduces_to_molecular_in_large_cell(self):
         """With a cell large enough that only the origin image contributes,
-        PBCGTO values must equal the molecular MolGTO values."""
+        GTO values must equal the molecular MolGTO values."""
         cell = _h2_cell(L=30.0)
         mol = _matching_mol()
-        pbc_gto = PBCGTO.from_cell(cell, rcut=1.0)  # only zero image
+        pbc_gto = GTO.from_cell(cell, rcut=1.0)  # only zero image
         mol_gto = MolGTO.create(mol)
         # The two should now have the same data
         self.assertEqual(pbc_gto.images.shape[0], 1)
@@ -98,7 +98,7 @@ class TestPBCGTOValues(unittest.TestCase):
         lattice vector T. Uses a tight rcut so the truncation error is well
         below the asserted tolerance."""
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell, rcut=25.0)
+        gto_obj = GTO.from_cell(cell, rcut=25.0)
         lattice = jnp.asarray(cell.lattice_vectors())
 
         rng = np.random.default_rng(1)
@@ -116,7 +116,7 @@ class TestPBCGTOValues(unittest.TestCase):
         periodic to better than ~1e-8 — this is the regime that matters for
         Monte Carlo wrap-arounds."""
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell)
+        gto_obj = GTO.from_cell(cell)
         lattice = jnp.asarray(cell.lattice_vectors())
         rng = np.random.default_rng(10)
         r = jnp.asarray(rng.uniform(0.0, 3.0, size=3))
@@ -127,7 +127,7 @@ class TestPBCGTOValues(unittest.TestCase):
 
     def test_periodicity_of_gradient(self):
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell)
+        gto_obj = GTO.from_cell(cell)
         lattice = jnp.asarray(cell.lattice_vectors())
         rng = np.random.default_rng(2)
         r = jnp.asarray(rng.uniform(0.0, 3.0, size=3))
@@ -136,13 +136,13 @@ class TestPBCGTOValues(unittest.TestCase):
         np.testing.assert_allclose(g0, g1, atol=1e-7, rtol=1e-7)
 
     def test_bloch_sum_matches_brute_force(self):
-        """Compare PBCGTO at a field point against an explicit Python sum
+        """Compare GTO at a field point against an explicit Python sum
         over the molecular orbital evaluated at translated copies. Both
         sums use the same cutoff so they agree exactly (up to floating
         point)."""
         cell = _h2_cell(L=2.5)
         rcut = 15.0
-        pbc_gto = PBCGTO.from_cell(cell, rcut=rcut)
+        pbc_gto = GTO.from_cell(cell, rcut=rcut)
 
         mol = _matching_mol()
         mol_gto = MolGTO.create(mol)
@@ -151,7 +151,7 @@ class TestPBCGTOValues(unittest.TestCase):
         rng = np.random.default_rng(3)
         r = jnp.asarray(rng.uniform(0.0, 2.5, size=3))
 
-        # Match the PBCGTO image sum exactly: iterate over the same
+        # Match the GTO image sum exactly: iterate over the same
         # image translations and evaluate the single-image molecular orbital
         # at r - T (mol_gto's internal image is the origin only).
         ref = jnp.zeros_like(eval_gto(mol_gto, r))
@@ -164,7 +164,7 @@ class TestPBCGTOValues(unittest.TestCase):
     def test_eval_ao_batched(self):
         """The high-level eval_ao with deriv=2 works on a batch of positions."""
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell)
+        gto_obj = GTO.from_cell(cell)
         rng = np.random.default_rng(4)
         positions = jnp.asarray(rng.uniform(0.0, 3.0, size=(4, 2, 3)))
         vals, grads, laps = eval_ao(gto_obj, positions, deriv=2)
@@ -175,10 +175,10 @@ class TestPBCGTOValues(unittest.TestCase):
         self.assertTrue(bool(jnp.all(jnp.isfinite(laps))))
 
 
-class TestPBCGTOJit(unittest.TestCase):
+class TestGTOJit(unittest.TestCase):
     def test_jit_eval(self):
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell)
+        gto_obj = GTO.from_cell(cell)
         r = jnp.array([0.5, 1.0, 1.5])
         f = jax.jit(eval_gto)
         np.testing.assert_allclose(
@@ -187,7 +187,7 @@ class TestPBCGTOJit(unittest.TestCase):
 
     def test_grad_compiles(self):
         cell = _h2_cell(L=3.0)
-        gto_obj = PBCGTO.from_cell(cell)
+        gto_obj = GTO.from_cell(cell)
         r = jnp.array([0.5, 1.0, 1.5])
         # Sum reduction to get a scalar for grad.
         f = jax.jit(jax.grad(lambda x: jnp.sum(eval_gto(gto_obj, x))))

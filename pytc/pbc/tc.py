@@ -9,7 +9,7 @@ So the periodic port reduces to a single factory:
 
 * Build a periodic Becke grid via :class:`pyscf.pbc.dft.gen_grid.BeckeGrids`.
 * Evaluate AOs (and gradients) on that grid using PySCF's PBC numint at
-  the Gamma point. Equivalent to our :class:`PBCGTO` evaluator (we
+  the Gamma point. Equivalent to our :class:`GTO` evaluator (we
   verified they agree to machine precision), but PySCF's path is the
   reference implementation and avoids re-tuning rcut for the
   integration grid.
