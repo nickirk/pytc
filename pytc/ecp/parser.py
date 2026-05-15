@@ -29,6 +29,8 @@ coefficients zero for non-ECP atoms).
 
 from __future__ import annotations
 
+import logging
+import warnings
 from typing import List, Optional, Tuple
 
 import jax.numpy as jnp
@@ -39,6 +41,7 @@ from pytc.ecp import radial as _radial
 
 
 _DEFAULT_QUAD_GRID = "icosahedral_12"
+_logger = logging.getLogger(__name__)
 
 
 @struct.dataclass
@@ -129,6 +132,64 @@ def _collect_nonlocal(
     return l_max + 1, per_l
 
 
+def _warn_on_ecp_sphere_overlap(mol, has_ecp, r_cut, *, warn_threshold: float = 1.0):
+    """Emit a warning if any pair of ECP atoms has overlapping non-local
+    cutoff spheres.
+
+    The locality-approximation non-local kernel quadrature lives on the
+    sphere of radius r_iA around each ECP nucleus A; when an electron sits
+    inside two ECP spheres simultaneously, displaced quadrature points from
+    atom A can land inside atom B's non-local active region (and vice
+    versa).  The mathematics still sums contributions atom-by-atom, but
+    the trial-wavefunction representation in the overlap region is
+    typically poor — production QMC practice prefers small-core ECPs at
+    short bond distances.
+
+    The check is
+
+         |R_A - R_B| < (r_cut^A + r_cut^B) * warn_threshold
+
+    ``warn_threshold`` is 1.0 by default (true geometric overlap).  Set
+    above 1.0 to be more conservative (warn for "near-touching" cases).
+    """
+    r_cut_np = np.asarray(r_cut)
+    has_ecp_np = np.asarray(has_ecp)
+    coords = mol.atom_coords()  # Bohr
+    n_atoms = coords.shape[0]
+    offenders = []
+    for a in range(n_atoms):
+        if not has_ecp_np[a]:
+            continue
+        for b in range(a + 1, n_atoms):
+            if not has_ecp_np[b]:
+                continue
+            dist = float(np.linalg.norm(coords[a] - coords[b]))
+            sum_rcut = float(r_cut_np[a] + r_cut_np[b])
+            if dist < sum_rcut * warn_threshold:
+                offenders.append((a, b, dist, r_cut_np[a], r_cut_np[b], sum_rcut))
+
+    if not offenders:
+        return
+
+    lines = [
+        "Overlapping ECP non-local cutoff spheres detected. "
+        "The trial wavefunction's representation may be unreliable in "
+        "the overlap region; consider a smaller-core ECP or a longer "
+        "bond distance.  Offending pairs (Bohr):",
+    ]
+    for a, b, dist, rA, rB, total in offenders:
+        sym_a = mol.atom_symbol(a)
+        sym_b = mol.atom_symbol(b)
+        lines.append(
+            f"  {sym_a}(atom {a}) - {sym_b}(atom {b}): "
+            f"|R| = {dist:.3f}, r_cut sum = {total:.3f} "
+            f"(r_cut[{sym_a}]={rA:.3f}, r_cut[{sym_b}]={rB:.3f})"
+        )
+    msg = "\n".join(lines)
+    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    _logger.warning(msg)
+
+
 def parse_pyscf_ecp(
     mol,
     *,
@@ -136,6 +197,7 @@ def parse_pyscf_ecp(
     nl_cutoff_rmax: float = 10.0,
     nl_cutoff_ngrid: int = 4096,
     quad_grid_name: str = _DEFAULT_QUAD_GRID,
+    warn_on_overlap: bool = True,
 ) -> EcpData:
     """Parse `mol._ecp` into padded JAX arrays for VMC use.
 
@@ -238,6 +300,9 @@ def parse_pyscf_ecp(
         r_max=nl_cutoff_rmax,
         n_grid=nl_cutoff_ngrid,
     )
+
+    if warn_on_overlap:
+        _warn_on_ecp_sphere_overlap(mol, has_ecp, r_cut)
 
     return EcpData(
         has_ecp=has_ecp,

@@ -33,7 +33,8 @@ class SlaterJastrow:
     @classmethod
     def create(cls, mol, jastrow, dets: List[SlaterDet], *,
                ecp_nl_cutoff_tol: float = 1.0e-5,
-               ecp_quad_grid: str = "icosahedral_12"):
+               ecp_quad_grid: str = "icosahedral_12",
+               warn_on_ecp_overlap: bool = True):
         """Initialize the ansatz without storing optimizable parameters.
 
         If ``mol`` carries an effective-core potential (``mol._ecp`` populated),
@@ -68,6 +69,7 @@ class SlaterJastrow:
             mol,
             nl_cutoff_tol=ecp_nl_cutoff_tol,
             quad_grid_name=ecp_quad_grid,
+            warn_on_overlap=warn_on_ecp_overlap,
         )
 
         return cls(

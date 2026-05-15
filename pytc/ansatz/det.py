@@ -14,12 +14,16 @@ class SlaterDet:
     mo_coeff_alpha_occ: jax.Array
     mo_coeff_beta_occ: jax.Array
     mol_gto: Union[MolGTO, MolGTO_Spherical]
+    # atom_coords / atom_charges are pytree LEAVES (not metadata).  JAX cannot
+    # hash arrays for JIT-cache lookup, which trips multi-molecule workflows
+    # (e.g. bond-length scans) when two ansatzes with different geometries are
+    # used in succession.
+    atom_coords: jax.Array
+    atom_charges: jax.Array
     n_alpha: int = struct.field(pytree_node=False)
     n_beta: int = struct.field(pytree_node=False)
     alpha_occ: Tuple[int] = struct.field(pytree_node=False)
     beta_occ: Tuple[int] = struct.field(pytree_node=False)
-    atom_coords: jax.Array = struct.field(pytree_node=False)
-    atom_charges: jax.Array = struct.field(pytree_node=False)
     eval_ao_func: Callable = struct.field(pytree_node=False)
     unrestricted: bool = struct.field(pytree_node=False, default=False)
 
