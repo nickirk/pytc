@@ -32,23 +32,34 @@ def burn_in(
     key,
     move_type: str = "one",
     log: bool = True,
+    adaptive_step_size: bool = True,
+    step_size_adjust_interval: int = 100,
+    target_acceptance: float = 0.5,
 ):
     """Run an MCMC burn-in pass and return the equilibrated walker batch.
 
+    With ``adaptive_step_size=True`` (default), the step size is rescaled
+    every ``step_size_adjust_interval`` steps toward ``target_acceptance``
+    via ``step_size *= acc / target_acceptance`` — matching the molecular
+    :func:`pytc.vmc.burn_in` behavior. The adapted final step size is
+    returned so production samplers can use it.
+
     Args:
         sj: PBC :class:`SlaterJastrow`.
-        cell: ``pyscf.pbc.gto.Cell`` (used for walker initialization and to
-            obtain the lattice).
+        cell: ``pyscf.pbc.gto.Cell``.
         n_walkers: Number of walkers.
         n_steps: Number of MCMC steps to discard.
-        step_size: Gaussian proposal width.
+        step_size: Initial Gaussian proposal width.
         params: Ansatz parameters.
         key: PRNG key.
-        move_type: ``"one"`` (rank-1) or ``"all"`` (full-batch proposal).
-        log: Emit info-level progress every ``n_steps // 5`` steps.
+        move_type: ``"one"`` or ``"all"``.
+        log: Emit info-level progress at each adjustment.
+        adaptive_step_size: If True, rescale step_size toward target.
+        step_size_adjust_interval: Steps between rescaling.
+        target_acceptance: Target acceptance rate (~0.5 is standard).
 
     Returns:
-        ``(walker, mean_acceptance_rate, key)``.
+        ``(walker, mean_acceptance_rate, key, final_step_size)``.
     """
     lattice = jnp.asarray(cell.lattice_vectors())
 
@@ -59,21 +70,42 @@ def burn_in(
     batch_ansatz = jax.vmap(lambda w, p: sj(w, p), in_axes=(0, None))
     _, walker = batch_ansatz(walker, params)
 
-    step = make_mcmc_step(sj, step_size=step_size, lattice=lattice, move_type=move_type)
-
     acceptance_sum = 0.0
-    report_every = max(1, n_steps // 5)
+    interval_acc_sum = 0.0
+    interval_count = 0
+    current_step = make_mcmc_step(
+        sj, step_size=step_size, lattice=lattice, move_type=move_type)
+
     for i in range(n_steps):
         key, sub = random.split(key)
-        walker, acc = step(sj, walker, sub, params)
-        acceptance_sum += float(acc)
-        if log and (i % report_every == 0 or i == n_steps - 1):
-            logger.info(
-                "Burn-in step %d / %d, running acceptance = %.3f",
-                i, n_steps, acceptance_sum / (i + 1),
-            )
+        walker, acc = current_step(sj, walker, sub, params)
+        a = float(acc)
+        acceptance_sum += a
+        interval_acc_sum += a
+        interval_count += 1
 
-    return walker, acceptance_sum / max(n_steps, 1), key
+        last_step = (i == n_steps - 1)
+        do_adjust = adaptive_step_size and (
+            interval_count >= step_size_adjust_interval or last_step
+        )
+        if do_adjust:
+            interval_acc = interval_acc_sum / interval_count
+            new_step_size = step_size * interval_acc / max(target_acceptance, 1e-6)
+            # Clamp to prevent runaway.
+            new_step_size = max(new_step_size, 1e-4)
+            if log:
+                logger.info(
+                    "Burn-in step %d / %d  acc(interval)=%.3f  step_size %.4g -> %.4g",
+                    i + 1, n_steps, interval_acc, step_size, new_step_size,
+                )
+            if not last_step:
+                step_size = new_step_size
+                current_step = make_mcmc_step(
+                    sj, step_size=step_size, lattice=lattice, move_type=move_type)
+            interval_acc_sum = 0.0
+            interval_count = 0
+
+    return walker, acceptance_sum / max(n_steps, 1), key, step_size
 
 
 def sample(
@@ -123,12 +155,15 @@ def sample(
 
     lattice = jnp.asarray(cell.lattice_vectors())
 
-    walker, burn_acc, key = burn_in(
+    walker, burn_acc, key, step_size = burn_in(
         sj, cell, n_walkers, burn_in_steps, step_size, params, key,
         move_type=move_type, log=log,
     )
     if log:
-        logger.info("Burn-in complete (acceptance %.3f). Beginning production.", burn_acc)
+        logger.info(
+            "Burn-in complete (acc %.3f, adapted step_size=%.4g). Beginning production.",
+            burn_acc, step_size,
+        )
 
     step = make_mcmc_step(sj, step_size=step_size, lattice=lattice, move_type=move_type)
     batch_local_energy = jax.jit(jax.vmap(
@@ -198,25 +233,40 @@ def sample_bare(
     batch_call = jax.vmap(lambda w: det(w, None))
     _, walker = batch_call(walker)
 
+    # Burn-in with adaptive step_size (matches the SlaterJastrow burn_in
+    # behavior: rescale toward acceptance 0.5 every 100 steps).
     step = make_mcmc_step(det, step_size=step_size, lattice=lattice)
-
-    # Burn-in
     acc_sum_burn = 0.0
-    report_every = max(1, burn_in_steps // 5)
+    interval_acc = 0.0
+    interval_count = 0
+    adjust_every = 100
+    target_acc = 0.5
     for i in range(burn_in_steps):
         key, sub = random.split(key)
         walker, acc = step(det, walker, sub, None)
-        acc_sum_burn += float(acc)
-        if log and (i % report_every == 0 or i == burn_in_steps - 1):
-            logger.info(
-                "Burn-in step %d / %d, running acceptance = %.3f",
-                i, burn_in_steps, acc_sum_burn / (i + 1),
-            )
+        a = float(acc)
+        acc_sum_burn += a
+        interval_acc += a
+        interval_count += 1
+        last = (i == burn_in_steps - 1)
+        if interval_count >= adjust_every or last:
+            mean_interval_acc = interval_acc / interval_count
+            new_step = max(step_size * mean_interval_acc / max(target_acc, 1e-6), 1e-4)
+            if log:
+                logger.info(
+                    "Burn-in step %d / %d  acc(interval)=%.3f  step_size %.4g -> %.4g",
+                    i + 1, burn_in_steps, mean_interval_acc, step_size, new_step,
+                )
+            if not last:
+                step_size = new_step
+                step = make_mcmc_step(det, step_size=step_size, lattice=lattice)
+            interval_acc = 0.0
+            interval_count = 0
 
     if log:
         logger.info(
-            "Burn-in complete (acceptance %.3f). Beginning production.",
-            acc_sum_burn / max(burn_in_steps, 1),
+            "Burn-in complete (acc %.3f, adapted step_size=%.4g). Beginning production.",
+            acc_sum_burn / max(burn_in_steps, 1), step_size,
         )
 
     batch_local_energy = jax.jit(jax.vmap(
