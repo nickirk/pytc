@@ -34,6 +34,7 @@ from pytc.vmc.optimization import (
     make_opt_update_step,
 )
 
+from ..ansatz.ksj import KSlaterJastrow
 from .ewald import EwaldParams
 from .metropolis import make_mcmc_step
 from .sampling import burn_in
@@ -43,7 +44,7 @@ from .hamiltonian import compute_single_walker_energy
 
 @struct.dataclass
 class PBCSlaterJastrow(SlaterJastrow):
-    """SlaterJastrow with Ewald-aware ``local_energy``.
+    """Γ-only SlaterJastrow with Ewald-aware ``local_energy``.
 
     Adds an :class:`EwaldParams` field and overrides ``local_energy`` to
     use :func:`pytc.pbc.vmc.hamiltonian.compute_single_walker_energy`
@@ -66,6 +67,40 @@ class PBCSlaterJastrow(SlaterJastrow):
         jastrow_params, _ = params
         e = compute_single_walker_energy(self, walker, jastrow_params, self.ewald)
         return e, walker
+
+
+@struct.dataclass
+class PBCKSlaterJastrow(KSlaterJastrow):
+    """k-point SlaterJastrow with Ewald-aware ``local_energy``.
+
+    Same idea as :class:`PBCSlaterJastrow` but inherits :class:`KSlaterJastrow`
+    so ``__call__`` routes through ``eval_ksj`` (complex Bloch path)
+    instead of the real-valued molecular evaluator.
+    """
+    ewald: EwaldParams = None
+
+    @classmethod
+    def from_base(cls, ksj: KSlaterJastrow, ewald: EwaldParams):
+        return cls(
+            dets=ksj.dets,
+            atom_coords=ksj.atom_coords,
+            atom_charges=ksj.atom_charges,
+            ion_ion_potential=ksj.ion_ion_potential,
+            jastrow=ksj.jastrow,
+            ewald=ewald,
+        )
+
+    def local_energy(self, walker, params):
+        jastrow_params, _ = params
+        e = compute_single_walker_energy(self, walker, jastrow_params, self.ewald)
+        return e, walker
+
+
+def _wrap_with_ewald(sj, ewald):
+    """Dispatch on the SJ type to attach the Ewald-aware ``local_energy``."""
+    if isinstance(sj, KSlaterJastrow):
+        return PBCKSlaterJastrow.from_base(sj, ewald)
+    return PBCSlaterJastrow.from_base(sj, ewald)
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +162,7 @@ def optimize_ref_var(
     if params is None:
         params = [sj.jastrow.init_params(), __import__('jax').numpy.ones(len(sj.dets))]
 
-    ansatz = PBCSlaterJastrow.from_base(sj, ewald)
+    ansatz = _wrap_with_ewald(sj, ewald)
 
     walkers = initialize_walkers(sj.dets[0], cell, n_walkers=n_walkers, key=key,
                                  log_init=False)
