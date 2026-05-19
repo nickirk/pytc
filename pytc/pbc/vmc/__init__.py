@@ -24,6 +24,7 @@ from .hamiltonian import (
 )
 from .metropolis import metropolis_hastings, make_mcmc_step
 from .sampling import burn_in, sample, sample_bare
+from .optimization import optimize_ref_var
 
 __all__ = [
     'Walker',
@@ -46,4 +47,5 @@ __all__ = [
     'burn_in',
     'sample',
     'sample_bare',
+    'optimize_ref_var',
 ]
