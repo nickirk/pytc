@@ -78,6 +78,11 @@ class RCCSD(rccsd.RCCSD):
         self.e_hf = self.get_e_hf(eris)
         return super().ccsd(t1, t2, eris, mbpt2)
 
+    def ccsd_t(self, t1=None, t2=None, eris=None):
+        """xTC-CCSD(T) perturbative triples (1+2-body xTC integrals only)."""
+        from pytc.solver.xtc_ccsd_t import kernel as _ccsd_t_kernel
+        return _ccsd_t_kernel(self, eris=eris, t1=t1, t2=t2)
+
     def energy_tot(self, t1=None, t2=None, eris=None):
         return self.get_e_hf(eris) + self.energy(t1, t2, eris)
 
