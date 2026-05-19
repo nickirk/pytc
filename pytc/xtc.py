@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial, reduce
+from typing import Any, Optional
 import numpy as np
 import os
 import gc
@@ -286,24 +287,36 @@ def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=Non
 @struct.dataclass
 class XTC(TC):
     """JAX implementation of extended transcorrelated methods using flax dataclass.
-    
+
     Attributes:
         mo_occ: Molecular orbital occupation numbers (N_orb,)
         energy_nuc: Nuclear repulsion energy (static)
+        ecp_data: Parsed ECP table (EcpData) — populated when ``mf.mol``
+            carries an ECP. ``None`` for all-electron systems.  Used by
+            ``get_1b_ecp_chi`` (Option B Phase 1).
     """
     mo_occ: jnp.ndarray = struct.field(default=None)
     energy_nuc: float = struct.field(pytree_node=False, default=0.0)
+    ecp_data: Any = struct.field(pytree_node=True, default=None)
 
     @classmethod
     def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
         """Initialize XTC object from PySCF mean-field object."""
         # Create base TC object
         tc_obj = super().from_pyscf(mf, jastrow_factor, mo_coeff, grid_lvl)
-        
+
         # Extract additional fields
         mo_occ = jnp.asarray(mf.mo_occ)
         energy_nuc = mf.energy_nuc()
-        
+
+        # Parse ECP data once at construction.  Carry it on the XTC
+        # dataclass so the new ``get_1b_ecp_chi`` method does not need
+        # mol/mf at every call.  All-electron molecules get None.
+        ecp_data = None
+        if getattr(mf.mol, "_ecp", None):
+            from pytc.ecp.parser import parse_pyscf_ecp
+            ecp_data = parse_pyscf_ecp(mf.mol, warn_on_overlap=False)
+
         # Return XTC object with all fields
         return cls(
             grid_points=tc_obj.grid_points,
@@ -316,7 +329,8 @@ class XTC(TC):
             mo_coeff=tc_obj.mo_coeff,
             nocc=tc_obj.nocc,
             mo_occ=mo_occ,
-            energy_nuc=energy_nuc
+            energy_nuc=energy_nuc,
+            ecp_data=ecp_data,
         )
     
     @property
@@ -695,6 +709,95 @@ class XTC(TC):
         """
         return self.get_delta_h(jastrow_params, dm1, block_str, ranges, orb_block_size, batch_size)
 
+    def _find_nuclear_cusp(self):
+        """Locate the NuclearCusp factor and its parameter index, if any.
+
+        Supports:
+            (a) ``self.jastrow_factor`` being a NuclearCusp directly, and
+            (b) ``CompositeJastrow`` containing exactly one NuclearCusp.
+
+        Returns:
+            ``(ncusp, param_idx)`` — ``ncusp`` is the NuclearCusp instance,
+            ``param_idx`` is ``None`` for case (a) (params is the raw dict)
+            or the integer slot in the composite list for case (b).
+            Returns ``(None, None)`` if no NuclearCusp is present.
+        """
+        from pytc.jastrow.ncusp import NuclearCusp
+        from pytc.jastrow.composite import CompositeJastrow
+
+        jf = self.jastrow_factor
+        if isinstance(jf, NuclearCusp):
+            return jf, None
+        if isinstance(jf, CompositeJastrow):
+            for i, sub in enumerate(jf.jastrows):
+                if isinstance(sub, NuclearCusp):
+                    return sub, i
+        return None, None
+
+    def get_1b_ecp_chi(self, mf, jastrow_params, quad_grid_name=None):
+        """Δh^{(NL,χ)}_{pq} from the [V_NL, χ] commutator, Option B Phase 1.
+
+        Resums the 1-body part χ of the Jastrow exactly inside the nonlocal
+        ECP angular quadrature:
+
+            Δh^{(NL,χ)}_{pq} = Σ_g w_g φ_p(r_g)
+                              × Σ_A Σ_l (2l+1) V_l^A(r_{gA})
+                              × Σ_q w_q P_l(cos θ_q)
+                              × [exp(χ(r'_{g,A,q}) - χ(r_g)) - 1]
+                              × φ_q(r'_{g,A,q})
+
+        Args:
+            mf: pyscf mean-field object — used only for ``mf.mol`` to
+                evaluate AOs at displaced points.
+            jastrow_params: parameter container matching ``self.jastrow_factor``.
+            quad_grid_name: angular quadrature name (default = the name
+                stored on ``self.ecp_data``, falling back to
+                ``"icosahedral_12"``).
+
+        Returns:
+            (n_orb, n_orb) ``jnp.ndarray`` to be added to h1e in the MO
+            basis.  Returns zeros if no ECP atoms or no χ Jastrow component.
+        """
+        from pytc.ecp.quadrature import get_grid
+        from pytc.xtc_ecp_chi import compute_delta_h_ecp_chi
+
+        if self.ecp_data is None or not bool(np.any(np.asarray(self.ecp_data.has_ecp))):
+            return jnp.zeros((self.n_orb, self.n_orb))
+
+        ncusp, param_idx = self._find_nuclear_cusp()
+        if ncusp is None:
+            logger.warning(
+                "get_1b_ecp_chi: no NuclearCusp component in jastrow; "
+                "returning zero correction.  Phase 1 only resums the "
+                "1-body Jastrow piece."
+            )
+            return jnp.zeros((self.n_orb, self.n_orb))
+
+        # Build a jax-traceable chi(r) closure that pulls the right param
+        # slot out of the composite (or uses params directly).
+        if param_idx is None:
+            ncusp_params = jastrow_params
+        else:
+            ncusp_params = jastrow_params[param_idx]
+
+        def chi_fn(r):
+            return ncusp.eval_chi_single(r, ncusp_params)
+
+        if quad_grid_name is None:
+            quad_grid_name = self.ecp_data.quad_grid_name
+        angular_grid = get_grid(quad_grid_name)
+
+        return compute_delta_h_ecp_chi(
+            mol=mf.mol,
+            mo_coeff=np.asarray(self.mo_coeff),
+            grid_points=np.asarray(self.grid_points),
+            weights=np.asarray(self.weights),
+            phi_grid=self.phi,
+            ecp=self.ecp_data,
+            angular_grid=angular_grid,
+            chi_fn=chi_fn,
+        )
+
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
@@ -751,31 +854,44 @@ class XTC(TC):
         """Get three-body extended correlation."""
         raise NotImplementedError("JAX implementation pending")
         
-    def make_eris(self, mf, jastrow_params):
+    def make_eris(self, mf, jastrow_params, *, use_ecp_chi=True):
         """Create ChemistsERIs object for CCSD calculation.
-        
+
         Args:
             mf: PySCF mean-field object (required for initializing RCCSD)
             jastrow_params: Parameters for the Jastrow factor
+            use_ecp_chi: if True (default) and an ECP + NuclearCusp Jastrow
+                are both present, add the Option B Phase 1 correction
+                Δh^{(NL,χ)} to the 1-body Hamiltonian.  Has no effect on
+                all-electron systems or when the Jastrow has no
+                NuclearCusp factor — falls back to a zero matrix.
         """
         from pyscf.cc import rccsd
         mycc = rccsd.RCCSD(mf)
         nocc = np.sum(mf.mo_occ > 0)
-        
+
         eris = rccsd._ChemistsERIs(mycc)
-        
+
         # Get standard integrals from helper
         eri_std = tc_helper.get_eri(mf, self.mo_coeff)
         h1e_std = tc_helper.get_hcore(mf, self.mo_coeff)
-        
+
         # Get corrections
         # Force concrete value computation
         const = np.asarray(self.get_const(jastrow_params))
         h1e_corr = np.asarray(self.get_1b(jastrow_params))
         h2e_corr = np.asarray(self.get_2b(jastrow_params))
-        
+
+        # ECP non-local chi resummation (Option B Phase 1).  Cheap and
+        # zero-by-construction on systems where the prerequisites
+        # (ECP atoms AND a NuclearCusp component) are not both present.
+        if use_ecp_chi:
+            h1e_ecp_chi = np.asarray(self.get_1b_ecp_chi(mf, jastrow_params))
+        else:
+            h1e_ecp_chi = np.zeros_like(h1e_corr)
+
         # Combine
-        h1e = h1e_std + h1e_corr
+        h1e = h1e_std + h1e_corr + h1e_ecp_chi
         h2e = eri_std + h2e_corr
         
         # Now use the concrete NumPy arrays

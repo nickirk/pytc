@@ -257,6 +257,18 @@ def _make_xtc_eris(cc, mo_coeff=None):
     
     # orb_block_size=None → get_delta_h auto-picks from probed GPU free memory.
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
+
+    # Option B Phase 1: [V_NL, chi] commutator correction.  Zero unless
+    # the system has both an ECP atom and a NuclearCusp Jastrow factor;
+    # cheap to call and a no-op otherwise.  Note: this adds to the Fock
+    # matrix below but is NOT folded into ``e_core`` — it is a genuine
+    # 1-body operator, not a constant offset.  See
+    # ``_local/design/ecp_xtc_theory.md`` §8.
+    if hasattr(xtc_obj, "get_1b_ecp_chi"):
+        h1e_ecp_chi_corr = np.asarray(xtc_obj.get_1b_ecp_chi(cc._scf, jastrow_params))
+    else:
+        h1e_ecp_chi_corr = np.zeros_like(h1e_corr)
+
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
     _fock_devices = _solver_local_devices()
@@ -298,6 +310,9 @@ def _make_xtc_eris(cc, mo_coeff=None):
         h2e_piiq_corr = _fock_worker(_fock_ranges[1], _device)
 
     fock_corr = h1e_corr + 2 * np.einsum('pqii->pq', h2e_pqii_corr) - np.einsum('piiq->pq', h2e_piiq_corr)
+    # Add the [V_NL, chi] 1-body correction (Option B Phase 1).  Already
+    # zero for AE-only or no-NuclearCusp setups; see above.
+    fock_corr = fock_corr + h1e_ecp_chi_corr
     eris.fock = fock_std + fock_corr
     eris.fvo = eris.fock[nocc:, :nocc].copy()
     eris.mo_energy = np.diag(eris.fock)

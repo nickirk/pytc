@@ -269,6 +269,30 @@ class NuclearCusp(Jastrow):
 
         return self._compute_inner(r1, r2, params, poly_coeffs)
 
+    def eval_chi_single(self, r, params):
+        """Per-electron 1-body Jastrow log-contribution chi(r) = sum_A chi_A(r_A).
+
+        ``_compute_inner`` returns the per-electron sum divided by
+        ``(n_e - 1)`` to match CASINO's TERM-convention 1/(N-1) scaling used
+        by the pair-Jastrow accumulator.  For Option B's exact
+        chi-resummation we want the *natural* per-electron value, so we
+        undo that scaling here.
+
+        Args:
+            r: Array of shape (3,) — single-electron position.
+            params: Same NuclearCusp parameter dict consumed by ``_compute``.
+
+        Returns:
+            Scalar — sum_A chi_A(|r - R_A|), with ECP-atom contributions
+            already gated off (handled inside ``_compute_inner``).
+        """
+        clipped = self._clip_params(params)
+        poly_coeffs = self._precompute_poly_coeffs(clipped)
+        # r2 is unused inside _compute_inner; supply a dummy.
+        dummy_r2 = jnp.zeros_like(r)
+        per_pair = self._compute_inner(r, dummy_r2, clipped, poly_coeffs)
+        return per_pair * (self.nelectron - 1)
+
     def _precompute_poly_coeffs(self, clipped_params):
         """Compute polynomial coefficients from (already-clipped) params.
 
