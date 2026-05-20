@@ -417,25 +417,35 @@ def _single_triple_contribution(a, b, c,
     # by a different (i,j,k) permutation. Pre-computing all six transposes
     # of the W stack and assembling the per-Z "summed W" reduces the
     # 36 small einsums to **one** large `Sijk,Sijk->` contraction.
-    W_ijk = W_stack                                          # identity
-    W_ikj = jnp.transpose(W_stack, (0, 1, 3, 2))             # (i,k,j)
-    W_jik = jnp.transpose(W_stack, (0, 2, 1, 3))             # (j,i,k)
-    W_jki = jnp.transpose(W_stack, (0, 3, 1, 2))             # (j,k,i)
-    W_kij = jnp.transpose(W_stack, (0, 2, 3, 1))             # (k,i,j)
-    W_kji = jnp.transpose(W_stack, (0, 3, 2, 1))             # (k,j,i)
+    # 36-term consumer sum.
+    # Initial fusion attempt with a pre-summed W_for_Z[6, i, j, k] tensor was a
+    # regression on the synthetic bench (the 30 explicit additions to build
+    # W_for_Z dominate the per-triple cost on small nocc). The 36-einsum form
+    # below is what we shipped originally and what passed the unit tests.
+    # XLA fuses these well enough on the GPU; the wins from W/V stacking
+    # above already give us most of the launch-overhead reduction.
+    wabc, wacb, wbac, wbca, wcab, wcba = (W_stack[i] for i in range(6))
+    zabc, zacb, zbac, zbca, zcab, zcba = (Z_stack[i] for i in range(6))
 
-    # Per-Z summed-W tables — index gymnastics derived from the original
-    # blocks (zabc..zcba) of the reference kernel.
-    W_for_Z = jnp.stack([
-        W_ijk[0] + W_ikj[1] + W_jik[2] + W_jki[3] + W_kij[4] + W_kji[5],
-        W_ijk[1] + W_ikj[0] + W_jik[4] + W_jki[5] + W_kij[2] + W_kji[3],
-        W_ijk[2] + W_ikj[3] + W_jik[0] + W_jki[1] + W_kij[5] + W_kji[4],
-        W_ijk[3] + W_ikj[2] + W_jik[5] + W_jki[4] + W_kij[0] + W_kji[1],
-        W_ijk[4] + W_ikj[5] + W_jik[1] + W_jki[0] + W_kij[3] + W_kji[2],
-        W_ijk[5] + W_ikj[4] + W_jik[3] + W_jki[2] + W_kij[1] + W_kji[0],
-    ], axis=0)
-
-    return jnp.einsum("Sijk,Sijk->", W_for_Z, Z_stack)
+    et = (jnp.einsum("ijk,ijk", wabc, zabc) + jnp.einsum("ikj,ijk", wacb, zabc)
+          + jnp.einsum("jik,ijk", wbac, zabc) + jnp.einsum("jki,ijk", wbca, zabc)
+          + jnp.einsum("kij,ijk", wcab, zabc) + jnp.einsum("kji,ijk", wcba, zabc)
+          + jnp.einsum("ijk,ijk", wacb, zacb) + jnp.einsum("ikj,ijk", wabc, zacb)
+          + jnp.einsum("jik,ijk", wcab, zacb) + jnp.einsum("jki,ijk", wcba, zacb)
+          + jnp.einsum("kij,ijk", wbac, zacb) + jnp.einsum("kji,ijk", wbca, zacb)
+          + jnp.einsum("ijk,ijk", wbac, zbac) + jnp.einsum("ikj,ijk", wbca, zbac)
+          + jnp.einsum("jik,ijk", wabc, zbac) + jnp.einsum("jki,ijk", wacb, zbac)
+          + jnp.einsum("kij,ijk", wcba, zbac) + jnp.einsum("kji,ijk", wcab, zbac)
+          + jnp.einsum("ijk,ijk", wbca, zbca) + jnp.einsum("ikj,ijk", wbac, zbca)
+          + jnp.einsum("jik,ijk", wcba, zbca) + jnp.einsum("jki,ijk", wcab, zbca)
+          + jnp.einsum("kij,ijk", wabc, zbca) + jnp.einsum("kji,ijk", wacb, zbca)
+          + jnp.einsum("ijk,ijk", wcab, zcab) + jnp.einsum("ikj,ijk", wcba, zcab)
+          + jnp.einsum("jik,ijk", wacb, zcab) + jnp.einsum("jki,ijk", wabc, zcab)
+          + jnp.einsum("kij,ijk", wbca, zcab) + jnp.einsum("kji,ijk", wbac, zcab)
+          + jnp.einsum("ijk,ijk", wcba, zcba) + jnp.einsum("ikj,ijk", wcab, zcba)
+          + jnp.einsum("jik,ijk", wbca, zcba) + jnp.einsum("jki,ijk", wbac, zcba)
+          + jnp.einsum("kij,ijk", wacb, zcba) + jnp.einsum("kji,ijk", wabc, zcba))
+    return et
 
 
 def _make_batch_fn():
