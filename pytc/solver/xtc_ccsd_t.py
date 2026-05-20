@@ -409,32 +409,38 @@ def _single_triple_contribution(a, b, c,
     return et
 
 
-def _make_scan_fn():
-    """Compile a per-device on-device scan that sums contributions over triples.
+def _make_batch_fn():
+    """Compile a vmap-batched kernel that sums contributions over a batch of triples.
+
+    Per-triple sequential ``lax.scan`` produced an XLA program dominated by
+    instruction-issue overhead on tiny operands (each einsum is ``nocc^3``
+    elements). Batching B triples lifts every op to ``(B, nocc, nocc, nocc)``
+    so cuBLAS-class kernels can saturate the GPU. See the design note in the
+    module docstring for the bottleneck analysis.
 
     Wrapped in a builder so each device gets its own JIT compilation cache
     keyed by tensor shapes (one compile per problem size, reused across runs
     when the persistent XLA cache is active).
     """
+    _batched = jax.vmap(
+        _single_triple_contribution,
+        in_axes=(0, 0, 0,
+                 None, None, None, None, None, None, None, None),
+    )
 
     @jax.jit
-    def _scan(abc_array, mo_e_o, mo_e_v,
-              t1T, t2T, vvov, vooo, vvoo, fvo):
-        def body(et_acc, abc):
-            contrib = _single_triple_contribution(
-                abc[0], abc[1], abc[2],
-                mo_e_o, mo_e_v, t1T, t2T, vvov, vooo, vvoo, fvo,
-            )
-            return et_acc + contrib, None
+    def _batch_sum(a_vec, b_vec, c_vec, mask_vec, mo_e_o, mo_e_v,
+                   t1T, t2T, vvov, vooo, vvoo, fvo):
+        contribs = _batched(
+            a_vec, b_vec, c_vec,
+            mo_e_o, mo_e_v, t1T, t2T, vvov, vooo, vvoo, fvo,
+        )
+        return jnp.sum(contribs * mask_vec)
 
-        et0 = jnp.zeros((), dtype=t2T.dtype)
-        et_final, _ = jax.lax.scan(body, et0, abc_array)
-        return et_final
-
-    return _scan
+    return _batch_sum
 
 
-_scan_triples = _make_scan_fn()
+_batch_triples = _make_batch_fn()
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +557,41 @@ def _make_streaming_kernel():
 
 
 _streaming_kernel = _make_streaming_kernel()
+
+
+def _make_streaming_batch_kernel():
+    """Vmap-batched streaming kernel.
+
+    Inputs per batch:
+        slab_a_stack, slab_b_stack, slab_c_stack  — shape (B, nvir, nocc, nvir)
+        a_vec, b_vec, c_vec                       — shape (B,)
+        mask_vec                                   — shape (B,)
+    Output: scalar = sum over batch (with mask applied).
+    """
+    _batched = jax.vmap(
+        _single_triple_streaming,
+        in_axes=(0, 0, 0,            # slab_a, slab_b, slab_c
+                 0, 0, 0,            # a, b, c
+                 None, None,         # mo_e_o, mo_e_v
+                 None, None,         # t1T, t2T
+                 None, None, None),  # vooo, vvoo, fvo
+    )
+
+    @jax.jit
+    def _batch_sum(slab_a_stack, slab_b_stack, slab_c_stack,
+                   a_vec, b_vec, c_vec, mask_vec,
+                   mo_e_o, mo_e_v, t1T, t2T, vooo, vvoo, fvo):
+        contribs = _batched(
+            slab_a_stack, slab_b_stack, slab_c_stack,
+            a_vec, b_vec, c_vec,
+            mo_e_o, mo_e_v, t1T, t2T, vooo, vvoo, fvo,
+        )
+        return jnp.sum(contribs * mask_vec)
+
+    return _batch_sum
+
+
+_streaming_batch_kernel = _make_streaming_batch_kernel()
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +832,8 @@ def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
               len(triples), n_devices)
     triples_by_dev = partition_round_robin(triples, devices)
 
+    batch_size = int(getattr(mycc, "ccsd_t_batch_size", 1024))
+
     # --- 4. Per-device worker ---
     def worker(device):
         my_triples = triples_by_dev[device]
@@ -799,17 +842,42 @@ def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
         abc_np = np.asarray(my_triples, dtype=np.int32)
         ctx = (jax.default_device(device) if device is not None
                else contextlib.nullcontext())
+        # Process in fixed-size batches so the JIT program compiles once
+        # per shape and is reused. Last batch is padded with the first
+        # triple's indices; ``mask_vec`` zeros out the padded contributions
+        # at the in-kernel reduction.
         with ctx:
-            abc_jax = jax.device_put(abc_np, device) if device is not None else jnp.asarray(abc_np)
-            et_scalar = _scan_triples(
-                abc_jax,
-                mo_e_o_by_dev[device], mo_e_v_by_dev[device],
-                t1T_by_dev[device], t2T_by_dev[device],
-                vvov_by_dev[device], vooo_by_dev[device],
-                vvoo_by_dev[device], fvo_by_dev[device],
-            )
-            # Force completion on this device before returning to the host.
-            return float(np.asarray(et_scalar))
+            et_acc = 0.0
+            n = len(my_triples)
+            triples_arr = np.asarray(my_triples, dtype=np.int32)
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                actual = end - start
+                if actual < batch_size:
+                    pad = np.tile(triples_arr[0], (batch_size - actual, 1))
+                    chunk = np.concatenate([triples_arr[start:end], pad], axis=0)
+                    mask = np.concatenate([
+                        np.ones(actual, dtype=np.float64),
+                        np.zeros(batch_size - actual, dtype=np.float64),
+                    ])
+                else:
+                    chunk = triples_arr[start:end]
+                    mask = np.ones(batch_size, dtype=np.float64)
+                if device is not None:
+                    abc_jax = jax.device_put(chunk, device)
+                    mask_jax = jax.device_put(mask, device)
+                else:
+                    abc_jax = jnp.asarray(chunk)
+                    mask_jax = jnp.asarray(mask)
+                contrib = float(np.asarray(_batch_triples(
+                    abc_jax[:, 0], abc_jax[:, 1], abc_jax[:, 2], mask_jax,
+                    mo_e_o_by_dev[device], mo_e_v_by_dev[device],
+                    t1T_by_dev[device], t2T_by_dev[device],
+                    vvov_by_dev[device], vooo_by_dev[device],
+                    vvoo_by_dev[device], fvo_by_dev[device],
+                )))
+                et_acc += contrib
+            return et_acc
 
     # --- 5. Concurrent dispatch — one OS thread per device ---
     if n_devices > 1:
@@ -936,6 +1004,7 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
     max_cached = _resolve_max_cached_slabs(mycc, nocc, nvir, n_devices, log)
     prefetch_workers = max(2, int(getattr(mycc, "ccsd_t_prefetch_workers", 2)))
     prefetch_lookahead = max(1, int(getattr(mycc, "ccsd_t_prefetch_lookahead", 4)))
+    batch_size = int(getattr(mycc, "ccsd_t_batch_size", 32))
 
     # --- Per-device worker ---
     def worker(device_index, device):
@@ -954,40 +1023,66 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
             slab_cache = _SlabPrefetcher(
                 vvov_host, device, max_cached, executor,
             )
-            # Prime: fetch lookahead worth of slabs from the head of the list.
-            seen = set()
-            for k in range(min(prefetch_lookahead, len(my_triples))):
-                for s in my_triples[k]:
-                    if s not in seen:
-                        slab_cache.prefetch(int(s))
-                        seen.add(s)
 
             ctx = (jax.default_device(device) if device is not None
                    else contextlib.nullcontext())
+            n = len(my_triples)
             et_local = 0.0
+
+            # Prefetch lookahead for the very first batch.
+            for s in (sl for t in my_triples[:prefetch_lookahead * batch_size]
+                      for sl in t):
+                slab_cache.prefetch(int(s))
+
             with ctx:
-                for i, (a, b, c) in enumerate(my_triples):
-                    # Look ahead and prefetch upcoming slabs while compute runs.
-                    look = i + prefetch_lookahead
-                    if look < len(my_triples):
-                        for s in my_triples[look]:
-                            slab_cache.prefetch(int(s))
+                for start in range(0, n, batch_size):
+                    end = min(start + batch_size, n)
+                    actual = end - start
+                    # Prefetch slabs needed batch_size * lookahead triples ahead.
+                    pf_start = end
+                    pf_end = min(pf_start + batch_size * prefetch_lookahead, n)
+                    for s in (sl for t in my_triples[pf_start:pf_end]
+                              for sl in t):
+                        slab_cache.prefetch(int(s))
 
-                    slab_a = slab_cache.get(int(a))
-                    slab_b = slab_cache.get(int(b)) if b != a else slab_a
-                    slab_c = (slab_cache.get(int(c))
-                              if c != a and c != b
-                              else (slab_a if c == a else slab_b))
+                    # Build the batch slab stacks. Each triple contributes its
+                    # own slab_a/slab_b/slab_c — cache hits avoid host fetch.
+                    batch_triples = my_triples[start:end]
+                    if actual < batch_size:
+                        batch_triples = batch_triples + [my_triples[0]] * (batch_size - actual)
 
-                    contrib = _streaming_kernel(
-                        slab_a, slab_b, slab_c,
-                        jnp.int32(a), jnp.int32(b), jnp.int32(c),
+                    slab_a_list = [slab_cache.get(int(t[0])) for t in batch_triples]
+                    slab_b_list = [slab_cache.get(int(t[1])) for t in batch_triples]
+                    slab_c_list = [slab_cache.get(int(t[2])) for t in batch_triples]
+                    slab_a_stack = jnp.stack(slab_a_list, axis=0)
+                    slab_b_stack = jnp.stack(slab_b_list, axis=0)
+                    slab_c_stack = jnp.stack(slab_c_list, axis=0)
+
+                    abc_chunk = np.asarray(batch_triples, dtype=np.int32)
+                    if actual < batch_size:
+                        mask = np.concatenate([
+                            np.ones(actual, dtype=np.float64),
+                            np.zeros(batch_size - actual, dtype=np.float64),
+                        ])
+                    else:
+                        mask = np.ones(batch_size, dtype=np.float64)
+
+                    if device is not None:
+                        abc_jax = jax.device_put(abc_chunk, device)
+                        mask_jax = jax.device_put(mask, device)
+                    else:
+                        abc_jax = jnp.asarray(abc_chunk)
+                        mask_jax = jnp.asarray(mask)
+
+                    contrib = float(np.asarray(_streaming_batch_kernel(
+                        slab_a_stack, slab_b_stack, slab_c_stack,
+                        abc_jax[:, 0], abc_jax[:, 1], abc_jax[:, 2], mask_jax,
                         mo_e_o_by_dev[device], mo_e_v_by_dev[device],
                         t1T_by_dev[device], t2T_by_dev[device],
                         vooo_by_dev[device], vvoo_by_dev[device],
                         fvo_by_dev[device],
-                    )
-                    et_local += float(np.asarray(contrib))
+                    )))
+                    et_local += contrib
             return et_local, slab_cache.stats()
         finally:
             executor.shutdown(wait=True)
