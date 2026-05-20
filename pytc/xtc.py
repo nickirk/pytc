@@ -1099,13 +1099,20 @@ class ISDFXTC(XTC, ISDFTC):
                         kernels['X'] = f['X'][:]
                         f.close()
                     else:
-                        # Stream X from file. 
-                        # Return the dataset object directly. 
+                        # Stream X from file.
+                        # Return the dataset object directly.
                         # Do NOT close 'f' here; the dataset object keeps the file open.
                         logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
                         kernels['X'] = f['X']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
+                # D/X not cached — close the read handle before we fall through
+                # to ``compute_delta_u_kernels``, which reopens the same file in
+                # 'a' mode. Without this close, ``super().isdf`` having written
+                # K1/K3 earlier leaves out_path present, the read handle from
+                # this block stays alive, and the 'a' open raises OSError
+                # "file is already open for read-only".
+                f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
 
