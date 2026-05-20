@@ -710,19 +710,69 @@ class _SlabPrefetcher:
                     max_cached=self.max_cached)
 
 
+class _Hdf5VvovSlabView:
+    """``vvov[idx] -> (nvir, nocc, nvir)`` over an HDF5-backed ``ovvv``.
+
+    The xtc_ccsd integral build stores ``eris.ovvv`` with shape
+    ``(nocc, nvir, nvir, nvir)`` as an HDF5 dataset. The (T) kernel wants the
+    transposed layout ``vvov[a, b, i, f] = ovvv[i, a, f, b]`` indexed by ``a``
+    — one slab at a time.
+
+    Materialising the full ``vvov`` in host RAM costs ``nocc·nvir³·8`` bytes;
+    at production scale (nocc=50, nvir=1000) that's 400 GB — bigger than
+    any reasonable node. This view does the indexing without ever holding
+    the full tensor:
+
+      * read the slab ``ovvv[:, idx, :, :]`` from disk (shape (nocc, nvir, nvir))
+      * transpose to ``(nvir, nocc, nvir)`` matching the JIT's expectation.
+
+    The slab is ``nvir² · nocc · 8`` bytes — at (50, 1000) that's 400 MB,
+    fine on any GPU. The slab cache in ``_SlabPrefetcher`` keeps a bounded
+    number of these resident.
+    """
+
+    def __init__(self, ovvv_dset, nocc, nvir):
+        self._dset = ovvv_dset
+        self.nocc = int(nocc)
+        self.nvir = int(nvir)
+
+    def __getitem__(self, idx):
+        # vvov[a, c, i, b] = ovvv[i, a, b, c] — the full-vvov transpose is
+        # (1, 3, 0, 2). After fixing a = idx, the slab axes (i, b, c) become
+        # (c, i, b), i.e. transpose (2, 0, 1).
+        slab = np.asarray(self._dset[:, int(idx), :, :])  # (nocc, nvir, nvir)
+        return np.ascontiguousarray(slab.transpose(2, 0, 1))
+
+
 def _make_host_slab_view(eris, nocc, nvir):
     """Return an object supporting ``[idx] -> (nvir, nocc, nvir)`` slab access.
 
-    Always materialises ``ovvv`` on the host (NumPy) and transposes to vvov
-    layout once; the result is a contiguous host array, indexable as
-    ``vvov[idx]``. For very large jobs this still requires
-    ``nocc * nvir**3 * 8`` host bytes — that's the *host* RAM cost, which is
-    typically large but available (~51 GB for nvir=600, nocc=30). The
-    point of streaming is to bound *device* HBM, not host RAM.
+    Auto-selects the cheapest representation given how ``eris.ovvv`` is stored:
 
-    If/when even host RAM is too small, this is the right hook to swap in an
-    HDF5-dataset-backed slab view (the JIT kernel needs no further changes).
+    * **HDF5 dataset** → ``_Hdf5VvovSlabView`` reads one slab at a time on
+      demand. Host RAM cost: ~one slab (nvir²·nocc·8 B). The right choice
+      for nvir ≳ 600 or any production-scale system.
+    * **In-memory ndarray** (small benchmarks, plain RCCSD path) → materialise
+      the full vvov once and return a contiguous NumPy array. Host RAM cost:
+      nocc·nvir³·8 B. Cheap-and-fast for nvir ≲ 600.
+
+    The downstream prefetcher and JIT kernel see an identical
+    ``slab_source[idx] -> (nvir, nocc, nvir)`` interface either way.
     """
+    ovvv_attr = getattr(eris, "ovvv", None)
+    # HDF5 detection: h5py datasets are not numpy arrays but support
+    # __getitem__ with the right shape. Identify by ndim+shape, not isinstance,
+    # so we don't have to import h5py here.
+    is_hdf5 = (
+        ovvv_attr is not None
+        and not isinstance(ovvv_attr, np.ndarray)
+        and getattr(ovvv_attr, "ndim", None) == 4
+        and tuple(ovvv_attr.shape) == (nocc, nvir, nvir, nvir)
+    )
+    if is_hdf5:
+        return _Hdf5VvovSlabView(ovvv_attr, nocc, nvir)
+
+    # Fall back to materialising in host RAM (existing behaviour).
     if hasattr(eris, "get_ovvv"):
         ovvv = np.asarray(eris.get_ovvv())
     else:
