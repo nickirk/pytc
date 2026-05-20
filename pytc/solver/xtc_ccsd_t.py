@@ -65,7 +65,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import lib
-from pyscf.lib import logger as pyscf_logger
 
 from pytc.utils.gpu_pipeline import (
     _solver_local_devices,
@@ -76,7 +75,7 @@ from pytc.utils.gpu_pipeline import (
 logger = logging.getLogger(__name__)
 
 
-def kernel(mycc, eris=None, t1=None, t2=None, verbose=None):
+def kernel(mycc, eris=None, t1=None, t2=None):
     """xTC-CCSD(T) energy correction.
 
     Parameters
@@ -87,14 +86,14 @@ def kernel(mycc, eris=None, t1=None, t2=None, verbose=None):
         ERIs as built by ``mycc.ao2mo()``. Defaults to a fresh build.
     t1, t2 : array_like, optional
         Override amplitudes. Default uses ``mycc.t1`` / ``mycc.t2``.
-    verbose : int or pyscf logger, optional
-        Verbosity for PySCF-style timing.
 
     Returns
     -------
     float
         E((T)) correlation correction. To get the total energy, add this
-        to ``mycc.e_tot``.
+        to ``mycc.e_tot``. Progress / timing messages are emitted on the
+        ``pytc.solver.xtc_ccsd_t`` logger; configure verbosity via the
+        standard ``logging`` module.
     """
     if eris is None:
         eris = mycc.ao2mo()
@@ -111,62 +110,52 @@ def kernel(mycc, eris=None, t1=None, t2=None, verbose=None):
         mode = "multigpu" if getattr(mycc, "ccsd_t_use_multigpu", False) else "reference"
 
     if mode == "reference":
-        return _kernel_reference(mycc, eris, t1, t2, verbose=verbose)
+        return _kernel_reference(mycc, eris, t1, t2)
     if mode == "multigpu":
-        return _kernel_multigpu(mycc, eris, t1, t2, verbose=verbose)
+        return _kernel_multigpu(mycc, eris, t1, t2)
     if mode == "streaming":
-        return _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=verbose)
+        return _kernel_multigpu_streaming(mycc, eris, t1, t2)
     if mode == "auto":
-        return _kernel_auto(mycc, eris, t1, t2, verbose=verbose)
+        return _kernel_auto(mycc, eris, t1, t2)
     raise ValueError(f"Unknown ccsd_t_mode: {mode!r}. "
                      "Choose one of: 'reference', 'multigpu', 'streaming', 'auto'.")
 
 
-def _kernel_auto(mycc, eris, t1, t2, verbose=None):
+def _kernel_auto(mycc, eris, t1, t2):
     """Pick replicated vs streaming based on per-device HBM headroom.
 
     Replicated path is faster (no PCIe traffic per triple) when ``vvov`` fits
     comfortably on each device; otherwise stream.
     """
-    if isinstance(verbose, pyscf_logger.Logger):
-        log = verbose
-    else:
-        log = pyscf_logger.Logger(mycc.stdout,
-                                  verbose if verbose is not None else mycc.verbose)
-
     nocc, nvir = t1.shape
     devices = _solver_local_devices()
     n_devices = len(devices)
 
     only_cpu = all(d is None or getattr(d, "platform", "") == "cpu" for d in devices)
     if only_cpu and not getattr(mycc, "ccsd_t_force_multigpu", False):
-        return _kernel_reference(mycc, eris, t1, t2, verbose=verbose)
+        return _kernel_reference(mycc, eris, t1, t2)
 
-    per_dev_gb = _check_hbm_budget(nocc, nvir, n_devices, log)
+    per_dev_gb = _check_hbm_budget(nocc, nvir, n_devices)
     gpu_max_mb = getattr(mycc, "gpu_max_memory", None)
     if gpu_max_mb is not None and per_dev_gb * 1000 > 0.7 * float(gpu_max_mb):
-        log.info("xTC-(T) auto: replicated path needs %.1f GB/device but "
-                 "gpu_max_memory=%.1f GB — using streaming.",
-                 per_dev_gb, float(gpu_max_mb) / 1000)
-        return _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=verbose)
-    return _kernel_multigpu(mycc, eris, t1, t2, verbose=verbose)
+        logger.info("xTC-(T) auto: replicated path needs %.1f GB/device but "
+                    "gpu_max_memory=%.1f GB — using streaming.",
+                    per_dev_gb, float(gpu_max_mb) / 1000)
+        return _kernel_multigpu_streaming(mycc, eris, t1, t2)
+    return _kernel_multigpu(mycc, eris, t1, t2)
 
 
 # ---------------------------------------------------------------------------
 # Single-device reference (correctness-only, slow)
 # ---------------------------------------------------------------------------
 
-def _kernel_reference(mycc, eris, t1, t2, verbose=None):
+def _kernel_reference(mycc, eris, t1, t2):
     """NumPy reference implementation.
 
     Adapted from ``pyscf/cc/ccsd_t_slow.py`` with ``.conj()`` removed for the
     real non-Hermitian xTC case. Used as a correctness oracle; not intended
     for production scale.
     """
-    if isinstance(verbose, pyscf_logger.Logger):
-        log = verbose
-    else:
-        log = pyscf_logger.Logger(mycc.stdout, verbose if verbose is not None else mycc.verbose)
     t_start = time.perf_counter()
 
     nocc, nvir = t1.shape
@@ -274,8 +263,8 @@ def _kernel_reference(mycc, eris, t1, t2, verbose=None):
                 et += np.einsum("kji,ijk", wabc, zcba)
 
     et *= 2
-    log.info("xTC-CCSD(T) correction = %.15g  (%.1f s)",
-             et, time.perf_counter() - t_start)
+    logger.info("xTC-CCSD(T) correction = %.15g  (%.1f s)",
+                et, time.perf_counter() - t_start)
     return float(et)
 
 
@@ -727,7 +716,7 @@ def _balanced_a_partition(nvir, n_partitions):
 # Multi-GPU driver
 # ---------------------------------------------------------------------------
 
-def _check_hbm_budget(nocc, nvir, n_devices, log):
+def _check_hbm_budget(nocc, nvir, n_devices):
     """Return required-bytes-per-device for the replicated path, and warn / abort.
 
     Strategy A (this module) replicates ``vvov`` on every device. When that
@@ -745,9 +734,9 @@ def _check_hbm_budget(nocc, nvir, n_devices, log):
         + 4 * float(nocc) * float(nvir) * 8
     )
     total_per_dev_gb = (vvov_bytes + other_bytes) / 1e9
-    log.info("xTC-(T) multi-GPU memory budget: %.2f GB per device "
-             "(vvov %.2f GB + small tensors %.2f GB) across %d device(s)",
-             total_per_dev_gb, vvov_bytes / 1e9, other_bytes / 1e9, n_devices)
+    logger.info("xTC-(T) multi-GPU memory budget: %.2f GB per device "
+                "(vvov %.2f GB + small tensors %.2f GB) across %d device(s)",
+                total_per_dev_gb, vvov_bytes / 1e9, other_bytes / 1e9, n_devices)
     return total_per_dev_gb
 
 
@@ -769,24 +758,19 @@ def _build_layout_transforms(eris, nocc, nvir):
     return vvov, vooo, vvoo
 
 
-def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
+def _kernel_multigpu(mycc, eris, t1, t2):
     """Multi-device JAX-jitted (T) on top of converged xTC amplitudes.
 
     Tensors that are small enough to replicate (``t1T``, ``t2T``, ``vooo``,
     ``vvoo``, ``fvo``, ``mo_energy``, ``vvov``) are broadcast to every local
     device. Triangular (a, b, c) triples are partitioned round-robin and one
-    worker thread per device runs an on-device ``lax.scan`` that accumulates
-    its partition's contribution to ``et``. Partials are summed on the host.
+    worker thread per device runs the vmap-batched kernel over its share
+    of the triples. Partials are summed on the host.
 
     Falls back to the reference path on a single CPU device unless
     ``mycc.ccsd_t_force_multigpu = True`` — the JAX path on CPU is slower
     than NumPy for small problems because of XLA dispatch overhead.
     """
-    if isinstance(verbose, pyscf_logger.Logger):
-        log = verbose
-    else:
-        log = pyscf_logger.Logger(mycc.stdout,
-                                  verbose if verbose is not None else mycc.verbose)
     t_start = time.perf_counter()
 
     nocc, nvir = t1.shape
@@ -795,11 +779,11 @@ def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
 
     only_cpu = all(d is None or getattr(d, "platform", "") == "cpu" for d in devices)
     if only_cpu and not getattr(mycc, "ccsd_t_force_multigpu", False):
-        log.info("xTC-(T) multi-GPU: no accelerators present and "
-                 "ccsd_t_force_multigpu is unset — falling back to NumPy reference.")
-        return _kernel_reference(mycc, eris, t1, t2, verbose=verbose)
+        logger.info("xTC-(T) multi-GPU: no accelerators present and "
+                    "ccsd_t_force_multigpu is unset — falling back to NumPy reference.")
+        return _kernel_reference(mycc, eris, t1, t2)
 
-    _check_hbm_budget(nocc, nvir, n_devices, log)
+    _check_hbm_budget(nocc, nvir, n_devices)
 
     # --- 1. Host-side layout transforms (once) ---
     vvov_host, vooo_host, vvoo_host = _build_layout_transforms(eris, nocc, nvir)
@@ -828,8 +812,8 @@ def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
                for a in range(nvir)
                for b in range(a + 1)
                for c in range(b + 1)]
-    log.debug("xTC-(T) sweeping %d triangular triples across %d device(s)",
-              len(triples), n_devices)
+    logger.debug("xTC-(T) sweeping %d triangular triples across %d device(s)",
+                 len(triples), n_devices)
     triples_by_dev = partition_round_robin(triples, devices)
 
     batch_size = int(getattr(mycc, "ccsd_t_batch_size", 1024))
@@ -888,8 +872,8 @@ def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
         partials = [worker(devices[0])]
 
     et = 2.0 * sum(partials)
-    log.info("xTC-CCSD(T) (multi-GPU) correction = %.15g  (%d devices, %.1f s)",
-             et, n_devices, time.perf_counter() - t_start)
+    logger.info("xTC-CCSD(T) (multi-GPU) correction = %.15g  (%d devices, %.1f s)",
+                et, n_devices, time.perf_counter() - t_start)
     return float(et)
 
 
@@ -897,7 +881,7 @@ def _kernel_multigpu(mycc, eris, t1, t2, verbose=None):
 # Streaming multi-GPU path: vvov host-resident, per-device LRU slab cache
 # ---------------------------------------------------------------------------
 
-def _resolve_max_cached_slabs(mycc, nocc, nvir, n_partitions, log):
+def _resolve_max_cached_slabs(mycc, nocc, nvir, n_partitions):
     """Bound the LRU slab cache so the device fits cache + replicated tensors.
 
     Each slab is ``nvir * nocc * nvir * 8 B``. The accessory tensors
@@ -907,7 +891,7 @@ def _resolve_max_cached_slabs(mycc, nocc, nvir, n_partitions, log):
     """
     override = getattr(mycc, "ccsd_t_max_cached_slabs", None)
     if override is not None:
-        log.info("xTC-(T) streaming: cache cap from ccsd_t_max_cached_slabs = %d", override)
+        logger.info("xTC-(T) streaming: cache cap from ccsd_t_max_cached_slabs = %d", override)
         return int(override)
 
     slab_bytes = float(nvir) * float(nocc) * float(nvir) * 8
@@ -921,17 +905,17 @@ def _resolve_max_cached_slabs(mycc, nocc, nvir, n_partitions, log):
         # No budget hint — pick a sensible default that gives prefetch room
         # for several triples ahead without ballooning unbounded.
         default = min(nvir, 32)
-        log.info("xTC-(T) streaming: cache cap defaulted to %d slabs "
-                 "(no gpu_max_memory set)", default)
+        logger.info("xTC-(T) streaming: cache cap defaulted to %d slabs "
+                    "(no gpu_max_memory set)", default)
         return default
     # 60% of HBM for slabs, leaving headroom for compile artifacts +
     # transient JIT workspaces. The compute itself only needs a few
     # intermediates of size (nocc^3) — negligible compared to slab cache.
     budget_bytes = 0.6 * float(gpu_max_mb) * 1e6 - accessory_bytes
     max_slabs = max(3, int(budget_bytes / slab_bytes))
-    log.info("xTC-(T) streaming: cache cap = %d slabs "
-             "(slab=%.1f MB, budget=%.1f GB/device)",
-             max_slabs, slab_bytes / 1e6, float(gpu_max_mb) / 1000)
+    logger.info("xTC-(T) streaming: cache cap = %d slabs "
+                "(slab=%.1f MB, budget=%.1f GB/device)",
+                max_slabs, slab_bytes / 1e6, float(gpu_max_mb) / 1000)
     return max_slabs
 
 
@@ -947,7 +931,7 @@ def _per_device_triples_contiguous_a(nvir, n_devices, device_index):
             for c in range(b + 1)]
 
 
-def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
+def _kernel_multigpu_streaming(mycc, eris, t1, t2):
     """Streaming multi-GPU (T): vvov on host, slabs pulled on demand.
 
     Memory profile per device: at most ``ccsd_t_max_cached_slabs`` slabs of
@@ -961,11 +945,6 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
     The JIT kernel takes three slabs and the integer ``(a, b, c)`` so XLA
     compiles a single program reused across every triple.
     """
-    if isinstance(verbose, pyscf_logger.Logger):
-        log = verbose
-    else:
-        log = pyscf_logger.Logger(mycc.stdout,
-                                  verbose if verbose is not None else mycc.verbose)
     t_start = time.perf_counter()
 
     nocc, nvir = t1.shape
@@ -974,13 +953,13 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
 
     only_cpu = all(d is None or getattr(d, "platform", "") == "cpu" for d in devices)
     if only_cpu and not getattr(mycc, "ccsd_t_force_multigpu", False):
-        log.info("xTC-(T) streaming: CPU-only environment without "
-                 "ccsd_t_force_multigpu — falling back to NumPy reference.")
-        return _kernel_reference(mycc, eris, t1, t2, verbose=verbose)
+        logger.info("xTC-(T) streaming: CPU-only environment without "
+                    "ccsd_t_force_multigpu — falling back to NumPy reference.")
+        return _kernel_reference(mycc, eris, t1, t2)
 
     # --- Host-resident vvov + accessories ---
-    log.info("xTC-(T) streaming: building host vvov view (%.1f GB)",
-             nocc * nvir ** 3 * 8 / 1e9)
+    logger.info("xTC-(T) streaming: building host vvov view (%.1f GB)",
+                nocc * nvir ** 3 * 8 / 1e9)
     vvov_host = _make_host_slab_view(eris, nocc, nvir)
     vooo_host = np.ascontiguousarray(np.asarray(eris.ovoo).transpose(1, 0, 2, 3))
     vvoo_host = np.ascontiguousarray(np.asarray(eris.ovov).transpose(1, 3, 0, 2))
@@ -1001,7 +980,7 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
     mo_e_o_by_dev = broadcast_to_devices(mo_e_o_host, devices)
     mo_e_v_by_dev = broadcast_to_devices(mo_e_v_host, devices)
 
-    max_cached = _resolve_max_cached_slabs(mycc, nocc, nvir, n_devices, log)
+    max_cached = _resolve_max_cached_slabs(mycc, nocc, nvir, n_devices)
     prefetch_workers = max(2, int(getattr(mycc, "ccsd_t_prefetch_workers", 2)))
     prefetch_lookahead = max(1, int(getattr(mycc, "ccsd_t_prefetch_lookahead", 4)))
     batch_size = int(getattr(mycc, "ccsd_t_batch_size", 32))
@@ -1098,9 +1077,9 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2, verbose=None):
     partials = [r[0] for r in results]
     for idx, (_, stats) in enumerate(results):
         if stats is not None:
-            log.debug("xTC-(T) streaming dev %d slab stats: %s", idx, stats)
+            logger.debug("xTC-(T) streaming dev %d slab stats: %s", idx, stats)
 
     et = 2.0 * sum(partials)
-    log.info("xTC-CCSD(T) (streaming) correction = %.15g  (%d devices, %.1f s)",
-             et, n_devices, time.perf_counter() - t_start)
+    logger.info("xTC-CCSD(T) (streaming) correction = %.15g  (%d devices, %.1f s)",
+                et, n_devices, time.perf_counter() - t_start)
     return float(et)
