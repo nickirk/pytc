@@ -79,8 +79,16 @@ class RCCSD(rccsd.RCCSD):
         return super().ccsd(t1, t2, eris, mbpt2)
 
     def ccsd_t(self, t1=None, t2=None, eris=None):
-        """xTC-CCSD(T) perturbative triples (1+2-body xTC integrals only)."""
+        """xTC-CCSD(T) perturbative triples (1+2-body xTC integrals only).
+
+        Reuses ``self.eris`` (cached during the preceding ``ccsd()`` call)
+        when ``eris`` is not explicitly passed. Rebuilding the full xTC
+        ERIS at production basis can take 20-40 min for benzene/cc-pVTZ,
+        so the cache hit matters.
+        """
         from pytc.solver.xtc_ccsd_t import kernel as _ccsd_t_kernel
+        if eris is None:
+            eris = getattr(self, "eris", None)
         return _ccsd_t_kernel(self, eris=eris, t1=t1, t2=t2)
 
     def energy_tot(self, t1=None, t2=None, eris=None):
