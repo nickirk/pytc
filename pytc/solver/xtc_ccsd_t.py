@@ -595,13 +595,15 @@ _streaming_kernel = _make_streaming_kernel()
 
 
 def _make_streaming_batch_kernel():
-    """Vmap-batched streaming kernel.
+    """Vmap-batched streaming kernel — all three slabs vary across the batch.
 
     Inputs per batch:
         slab_a_stack, slab_b_stack, slab_c_stack  — shape (B, nvir, nocc, nvir)
         a_vec, b_vec, c_vec                       — shape (B,)
         mask_vec                                   — shape (B,)
     Output: scalar = sum over batch (with mask applied).
+
+    The general-purpose path used when batch entries do not share (a, b).
     """
     _batched = jax.vmap(
         _single_triple_streaming,
@@ -627,6 +629,49 @@ def _make_streaming_batch_kernel():
 
 
 _streaming_batch_kernel = _make_streaming_batch_kernel()
+
+
+def _make_streaming_batch_kernel_fixed_ab():
+    """Vmap-batched streaming kernel with **fixed ``(a, b)``** across the batch.
+
+    Only ``c`` and ``slab_c`` vary; ``slab_a``, ``slab_b``, ``a``, ``b`` are
+    scalars / single-slab tensors broadcast via ``in_axes=None``.
+
+    Inputs per batch:
+        slab_a, slab_b   — shape (nvir, nocc, nvir)  — broadcast
+        slab_c_stack     — shape (B, nvir, nocc, nvir)
+        a, b             — scalar int
+        c_vec, mask_vec  — shape (B,)
+    Output: scalar = sum over batch (with mask).
+
+    Saves ``2·B·nvir²·nocc·8 B`` of HBM per batch versus the general kernel
+    (~25 GB at nvir=1000, B=32). This is the fast path the worker calls
+    when the iteration order keeps (a, b) constant within a batch.
+    """
+    _batched = jax.vmap(
+        _single_triple_streaming,
+        in_axes=(None, None, 0,          # slab_a, slab_b broadcast; slab_c vmapped
+                 None, None, 0,          # a, b broadcast; c vmapped
+                 None, None,             # mo_e_o, mo_e_v
+                 None, None,             # t1T, t2T
+                 None, None, None),      # vooo, vvoo, fvo
+    )
+
+    @jax.jit
+    def _batch_sum(slab_a, slab_b, slab_c_stack,
+                   a, b, c_vec, mask_vec,
+                   mo_e_o, mo_e_v, t1T, t2T, vooo, vvoo, fvo):
+        contribs = _batched(
+            slab_a, slab_b, slab_c_stack,
+            a, b, c_vec,
+            mo_e_o, mo_e_v, t1T, t2T, vooo, vvoo, fvo,
+        )
+        return jnp.sum(contribs * mask_vec)
+
+    return _batch_sum
+
+
+_streaming_batch_kernel_fixed_ab = _make_streaming_batch_kernel_fixed_ab()
 
 
 # ---------------------------------------------------------------------------
@@ -1101,63 +1146,87 @@ def _kernel_multigpu_streaming(mycc, eris, t1, t2):
 
             ctx = (jax.default_device(device) if device is not None
                    else contextlib.nullcontext())
-            n = len(my_triples)
             et_local = 0.0
 
-            # Prefetch lookahead for the very first batch.
-            for s in (sl for t in my_triples[:prefetch_lookahead * batch_size]
-                      for sl in t):
-                slab_cache.prefetch(int(s))
+            # Group the device's triples by (a, b). Inside one group only
+            # c varies, so slab_a/slab_b stay constant across the batch
+            # and we use the fixed-ab kernel (broadcasts slab_a/b instead
+            # of stacking them — saves ~2·B·slab_bytes HBM per batch).
+            from itertools import groupby
+            ab_groups = []
+            for (a_key, b_key), tris in groupby(my_triples, key=lambda t: (t[0], t[1])):
+                ab_groups.append((int(a_key), int(b_key),
+                                  [int(t[2]) for t in tris]))
+
+            # Prefetch the next prefetch_lookahead*batch_size unique slabs
+            # to keep the prefetch pipeline warm.
+            def _enqueue_lookahead(group_idx, c_start_in_group):
+                ahead_remaining = prefetch_lookahead * batch_size
+                gi = group_idx
+                ci = c_start_in_group
+                seen = set()
+                while ahead_remaining > 0 and gi < len(ab_groups):
+                    a_g, b_g, c_list = ab_groups[gi]
+                    for s in (a_g, b_g):
+                        if s not in seen:
+                            slab_cache.prefetch(s)
+                            seen.add(s)
+                    for c in c_list[ci:]:
+                        if ahead_remaining <= 0:
+                            break
+                        if c not in seen:
+                            slab_cache.prefetch(c)
+                            seen.add(c)
+                        ahead_remaining -= 1
+                    gi += 1
+                    ci = 0
+
+            _enqueue_lookahead(0, 0)
 
             with ctx:
-                for start in range(0, n, batch_size):
-                    end = min(start + batch_size, n)
-                    actual = end - start
-                    # Prefetch slabs needed batch_size * lookahead triples ahead.
-                    pf_start = end
-                    pf_end = min(pf_start + batch_size * prefetch_lookahead, n)
-                    for s in (sl for t in my_triples[pf_start:pf_end]
-                              for sl in t):
-                        slab_cache.prefetch(int(s))
+                for g_idx, (a_g, b_g, c_list) in enumerate(ab_groups):
+                    # slab_a / slab_b are constant across this group.
+                    slab_a = slab_cache.get(a_g)
+                    slab_b = slab_cache.get(b_g) if b_g != a_g else slab_a
 
-                    # Build the batch slab stacks. Each triple contributes its
-                    # own slab_a/slab_b/slab_c — cache hits avoid host fetch.
-                    batch_triples = my_triples[start:end]
-                    if actual < batch_size:
-                        batch_triples = batch_triples + [my_triples[0]] * (batch_size - actual)
+                    for cb_start in range(0, len(c_list), batch_size):
+                        cb_end = min(cb_start + batch_size, len(c_list))
+                        c_chunk = c_list[cb_start:cb_end]
+                        actual = len(c_chunk)
+                        if actual < batch_size:
+                            pad_c = [c_chunk[0]] * (batch_size - actual)
+                            c_chunk_pad = c_chunk + pad_c
+                            mask = np.concatenate([
+                                np.ones(actual, dtype=np.float64),
+                                np.zeros(batch_size - actual, dtype=np.float64),
+                            ])
+                        else:
+                            c_chunk_pad = c_chunk
+                            mask = np.ones(batch_size, dtype=np.float64)
 
-                    slab_a_list = [slab_cache.get(int(t[0])) for t in batch_triples]
-                    slab_b_list = [slab_cache.get(int(t[1])) for t in batch_triples]
-                    slab_c_list = [slab_cache.get(int(t[2])) for t in batch_triples]
-                    slab_a_stack = jnp.stack(slab_a_list, axis=0)
-                    slab_b_stack = jnp.stack(slab_b_list, axis=0)
-                    slab_c_stack = jnp.stack(slab_c_list, axis=0)
+                        # Prefetch upcoming batches' slabs while compute runs.
+                        _enqueue_lookahead(g_idx, cb_end)
 
-                    abc_chunk = np.asarray(batch_triples, dtype=np.int32)
-                    if actual < batch_size:
-                        mask = np.concatenate([
-                            np.ones(actual, dtype=np.float64),
-                            np.zeros(batch_size - actual, dtype=np.float64),
-                        ])
-                    else:
-                        mask = np.ones(batch_size, dtype=np.float64)
+                        slab_c_stack = jnp.stack(
+                            [slab_cache.get(c) for c in c_chunk_pad], axis=0,
+                        )
+                        c_vec = np.asarray(c_chunk_pad, dtype=np.int32)
+                        if device is not None:
+                            c_jax = jax.device_put(c_vec, device)
+                            mask_jax = jax.device_put(mask, device)
+                        else:
+                            c_jax = jnp.asarray(c_vec)
+                            mask_jax = jnp.asarray(mask)
 
-                    if device is not None:
-                        abc_jax = jax.device_put(abc_chunk, device)
-                        mask_jax = jax.device_put(mask, device)
-                    else:
-                        abc_jax = jnp.asarray(abc_chunk)
-                        mask_jax = jnp.asarray(mask)
-
-                    contrib = float(np.asarray(_streaming_batch_kernel(
-                        slab_a_stack, slab_b_stack, slab_c_stack,
-                        abc_jax[:, 0], abc_jax[:, 1], abc_jax[:, 2], mask_jax,
-                        mo_e_o_by_dev[device], mo_e_v_by_dev[device],
-                        t1T_by_dev[device], t2T_by_dev[device],
-                        vooo_by_dev[device], vvoo_by_dev[device],
-                        fvo_by_dev[device],
-                    )))
-                    et_local += contrib
+                        contrib = float(np.asarray(_streaming_batch_kernel_fixed_ab(
+                            slab_a, slab_b, slab_c_stack,
+                            jnp.int32(a_g), jnp.int32(b_g), c_jax, mask_jax,
+                            mo_e_o_by_dev[device], mo_e_v_by_dev[device],
+                            t1T_by_dev[device], t2T_by_dev[device],
+                            vooo_by_dev[device], vvoo_by_dev[device],
+                            fvo_by_dev[device],
+                        )))
+                        et_local += contrib
             return et_local, slab_cache.stats()
         finally:
             executor.shutdown(wait=True)
