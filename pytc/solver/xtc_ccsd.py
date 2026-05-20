@@ -270,33 +270,21 @@ def _make_xtc_eris(cc, mo_coeff=None):
         h1e_ecp_chi_corr = np.zeros_like(h1e_corr)
 
     # Option B' Phase 3 (honest): rank-2 pair-Jastrow correction routed
-    # to h2e as a (pq|rs) ERI block, not h1e.  Materialised in full
-    # because the kernel produces a true 2-body tensor (no density
-    # contraction), and we need to slice it into oooo/oovv/.../vvvv
-    # blocks below.  Zero by construction for AE / no-pair-Jastrow.
-    #
-    # TODO(ECP-Δu, DF/ISDF path): the streamed large/medium/vvvv block
-    # builders below currently *do not* receive the ECP-Δu slice — only
-    # the Fock build and the small all-occupied blocks (oooo/ovoo/ooov/
-    # vooo) do.  For AE+ECP production runs through the DF/ISDF path the
-    # virtual-index blocks need to be patched after construction (read-
-    # modify-write on the HDF5 datasets, plus an in-memory add for the
-    # medium blocks).  See ``pytc/xtc.py`` ``make_eris`` for the
-    # reference full-tensor wiring used by the standard path.
+    # to h2e as a (pq|rs) ERI block, not h1e.  Materialised in full and
+    # bound onto the XTC instance via ``.replace(ecp_du_full=...)``;
+    # from that point on every ``get_2b`` / ``_assemble_2b_tile`` call
+    # transparently adds the matching ``ranges`` slice on top of the
+    # standard TC + Δu tile, so the Fock build, the small all-occupied
+    # blocks, the streamed large/medium/vvvv writers, and the ao2mo
+    # vvvv writer all pick the correction up "for free" — no per-block
+    # plumbing is needed.  Zero by construction for AE / no-pair-Jastrow
+    # (``.ecp_du_full`` stays None and the fast path is unaffected).
     if hasattr(xtc_obj, "get_2b_ecp_du"):
         h2e_ecp_du_corr = np.asarray(xtc_obj.get_2b_ecp_du(cc._scf, jastrow_params))
         if bool(np.any(h2e_ecp_du_corr)):
-            logger.warning(
-                "xtc_ccsd: ECP-Δu correction is materialised in full and "
-                "added to the Fock build + (oooo/ovoo/ooov/vooo) blocks "
-                "only.  Streamed virtual-index blocks (ovvv/vovv/vvvv/"
-                "oovv/ovov/...) currently DO NOT include the ECP-Δu "
-                "correction in this DF/ISDF path.  Use the standard "
-                "XTC.make_eris path for fully consistent results until "
-                "this is plumbed through."
-            )
-    else:
-        h2e_ecp_du_corr = np.zeros((nmo, nmo, nmo, nmo))
+            xtc_obj = xtc_obj.replace(ecp_du_full=h2e_ecp_du_corr)
+            cc.xtc_obj = xtc_obj
+            eris.xtc_obj = xtc_obj
 
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
@@ -338,17 +326,14 @@ def _make_xtc_eris(cc, mo_coeff=None):
         h2e_pqii_corr = _fock_worker(_fock_ranges[0], _device)
         h2e_piiq_corr = _fock_worker(_fock_ranges[1], _device)
 
+    # ``h2e_pqii_corr`` / ``h2e_piiq_corr`` already include the ECP-Δu
+    # rank-4 slice because they came from ``xtc_obj.get_2b(ranges=...)``
+    # with ``xtc_obj.ecp_du_full`` bound (Phase 3 honest-B').  No extra
+    # ECP-Δu addition needed here.
     fock_corr = h1e_corr + 2 * np.einsum('pqii->pq', h2e_pqii_corr) - np.einsum('piiq->pq', h2e_piiq_corr)
     # Add the [V_NL, chi] 1-body correction (Option B Phase 1).  Already
     # zero for AE-only or no-NuclearCusp setups; see above.
     fock_corr = fock_corr + h1e_ecp_chi_corr
-    # Add the Δu 2-body pair-Jastrow correction (honest Option B' Phase 3)
-    # via the standard Fock build: 2 (pq|ii) - (pi|iq) on the rank-4
-    # ECP-Δu tensor.
-    fock_corr = fock_corr + (
-        2 * np.einsum('pqii->pq', h2e_ecp_du_corr[:, :, :nocc, :nocc])
-        - np.einsum('piiq->pq', h2e_ecp_du_corr[:, :nocc, :nocc, :])
-    )
     eris.fock = fock_std + fock_corr
     eris.fvo = eris.fock[nocc:, :nocc].copy()
     eris.mo_energy = np.diag(eris.fock)
@@ -449,6 +434,9 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # oovv/vvoo/ovov/ovvo/vovo each have two virtual indices; we tile over
         # one virtual dimension in chunks of panel_blk and dispatch across all
         # local GPUs via _round_robin_pipeline.
+        # The ECP-Δu Phase 3 slice flows through ``compute_2b_tile`` because
+        # ``xtc_obj.ecp_du_full`` was bound up in ``_make_xtc_eris``; the
+        # writers themselves stay oblivious.
         _medium_devices = _solver_local_devices()
         _medium_results = _compute_medium_blocks_tiled(
             xtc_obj, jastrow_params, Loo, Lov_reshaped, L_vv_full,
@@ -494,9 +482,10 @@ def _make_xtc_eris(cc, mo_coeff=None):
             ('vooo', lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc).transpose(1, 0, 2, 3)),
         ]:
             logger.debug("Computing block %s", _blk_str)
+            # ``_tc`` already bakes in the ECP-Δu Phase 3 slice when
+            # ``xtc_obj.ecp_du_full`` is set (bound up by this function).
             _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str))
-            _slices = tuple(slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in _blk_str)
-            setattr(eris, _blk_str, _std + _tc + h2e_ecp_du_corr[_slices])
+            setattr(eris, _blk_str, _std + _tc)
 
         del Loo, Lov, Lov_reshaped
 
@@ -512,9 +501,11 @@ def _make_xtc_eris(cc, mo_coeff=None):
         
         def get_block(block_str):
             logger.debug(f"Computing block {block_str} for xtc")
+            # ``tc_part`` already bakes in the ECP-Δu Phase 3 slice when
+            # ``xtc_obj.ecp_du_full`` is set (bound up by this function).
             tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
             slices = tuple(slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str)
-            return eri_std_full[slices] + tc_part + h2e_ecp_du_corr[slices]
+            return eri_std_full[slices] + tc_part
     
         eris.oooo = get_block('oooo')
         eris.ovoo = get_block('ovoo')
@@ -1328,6 +1319,10 @@ def _compute_large_blocks(eris, xtc_obj, jastrow_params, Lov_reshaped,
     panel_size=max(nocc, panel_blk) pads the variable-sized dimensions (p=occ
     for ovvv, q=occ for vovv, and r=vir_r_blk) to a fixed size for JIT shape
     stability.  The large vir_all dimensions remain fixed across all tiles.
+
+    The honest-B' Phase 3 ECP-Δu rank-4 correction is *not* added here:
+    it is baked into each tile by ``ISDFXTC._assemble_2b_tile`` whenever
+    ``xtc_obj.ecp_du_full`` has been set (see ``_make_xtc_eris``).
     """
     devices  = _solver_local_devices()
     n_tiles  = -(-nvir // panel_blk)
@@ -1421,6 +1416,10 @@ def _compute_medium_blocks_tiled(
       ovov (nocc,nvir,nocc,nvir) — tile dim-1 (vir): layout="qr" → JIT (nocc,ps,ps,nvir)
       ovvo (nocc,nvir,nvir,nocc) — tile dim-2 (vir): layout="pr" → JIT (ps,nvir,ps,nocc)
       vovo (nvir,nocc,nvir,nocc) — tile dim-2 (vir): layout="qr" → JIT (nvir,ps,ps,nocc)
+
+    The honest-B' Phase 3 ECP-Δu rank-4 correction is *not* added here:
+    it is baked into each tile by ``ISDFXTC._assemble_2b_tile`` whenever
+    ``xtc_obj.ecp_du_full`` has been set (see ``_make_xtc_eris``).
     """
     naux     = Loo.shape[0]
     Lov_flat = Lov_reshaped.reshape(naux, nocc * nvir)  # (naux, nocc*nvir) for ddot
@@ -1560,6 +1559,11 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
 
     vvvv shape: (a, b, c, d) = (nvir, nvir, nvir, nvir).
     We iterate over the first index 'a' in blocks to limit memory usage.
+
+    The honest-B' Phase 3 ECP-Δu rank-4 correction is *not* added here:
+    it is baked into each per-tile ``compute_2b_tile`` result by
+    ``ISDFXTC._assemble_2b_tile`` whenever ``xtc_obj.ecp_du_full`` has
+    been set (see ``_make_xtc_eris``).
     """
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
@@ -1685,7 +1689,9 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
                     release_gpu_slot()  # GPU pipeline is now free to issue the next tile
                     std_tile = np.tensordot(_L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
                     t2 = time.perf_counter()
-                    # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed
+                    # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed.
+                    # ``tc_tile`` already carries the ECP-Δu Phase 3 slice when
+                    # ``xtc_obj.ecp_du_full`` is set; see ``_make_xtc_eris``.
                     _slab[:, :, r0:r1, :] = std_tile + tc_tile
                     t3 = time.perf_counter()
                     with _timing_lock:
@@ -1740,6 +1746,11 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
 
     vvvv shape: (a, b, c, d) = (nvir, nvir, nvir, nvir).
     We iterate over the first index 'a' in blocks to limit memory usage.
+
+    The honest-B' Phase 3 ECP-Δu rank-4 correction is *not* added here:
+    it is baked into each ``xtc_obj.get_2b(ranges=...)`` result by
+    ``XTC.get_2b`` whenever ``xtc_obj.ecp_du_full`` has been set (see
+    ``_make_xtc_eris``).
     """
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
@@ -1802,6 +1813,8 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
 
                 # Fuse std + tc into the slab that will be handed to the writer.
                 # Use += on std_blk to avoid one extra slab-sized allocation.
+                # ``tc_blk`` already carries the ECP-Δu Phase 3 slice when
+                # ``xtc_obj.ecp_du_full`` is set (see ``_make_xtc_eris``).
                 std_blk += tc_blk
                 del tc_blk
                 slab = std_blk

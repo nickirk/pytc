@@ -261,6 +261,27 @@ def _get_device_free_bytes(device=None):
     return _get_gpu_free_bytes()
 
 
+def _pad_slice_to_panel(slice_np, panel_size, panel_layout):
+    """Pad a (Np, Nq, Nr, Ns) numpy slice to the JIT-stable panel shape.
+
+    Mirrors the layout convention of ``trim_panel``: axes 0 (p) and 2 (r)
+    are padded for ``"pr"``, axes 1 (q) and 2 (r) for ``"qr"``, and axes
+    0 (p) and 3 (s) for ``"ps"``.  Used by ``ISDFXTC._assemble_2b_tile``
+    when an ``ecp_du_full`` slice is added on top of the (padded) TC + Δu
+    tile so that all three contributions share a single padded layout.
+    """
+    layout = _normalize_panel_layout(panel_layout)
+    Np, Nq, Nr, Ns = slice_np.shape
+    if layout == "pr":
+        target = (panel_size, Nq, panel_size, Ns)
+    elif layout == "qr":
+        target = (Np, panel_size, panel_size, Ns)
+    else:  # "ps"
+        target = (panel_size, Nq, Nr, panel_size)
+    pad_widths = [(0, t - c) for t, c in zip(target, slice_np.shape)]
+    return np.pad(slice_np, pad_widths)
+
+
 def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=None,
                     panel_layout="pr"):
     """Execute one XTC 2-body tile using the internal tile API only."""
@@ -294,10 +315,25 @@ class XTC(TC):
         ecp_data: Parsed ECP table (EcpData) — populated when ``mf.mol``
             carries an ECP. ``None`` for all-electron systems.  Used by
             ``get_1b_ecp_chi`` (Option B Phase 1).
+        ecp_du_full: Optional precomputed full rank-4 ECP-Δu tensor of
+            shape (n_orb, n_orb, n_orb, n_orb) (host-side numpy).  When
+            non-None, ``get_2b`` and ``_assemble_2b_tile`` automatically
+            add the requested ``ranges`` slice on top of the standard
+            TC + Δu result, so downstream callers (the full-tensor
+            ``make_eris`` path and the streamed DF/ISDF block writers)
+            do not need any extra plumbing — they just call ``get_2b``
+            or ``compute_2b_tile`` as usual and the ECP-Δu correction
+            comes along for free.  Computed once by ``make_eris`` (and
+            by ``solver/xtc_ccsd._make_xtc_eris``) and bound via
+            ``.replace(ecp_du_full=...)`` so all subsequent
+            ``ranges``-based tile requests on this object inherit it.
     """
     mo_occ: jnp.ndarray = struct.field(default=None)
     energy_nuc: float = struct.field(pytree_node=False, default=0.0)
     ecp_data: Any = struct.field(pytree_node=True, default=None)
+    # Host-side numpy array; never traced by JAX (pytree_node=False so
+    # ``.replace()`` keeps it intact across kernel re-runs).
+    ecp_du_full: Any = struct.field(pytree_node=False, default=None)
 
     @classmethod
     def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
@@ -774,7 +810,7 @@ class XTC(TC):
             return jnp.reshape(val, ())
         return pair_fn
 
-    def get_2b_ecp_du(self, mf, jastrow_params, quad_grid_name=None):
+    def get_2b_ecp_du(self, mf, jastrow_params, quad_grid_name=None, ranges=None):
         """ΔU^{(NL,Δu)}_{pqrs} — *honest* Option B' Phase 3 2-body correction.
 
         Builds the rank-4 MO tensor of the dressed-V_NL pair operator
@@ -797,16 +833,41 @@ class XTC(TC):
             jastrow_params: parameter container matching ``self.jastrow_factor``.
             quad_grid_name: angular quadrature name (defaults to the one
                 stored on ``self.ecp_data``).
+            ranges: optional ``(slice_p, slice_q, slice_r, slice_s)`` to
+                return only a (p, q, r, s) sub-block of the full tensor.
+                This mirrors the ``ranges=`` convention of
+                ``XTC.get_2b`` / ``get_delta_U`` and is used by the
+                streamed DF/ISDF block writers in ``solver/xtc_ccsd.py``.
+                The current implementation slices the full tensor after
+                construction (the inner kernel does not yet support
+                per-tile work-reduction); upgrading to a tile-aware
+                kernel is straightforward future work.
 
         Returns:
-            (n_orb, n_orb, n_orb, n_orb) ``jnp.ndarray`` to be *added* to
-            the standard h2e in chemist's notation ``(pq|rs)``.  Zeros if
-            no ECP atom or no pair-Jastrow component.
+            (n_orb, n_orb, n_orb, n_orb) ``jnp.ndarray`` (or the requested
+            (p, q, r, s) sub-block) to be *added* to the standard h2e in
+            chemist's notation ``(pq|rs)``.  Zeros if no ECP atom or no
+            pair-Jastrow component.
         """
         from pytc.ecp.quadrature import get_grid
         from pytc.xtc_ecp_du import compute_delta_U_ecp_du
 
-        zero4 = jnp.zeros((self.n_orb, self.n_orb, self.n_orb, self.n_orb))
+        n_orb = self.n_orb
+
+        def _maybe_slice(tensor):
+            if ranges is None:
+                return tensor
+            return tensor[ranges[0], ranges[1], ranges[2], ranges[3]]
+
+        if ranges is None:
+            zero_shape = (n_orb, n_orb, n_orb, n_orb)
+        else:
+            def _slice_len(s, axis_size):
+                start, stop, step = s.indices(axis_size)
+                return max(0, (stop - start + (step - (1 if step > 0 else -1))) // step)
+            zero_shape = tuple(_slice_len(s, n_orb) for s in ranges)
+        zero4 = jnp.zeros(zero_shape)
+
         if self.ecp_data is None or not bool(np.any(np.asarray(self.ecp_data.has_ecp))):
             return zero4
 
@@ -831,7 +892,7 @@ class XTC(TC):
             quad_grid_name = self.ecp_data.quad_grid_name
         angular_grid = get_grid(quad_grid_name)
 
-        return compute_delta_U_ecp_du(
+        full = compute_delta_U_ecp_du(
             mol=mf.mol,
             mo_coeff=np.asarray(self.mo_coeff),
             grid_points=np.asarray(self.grid_points),
@@ -842,6 +903,7 @@ class XTC(TC):
             chi_fn=chi_fn,
             pair_fn=pair_fn,
         )
+        return _maybe_slice(full)
 
     def get_1b_ecp_chi(self, mf, jastrow_params, quad_grid_name=None):
         """Δh^{(NL,χ)}_{pq} from the [V_NL, χ] commutator, Option B Phase 1.
@@ -908,25 +970,44 @@ class XTC(TC):
         )
 
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
-        """Compute two-body integrals correction."""
+        """Compute two-body integrals correction.
+
+        Returns ``TC + Δu + (optional ECP-Δu slice)`` for the requested
+        block.  The ECP-Δu addition is automatic when ``self.ecp_du_full``
+        has been set (e.g. by ``make_eris`` or
+        ``solver/xtc_ccsd._make_xtc_eris``) — no caller-side plumbing is
+        needed for the Fock build, the small all-occupied blocks, the
+        ao2mo vvvv writer, or the full-tensor ``make_eris`` path.
+        """
         start_time = time.perf_counter()
         logger.debug("Starting XTC.get_2b")
         if dm1 is None:
             dm1 = self._get_mf_dm()
-            
+
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
-        
+
         # Accumulate on host to avoid holding two output-sized GPU tensors.
         # ISDFTC.get_2b already returns via host internally.
         tc_result = super().get_2b(jastrow_params, ranges=ranges)
         result_np = np.array(tc_result)  # writable host copy
         del tc_result
-        
+
         delta_U = self.get_delta_U(jastrow_params, dm1, ranges=ranges, batch_size=batch_size)
         result_np += np.asarray(delta_U)
         del delta_U
-        
+
+        # Honest Option B' Phase 3: add the ECP-Δu slice when a
+        # precomputed full tensor has been bound to this XTC instance.
+        # The slice is a thin host-side numpy operation (no JAX), so
+        # this stays out of all traced regions.
+        ecp_du_full = self.ecp_du_full
+        if ecp_du_full is not None:
+            if ranges is None:
+                result_np += ecp_du_full
+            else:
+                result_np += ecp_du_full[ranges[0], ranges[1], ranges[2], ranges[3]]
+
         total_time = time.perf_counter() - start_time
         logger.debug(f"XTC.get_2b completed in {time.perf_counter() - start_time:.4f} s")
         return jnp.asarray(result_np)
@@ -991,31 +1072,39 @@ class XTC(TC):
         eri_std = tc_helper.get_eri(mf, self.mo_coeff)
         h1e_std = tc_helper.get_hcore(mf, self.mo_coeff)
 
-        # Get corrections
+        # ECP non-local 2-body Δu pair resummation (honest Option B'
+        # Phase 3) -- routed into h2e, not h1e, because r_2 is kept as a
+        # free grid index (no density contraction).  We bind the full
+        # rank-4 tensor onto a fresh XTC instance so that every
+        # downstream ``get_2b`` / ``_assemble_2b_tile`` call (including
+        # the implicit ones inside ``get_const`` / ``get_1b``) picks
+        # up the correction automatically — no separate ``h2e_ecp_du``
+        # addition is needed below.  Zero by construction for AE
+        # systems and for Jastrows with no pair piece.
+        if use_ecp_du:
+            ecp_du_full = np.asarray(self.get_2b_ecp_du(mf, jastrow_params))
+            xtc_self = self.replace(ecp_du_full=ecp_du_full)
+        else:
+            xtc_self = self
+
+        # Get corrections (xtc_self.get_2b now bakes in ECP-Δu when set).
         # Force concrete value computation
-        const = np.asarray(self.get_const(jastrow_params))
-        h1e_corr = np.asarray(self.get_1b(jastrow_params))
-        h2e_corr = np.asarray(self.get_2b(jastrow_params))
+        const = np.asarray(xtc_self.get_const(jastrow_params))
+        h1e_corr = np.asarray(xtc_self.get_1b(jastrow_params))
+        h2e_corr = np.asarray(xtc_self.get_2b(jastrow_params))
 
         # ECP non-local chi resummation (Option B Phase 1).  Cheap and
         # zero-by-construction on systems where the prerequisites
         # (ECP atoms AND a NuclearCusp component) are not both present.
         if use_ecp_chi:
-            h1e_ecp_chi = np.asarray(self.get_1b_ecp_chi(mf, jastrow_params))
+            h1e_ecp_chi = np.asarray(xtc_self.get_1b_ecp_chi(mf, jastrow_params))
         else:
             h1e_ecp_chi = np.zeros_like(h1e_corr)
 
-        # ECP non-local 2-body Δu pair resummation (honest Option B'
-        # Phase 3) -- routed into h2e, not h1e, because r_2 is kept as a
-        # free grid index (no density contraction).
-        if use_ecp_du:
-            h2e_ecp_du = np.asarray(self.get_2b_ecp_du(mf, jastrow_params))
-        else:
-            h2e_ecp_du = np.zeros_like(h2e_corr)
-
-        # Combine
+        # Combine — note: the ECP-Δu correction is already inside
+        # h2e_corr because we bound it on xtc_self above.
         h1e = h1e_std + h1e_corr + h1e_ecp_chi
-        h2e = eri_std + h2e_corr + h2e_ecp_du
+        h2e = eri_std + h2e_corr
         
         # Now use the concrete NumPy arrays
         eris.e_core = np.float64(const)
@@ -1281,6 +1370,11 @@ class ISDFXTC(XTC, ISDFTC):
             mo_occ=xtc_obj.mo_occ,
             nocc=xtc_obj.nocc,
             energy_nuc=xtc_obj.energy_nuc,
+            # Forward the ECP table so that the ECP-Δu / ECP-χ paths
+            # are reachable from ISDFXTC instances built via from_xtc.
+            # Without this the streamed DF/ISDF CCSD path silently
+            # returns zero for the Phase 1 / Phase 3 corrections.
+            ecp_data=xtc_obj.ecp_data,
             xi_phi=xi_phi,
             xi_grad=xi_grad,
             pivots=pivots,
@@ -2711,10 +2805,32 @@ class ISDFXTC(XTC, ISDFTC):
                 device_key,
             )
 
+        # Optional honest-B' Phase 3 ECP-Δu slice, lifted onto the same
+        # device as the (padded) tc_tile so the final sum is a single
+        # JAX op without an extra GPU→host round-trip.  The slice is a
+        # cheap host-side gather (numpy fancy indexing) followed by a
+        # pad-to-panel-shape so it matches the JAX-traced layout.  See
+        # the ``XTC.ecp_du_full`` docstring for the binding protocol.
+        ecp_du_padded = None
+        if self.ecp_du_full is not None and ranges is not None:
+            slice_np = self.ecp_du_full[ranges[0], ranges[1], ranges[2], ranges[3]]
+            if panel_size is not None:
+                ecp_du_padded = _pad_slice_to_panel(
+                    slice_np, panel_size=panel_size, panel_layout=panel_layout,
+                )
+            else:
+                ecp_du_padded = slice_np
+            if device is not None:
+                ecp_du_padded = jax.device_put(ecp_du_padded, device)
+            else:
+                ecp_du_padded = jnp.asarray(ecp_du_padded)
+
         if panel_size is not None:
             if _stage_timing:
                 _t_stage_sum0 = time.perf_counter()
             result = tc_tile + delta_u_tile
+            if ecp_du_padded is not None:
+                result = result + ecp_du_padded
             if _stage_timing:
                 _t_stage_sum1 = time.perf_counter()
                 _accum_issue_stage("final_sum_s", _t_stage_sum1 - _t_stage_sum0)
@@ -2733,5 +2849,7 @@ class ISDFXTC(XTC, ISDFTC):
 
         tc_tile = np.array(tc_tile)
         tc_tile += np.array(delta_u_tile)
+        if ecp_du_padded is not None:
+            tc_tile += np.asarray(ecp_du_padded)
         return jnp.asarray(tc_tile)
     
