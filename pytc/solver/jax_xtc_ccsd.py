@@ -18,68 +18,19 @@ jax.config.update("jax_enable_x64", True)
 
 logger = logging.getLogger(__name__)
 
-# --- JAX-compatible Intermediates (Micro-Kernels) ---
-
-@jax.jit
-def _jax_cc_Fov(t1, eris_fock, eris_ovov):
-    fov = eris_fock[:t1.shape[0], t1.shape[0]:]
-    Fkc  = 2*jnp.einsum('kcld,ld->kc', eris_ovov, t1)
-    Fkc -=   jnp.einsum('kdlc,ld->kc', eris_ovov, t1)
-    Fkc += fov
-    return Fkc
-
-@jax.jit
-def _jax_cc_Foo(t1, t2, eris_fock, eris_ovov):
-    nocc = t1.shape[0]
-    foo = eris_fock[:nocc, :nocc]
-    Fki  = 2*jnp.einsum('kcld,ilcd->ki', eris_ovov, t2)
-    Fki -=   jnp.einsum('kdlc,ilcd->ki', eris_ovov, t2)
-    Fki += 2*jnp.einsum('kcld,ic,ld->ki', eris_ovov, t1, t1)
-    Fki -=   jnp.einsum('kdlc,ic,ld->ki', eris_ovov, t1, t1)
-    Fki += foo
-    return Fki
-
-@jax.jit
-def _jax_cc_Fvv(t1, t2, eris_fock, eris_ovov):
-    nocc = t1.shape[0]
-    fvv = eris_fock[nocc:, nocc:]
-    Fac  =-2*jnp.einsum('kcld,klad->ac', eris_ovov, t2)
-    Fac +=   jnp.einsum('kdlc,klad->ac', eris_ovov, t2)
-    Fac -= 2*jnp.einsum('kcld,ka,ld->ac', eris_ovov, t1, t1)
-    Fac +=   jnp.einsum('kdlc,ka,ld->ac', eris_ovov, t1, t1)
-    Fac += fvv
-    return Fac
-
-@jax.jit
-def _jax_Loo(t1, t2, eris_fock, eris_ovov, eris_ovoo):
-    nocc = t1.shape[0]
-    ki = _jax_cc_Foo(t1, t2, eris_fock, eris_ovov)
-    ki += jnp.einsum('kc,ic->ki', eris_fock[:nocc, nocc:], t1)
-    ki += 2*jnp.einsum('lcki,lc->ki', eris_ovoo, t1)
-    ki -=   jnp.einsum('kcli,lc->ki', eris_ovoo, t1)
-    return ki
-
-@jax.jit
-def _jax_Lvv(t1, t2, eris_fock, eris_ovov, eris_ovvv_all=None):
-    # This Lvv includes contributions from Fvv and ovvv if provided (memory resident)
-    # If ovvv is blocked (None), only the Fvv part is computed here.
-    nocc = t1.shape[0]
-    fov = eris_fock[:nocc, nocc:]
-    ac = _jax_cc_Fvv(t1, t2, eris_fock, eris_ovov)
-    ac -= jnp.einsum('kc,ka->ac', fov, t1)
-    if eris_ovvv_all is not None:
-        ac += 2*jnp.einsum('kdac,kd->ac', eris_ovvv_all, t1)
-        ac -=   jnp.einsum('kcad,kd->ac', eris_ovvv_all, t1)
-    return ac
-
-@jax.jit
-def _jax_cc_Woooo(t1, t2, eris_oooo, eris_ovov, eris_ovoo):
-    Wklij  = jnp.einsum('lcki,jc->klij', eris_ovoo, t1)
-    Wklij += jnp.einsum('kclj,ic->klij', eris_ovoo, t1)
-    Wklij += jnp.einsum('kcld,ijcd->klij', eris_ovov, t2)
-    Wklij += jnp.einsum('kcld,ic,jd->klij', eris_ovov, t1, t1)
-    Wklij += eris_oooo.transpose(0,2,1,3)
-    return Wklij
+# H̄ intermediate micro-kernels live in jax_xtc_rintermediates (shared with
+# the EOM-CCSD σ-vector module). Re-exported here for back-compat with code
+# and tests that reach for ``jax_xtc_ccsd._jax_cc_Foo`` etc.
+from pytc.solver.jax_xtc_rintermediates import (  # noqa: E402,F401
+    _jax_cc_Fov,
+    _jax_cc_Foo,
+    _jax_cc_Fvv,
+    _jax_Loo,
+    _jax_Lvv,
+    _jax_cc_Woooo,
+    _jax_cc_Wvoov,
+    _jax_cc_Wvovo,
+)
 
 # Micro-kernels for Block processing
 

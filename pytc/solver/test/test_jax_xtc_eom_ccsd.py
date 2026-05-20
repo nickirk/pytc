@@ -37,15 +37,20 @@ class TestEOMEEImports(unittest.TestCase):
 
 
 class TestEOMEEAgainstPySCF(unittest.TestCase):
-    """M5 — zero-Jastrow XTC-EOM-CCSD must match pyscf EOM-EE-CCSD."""
+    """M5 — singlet EOM-EE-CCSD numerical validation against pyscf."""
 
-    @unittest.skip("M5 not yet implemented — σ-vector still NotImplementedError")
-    def test_h2o_sto3g(self):
+    def test_same_eris_matches_pyscf(self):
+        """Code-level cross-check: ours and pyscf agree to micro-Hartree
+        when fed the same Hermitian eris.
+
+        Validates that our JAX H̄ intermediates, σ-vector, F-only
+        preconditioner, and the Davidson wiring through pyscf's
+        ``EOMEESinglet.kernel`` reproduce stock pyscf EOM-EE-CCSD on a
+        system where pyscf can also be run end-to-end. Skips the
+        XTC code path entirely — exercises only ``xtc_eom_ccsd.EOMEE``.
+        """
         from pyscf import cc as pcc
-
-        from pytc import xtc as xtc_mod
-        from pytc.jastrow.rexp import REXP
-        from pytc.solver import jax_xtc_ccsd
+        from pyscf.cc import eom_rccsd
         from pytc.solver.xtc_eom_ccsd import EOMEE
 
         mol = gto.M(
@@ -55,22 +60,62 @@ class TestEOMEEAgainstPySCF(unittest.TestCase):
         )
         mf = scf.RHF(mol).run()
 
-        # Stock pyscf EOM-EE-CCSD reference
         ref_cc = pcc.CCSD(mf)
         ref_cc.kernel()
-        ref_eom = ref_cc.eomee_ccsd_singlet(nroots=2)
-        e_ref = np.asarray(ref_eom[0])
 
-        # XTC-EOM-CCSD with ALL-ZERO Jastrow should match ref
-        jastrow = REXP()
-        zero_params = {"alpha": jnp.array([0.0])}
-        my_xtc = xtc_mod.XTC.from_pyscf(mf, jastrow)
-        cc = jax_xtc_ccsd.RCCSD(mf, my_xtc, zero_params)
+        # pyscf reference uses its own packed-ovvv eris untouched.
+        e_ref = ref_cc.eomee_ccsd_singlet(nroots=6)[0]
+
+        # Our path needs a 4D ovvv (matches pytc convention). Build a
+        # separate eris on the same converged amplitudes and patch.
+        my_eris = ref_cc.ao2mo()
+        my_eris.ovvv = np.asarray(my_eris.get_ovvv())
+        ref_cc.eris = my_eris
+        e_xtc, _ = EOMEE(ref_cc).kernel(nroots=6)
+
+        # 5 µEh tolerance: our F-only preconditioner reaches Davidson
+        # convergence slightly less tightly than pyscf's full diag, so
+        # eigenvalues land within ~1.5 µEh rather than the ~0.1 µEh pyscf
+        # achieves end-to-end. Both are well below chemistry precision.
+        np.testing.assert_allclose(
+            np.sort(np.asarray(e_xtc)),
+            np.sort(np.asarray(e_ref)),
+            atol=5e-6,
+        )
+
+    def test_hermitian_limit_matches_pyscf(self):
+        """End-to-end pytc-XTC → EOMEE matches pyscf in the large-α limit.
+
+        Per pytc convention (see ``test_jax_xtc_ccsd.test_hermitian_limit``),
+        ``alpha=1000`` makes the REXP Jastrow effectively negligible — XTC
+        integrals reduce to standard Coulomb. Excitation energies from
+        XTC-EOM-CCSD on this reference should reproduce stock pyscf
+        EOM-EE-CCSD to sub-µEh.
+        """
+        from pyscf import cc as pcc
+        from pytc import xtc as xtc_mod
+        from pytc.jastrow.rexp import REXP
+        from pytc.solver import jax_xtc_ccsd
+        from pytc.solver.xtc_eom_ccsd import EOMEE
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="cc-pvdz", verbose=0)
+        mf = scf.RHF(mol).run()
+
+        ref_cc = pcc.CCSD(mf)
+        ref_cc.kernel()
+        e_ref = ref_cc.eomee_ccsd_singlet(nroots=4)[0]
+
+        large_alpha = {"alpha": jnp.array([1000.0])}
+        my_xtc = xtc_mod.XTC.from_pyscf(mf, REXP())
+        cc = jax_xtc_ccsd.RCCSD(mf, my_xtc, large_alpha)
         cc.kernel()
-        e_xtc, _ = EOMEE(cc).kernel(nroots=2)
+        e_xtc, _ = EOMEE(cc).kernel(nroots=4)
 
-        # Should agree to micro-Hartree
-        np.testing.assert_allclose(np.sort(e_xtc), np.sort(e_ref), atol=1e-6)
+        np.testing.assert_allclose(
+            np.sort(np.asarray(e_xtc)),
+            np.sort(np.asarray(e_ref)),
+            atol=1e-6,
+        )
 
 
 class TestEOMEECBDDiradical(unittest.TestCase):
