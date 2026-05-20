@@ -734,6 +734,115 @@ class XTC(TC):
                     return sub, i
         return None, None
 
+    def _extract_pair_jastrow_fn(self, jastrow_params):
+        """Return a JAX-traceable u(r1, r2) for the non-chi 2-body Jastrow.
+
+        Walks ``self.jastrow_factor`` and assembles a closure that sums the
+        ``_compute(r1, r2, params)`` of every non-NuclearCusp factor.  If
+        the Jastrow contains only a NuclearCusp piece (or *is* a
+        NuclearCusp), returns ``None`` — Phase 3 then contributes zero.
+
+        Returns:
+            ``pair_fn(r1, r2) -> scalar``, or ``None``.
+        """
+        from pytc.jastrow.ncusp import NuclearCusp
+        from pytc.jastrow.composite import CompositeJastrow
+
+        jf = self.jastrow_factor
+        if isinstance(jf, CompositeJastrow):
+            pair_factors = []
+            for i, sub in enumerate(jf.jastrows):
+                if not isinstance(sub, NuclearCusp):
+                    pair_factors.append((sub, jastrow_params[i]))
+            if not pair_factors:
+                return None
+            def pair_fn(r1, r2):
+                total = 0.0
+                for f, p in pair_factors:
+                    val = f._compute(r1, r2, p)
+                    # Some factors (e.g. REXP) return a (1,)-shaped scalar
+                    # because their param vectors are length-1.  Coerce to
+                    # a true scalar so vmap stacks cleanly.
+                    total = total + jnp.reshape(val, ())
+                return total
+            return pair_fn
+        if isinstance(jf, NuclearCusp):
+            return None
+        # Plain single-factor Jastrow (e.g. REXP alone).
+        def pair_fn(r1, r2):
+            val = jf._compute(r1, r2, jastrow_params)
+            return jnp.reshape(val, ())
+        return pair_fn
+
+    def get_2b_ecp_du(self, mf, jastrow_params, quad_grid_name=None):
+        """ΔU^{(NL,Δu)}_{pqrs} — *honest* Option B' Phase 3 2-body correction.
+
+        Builds the rank-4 MO tensor of the dressed-V_NL pair operator
+
+            V_NL,1 · e^{Δχ_1} · (e^{u(r_1', r_2) - u(r_1, r_2)} - 1)
+
+        on the TC grid + ECP angular quadrature, mirroring the K3 scan
+        structure in ``pytc.kmat.calc_K3``.  Electron 2's coordinate is
+        kept as a free grid axis (no density factorization) and the
+        ``ket`` side contracts against φ_r(r_2) φ_s(r_2) w_{r_2}, exactly
+        like the existing ``get_delta_U`` kinetic-Jastrow 2-body piece.
+
+        The result is symmetric in the (p,q) ↔ (r,s) pair indices: the
+        kernel as written places V_NL on electron 1, and the V_NL-on-
+        electron-2 partner is added by tensor transposition inside
+        ``compute_delta_U_ecp_du``.
+
+        Args:
+            mf: pyscf mean-field — used only for ``mf.mol`` and AO eval.
+            jastrow_params: parameter container matching ``self.jastrow_factor``.
+            quad_grid_name: angular quadrature name (defaults to the one
+                stored on ``self.ecp_data``).
+
+        Returns:
+            (n_orb, n_orb, n_orb, n_orb) ``jnp.ndarray`` to be *added* to
+            the standard h2e in chemist's notation ``(pq|rs)``.  Zeros if
+            no ECP atom or no pair-Jastrow component.
+        """
+        from pytc.ecp.quadrature import get_grid
+        from pytc.xtc_ecp_du import compute_delta_U_ecp_du
+
+        zero4 = jnp.zeros((self.n_orb, self.n_orb, self.n_orb, self.n_orb))
+        if self.ecp_data is None or not bool(np.any(np.asarray(self.ecp_data.has_ecp))):
+            return zero4
+
+        pair_fn = self._extract_pair_jastrow_fn(jastrow_params)
+        if pair_fn is None:
+            logger.info(
+                "get_2b_ecp_du: Jastrow has no 2-body pair component; "
+                "Phase 3 correction is zero."
+            )
+            return zero4
+
+        # Build optional chi_fn (None if no NuclearCusp).
+        ncusp, param_idx = self._find_nuclear_cusp()
+        if ncusp is None:
+            chi_fn = None
+        else:
+            ncusp_params = jastrow_params if param_idx is None else jastrow_params[param_idx]
+            def chi_fn(r):
+                return ncusp.eval_chi_single(r, ncusp_params)
+
+        if quad_grid_name is None:
+            quad_grid_name = self.ecp_data.quad_grid_name
+        angular_grid = get_grid(quad_grid_name)
+
+        return compute_delta_U_ecp_du(
+            mol=mf.mol,
+            mo_coeff=np.asarray(self.mo_coeff),
+            grid_points=np.asarray(self.grid_points),
+            weights=np.asarray(self.weights),
+            phi_grid=self.phi,
+            ecp=self.ecp_data,
+            angular_grid=angular_grid,
+            chi_fn=chi_fn,
+            pair_fn=pair_fn,
+        )
+
     def get_1b_ecp_chi(self, mf, jastrow_params, quad_grid_name=None):
         """Δh^{(NL,χ)}_{pq} from the [V_NL, χ] commutator, Option B Phase 1.
 
@@ -854,7 +963,7 @@ class XTC(TC):
         """Get three-body extended correlation."""
         raise NotImplementedError("JAX implementation pending")
         
-    def make_eris(self, mf, jastrow_params, *, use_ecp_chi=True):
+    def make_eris(self, mf, jastrow_params, *, use_ecp_chi=True, use_ecp_du=True):
         """Create ChemistsERIs object for CCSD calculation.
 
         Args:
@@ -865,6 +974,12 @@ class XTC(TC):
                 Δh^{(NL,χ)} to the 1-body Hamiltonian.  Has no effect on
                 all-electron systems or when the Jastrow has no
                 NuclearCusp factor — falls back to a zero matrix.
+            use_ecp_du: if True (default) and an ECP + 2-body Jastrow are
+                both present, add the *honest* Option B' Phase 3
+                correction ΔU^{(NL,Δu)} to the **2-body** ERI tensor (no
+                density factorization; treated like the existing ΔU
+                kinetic-Jastrow piece).  Falls back to a zero matrix for
+                AE systems or Jastrows with no pair piece.
         """
         from pyscf.cc import rccsd
         mycc = rccsd.RCCSD(mf)
@@ -890,9 +1005,17 @@ class XTC(TC):
         else:
             h1e_ecp_chi = np.zeros_like(h1e_corr)
 
+        # ECP non-local 2-body Δu pair resummation (honest Option B'
+        # Phase 3) -- routed into h2e, not h1e, because r_2 is kept as a
+        # free grid index (no density contraction).
+        if use_ecp_du:
+            h2e_ecp_du = np.asarray(self.get_2b_ecp_du(mf, jastrow_params))
+        else:
+            h2e_ecp_du = np.zeros_like(h2e_corr)
+
         # Combine
         h1e = h1e_std + h1e_corr + h1e_ecp_chi
-        h2e = eri_std + h2e_corr
+        h2e = eri_std + h2e_corr + h2e_ecp_du
         
         # Now use the concrete NumPy arrays
         eris.e_core = np.float64(const)

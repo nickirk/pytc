@@ -269,6 +269,35 @@ def _make_xtc_eris(cc, mo_coeff=None):
     else:
         h1e_ecp_chi_corr = np.zeros_like(h1e_corr)
 
+    # Option B' Phase 3 (honest): rank-2 pair-Jastrow correction routed
+    # to h2e as a (pq|rs) ERI block, not h1e.  Materialised in full
+    # because the kernel produces a true 2-body tensor (no density
+    # contraction), and we need to slice it into oooo/oovv/.../vvvv
+    # blocks below.  Zero by construction for AE / no-pair-Jastrow.
+    #
+    # TODO(ECP-Δu, DF/ISDF path): the streamed large/medium/vvvv block
+    # builders below currently *do not* receive the ECP-Δu slice — only
+    # the Fock build and the small all-occupied blocks (oooo/ovoo/ooov/
+    # vooo) do.  For AE+ECP production runs through the DF/ISDF path the
+    # virtual-index blocks need to be patched after construction (read-
+    # modify-write on the HDF5 datasets, plus an in-memory add for the
+    # medium blocks).  See ``pytc/xtc.py`` ``make_eris`` for the
+    # reference full-tensor wiring used by the standard path.
+    if hasattr(xtc_obj, "get_2b_ecp_du"):
+        h2e_ecp_du_corr = np.asarray(xtc_obj.get_2b_ecp_du(cc._scf, jastrow_params))
+        if bool(np.any(h2e_ecp_du_corr)):
+            logger.warning(
+                "xtc_ccsd: ECP-Δu correction is materialised in full and "
+                "added to the Fock build + (oooo/ovoo/ooov/vooo) blocks "
+                "only.  Streamed virtual-index blocks (ovvv/vovv/vvvv/"
+                "oovv/ovov/...) currently DO NOT include the ECP-Δu "
+                "correction in this DF/ISDF path.  Use the standard "
+                "XTC.make_eris path for fully consistent results until "
+                "this is plumbed through."
+            )
+    else:
+        h2e_ecp_du_corr = np.zeros((nmo, nmo, nmo, nmo))
+
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
     _fock_devices = _solver_local_devices()
@@ -313,6 +342,13 @@ def _make_xtc_eris(cc, mo_coeff=None):
     # Add the [V_NL, chi] 1-body correction (Option B Phase 1).  Already
     # zero for AE-only or no-NuclearCusp setups; see above.
     fock_corr = fock_corr + h1e_ecp_chi_corr
+    # Add the Δu 2-body pair-Jastrow correction (honest Option B' Phase 3)
+    # via the standard Fock build: 2 (pq|ii) - (pi|iq) on the rank-4
+    # ECP-Δu tensor.
+    fock_corr = fock_corr + (
+        2 * np.einsum('pqii->pq', h2e_ecp_du_corr[:, :, :nocc, :nocc])
+        - np.einsum('piiq->pq', h2e_ecp_du_corr[:, :nocc, :nocc, :])
+    )
     eris.fock = fock_std + fock_corr
     eris.fvo = eris.fock[nocc:, :nocc].copy()
     eris.mo_energy = np.diag(eris.fock)
@@ -459,7 +495,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
         ]:
             logger.debug("Computing block %s", _blk_str)
             _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str))
-            setattr(eris, _blk_str, _std + _tc)
+            _slices = tuple(slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in _blk_str)
+            setattr(eris, _blk_str, _std + _tc + h2e_ecp_du_corr[_slices])
 
         del Loo, Lov, Lov_reshaped
 
@@ -476,8 +513,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
         def get_block(block_str):
             logger.debug(f"Computing block {block_str} for xtc")
             tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
-            slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
-            return eri_std_full[tuple(slices)] + tc_part
+            slices = tuple(slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str)
+            return eri_std_full[slices] + tc_part + h2e_ecp_du_corr[slices]
     
         eris.oooo = get_block('oooo')
         eris.ovoo = get_block('ovoo')
