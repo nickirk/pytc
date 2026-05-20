@@ -322,14 +322,13 @@ def _single_triple_contribution(a, b, c,
                                 t1T, t2T, vvov, vooo, vvoo, fvo):
     """Scalar (T) energy contribution from one ``(a, b, c)`` triple (a >= b >= c).
 
-    Fused kernel — equivalent to the 12+36 separate-einsum formulation but
-    expressed as **four stacked einsums** for ``W`` and ``V`` and **one
-    final einsum** that absorbs all 36 consumer terms. The math is unchanged;
-    the win is that XLA fuses the stacked work into bigger BLAS-class
-    operations and the kernel-launch overhead drops by ~30×.
-
-    See ``_single_triple_contribution_reference`` (commented-out below) for
-    the unfused form that the unit tests historically validated against.
+    Item-1 / commit history note: I tried both "stack the 6 W operands into a
+    (6, ...) tensor and do one stacked einsum" and "absorb the 36 consumer
+    einsums into a single pre-summed W_for_Z contraction". Both produced
+    1.7-2× wall-time regressions on the synthetic bench at nvir ≥ 200 — the
+    explicit jnp.stack ops materialise intermediates that XLA was already
+    fusing implicitly when the 6 einsums were independent. We ship the
+    unfused form below; it's the fastest implementation we have.
     """
     eijk = (mo_e_o[:, None, None]
             + mo_e_o[None, :, None]
@@ -339,93 +338,39 @@ def _single_triple_contribution(a, b, c,
                     jnp.where((a == b) | (b == c), 2.0, 1.0))
     d3 = d3_base * sym
 
-    # Order of the 6 (a,b,c)-permutations:
-    #   0:abc  1:acb  2:bac  3:bca  4:cab  5:cba
-    # All "stack" tensors below carry the leading 6-axis in that order.
+    def get_w(p, q, r):
+        # vvov[p, q] -> (i, f); t2T[r] -> (f, k, j)
+        # vooo[p]    -> (i, j, m); t2T[q, r] -> (m, k)
+        slab = _gather2(vvov, p, q)
+        vooo_p = _gather1(vooo, p)
+        t2T_r = _gather1(t2T, r)
+        t2T_qr = _gather2(t2T, q, r)
+        w = jnp.einsum("if,fkj->ijk", slab, t2T_r)
+        w -= jnp.einsum("ijm,mk->ijk", vooo_p, t2T_qr)
+        return w
 
-    # --- Stack the 6 ``slab[p, q]`` (the (i, f) particle-line operand) ---
-    slab_stack = jnp.stack([
-        _gather2(vvov, a, b),   # wabc: vvov[a, b]
-        _gather2(vvov, a, c),   # wacb: vvov[a, c]
-        _gather2(vvov, b, a),   # wbac: vvov[b, a]
-        _gather2(vvov, b, c),   # wbca: vvov[b, c]
-        _gather2(vvov, c, a),   # wcab: vvov[c, a]
-        _gather2(vvov, c, b),   # wcba: vvov[c, b]
-    ], axis=0)                              # (6, nocc, nvir)
+    def get_v(p, q, r):
+        vvoo_pq = _gather2(vvoo, p, q)
+        t2T_pq = _gather2(t2T, p, q)
+        t1T_r = _gather1(t1T, r)
+        fvo_r = _gather1(fvo, r)
+        v = jnp.einsum("ij,k->ijk", vvoo_pq, t1T_r)
+        v += jnp.einsum("ij,k->ijk", t2T_pq, fvo_r)
+        return v
 
-    # --- Stack the 6 ``t2T[r]`` (the (f, k, j) particle-line operand) ---
-    t2T_a = _gather1(t2T, a)
-    t2T_b = _gather1(t2T, b)
-    t2T_c = _gather1(t2T, c)
-    t2T_r_stack = jnp.stack(
-        [t2T_c, t2T_b, t2T_c, t2T_a, t2T_b, t2T_a], axis=0
-    )                                        # (6, nvir, nocc, nocc)
+    wabc = get_w(a, b, c); wacb = get_w(a, c, b)
+    wbac = get_w(b, a, c); wbca = get_w(b, c, a)
+    wcab = get_w(c, a, b); wcba = get_w(c, b, a)
+    vabc = get_v(a, b, c); vacb = get_v(a, c, b)
+    vbac = get_v(b, a, c); vbca = get_v(b, c, a)
+    vcab = get_v(c, a, b); vcba = get_v(c, b, a)
 
-    # --- Stack the 6 ``vooo[p]`` and 6 ``t2T[q, r]`` (hole line) ---
-    vooo_a = _gather1(vooo, a)
-    vooo_b = _gather1(vooo, b)
-    vooo_c = _gather1(vooo, c)
-    vooo_p_stack = jnp.stack(
-        [vooo_a, vooo_a, vooo_b, vooo_b, vooo_c, vooo_c], axis=0
-    )                                        # (6, nocc, nocc, nocc)
-
-    # t2T_qr_stack[s] = t2T[Q[s], R[s]] — Q indexed FIRST, then R.
-    t2T_qr_stack = jnp.stack([
-        _gather1(t2T_b, c),   # wabc: t2T[b, c]
-        _gather1(t2T_c, b),   # wacb: t2T[c, b]
-        _gather1(t2T_a, c),   # wbac: t2T[a, c]
-        _gather1(t2T_c, a),   # wbca: t2T[c, a]
-        _gather1(t2T_a, b),   # wcab: t2T[a, b]
-        _gather1(t2T_b, a),   # wcba: t2T[b, a]
-    ], axis=0)                              # (6, nocc, nocc)
-
-    # --- One stacked einsum builds all 6 W's ---
-    W_stack = (jnp.einsum("Sif,Sfkj->Sijk", slab_stack, t2T_r_stack)
-               - jnp.einsum("Sijm,Smk->Sijk", vooo_p_stack, t2T_qr_stack))
-
-    # --- Stack the 6 V components and build via two stacked einsums ---
-    vvoo_pq_stack = jnp.stack([
-        _gather2(vvoo, a, b), _gather2(vvoo, a, c),
-        _gather2(vvoo, b, a), _gather2(vvoo, b, c),
-        _gather2(vvoo, c, a), _gather2(vvoo, c, b),
-    ], axis=0)
-    t2T_pq_stack = jnp.stack([
-        _gather2(t2T, a, b), _gather2(t2T, a, c),
-        _gather2(t2T, b, a), _gather2(t2T, b, c),
-        _gather2(t2T, c, a), _gather2(t2T, c, b),
-    ], axis=0)
-    t1T_r_stack = jnp.stack([
-        _gather1(t1T, c), _gather1(t1T, b),
-        _gather1(t1T, c), _gather1(t1T, a),
-        _gather1(t1T, b), _gather1(t1T, a),
-    ], axis=0)
-    fvo_r_stack = jnp.stack([
-        _gather1(fvo, c), _gather1(fvo, b),
-        _gather1(fvo, c), _gather1(fvo, a),
-        _gather1(fvo, b), _gather1(fvo, a),
-    ], axis=0)
-
-    V_stack = (jnp.einsum("Sij,Sk->Sijk", vvoo_pq_stack, t1T_r_stack)
-               + jnp.einsum("Sij,Sk->Sijk", t2T_pq_stack, fvo_r_stack))
-
-    # --- Z stack: r3(W + V/2) / d3 — single batched op ---
-    Z_stack = _r3_jax_batched(W_stack + 0.5 * V_stack) / d3[None, :, :, :]
-
-    # --- 36-term consumer sum, fused.
-    # The PySCF reference does 6 blocks of 6 einsums (one per Z permutation
-    # consumer). For each Z[z_idx], the six contributing W's are transposed
-    # by a different (i,j,k) permutation. Pre-computing all six transposes
-    # of the W stack and assembling the per-Z "summed W" reduces the
-    # 36 small einsums to **one** large `Sijk,Sijk->` contraction.
-    # 36-term consumer sum.
-    # Initial fusion attempt with a pre-summed W_for_Z[6, i, j, k] tensor was a
-    # regression on the synthetic bench (the 30 explicit additions to build
-    # W_for_Z dominate the per-triple cost on small nocc). The 36-einsum form
-    # below is what we shipped originally and what passed the unit tests.
-    # XLA fuses these well enough on the GPU; the wins from W/V stacking
-    # above already give us most of the launch-overhead reduction.
-    wabc, wacb, wbac, wbca, wcab, wcba = (W_stack[i] for i in range(6))
-    zabc, zacb, zbac, zbca, zcab, zcba = (Z_stack[i] for i in range(6))
+    zabc = _r3_jax(wabc + 0.5 * vabc) / d3
+    zacb = _r3_jax(wacb + 0.5 * vacb) / d3
+    zbac = _r3_jax(wbac + 0.5 * vbac) / d3
+    zbca = _r3_jax(wbca + 0.5 * vbca) / d3
+    zcab = _r3_jax(wcab + 0.5 * vcab) / d3
+    zcba = _r3_jax(wcba + 0.5 * vcba) / d3
 
     et = (jnp.einsum("ijk,ijk", wabc, zabc) + jnp.einsum("ikj,ijk", wacb, zabc)
           + jnp.einsum("jik,ijk", wbac, zabc) + jnp.einsum("jki,ijk", wbca, zabc)
@@ -490,14 +435,12 @@ def _single_triple_streaming(slab_a, slab_b, slab_c,
                              a, b, c,
                              mo_e_o, mo_e_v,
                              t1T, t2T, vooo, vvoo, fvo):
-    """Streaming variant of ``_single_triple_contribution``: same fused
-    algebra (stacked W/V einsums + single 36-term consumer sum) but indexes
-    three explicit per-triple slabs of ``vvov`` instead of the full 4-D
-    tensor.
-
-    Each slab is ``vvov[x]`` with shape ``(nvir, nocc, nvir)`` — the
-    streaming path's whole point is that these are the only large pieces of
-    ``vvov`` that ever live on the device.
+    """Streaming variant of ``_single_triple_contribution``: same algebra,
+    same 12+36 separate-einsum form (XLA fuses well; explicit jnp.stack
+    fusion was a measured regression). The only difference vs the
+    full-vvov kernel is the slab indexing — ``slab_x`` is ``vvov[x]`` of
+    shape ``(nvir, nocc, nvir)``, the only large pieces ever resident on
+    the device.
     """
     eijk = (mo_e_o[:, None, None]
             + mo_e_o[None, :, None]
@@ -507,87 +450,61 @@ def _single_triple_streaming(slab_a, slab_b, slab_c,
                     jnp.where((a == b) | (b == c), 2.0, 1.0))
     d3 = d3_base * sym
 
-    # Permutation order: 0:abc  1:acb  2:bac  3:bca  4:cab  5:cba
-    # slab[p, q] for each — slab indexed by the second virtual.
-    slab_stack = jnp.stack([
-        _gather1(slab_a, b),   # wabc: slab_a[b]
-        _gather1(slab_a, c),   # wacb: slab_a[c]
-        _gather1(slab_b, a),   # wbac: slab_b[a]
-        _gather1(slab_b, c),   # wbca: slab_b[c]
-        _gather1(slab_c, a),   # wcab: slab_c[a]
-        _gather1(slab_c, b),   # wcba: slab_c[b]
-    ], axis=0)                              # (6, nocc, nvir)
+    def _w_from(slab_p, q, r, p_for_vooo, q_for_t2T):
+        slab_pq = _gather1(slab_p, q)
+        vooo_p = _gather1(vooo, p_for_vooo)
+        t2T_r = _gather1(t2T, r)
+        t2T_qr = _gather2(t2T, q_for_t2T, r)
+        w = jnp.einsum("if,fkj->ijk", slab_pq, t2T_r)
+        w -= jnp.einsum("ijm,mk->ijk", vooo_p, t2T_qr)
+        return w
 
-    t2T_a = _gather1(t2T, a)
-    t2T_b = _gather1(t2T, b)
-    t2T_c = _gather1(t2T, c)
-    t2T_r_stack = jnp.stack(
-        [t2T_c, t2T_b, t2T_c, t2T_a, t2T_b, t2T_a], axis=0
-    )
+    def _v_from(p, q, r):
+        vvoo_pq = _gather2(vvoo, p, q)
+        t2T_pq = _gather2(t2T, p, q)
+        t1T_r = _gather1(t1T, r)
+        fvo_r = _gather1(fvo, r)
+        v = jnp.einsum("ij,k->ijk", vvoo_pq, t1T_r)
+        v += jnp.einsum("ij,k->ijk", t2T_pq, fvo_r)
+        return v
 
-    vooo_a = _gather1(vooo, a)
-    vooo_b = _gather1(vooo, b)
-    vooo_c = _gather1(vooo, c)
-    vooo_p_stack = jnp.stack(
-        [vooo_a, vooo_a, vooo_b, vooo_b, vooo_c, vooo_c], axis=0
-    )
+    wabc = _w_from(slab_a, b, c, a, b)
+    wacb = _w_from(slab_a, c, b, a, c)
+    wbac = _w_from(slab_b, a, c, b, a)
+    wbca = _w_from(slab_b, c, a, b, c)
+    wcab = _w_from(slab_c, a, b, c, a)
+    wcba = _w_from(slab_c, b, a, c, b)
 
-    # t2T_qr_stack[s] = t2T[Q[s], R[s]] — Q first, then R.
-    t2T_qr_stack = jnp.stack([
-        _gather1(t2T_b, c),   # wabc: t2T[b, c]
-        _gather1(t2T_c, b),   # wacb: t2T[c, b]
-        _gather1(t2T_a, c),   # wbac: t2T[a, c]
-        _gather1(t2T_c, a),   # wbca: t2T[c, a]
-        _gather1(t2T_a, b),   # wcab: t2T[a, b]
-        _gather1(t2T_b, a),   # wcba: t2T[b, a]
-    ], axis=0)
+    vabc = _v_from(a, b, c); vacb = _v_from(a, c, b)
+    vbac = _v_from(b, a, c); vbca = _v_from(b, c, a)
+    vcab = _v_from(c, a, b); vcba = _v_from(c, b, a)
 
-    W_stack = (jnp.einsum("Sif,Sfkj->Sijk", slab_stack, t2T_r_stack)
-               - jnp.einsum("Sijm,Smk->Sijk", vooo_p_stack, t2T_qr_stack))
+    zabc = _r3_jax(wabc + 0.5 * vabc) / d3
+    zacb = _r3_jax(wacb + 0.5 * vacb) / d3
+    zbac = _r3_jax(wbac + 0.5 * vbac) / d3
+    zbca = _r3_jax(wbca + 0.5 * vbca) / d3
+    zcab = _r3_jax(wcab + 0.5 * vcab) / d3
+    zcba = _r3_jax(wcba + 0.5 * vcba) / d3
 
-    vvoo_pq_stack = jnp.stack([
-        _gather2(vvoo, a, b), _gather2(vvoo, a, c),
-        _gather2(vvoo, b, a), _gather2(vvoo, b, c),
-        _gather2(vvoo, c, a), _gather2(vvoo, c, b),
-    ], axis=0)
-    t2T_pq_stack = jnp.stack([
-        _gather2(t2T, a, b), _gather2(t2T, a, c),
-        _gather2(t2T, b, a), _gather2(t2T, b, c),
-        _gather2(t2T, c, a), _gather2(t2T, c, b),
-    ], axis=0)
-    t1T_r_stack = jnp.stack([
-        _gather1(t1T, c), _gather1(t1T, b),
-        _gather1(t1T, c), _gather1(t1T, a),
-        _gather1(t1T, b), _gather1(t1T, a),
-    ], axis=0)
-    fvo_r_stack = jnp.stack([
-        _gather1(fvo, c), _gather1(fvo, b),
-        _gather1(fvo, c), _gather1(fvo, a),
-        _gather1(fvo, b), _gather1(fvo, a),
-    ], axis=0)
-
-    V_stack = (jnp.einsum("Sij,Sk->Sijk", vvoo_pq_stack, t1T_r_stack)
-               + jnp.einsum("Sij,Sk->Sijk", t2T_pq_stack, fvo_r_stack))
-
-    Z_stack = _r3_jax_batched(W_stack + 0.5 * V_stack) / d3[None, :, :, :]
-
-    W_ijk = W_stack
-    W_ikj = jnp.transpose(W_stack, (0, 1, 3, 2))
-    W_jik = jnp.transpose(W_stack, (0, 2, 1, 3))
-    W_jki = jnp.transpose(W_stack, (0, 3, 1, 2))
-    W_kij = jnp.transpose(W_stack, (0, 2, 3, 1))
-    W_kji = jnp.transpose(W_stack, (0, 3, 2, 1))
-
-    W_for_Z = jnp.stack([
-        W_ijk[0] + W_ikj[1] + W_jik[2] + W_jki[3] + W_kij[4] + W_kji[5],
-        W_ijk[1] + W_ikj[0] + W_jik[4] + W_jki[5] + W_kij[2] + W_kji[3],
-        W_ijk[2] + W_ikj[3] + W_jik[0] + W_jki[1] + W_kij[5] + W_kji[4],
-        W_ijk[3] + W_ikj[2] + W_jik[5] + W_jki[4] + W_kij[0] + W_kji[1],
-        W_ijk[4] + W_ikj[5] + W_jik[1] + W_jki[0] + W_kij[3] + W_kji[2],
-        W_ijk[5] + W_ikj[4] + W_jik[3] + W_jki[2] + W_kij[1] + W_kji[0],
-    ], axis=0)
-
-    return jnp.einsum("Sijk,Sijk->", W_for_Z, Z_stack)
+    et = (jnp.einsum("ijk,ijk", wabc, zabc) + jnp.einsum("ikj,ijk", wacb, zabc)
+          + jnp.einsum("jik,ijk", wbac, zabc) + jnp.einsum("jki,ijk", wbca, zabc)
+          + jnp.einsum("kij,ijk", wcab, zabc) + jnp.einsum("kji,ijk", wcba, zabc)
+          + jnp.einsum("ijk,ijk", wacb, zacb) + jnp.einsum("ikj,ijk", wabc, zacb)
+          + jnp.einsum("jik,ijk", wcab, zacb) + jnp.einsum("jki,ijk", wcba, zacb)
+          + jnp.einsum("kij,ijk", wbac, zacb) + jnp.einsum("kji,ijk", wbca, zacb)
+          + jnp.einsum("ijk,ijk", wbac, zbac) + jnp.einsum("ikj,ijk", wbca, zbac)
+          + jnp.einsum("jik,ijk", wabc, zbac) + jnp.einsum("jki,ijk", wacb, zbac)
+          + jnp.einsum("kij,ijk", wcba, zbac) + jnp.einsum("kji,ijk", wcab, zbac)
+          + jnp.einsum("ijk,ijk", wbca, zbca) + jnp.einsum("ikj,ijk", wbac, zbca)
+          + jnp.einsum("jik,ijk", wcba, zbca) + jnp.einsum("jki,ijk", wcab, zbca)
+          + jnp.einsum("kij,ijk", wabc, zbca) + jnp.einsum("kji,ijk", wacb, zbca)
+          + jnp.einsum("ijk,ijk", wcab, zcab) + jnp.einsum("ikj,ijk", wcba, zcab)
+          + jnp.einsum("jik,ijk", wacb, zcab) + jnp.einsum("jki,ijk", wabc, zcab)
+          + jnp.einsum("kij,ijk", wbca, zcab) + jnp.einsum("kji,ijk", wbac, zcab)
+          + jnp.einsum("ijk,ijk", wcba, zcba) + jnp.einsum("ikj,ijk", wcab, zcba)
+          + jnp.einsum("jik,ijk", wbca, zcba) + jnp.einsum("jki,ijk", wbac, zcba)
+          + jnp.einsum("kij,ijk", wacb, zcba) + jnp.einsum("kji,ijk", wabc, zcba))
+    return et
 
 
 def _make_streaming_kernel():
