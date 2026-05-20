@@ -74,6 +74,12 @@ from pytc.utils.gpu_pipeline import (
 
 logger = logging.getLogger(__name__)
 
+# Process-wide lock around slab-source reads. libhdf5 is not thread-safe in
+# the standard build; concurrent reads from multiple device workers can
+# trip race conditions inside the C library. The lock costs a few µs of
+# serialisation per slab fetch — negligible compared to the actual I/O.
+_SLAB_SOURCE_READ_LOCK = threading.Lock()
+
 
 def kernel(mycc, eris=None, t1=None, t2=None):
     """xTC-CCSD(T) energy correction.
@@ -638,18 +644,28 @@ class _SlabPrefetcher:
         self.evictions = 0
 
     def _load(self, idx):
-        # HDF5 reads are not Python-thread-safe for some builds; serialise on
-        # the executor (small worker count is fine — we want pipelining, not
-        # parallel HDF5 reads from a single dataset).
-        host = np.asarray(self.source[idx])
+        # HDF5 reads are not Python-thread-safe for some builds; serialise
+        # via _SLAB_SOURCE_READ_LOCK so concurrent device workers don't trip
+        # libhdf5's non-thread-safe code paths.
+        with _SLAB_SOURCE_READ_LOCK:
+            host = np.asarray(self.source[idx])
         if self.device is None:
             return jnp.asarray(host)
         return jax.device_put(host, self.device)
 
     def prefetch(self, idx):
-        """Issue a non-blocking load if ``idx`` is not already cached/pending."""
+        """Issue a non-blocking load if ``idx`` is not already cached/pending.
+
+        Throttled by ``max_cached``: the prefetch is dropped silently when
+        ``cache + pending`` already saturates the per-device budget. Without
+        this, the unbounded ``pending`` dict would let ``_enqueue_lookahead``
+        materialise the entire lookahead window of on-device slabs, blowing
+        past the user's HBM budget (see Critique 1 in ccsd_t_critiques.md).
+        """
         with self.lock:
             if idx in self.cache or idx in self.pending:
+                return
+            if len(self.cache) + len(self.pending) >= self.max_cached:
                 return
             self.pending[idx] = self.executor.submit(self._load, idx)
 
