@@ -58,8 +58,15 @@ def setup_logging(level=logging.INFO):
     # Prevent propagation to root logger to avoid double logging if root is also configured
     logger.propagate = False
 
-# Initialize logging when package is imported
-setup_logging()
+# Initialize logging when package is imported. Honor PYTC_LOG_LEVEL env var
+# so users can crank up verbosity from the shell without editing code:
+#   PYTC_LOG_LEVEL=DEBUG python my_script.py
+_env_level = os.environ.get("PYTC_LOG_LEVEL")
+if _env_level:
+    _level = getattr(logging, _env_level.upper(), logging.INFO)
+    setup_logging(level=_level)
+else:
+    setup_logging()
 
 # Log startup information for reproducibility (skip during Sphinx autodoc builds)
 if not os.environ.get("SPHINX_AUTODOC_BUILD"):
