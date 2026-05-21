@@ -76,6 +76,12 @@ class RCCSD(rccsd.RCCSD):
         if eris is None:
             eris = self.ao2mo()
         self.e_hf = self.get_e_hf(eris)
+        # Cache so a subsequent ccsd_t() call doesn't rebuild the (often
+        # 20-40 min) xTC ERIS from scratch. The HDF5-backed VVVV dataset
+        # stays open for the lifetime of `eris` — (T) doesn't read it
+        # anyway (only ovvv / ovoo / ovov / fock), but keeping the full
+        # object around is simpler than synthesising a (T)-only slice.
+        self.eris = eris
         return super().ccsd(t1, t2, eris, mbpt2)
 
     def ccsd_t(self, t1=None, t2=None, eris=None):
