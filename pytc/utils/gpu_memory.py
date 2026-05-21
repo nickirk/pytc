@@ -111,45 +111,127 @@ def estimate_persistent_gpu_bytes(nocc, nvir, include_eris=True,
 # Public API
 # ---------------------------------------------------------------------------
 
+def _query_nvml_bytes():
+    """Return ``(min_total, min_free)`` in bytes via NVML, or ``None`` on failure.
+
+    NVML reports the actual hardware HBM (e.g. 80 GiB on A100-80g, 192 GiB on
+    B200) regardless of which XLA allocator is active. This is the only
+    reliable source when ``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` is set —
+    the cuMallocAsync path doesn't preallocate, so JAX's ``bytes_limit`` is
+    ``0`` or meaningless.
+
+    Returns the minimum total/free across all local CUDA devices so the
+    block-size estimate is safe on the most-constrained card in the job.
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            n = pynvml.nvmlDeviceGetCount()
+            if n == 0:
+                return None
+            totals, frees = [], []
+            for i in range(n):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                mi = pynvml.nvmlDeviceGetMemoryInfo(h)
+                totals.append(int(mi.total))
+                frees.append(int(mi.free))
+            return min(totals), min(frees)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return None
+
+
+def _env_gpu_budget_bytes():
+    """Honor ``PYTC_GPU_BUDGET_GB`` env override (returns bytes or None)."""
+    import os
+    v = os.environ.get("PYTC_GPU_BUDGET_GB")
+    if not v:
+        return None
+    try:
+        return int(float(v) * 1024 ** 3)
+    except (ValueError, TypeError):
+        return None
+
+
+def _xla_mem_fraction():
+    """Honor ``XLA_PYTHON_CLIENT_MEM_FRACTION`` (default 0.75 — matches JAX BFC)."""
+    import os
+    v = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return 0.75
+
+
 def get_gpu_budget_bytes(gpu_max_memory_mb=None):
     """Return the total usable GPU memory budget in bytes.
 
-    If *gpu_max_memory_mb* is provided and > 0 it is treated as the
-    authoritative limit (no runtime query).  Otherwise the minimum
-    ``bytes_limit`` across all local devices is used, falling back to a
-    conservative 16 GiB default.
+    Resolution order (most-authoritative first):
 
-    Returns
-    -------
-    int
-        Total GPU budget in bytes.
+    1. ``gpu_max_memory_mb`` argument (if > 0).
+    2. ``PYTC_GPU_BUDGET_GB`` environment variable.
+    3. JAX ``bytes_limit`` if > 0 — this is the allocator's pool size and
+       already respects ``XLA_PYTHON_CLIENT_MEM_FRACTION``; the caller
+       reserved some HBM for other things on purpose, don't overcommit.
+    4. NVML hardware total × ``XLA_PYTHON_CLIENT_MEM_FRACTION`` (default
+       0.75). Only reached when JAX runs under ``ALLOCATOR=platform``
+       (cuMallocAsync), where ``bytes_limit`` is ``0`` because no pool
+       was preallocated.
+    5. 16 GiB conservative fallback.
+
+    Without (4), bouchet runs under ``ALLOCATOR=platform`` got `bytes_limit=0`
+    → JAX-pool path returned the 16 GiB fallback → tile budgets collapsed
+    to zero → `blk` auto-picked at the floor of 1.
     """
     if gpu_max_memory_mb is not None and gpu_max_memory_mb > 0:
         return int(gpu_max_memory_mb * 1024 ** 2)
 
+    env = _env_gpu_budget_bytes()
+    if env is not None:
+        return env
+
     try:
         import jax
         limits = [int(d.memory_stats()['bytes_limit'])
                   for d in jax.local_devices()]
-        return min(limits) if limits else 16 * 1024 ** 3
+        limits = [l for l in limits if l > 0]
+        if limits:
+            return min(limits)
     except Exception:
-        return 16 * 1024 ** 3  # 16 GiB fallback
+        pass
+
+    nvml = _query_nvml_bytes()
+    if nvml is not None:
+        return int(nvml[0] * _xla_mem_fraction())
+
+    return 16 * 1024 ** 3  # last-resort 16 GiB
 
 
 def _get_gpu_physical_bytes():
-    """Return the minimum GPU pool limit across all local devices.
+    """Minimum HBM total across local devices, in bytes.
 
-    Uses ``bytes_limit`` (JAX's pre-allocation pool) as a conservative proxy
-    for physical capacity.  Taking the minimum ensures that block-size
-    estimates are safe for the most memory-constrained device.
+    Prefers JAX ``bytes_limit`` (BFC pool) — that's the budget we're
+    actually allowed to use without stepping on other processes' reservations.
+    Falls back to NVML × XLA mem-fraction when JAX hasn't preallocated
+    (platform allocator), then to 80 GiB.
     """
     try:
         import jax
         limits = [int(d.memory_stats()['bytes_limit'])
                   for d in jax.local_devices()]
-        return min(limits) if limits else 80 * 1024 ** 3
+        limits = [l for l in limits if l > 0]
+        if limits:
+            return min(limits)
     except Exception:
-        return 80 * 1024 ** 3  # 80 GiB fallback (A100)
+        pass
+    nvml = _query_nvml_bytes()
+    if nvml is not None:
+        return int(nvml[0] * _xla_mem_fraction())
+    return 80 * 1024 ** 3
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +420,10 @@ def choose_orb_block_size(
 def _get_gpu_free_bytes():
     """Return the *currently free* GPU memory of the most-constrained local device.
 
-    Takes the minimum across all local devices so that tile sizing is
-    conservative for every GPU in the job, not just device 0.
-
-    Falls back to ``_get_gpu_physical_bytes() * 0.75`` if stats are unavailable.
+    Tries JAX's pool-aware accounting first (``pool_limit - bytes_in_use``);
+    if JAX is on the platform/cuMallocAsync allocator ``pool_limit`` is 0
+    and the result is meaningless — fall back to NVML's free-bytes query
+    (which works for any allocator).
     """
     try:
         import jax
@@ -353,14 +435,25 @@ def _get_gpu_free_bytes():
             free = max(pool_limit - in_use, 0)
             logger.debug(
                 "_get_gpu_free_bytes: device=%s pool_limit=%.2f GB, "
-                "in_use=%.2f GB, free=%.2f GB",
+                "in_use=%.2f GB, free=%.2f GB (JAX)",
                 getattr(d, 'id', repr(d)),
                 pool_limit / 1e9, in_use / 1e9, free / 1e9)
             if min_free is None or free < min_free:
                 min_free = free
-        return min_free if min_free is not None else int(_get_gpu_physical_bytes() * 0.75)
+        if min_free and min_free > 0:
+            return min_free
     except Exception:
-        return int(_get_gpu_physical_bytes() * 0.75)
+        pass
+
+    # JAX reported nothing usable (platform allocator). Ask NVML directly.
+    nvml = _query_nvml_bytes()
+    if nvml is not None:
+        _total, free = nvml
+        logger.debug(
+            "_get_gpu_free_bytes: NVML reports min_free=%.2f GB across devices",
+            free / 1e9)
+        return free
+    return int(_get_gpu_physical_bytes() * 0.75)
 
 
 def estimate_blksize(nocc, nvir, phase, *,
