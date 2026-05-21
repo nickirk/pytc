@@ -127,6 +127,24 @@ def kernel(mycc, eris=None, t1=None, t2=None):
                      "Choose one of: 'reference', 'multigpu', 'streaming', 'auto'.")
 
 
+def _resolve_gpu_max_mb(mycc):
+    """Return per-device HBM budget in MB, falling back to NVML when unset.
+
+    PySCF's ``CCSD`` base class doesn't set ``gpu_max_memory`` on the
+    object, so a bare ``mycc.ccsd_t()`` call would otherwise get the
+    conservative defaults inside the (T) kernel (replicated path even when
+    it's huge, ``min(nvir, 32)`` slab cache). Reuse the single source of
+    truth in ``pytc.utils.gpu_memory`` — its resolution order honors any
+    explicit override the user has set via env var or
+    ``XLA_PYTHON_CLIENT_MEM_FRACTION``.
+    """
+    explicit = getattr(mycc, "gpu_max_memory", None)
+    if explicit is not None and float(explicit) > 0:
+        return float(explicit)
+    from pytc.utils.gpu_memory import get_gpu_budget_bytes
+    return get_gpu_budget_bytes() / 1e6
+
+
 def _kernel_auto(mycc, eris, t1, t2):
     """Pick replicated vs streaming based on per-device HBM headroom.
 
@@ -142,11 +160,11 @@ def _kernel_auto(mycc, eris, t1, t2):
         return _kernel_reference(mycc, eris, t1, t2)
 
     per_dev_gb = _check_hbm_budget(nocc, nvir, n_devices)
-    gpu_max_mb = getattr(mycc, "gpu_max_memory", None)
-    if gpu_max_mb is not None and per_dev_gb * 1000 > 0.7 * float(gpu_max_mb):
+    gpu_max_mb = _resolve_gpu_max_mb(mycc)
+    if per_dev_gb * 1000 > 0.7 * gpu_max_mb:
         logger.info("xTC-(T) auto: replicated path needs %.1f GB/device but "
                     "gpu_max_memory=%.1f GB — using streaming.",
-                    per_dev_gb, float(gpu_max_mb) / 1000)
+                    per_dev_gb, gpu_max_mb / 1000)
         return _kernel_multigpu_streaming(mycc, eris, t1, t2)
     return _kernel_multigpu(mycc, eris, t1, t2)
 
@@ -984,22 +1002,15 @@ def _resolve_max_cached_slabs(mycc, nocc, nvir, n_partitions):
         + float(nocc) ** 3 * float(nvir) * 8          # vooo
         + 8 * float(nocc) * float(nvir) * 8           # smalls (generous)
     )
-    gpu_max_mb = getattr(mycc, "gpu_max_memory", None)
-    if gpu_max_mb is None:
-        # No budget hint — pick a sensible default that gives prefetch room
-        # for several triples ahead without ballooning unbounded.
-        default = min(nvir, 32)
-        logger.info("xTC-(T) streaming: cache cap defaulted to %d slabs "
-                    "(no gpu_max_memory set)", default)
-        return default
+    gpu_max_mb = _resolve_gpu_max_mb(mycc)
     # 60% of HBM for slabs, leaving headroom for compile artifacts +
     # transient JIT workspaces. The compute itself only needs a few
     # intermediates of size (nocc^3) — negligible compared to slab cache.
-    budget_bytes = 0.6 * float(gpu_max_mb) * 1e6 - accessory_bytes
+    budget_bytes = 0.6 * gpu_max_mb * 1e6 - accessory_bytes
     max_slabs = max(3, int(budget_bytes / slab_bytes))
     logger.info("xTC-(T) streaming: cache cap = %d slabs "
                 "(slab=%.1f MB, budget=%.1f GB/device)",
-                max_slabs, slab_bytes / 1e6, float(gpu_max_mb) / 1000)
+                max_slabs, slab_bytes / 1e6, gpu_max_mb / 1000)
     return max_slabs
 
 
