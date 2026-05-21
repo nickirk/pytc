@@ -35,6 +35,7 @@ from pytc.solver import jax_xtc_ccsd, xtc_ccsd  # noqa: F401  (kept for callers)
 from pytc.solver.jax_xtc_rintermediates import (
     _jax_make_ee_imds,
     _jax_eeccsd_matvec_singlet,
+    _jax_eeccsd_diag_singlet,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,21 +195,24 @@ class EOMEE(eom_rccsd.EOMEESinglet):
         return self.amplitudes_to_vector(np.asarray(s1), np.asarray(s2))
 
     def get_diag(self, imds=None):
-        """F-block diagonal preconditioner.
+        """Full singlet EOM-EE diagonal preconditioner.
 
-        Skips pyscf's :func:`eeccsd_diag`, which reaches for
-        ``eris.get_ovvv`` assuming triangular-packed storage. Pytc stores
-        ``ovvv`` unpacked (4D), so that path breaks. The simpler F-only
-        diagonal still gives a usable Davidson preconditioner — slightly
-        slower convergence vs. pyscf's full diag but correct eigenvalues.
+        Direct JAX port of pyscf's :func:`eeccsd_diag` (singlet path only),
+        reading pytc's natively-stored 4D ``ovvv`` / ``vvvv`` blocks instead
+        of pyscf's triangular-packed layout. Davidson with this preconditioner
+        finds the same subset of roots as stock pyscf EOMEE — important when
+        the spectrum has near-degenerate or doubles-dominant states the
+        simpler F-only diagonal would miss.
         """
         if imds is None:
             imds = self.make_imds()
-        Foo_diag = np.asarray(jnp.diag(imds.Foo))
-        Fvv_diag = np.asarray(jnp.diag(imds.Fvv))
-        eia = Fvv_diag[None, :] - Foo_diag[:, None]
-        eijab = (eia[:, None, :, None] + eia[None, :, None, :])
-        return self.amplitudes_to_vector(eia, eijab)
+        Hr1, Hr2 = _jax_eeccsd_diag_singlet(
+            imds._t1_jax, imds._t2_jax,
+            imds.Foo, imds.Fvv,
+            imds.woOoO, imds.woVVo, imds.woVvO,
+            imds._eris_ovov, imds._eris_ovvv, imds._eris_vvvv,
+        )
+        return self.amplitudes_to_vector(np.asarray(Hr1), np.asarray(Hr2))
 
 
 def eomee(cc, nroots=1, koopmans=False):

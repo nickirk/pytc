@@ -367,3 +367,76 @@ def _jax_eeccsd_matvec_singlet(
 
     Hr2 = Hr2 + Hr2.transpose(1, 0, 3, 2)
     return Hr1, Hr2
+
+
+# ---------------------------------------------------------------------------
+# Singlet EOM-EE diagonal preconditioner
+# ---------------------------------------------------------------------------
+#
+# Direct JAX port of the singlet portion of
+# ``pyscf.cc.eom_rccsd.eeccsd_diag`` (pyscf/cc/eom_rccsd.py:1559–1662),
+# stripped of the triplet and SF outputs. The pyscf reference uses
+# ``eris.get_ovvv(slice(p0,p1))`` which assumes triangular-packed storage;
+# pytc stores ``ovvv`` and ``vvvv`` as dense 4D arrays, so the corresponding
+# einsums work directly without the prange/unpack_tril dance.
+
+
+@jax.jit
+def _jax_eeccsd_diag_singlet(
+    t1, t2,
+    Foo, Fvv,
+    woOoO, woVVo, woVvO,
+    eris_ovov, eris_ovvv, eris_vvvv,
+):
+    """Diagonal of H̄ in the singlet (r1, r2) basis.
+
+    Returns ``(Hr1aa, Hr2ab)``; pack with
+    ``EOMEESinglet.amplitudes_to_vector`` to obtain the flat preconditioner
+    vector Davidson expects.
+    """
+    nocc = t1.shape[0]
+    nvir = t1.shape[1]
+
+    tau = _make_tau(t2, t1, t1)
+
+    # F-block diagonals (orbital energies dressed by t1,t2)
+    Fo = jnp.diag(Foo)
+    Fv = jnp.diag(Fvv)
+
+    # 2e Wov corrections to the singles diagonal
+    Wovab = jnp.einsum('iaai->ia', woVVo)
+    Wovaa = Wovab + jnp.einsum('iaai->ia', woVvO)
+
+    # eia[i,a] = Fv[a] − Fo[i]
+    eia = -Fo[:, None] + Fv[None, :]
+    Hr1aa = eia + Wovaa
+
+    # Doubles diagonal — ovov-derived blocks
+    ijb = jnp.einsum('iejb,ijeb->ijb', eris_ovov, t2)
+    jab = jnp.einsum('kajb,kjab->jab', eris_ovov, t2)
+
+    # Hr2ab[i,j,a,b] = −ijb[i,j,b] + Fv[a] − Fo[i] − jab[j,a,b]
+    Hr2ab = (-ijb)[:, :, None, :] + Fv[None, None, :, None]
+    Hr2ab = Hr2ab + (-Fo)[:, None, None, None] + (-jab)[None, :, :, :]
+
+    # Wov contributions to doubles diagonal
+    Hr2ab = Hr2ab + Wovaa[None, :, None, :]   # j,b axis
+    Hr2ab = Hr2ab + Wovab[:, None, None, :]   # i,b axis
+    # Singlet symmetry: r2[i,j,a,b] = r2[j,i,b,a]
+    Hr2ab = Hr2ab + Hr2ab.transpose(1, 0, 3, 2)
+
+    # Woooo contribution
+    Wooab = jnp.einsum('ijij->ij', woOoO)
+    Hr2ab = Hr2ab + Wooab[:, :, None, None]
+
+    # Wvvab contributions
+    Wvvab = jnp.einsum('mnab,manb->ab', tau, eris_ovov)
+    # ovvv contribution: tmp[a,b] = sum_m t1[m,b] * ovvv[m,b,a,a]
+    tmp = jnp.einsum('mb,mbaa->ab', t1, eris_ovvv)
+    Wvvab = Wvvab - tmp - tmp.T
+    # vvvv contribution: diagonal in the (a,b) sense
+    Wvvab = Wvvab + jnp.einsum('aabb->ab', eris_vvvv)
+
+    Hr2ab = Hr2ab + Wvvab[None, None, :, :]
+
+    return Hr1aa, Hr2ab
