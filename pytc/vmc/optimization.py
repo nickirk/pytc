@@ -1344,6 +1344,10 @@ def optimize_ref_var_multistate(
                 f"E: [{e_str}] | Acc: [{acc_str}] | "
                 f"|g|: {gnorm_f:.3f} | t: {elapsed:.1f}s"
             )
+            # Reset so subsequent entries show per-block wall time, not
+            # cumulative-since-opt-start (which silently absorbs the
+            # one-time JIT compilation cost on step 0).
+            t_start = time.time()
 
         # Periodic save
         if save_path and (opt_step + 1) % save_frequency == 0:
