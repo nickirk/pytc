@@ -1002,11 +1002,16 @@ def optimize_ref_var_multistate(
                     nested list — linear_coeffs_list is fixed)
     """
     n_states = len(ansatze)
-    if n_states < 2:
+    if n_states < 1:
         raise ValueError(
-            f"optimize_ref_var_multistate needs >=2 ansatze; got {n_states}. "
-            "Use optimize_ref_var for the single-state case."
+            f"optimize_ref_var_multistate needs >=1 ansatz; got {n_states}."
         )
+    # Note: n_states == 1 is a useful degenerate case — it lets us sample a
+    # SINGLE multi-determinantal ansatz from |Phi|^2 = |sum_i c_i D_i|^2 via
+    # MultiSlaterRef, whereas single-state ``optimize_ref_var`` samples from
+    # |D_0|^2 only. Used for validation: optimizing the same multi-det
+    # ansatz via both code paths must converge to the same eigenstate
+    # energy within statistical noise (zero-variance principle).
 
     # ---- Validate inputs ----
     j0 = ansatze[0].jastrow
