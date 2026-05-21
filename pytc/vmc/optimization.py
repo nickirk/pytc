@@ -40,7 +40,11 @@ from .metropolis import make_mcmc_step, make_mcmc_step_importance
 from .walker import initialize_walkers
 from .sampling import burn_in, burn_in_with_importance
 from .optimizer import create_optimizer, create_gradient_mask
-from .loss import make_energy_loss, make_variance_loss
+from .loss import (
+    make_energy_loss,
+    make_variance_loss,
+    make_state_averaged_variance_loss,
+)
 from .mcmc_utils import save_optimization_history
 
 logger = logging.getLogger(__name__)
@@ -895,12 +899,472 @@ def optimize_ref_var(
             logger.info(f"Saved intermediate optimization history to {save_path}")
     
     logger.info("Optimization complete!")
-    
-    
+
+
     return {
         "cost": np.array(losses),
         "energies": np.array(energies),
         "stds": np.array(stds),
         "acceptance": np.array(acceptances),
         "params": params_history
+    }
+
+
+# =============================================================================
+# State-averaged variance optimization (multi-state, shared Jastrow)
+# =============================================================================
+
+
+def optimize_ref_var_multistate(
+    ansatze,
+    linear_coeffs_list,
+    jastrow_params=None,
+    weights=None,
+    n_walkers: int = 30000,
+    n_mcmc_per_opt: int = 20,
+    step_size: float = 0.3,
+    burn_in_steps: int = 2000,
+    n_opt_steps: int = 1000,
+    optimizer_type: str = "adam",
+    learning_rate: float = 0.01,
+    max_vmap_batch_size: int = 0,
+    move_type: str = "all",
+    opt_kwargs: Optional[Dict[str, Any]] = None,
+    key=None,
+    save_frequency: int = 100,
+    save_path: Optional[str] = None,
+    clip_multiplier: float = 5.0,
+    grad_clip_norm: Optional[float] = 1.0,
+):
+    """State-averaged variance optimization of a SHARED Jastrow.
+
+    Minimizes ``L[J] = sum_n w_n Var_{Psi_n}[E_L]``, where each
+    ``Psi_n = J * Phi_n`` shares the same Jastrow ``J`` and Phi_n is a
+    FIXED linear combination of Slater determinants (e.g. a singlet-CIS
+    CSF whose coefficients are constrained by spin symmetry). Only the
+    Jastrow is optimized; per-state linear coefficients are constants.
+
+    The reduced parameter space (a single ``jastrow_params`` PyTree, no
+    nested per-state coefficient list) means this routine is a drop-in
+    replacement for single-state ``optimize_ref_var`` modulo the
+    multi-walker bookkeeping.
+
+    Each state n is sampled from its own walker population, distributed
+    as ``|Phi_n|^2 = |sum_i c_i^{(n)} D_i^{(n)}|^2`` (multi-det, no
+    Jastrow). At every optimization step we run ``n_mcmc_per_opt`` MCMC
+    sweeps per state, then compute the combined loss + gradients on the
+    JAX side and apply one optimizer update.
+
+    Args:
+        ansatze: list of ``SlaterJastrow``. All must share the same Jastrow
+            (Python identity).
+        linear_coeffs_list: list of arrays giving the fixed linear
+            coefficients for each state's determinant expansion. Must
+            satisfy ``len(linear_coeffs_list[n]) == len(ansatze[n].dets)``.
+            For a singlet-CIS CSF, this is ``[1/sqrt(2), 1/sqrt(2)]``.
+        jastrow_params: optional initial Jastrow parameter tree. If None,
+            uses ``ansatze[0].jastrow.init_params()``.
+        weights: optional per-state weights (default uniform).
+        n_walkers: TOTAL walker budget; split evenly across states.
+        n_mcmc_per_opt: MCMC sweeps between optimization updates (per state).
+        step_size: initial MCMC step size.
+        burn_in_steps: burn-in length per state.
+        n_opt_steps: number of optimization steps.
+        optimizer_type: Optax-style optimizer ("adam", "sgd", ...). Newton is
+            NOT yet supported in this multi-state path.
+        learning_rate: learning rate.
+        max_vmap_batch_size: forwarded to per-state variance losses.
+        move_type: "all" (default) or "one". The single-electron rank-1
+            update path in ``_one_electron_move`` only updates the first
+            determinant and computes the proposal psi from ``c_0 * D_0``
+            instead of ``sum_i c_i D_i`` — so it is INCORRECT for any
+            multi-determinant reference (e.g. CIS singlet CSFs). The
+            default ``"all"`` move type goes through the full multi-det
+            ansatz call and is statistically correct. Only override to
+            ``"one"`` if you know every ansatz is single-det (then the
+            fast rank-1 path is exact).
+        opt_kwargs: extra optimizer kwargs.
+        key: PRNG key.
+        save_frequency: history-save cadence (in opt steps).
+        save_path: optional HDF5 path for periodic history dumps.
+        clip_multiplier: per-state energy clipping (passed to variance loss).
+        grad_clip_norm: global-norm clip for gradients before the optimizer
+            step. Set to ``None`` to disable. Recommended ~1.0 for Adam to
+            tame occasional spikes from outlier walkers.
+
+    Returns:
+        Dictionary with arrays:
+            cost: combined loss per opt step
+            energies: shape (n_steps, n_states) — per-state mean E_L
+            stds: shape (n_steps, n_states) — per-state std of E_L
+            acceptance: shape (n_steps, n_states) — per-state pmove
+            params: list of jastrow_params snapshots (PyTree, not the
+                    nested list — linear_coeffs_list is fixed)
+    """
+    n_states = len(ansatze)
+    if n_states < 2:
+        raise ValueError(
+            f"optimize_ref_var_multistate needs >=2 ansatze; got {n_states}. "
+            "Use optimize_ref_var for the single-state case."
+        )
+
+    # ---- Validate inputs ----
+    j0 = ansatze[0].jastrow
+    for k, a in enumerate(ansatze[1:], start=1):
+        if a.jastrow is not j0:
+            raise ValueError(
+                f"ansatze[{k}].jastrow is a different Python object from "
+                f"ansatze[0].jastrow. The state-averaged optimizer requires "
+                f"all ansatze to share the SAME Jastrow instance so that "
+                f"jastrow_params is meaningful as a shared parameter."
+            )
+    if len(linear_coeffs_list) != n_states:
+        raise ValueError(
+            f"linear_coeffs_list has length {len(linear_coeffs_list)}, "
+            f"but n_states = {n_states}."
+        )
+    for n, (a, lc) in enumerate(zip(ansatze, linear_coeffs_list)):
+        if len(lc) != len(a.dets):
+            raise ValueError(
+                f"state {n}: linear_coeffs_list has length {len(lc)} but "
+                f"ansatze[{n}].dets has length {len(a.dets)}."
+            )
+
+    if key is None:
+        key = random.PRNGKey(int(time.time()))
+    if opt_kwargs is None:
+        opt_kwargs = {}
+
+    use_newton = optimizer_type.lower() == "newton"
+    newton_damping = float(opt_kwargs.get("damping", 1e-3)) if use_newton else None
+
+    # ---- Walker budget per state ----
+    n_walkers_per_state = n_walkers // n_states
+    if n_walkers_per_state * n_states != n_walkers:
+        logger.info(
+            f"n_walkers={n_walkers} not divisible by n_states={n_states}; "
+            f"using {n_walkers_per_state} walkers per state "
+            f"(total {n_walkers_per_state * n_states})."
+        )
+
+    # ---- Default Jastrow params ----
+    if jastrow_params is None:
+        jastrow_params = j0.init_params()
+
+    # ---- Convert linear_coeffs_list to jnp constants ----
+    linear_coeffs_list = [jnp.asarray(lc) for lc in linear_coeffs_list]
+
+    # ---- Build per-state multi-det references (sampling distribution) ----
+    # For multi-det CSFs (e.g. singlet CIS), sampling from |D_0|^2 alone
+    # misses the inter-determinant interference and uses the wrong nodal
+    # surface. The correct reference distribution is the multi-det
+    # |sum_i c_i D_i|^2 — implemented by MultiSlaterRef, which ignores the
+    # Jastrow params. For single-det ground states this reduces to |D_0|^2.
+    from pytc.ansatz.sj import MultiSlaterRef
+    refs = [MultiSlaterRef.from_dets(ans.dets) for ans in ansatze]
+
+    # ---- Initialize walker populations (one per state) ----
+    logger.info(
+        f"Initializing {n_states} walker populations × "
+        f"{n_walkers_per_state} walkers each."
+    )
+    walkers_list = []
+    step_sizes = []
+    for n, ans in enumerate(ansatze):
+        key, subkey = random.split(key)
+        ref_n = refs[n]
+        w_n = initialize_walkers(ref_n, n_walkers_per_state, None, subkey)
+        # Burn-in: MultiSlaterRef.__call__ takes [jastrow_params, linear_coeffs]
+        # in its `params` argument and reads ONLY the linear coeffs (Jastrow
+        # is ignored by the reference). We supply jastrow_params here just to
+        # match the expected PyTree signature.
+        params_n = [jastrow_params, linear_coeffs_list[n]]
+        logger.info(f"  burn-in state {n} ({burn_in_steps} steps)...")
+        w_n, _, key, sz_n = burn_in(
+            ref_n, w_n, burn_in_steps, step_size, key,
+            params=params_n,
+            move_type=move_type,
+            max_vmap_batch_size=max_vmap_batch_size,
+            mesh=None,
+        )
+        walkers_list.append(w_n)
+        step_sizes.append(sz_n)
+
+    logger.info(
+        "Burn-in done. Step sizes per state: "
+        + ", ".join(f"{float(s):.3f}" for s in step_sizes)
+    )
+
+    # ---- Build per-state MCMC steps ----
+    # Captured ansatz = MultiSlaterRef (multi-det, no Jastrow).
+    mcmc_steps = []
+    for n, ans in enumerate(ansatze):
+        mcmc_n = make_mcmc_step(
+            refs[n], step_sizes[n], move_type,
+            max_vmap_batch_size=max_vmap_batch_size, mesh=None,
+        )
+        mcmc_steps.append(mcmc_n)
+
+    # ---- Build combined loss + gradient ----
+    # Loss signature: (jastrow_params, walkers_list) -> (scalar, aux)
+    loss_fn = make_state_averaged_variance_loss(
+        ansatze=ansatze,
+        linear_coeffs_list=linear_coeffs_list,
+        weights=weights,
+        optimizer_type=optimizer_type,
+        use_custom_jvp=True,
+        max_vmap_batch_size=max_vmap_batch_size,
+        clip_multiplier=clip_multiplier,
+    )
+    loss_and_grad = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+
+    if use_newton:
+        # ---- Multistate Gauss-Newton step ----
+        # Combined curvature G = sum_n w_n * G_n and gradient g = sum_n w_n
+        # * g_n on the same parameter space (jastrow_params). One solve per
+        # opt step. Per-state Jacobian / local-energy computations are JITted
+        # in build_per_state_gn().
+        if weights is None:
+            w_arr = np.ones(n_states) / n_states
+        else:
+            w_arr_raw = np.asarray(weights, dtype=np.float64)
+            w_arr = w_arr_raw / w_arr_raw.sum()
+
+        # Pre-flatten the Jastrow PyTree to get the unravel_fn (static).
+        _, unravel_fn = jax.flatten_util.ravel_pytree(jastrow_params)
+        n_params_flat = jax.flatten_util.ravel_pytree(jastrow_params)[0].shape[0]
+
+        def make_per_state_gn(ansatz_n, linear_coeffs_n):
+            """Returns a JIT'd function computing (G_n, g_n, e_mean_n, e_std_n)
+            for state n on its walker batch.
+
+            Math (per state):
+                E_i  = E_L(w_i; J, c_n)
+                J_ip = d E_L(w_i; J, c_n) / d J_p              (Jacobian)
+                E_clipped = clip(E_i, mean ± clip_mul * MAD)
+                E_diff = E_clipped - mean(E_clipped)
+                J_centered = J - mean_walker(J)
+                g_n = 2/(N-1) * J^T @ E_diff
+                G_n = 2/N * J_centered^T @ J_centered
+            """
+            def single_le_and_grad(w, jp):
+                params_n = [jp, linear_coeffs_n]
+                def le_of_j(j_inner):
+                    p_inner = [j_inner, linear_coeffs_n]
+                    return ansatz_n.local_energy(w, p_inner)[0]
+                return jax.value_and_grad(le_of_j)(jp)
+
+            def per_state(jp, walkers_n):
+                vmap_fn = jax.vmap(single_le_and_grad, in_axes=(0, None))
+                e_vec, j_tree = vmap_fn(walkers_n, jp)
+                # Flatten Jacobian into (N, P)
+                j_flat_leaves, _ = jax.tree_util.tree_flatten(j_tree)
+                jac_mat = jnp.concatenate(
+                    [jnp.reshape(leaf, (e_vec.shape[0], -1))
+                     for leaf in j_flat_leaves],
+                    axis=1,
+                )
+                # Clip energies (same MAD-based scheme as single-state)
+                if clip_multiplier > 0:
+                    e_mean_raw = jnp.mean(e_vec)
+                    e_mad = jnp.mean(jnp.abs(e_vec - e_mean_raw))
+                    e_lo = e_mean_raw - clip_multiplier * e_mad
+                    e_hi = e_mean_raw + clip_multiplier * e_mad
+                    e_vec = jnp.clip(e_vec, e_lo, e_hi)
+                n_w = e_vec.shape[0]
+                e_mean = jnp.mean(e_vec)
+                e_std = jnp.std(e_vec)
+                e_diff = e_vec - e_mean
+                variance_n = jnp.sum(e_diff * e_diff) / (n_w - 1)
+                g_n_vec = (2.0 / (n_w - 1)) * (jac_mat.T @ e_diff)
+                jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
+                G_n_mat = (2.0 / n_w) * (jac_centered.T @ jac_centered)
+                return variance_n, g_n_vec, G_n_mat, e_mean, e_std
+
+            return jax.jit(per_state)
+
+        per_state_gn_fns = [
+            make_per_state_gn(ansatze[n], linear_coeffs_list[n])
+            for n in range(n_states)
+        ]
+
+        def newton_opt_step(jastrow_params, walkers_list_in):
+            # Per-state contributions
+            total_loss = 0.0
+            g_total = jnp.zeros(n_params_flat, dtype=jnp.float64)
+            G_total = jnp.zeros(
+                (n_params_flat, n_params_flat), dtype=jnp.float64
+            )
+            e_means = []
+            e_stds = []
+            for n in range(n_states):
+                var_n, g_n_vec, G_n_mat, em, es = per_state_gn_fns[n](
+                    jastrow_params, walkers_list_in[n]
+                )
+                w_n = float(w_arr[n])
+                total_loss = total_loss + w_n * var_n
+                g_total = g_total + w_n * g_n_vec
+                G_total = G_total + w_n * G_n_mat
+                e_means.append(em)
+                e_stds.append(es)
+            # Damped solve
+            G_damped = G_total + newton_damping * jnp.eye(n_params_flat)
+            delta_vec = jax.scipy.linalg.solve(
+                G_damped, -g_total, assume_a="pos"
+            )
+            # Diagnostic: raw gradient norm BEFORE damping (no clip applied)
+            grad_norm = jnp.linalg.norm(g_total)
+            # Apply update
+            lr = float(learning_rate)
+            delta_pytree = unravel_fn(delta_vec)
+            new_jastrow_params = jax.tree_util.tree_map(
+                lambda p, d: p + lr * d, jastrow_params, delta_pytree
+            )
+            aux = (jnp.stack(e_means), jnp.stack(e_stds))
+            return new_jastrow_params, total_loss, aux, grad_norm
+
+        opt_update_step_jit = newton_opt_step  # already JIT'd internally
+        opt_state = None  # unused for Newton
+    else:
+        # Optax path (Adam, SGD, RMSprop, ...)
+        base_optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            # Compose global-norm gradient clipping BEFORE the base optimizer
+            # so that catastrophic single-step spikes in the noisy variance
+            # gradient cannot derail Adam (which has no inherent step-size
+            # regulation, unlike Newton/Gauss-Newton).
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(grad_clip_norm),
+                base_optimizer,
+            )
+        else:
+            optimizer = base_optimizer
+        opt_state = optimizer.init(jastrow_params)
+
+        # ---- Combined opt step (JIT'd) ----
+        def opt_update_step(jastrow_params, walkers_list_in, opt_state):
+            (loss, aux_data), grads = loss_and_grad(
+                jastrow_params, walkers_list_in
+            )
+            # Diagnostic: raw gradient norm BEFORE the clip-by-global-norm
+            # transformation. Actual clipping is applied inside `optimizer`.
+            grad_leaves = jax.tree_util.tree_leaves(grads)
+            grad_norm = jnp.sqrt(sum(jnp.sum(g * g) for g in grad_leaves))
+            updates, opt_state = optimizer.update(
+                grads, opt_state, jastrow_params
+            )
+            new_jastrow_params = optax.apply_updates(jastrow_params, updates)
+            return new_jastrow_params, opt_state, loss, aux_data, grad_norm
+
+        opt_update_step_jit = jax.jit(opt_update_step)
+
+    # ---- Per-state MCMC sweep (JIT'd separately per state) ----
+    # The mcmc_step has the MultiSlaterRef captured at factory time and
+    # ignores its runtime ansatz argument, but pass `refs[n]` for clarity.
+    def make_mcmc_sweep(mcmc_step_n, ref_n, n_sweeps):
+        def sweep(walkers, key_in, params_n):
+            def scan_body(carry, _):
+                w_c, k_c = carry
+                k_c, sk = random.split(k_c)
+                w_c, pmv = mcmc_step_n(ref_n, w_c, sk, params_n)
+                return (w_c, k_c), pmv
+            (walkers, key_in), pmoves = jax.lax.scan(
+                scan_body, (walkers, key_in), None, length=n_sweeps
+            )
+            return walkers, key_in, jnp.mean(pmoves)
+        return jax.jit(sweep)
+
+    mcmc_sweeps = [
+        make_mcmc_sweep(mcmc_steps[n], refs[n], n_mcmc_per_opt)
+        for n in range(n_states)
+    ]
+
+    # ---- History ----
+    losses = []
+    energies_history = []      # list of arrays shape (n_states,)
+    stds_history = []          # list of arrays shape (n_states,)
+    acceptance_history = []    # list of arrays shape (n_states,)
+    params_history = []
+
+    logger.info(f"Starting state-averaged optimization "
+                f"({n_states} states, lr={learning_rate}, "
+                f"{n_opt_steps} steps)...")
+
+    t_start = time.time()
+    for opt_step in range(n_opt_steps):
+        # MCMC: refresh each state's walkers (sampled from |Phi_n|^2 via
+        # MultiSlaterRef; the linear coeffs come from linear_coeffs_list).
+        pmoves_step = []
+        for n in range(n_states):
+            key, subkey = random.split(key)
+            params_n = [jastrow_params, linear_coeffs_list[n]]
+            walkers_list[n], _, pmv = mcmc_sweeps[n](
+                walkers_list[n], subkey, params_n
+            )
+            pmoves_step.append(pmv)
+
+        # Optimization step on combined loss (Newton vs Adam dispatch)
+        if use_newton:
+            jastrow_params, loss_val, aux, grad_norm = opt_update_step_jit(
+                jastrow_params, walkers_list
+            )
+        else:
+            jastrow_params, opt_state, loss_val, aux, grad_norm = opt_update_step_jit(
+                jastrow_params, walkers_list, opt_state
+            )
+
+        # Record
+        loss_f = float(jax.device_get(loss_val))
+        e_means, e_stds = aux
+        e_means_np = np.array(jax.device_get(e_means))
+        e_stds_np = np.array(jax.device_get(e_stds))
+        pmoves_np = np.array([float(jax.device_get(p)) for p in pmoves_step])
+        gnorm_f = float(jax.device_get(grad_norm))
+
+        losses.append(loss_f)
+        energies_history.append(e_means_np)
+        stds_history.append(e_stds_np)
+        acceptance_history.append(pmoves_np)
+
+        # Only the Jastrow params evolve; record those.
+        jastrow_copy = tree_map(
+            lambda x: np.array(jax.device_get(x)) if isinstance(x, jnp.ndarray) else x,
+            jastrow_params,
+        )
+        params_history.append(jastrow_copy)
+
+        # Logging cadence
+        if (opt_step % max(1, n_opt_steps // 200) == 0
+                or opt_step == n_opt_steps - 1):
+            e_str = " ".join(f"{e:+.4f}" for e in e_means_np)
+            acc_str = " ".join(f"{p:.2f}" for p in pmoves_np)
+            elapsed = time.time() - t_start
+            logger.info(
+                f"Step {opt_step:5d} | L: {loss_f:.5f} | "
+                f"E: [{e_str}] | Acc: [{acc_str}] | "
+                f"|g|: {gnorm_f:.3f} | t: {elapsed:.1f}s"
+            )
+
+        # Periodic save
+        if save_path and (opt_step + 1) % save_frequency == 0:
+            current = {
+                "cost": np.array(losses),
+                "energies": np.stack(energies_history),       # (steps, n_states)
+                "stds": np.stack(stds_history),
+                "acceptance": np.stack(acceptance_history),
+                "params": params_history,
+            }
+            save_optimization_history(current, save_path)
+            logger.info(f"Saved multistate history to {save_path}")
+
+    logger.info("State-averaged optimization complete.")
+
+    return {
+        "cost": np.array(losses),
+        "energies": np.stack(energies_history),
+        "stds": np.stack(stds_history),
+        "acceptance": np.stack(acceptance_history),
+        "params": params_history,            # jastrow_params snapshots (PyTree)
+        "linear_coeffs": [np.array(lc) for lc in linear_coeffs_list],
+        "n_states": n_states,
     }

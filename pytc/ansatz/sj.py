@@ -5,7 +5,127 @@ import jax.numpy as jnp
 from typing import List, Any
 from flax import struct
 
-from pytc.ansatz.det import SlaterDet, value_and_grad, grad 
+from pytc.ansatz.det import SlaterDet, value_and_grad, grad
+
+
+@struct.dataclass
+class MultiSlaterRef:
+    """Linear combination of Slater determinants, WITHOUT a Jastrow factor.
+
+    Used as the **fixed-form reference distribution** for VMC sampling of
+    multi-determinant CSFs (e.g. singlet CIS states built as
+    (1/sqrt(2)) (D_{ia->aa} + D_{ib->ab})).
+
+    The walker distribution is the correct quantum density
+        |Psi_ref|^2 = |sum_i c_i D_i(R)|^2
+    of the multi-det reference, including the inter-determinant
+    interference term Re(D_i^* D_j) — which the single-det
+    ``ansatz.dets[0]`` reference would have missed.
+
+    The linear coefficients c_i are read from ``params[1]`` at call time
+    (so they update continuously alongside the Jastrow during state-averaged
+    optimization). The Jastrow params ``params[0]`` are accepted from the
+    call signature but ignored: this object intentionally has no Jastrow.
+
+    For a single-determinant case (len(dets) == 1) this reduces to the
+    standard ``SlaterDet`` reference up to the trivial scalar factor c_0.
+    """
+    dets: List[SlaterDet]
+
+    @classmethod
+    def from_dets(cls, dets):
+        return cls(dets=list(dets))
+
+    # Attributes that walker init / metropolis machinery reads off the ref:
+    @property
+    def n_electrons(self):
+        return self.dets[0].n_electrons
+
+    @property
+    def n_alpha(self):
+        return self.dets[0].n_alpha
+
+    @property
+    def n_beta(self):
+        return self.dets[0].n_beta
+
+    @property
+    def atom_coords(self):
+        return self.dets[0].atom_coords
+
+    @property
+    def atom_charges(self):
+        return self.dets[0].atom_charges
+
+    @property
+    def mol_gto(self):
+        return self.dets[0].mol_gto
+
+    @property
+    def eval_ao_func(self):
+        return self.dets[0].eval_ao_func
+
+    @property
+    def alpha_occ(self):
+        return self.dets[0].alpha_occ
+
+    @property
+    def beta_occ(self):
+        return self.dets[0].beta_occ
+
+    @property
+    def unrestricted(self):
+        return self.dets[0].unrestricted
+
+    def __call__(self, walker, params):
+        return eval_multi_slater_ref(self, walker, params)
+
+
+def eval_multi_slater_ref(ms_ref, walker, params):
+    """Evaluate Psi_ref(R) = sum_i c_i * D_i(R) for a single walker.
+
+    Mirrors ``eval_sj`` minus the Jastrow contribution. Returns the same
+    ((sign, log|Psi|), updated_walker) tuple the metropolis kernel expects,
+    with ``log_jastrow`` set to 0 on the returned walker (no Jastrow here).
+
+    Args:
+        ms_ref: ``MultiSlaterRef`` ansatz.
+        walker: single Walker dataclass instance.
+        params: ``[jastrow_params, linear_coeffs]``. ``jastrow_params`` is
+            accepted but ignored; ``linear_coeffs`` (length == len(dets))
+            sets the linear combination.
+
+    Returns:
+        ((psi_sign, psi_logabs), updated_walker)
+    """
+    _jastrow_params, linear_coeffs = params
+
+    if len(ms_ref.dets) == 1:
+        det_val, final_walker = value_and_grad(ms_ref.dets[0], walker)
+        det_sign, det_logabs = det_val
+        psi_sign = jnp.sign(linear_coeffs[0]) * det_sign
+        psi_logabs = jnp.log(jnp.abs(linear_coeffs[0])) + det_logabs
+    else:
+        det_vals_list = []
+        final_walker = None
+        for i, det in enumerate(ms_ref.dets):
+            det_val, uw = value_and_grad(det, walker)
+            det_sign, det_logabs = det_val
+            det_vals_list.append(det_sign * jnp.exp(det_logabs))
+            if i == 0:
+                final_walker = uw
+
+        det_vals_array = jnp.array(det_vals_list)
+        linear_combo = jnp.sum(linear_coeffs * det_vals_array)
+        psi_sign = jnp.sign(linear_combo)
+        psi_logabs = jnp.log(jnp.abs(linear_combo) + 1e-100)
+
+    final_walker = final_walker.replace(
+        log_psi=psi_logabs,
+        psi_sign=psi_sign,
+        log_jastrow=jnp.zeros_like(psi_logabs),  # no Jastrow in the reference
+    )
+    return (psi_sign, psi_logabs), final_walker
 
 @struct.dataclass
 class SlaterJastrow:

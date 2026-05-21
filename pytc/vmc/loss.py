@@ -425,9 +425,127 @@ def make_variance_loss(
             # Sample variance: sum((E - <E>)^2) / (n - 1)
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
-            
+
             return variance, (e_mean, jnp.std(energies))
-        
+
         return loss_fn
 
 
+def make_state_averaged_variance_loss(
+    ansatze,
+    linear_coeffs_list,
+    weights=None,
+    optimizer_type: str = "adam",
+    use_custom_jvp: bool = True,
+    max_vmap_batch_size: int = 0,
+    clip_multiplier: float = 5.0,
+    mesh: Optional[jax.sharding.Mesh] = None,
+):
+    """Factory for state-averaged variance loss with JASTROW-ONLY parameters.
+
+    The loss is
+
+        L[J] = sum_n w_n * Var_{Psi_n}[E_L]
+
+    where {Psi_n = J * Phi_n} is a list of wavefunctions sharing the same
+    Jastrow factor J. Each Phi_n is built from a FIXED linear combination of
+    Slater determinants — for example, a singlet-CIS CSF whose coefficients
+    (1/sqrt 2, 1/sqrt 2) are fixed by spin symmetry. Only ``jastrow_params``
+    is optimized; the per-state linear coefficients are constants captured
+    here at factory time.
+
+    With params reduced to a single PyTree (``jastrow_params``), the
+    resulting loss is a drop-in target for any Optax optimizer or the
+    in-tree ``NewtonOptimizer`` (curvature="gauss_newton") just as in the
+    single-state ``optimize_ref_var`` code path.
+
+    Each Psi_n is sampled from its own walker population (each following
+    |Phi_n(R)|^2 = |sum_i c_i^{(n)} D_i^{(n)}(R)|^2, the correct multi-det
+    reference distribution without the Jastrow), so ``batch_data`` is a
+    list of walker objects, one per state.
+
+    Args:
+        ansatze: list of ``SlaterJastrow``. All must share the same Jastrow
+            object so that ``jastrow_params`` is meaningful as a shared
+            parameter.
+        linear_coeffs_list: list of arrays, one per state, of fixed linear
+            coefficients for the Slater dets in each ``ansatze[n].dets``.
+            ``len(linear_coeffs_list[n]) == len(ansatze[n].dets)``.
+        weights: optional per-state weights. Defaults to uniform.
+            Internally normalized to sum to 1.
+        optimizer_type: passed to ``make_variance_loss`` (kept for parity).
+        use_custom_jvp: whether to use custom-JVP variance loss per state.
+        max_vmap_batch_size: forwarded to ``make_variance_loss``.
+        clip_multiplier: energy-clipping range (per state).
+        mesh: optional device mesh.
+
+    Returns:
+        ``loss_fn(jastrow_params, batch_data) -> (combined_variance,
+        (mean_E_per_state, std_E_per_state))``, where ``batch_data`` is the
+        per-state walker list.
+    """
+    n_states = len(ansatze)
+    if len(linear_coeffs_list) != n_states:
+        raise ValueError(
+            f"linear_coeffs_list has {len(linear_coeffs_list)} entries; "
+            f"expected {n_states} (one per ansatz)."
+        )
+    for n, (a, lc) in enumerate(zip(ansatze, linear_coeffs_list)):
+        if len(lc) != len(a.dets):
+            raise ValueError(
+                f"state {n}: linear_coeffs_list[{n}] has length {len(lc)} "
+                f"but ansatze[{n}].dets has length {len(a.dets)}."
+            )
+
+    if weights is None:
+        weights_arr = jnp.ones(n_states) / n_states
+    else:
+        weights_arr = jnp.asarray(weights, dtype=jnp.float64)
+        weights_arr = weights_arr / jnp.sum(weights_arr)
+
+    # Capture the per-state linear coefficients as constants (jnp arrays
+    # held in the closure). This lifts them out of the params PyTree.
+    linear_coeffs_const = [jnp.asarray(lc) for lc in linear_coeffs_list]
+
+    # Build one variance loss per state. Each closes over its own ansatz.
+    per_state_losses = [
+        make_variance_loss(
+            ansatz=a,
+            optimizer_type=optimizer_type,
+            use_custom_jvp=use_custom_jvp,
+            max_vmap_batch_size=max_vmap_batch_size,
+            clip_multiplier=clip_multiplier,
+            mesh=mesh,
+        )
+        for a in ansatze
+    ]
+
+    def loss_fn(jastrow_params, batch_data):
+        """Combined state-averaged variance loss (Jastrow only).
+
+        Args:
+            jastrow_params: shared Jastrow parameter tree.
+            batch_data: list of per-state walker batches (length n_states).
+
+        Returns:
+            combined_loss: ``sum_n w_n * Var_n``.
+            aux: ``(jnp.stack(mean_energies), jnp.stack(stds))``.
+        """
+        total_loss = 0.0
+        e_means = []
+        e_stds = []
+        for n in range(n_states):
+            # Reconstruct the [jastrow, linear_coeffs] PyTree that the
+            # underlying single-state variance loss expects, with the per-
+            # state linear coeffs supplied as a constant (NOT differentiated).
+            params_n = [jastrow_params, linear_coeffs_const[n]]
+            var_n, (e_mean_n, e_std_n) = per_state_losses[n](
+                params_n, batch_data[n]
+            )
+            total_loss = total_loss + weights_arr[n] * var_n
+            e_means.append(e_mean_n)
+            e_stds.append(e_std_n)
+
+        return total_loss, (jnp.stack(e_means), jnp.stack(e_stds))
+
+    return loss_fn
