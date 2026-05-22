@@ -203,19 +203,66 @@ def _kernel_reference(mycc, eris, t1, t2):
     ovoo = np.asarray(eris.ovoo)            # (i, a, j, k)
     ovov = np.asarray(eris.ovov)            # (i, a, j, b)
 
-    # Layout transforms matching ccsd_t_slow (without .conj() for non-Hermitian).
-    eris_vvov = ovvv.transpose(1, 3, 0, 2)  # (a, c, i, b)  — get_w 1st term uses [a,b,i,f]
-    eris_vooo = ovoo.transpose(1, 0, 2, 3)  # (a, i, j, k)
-    eris_vvoo = ovov.transpose(1, 3, 0, 2)  # (a, b, i, j)
+    # ------------------------------------------------------------------
+    # Non-Hermitian xTC: two ERI access patterns are needed.
+    #
+    # PySCF's `ccsd_t_slow` builds three layouts via .conj().transpose(...)
+    # on ovvv/ovoo/ovov. For Hermitian eris .conj() is identity (real),
+    # but the *structural role* is that the (T) energy formula pairs a
+    # "right" W (built from H̃ acting on |Φ_{ijk}^{abc}>) with a "left" Z
+    # (built from H̃ acting on |T̂2 Φ_0> on the bra side).
+    #
+    # For Hermitian H, the right-side and left-side ERI blocks coincide
+    # and PySCF gets away with a single integral set + .conj() = identity.
+    # For non-Hermitian xTC, in-pair-swap is broken — the left side wants
+    # the .conj()-partner block, which corresponds to the genuine
+    # vovv/vooo/vovo xTC blocks under a different permutation.
+    #
+    # Under the simplification that left and right t-amplitudes coincide
+    # (t̄ ≈ t̃, an approximation; the rigorous treatment in Mörchen et al.
+    # 2025 (arXiv:2408.07858) needs a separate Λ-CCSD solve), the
+    # energy becomes E(T) = (1/36) Σ W_R · Z_L where:
+    #   - W_R is built from "right" eris (ovvv/ovoo/ovov.transpose(...))
+    #   - W_L is built from "left"  eris (vovv/vooo/vovo.transpose(...))
+    #   - Z_L = R3(W_L + V_L/2) / D
+    # For Hermitian eris this collapses back to the PySCF reference.
+    # ------------------------------------------------------------------
+    eris_vvov_R = ovvv.transpose(1, 3, 0, 2)  # (a, c, i, b), value (ia|fb)_R
+    eris_vooo_R = ovoo.transpose(1, 0, 2, 3)
+    eris_vvoo_R = ovov.transpose(1, 3, 0, 2)
+    # Left-side blocks: prefer the genuine xTC dual blocks (vovv, vooo,
+    # vovo). For plain PySCF (Hermitian) eris these aren't there — fall
+    # back to the same R blocks, which under Hermitian symmetry give an
+    # equal value. That keeps the unit tests against PySCF passing.
+    if (getattr(eris, "vovv", None) is not None
+            and getattr(eris, "vooo", None) is not None
+            and getattr(eris, "vovo", None) is not None):
+        eris_vvov_L = np.asarray(eris.vovv).transpose(0, 2, 1, 3)
+        eris_vooo_L = np.asarray(eris.vooo).transpose(0, 1, 3, 2)
+        eris_vvoo_L = np.asarray(eris.vovo).transpose(0, 2, 1, 3)
+    else:
+        eris_vvov_L = eris_vvov_R
+        eris_vooo_L = eris_vooo_R
+        eris_vvoo_L = eris_vvoo_R
     fvo = eris.fock[nocc:, :nocc]
 
-    def get_w(a, b, c):
-        w = np.einsum("if,fkj->ijk", eris_vvov[a, b], t2T[c, :])
-        w -= np.einsum("ijm,mk->ijk", eris_vooo[a, :], t2T[b, c])
+    def get_w_R(a, b, c):
+        w = np.einsum("if,fkj->ijk", eris_vvov_R[a, b], t2T[c, :])
+        w -= np.einsum("ijm,mk->ijk", eris_vooo_R[a, :], t2T[b, c])
         return w
 
-    def get_v(a, b, c):
-        v = np.einsum("ij,k->ijk", eris_vvoo[a, b], t1T[c])
+    def get_w_L(a, b, c):
+        w = np.einsum("if,fkj->ijk", eris_vvov_L[a, b], t2T[c, :])
+        w -= np.einsum("ijm,mk->ijk", eris_vooo_L[a, :], t2T[b, c])
+        return w
+
+    def get_v_R(a, b, c):
+        v = np.einsum("ij,k->ijk", eris_vvoo_R[a, b], t1T[c])
+        v += np.einsum("ij,k->ijk", t2T[a, b], fvo[c])
+        return v
+
+    def get_v_L(a, b, c):
+        v = np.einsum("ij,k->ijk", eris_vvoo_L[a, b], t1T[c])
         v += np.einsum("ij,k->ijk", t2T[a, b], fvo[c])
         return v
 
@@ -229,62 +276,69 @@ def _kernel_reference(mycc, eris, t1, t2):
                 elif a == b or b == c:
                     d3 *= 2
 
-                wabc = get_w(a, b, c); wacb = get_w(a, c, b)
-                wbac = get_w(b, a, c); wbca = get_w(b, c, a)
-                wcab = get_w(c, a, b); wcba = get_w(c, b, a)
-                vabc = get_v(a, b, c); vacb = get_v(a, c, b)
-                vbac = get_v(b, a, c); vbca = get_v(b, c, a)
-                vcab = get_v(c, a, b); vcba = get_v(c, b, a)
+                # Right-side W (and V) — used as the bra of the 36-term
+                # energy contraction.
+                wabc_R = get_w_R(a, b, c); wacb_R = get_w_R(a, c, b)
+                wbac_R = get_w_R(b, a, c); wbca_R = get_w_R(b, c, a)
+                wcab_R = get_w_R(c, a, b); wcba_R = get_w_R(c, b, a)
 
-                zabc = _r3(wabc + 0.5 * vabc) / d3
-                zacb = _r3(wacb + 0.5 * vacb) / d3
-                zbac = _r3(wbac + 0.5 * vbac) / d3
-                zbca = _r3(wbca + 0.5 * vbca) / d3
-                zcab = _r3(wcab + 0.5 * vcab) / d3
-                zcba = _r3(wcba + 0.5 * vcba) / d3
+                # Left-side W and V — used to build Z_L (the ket).
+                wabc_L = get_w_L(a, b, c); wacb_L = get_w_L(a, c, b)
+                wbac_L = get_w_L(b, a, c); wbca_L = get_w_L(b, c, a)
+                wcab_L = get_w_L(c, a, b); wcba_L = get_w_L(c, b, a)
+                vabc_L = get_v_L(a, b, c); vacb_L = get_v_L(a, c, b)
+                vbac_L = get_v_L(b, a, c); vbca_L = get_v_L(b, c, a)
+                vcab_L = get_v_L(c, a, b); vcba_L = get_v_L(c, b, a)
 
-                # Drop .conj() — xTC ERIs are real but non-Hermitian.
-                et += np.einsum("ijk,ijk", wabc, zabc)
-                et += np.einsum("ikj,ijk", wacb, zabc)
-                et += np.einsum("jik,ijk", wbac, zabc)
-                et += np.einsum("jki,ijk", wbca, zabc)
-                et += np.einsum("kij,ijk", wcab, zabc)
-                et += np.einsum("kji,ijk", wcba, zabc)
+                zabc = _r3(wabc_L + 0.5 * vabc_L) / d3
+                zacb = _r3(wacb_L + 0.5 * vacb_L) / d3
+                zbac = _r3(wbac_L + 0.5 * vbac_L) / d3
+                zbca = _r3(wbca_L + 0.5 * vbca_L) / d3
+                zcab = _r3(wcab_L + 0.5 * vcab_L) / d3
+                zcba = _r3(wcba_L + 0.5 * vcba_L) / d3
 
-                et += np.einsum("ijk,ijk", wacb, zacb)
-                et += np.einsum("ikj,ijk", wabc, zacb)
-                et += np.einsum("jik,ijk", wcab, zacb)
-                et += np.einsum("jki,ijk", wcba, zacb)
-                et += np.einsum("kij,ijk", wbac, zacb)
-                et += np.einsum("kji,ijk", wbca, zacb)
+                # Pair W_R with Z_L (no .conj() — real eris).
+                et += np.einsum("ijk,ijk", wabc_R, zabc)
+                et += np.einsum("ikj,ijk", wacb_R, zabc)
+                et += np.einsum("jik,ijk", wbac_R, zabc)
+                et += np.einsum("jki,ijk", wbca_R, zabc)
+                et += np.einsum("kij,ijk", wcab_R, zabc)
+                et += np.einsum("kji,ijk", wcba_R, zabc)
 
-                et += np.einsum("ijk,ijk", wbac, zbac)
-                et += np.einsum("ikj,ijk", wbca, zbac)
-                et += np.einsum("jik,ijk", wabc, zbac)
-                et += np.einsum("jki,ijk", wacb, zbac)
-                et += np.einsum("kij,ijk", wcba, zbac)
-                et += np.einsum("kji,ijk", wcab, zbac)
+                et += np.einsum("ijk,ijk", wacb_R, zacb)
+                et += np.einsum("ikj,ijk", wabc_R, zacb)
+                et += np.einsum("jik,ijk", wcab_R, zacb)
+                et += np.einsum("jki,ijk", wcba_R, zacb)
+                et += np.einsum("kij,ijk", wbac_R, zacb)
+                et += np.einsum("kji,ijk", wbca_R, zacb)
 
-                et += np.einsum("ijk,ijk", wbca, zbca)
-                et += np.einsum("ikj,ijk", wbac, zbca)
-                et += np.einsum("jik,ijk", wcba, zbca)
-                et += np.einsum("jki,ijk", wcab, zbca)
-                et += np.einsum("kij,ijk", wabc, zbca)
-                et += np.einsum("kji,ijk", wacb, zbca)
+                et += np.einsum("ijk,ijk", wbac_R, zbac)
+                et += np.einsum("ikj,ijk", wbca_R, zbac)
+                et += np.einsum("jik,ijk", wabc_R, zbac)
+                et += np.einsum("jki,ijk", wacb_R, zbac)
+                et += np.einsum("kij,ijk", wcba_R, zbac)
+                et += np.einsum("kji,ijk", wcab_R, zbac)
 
-                et += np.einsum("ijk,ijk", wcab, zcab)
-                et += np.einsum("ikj,ijk", wcba, zcab)
-                et += np.einsum("jik,ijk", wacb, zcab)
-                et += np.einsum("jki,ijk", wabc, zcab)
-                et += np.einsum("kij,ijk", wbca, zcab)
-                et += np.einsum("kji,ijk", wbac, zcab)
+                et += np.einsum("ijk,ijk", wbca_R, zbca)
+                et += np.einsum("ikj,ijk", wbac_R, zbca)
+                et += np.einsum("jik,ijk", wcba_R, zbca)
+                et += np.einsum("jki,ijk", wcab_R, zbca)
+                et += np.einsum("kij,ijk", wabc_R, zbca)
+                et += np.einsum("kji,ijk", wacb_R, zbca)
 
-                et += np.einsum("ijk,ijk", wcba, zcba)
-                et += np.einsum("ikj,ijk", wcab, zcba)
-                et += np.einsum("jik,ijk", wbca, zcba)
-                et += np.einsum("jki,ijk", wbac, zcba)
-                et += np.einsum("kij,ijk", wacb, zcba)
-                et += np.einsum("kji,ijk", wabc, zcba)
+                et += np.einsum("ijk,ijk", wcab_R, zcab)
+                et += np.einsum("ikj,ijk", wcba_R, zcab)
+                et += np.einsum("jik,ijk", wacb_R, zcab)
+                et += np.einsum("jki,ijk", wabc_R, zcab)
+                et += np.einsum("kij,ijk", wbca_R, zcab)
+                et += np.einsum("kji,ijk", wbac_R, zcab)
+
+                et += np.einsum("ijk,ijk", wcba_R, zcba)
+                et += np.einsum("ikj,ijk", wcab_R, zcba)
+                et += np.einsum("jik,ijk", wbca_R, zcba)
+                et += np.einsum("jki,ijk", wbac_R, zcba)
+                et += np.einsum("kij,ijk", wacb_R, zcba)
+                et += np.einsum("kji,ijk", wabc_R, zcba)
 
     et *= 2
     logger.info("xTC-CCSD(T) correction = %.15g  (%.1f s)",
@@ -343,8 +397,19 @@ def _r3_jax_batched(w):
 
 def _single_triple_contribution(a, b, c,
                                 mo_e_o, mo_e_v,
-                                t1T, t2T, vvov, vooo, vvoo, fvo):
+                                t1T, t2T,
+                                vvov_R, vooo_R, vvoo_R,
+                                vvov_L, vooo_L, vvoo_L,
+                                fvo):
     """Scalar (T) energy contribution from one ``(a, b, c)`` triple (a >= b >= c).
+
+    Under the non-Hermitian xTC formulation with the t̄=t̃ approximation, the
+    formula is E(T) = (1/36) Σ W_R · Z_L where:
+      - W_R is built from "right" ERI layouts (ovvv/ovoo/ovov.transpose(...)).
+      - Z_L = R3(W_L + V_L/2) / D, built from "left" layouts (vovv/vooo/vovo
+        permuted to match PySCF's algorithm-expected axes).
+    For Hermitian eris the left and right blocks coincide numerically and
+    this reduces to PySCF's closed-shell (T) reference.
 
     Item-1 / commit history note: I tried both "stack the 6 W operands into a
     (6, ...) tensor and do one stacked einsum" and "absorb the 36 consumer
@@ -362,9 +427,7 @@ def _single_triple_contribution(a, b, c,
                     jnp.where((a == b) | (b == c), 2.0, 1.0))
     d3 = d3_base * sym
 
-    def get_w(p, q, r):
-        # vvov[p, q] -> (i, f); t2T[r] -> (f, k, j)
-        # vooo[p]    -> (i, j, m); t2T[q, r] -> (m, k)
+    def _get_w(vvov, vooo, p, q, r):
         slab = _gather2(vvov, p, q)
         vooo_p = _gather1(vooo, p)
         t2T_r = _gather1(t2T, r)
@@ -373,7 +436,7 @@ def _single_triple_contribution(a, b, c,
         w -= jnp.einsum("ijm,mk->ijk", vooo_p, t2T_qr)
         return w
 
-    def get_v(p, q, r):
+    def _get_v(vvoo, p, q, r):
         vvoo_pq = _gather2(vvoo, p, q)
         t2T_pq = _gather2(t2T, p, q)
         t1T_r = _gather1(t1T, r)
@@ -382,38 +445,44 @@ def _single_triple_contribution(a, b, c,
         v += jnp.einsum("ij,k->ijk", t2T_pq, fvo_r)
         return v
 
-    wabc = get_w(a, b, c); wacb = get_w(a, c, b)
-    wbac = get_w(b, a, c); wbca = get_w(b, c, a)
-    wcab = get_w(c, a, b); wcba = get_w(c, b, a)
-    vabc = get_v(a, b, c); vacb = get_v(a, c, b)
-    vbac = get_v(b, a, c); vbca = get_v(b, c, a)
-    vcab = get_v(c, a, b); vcba = get_v(c, b, a)
+    # Right-side W's — used as the bra in the 36-term contraction.
+    wabc_R = _get_w(vvov_R, vooo_R, a, b, c); wacb_R = _get_w(vvov_R, vooo_R, a, c, b)
+    wbac_R = _get_w(vvov_R, vooo_R, b, a, c); wbca_R = _get_w(vvov_R, vooo_R, b, c, a)
+    wcab_R = _get_w(vvov_R, vooo_R, c, a, b); wcba_R = _get_w(vvov_R, vooo_R, c, b, a)
 
-    zabc = _r3_jax(wabc + 0.5 * vabc) / d3
-    zacb = _r3_jax(wacb + 0.5 * vacb) / d3
-    zbac = _r3_jax(wbac + 0.5 * vbac) / d3
-    zbca = _r3_jax(wbca + 0.5 * vbca) / d3
-    zcab = _r3_jax(wcab + 0.5 * vcab) / d3
-    zcba = _r3_jax(wcba + 0.5 * vcba) / d3
+    # Left-side W and V — used to build Z_L (the ket).
+    wabc_L = _get_w(vvov_L, vooo_L, a, b, c); wacb_L = _get_w(vvov_L, vooo_L, a, c, b)
+    wbac_L = _get_w(vvov_L, vooo_L, b, a, c); wbca_L = _get_w(vvov_L, vooo_L, b, c, a)
+    wcab_L = _get_w(vvov_L, vooo_L, c, a, b); wcba_L = _get_w(vvov_L, vooo_L, c, b, a)
+    vabc_L = _get_v(vvoo_L, a, b, c); vacb_L = _get_v(vvoo_L, a, c, b)
+    vbac_L = _get_v(vvoo_L, b, a, c); vbca_L = _get_v(vvoo_L, b, c, a)
+    vcab_L = _get_v(vvoo_L, c, a, b); vcba_L = _get_v(vvoo_L, c, b, a)
 
-    et = (jnp.einsum("ijk,ijk", wabc, zabc) + jnp.einsum("ikj,ijk", wacb, zabc)
-          + jnp.einsum("jik,ijk", wbac, zabc) + jnp.einsum("jki,ijk", wbca, zabc)
-          + jnp.einsum("kij,ijk", wcab, zabc) + jnp.einsum("kji,ijk", wcba, zabc)
-          + jnp.einsum("ijk,ijk", wacb, zacb) + jnp.einsum("ikj,ijk", wabc, zacb)
-          + jnp.einsum("jik,ijk", wcab, zacb) + jnp.einsum("jki,ijk", wcba, zacb)
-          + jnp.einsum("kij,ijk", wbac, zacb) + jnp.einsum("kji,ijk", wbca, zacb)
-          + jnp.einsum("ijk,ijk", wbac, zbac) + jnp.einsum("ikj,ijk", wbca, zbac)
-          + jnp.einsum("jik,ijk", wabc, zbac) + jnp.einsum("jki,ijk", wacb, zbac)
-          + jnp.einsum("kij,ijk", wcba, zbac) + jnp.einsum("kji,ijk", wcab, zbac)
-          + jnp.einsum("ijk,ijk", wbca, zbca) + jnp.einsum("ikj,ijk", wbac, zbca)
-          + jnp.einsum("jik,ijk", wcba, zbca) + jnp.einsum("jki,ijk", wcab, zbca)
-          + jnp.einsum("kij,ijk", wabc, zbca) + jnp.einsum("kji,ijk", wacb, zbca)
-          + jnp.einsum("ijk,ijk", wcab, zcab) + jnp.einsum("ikj,ijk", wcba, zcab)
-          + jnp.einsum("jik,ijk", wacb, zcab) + jnp.einsum("jki,ijk", wabc, zcab)
-          + jnp.einsum("kij,ijk", wbca, zcab) + jnp.einsum("kji,ijk", wbac, zcab)
-          + jnp.einsum("ijk,ijk", wcba, zcba) + jnp.einsum("ikj,ijk", wcab, zcba)
-          + jnp.einsum("jik,ijk", wbca, zcba) + jnp.einsum("jki,ijk", wbac, zcba)
-          + jnp.einsum("kij,ijk", wacb, zcba) + jnp.einsum("kji,ijk", wabc, zcba))
+    zabc = _r3_jax(wabc_L + 0.5 * vabc_L) / d3
+    zacb = _r3_jax(wacb_L + 0.5 * vacb_L) / d3
+    zbac = _r3_jax(wbac_L + 0.5 * vbac_L) / d3
+    zbca = _r3_jax(wbca_L + 0.5 * vbca_L) / d3
+    zcab = _r3_jax(wcab_L + 0.5 * vcab_L) / d3
+    zcba = _r3_jax(wcba_L + 0.5 * vcba_L) / d3
+
+    et = (jnp.einsum("ijk,ijk", wabc_R, zabc) + jnp.einsum("ikj,ijk", wacb_R, zabc)
+          + jnp.einsum("jik,ijk", wbac_R, zabc) + jnp.einsum("jki,ijk", wbca_R, zabc)
+          + jnp.einsum("kij,ijk", wcab_R, zabc) + jnp.einsum("kji,ijk", wcba_R, zabc)
+          + jnp.einsum("ijk,ijk", wacb_R, zacb) + jnp.einsum("ikj,ijk", wabc_R, zacb)
+          + jnp.einsum("jik,ijk", wcab_R, zacb) + jnp.einsum("jki,ijk", wcba_R, zacb)
+          + jnp.einsum("kij,ijk", wbac_R, zacb) + jnp.einsum("kji,ijk", wbca_R, zacb)
+          + jnp.einsum("ijk,ijk", wbac_R, zbac) + jnp.einsum("ikj,ijk", wbca_R, zbac)
+          + jnp.einsum("jik,ijk", wabc_R, zbac) + jnp.einsum("jki,ijk", wacb_R, zbac)
+          + jnp.einsum("kij,ijk", wcba_R, zbac) + jnp.einsum("kji,ijk", wcab_R, zbac)
+          + jnp.einsum("ijk,ijk", wbca_R, zbca) + jnp.einsum("ikj,ijk", wbac_R, zbca)
+          + jnp.einsum("jik,ijk", wcba_R, zbca) + jnp.einsum("jki,ijk", wcab_R, zbca)
+          + jnp.einsum("kij,ijk", wabc_R, zbca) + jnp.einsum("kji,ijk", wacb_R, zbca)
+          + jnp.einsum("ijk,ijk", wcab_R, zcab) + jnp.einsum("ikj,ijk", wcba_R, zcab)
+          + jnp.einsum("jik,ijk", wacb_R, zcab) + jnp.einsum("jki,ijk", wabc_R, zcab)
+          + jnp.einsum("kij,ijk", wbca_R, zcab) + jnp.einsum("kji,ijk", wbac_R, zcab)
+          + jnp.einsum("ijk,ijk", wcba_R, zcba) + jnp.einsum("ikj,ijk", wcab_R, zcba)
+          + jnp.einsum("jik,ijk", wbca_R, zcba) + jnp.einsum("jki,ijk", wbac_R, zcba)
+          + jnp.einsum("kij,ijk", wacb_R, zcba) + jnp.einsum("kji,ijk", wabc_R, zcba))
     return et
 
 
@@ -432,16 +501,27 @@ def _make_batch_fn():
     """
     _batched = jax.vmap(
         _single_triple_contribution,
+        # 3 vmap'd axes (a, b, c); 11 broadcast (None) — the broadcast list
+        # now includes both R and L ERI sets plus fvo.
         in_axes=(0, 0, 0,
-                 None, None, None, None, None, None, None, None),
+                 None, None, None, None,
+                 None, None, None,
+                 None, None, None,
+                 None),
     )
 
     @jax.jit
     def _batch_sum(a_vec, b_vec, c_vec, mask_vec, mo_e_o, mo_e_v,
-                   t1T, t2T, vvov, vooo, vvoo, fvo):
+                   t1T, t2T,
+                   vvov_R, vooo_R, vvoo_R,
+                   vvov_L, vooo_L, vvoo_L,
+                   fvo):
         contribs = _batched(
             a_vec, b_vec, c_vec,
-            mo_e_o, mo_e_v, t1T, t2T, vvov, vooo, vvoo, fvo,
+            mo_e_o, mo_e_v, t1T, t2T,
+            vvov_R, vooo_R, vvoo_R,
+            vvov_L, vooo_L, vvoo_L,
+            fvo,
         )
         return jnp.sum(contribs * mask_vec)
 
@@ -843,7 +923,17 @@ def _check_hbm_budget(nocc, nvir, n_devices):
 
 
 def _build_layout_transforms(eris, nocc, nvir):
-    """Materialise vvov, vooo, vvoo on the host once (CPU)."""
+    """Materialise vvov/vooo/vvoo in both right and left flavours.
+
+    Returns a 6-tuple ``(vvov_R, vooo_R, vvoo_R, vvov_L, vooo_L, vvoo_L)``.
+
+    Right-side blocks: ovvv/ovoo/ovov.transpose(...) — used to build W_R for
+    the bra of the 36-term contraction.
+
+    Left-side blocks: vovv/vooo/vovo.transpose(...) — used to build Z_L (the
+    ket). For plain PySCF (Hermitian) eris that don't have ``vovv`` etc.,
+    fall back to the same R blocks (numerically equal under Hermitian).
+    """
     if hasattr(eris, "get_ovvv"):
         ovvv = np.asarray(eris.get_ovvv())
     else:
@@ -852,12 +942,22 @@ def _build_layout_transforms(eris, nocc, nvir):
         ovvv = lib.unpack_tril(
             ovvv.reshape(nocc * nvir, -1)
         ).reshape(nocc, nvir, nvir, nvir)
-    # Match ccsd_t_slow convention: vvov layout (a, b, i, f); vooo (a, i, j, k);
-    # vvoo (a, b, i, j). For non-Hermitian xTC we drop the .conj().
-    vvov = np.ascontiguousarray(ovvv.transpose(1, 3, 0, 2))
-    vooo = np.ascontiguousarray(np.asarray(eris.ovoo).transpose(1, 0, 2, 3))
-    vvoo = np.ascontiguousarray(np.asarray(eris.ovov).transpose(1, 3, 0, 2))
-    return vvov, vooo, vvoo
+    vvov_R = np.ascontiguousarray(ovvv.transpose(1, 3, 0, 2))
+    vooo_R = np.ascontiguousarray(np.asarray(eris.ovoo).transpose(1, 0, 2, 3))
+    vvoo_R = np.ascontiguousarray(np.asarray(eris.ovov).transpose(1, 3, 0, 2))
+
+    if (getattr(eris, "vovv", None) is not None
+            and getattr(eris, "vooo", None) is not None
+            and getattr(eris, "vovo", None) is not None):
+        vvov_L = np.ascontiguousarray(
+            np.asarray(eris.vovv).transpose(0, 2, 1, 3))
+        vooo_L = np.ascontiguousarray(
+            np.asarray(eris.vooo).transpose(0, 1, 3, 2))
+        vvoo_L = np.ascontiguousarray(
+            np.asarray(eris.vovo).transpose(0, 2, 1, 3))
+    else:
+        vvov_L, vooo_L, vvoo_L = vvov_R, vooo_R, vvoo_R
+    return vvov_R, vooo_R, vvoo_R, vvov_L, vooo_L, vvoo_L
 
 
 def _kernel_multigpu(mycc, eris, t1, t2):
@@ -888,7 +988,8 @@ def _kernel_multigpu(mycc, eris, t1, t2):
     _check_hbm_budget(nocc, nvir, n_devices)
 
     # --- 1. Host-side layout transforms (once) ---
-    vvov_host, vooo_host, vvoo_host = _build_layout_transforms(eris, nocc, nvir)
+    (vvov_R_host, vooo_R_host, vvoo_R_host,
+     vvov_L_host, vooo_L_host, vvoo_L_host) = _build_layout_transforms(eris, nocc, nvir)
     t1T_host = np.ascontiguousarray(t1.T)
     t2T_host = np.ascontiguousarray(t2.transpose(2, 3, 0, 1))
     fvo_host = np.ascontiguousarray(eris.fock[nocc:, :nocc])
@@ -897,9 +998,12 @@ def _kernel_multigpu(mycc, eris, t1, t2):
     mo_e_v_host = mo_e[nocc:]
 
     # --- 2. Broadcast everything to every device ---
-    vvov_by_dev = broadcast_to_devices(vvov_host, devices)
-    vooo_by_dev = broadcast_to_devices(vooo_host, devices)
-    vvoo_by_dev = broadcast_to_devices(vvoo_host, devices)
+    vvov_R_by_dev = broadcast_to_devices(vvov_R_host, devices)
+    vooo_R_by_dev = broadcast_to_devices(vooo_R_host, devices)
+    vvoo_R_by_dev = broadcast_to_devices(vvoo_R_host, devices)
+    vvov_L_by_dev = broadcast_to_devices(vvov_L_host, devices)
+    vooo_L_by_dev = broadcast_to_devices(vooo_L_host, devices)
+    vvoo_L_by_dev = broadcast_to_devices(vvoo_L_host, devices)
     t1T_by_dev = broadcast_to_devices(t1T_host, devices)
     t2T_by_dev = broadcast_to_devices(t2T_host, devices)
     fvo_by_dev = broadcast_to_devices(fvo_host, devices)
@@ -907,7 +1011,8 @@ def _kernel_multigpu(mycc, eris, t1, t2):
     mo_e_v_by_dev = broadcast_to_devices(mo_e_v_host, devices)
 
     # Free the large host copies — they live on-device now.
-    del vvov_host, vooo_host, vvoo_host
+    del vvov_R_host, vooo_R_host, vvoo_R_host
+    del vvov_L_host, vooo_L_host, vvoo_L_host
 
     # --- 3. Triangular triples, partitioned across devices ---
     triples = [(a, b, c)
@@ -959,8 +1064,9 @@ def _kernel_multigpu(mycc, eris, t1, t2):
                     abc_jax[:, 0], abc_jax[:, 1], abc_jax[:, 2], mask_jax,
                     mo_e_o_by_dev[device], mo_e_v_by_dev[device],
                     t1T_by_dev[device], t2T_by_dev[device],
-                    vvov_by_dev[device], vooo_by_dev[device],
-                    vvoo_by_dev[device], fvo_by_dev[device],
+                    vvov_R_by_dev[device], vooo_R_by_dev[device], vvoo_R_by_dev[device],
+                    vvov_L_by_dev[device], vooo_L_by_dev[device], vvoo_L_by_dev[device],
+                    fvo_by_dev[device],
                 )))
                 et_acc += contrib
             return et_acc
