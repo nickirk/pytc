@@ -237,15 +237,16 @@ def _kernel_reference(mycc, eris, t1, t2):
     if (getattr(eris, "vovv", None) is not None
             and getattr(eris, "vooo", None) is not None
             and getattr(eris, "vovo", None) is not None):
-        # L blocks are the in-pair-swap duals of the R blocks (xTC breaks
-        # (iα)→(αi) within each pair; particle exchange is preserved).
-        # Indexing parity with R:
-        #   vvov_R[α,β,i,f]=(iα|fβ);  vvov_L[α,β,i,f]=(αi|fβ)=vovv[α,i,f,β]
-        #   vooo_R[α,i,j,m]=(iα|jm);  vooo_L[α,i,j,m]=(αi|jm)=vooo[α,i,j,m]
-        #   vvoo_R[α,β,i,j]=(iα|jβ);  vvoo_L[α,β,i,j]=(αi|jβ)=vovo[α,i,β,j]
+        # L blocks hold the BOTH-PAIRS in-pair-swap of the R values — this
+        # is what .conj() does for complex Hermitian eris (flip bra↔ket in
+        # each pair). Under xTC both in-pair swaps are broken, so this is a
+        # genuinely distinct integral block.
+        #   R: eris_vvov_R[α,β,i,f]=(iα|fβ);  L: vvov_L[α,β,i,f]=(αi|βf)=vovv[α,i,β,f]
+        #   R: eris_vooo_R[α,i,j,m]=(iα|jm);  L: vooo_L[α,i,j,m]=(αi|mj)=vooo[α,i,m,j]
+        #   R: eris_vvoo_R[α,β,i,j]=(iα|jβ);  L: vvoo_L[α,β,i,j]=(αi|βj)=vovo[α,i,β,j]
         # Each transpose collapses to a no-op under Hermitian (vovv→ovvv).
-        eris_vvov_L = np.asarray(eris.vovv).transpose(0, 3, 1, 2)
-        eris_vooo_L = np.asarray(eris.vooo)
+        eris_vvov_L = np.asarray(eris.vovv).transpose(0, 2, 1, 3)
+        eris_vooo_L = np.asarray(eris.vooo).transpose(0, 1, 3, 2)
         eris_vvoo_L = np.asarray(eris.vovo).transpose(0, 2, 1, 3)
     else:
         eris_vvov_L = eris_vvov_R
@@ -963,12 +964,14 @@ def _build_layout_transforms(eris, nocc, nvir):
     if (getattr(eris, "vovv", None) is not None
             and getattr(eris, "vooo", None) is not None
             and getattr(eris, "vovo", None) is not None):
-        # L blocks are the in-pair-swap duals of the R blocks. See
-        # _kernel_reference for the index-by-index derivation. Each
-        # transpose collapses to a no-op under the Hermitian limit.
+        # L = both-pairs in-pair-swap dual of R (the role of .conj() in
+        # PySCF's Hermitian (T) algorithm). See _kernel_reference for the
+        # index-by-index derivation. Each transpose collapses to a no-op
+        # under the Hermitian limit.
         vvov_L = np.ascontiguousarray(
-            np.asarray(eris.vovv).transpose(0, 3, 1, 2))
-        vooo_L = np.ascontiguousarray(np.asarray(eris.vooo))
+            np.asarray(eris.vovv).transpose(0, 2, 1, 3))
+        vooo_L = np.ascontiguousarray(
+            np.asarray(eris.vooo).transpose(0, 1, 3, 2))
         vvoo_L = np.ascontiguousarray(
             np.asarray(eris.vovo).transpose(0, 2, 1, 3))
     else:
