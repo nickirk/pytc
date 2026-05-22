@@ -245,6 +245,11 @@ def _kernel_reference(mycc, eris, t1, t2):
         eris_vooo_L = eris_vooo_R
         eris_vvoo_L = eris_vvoo_R
     fvo = eris.fock[nocc:, :nocc]
+    # Left-side Fock element for V_L: in xTC the Fock is non-Hermitian, so
+    # fov.T ≠ fvo. v_L uses the OV-block element f(k, c); we expose it as
+    # fov_T so that fov_T[c, k] = fov[k, c], matching the indexing fvo[c, k].
+    # In Hermitian fallback fov_T == fvo numerically.
+    fov_T = np.ascontiguousarray(eris.fock[:nocc, nocc:].T)
 
     def get_w_R(a, b, c):
         w = np.einsum("if,fkj->ijk", eris_vvov_R[a, b], t2T[c, :])
@@ -263,7 +268,7 @@ def _kernel_reference(mycc, eris, t1, t2):
 
     def get_v_L(a, b, c):
         v = np.einsum("ij,k->ijk", eris_vvoo_L[a, b], t1T[c])
-        v += np.einsum("ij,k->ijk", t2T[a, b], fvo[c])
+        v += np.einsum("ij,k->ijk", t2T[a, b], fov_T[c])
         return v
 
     et = 0.0
@@ -400,7 +405,7 @@ def _single_triple_contribution(a, b, c,
                                 t1T, t2T,
                                 vvov_R, vooo_R, vvoo_R,
                                 vvov_L, vooo_L, vvoo_L,
-                                fvo):
+                                fvo, fov_T):
     """Scalar (T) energy contribution from one ``(a, b, c)`` triple (a >= b >= c).
 
     Under the non-Hermitian xTC formulation with the t̄=t̃ approximation, the
@@ -436,13 +441,15 @@ def _single_triple_contribution(a, b, c,
         w -= jnp.einsum("ijm,mk->ijk", vooo_p, t2T_qr)
         return w
 
-    def _get_v(vvoo, p, q, r):
+    def _get_v_L(vvoo, p, q, r):
+        # V_L uses the LEFT Fock element f(k, c) — supplied as fov_T with
+        # fov_T[r, k] = fov[k, r]. For Hermitian fallback fov_T == fvo.
         vvoo_pq = _gather2(vvoo, p, q)
         t2T_pq = _gather2(t2T, p, q)
         t1T_r = _gather1(t1T, r)
-        fvo_r = _gather1(fvo, r)
+        fov_T_r = _gather1(fov_T, r)
         v = jnp.einsum("ij,k->ijk", vvoo_pq, t1T_r)
-        v += jnp.einsum("ij,k->ijk", t2T_pq, fvo_r)
+        v += jnp.einsum("ij,k->ijk", t2T_pq, fov_T_r)
         return v
 
     # Right-side W's — used as the bra in the 36-term contraction.
@@ -454,9 +461,9 @@ def _single_triple_contribution(a, b, c,
     wabc_L = _get_w(vvov_L, vooo_L, a, b, c); wacb_L = _get_w(vvov_L, vooo_L, a, c, b)
     wbac_L = _get_w(vvov_L, vooo_L, b, a, c); wbca_L = _get_w(vvov_L, vooo_L, b, c, a)
     wcab_L = _get_w(vvov_L, vooo_L, c, a, b); wcba_L = _get_w(vvov_L, vooo_L, c, b, a)
-    vabc_L = _get_v(vvoo_L, a, b, c); vacb_L = _get_v(vvoo_L, a, c, b)
-    vbac_L = _get_v(vvoo_L, b, a, c); vbca_L = _get_v(vvoo_L, b, c, a)
-    vcab_L = _get_v(vvoo_L, c, a, b); vcba_L = _get_v(vvoo_L, c, b, a)
+    vabc_L = _get_v_L(vvoo_L, a, b, c); vacb_L = _get_v_L(vvoo_L, a, c, b)
+    vbac_L = _get_v_L(vvoo_L, b, a, c); vbca_L = _get_v_L(vvoo_L, b, c, a)
+    vcab_L = _get_v_L(vvoo_L, c, a, b); vcba_L = _get_v_L(vvoo_L, c, b, a)
 
     zabc = _r3_jax(wabc_L + 0.5 * vabc_L) / d3
     zacb = _r3_jax(wacb_L + 0.5 * vacb_L) / d3
@@ -501,13 +508,13 @@ def _make_batch_fn():
     """
     _batched = jax.vmap(
         _single_triple_contribution,
-        # 3 vmap'd axes (a, b, c); 11 broadcast (None) — the broadcast list
-        # now includes both R and L ERI sets plus fvo.
+        # 3 vmap'd axes (a, b, c); 12 broadcast (None) — the broadcast list
+        # now includes both R and L ERI sets plus fvo (R) and fov_T (L).
         in_axes=(0, 0, 0,
                  None, None, None, None,
                  None, None, None,
                  None, None, None,
-                 None),
+                 None, None),
     )
 
     @jax.jit
@@ -515,13 +522,13 @@ def _make_batch_fn():
                    t1T, t2T,
                    vvov_R, vooo_R, vvoo_R,
                    vvov_L, vooo_L, vvoo_L,
-                   fvo):
+                   fvo, fov_T):
         contribs = _batched(
             a_vec, b_vec, c_vec,
             mo_e_o, mo_e_v, t1T, t2T,
             vvov_R, vooo_R, vvoo_R,
             vvov_L, vooo_L, vvoo_L,
-            fvo,
+            fvo, fov_T,
         )
         return jnp.sum(contribs * mask_vec)
 
@@ -993,6 +1000,8 @@ def _kernel_multigpu(mycc, eris, t1, t2):
     t1T_host = np.ascontiguousarray(t1.T)
     t2T_host = np.ascontiguousarray(t2.transpose(2, 3, 0, 1))
     fvo_host = np.ascontiguousarray(eris.fock[nocc:, :nocc])
+    # Left-side Fock element for V_L: non-Hermitian xTC ⇒ fov.T ≠ fvo.
+    fov_T_host = np.ascontiguousarray(eris.fock[:nocc, nocc:].T)
     mo_e = np.asarray(eris.mo_energy)
     mo_e_o_host = mo_e[:nocc]
     mo_e_v_host = mo_e[nocc:]
@@ -1007,6 +1016,7 @@ def _kernel_multigpu(mycc, eris, t1, t2):
     t1T_by_dev = broadcast_to_devices(t1T_host, devices)
     t2T_by_dev = broadcast_to_devices(t2T_host, devices)
     fvo_by_dev = broadcast_to_devices(fvo_host, devices)
+    fov_T_by_dev = broadcast_to_devices(fov_T_host, devices)
     mo_e_o_by_dev = broadcast_to_devices(mo_e_o_host, devices)
     mo_e_v_by_dev = broadcast_to_devices(mo_e_v_host, devices)
 
@@ -1066,7 +1076,7 @@ def _kernel_multigpu(mycc, eris, t1, t2):
                     t1T_by_dev[device], t2T_by_dev[device],
                     vvov_R_by_dev[device], vooo_R_by_dev[device], vvoo_R_by_dev[device],
                     vvov_L_by_dev[device], vooo_L_by_dev[device], vvoo_L_by_dev[device],
-                    fvo_by_dev[device],
+                    fvo_by_dev[device], fov_T_by_dev[device],
                 )))
                 et_acc += contrib
             return et_acc
