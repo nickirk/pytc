@@ -191,12 +191,22 @@ def _kernel_reference(mycc, eris, t1, t2):
     e_occ, e_vir = mo_e[:nocc], mo_e[nocc:]
     eijk = lib.direct_sum("i,j,k->ijk", e_occ, e_occ, e_occ)
 
-    # PySCF's `ccsd_t_slow` builds three eris layouts via .conj().transpose()
-    # — Hermitian-trick that gives the *dual* integral block (eg. (bf|ia))
-    # from the *direct* block (eg. (ia|bf)). For non-Hermitian xTC the
-    # dual blocks differ; use them directly. `_build_dual_blocks` does the
-    # dispatch.
-    eris_vvov, eris_vooo, eris_vvoo = _build_dual_blocks(mycc, eris, nocc, nvir)
+    # xTC eris.ovvv is full 4D (HDF5 or ndarray); plain PySCF eris.ovvv is
+    # stored packed-triangular (n_o, n_v, n_v*(n_v+1)/2). ``get_ovvv`` unpacks
+    # to (n_o, n_v, n_v, n_v) in either case.
+    if hasattr(eris, "get_ovvv"):
+        ovvv = np.asarray(eris.get_ovvv())
+    else:
+        ovvv = np.asarray(eris.ovvv)
+    if ovvv.ndim == 3:  # safety fallback if get_ovvv missed
+        ovvv = lib.unpack_tril(ovvv.reshape(nocc * nvir, -1)).reshape(nocc, nvir, nvir, nvir)
+    ovoo = np.asarray(eris.ovoo)            # (i, a, j, k)
+    ovov = np.asarray(eris.ovov)            # (i, a, j, b)
+
+    # Layout transforms matching ccsd_t_slow (without .conj() for non-Hermitian).
+    eris_vvov = ovvv.transpose(1, 3, 0, 2)  # (a, c, i, b)  — get_w 1st term uses [a,b,i,f]
+    eris_vooo = ovoo.transpose(1, 0, 2, 3)  # (a, i, j, k)
+    eris_vvoo = ovov.transpose(1, 3, 0, 2)  # (a, b, i, j)
     fvo = eris.fock[nocc:, :nocc]
 
     def get_w(a, b, c):
@@ -832,39 +842,8 @@ def _check_hbm_budget(nocc, nvir, n_devices):
     return total_per_dev_gb
 
 
-def _build_dual_blocks(mycc, eris, nocc, nvir):
-    """Build the three integral tensors `_kernel_reference` consumes.
-
-    Layouts (matching PySCF's ``ccsd_t_slow.py`` access pattern):
-        vvov[a, b, i, f] = (bf | ia)
-        vooo[a, i, j, k] = (jk | ia)
-        vvoo[a, b, i, j] = (jb | ia)
-
-    Sources depend on eris type:
-
-    * **xTC eris** (has ``.ooov`` and ``.vvov`` blocks built by the
-      non-Hermitian builder, or lazily reconstructible) — use the genuine
-      dual blocks permuted to the layout above:
-
-          vvov_layout = eris.vvov.transpose(3, 0, 2, 1)   # (αβ|iγ) → [γ, α, i, β]
-          vooo_layout = eris.ooov.transpose(3, 2, 0, 1)   # (jk|ia) → [a, i, j, k]
-          vvoo_layout = eris.ovov.transpose(3, 1, 2, 0)   # (jb|ia) → [a, b, i, j]
-
-    * **Plain PySCF eris** (Hermitian, only ``ovvv`` / ``ovoo`` / ``ovov``
-      stored) — use the historic ``.conj().transpose(...)`` Hermitian
-      trick. `.conj()` is identity for real eris.
-    """
-    has_xtc_blocks = (getattr(eris, "ooov", None) is not None
-                      and getattr(eris, "ovov", None) is not None)
-
-    if has_xtc_blocks:
-        vvov_raw = _get_or_build_vvov(mycc, eris)
-        vvov = np.ascontiguousarray(np.asarray(vvov_raw).transpose(3, 0, 2, 1))
-        vooo = np.ascontiguousarray(np.asarray(eris.ooov).transpose(3, 2, 0, 1))
-        vvoo = np.ascontiguousarray(np.asarray(eris.ovov).transpose(3, 1, 2, 0))
-        return vvov, vooo, vvoo
-
-    # Hermitian fallback (plain PySCF eris, used in correctness tests)
+def _build_layout_transforms(eris, nocc, nvir):
+    """Materialise vvov, vooo, vvoo on the host once (CPU)."""
     if hasattr(eris, "get_ovvv"):
         ovvv = np.asarray(eris.get_ovvv())
     else:
@@ -873,114 +852,12 @@ def _build_dual_blocks(mycc, eris, nocc, nvir):
         ovvv = lib.unpack_tril(
             ovvv.reshape(nocc * nvir, -1)
         ).reshape(nocc, nvir, nvir, nvir)
-    ovoo = np.asarray(eris.ovoo)
-    ovov = np.asarray(eris.ovov)
+    # Match ccsd_t_slow convention: vvov layout (a, b, i, f); vooo (a, i, j, k);
+    # vvoo (a, b, i, j). For non-Hermitian xTC we drop the .conj().
     vvov = np.ascontiguousarray(ovvv.transpose(1, 3, 0, 2))
-    vooo = np.ascontiguousarray(ovoo.transpose(1, 0, 2, 3))
-    vvoo = np.ascontiguousarray(ovov.transpose(1, 3, 0, 2))
+    vooo = np.ascontiguousarray(np.asarray(eris.ovoo).transpose(1, 0, 2, 3))
+    vvoo = np.ascontiguousarray(np.asarray(eris.ovov).transpose(1, 3, 0, 2))
     return vvov, vooo, vvoo
-
-
-def _get_or_build_vvov(mycc, eris):
-    """Return the genuine non-Hermitian ``vvov`` block, building lazily.
-
-    Layout: ``eris.vvov[α, β, i, γ]`` holds the integral ``(αβ|iγ)``.
-
-    The standard ao2mo path of ``xtc_ccsd._make_xtc_eris`` builds this block
-    explicitly (line `eris.vvov = get_block('vvov')`). The DF path does NOT —
-    canonical CCSD never needs the ``vvov`` block (it can reach the same
-    contractions via ``ovvv`` + Hermitian symmetry), so the DF builder skips
-    it as an optimisation. For xTC (T), Hermitian symmetry isn't available,
-    so we must materialise the genuine ``(αβ|iγ)`` block.
-
-    Build cost is comparable to the existing ``ovvv``/``vovv`` build
-    (~10–30 min at benzene/cc-pCVQZ), so we do it lazily — only when (T)
-    is actually called, and cache on ``eris`` so a second ``(T)`` call
-    reuses it.
-    """
-    existing = getattr(eris, "vvov", None)
-    if existing is not None:
-        return existing
-
-    logger.info("xTC-(T): eris.vvov not present (DF-path build) — constructing lazily")
-    t0 = time.perf_counter()
-
-    xtc_obj = getattr(eris, "xtc_obj", None) or getattr(mycc, "xtc_obj", None)
-    if xtc_obj is None:
-        raise RuntimeError(
-            "xTC-(T) lazy vvov build: no xtc_obj on eris or mycc — cannot "
-            "obtain the TC contribution to the vvov block. Ensure "
-            "xtc_ccsd.RCCSD.ccsd() ran with the xTC ERI builder."
-        )
-    jastrow_params = getattr(mycc, "jastrow_params", None)
-    if jastrow_params is None:
-        # Fall back: try the jastrow attribute carrying the params
-        jastrow_params = getattr(mycc, "_jastrow_params", None)
-    if jastrow_params is None:
-        raise RuntimeError(
-            "xTC-(T) lazy vvov build: no jastrow_params accessible on mycc."
-        )
-
-    nocc, nmo = mycc.nocc, mycc.nmo
-    nvir = nmo - nocc
-
-    # --- Standard DF part ---
-    # vvov_std[α, β, i, γ] = Σ_L L_vv[L, α, β] * L_ov[L, i, γ]
-    if hasattr(eris, "vvL") and eris.vvL is not None:
-        L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0)  # (nvir, nvir, naux)
-    else:
-        raise RuntimeError(
-            "xTC-(T) lazy vvov build: eris.vvL not available; the DF "
-            "auxiliary tensor was freed. Rebuild eris via mycc.ao2mo() "
-            "first or extend the DF ERI builder to retain Lov/Lvv."
-        )
-
-    # Rebuild Lov from the DF auxiliary on-demand. For benzene cc-pCVQZ this
-    # is cheap (naux × nocc × nvir = ~3000 × 21 × 663 × 8 ≈ 330 MB).
-    Lov = _rebuild_lov_from_df(mycc, nocc, nvir)
-    # Lov shape: (naux, nocc, nvir); L_vv_full shape: (nvir, nvir, naux)
-    std_part = np.tensordot(L_vv_full, Lov, axes=((2,), (0,)))  # (nvir, nvir, nocc, nvir)
-
-    # --- xTC TC part ---
-    tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str="vvov"))
-
-    eris.vvov = std_part + tc_part
-    elapsed = time.perf_counter() - t0
-    logger.info(
-        "xTC-(T) lazy vvov done in %.1f s (%.2f GB)",
-        elapsed, eris.vvov.nbytes / 1e9,
-    )
-    return eris.vvov
-
-
-def _rebuild_lov_from_df(mycc, nocc, nvir):
-    """Rebuild ``Lov`` = (naux, nocc, nvir) from the DF auxiliary basis."""
-    mo_coeff = mycc.mo_coeff
-    mo_o = mo_coeff[:, :nocc]
-    mo_v = mo_coeff[:, nocc:]
-    with_df = mycc._scf.with_df
-    nao = mo_coeff.shape[0]
-    naux = with_df.get_naoaux()
-    Lov = np.empty((naux, nocc * nvir))
-    p1 = 0
-    for eri1 in with_df.loop():
-        # eri1 has shape (naux_block, nao*(nao+1)/2) — packed-triangular AO
-        Lao = lib.unpack_tril(eri1, axis=-1).reshape(-1, nao, nao)
-        n_chunk = Lao.shape[0]
-        # Lov_chunk[L, i, a] = mo_o^T[i, μ] * Lao[L, μ, ν] * mo_v[ν, a]
-        for L in range(n_chunk):
-            Lov[p1 + L] = (mo_o.T @ Lao[L] @ mo_v).reshape(-1)
-        p1 += n_chunk
-    return Lov.reshape(naux, nocc, nvir)
-
-
-def _build_layout_transforms(eris, nocc, nvir, mycc=None):
-    """Materialise vvov, vooo, vvoo on host for the JAX (T) kernels.
-
-    Thin wrapper around `_build_dual_blocks` — same dispatch (xTC dual
-    blocks if available, Hermitian fallback otherwise).
-    """
-    return _build_dual_blocks(mycc, eris, nocc, nvir)
 
 
 def _kernel_multigpu(mycc, eris, t1, t2):
@@ -1011,7 +888,7 @@ def _kernel_multigpu(mycc, eris, t1, t2):
     _check_hbm_budget(nocc, nvir, n_devices)
 
     # --- 1. Host-side layout transforms (once) ---
-    vvov_host, vooo_host, vvoo_host = _build_layout_transforms(eris, nocc, nvir, mycc=mycc)
+    vvov_host, vooo_host, vvoo_host = _build_layout_transforms(eris, nocc, nvir)
     t1T_host = np.ascontiguousarray(t1.T)
     t2T_host = np.ascontiguousarray(t2.transpose(2, 3, 0, 1))
     fvo_host = np.ascontiguousarray(eris.fock[nocc:, :nocc])
