@@ -97,19 +97,19 @@ def _build_ee_imds(imds: "_JAXIMDS") -> None:
     oovv = jnp.asarray(eris.oovv)
     ovvv = _materialize_ovvv(eris)
 
-    # eris.vvov: pytc stores this TC block explicitly. For pyscf-only eris
-    # objects (used in M3d numerical validation), reconstruct it from ovvv
-    # via the Hermitian-limit identity vvov = ovvv.conj().transpose(2,0,3,1).
-    # pytc's vvov has layout (a, b, c, d) = (ab|cd) with c occupied — shape
-    # (nv, nv, no, nv). For pyscf-only eris (M3d validation), reconstruct
-    # via Hermitian-limit identity (ab|cd) = (cd|ab) = ovvv[c, d, a, b].
-    if getattr(eris, "vvov", None) is not None:
-        vvov = jnp.asarray(np.asarray(eris.vvov))
+    # eris.vovv: pytc stores this TC block explicitly. Layout (a, i, b, c) =
+    # (ai|bc). Used in the wvOvV Hermitian-symmetry substitution — for non-
+    # Hermitian TC, (em|fb) is a separately stored integral (the (vo|vv) block)
+    # rather than ovvv.conj() reordered. For pyscf-only eris (M3d numerical
+    # validation, Hermitian RHF), reconstruct from ovvv via the identity
+    # (em|fb) = (me|bf) = ovvv[m, e, b, f], rearranged into vovv[e, m, f, b].
+    if getattr(eris, "vovv", None) is not None:
+        vovv = jnp.asarray(np.asarray(eris.vovv))
     else:
-        vvov = ovvv.transpose(2, 3, 0, 1).conj()
+        vovv = ovvv.transpose(1, 0, 3, 2)  # (m,e,b,f) -> (e,m,f,b)
 
     Foo, Fov, Fvv, woOoO, woVoO, woVvO, woVVo, woOoV, wvOvV = _jax_make_ee_imds(
-        t1, t2, fock, ovov, ovoo, oooo, ovvo, oovv, ovvv, vvov,
+        t1, t2, fock, ovov, ovoo, oooo, ovvo, oovv, ovvv, vovv,
     )
 
     imds.Foo = Foo

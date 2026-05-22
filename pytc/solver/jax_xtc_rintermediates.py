@@ -120,10 +120,20 @@ def _jax_cc_Wvovo(t1, t2, eris_ovvv, eris_ovoo, eris_oovv, eris_ovov):
 #
 #   2. TC-aware ERI access — the one conjugate-transpose pattern in pyscf's
 #      reference (``eris_ovvv.transpose(2,0,3,1).conj()`` at the wvOvV
-#      Hermitian-symmetry line) is replaced by ``eris.vvov.transpose(0,2,1,3)``
-#      per the nickirk/pyscf@tc-ccsd convention. All other ERI blocks are
-#      used directly (pytc stores ``oovv``, ``ovvo``, ``ovoo``, ``ovov``,
-#      ``ovvv``, ``oooo`` as separate TC blocks).
+#      Hermitian-symmetry line) requires care for non-Hermitian TC.
+#      Tracing through the chemist-notation indices:
+#        ovvv[m,e,b,f] = (me|bf), labelled IAbc (uppercase = first electron).
+#        conj()         → (em|fb) = AIcb  ⇒ requires the TC (vo|vv) block.
+#        transpose(2,0,3,1) on ovvv yields the form bIcA (lowercase, uppercase
+#        interleaved per wvOvV's r-pairing).
+#      To produce ``bIcA`` from the stored ``vovv[a,i,b,c] = (ai|bc)``
+#      (= ``AIcb``), do ``vovv.transpose(3,1,2,0)``. This is the correct TC
+#      substitution. The earlier ``vvov.transpose(0,2,1,3)`` was wrong: it
+#      delivers ``(bf|me)`` at the target index, which only equals ``(em|fb)``
+#      under Hermitian symmetry (real RHF, non-TC).
+#      All other ERI blocks are used directly (pytc stores ``oovv``,
+#      ``ovvo``, ``ovoo``, ``ovov``, ``ovvv``, ``vovv``, ``oooo`` as separate
+#      TC blocks).
 
 
 def _make_tau(t2, t1a, t1b, fac=1.0):
@@ -145,7 +155,7 @@ def _jax_make_ee_imds(
     eris_ovvo,
     eris_oovv,
     eris_ovvv,
-    eris_vvov,
+    eris_vovv,
 ):
     """JAX port of ``_IMDS.make_ee``. Returns the 9 EE H̄ intermediates.
 
@@ -158,9 +168,10 @@ def _jax_make_ee_imds(
         Standard chemist-notation ERI blocks (pytc-stored TC versions).
     eris_ovvv : jnp.ndarray, shape (no, nv, nv, nv)
         Full ovvv block (caller materializes from HDF5 if needed).
-    eris_vvov : jnp.ndarray, shape (nv, nv, no, nv)
-        TC-aware vvov block (= ``ovvv.conj().transpose(2,0,3,1)`` for the
-        Hermitian limit; pytc stores it separately for TC).
+    eris_vovv : jnp.ndarray, shape (nv, no, nv, nv)
+        TC (vo|vv) block, ``vovv[a,i,b,c] = (ai|bc)``. Used in the wvOvV
+        Hermitian-symmetry substitution. For non-Hermitian TC this is a
+        distinct stored block (not derivable from ovvv by Hermitian symmetry).
 
     Returns
     -------
@@ -256,14 +267,19 @@ def _jax_make_ee_imds(
     wvOvV = -0.5 * wvOvV.transpose(0, 1, 3, 2) - wvOvV
 
     # Hermitian-symmetry term: pyscf uses einsum('ebmf->bmfe', ebmf.conj()),
-    # i.e. ovvv.transpose(2, 0, 3, 1).conj() — shape (nv, no, nv, nv), value
-    # (me|bf)* at element [b, m, f, e]. The TC substitution swaps this with
-    # the directly-stored (vv|ov) block. With pytc's layout
-    # eris_vvov[a, b, c, d] = (ab|cd) (a, b, d vir; c occ), the equivalent
-    # is eris_vvov.transpose(0, 2, 1, 3) — shape (nv, no, nv, nv), value
-    # (ab|cd) at element [a, c, b, d], matching the Hermitian form's
-    # element-wise content via (me|bf)* = (bf|me) for real integrals.
-    wvOvV += eris_vvov.transpose(0, 2, 1, 3)
+    # i.e. ``ovvv.transpose(2, 0, 3, 1).conj()`` — shape (nv, no, nv, nv),
+    # value ``(em|fb)`` (= ``(me|bf)*``) at element [b, m, f, e].
+    #
+    # In non-Hermitian TC, (em|fb) is a separately-stored integral — the
+    # (vo|vv) block ``eris_vovv[a, i, b, c] = (ai|bc)``. Identifying
+    # ``vovv[e, m, f, b] = (em|fb)`` and reshaping to put the result at
+    # [b, m, f, e]: do ``vovv.transpose(3, 1, 2, 0)``.
+    #
+    # The earlier ``vvov.transpose(0, 2, 1, 3)`` used the (vv|ov) block,
+    # delivering ``(bf|me)`` at [b, m, f, e]. That equals (em|fb) only by
+    # Hermitian symmetry of real RHF; for non-Hermitian TC it is the wrong
+    # integral.
+    wvOvV += eris_vovv.transpose(3, 1, 2, 0)
 
     tmp = -0.5 * ebmf + ebmf.transpose(1, 0, 2, 3)
     wvOvV += jnp.einsum('efmb,mifa->eiba', tmp, theta)
