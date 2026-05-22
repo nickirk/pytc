@@ -835,59 +835,36 @@ def _check_hbm_budget(nocc, nvir, n_devices):
 def _build_dual_blocks(mycc, eris, nocc, nvir):
     """Build the three integral tensors `_kernel_reference` consumes.
 
-    PySCF's ``ccsd_t_slow`` builds three eris layouts via
-    ``ovvv/ovoo/ovov.conj().transpose(...)``. For Hermitian integrals,
-    ``.conj()`` paired with the transpose effectively accesses a
-    *different* chemist block via the 8-fold symmetry — specifically:
+    Layouts (matching PySCF's ``ccsd_t_slow.py`` access pattern):
+        vvov[a, b, i, f] = (bf | ia)
+        vooo[a, i, j, k] = (jk | ia)
+        vvoo[a, b, i, j] = (jb | ia)
 
-        ovvv.conj() effectively accesses the integral with chemist
-                    letters re-paired by a *double in-pair swap*:
-                    (ia|bc) → (ai|cb), which has block letters 'vovv'.
-        ovoo.conj() → (ai|kj), block letters 'vooo'.
-        ovov.conj() → (ai|bj), block letters 'vovo'.
+    Sources depend on eris type:
 
-    For Hermitian eris, in-pair swap is free, so these blocks have the
-    same numerical value as ``ovvv``/``ovoo``/``ovov`` at the same orbital
-    labels — PySCF gets away with using the "wrong" block.
+    * **xTC eris** (has ``.ooov`` and ``.vvov`` blocks built by the
+      non-Hermitian builder, or lazily reconstructible) — use the genuine
+      dual blocks permuted to the layout above:
 
-    For non-Hermitian xTC, in-pair swap is broken — so we must access
-    the genuine ``vovv``/``vooo``/``vovo`` blocks directly. All three
-    are built explicitly in the xTC ERI builder.
+          vvov_layout = eris.vvov.transpose(3, 0, 2, 1)   # (αβ|iγ) → [γ, α, i, β]
+          vooo_layout = eris.ooov.transpose(3, 2, 0, 1)   # (jk|ia) → [a, i, j, k]
+          vvoo_layout = eris.ovov.transpose(3, 1, 2, 0)   # (jb|ia) → [a, b, i, j]
 
-    Final layouts match PySCF's algorithm expectations:
-        vvov[a, c, i, b]  ← eris.vovv.transpose(0, 2, 1, 3),  value = (ai|cb)
-        vooo[a, i, j, k]  ← eris.vooo.transpose(0, 1, 3, 2),  value = (ai|kj)
-        vvoo[a, b, i, j]  ← eris.vovo.transpose(0, 2, 1, 3),  value = (ai|bj)
-
-    For plain PySCF (Hermitian) eris that don't have ``vovv``/``vovo``,
-    fall back to the historic ovvv/ovoo/ovov.transpose path — equivalent
-    under the Hermitian symmetry the test ERIs satisfy.
+    * **Plain PySCF eris** (Hermitian, only ``ovvv`` / ``ovoo`` / ``ovov``
+      stored) — use the historic ``.conj().transpose(...)`` Hermitian
+      trick. `.conj()` is identity for real eris.
     """
-    # For the vvov layout, prefer eris.vovv (direct dual-block); fall back
-    # to eris.vvvo via particle-exchange equivalence (ai|cb) = (cb|ai)
-    # — both blocks give the same numerical value at the algorithm-required
-    # access pattern, but xTC builders may carry one or the other depending
-    # on which path built the eris.
-    vovv_arr = getattr(eris, "vovv", None)
-    vvvo_arr = getattr(eris, "vvvo", None)
-    vooo_arr = getattr(eris, "vooo", None)
-    vovo_arr = getattr(eris, "vovo", None)
+    has_xtc_blocks = (getattr(eris, "ooov", None) is not None
+                      and getattr(eris, "ovov", None) is not None)
 
-    have_vvov_substitute = vovv_arr is not None or vvvo_arr is not None
-    if have_vvov_substitute and vooo_arr is not None and vovo_arr is not None:
-        if vovv_arr is not None:
-            # T[a, c, i, b] = vovv[a, i, c, b] = (ai|cb)
-            vvov = np.ascontiguousarray(np.asarray(vovv_arr).transpose(0, 2, 1, 3))
-        else:
-            # T[a, c, i, b] = vvvo[c, b, a, i] = (cb|ai) = (ai|cb) by particle
-            vvov = np.ascontiguousarray(np.asarray(vvvo_arr).transpose(2, 0, 3, 1))
-        vooo = np.ascontiguousarray(np.asarray(vooo_arr).transpose(0, 1, 3, 2))
-        vvoo = np.ascontiguousarray(np.asarray(vovo_arr).transpose(0, 2, 1, 3))
+    if has_xtc_blocks:
+        vvov_raw = _get_or_build_vvov(mycc, eris)
+        vvov = np.ascontiguousarray(np.asarray(vvov_raw).transpose(3, 0, 2, 1))
+        vooo = np.ascontiguousarray(np.asarray(eris.ooov).transpose(3, 2, 0, 1))
+        vvoo = np.ascontiguousarray(np.asarray(eris.ovov).transpose(3, 1, 2, 0))
         return vvov, vooo, vvoo
 
-    # Hermitian fallback (plain PySCF eris, used in correctness tests).
-    # For real Hermitian eris, in-pair swap is free, so the historic
-    # transposes give the same value as the genuine-dual-block path above.
+    # Hermitian fallback (plain PySCF eris, used in correctness tests)
     if hasattr(eris, "get_ovvv"):
         ovvv = np.asarray(eris.get_ovvv())
     else:
