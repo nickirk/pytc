@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-6 -6 242 116" role="img" aria-label="PyTC logo">
+  <defs>
+    <!-- JAX-flavoured purple→orange gradient, applied across the full
+         letterforms via userSpaceOnUse so individual blocks pick up the
+         appropriate slice of the spectrum. -->
+    <linearGradient id="pytcGrad" x1="0" y1="0" x2="230" y2="104"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%"  stop-color="#6c5ce7"/>
+      <stop offset="55%" stop-color="#c5547f"/>
+      <stop offset="100%" stop-color="#ff9f43"/>
+    </linearGradient>
+    <!-- Subtle top highlight on each block for a hint of depth. -->
+    <linearGradient id="pytcShine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="50%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <g>
+    <!-- T: top bar of 3 blocks + 2-block stem under the centre -->
+    <rect x="0"   y="0"  width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="36"  y="0"  width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="72"  y="0"  width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="36"  y="36" width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="36"  y="72" width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+
+    <!-- C: top bar, left stem, bottom bar -->
+    <rect x="126" y="0"  width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="162" y="0"  width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="198" y="0"  width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="126" y="36" width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="126" y="72" width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="162" y="72" width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+    <rect x="198" y="72" width="32" height="32" rx="5" fill="url(#pytcGrad)"/>
+
+    <!-- Re-emit each block with the shine overlay (kept as a second pass
+         so the gradient under it stays clean). -->
+    <g pointer-events="none">
+      <rect x="0"   y="0"  width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="36"  y="0"  width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="72"  y="0"  width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="36"  y="36" width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="36"  y="72" width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="126" y="0"  width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="162" y="0"  width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="198" y="0"  width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="126" y="36" width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="126" y="72" width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="162" y="72" width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+      <rect x="198" y="72" width="32" height="32" rx="5" fill="url(#pytcShine)"/>
+    </g>
+  </g>
+</svg>
