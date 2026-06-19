@@ -838,10 +838,11 @@ class XTC(TC):
                 This mirrors the ``ranges=`` convention of
                 ``XTC.get_2b`` / ``get_delta_U`` and is used by the
                 streamed DF/ISDF block writers in ``solver/xtc_ccsd.py``.
-                The current implementation slices the full tensor after
-                construction (the inner kernel does not yet support
-                per-tile work-reduction); upgrading to a tile-aware
-                kernel is straightforward future work.
+                The construction is tile-aware: only the requested
+                sub-block is built (displaced-AO eval, orbital
+                projections, and scan accumulator all carry the reduced
+                shape), so a ranged query never materialises the full
+                ``n_orb**4`` tensor.
 
         Returns:
             (n_orb, n_orb, n_orb, n_orb) ``jnp.ndarray`` (or the requested
@@ -853,11 +854,6 @@ class XTC(TC):
         from pytc.xtc_ecp_du import compute_delta_U_ecp_du
 
         n_orb = self.n_orb
-
-        def _maybe_slice(tensor):
-            if ranges is None:
-                return tensor
-            return tensor[ranges[0], ranges[1], ranges[2], ranges[3]]
 
         if ranges is None:
             zero_shape = (n_orb, n_orb, n_orb, n_orb)
@@ -902,8 +898,9 @@ class XTC(TC):
             angular_grid=angular_grid,
             chi_fn=chi_fn,
             pair_fn=pair_fn,
+            ranges=ranges,
         )
-        return _maybe_slice(full)
+        return full
 
     def get_1b_ecp_chi(self, mf, jastrow_params, quad_grid_name=None):
         """Δh^{(NL,χ)}_{pq} from the [V_NL, χ] commutator, Option B Phase 1.
