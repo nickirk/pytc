@@ -74,6 +74,7 @@ from . import df
 from . import kmat
 from . import lmat
 from . import tc_helper
+from . import fno
 
 # Submodules
 from . import ansatz
@@ -88,6 +89,7 @@ __all__ = [
     'kmat',
     'lmat',
     'tc_helper',
+    'fno',
     'ansatz',
     'jastrow',
     'vmc',
