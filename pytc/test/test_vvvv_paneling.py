@@ -311,12 +311,7 @@ class TestBroadcastToDevices(unittest.TestCase):
         self.assertEqual(result, {})
 
 
-_ON_CI = os.environ.get("CI", "").lower() == "true"
-
-
 class TestSolverRoundRobin(unittest.TestCase):
-    @unittest.skipIf(_ON_CI, "Race condition: consume threads release the issue semaphore "
-                              "in nondeterministic order on slow CI runners; pre-existing flake.")
     def test_round_robin_pipeline_cycles_devices(self):
         seen = []
         seen_lock = __import__("threading").Lock()
@@ -338,10 +333,13 @@ class TestSolverRoundRobin(unittest.TestCase):
             devices=("d0", "d1"),
         )
 
-        # Issue order is deterministic (main thread); consume order may vary
-        # because consumes now run concurrently in a thread pool.
-        issue_devices = [entry[2] for entry in seen if entry[0] == "issue"]
-        self.assertEqual(issue_devices, ["d0", "d1", "d0", "d1", "d0"])
+        # Each device has its own issue thread, so global callback order is
+        # intentionally nondeterministic. Assignment remains round-robin.
+        issue_entries = [entry for entry in seen if entry[0] == "issue"]
+        self.assertEqual(
+            sorted((entry[1], entry[2]) for entry in issue_entries),
+            [(0, "d0"), (1, "d1"), (2, "d0"), (3, "d1"), (4, "d0")],
+        )
         consume_entries = [entry for entry in seen if entry[0] == "consume"]
         self.assertEqual(len(consume_entries), 5)
         self.assertEqual(

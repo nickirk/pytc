@@ -19,12 +19,13 @@ class TestFCIDump(unittest.TestCase):
     def test_fcidump(self):
         mf = scf.RHF(self.mol)
         mf.kernel()
-        my_jastrow = REXP([1.4])
-        my_xtc = XTC(mf, my_jastrow, grid_lvl=2)
+        my_jastrow = REXP()
+        params = my_jastrow.init_params(alpha=1.4)
+        my_xtc = XTC.from_pyscf(mf, my_jastrow, grid_lvl=2)
         
-        h1e_xtc = my_xtc.get_1b()
-        h2e_xtc = my_xtc.get_2b()
-        ecore_xtc = my_xtc.get_const()
+        h1e_xtc = my_xtc.get_1b(params)
+        h2e_xtc = my_xtc.get_2b(params)
+        ecore_xtc = my_xtc.get_const(params)
         n_orb_xtc = h1e_xtc.shape[0]
         n_elec_xtc = self.mol.nelectron
         

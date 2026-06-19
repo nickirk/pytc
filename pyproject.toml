@@ -46,6 +46,9 @@ docs = [
     "sphinx-copybutton",
     "sphinx-autodoc-typehints",
 ]
+test = [
+    "coverage[toml]>=7.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/nickirk/pytc"
@@ -57,3 +60,12 @@ exclude = ["logs*", "*.tests", "*.tests.*", "tests.*", "tests"]
 
 [tool.setuptools.package-data]
 pytc = ["py.typed"]
+
+[tool.coverage.run]
+branch = true
+source = ["pytc"]
+omit = ["pytc/**/test/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

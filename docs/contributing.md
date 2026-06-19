@@ -14,10 +14,7 @@ Contributions are welcome! Here's how you can help.
 2. Make your changes, following the existing code style
 3. **Run the tests** before submitting:
    ```bash
-   python -m unittest discover pytc/test
-   python -m unittest discover pytc/ansatz/test
-   python -m unittest discover pytc/vmc/test
-   python -m unittest discover pytc/jastrow/test
+   python -m unittest discover -v
    ```
 4. Submit a pull request with a clear description of your changes
 
@@ -30,15 +27,10 @@ Contributions are welcome! Here's how you can help.
 ## Testing
 
 ```bash
-# Core tests
-python -m unittest discover pytc/test
+# Canonical full suite
+python -m unittest discover -v
 
-# Submodule tests
-python -m unittest discover pytc/ansatz/test
-python -m unittest discover pytc/vmc/test
-python -m unittest discover pytc/jastrow/test
-python -m unittest discover pytc/solver/test
-
-# Legacy tests (NumPy implementation)
-python -m unittest discover pytc/legacy/test
+# Coverage baseline (install with: python -m pip install -e '.[test]')
+python -m coverage run -m unittest discover
+python -m coverage report
 ```
