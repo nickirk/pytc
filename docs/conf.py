@@ -19,7 +19,7 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=1")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 # -- Project information -----------------------------------------------------
-project = "pytc"
+project = "PyTC"
 copyright = "2025, Ke Liao"
 author = "Ke Liao"
 release = "0.1.0"
@@ -30,6 +30,7 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
+    "sphinx.ext.mathjax",
     "myst_parser",
     "sphinx_copybutton",
 ]
@@ -94,11 +95,13 @@ def setup(app):
 myst_enable_extensions = [
     "colon_fence",
     "deflist",
+    "dollarmath",
 ]
 
 # -- Options for HTML output -------------------------------------------------
 html_theme = "furo"
-html_title = "pytc"
+html_title = "PyTC"
+html_logo = "_static/pytc-logo.svg"
 html_static_path = ["_static"]
 html_baseurl = "https://nickirk.github.io/pytc/"
 
