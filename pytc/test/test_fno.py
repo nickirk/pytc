@@ -79,8 +79,31 @@ class TestMakeFNOMoCoeff(unittest.TestCase):
         P2 = r.mo_coeff @ r.mo_coeff.T
         np.testing.assert_allclose(P1, P2, atol=1e-9)
 
-    def test_mf_copy_preserves_eri_cache(self):
-        # mf.copy() must keep mf._eri so the solver's ao2mo path works; the
+    def test_rdm_transform_uses_overlap_metric(self):
+        """Regression for the AO-overlap-metric bug: the MP2 1-RDM must be
+        transformed to the MO basis as gamma_mo = C^T S P_ao S C (MOs are
+        orthonormal in the S-metric, C^T S C = I), NOT a plain C^T P C.
+        Confirms the returned NO occupations equal eigh of the metric-correct
+        virtual-virtual block, and *disagree* with the (buggy) no-metric block
+        so the guard fails if the metric is ever dropped.
+        """
+        from pyscf import mp as _mp
+        pt = _mp.MP2(self.mf).run()
+        P = np.asarray(pt.make_rdm1(ao_repr=True), dtype=float)
+        C = self.mf.mo_coeff
+        S = self.S
+        nocc = self.nocc
+        occ_ref = np.sort(np.linalg.eigvalsh(
+            (C.T @ S @ P @ S @ C)[nocc:, nocc:]))[::-1]
+        occ_buggy = np.sort(np.linalg.eigvalsh(
+            (C.T @ P @ C)[nocc:, nocc:]))[::-1]
+        r = make_fno_mo_coeff(self.mf, n_keep=4)
+        np.testing.assert_allclose(np.sort(r.no_occ)[::-1], occ_ref, atol=1e-10)
+        # negative control: dropping S must change the occupations
+        self.assertFalse(np.allclose(occ_ref, occ_buggy, atol=1e-6),
+                         "metric vs no-metric RDM transforms must differ")
+
+    def test_mf_copy_preserves_eri_cache(self):        # mf.copy() must keep mf._eri so the solver's ao2mo path works; the
         # generic copy.copy nulls it via pyscf __getstate__.
         r = make_fno_mo_coeff(self.mf, n_keep=4)
         self.assertIsNotNone(r.mf._eri)
