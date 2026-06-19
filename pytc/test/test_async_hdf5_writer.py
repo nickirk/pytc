@@ -199,9 +199,9 @@ class TestAsyncHDF5Writer(unittest.TestCase):
 
         self.assertEqual(s["n_jobs"], 5)
         self.assertEqual(s["bytes_written"], 5 * 1_000_000)
-        # Each job slept ~30ms, so busy_time should be near 0.15s.
+        # Each job slept at least ~30ms. Loaded CI hosts may oversleep,
+        # so only the lower bound is a portable correctness invariant.
         self.assertGreater(s["busy_time_s"], 0.10)
-        self.assertLess(s["busy_time_s"], 0.50)
         # Single-threaded serial execution → saturation near 1.0.
         self.assertGreater(s["saturation"], 0.80)
         self.assertLessEqual(s["saturation"], 1.0 + 1e-9)

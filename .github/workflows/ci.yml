@@ -29,8 +29,7 @@ jobs:
 
     - name: Run full tests
       run: |
-        python -m unittest discover -v -s pytc/test -t pytc/test
-        python -m unittest discover -v -s pytc/jastrow/test -t pytc/jastrow/test
+        python -m unittest discover -v
         # The vmc dir contains modules that need XLA_FLAGS set BEFORE jax import
         # (test_multi_gpu, test_multi_gpu_batched, test_shard_map). When discover
         # walks the dir it imports other modules first and jax initialises with
@@ -43,9 +42,6 @@ jobs:
               pytc.vmc.test.test_multi_gpu \
               pytc.vmc.test.test_multi_gpu_batched \
               pytc.vmc.test.test_shard_map
-        python -m unittest discover -v -s pytc/ansatz/test -t pytc/ansatz/test
-        python -m unittest discover -v -s pytc/solver/test -t pytc/solver/test
-        python -m unittest discover -v -s pytc/legacy/test -t pytc/legacy/test
 
   # Smoke tests on intermediate Python versions (quick import + basic tests)
   smoke-test:

@@ -181,17 +181,7 @@ See the `pytc/examples/` directory for complete examples:
 
 To run the tests:
 ```bash
-# Core tests
-python -m unittest discover pytc/test
-
-# Submodule tests
-python -m unittest discover pytc/ansatz/test
-python -m unittest discover pytc/vmc/test
-python -m unittest discover pytc/jastrow/test
-python -m unittest discover pytc/solver/test
-
-# Legacy tests (NumPy implementation)
-python -m unittest discover pytc/legacy/test
+python -m unittest discover -v
 ```
 
 ## Publications
@@ -212,10 +202,7 @@ Contributions are welcome! Here's how you can help:
 2. Make your changes, following the existing code style
 3. **Run the tests** before submitting:
    ```bash
-   python -m unittest discover pytc/test
-   python -m unittest discover pytc/ansatz/test
-   python -m unittest discover pytc/vmc/test
-   python -m unittest discover pytc/jastrow/test
+   python -m unittest discover -v
    ```
 4. Submit a pull request with a clear description of your changes
 
