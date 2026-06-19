@@ -90,6 +90,14 @@ def make_fno_mo_coeff(mf, *, n_keep=None, occ_threshold=None):
         ValueError: if the mean-field is not restricted, if neither
             truncation argument is compatible, or if ``n_keep`` exceeds
             the virtual count.
+
+    Notes:
+        Truncation is **virtual-only**: every occupied orbital (read from
+        ``mf.mo_occ``) is retained and kept first in the output; only the
+        virtual space is rotated to natural orbitals and truncated. The MP2
+        step is **all-electron** (no frozen core) — consistent with the
+        project's all-electron convention; if a frozen-core FNO is wanted,
+        pass an ``mf`` whose occupied space already reflects that choice.
     """
     from pyscf import scf as _pyscf_scf
 
