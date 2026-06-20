@@ -101,6 +101,15 @@ class TestTC(unittest.TestCase):
             rtol=1e-5, atol=1e-5,
             err_msg="JAX and numpy two-body terms don't match"
         )
+
+    def test_get_eri_without_incore_cache(self):
+        """Test AO-to-MO transformation when PySCF does not cache AO ERIs."""
+        expected = tc_helper.get_eri(self.mf)
+        self.mf._eri = None
+
+        actual = tc_helper.get_eri(self.mf)
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
     
     def test_mo_coeff_handling(self):
         """Test handling of molecular orbital coefficients."""

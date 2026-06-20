@@ -163,7 +163,6 @@ class TestXTC(unittest.TestCase):
 
     def test_nhccsd(self):
         from pyscf.cc import rccsd, CCSD
-        from pyscf import ao2mo
         import numpy as np
         from functools import reduce
 
@@ -175,9 +174,7 @@ class TestXTC(unittest.TestCase):
         t = mycc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))
         print("|t1+t2| = ", np.linalg.norm(t))
-        eri1 = ao2mo.incore.full(self.xtc_jax.mf._eri if hasattr(self.xtc_jax, 'mf') else self.mf._eri, 
-                                 self.xtc_jax.mo_coeff, compact=False)
-        eri1 = ao2mo.restore(1, eri1, self.xtc_jax.mo_coeff.shape[1])
+        eri1 = tc_helper.get_eri(self.mf, self.xtc_jax.mo_coeff)
         h1e = mycc._scf.get_hcore()
         h1e = reduce(np.dot, (self.xtc_jax.mo_coeff.T, h1e, self.xtc_jax.mo_coeff))
         

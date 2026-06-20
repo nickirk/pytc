@@ -6,10 +6,11 @@ from functools import partial, reduce
 import numpy as np
 import time
 
-from pyscf import gto, scf, ao2mo
+from pyscf import gto, scf
 
 from pytc.legacy.xtc import XTC
 from pytc.legacy.jastrow import REXP
+from pytc.tc_helper import get_eri
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
@@ -76,8 +77,7 @@ class TestXTC(unittest.TestCase):
         t = mycc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))
         print("|t1+t2| = ", np.linalg.norm(t))
-        eri1 = ao2mo.incore.full(self.xtc.mf._eri, self.xtc.mo_coeff, compact=False)
-        eri1 = ao2mo.restore(1, eri1, self.xtc.mo_coeff.shape[1])
+        eri1 = get_eri(self.xtc.mf, self.xtc.mo_coeff)
         h1e = mycc._scf.get_hcore()
         h1e = reduce(np.dot, (self.xtc.mo_coeff.T, h1e, self.xtc.mo_coeff))
         
@@ -90,7 +90,9 @@ class TestXTC(unittest.TestCase):
 
         myrcc = rccsd.RCCSD(self.mf)
         #myrcc.verbose = 5
+        self.xtc.mf._eri = None
         eris = self.xtc.make_eris()
+        self.assertIsNotNone(self.xtc.mf._eri)
         tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
         t = myrcc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))

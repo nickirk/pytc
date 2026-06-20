@@ -16,8 +16,13 @@ def get_eri(mf, mo_coeff=None):
     if mo_coeff is None:
         mo_coeff = mf.mo_coeff
         
-    # Compute ERI using PySCF
-    eri = ao2mo.incore.full(mf._eri, mo_coeff, compact=False)
+    # PySCF may not retain the AO integral cache for larger molecules or on
+    # memory-constrained runners. Fall back to the molecule-backed transform.
+    ao_eri = getattr(mf, "_eri", None)
+    if ao_eri is None:
+        eri = ao2mo.kernel(mf.mol, mo_coeff, compact=False)
+    else:
+        eri = ao2mo.incore.full(ao_eri, mo_coeff, compact=False)
     eri = ao2mo.restore(1, eri, mo_coeff.shape[1])
     return eri
 
