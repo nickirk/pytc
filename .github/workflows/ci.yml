@@ -29,7 +29,20 @@ jobs:
 
     - name: Run full tests
       run: |
-        python -m unittest discover -v
+        # Run each package in a fresh process so JAX/PySCF caches from the
+        # numerical suites cannot accumulate and exhaust hosted-runner memory.
+        for test_dir in \
+          pytc/test \
+          pytc/jastrow/test \
+          pytc/vmc/test \
+          pytc/ansatz/test \
+          pytc/solver/test \
+          pytc/utils/test \
+          pytc/legacy/jastrow/test \
+          pytc/legacy/test
+        do
+          python -m unittest discover -v -s "$test_dir" -t "$test_dir"
+        done
         # The vmc dir contains modules that need XLA_FLAGS set BEFORE jax import
         # (test_multi_gpu, test_multi_gpu_batched, test_shard_map). When discover
         # walks the dir it imports other modules first and jax initialises with
