@@ -7,6 +7,7 @@ import time
 from pyscf import gto, scf
 from pytc.tc import TC, ISDFTC
 from pytc.xtc import XTC, ISDFXTC
+from pytc.tc_helper import get_eri
 
 jax.config.update("jax_enable_x64", True)
 from pytc.jastrow.rexp import REXP
@@ -115,9 +116,7 @@ class TestISDF(unittest.TestCase):
         print("Running NumPy Exact 2-Body Correction...")
         k2b_numpy_full = self.tc_numpy.get_2b()
         # Compute ERI to isolate TC correction
-        from pyscf import ao2mo
-        eri = ao2mo.incore.full(self.mf._eri, self.mf.mo_coeff, compact=False)
-        eri = ao2mo.restore(1, eri, self.mf.mo_coeff.shape[1])
+        eri = get_eri(self.mf)
         k2b_exact_numpy = k2b_numpy_full - eri
         
         # --- Compare Exact Versions ---

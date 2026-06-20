@@ -2,14 +2,22 @@
 
 import unittest
 import os 
+import sys
 from functools import partial, reduce
 import numpy as np
 import time
 
-from pyscf import gto, scf, ao2mo
+from pyscf import gto, scf
 
 from pytc.legacy.xtc import XTC
 from pytc.legacy.jastrow import REXP
+from pytc.tc_helper import get_eri
+
+_SKIP_ISDF_STRESS = (
+    os.environ.get("CI", "").lower() == "true"
+    and sys.version_info >= (3, 14)
+)
+
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
@@ -76,8 +84,7 @@ class TestXTC(unittest.TestCase):
         t = mycc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))
         print("|t1+t2| = ", np.linalg.norm(t))
-        eri1 = ao2mo.incore.full(self.xtc.mf._eri, self.xtc.mo_coeff, compact=False)
-        eri1 = ao2mo.restore(1, eri1, self.xtc.mo_coeff.shape[1])
+        eri1 = get_eri(self.xtc.mf, self.xtc.mo_coeff)
         h1e = mycc._scf.get_hcore()
         h1e = reduce(np.dot, (self.xtc.mo_coeff.T, h1e, self.xtc.mo_coeff))
         
@@ -90,7 +97,9 @@ class TestXTC(unittest.TestCase):
 
         myrcc = rccsd.RCCSD(self.mf)
         #myrcc.verbose = 5
+        self.xtc.mf._eri = None
         eris = self.xtc.make_eris()
+        self.assertIsNotNone(self.xtc.mf._eri)
         tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
         t = myrcc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))
@@ -132,6 +141,10 @@ class TestXTC(unittest.TestCase):
              self.fail(f"Total energy {tc_e_hf + tc_e_corr} does not match expected custom ({expected_total_custom}) or standard ({expected_total_standard}) values.")
 
 
+    @unittest.skipIf(
+        _SKIP_ISDF_STRESS,
+        "Exceeds GitHub-hosted runner resources on Python 3.14; covered by the 3.10 full job",
+    )
     def test_delta_U_isdf_convergence(self):
         """Test convergence of ISDF delta_U calculation with increasing rank."""
         # Get reference delta_U using original method
@@ -197,6 +210,10 @@ class TestXTC(unittest.TestCase):
         print(f"\nReference calculation time: {ref_time:.2f}s")
         
 
+    @unittest.skipIf(
+        _SKIP_ISDF_STRESS,
+        "Exceeds GitHub-hosted runner resources on Python 3.14; covered by the 3.10 full job",
+    )
     def test_isdf_ccsd_convergence(self):
         """Test convergence of ISDF XTC-CCSD energy with increasing rank."""
         from pyscf.cc import rccsd

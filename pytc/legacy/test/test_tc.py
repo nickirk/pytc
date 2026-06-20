@@ -2,9 +2,10 @@
 
 import unittest
 import numpy as np
-from pyscf import gto, scf, ao2mo
+from pyscf import gto, scf
 from pytc.legacy.tc import TC
 from pytc.legacy.jastrow import Jastrow
+from pytc.tc_helper import get_eri
 
 
 def get_h2_sto3g():
@@ -100,8 +101,7 @@ class TestTC(unittest.TestCase):
         result += result.transpose(2, 3, 0, 1)
         
         # Add ERI
-        eri1 = ao2mo.incore.full(self.tc.mf._eri, self.tc.mo_coeff, compact=False)
-        eri1 = ao2mo.restore(1, eri1, n_orb)
+        eri1 = get_eri(self.tc.mf, self.tc.mo_coeff)
         
         expected = eri1 - result
         

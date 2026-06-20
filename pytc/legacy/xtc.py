@@ -332,6 +332,9 @@ class XTC(TC):
 
     def make_eris(self):
         from pyscf.cc import rccsd
+        if getattr(self.mf, "_eri", None) is None:
+            self.mf._eri = self.mol.intor("int2e", aosym="s8")
+
         mycc = rccsd.RCCSD(self.mf)
         nocc = np.sum(self.mf.mo_occ > 0)
         nmo = mycc.nmo

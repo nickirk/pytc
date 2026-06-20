@@ -139,11 +139,11 @@ def main():
 
 def do_ccsd(mf, jastrow_factor, params):
     from pyscf.cc import rccsd, CCSD
-    from pyscf import ao2mo
     import numpy as np
     from functools import reduce
 
     from pytc.xtc import XTC
+    from pytc.tc_helper import get_eri
     # only need the jastrow params
     xtc = XTC(mf, jastrow_factor, grid_lvl=2)
 
@@ -155,8 +155,7 @@ def do_ccsd(mf, jastrow_factor, params):
     t = mycc.amplitudes_to_vector(t1, t2)
     print("|t2| = ", np.linalg.norm(t2))
     print("|t1+t2| = ", np.linalg.norm(t))
-    eri1 = ao2mo.incore.full(xtc.mf._eri, xtc.mo_coeff, compact=False)
-    eri1 = ao2mo.restore(1, eri1, xtc.mo_coeff.shape[1])
+    eri1 = get_eri(xtc.mf, xtc.mo_coeff)
     h1e = mycc._scf.get_hcore()
     h1e = reduce(np.dot, (xtc.mo_coeff.T, h1e, xtc.mo_coeff))
     

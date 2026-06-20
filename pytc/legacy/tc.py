@@ -2,9 +2,10 @@
 
 import numpy as np
 from functools import partial
-from pyscf import dft, ao2mo
+from pyscf import dft
 from . import lmat
 from .df import isdf_decompose_multi, test_accuracy
+from ..tc_helper import get_eri
 import logging
 
 logger = logging.getLogger(__name__)
@@ -209,8 +210,7 @@ class TC:
         result += result.transpose(2, 3, 0, 1)
         
         # Add original two-body integrals
-        eri1 = ao2mo.incore.full(self.mf._eri, self.mo_coeff, compact=False)
-        eri1 = ao2mo.restore(1, eri1, self.mo_coeff.shape[1])
+        eri1 = get_eri(self.mf, self.mo_coeff)
         
         return eri1-result
 
