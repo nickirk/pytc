@@ -2,6 +2,7 @@
 
 import unittest
 import os 
+import sys
 from functools import partial, reduce
 import numpy as np
 import time
@@ -11,6 +12,12 @@ from pyscf import gto, scf
 from pytc.legacy.xtc import XTC
 from pytc.legacy.jastrow import REXP
 from pytc.tc_helper import get_eri
+
+_SKIP_ISDF_STRESS = (
+    os.environ.get("CI", "").lower() == "true"
+    and sys.version_info >= (3, 14)
+)
+
 
 def get_be_ccpvdz():
     """Return a Be atom with cc-pVDZ basis for testing."""
@@ -134,6 +141,10 @@ class TestXTC(unittest.TestCase):
              self.fail(f"Total energy {tc_e_hf + tc_e_corr} does not match expected custom ({expected_total_custom}) or standard ({expected_total_standard}) values.")
 
 
+    @unittest.skipIf(
+        _SKIP_ISDF_STRESS,
+        "Exceeds GitHub-hosted runner resources on Python 3.14; covered by the 3.10 full job",
+    )
     def test_delta_U_isdf_convergence(self):
         """Test convergence of ISDF delta_U calculation with increasing rank."""
         # Get reference delta_U using original method
@@ -199,6 +210,10 @@ class TestXTC(unittest.TestCase):
         print(f"\nReference calculation time: {ref_time:.2f}s")
         
 
+    @unittest.skipIf(
+        _SKIP_ISDF_STRESS,
+        "Exceeds GitHub-hosted runner resources on Python 3.14; covered by the 3.10 full job",
+    )
     def test_isdf_ccsd_convergence(self):
         """Test convergence of ISDF XTC-CCSD energy with increasing rank."""
         from pyscf.cc import rccsd
