@@ -118,8 +118,14 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
     """Specialized pivoted Cholesky for phi decomposition."""
     n_grid = phi_weighted.shape[1]
     
-    # Initialize diagonal
+    # Deterministic tie-break ramp for argmax (GPU/CPU pivot selection).
+    # GPU tree-reduction in sum(phi**2,axis=0) produces diag_err values differing
+    # ~eps·V (≈1e-16) device-to-device, flipping near-tie argmax results. Adding
+    # a ramp = 1e-12 * arange(n_grid) * max(|diag_err|) overrides reduction noise
+    # (~4 orders above eps, ~4 orders below typical candidate gaps) so the
+    # highest index wins ties deterministically on both devices.
     diag_err = jnp.sum(phi_weighted**2, axis=0)**2 + shift
+    diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
     
     # Storage for L factor (N_grid, n_rank)
     L = jnp.zeros((n_grid, n_rank))
@@ -162,6 +168,8 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
     A_diag = jnp.sum(phi_weighted**2, axis=0)
     B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
     diag_err = A_diag * B_diag + shift
+    # Same deterministic tie-break ramp as _pivoted_cholesky_phi (see comment there).
+    diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
     
     # Storage for L factor (N_grid, n_rank)
     L = jnp.zeros((n_grid, n_rank))
@@ -204,7 +212,7 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
 
 def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                    grid_batch_size=4096, rcond=1e-14,
-                   is_incore=False, save_path=None):
+                   is_incore=False, save_path=None, fixed_pivots=None):
     """Perform ISDF decomposition of orbitals and their gradients.
     
     Memory-efficient implementation using SVD-based solver to avoid
@@ -228,7 +236,7 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         xi_grad: (N_fused, N_grid, 3)
         pivots: (N_fused,)
     """
-    if save_path is not None and os.path.exists(save_path):
+    if save_path is not None and os.path.exists(save_path) and fixed_pivots is None:
         try:
             with h5py.File(save_path, 'r') as f:
                 if all(k in f for k in ['xi_phi', 'xi_grad', 'pivots', 'phi_isdf', 'grad_phi_isdf']):
@@ -303,6 +311,23 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     n_fused = pivots.shape[0]
     t1 = time.perf_counter()
     logger.info(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
+
+    # Experiment hook (Task B precision investigation): override the device-selected
+    # pivots with an externally-supplied fused-pivot set. Used to force CPU-selected
+    # pivots onto the GPU interpolation so we can isolate whether the GPU/CPU
+    # isdf_dU_err gap comes from pivot SELECTION (gap collapses) or downstream
+    # numerics (gap persists). No effect on the default path (fixed_pivots=None).
+    if fixed_pivots is not None:
+        fp = np.asarray(fixed_pivots)
+        if fp.ndim != 1 or not np.issubdtype(fp.dtype, np.integer):
+            raise ValueError("fixed_pivots must be a 1-D integer array of grid indices")
+        if np.unique(fp).shape[0] != fp.shape[0]:
+            raise ValueError("fixed_pivots must be unique")
+        if fp.size == 0 or fp.min() < 0 or fp.max() >= n_grid:
+            raise ValueError(f"fixed_pivots out of range [0, {n_grid})")
+        pivots = jnp.asarray(fp, dtype=pivots.dtype)
+        n_fused = int(pivots.shape[0])
+        logger.info(f"isdf_decompose: overriding with {n_fused} externally-supplied fixed pivots")
     
     # --- 4. Extract pivot values ---
     t0 = time.perf_counter()

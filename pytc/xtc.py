@@ -949,7 +949,7 @@ class ISDFXTC(XTC, ISDFTC):
     # Fields are inherited from ISDFTC
 
     @classmethod
-    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
+    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384, fixed_pivots=None):
         """Initialize ISDFXTC object from XTC object.
 
         Args:
@@ -988,7 +988,8 @@ class ISDFXTC(XTC, ISDFTC):
         logger.info("ISDFXTC.from_xtc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
-            is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
+            is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size,
+            fixed_pivots=fixed_pivots
         )
 
         # Persist xtc_obj's mo_coeff / mo_occ so subsequent runs that reuse
