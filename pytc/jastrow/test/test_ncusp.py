@@ -334,5 +334,69 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         for x, E, u in zip(x_points, energies, jastrow_vals):
             print(f"{x:10.4f}  {E:15.6f}  {u:15.6f}")
 
+
+class TestNuclearCuspFiniteDiff(unittest.TestCase):
+    """Finite-difference safety net for ncusp.get_log_grads_r1.
+
+    Pins grad_u and lap_u (via folx.forward_laplacian) against central
+    finite differences of ncusp._compute.  This is the correctness
+    contract that the PR10 direct-indexing refactor must preserve.
+    """
+
+    def setUp(self):
+        self.mol = gto.M(atom='H 0 0 1.4; O 0 0 0; H 0 0 -1.4', basis='cc-pvdz')
+        self.mf = scf.RHF(self.mol)
+        self.mf.kernel()
+        self.ncusp = NuclearCusp.create(self.mol, n_radial=1000)
+        self.params = self.ncusp.init_params()
+
+    def _fd_grad_lap(self, r1, r2, eps=1e-5):
+        """Central FD of _compute w.r.t. r1 in float64."""
+        r1_np = np.asarray(r1, dtype=np.float64)
+        fd_grad = np.zeros(3)
+        fd_second = 0.0
+        for d in range(3):
+            plus = jnp.array(r1_np + eps * np.eye(3)[d])
+            minus = jnp.array(r1_np - eps * np.eye(3)[d])
+            u_plus = float(self.ncusp._compute(plus, r2, self.params))
+            u_minus = float(self.ncusp._compute(minus, r2, self.params))
+            fd_grad[d] = (u_plus - u_minus) / (2 * eps)
+            u0 = float(self.ncusp._compute(jnp.array(r1_np), r2, self.params))
+            fd_second += (u_plus - 2 * u0 + u_minus) / eps ** 2
+        return fd_grad, fd_second
+
+    def test_grad_near_hydrogen(self):
+        r1 = jnp.array([0.03, 0.0, 1.37])
+        r2 = jnp.array([0.0, 0.01, -1.35])
+        grad_u, lap_u = self.ncusp.get_log_grads_r1(r1, r2, self.params)
+        fd_grad, fd_lap = self._fd_grad_lap(r1, r2)
+        np.testing.assert_allclose(np.asarray(grad_u), fd_grad, atol=1e-4,
+                                   err_msg="ncusp grad_u != FD near H")
+
+    def test_lap_near_hydrogen(self):
+        r1 = jnp.array([0.03, 0.0, 1.37])
+        r2 = jnp.array([0.0, 0.01, -1.35])
+        grad_u, lap_u = self.ncusp.get_log_grads_r1(r1, r2, self.params)
+        fd_grad, fd_lap = self._fd_grad_lap(r1, r2)
+        np.testing.assert_allclose(float(lap_u), fd_lap, atol=1e-2,
+                                   err_msg="ncusp lap_u != FD near H")
+
+    def test_grad_near_oxygen(self):
+        r1 = jnp.array([0.02, 0.02, 0.0])
+        r2 = jnp.array([0.0, 0.0, 1.0])
+        grad_u, lap_u = self.ncusp.get_log_grads_r1(r1, r2, self.params)
+        fd_grad, fd_lap = self._fd_grad_lap(r1, r2)
+        np.testing.assert_allclose(np.asarray(grad_u), fd_grad, atol=1e-4,
+                                   err_msg="ncusp grad_u != FD near O")
+
+    def test_lap_near_oxygen(self):
+        r1 = jnp.array([0.02, 0.02, 0.0])
+        r2 = jnp.array([0.0, 0.0, 1.0])
+        grad_u, lap_u = self.ncusp.get_log_grads_r1(r1, r2, self.params)
+        fd_grad, fd_lap = self._fd_grad_lap(r1, r2)
+        np.testing.assert_allclose(float(lap_u), fd_lap, atol=1e-2,
+                                   err_msg="ncusp lap_u != FD near O")
+
+
 if __name__ == '__main__':
     unittest.main()

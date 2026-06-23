@@ -323,10 +323,8 @@ class NuclearCusp(Jastrow):
         xs = self.spline_xs
         coeffs = self.spline_coeffs
         
-        # Select data for this nucleus
-        mask = jnp.arange(self.n_nuclei) == nucleus_idx
-        x = jnp.sum(xs * mask[:, None], axis=0)
-        c = jnp.sum(coeffs * mask[:, None, None], axis=0)
+        x = xs[nucleus_idx]
+        c = coeffs[nucleus_idx]
         
         # Process differently based on input type
         if r_is_array:
@@ -367,10 +365,8 @@ class NuclearCusp(Jastrow):
         xs = self.spline_xs
         coeffs = self.spline_coeffs
         
-        # Select data for this nucleus using where/multiply
-        mask = jnp.arange(self.n_nuclei) == nucleus_idx
-        x = jnp.sum(xs * mask[:, None], axis=0)
-        c = jnp.sum(coeffs * mask[:, None, None], axis=0)
+        x = xs[nucleus_idx]
+        c = coeffs[nucleus_idx]
         
         # Find interval using safe integer operations
         dx = x[1] - x[0]
@@ -382,10 +378,10 @@ class NuclearCusp(Jastrow):
         t = r - x[index_int]  # Note: not normalized by dx here
         
         # Get coefficients for this interval
-        c0 = jnp.sum(c[0] * (jnp.arange(len(c[0])) == index_int))  # cubic term
-        c1 = jnp.sum(c[1] * (jnp.arange(len(c[1])) == index_int))  # quadratic term
-        c2 = jnp.sum(c[2] * (jnp.arange(len(c[2])) == index_int))  # linear term
-        c3 = jnp.sum(c[3] * (jnp.arange(len(c[3])) == index_int))  # constant term
+        c0 = c[0, index_int]
+        c1 = c[1, index_int]
+        c2 = c[2, index_int]
+        c3 = c[3, index_int]
         
         # Value: p(t) = c0*t³ + c1*t² + c2*t + c3
         phi = c3 + t*(c2 + t*(c1 + t*c0))
