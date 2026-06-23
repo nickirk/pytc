@@ -93,25 +93,16 @@ def save_mf_state_to_cache(save_path: Optional[str], mf) -> bool:
         return False
     if getattr(mf, "mo_coeff", None) is None:
         return False
-    with h5py.File(save_path, "a") as f:
-        for key, attr in (
-            (_KEY_MO_COEFF, "mo_coeff"),
-            (_KEY_MO_ENERGY, "mo_energy"),
-            (_KEY_MO_OCC, "mo_occ"),
-        ):
-            val = getattr(mf, attr, None)
-            if val is None:
-                continue
-            if key in f:
-                del f[key]
-            f.create_dataset(key, data=np.asarray(val))
-        e_tot = getattr(mf, "e_tot", None)
-        if e_tot is not None:
-            if _KEY_E_TOT in f:
-                del f[_KEY_E_TOT]
-            f.create_dataset(_KEY_E_TOT, data=float(e_tot))
-    logger.info("Persisted mf orbital state (mo_coeff etc.) to %s", save_path)
-    return True
+    result = save_orbital_state_to_cache(
+        save_path,
+        mo_coeff=getattr(mf, "mo_coeff", None),
+        mo_energy=getattr(mf, "mo_energy", None),
+        mo_occ=getattr(mf, "mo_occ", None),
+        e_tot=getattr(mf, "e_tot", None),
+    )
+    if result:
+        logger.info("Persisted mf orbital state (mo_coeff etc.) to %s", save_path)
+    return result
 
 
 def save_orbital_state_to_cache(
