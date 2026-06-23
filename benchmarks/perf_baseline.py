@@ -82,6 +82,20 @@ SYSTEMS: Dict[str, Dict[str, Any]] = {
         # Standard convention: cc-pCVDZ on C, cc-pVDZ on H.
         "basis": {"C": "ccpcvdz", "H": "ccpvdz"},
     },
+    # H30/minimal-basis stress vehicle (ke-liao + Woke, kernel-phase guardrail).
+    # 30 H atoms in a linear chain: 30 electrons + a long-chain grid stresses
+    # the grid-based ISDF/scan/tile paths (exactly the HBM-frugal code), while
+    # the STO-3G basis keeps the orbital count modest. ISDF + VMC paths only
+    # (make_eris/ccsd at 30 electrons would be enormous and aren't where the
+    # HBM-tiling lives). Opt-in: not in the default --systems list, not in
+    # REQUIRED_PATHS (would invalidate the existing canonical baseline).
+    "H30_minimal": {
+        "atom": None,  # filled by _h30_chain_geom() below
+        "basis": "sto3g",
+        # Skip make_eris/ccsd_kernel: at 30 electrons those are enormous and
+        # aren't where the HBM-tiling code lives (Woke). ISDF + VMC only.
+        "skip_eris": True,
+    },
 }
 
 
@@ -99,7 +113,14 @@ def _benzene_geom(cc: float = 1.397, ch: float = 1.084) -> str:
     return "; ".join(atoms)
 
 
+def _h30_chain_geom(spacing_ang: float = 1.0, n_atoms: int = 30) -> str:
+    """Linear hydrogen chain H_{n_atoms} equally spaced along x (Angstrom)."""
+    return "; ".join(
+        f"H {i*spacing_ang:.6f} 0 0" for i in range(n_atoms))
+
+
 SYSTEMS["benzene_ccpCVDZ"]["atom"] = _benzene_geom()
+SYSTEMS["H30_minimal"]["atom"] = _h30_chain_geom()
 
 # Paths whose regression is guarded in --compare (kernel paths; excludes setup).
 GUARDED_PATHS = {
@@ -128,6 +149,13 @@ COMPARE_POLICY: Dict[str, Any] = {
         "native_residual_gap_ceiling": 1e-8,
         # delta_U_maxabs: magnitude sanity (O(0.1-1)); absolute drift tolerance.
         "delta_U_maxabs_atol": 1e-8,
+        # peak HBM (peak_bytes_in_use) drift tolerance per path. Relative:
+        # ke-liao's "less HBM AND/OR faster" rule is enforced as "no path
+        # grows peak HBM by more than this fraction" (default 10%). Only
+        # enforced when both baseline and new runs reported a peak_hbm_bytes
+        # for that path (i.e. a GPU run). The drift check is the load-bearing
+        # memory guardrail for the kernel-phase vectorizations (PR12+).
+        "peak_hbm_drift_rel_tol": 0.10,
     },
     # Experiment-defining fields: a mismatch here FAILS compare outright (Rick:
     # accelerator model/count, JAX+jaxlib, PySCF, precision/XLA flags, threads,
@@ -292,8 +320,37 @@ def _sync(x: Any) -> None:
         pass
 
 
-def _time(fn: Callable[[], Any], warmup: int, repeats: int) -> Dict[str, float]:
-    """Run fn() warmup times (discarded) then repeats times; report med/min/max."""
+def _peak_hbm_now() -> int | None:
+    """Best-effort peak HBM bytes for the first local device.
+
+    Returns ``jax.devices()[0].memory_stats()['peak_bytes_in_use']`` when the
+    device exposes memory stats (GPU/TPU). On CPU (no memory_stats) returns
+    None and callers should treat the metric as unmeasured, not zero. The
+    value is a cumulative high-water mark for the process; for relative
+    comparison across versions of the same codepath the absolute value is
+    directly comparable (setup is identical between baseline and new run).
+    """
+    try:
+        stats = jax.devices()[0].memory_stats()
+        if not stats:
+            return None
+        v = stats.get("peak_bytes_in_use")
+        return int(v) if v else None
+    except Exception:
+        return None
+
+
+def _time(fn: Callable[[], Any], warmup: int, repeats: int) -> Dict[str, Any]:
+    """Run fn() warmup times (discarded) then repeats times; report med/min/max.
+
+    Also captures the peak HBM high-water mark (``peak_bytes_in_use``) before
+    the warmup pass and after the final timed repeat. The post-minus-pre delta
+    isolates allocations introduced *by this codepath* that exceed the
+    pre-existing process high-water mark (a non-zero delta signals a path that
+    pushes HBM higher than the setup state; the absolute ``peak_hbm_bytes``
+    field is the canonical comparison value).
+    """
+    pre_peak = _peak_hbm_now()
     for _ in range(max(0, warmup)):
         out = fn()
         _sync(out)
@@ -304,8 +361,16 @@ def _time(fn: Callable[[], Any], warmup: int, repeats: int) -> Dict[str, float]:
         _sync(out)
         samples.append(time.perf_counter() - t0)
     arr = np.asarray(samples)
-    return {"med": float(np.median(arr)), "min": float(np.min(arr)),
-            "max": float(np.max(arr)), "n": len(samples)}
+    post_peak = _peak_hbm_now()
+    result: Dict[str, Any] = {
+        "med": float(np.median(arr)), "min": float(np.min(arr)),
+        "max": float(np.max(arr)), "n": len(samples),
+    }
+    if post_peak is not None:
+        result["peak_hbm_bytes"] = post_peak
+        if pre_peak is not None:
+            result["peak_hbm_delta_from_pre"] = post_peak - pre_peak
+    return result
 
 
 def _err(exc: BaseException) -> Dict[str, str]:
@@ -634,22 +699,27 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
                 timings.setdefault(k, _err(exc))
 
     # ---- make_eris + CCSD kernel ----
-    try:
-        def _eris():
-            return xtc.make_eris(mf, jp)
-        timings["make_eris"] = _time(_eris, 0, min(args.repeats, 3))
-        eris = xtc.make_eris(mf, jp)
+    # Opt-out per system (H30_minimal stress vehicle skips this: at 30 electrons
+    # make_eris/ccsd is enormous and isn't where the HBM-tiling lives anyway).
+    if cfg.get("skip_eris", False):
+        print(f"[{name}] skipping make_eris/ccsd_kernel (skip_eris=True)", flush=True)
+    else:
+        try:
+            def _eris():
+                return xtc.make_eris(mf, jp)
+            timings["make_eris"] = _time(_eris, 0, min(args.repeats, 3))
+            eris = xtc.make_eris(mf, jp)
 
-        def _ccsd():
+            def _ccsd():
+                mycc = cc.rccsd.RCCSD(mf)
+                return mycc.kernel(eris=eris)
+            timings["ccsd_kernel"] = _time(_ccsd, 0, min(args.repeats, 3))
             mycc = cc.rccsd.RCCSD(mf)
-            return mycc.kernel(eris=eris)
-        timings["ccsd_kernel"] = _time(_ccsd, 0, min(args.repeats, 3))
-        mycc = cc.rccsd.RCCSD(mf)
-        ec, _, _ = mycc.kernel(eris=eris)
-        sanity["e_corr"] = float(ec)
-    except Exception as exc:
-        timings.setdefault("make_eris", _err(exc))
-        timings.setdefault("ccsd_kernel", _err(exc))
+            ec, _, _ = mycc.kernel(eris=eris)
+            sanity["e_corr"] = float(ec)
+        except Exception as exc:
+            timings.setdefault("make_eris", _err(exc))
+            timings.setdefault("ccsd_kernel", _err(exc))
 
     # ---- VMC step ----
     if not args.no_vmc:
@@ -715,18 +785,39 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
         print("\n=== BASELINE REJECTED (system set mismatch) ===")
         print(f"  base.systems {sorted(base.get('systems', {}))} != required {sorted(REQUIRED_PATHS)}")
         return 1
-    # Baseline's embedded compare_policy must match COMPARE_POLICY exactly
-    # (a tampered ceiling/threshold would weaken the guard).  Equality is strict
-    # because any policy change is an explicit reviewed code change to COMPARE_POLICY.
+    # Baseline's embedded compare_policy is checked additively: for every key
+    # the baseline DECLARES, its value must equal the harness value (catches a
+    # tampered ceiling/threshold that would weaken the guard). Keys present in
+    # the harness but absent from the baseline (e.g. a newly added tolerance)
+    # are permitted — the harness default applies, which is never weaker than
+    # the baseline's declared policy. This keeps existing baselines valid when
+    # new additive policy fields are introduced (avoids forcing a baseline
+    # re-record on every additive policy change).
     base_policy = base.get("compare_policy", {})
-    if base_policy != COMPARE_POLICY:
-        print("\n=== BASELINE REJECTED (compare_policy mismatch) ===")
-        for k in sorted(set(base_policy) | set(COMPARE_POLICY)):
-            bv = base_policy.get(k)
-            hv = COMPARE_POLICY[k]
-            if bv != hv:
-                print(f"  compare_policy.{k}: baseline={bv!r} != harness={hv!r}")
+    policy_diffs: List[str] = []
+
+    def _policy_diff(bv: Any, hv: Any, prefix: str) -> None:
+        if isinstance(bv, dict) and isinstance(hv, dict):
+            for k in sorted(set(bv) | set(hv)):
+                if k in bv:
+                    _policy_diff(bv[k], hv.get(k), f"{prefix}.{k}")
+        elif bv != hv:
+            policy_diffs.append(f"  compare_policy.{prefix}: baseline={bv!r} != harness={hv!r}")
+
+    for k in sorted(set(base_policy)):
+        _policy_diff(base_policy[k], COMPARE_POLICY.get(k), k)
+    if policy_diffs:
+        print("\n=== BASELINE REJECTED (compare_policy tampering detected) ===")
+        for d in policy_diffs:
+            print(d)
         return 1
+    # Surface additive policy additions (informational, never a rejection).
+    added = []
+    for k in sorted(set(COMPARE_POLICY) - set(base_policy)):
+        added.append(k)
+    if added:
+        print(f"\n[info] baseline predates policy additions: {added} "
+              f"(harness defaults apply; not weaker than baseline)")
 
     policy = base_policy
     thr = threshold
@@ -738,6 +829,8 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
                              COMPARE_POLICY["sanity"]["isdf_dU_err_drift_atol"]))
     du_maxabs_atol = float(san.get("delta_U_maxabs_atol",
                                    COMPARE_POLICY["sanity"]["delta_U_maxabs_atol"]))
+    hbm_tol = float(san.get("peak_hbm_drift_rel_tol",
+                            COMPARE_POLICY["sanity"]["peak_hbm_drift_rel_tol"]))
     compat_meta = policy.get("compat", {}).get("metadata",
                                                COMPARE_POLICY["compat"]["metadata"])
     compat_cfg = policy.get("compat", {}).get("config",
@@ -819,6 +912,7 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
     # ---- 3. TIMING (guarded %Δ) --------------------------------------------
     print("--- timing (guarded paths) ---")
     worst = 0.0
+    peak_hbm_regressions: List[str] = []
     for sname, sbase in base_sys.items():
         snew = new_sys.get(sname)
         if not snew or "timings_s" not in snew:
@@ -841,7 +935,29 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
                 failures.append(
                     f"timing: '{sname}/{path}' regressed {pct:+.1f}% "
                     f"(threshold +{thr:.0f}%)")
+            # Peak-HBM drift check (only when both runs reported it; ke-liao
+            # memory guardrail). Relative drift vs peak_hbm_drift_rel_tol.
+            phb_b = pb.get("peak_hbm_bytes")
+            phb_n = pn.get("peak_hbm_bytes")
+            if (phb_b is not None and phb_n is not None
+                    and phb_b > 0):
+                rel = (phb_n - phb_b) / phb_b
+                hbm_pct = rel * 100.0
+                hbm_flag = "HBM-REGRESS" if rel > hbm_tol else ""
+                print(f"  {sname:<20} {path:<18} peak_hbm "
+                      f"{phb_b/1e6:>10.2f}MB {phb_n/1e6:>10.2f}MB "
+                      f"{hbm_pct:>+7.1f}% {hbm_flag}")
+                if rel > hbm_tol:
+                    msg = (f"peak_hbm: '{sname}/{path}' grew peak HBM "
+                           f"{hbm_pct:+.1f}% (rel_tol +{hbm_tol*100:.0f}%); "
+                           f"baseline={phb_b/1e6:.2f}MB "
+                           f"new={phb_n/1e6:.2f}MB")
+                    failures.append(msg)
+                    peak_hbm_regressions.append(msg)
     print(f"  worst guarded regression: {worst:+.1f}% (threshold +{thr:.0f}%)")
+    if peak_hbm_regressions:
+        print(f"  peak-HBM regressions: {len(peak_hbm_regressions)} path(s) "
+              f"grew HBM > +{hbm_tol*100:.0f}% (ke-liao memory guardrail)")
 
     # ---- 4. SANITY (required keys must be present+finite; drift vs policy) --
     print("--- sanity ---")
@@ -928,10 +1044,18 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+_DEFAULT_SYSTEMS = ["H2O_ccpVDZ", "C2H4_ccpVDZ", "C2H4_ccpVTZ"]
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ISDF-XTC-CCSD+VMC perf baseline (task #16 Phase 1a)")
-    p.add_argument("--systems", nargs="+", default=list(SYSTEMS.keys()),
-                   choices=list(SYSTEMS.keys()), help="subset of systems to run")
+    p.add_argument("--systems", nargs="+", default=list(_DEFAULT_SYSTEMS),
+                   choices=list(SYSTEMS.keys()),
+                   help="subset of systems to run (H30_minimal/benzene are opt-in "
+                        "stress/diagnostic vehicles, not in the canonical set)")
+    p.add_argument("--with-h30", action="store_true",
+                   help="append H30_minimal (STO-3G stress vehicle) to --systems "
+                        "for the memory-sensitive --compare (ke-liao + Woke)")
     p.add_argument("--grid-lvl", type=int, default=2)
     p.add_argument("--n-rank-factor", type=float, default=6.0,
                    help="n_rank = int(n_rank_factor * n_orb)")
@@ -971,8 +1095,14 @@ def main() -> None:
     print(f"JAX devices: {jax.devices()}  local_device_count={jax.local_device_count()}", flush=True)
     lib.num_threads(1)
 
+    # --with-h30 appends the H30_minimal STO-3G stress vehicle (opt-in; not in
+    # the canonical REQUIRED_PATHS, so canonical validation is unaffected).
+    selected = list(args.systems)
+    if getattr(args, "with_h30", False) and "H30_minimal" not in selected:
+        selected.append("H30_minimal")
+
     systems: Dict[str, Any] = {}
-    for sname in args.systems:
+    for sname in selected:
         try:
             systems[sname] = bench_system(sname, SYSTEMS[sname], args)
         except Exception as exc:
