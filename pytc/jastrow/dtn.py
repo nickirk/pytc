@@ -158,137 +158,28 @@ class DTN(Jastrow):
         unique_charges = jnp.sort(jnp.unique(nuclear_charges))
         n_types = len(unique_charges)
 
-        atom_type_map = jnp.zeros(natom, dtype=jnp.int32)
-        for i, charge in enumerate(nuclear_charges):
-            type_idx = jnp.where(unique_charges == charge)[0][0].astype(jnp.int32)
-            atom_type_map = atom_type_map.at[i].set(type_idx)
+        atom_type_map = cls._build_atom_type_map(nuclear_charges, unique_charges, natom)
 
-        # --- Default terms ---
-        # If the user partially specified terms, we leave the omitted ones empty.
-        any_supplied = (ee_terms is not None) or (en_terms is not None) or (een_terms is not None)
+        ee_terms, en_terms, een_terms, n_ee, n_en, n_een = cls._resolve_terms(
+            ee_terms, en_terms, een_terms, max_een_degree, n_types)
 
-        if not any_supplied:
-            # Note: EE terms are global, not per-type
-            ee_terms = gen_ee_terms()
-            en_terms = [gen_en_terms() for _ in range(n_types)]
+        term_arrays, max_degree = cls._build_term_arrays(
+            ee_terms, en_terms, een_terms, n_types, n_en, n_een)
 
-            if max_een_degree is not None:
-                # Systematic expansion: all (n,l,m) with n>=2, l>=m>=2,
-                # max(n,l,m) <= max_een_degree.
-                een_terms = [
-                    gen_een_terms(max_een_degree)
-                    for _ in range(n_types)
-                ]
-            else:
-                # To prevent variational collapse in an unconstrained setup,
-                # we must omit all n=1 (violates e-e cusp) and l=1 or m=1 
-                # (violates e-n cusp) terms from the CASINO 26-term set.
-                een_terms_clean = []
-                # Keep only those from the original set that have n >= 2 and l,m >= 2.
-                for n, l, m in [
-                    (2, 4, 2),
-                    (3, 2, 2), (3, 3, 2), (3, 3, 3), (3, 4, 2), (3, 4, 3), (3, 4, 4),
-                    (4, 2, 2), (4, 3, 2), (4, 3, 3), (4, 4, 2), (4, 4, 3), (4, 4, 4),
-                ]:
-                    een_terms_clean.append(DTNTermEEN(n, l, m, 1e-5))
-                
-                een_terms = [een_terms_clean for _ in range(n_types)]
-        else:
-            if ee_terms is None:
-                ee_terms = []
-            if en_terms is None:
-                en_terms = [[] for _ in range(n_types)]
-            if een_terms is None:
-                if max_een_degree is not None:
-                    # They did not supply een_terms directly but asked to systematically generate them
-                    een_terms = [gen_een_terms(max_een_degree) for _ in range(n_types)]
-                else:
-                    een_terms = [[] for _ in range(n_types)]
-
-        # --- Validate same length per type for EN/EEN ---
-        def _check_uniform(terms_list, label):
-            if not isinstance(terms_list, list) or (len(terms_list) > 0 and not isinstance(terms_list[0], list)):
-                raise TypeError(f"{label} terms must be a list of lists (one list per atom type).")
-            
-            lengths = tuple(len(t) for t in terms_list)
-            if len(lengths) > 0 and len(set(lengths)) != 1:
-                raise ValueError(
-                    f"DTN requires the same number of {label} terms per atom type."
-                )
-            return lengths[0] if lengths else 0
-
-        # --- Reformat terms if accidentally given as 1D lists ---
-        if en_terms and not isinstance(en_terms[0], list):
-            en_terms = [en_terms for _ in range(n_types)]
-        if een_terms and not isinstance(een_terms[0], list):
-            een_terms = [een_terms for _ in range(n_types)]
-
-        n_ee = len(ee_terms)
-        n_en = _check_uniform(en_terms, "EN")
-        n_een = _check_uniform(een_terms, "EEN")
-
-        # --- Build arrays ---
-        max_degree = 0
-
-        # EE (Global)
-        if ee_terms:
-            max_degree = max(max_degree, max(t.o for t in ee_terms))
-            _ee_term_o = jnp.array([t.o for t in ee_terms], dtype=jnp.int32)
-            _ee_cusp_mask = (_ee_term_o == 1)
-        else:
-            _ee_term_o = jnp.zeros(0, dtype=jnp.int32)
-            _ee_cusp_mask = jnp.zeros(0, dtype=bool)
-
-        # EN (Per type)
-        en_k = []
-        for type_terms in en_terms:
-            en_k.append([t.k for t in type_terms])
-            if type_terms:
-                max_degree = max(max_degree, max(t.k for t in type_terms))
-        _en_term_k = jnp.array(en_k, dtype=jnp.int32) if n_en > 0 else jnp.zeros((n_types, 0), dtype=jnp.int32)
-
-        # EEN (Per type) - CASINO c_{n,l,m} notation
-        een_n_array, een_l_array, een_m_array = [], [], []
-        for type_terms in een_terms:
-            een_n_array.append([t.n for t in type_terms])  # r12 power
-            een_l_array.append([t.l for t in type_terms])  # r1I power
-            een_m_array.append([t.m for t in type_terms])  # r2I power
-            if type_terms:
-                cur = max(max(t.n for t in type_terms),
-                          max(t.l for t in type_terms),
-                          max(t.m for t in type_terms))
-                max_degree = max(max_degree, cur)
-
-        if n_een > 0:
-            _een_term_n = jnp.array(een_n_array, dtype=jnp.int32)  # r12 power
-            _een_term_l = jnp.array(een_l_array, dtype=jnp.int32)  # r1I power
-            _een_term_m = jnp.array(een_m_array, dtype=jnp.int32)  # r2I power
-            _een_delta_factor = jnp.ones((n_types, n_een))  # No symmetry factor
-        else:
-            _een_term_n = jnp.zeros((n_types, 0), dtype=jnp.int32)
-            _een_term_l = jnp.zeros((n_types, 0), dtype=jnp.int32)
-            _een_term_m = jnp.zeros((n_types, 0), dtype=jnp.int32)
-            _een_delta_factor = jnp.zeros((n_types, 0))
-
-        # --- Nuclei by type ---
-        nuclei_by_type = []
-        for i in range(n_types):
-            mask_np = jnp.array(atom_type_map) == i
-            nuclei_group = nuclear_pos[jnp.array(mask_np)]
-            nuclei_by_type.append(nuclei_group)
+        nuclei_by_type = cls._build_nuclei_by_type(nuclear_pos, atom_type_map, n_types)
 
         return cls(
             nuclear_pos=nuclear_pos,
             nuclear_charges=nuclear_charges,
             atom_type_map=atom_type_map,
             unique_charges=unique_charges,
-            _een_term_n=_een_term_n,    # r12 power (n in c_{n,l,m})
-            _een_term_l=_een_term_l,    # r1I power (l in c_{n,l,m})
-            _een_term_m=_een_term_m,    # r2I power (m in c_{n,l,m})
-            _een_delta_factor=_een_delta_factor,
-            _ee_term_o=_ee_term_o,
-            _ee_cusp_mask=_ee_cusp_mask,
-            _en_term_k=_en_term_k,
+            _een_term_n=term_arrays['_een_term_n'],
+            _een_term_l=term_arrays['_een_term_l'],
+            _een_term_m=term_arrays['_een_term_m'],
+            _een_delta_factor=term_arrays['_een_delta_factor'],
+            _ee_term_o=term_arrays['_ee_term_o'],
+            _ee_cusp_mask=term_arrays['_ee_cusp_mask'],
+            _en_term_k=term_arrays['_en_term_k'],
             nelectron=nelectron,
             natom=natom,
             n_types=n_types,
@@ -305,6 +196,129 @@ class DTN(Jastrow):
             max_rc_en=max_rc_en,
             max_rc_ee=max_rc_ee,
         )
+
+    @staticmethod
+    def _build_atom_type_map(nuclear_charges, unique_charges, natom):
+        atom_type_map = jnp.zeros(natom, dtype=jnp.int32)
+        for i, charge in enumerate(nuclear_charges):
+            type_idx = jnp.where(unique_charges == charge)[0][0].astype(jnp.int32)
+            atom_type_map = atom_type_map.at[i].set(type_idx)
+        return atom_type_map
+
+    @staticmethod
+    def _check_uniform_terms(terms_list, label):
+        if not isinstance(terms_list, list) or (len(terms_list) > 0 and not isinstance(terms_list[0], list)):
+            raise TypeError(f"{label} terms must be a list of lists (one list per atom type).")
+        lengths = tuple(len(t) for t in terms_list)
+        if len(lengths) > 0 and len(set(lengths)) != 1:
+            raise ValueError(
+                f"DTN requires the same number of {label} terms per atom type."
+            )
+        return lengths[0] if lengths else 0
+
+    @staticmethod
+    def _resolve_terms(ee_terms, en_terms, een_terms, max_een_degree, n_types):
+        any_supplied = (ee_terms is not None) or (en_terms is not None) or (een_terms is not None)
+
+        if not any_supplied:
+            ee_terms = gen_ee_terms()
+            en_terms = [gen_en_terms() for _ in range(n_types)]
+
+            if max_een_degree is not None:
+                een_terms = [
+                    gen_een_terms(max_een_degree)
+                    for _ in range(n_types)
+                ]
+            else:
+                een_terms_clean = []
+                for n, l, m in [
+                    (2, 4, 2),
+                    (3, 2, 2), (3, 3, 2), (3, 3, 3), (3, 4, 2), (3, 4, 3), (3, 4, 4),
+                    (4, 2, 2), (4, 3, 2), (4, 3, 3), (4, 4, 2), (4, 4, 3), (4, 4, 4),
+                ]:
+                    een_terms_clean.append(DTNTermEEN(n, l, m, 1e-5))
+                een_terms = [een_terms_clean for _ in range(n_types)]
+        else:
+            if ee_terms is None:
+                ee_terms = []
+            if en_terms is None:
+                en_terms = [[] for _ in range(n_types)]
+            if een_terms is None:
+                if max_een_degree is not None:
+                    een_terms = [gen_een_terms(max_een_degree) for _ in range(n_types)]
+                else:
+                    een_terms = [[] for _ in range(n_types)]
+
+        if en_terms and not isinstance(en_terms[0], list):
+            en_terms = [en_terms for _ in range(n_types)]
+        if een_terms and not isinstance(een_terms[0], list):
+            een_terms = [een_terms for _ in range(n_types)]
+
+        n_ee = len(ee_terms)
+        n_en = DTN._check_uniform_terms(en_terms, "EN")
+        n_een = DTN._check_uniform_terms(een_terms, "EEN")
+
+        return ee_terms, en_terms, een_terms, n_ee, n_en, n_een
+
+    @staticmethod
+    def _build_term_arrays(ee_terms, en_terms, een_terms, n_types, n_en, n_een):
+        max_degree = 0
+
+        if ee_terms:
+            max_degree = max(max_degree, max(t.o for t in ee_terms))
+            _ee_term_o = jnp.array([t.o for t in ee_terms], dtype=jnp.int32)
+            _ee_cusp_mask = (_ee_term_o == 1)
+        else:
+            _ee_term_o = jnp.zeros(0, dtype=jnp.int32)
+            _ee_cusp_mask = jnp.zeros(0, dtype=bool)
+
+        en_k = []
+        for type_terms in en_terms:
+            en_k.append([t.k for t in type_terms])
+            if type_terms:
+                max_degree = max(max_degree, max(t.k for t in type_terms))
+        _en_term_k = jnp.array(en_k, dtype=jnp.int32) if n_en > 0 else jnp.zeros((n_types, 0), dtype=jnp.int32)
+
+        een_n_array, een_l_array, een_m_array = [], [], []
+        for type_terms in een_terms:
+            een_n_array.append([t.n for t in type_terms])
+            een_l_array.append([t.l for t in type_terms])
+            een_m_array.append([t.m for t in type_terms])
+            if type_terms:
+                cur = max(max(t.n for t in type_terms),
+                          max(t.l for t in type_terms),
+                          max(t.m for t in type_terms))
+                max_degree = max(max_degree, cur)
+
+        if n_een > 0:
+            _een_term_n = jnp.array(een_n_array, dtype=jnp.int32)
+            _een_term_l = jnp.array(een_l_array, dtype=jnp.int32)
+            _een_term_m = jnp.array(een_m_array, dtype=jnp.int32)
+            _een_delta_factor = jnp.ones((n_types, n_een))
+        else:
+            _een_term_n = jnp.zeros((n_types, 0), dtype=jnp.int32)
+            _een_term_l = jnp.zeros((n_types, 0), dtype=jnp.int32)
+            _een_term_m = jnp.zeros((n_types, 0), dtype=jnp.int32)
+            _een_delta_factor = jnp.zeros((n_types, 0))
+
+        return {
+            '_ee_term_o': _ee_term_o,
+            '_ee_cusp_mask': _ee_cusp_mask,
+            '_en_term_k': _en_term_k,
+            '_een_term_n': _een_term_n,
+            '_een_term_l': _een_term_l,
+            '_een_term_m': _een_term_m,
+            '_een_delta_factor': _een_delta_factor,
+        }, max_degree
+
+    @staticmethod
+    def _build_nuclei_by_type(nuclear_pos, atom_type_map, n_types):
+        nuclei_by_type = []
+        for i in range(n_types):
+            mask_np = jnp.array(atom_type_map) == i
+            nuclei_group = nuclear_pos[jnp.array(mask_np)]
+            nuclei_by_type.append(nuclei_group)
+        return nuclei_by_type
 
     def _safe_norm(self, x):
         return jnp.sqrt(jnp.sum(x * x, axis=-1) + self.epsilon)
