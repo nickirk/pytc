@@ -237,23 +237,14 @@ def hdf5_slice_loader(
     -------
     Callable[[Tuple[int, int]], np.ndarray]
     """
-    import numpy as _np
-
     ndim = len(dataset.shape) if hasattr(dataset, "shape") else None
-    # Detect if dataset is an HDF5 dataset (h5py.Dataset has .file attribute)
-    is_hdf5 = hasattr(dataset, "file")
 
     def _load(key: Tuple[int, int]) -> Any:
         p0, p1 = key
         if ndim is not None:
             idx = [slice(None)] * ndim
             idx[axis] = slice(p0, p1)
-            # Serialize HDF5 access to avoid deadlocks
-            if is_hdf5:
-                with _HDF5_LOCK:
-                    return _np.asarray(dataset[tuple(idx)])
-            else:
-                return _np.asarray(dataset[tuple(idx)])
+            return safe_hdf5_read(dataset, tuple(idx))
         return dataset
 
     return _load
