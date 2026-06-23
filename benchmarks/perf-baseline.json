@@ -1,0 +1,394 @@
+{
+  "metadata": {
+    "recorded_at": "2026-06-23T03:09:07-0400",
+    "commit": "068487d034e2",
+    "jax": "0.8.1",
+    "jaxlib": "0.8.1",
+    "pyscf": "2.11.0",
+    "numpy": "2.3.3",
+    "platform": "Linux-5.14.0-570.119.1.el9_6.x86_64-x86_64-with-glibc2.34",
+    "processor": "x86_64",
+    "hostname": "a1116u29n01.mghpcc.ycrc.yale.edu",
+    "num_threads": 1,
+    "devices": [
+      "cuda:0"
+    ],
+    "device_kinds": [
+      "NVIDIA B200"
+    ],
+    "n_devices": 1,
+    "jax_enable_x64": true,
+    "env_JAX_ENABLE_X64": null,
+    "env_XLA_FLAGS": null,
+    "env_JAX_XLA_FLAGS": null,
+    "env_JAX_PLATFORMS": null,
+    "env_JAX_DEFAULT_MATMUL_PRECISION": null,
+    "default_matmul_precision": null,
+    "backend_platform_version": null,
+    "slurm_job_id": "15859912",
+    "slurm_partition": "gpu_b200",
+    "slurm_cluster": "bouchet",
+    "slurm_nodelist": "a1116u29n01"
+  },
+  "precision_probe": {
+    "jax_enable_x64": true,
+    "default_matmul_precision": null,
+    "f64_matmul_n": 512,
+    "f64_matmul_rel_err": 2.2246407575941455e-15,
+    "f32_matmul_n": 512,
+    "f32_matmul_rel_err": 1.1221758360650246e-06,
+    "f64_dot_rel_err": 1.91999712000336e-16,
+    "f32_dot_rel_err": 6.485411718279181e-08
+  },
+  "config": {
+    "grid_lvl": 2,
+    "n_rank_factor": 6.0,
+    "alpha": 1.0,
+    "batch_size": 256,
+    "host_grid_block": 2000,
+    "x_block": 8,
+    "warmup": 1,
+    "repeats": 5,
+    "vmc_walkers": 256,
+    "vmc_steps": 50,
+    "vmc_burnin": 50,
+    "no_vmc": false,
+    "basis_override": null,
+    "threshold": null
+  },
+  "compare_policy": {
+    "timing": {
+      "guarded_threshold_pct": 20.0
+    },
+    "sanity": {
+      "e_corr_atol": 1e-08,
+      "isdf_dU_err_drift_atol": 1e-09,
+      "native_residual_gap_ceiling": 1e-08,
+      "delta_U_maxabs_atol": 1e-08
+    },
+    "compat": {
+      "metadata": [
+        "jax",
+        "jaxlib",
+        "pyscf",
+        "device_kinds",
+        "n_devices",
+        "jax_enable_x64",
+        "default_matmul_precision",
+        "env_XLA_FLAGS",
+        "env_JAX_XLA_FLAGS",
+        "env_JAX_DEFAULT_MATMUL_PRECISION",
+        "backend_platform_version",
+        "num_threads"
+      ],
+      "config": [
+        "grid_lvl",
+        "n_rank_factor",
+        "alpha",
+        "batch_size",
+        "host_grid_block",
+        "x_block",
+        "warmup",
+        "repeats",
+        "vmc_walkers",
+        "vmc_steps",
+        "vmc_burnin",
+        "no_vmc",
+        "basis_override"
+      ]
+    }
+  },
+  "required_paths": {
+    "H2O_ccpVDZ": [
+      "ccsd_kernel",
+      "d_kernel",
+      "delta_U_exact",
+      "isdf_decompose",
+      "kmat_kernels",
+      "l_aux",
+      "make_eris",
+      "vmc_sample_step",
+      "x_kernel_block"
+    ],
+    "C2H4_ccpVDZ": [
+      "d_kernel",
+      "delta_U_exact",
+      "isdf_decompose",
+      "kmat_kernels",
+      "l_aux",
+      "vmc_sample_step",
+      "x_kernel_block"
+    ],
+    "C2H4_ccpVTZ": [
+      "d_kernel",
+      "delta_U_exact",
+      "isdf_decompose",
+      "kmat_kernels",
+      "l_aux",
+      "vmc_sample_step",
+      "x_kernel_block"
+    ]
+  },
+  "required_sanity": {
+    "H2O_ccpVDZ": [
+      "delta_U_maxabs",
+      "e_corr",
+      "isdf_dU_err"
+    ],
+    "C2H4_ccpVDZ": [
+      "delta_U_maxabs",
+      "isdf_dU_err"
+    ],
+    "C2H4_ccpVTZ": [
+      "delta_U_maxabs",
+      "isdf_dU_err"
+    ]
+  },
+  "systems": {
+    "H2O_ccpVDZ": {
+      "name": "H2O_ccpVDZ",
+      "shape": {
+        "n_orb": 24,
+        "n_grid": 21952,
+        "n_rank": 144
+      },
+      "timings_s": {
+        "xtc_init": 0.5122197979944758,
+        "delta_U_exact": {
+          "med": 0.8318132049753331,
+          "min": 0.8062217109836638,
+          "max": 0.8466538569773547,
+          "n": 5
+        },
+        "isdf_decompose": {
+          "med": 0.21430209698155522,
+          "min": 0.16437807498732582,
+          "max": 0.22853271797066554,
+          "n": 5
+        },
+        "kmat_kernels": {
+          "med": 10.895087631011847,
+          "min": 10.87873184599448,
+          "max": 10.94199485599529,
+          "n": 5
+        },
+        "l_aux": {
+          "med": 41.32222467602696,
+          "min": 41.196865762001835,
+          "max": 42.11810054501984,
+          "n": 5
+        },
+        "d_kernel": {
+          "med": 4.711376654973719,
+          "min": 4.675107289978769,
+          "max": 6.286725514975842,
+          "n": 5
+        },
+        "x_kernel_block": {
+          "med": 6.522600161959417,
+          "min": 6.51501431199722,
+          "max": 6.533169939997606,
+          "n": 5
+        },
+        "make_eris": {
+          "med": 5.27596973296022,
+          "min": 5.2410644280025735,
+          "max": 6.541293660004158,
+          "n": 3
+        },
+        "ccsd_kernel": {
+          "med": 0.03478833398548886,
+          "min": 0.034668048028834164,
+          "max": 0.03574766597012058,
+          "n": 3
+        },
+        "vmc_sample_step": {
+          "med": 0.08863683945965022,
+          "min": 0.08806055664084851,
+          "max": 0.08917938227998093,
+          "n": 3
+        },
+        "vmc_sample_total_med": 9.751980794011615,
+        "vmc_burnin_only_med": null
+      },
+      "sanity": {
+        "delta_U_maxabs": 0.03170618034645379,
+        "e_corr": -0.3956371192591239,
+        "isdf_dU_err": 6.787831302448866e-05,
+        "n_grid": 21952,
+        "n_orb": 24,
+        "n_rank": 144
+      },
+      "dtypes": {
+        "D_kernel": "float64",
+        "delta_U_exact": "float64",
+        "delta_U_isdf": "float64",
+        "jp_alpha": "float64",
+        "kmat": "['float64']",
+        "l_aux": "float64",
+        "mo_coeff": "float64",
+        "xtc_phi": "float64"
+      }
+    },
+    "C2H4_ccpVDZ": {
+      "name": "C2H4_ccpVDZ",
+      "shape": {
+        "n_orb": 48,
+        "n_grid": 43904,
+        "n_rank": 288
+      },
+      "timings_s": {
+        "xtc_init": 0.14249092596583068,
+        "delta_U_exact": {
+          "med": 2.1480834470130503,
+          "min": 2.141990998003166,
+          "max": 2.1537349689751863,
+          "n": 5
+        },
+        "isdf_decompose": {
+          "med": 0.5649823060375638,
+          "min": 0.5604206889984198,
+          "max": 0.5660385619848967,
+          "n": 5
+        },
+        "kmat_kernels": {
+          "med": 23.871815065969713,
+          "min": 23.704354725021403,
+          "max": 25.91088713594945,
+          "n": 5
+        },
+        "l_aux": {
+          "med": 184.0690404669731,
+          "min": 180.50504153297516,
+          "max": 195.1044640999753,
+          "n": 5
+        },
+        "d_kernel": {
+          "med": 12.434439855976962,
+          "min": 12.409460937022232,
+          "max": 12.443658636009786,
+          "n": 5
+        },
+        "x_kernel_block": {
+          "med": 15.941312795970589,
+          "min": 15.936386112996843,
+          "max": 17.217705690010916,
+          "n": 5
+        },
+        "make_eris": {
+          "error": "IndexError: tuple index out of range",
+          "trace": "Traceback (most recent call last):\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 640, in bench_system\n    timings[\"make_eris\"] = _time(_eris, 0, min(args.repeats, 3))\n                           ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 303, in _time\n    out = fn()\nIndexError: tuple index out of range\n"
+        },
+        "ccsd_kernel": {
+          "error": "IndexError: tuple index out of range",
+          "trace": "Traceback (most recent call last):\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 640, in bench_system\n    timings[\"make_eris\"] = _time(_eris, 0, min(args.repeats, 3))\n                           ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 303, in _time\n    out = fn()\nIndexError: tuple index out of range\n"
+        },
+        "vmc_sample_step": {
+          "med": 0.0929710228391923,
+          "min": 0.09243252838146873,
+          "max": 0.09306715860031545,
+          "n": 3
+        },
+        "vmc_sample_total_med": 10.25427305296762,
+        "vmc_burnin_only_med": null
+      },
+      "sanity": {
+        "delta_U_maxabs": 0.03176067067435728,
+        "isdf_dU_err": 0.0001488830809322603,
+        "n_grid": 43904,
+        "n_orb": 48,
+        "n_rank": 288
+      },
+      "dtypes": {
+        "D_kernel": "float64",
+        "delta_U_exact": "float64",
+        "delta_U_isdf": "float64",
+        "jp_alpha": "float64",
+        "kmat": "['float64']",
+        "l_aux": "float64",
+        "mo_coeff": "float64",
+        "xtc_phi": "float64"
+      }
+    },
+    "C2H4_ccpVTZ": {
+      "name": "C2H4_ccpVTZ",
+      "shape": {
+        "n_orb": 116,
+        "n_grid": 43904,
+        "n_rank": 696
+      },
+      "timings_s": {
+        "xtc_init": 0.15971617196919397,
+        "delta_U_exact": {
+          "med": 9.838226808991749,
+          "min": 9.832582971954253,
+          "max": 9.839649664994795,
+          "n": 5
+        },
+        "isdf_decompose": {
+          "med": 1.1552765849628486,
+          "min": 1.1388268769951537,
+          "max": 1.1647944370051846,
+          "n": 5
+        },
+        "kmat_kernels": {
+          "med": 26.78467645001365,
+          "min": 26.40860280499328,
+          "max": 27.800617657019757,
+          "n": 5
+        },
+        "l_aux": {
+          "med": 193.06275412300602,
+          "min": 191.18144747801125,
+          "max": 201.666730929981,
+          "n": 5
+        },
+        "d_kernel": {
+          "med": 14.730881235038396,
+          "min": 14.694216921983752,
+          "max": 16.50781370396726,
+          "n": 5
+        },
+        "x_kernel_block": {
+          "med": 18.72473053698195,
+          "min": 18.67880715301726,
+          "max": 18.74788866902236,
+          "n": 5
+        },
+        "make_eris": {
+          "error": "IndexError: tuple index out of range",
+          "trace": "Traceback (most recent call last):\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 640, in bench_system\n    timings[\"make_eris\"] = _time(_eris, 0, min(args.repeats, 3))\n                           ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 303, in _time\n    out = fn()\nIndexError: tuple index out of range\n"
+        },
+        "ccsd_kernel": {
+          "error": "IndexError: tuple index out of range",
+          "trace": "Traceback (most recent call last):\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 640, in bench_system\n    timings[\"make_eris\"] = _time(_eris, 0, min(args.repeats, 3))\n                           ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/kl2252/src/pytc/benchmarks/perf_baseline.py\", line 303, in _time\n    out = fn()\nIndexError: tuple index out of range\n"
+        },
+        "vmc_sample_step": {
+          "med": 0.12015487389988266,
+          "min": 0.11936690836097114,
+          "max": 0.12054550291970373,
+          "n": 3
+        },
+        "vmc_sample_total_med": 13.736444420996122,
+        "vmc_burnin_only_med": null
+      },
+      "sanity": {
+        "delta_U_maxabs": 0.03747860117493088,
+        "isdf_dU_err": 0.001139673420112751,
+        "n_grid": 43904,
+        "n_orb": 116,
+        "n_rank": 696
+      },
+      "dtypes": {
+        "D_kernel": "float64",
+        "delta_U_exact": "float64",
+        "delta_U_isdf": "float64",
+        "jp_alpha": "float64",
+        "kmat": "['float64']",
+        "l_aux": "float64",
+        "mo_coeff": "float64",
+        "xtc_phi": "float64"
+      }
+    }
+  }
+}
