@@ -37,7 +37,6 @@ class SlaterDet:
         else:
             n_alpha, n_beta = nelec
             
-        # Initialize the appropriate GTO evaluator
         if mol.cart:
             mol_gto = MolGTO.create(mol)
             eval_ao_func = eval_ao

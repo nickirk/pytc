@@ -20,7 +20,6 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     """Optimize Jastrow parameters using advanced optimizers with adaptive learning rate."""
     params = init_params.copy()
     
-    # Precompute standard integrals
     nocc = int(sum(mf.mo_occ == 2))
     h1e_std = jnp.asarray(tc_helper.get_hcore(mf, xtc_obj.mo_coeff))
     # on host RAM store eri full block, and slice it for each block for GPU
@@ -29,13 +28,11 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     eri_ovoo = jnp.asarray(eri[:nocc, nocc:, :nocc, :nocc])
     eri_ooov = jnp.asarray(eri[:nocc, :nocc, :nocc, nocc:])
 
-    # Add learning rate schedule parameters
     current_lr = learning_rate
     lr_decay_factor = 0.5  # How much to reduce learning rate
     lr_min = 1e-6  # Minimum learning rate
     patience = 10  # How many steps to wait before reducing lr
 
-    # Create optimizer with current learning rate
     def create_optimizer(lr):
         if (optimizer_name == 'adam'):
             return optax.adam(lr)
@@ -51,13 +48,11 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
     optimizer = create_optimizer(current_lr)
     opt_state = optimizer.init(params)
     
-    # Track gradient history for adaptive learning rate
     prev_grad_norm = None
     increasing_count = 0
     
     @jax.jit
     def loss_fn(params):
-        # Get corrections
         delta_h = xtc_obj.get_1b(params, block_str='ov')
         
         # Compute specific 2-body blocks to save memory
@@ -79,7 +74,7 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
         V_iajb = eri_ovov + delta_ovov
         V_iajb_anti = 2*V_iajb - V_iajb.transpose(0,3,2,1)
 
-        # Build Fock matrix elements
+        # Build Fock matrix: F_ia = h_ia + sum_j [2(ia|jj) - (ij|ja)]
         f_ia = one_body_ia
         
         # Coulomb term: 2 * sum_j (ia|jj)
@@ -105,20 +100,16 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
         flat_grads, _ = jtu.tree_flatten(grads)
         grad_norm = jnp.linalg.norm(jnp.concatenate([jnp.ravel(g) for g in flat_grads]))
         
-        # Check for NaN gradients using tree flattening
         if any(jnp.any(jnp.isnan(g)) for g in flat_grads):
             print(f"Warning: NaN gradients at step {step}")
             break
             
-        # Adaptive learning rate logic
         if prev_grad_norm is not None:
             if grad_norm > prev_grad_norm:
                 increasing_count += 1
                 if increasing_count >= patience and current_lr > lr_min:
-                    # Reduce learning rate
                     current_lr = max(current_lr * lr_decay_factor, lr_min)
                     print(f"\nReducing learning rate to {current_lr}")
-                    # Reinitialize optimizer with new learning rate
                     optimizer = create_optimizer(current_lr)
                     opt_state = optimizer.init(params)
                     increasing_count = 0
@@ -127,7 +118,6 @@ def optimize_jastrow(xtc_obj, mf, init_params, n_steps=50, optimizer_name='adam'
         
         prev_grad_norm = grad_norm
         
-        # Update parameters using optimizer
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
 

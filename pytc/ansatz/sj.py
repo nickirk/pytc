@@ -34,7 +34,6 @@ class SlaterJastrow:
         atom_coords = jnp.array(mol.atom_coords())
         atom_charges = jnp.array(mol.atom_charges())
         
-        # Calculate ion-ion potential energy
         n_atoms = len(atom_charges)
         R_diff = atom_coords[:, None, :] - atom_coords[None, :, :]
         R_dist = jnp.linalg.norm(R_diff, axis=-1)

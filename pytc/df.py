@@ -164,7 +164,6 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
     """Specialized pivoted Cholesky for gradient decomposition."""
     n_grid = phi_weighted.shape[1]
     
-    # Initialize diagonal
     A_diag = jnp.sum(phi_weighted**2, axis=0)
     B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
     diag_err = A_diag * B_diag + shift
@@ -395,7 +394,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
             if name in h5_file: del h5_file[name]
             h5_file.create_dataset(name, shape=shape, dtype=phi.dtype)
         
-        # Store metadata
         for name, data in [('pivots', pivots), ('phi_isdf', phi_piv), ('grad_phi_isdf', grad_phi_piv)]:
             if name in h5_file: del h5_file[name]
             h5_file.create_dataset(name, data=np.array(data))

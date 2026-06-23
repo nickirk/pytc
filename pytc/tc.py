@@ -338,7 +338,6 @@ class TC:
         n_orb = mo_coeff.shape[1]
         nocc = int(np.sum(mf.mo_occ > 0))
         
-        # Initialize grid
         logger.info(f"TC: Initializing grid with level {grid_lvl}")
         start_time = time.perf_counter()
         grids = dft.gen_grid.Grids(mol)
@@ -1399,8 +1398,6 @@ class ISDFTC(TC):
                     grid_eval_block = np.pad(grid_eval_block, ((0, padding), (0, 0)))
                 sharded_grid_eval = jax.device_put(grid_eval_block, eval_sharding)
                 
-                # Initialize accumulator on device
-                # We can use the first result to initialize, or create zeros
                 res_rep_accum = None
                 
                 # Inner loop: Integration blocks (g)
@@ -1451,7 +1448,6 @@ class ISDFTC(TC):
                     # Explicitly free memory
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
                 
-                # Store result for this evaluation block
                 res_block = res_rep_accum[:, :n_eval, :]
                 L_aux_out[:, r0:r1, :] = np.asarray(res_block)
                 
@@ -1487,7 +1483,6 @@ class ISDFTC(TC):
         # Use save_path if provided, otherwise use self.save_path
         out_path = save_path if save_path else self.save_path
         
-        # Check if kernels already exist in HDF5
         kernels = {}
         if out_path and os.path.exists(out_path):
             try:
@@ -1848,7 +1843,6 @@ class ISDFTC(TC):
             full = slice(None)
             ranges = (full, full, full, full)
 
-        # Check if kernels are available, if not compute them
         if self.isdf_kernels is None:
             kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
         else:
@@ -1927,7 +1921,6 @@ class ISDFTC(TC):
         if T is not None:
             return super().get_2b_fock(jastrow_params, dm1, T)
             
-        # Check if kernels are available
         if self.isdf_kernels is None:
              kernels = self.compute_kmat_kernels(jastrow_params)
         else:
