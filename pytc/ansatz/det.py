@@ -122,6 +122,31 @@ class SlaterDet:
     def __call__(self, walker, params=None):
         return eval_det_value_and_grad(self, walker)
 
+def _split_spin(det, ao, is_batched):
+    """Split AO array into alpha/beta along the electron axis."""
+    if is_batched:
+        return ao[:, :det.n_alpha], ao[:, det.n_alpha:]
+    return ao[:det.n_alpha], ao[det.n_alpha:]
+
+
+def _einsum_strings(is_batched):
+    """Return (val_str, grad_str) einsum patterns."""
+    if is_batched:
+        return 'bix,xj->bij', 'bixd,xj->bijd'
+    return 'ix,xj->ij', 'ixd,xj->ijd'
+
+
+def _build_slater_and_inv(slater_up, slater_down):
+    """Compute slogdet + inverse for both spin channels."""
+    sign_up, logdet_up = jnp.linalg.slogdet(slater_up)
+    sign_down, logdet_down = jnp.linalg.slogdet(slater_down)
+    inv_up = jnp.linalg.inv(slater_up)
+    inv_down = jnp.linalg.inv(slater_down)
+    det_sign = sign_up * sign_down
+    det_logabs = logdet_up + logdet_down
+    return (sign_up, logdet_up), (sign_down, logdet_down), inv_up, inv_down, det_sign, det_logabs
+
+
 def eval_det_value(det: SlaterDet, walker):
     """
     Compute determinant values and update walker.
@@ -132,37 +157,21 @@ def eval_det_value(det: SlaterDet, walker):
     # Evaluate AOs for all electrons
     ao_vals = det.eval_ao_func(det.mol_gto, positions, deriv=0) 
     
-    # Split into alpha and beta
-    if is_batched:
-        ao_alpha = ao_vals[:, :det.n_alpha, :]
-        ao_beta = ao_vals[:, det.n_alpha:, :]
-        einsum_str = 'bix,xj->bij'
-    else:
-        ao_alpha = ao_vals[:det.n_alpha, :]
-        ao_beta = ao_vals[det.n_alpha:, :]
-        einsum_str = 'ix,xj->ij'
+    ao_alpha, ao_beta = _split_spin(det, ao_vals, is_batched)
+    val_str, _ = _einsum_strings(is_batched)
     
-    # Compute Slater matrices
-    slater_up = jnp.einsum(einsum_str, ao_alpha, det.mo_coeff_alpha_occ)
-    slater_down = jnp.einsum(einsum_str, ao_beta, det.mo_coeff_beta_occ)
+    slater_up = jnp.einsum(val_str, ao_alpha, det.mo_coeff_alpha_occ)
+    slater_down = jnp.einsum(val_str, ao_beta, det.mo_coeff_beta_occ)
     
-    # Compute determinants and inverses
-    sign_up, logdet_up = jnp.linalg.slogdet(slater_up)
-    sign_down, logdet_down = jnp.linalg.slogdet(slater_down)
-    
-    inv_up = jnp.linalg.inv(slater_up)
-    inv_down = jnp.linalg.inv(slater_down)
-    
-    det_sign = sign_up * sign_down
-    det_logabs = logdet_up + logdet_down
+    det_up, det_down, inv_up, inv_down, det_sign, det_logabs = _build_slater_and_inv(slater_up, slater_down)
     
     updated_walker = walker.replace(
         slater_up=slater_up,
         slater_down=slater_down,
         inv_up=inv_up,
         inv_down=inv_down,
-        det_up=(sign_up, logdet_up),
-        det_down=(sign_down, logdet_down),
+        det_up=det_up,
+        det_down=det_down,
         log_psi=det_logabs,
         psi_sign=det_sign,
     )
@@ -178,50 +187,29 @@ def eval_det_value_and_grad(det: SlaterDet, walker):
     
     ao_vals, ao_grad, ao_lap = det.eval_ao_func(det.mol_gto, positions, deriv=2)
     
-    if is_batched:
-        ao_alpha = ao_vals[:, :det.n_alpha, :]
-        ao_beta = ao_vals[:, det.n_alpha:, :]
-        ao_grad_alpha = ao_grad[:, :det.n_alpha, :, :]
-        ao_grad_beta = ao_grad[:, det.n_alpha:, :, :]
-        ao_lap_alpha = ao_lap[:, :det.n_alpha, :]
-        ao_lap_beta = ao_lap[:, det.n_alpha:, :]
-        einsum_str_val = 'bix,xj->bij'
-        einsum_str_grad = 'bixd,xj->bijd'
-    else:
-        ao_alpha = ao_vals[:det.n_alpha, :]
-        ao_beta = ao_vals[det.n_alpha:, :]
-        ao_grad_alpha = ao_grad[:det.n_alpha, :, :]
-        ao_grad_beta = ao_grad[det.n_alpha:, :, :]
-        ao_lap_alpha = ao_lap[:det.n_alpha, :]
-        ao_lap_beta = ao_lap[det.n_alpha:, :]
-        einsum_str_val = 'ix,xj->ij'
-        einsum_str_grad = 'ixd,xj->ijd'
+    ao_alpha, ao_beta = _split_spin(det, ao_vals, is_batched)
+    ao_grad_alpha, ao_grad_beta = _split_spin(det, ao_grad, is_batched)
+    ao_lap_alpha, ao_lap_beta = _split_spin(det, ao_lap, is_batched)
+    val_str, grad_str = _einsum_strings(is_batched)
     
-    slater_up = jnp.einsum(einsum_str_val, ao_alpha, det.mo_coeff_alpha_occ)
-    slater_down = jnp.einsum(einsum_str_val, ao_beta, det.mo_coeff_beta_occ)
+    slater_up = jnp.einsum(val_str, ao_alpha, det.mo_coeff_alpha_occ)
+    slater_down = jnp.einsum(val_str, ao_beta, det.mo_coeff_beta_occ)
     
-    grad_up = jnp.einsum(einsum_str_grad, ao_grad_alpha, det.mo_coeff_alpha_occ)
-    grad_down = jnp.einsum(einsum_str_grad, ao_grad_beta, det.mo_coeff_beta_occ)
+    grad_up = jnp.einsum(grad_str, ao_grad_alpha, det.mo_coeff_alpha_occ)
+    grad_down = jnp.einsum(grad_str, ao_grad_beta, det.mo_coeff_beta_occ)
     
-    lap_up = jnp.einsum(einsum_str_val, ao_lap_alpha, det.mo_coeff_alpha_occ)
-    lap_down = jnp.einsum(einsum_str_val, ao_lap_beta, det.mo_coeff_beta_occ)
+    lap_up = jnp.einsum(val_str, ao_lap_alpha, det.mo_coeff_alpha_occ)
+    lap_down = jnp.einsum(val_str, ao_lap_beta, det.mo_coeff_beta_occ)
     
-    sign_up, logdet_up = jnp.linalg.slogdet(slater_up)
-    sign_down, logdet_down = jnp.linalg.slogdet(slater_down)
-    
-    inv_up = jnp.linalg.inv(slater_up)
-    inv_down = jnp.linalg.inv(slater_down)
-    
-    det_sign = sign_up * sign_down
-    det_logabs = logdet_up + logdet_down
+    det_up, det_down, inv_up, inv_down, det_sign, det_logabs = _build_slater_and_inv(slater_up, slater_down)
     
     updated_walker = walker.replace(
         slater_up=slater_up,
         slater_down=slater_down,
         inv_up=inv_up,
         inv_down=inv_down,
-        det_up=(sign_up, logdet_up),
-        det_down=(sign_down, logdet_down),
+        det_up=det_up,
+        det_down=det_down,
         grad_up=grad_up,
         grad_down=grad_down,
         lap_up=lap_up,
@@ -241,26 +229,15 @@ def eval_det_grad(det: SlaterDet, walker):
     
     ao_vals, ao_grad = det.eval_ao_func(det.mol_gto, positions, deriv=1)
     
-    if is_batched:
-        ao_alpha = ao_vals[:, :det.n_alpha, :]
-        ao_beta = ao_vals[:, det.n_alpha:, :]
-        ao_grad_alpha = ao_grad[:, :det.n_alpha, :, :]
-        ao_grad_beta = ao_grad[:, det.n_alpha:, :, :]
-        einsum_str_val = 'bix,xj->bij'
-        einsum_str_grad = 'bixd,xj->bijd'
-    else:
-        ao_alpha = ao_vals[:det.n_alpha, :]
-        ao_beta = ao_vals[det.n_alpha:, :]
-        ao_grad_alpha = ao_grad[:det.n_alpha, :, :]
-        ao_grad_beta = ao_grad[det.n_alpha:, :, :]
-        einsum_str_val = 'ix,xj->ij'
-        einsum_str_grad = 'ixd,xj->ijd'
+    ao_alpha, ao_beta = _split_spin(det, ao_vals, is_batched)
+    ao_grad_alpha, ao_grad_beta = _split_spin(det, ao_grad, is_batched)
+    val_str, grad_str = _einsum_strings(is_batched)
     
-    slater_up = jnp.einsum(einsum_str_val, ao_alpha, det.mo_coeff_alpha_occ)
-    slater_down = jnp.einsum(einsum_str_val, ao_beta, det.mo_coeff_beta_occ)
+    slater_up = jnp.einsum(val_str, ao_alpha, det.mo_coeff_alpha_occ)
+    slater_down = jnp.einsum(val_str, ao_beta, det.mo_coeff_beta_occ)
     
-    grad_up = jnp.einsum(einsum_str_grad, ao_grad_alpha, det.mo_coeff_alpha_occ)
-    grad_down = jnp.einsum(einsum_str_grad, ao_grad_beta, det.mo_coeff_beta_occ)
+    grad_up = jnp.einsum(grad_str, ao_grad_alpha, det.mo_coeff_alpha_occ)
+    grad_down = jnp.einsum(grad_str, ao_grad_beta, det.mo_coeff_beta_occ)
     
     return (slater_up, slater_down, grad_up, grad_down)
 
@@ -282,17 +259,11 @@ def eval_det_matrix(det: SlaterDet, coords):
     is_batched = coords.ndim == 3
     ao_vals = det.eval_ao_func(det.mol_gto, coords, deriv=0)
     
-    if is_batched:
-        ao_alpha = ao_vals[:, :det.n_alpha, :]
-        ao_beta = ao_vals[:, det.n_alpha:, :]
-        einsum_str = 'bix,xj->bij'
-    else:
-        ao_alpha = ao_vals[:det.n_alpha, :]
-        ao_beta = ao_vals[det.n_alpha:, :]
-        einsum_str = 'ix,xj->ij'
+    ao_alpha, ao_beta = _split_spin(det, ao_vals, is_batched)
+    val_str, _ = _einsum_strings(is_batched)
     
-    slater_up = jnp.einsum(einsum_str, ao_alpha, det.mo_coeff_alpha_occ)
-    slater_down = jnp.einsum(einsum_str, ao_beta, det.mo_coeff_beta_occ)
+    slater_up = jnp.einsum(val_str, ao_alpha, det.mo_coeff_alpha_occ)
+    slater_down = jnp.einsum(val_str, ao_beta, det.mo_coeff_beta_occ)
     
     return slater_up, slater_down
 
