@@ -201,21 +201,6 @@ class NuclearCusp(Jastrow):
         
         return X
 
-    def _update_alpha_coeffs(self, params):
-        """Compute but don't store polynomial coefficients."""
-        poly_coeffs = jnp.zeros((self.n_types, 5))
-        
-        for Z_idx, Z in enumerate(self.unique_Z):
-            rc = params['rc'][Z_idx]
-            X4 = params['X4'][Z_idx]
-            
-            # Compute X values and alpha coefficients
-            X = self._compute_X_values(Z_idx, rc, X4)
-            alpha = self._compute_alpha_coeffs(Z, rc, X)
-            poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
-        
-        return poly_coeffs  # Just return without storing in params
-
     def _cutoff_function(self, r, rc):
         """Smooth cutoff function using inverse polynomial.
         
@@ -343,9 +328,6 @@ class NuclearCusp(Jastrow):
             # Vectorized processing for array inputs
             dx = x[1] - x[0]
             
-            # Compute all indices and t values at once (JAX-traceable)
-            indices = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
-            # Compute all indices and t values at once (JAX-traceable)
             indices = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
             indices_stopped = jax.lax.stop_gradient(indices)
             indices_int = jnp.floor(indices_stopped).astype(jnp.int32)
