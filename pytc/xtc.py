@@ -965,12 +965,22 @@ class ISDFXTC(XTC, ISDFTC):
         if n_rank is None:
             n_rank = xtc_obj.grid_points.shape[0] // 4
 
-        # Warn early if the caller built xtc_obj from a fresh mf whose mo_coeff
-        # has a different gauge than the cache.  Mixing a fresh-SCF mo_coeff
-        # with cached xi_phi / phi_isdf silently corrupts transcorrelated
-        # integrals (SCF gauge non-determinism; see pytc.utils.cache_state).
+        # Fail-closed guard: if the caller built xtc_obj from a fresh mf whose
+        # mo_coeff has a different gauge than the cache, mixing them silently
+        # corrupts transcorrelated integrals (SCF gauge non-determinism).
         if save_path is not None and cache_state.cache_has_mf_state(save_path):
-            cache_state.check_mo_coeff_matches_cache(xtc_obj.mo_coeff, save_path)
+            if not cache_state.check_mo_coeff_matches_cache(
+                xtc_obj.mo_coeff, save_path
+            ):
+                raise ValueError(
+                    "mo_coeff in the ISDF cache at %s does not match the "
+                    "current mo_coeff. This is usually SCF gauge "
+                    "non-determinism (LAPACK eigvec sign/subspace mixing). "
+                    "Call pytc.utils.cache_state.sync_mf_from_cache(mf, "
+                    "save_path) BEFORE XTC.from_pyscf to adopt the cached "
+                    "gauge; otherwise expect ~mHa-scale errors in "
+                    "transcorrelated results." % save_path
+                )
 
         # Remember whether the cache already contained ISDF kernels *before*
         # we call isdf_decompose — that call will write xi_phi etc. if the

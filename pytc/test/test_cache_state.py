@@ -199,6 +199,43 @@ class TestISDFXTCAutoSavesMoCoeff(unittest.TestCase):
             np.testing.assert_array_equal(fresh.mo_coeff, np.asarray(mf.mo_coeff))
 
 
+class TestFromXtcFailsOnMismatchedMoCoeff(unittest.TestCase):
+    """from_xtc must raise (not warn) when the cache mo_coeff doesn't match."""
+
+    def test_mismatched_mo_coeff_raises(self):
+        mf = _tiny_mf()
+        jastrow = REXP()
+        xtc = XTC.from_pyscf(mf, jastrow, grid_lvl=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.h5")
+            n_rank = 4 * mf.mo_coeff.shape[1]
+
+            _ = ISDFXTC.from_xtc(xtc, n_rank=n_rank, save_path=cache_path)
+            self.assertTrue(cache_has_mf_state(cache_path))
+
+            flipped = np.asarray(mf.mo_coeff).copy()
+            flipped[:, 0] *= -1.0
+            save_orbital_state_to_cache(
+                cache_path, mo_coeff=flipped, mo_occ=mf.mo_occ)
+
+            with self.assertRaises(ValueError):
+                ISDFXTC.from_xtc(xtc, n_rank=n_rank, save_path=cache_path)
+
+    def test_matched_mo_coeff_passes(self):
+        mf = _tiny_mf()
+        jastrow = REXP()
+        xtc = XTC.from_pyscf(mf, jastrow, grid_lvl=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.h5")
+            n_rank = 4 * mf.mo_coeff.shape[1]
+
+            _ = ISDFXTC.from_xtc(xtc, n_rank=n_rank, save_path=cache_path)
+
+            _ = ISDFXTC.from_xtc(xtc, n_rank=n_rank, save_path=cache_path)
+
+
 class TestPrepareMf(unittest.TestCase):
     """prepare_mf runs SCF when no cache, adopts cached state when present."""
 
