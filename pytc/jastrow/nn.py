@@ -89,15 +89,6 @@ class NeuralBase(Jastrow):
     def _safe_norm(self, x):
         """Compute norm with a small epsilon to prevent division by zero."""
         return jnp.sqrt(jnp.sum(x*x, axis=-1) + self.epsilon)
-    
-    def get_param_count(self, input_size):
-        """Return parameter count for a single network"""
-        total = 0
-        prev_width = input_size
-        for width in self.features:
-            total += prev_width * width + width
-            prev_width = width
-        return total
 
 @struct.dataclass
 class NeuralEN(NeuralBase):

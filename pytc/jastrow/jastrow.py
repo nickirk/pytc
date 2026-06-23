@@ -19,11 +19,6 @@ class Jastrow:
     # name field is removed from base to avoid dataclass inheritance issues with defaults.
     # Subclasses should define 'name' field if needed.
     
-    def set_name(self, name):
-        """Set instance name for parameter filtering."""
-        # Since dataclasses are immutable by default in flax, we return a new instance
-        return self.replace(name=name)
-    
     def _compute(self, r1, r2, params):
         """Core computation of Jastrow exponent u.
         

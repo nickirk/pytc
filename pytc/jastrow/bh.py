@@ -237,10 +237,6 @@ class BoysHandy(Jastrow):
     def _compute(self, r1, r2, params):
         return self._compute_forward(r1, r2, params)
 
-    def get_param_count(self):
-        # b_raw (n_types), d_raw (n_types), c_raw (n_types * n_terms)
-        return self.n_types * 2 + self.n_types * self.n_terms
-
     def flatten_params(self, params):
         return jnp.concatenate([
             params['b_raw'].ravel(),

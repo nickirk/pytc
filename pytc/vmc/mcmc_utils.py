@@ -53,68 +53,6 @@ def analyze_energies(sampling_results: Dict[str, Any]) -> Dict[str, Any]:
     
     return stats
 
-def electron_density(sampling_results: Dict[str, Any], grid_points: int = 50, 
-                     range_xyz: Optional[List[Tuple[float, float]]] = None) -> jnp.ndarray:
-    """Calculate electron density from sampling results.
-    
-    Args:
-        sampling_results: Dictionary returned by metropolis_hastings
-        grid_points: Number of grid points in each dimension
-        range_xyz: Optional list of (min, max) tuples for x, y, z dimensions
-                   If None, automatically determined from samples
-                   
-    Returns:
-        3D array representing electron density
-    """
-    samples = sampling_results["samples"]
-    
-    # Flatten all walker and step dimensions to get list of all electron positions
-    all_electrons = samples.reshape(-1, samples.shape[-2], samples.shape[-1])
-    all_positions = all_electrons.reshape(-1, all_electrons.shape[-1])
-    
-    # Determine grid range if not provided
-    if range_xyz is None:
-        min_xyz = jnp.min(all_positions, axis=0) - 1.0
-        max_xyz = jnp.max(all_positions, axis=0) + 1.0
-        range_xyz = [(min_xyz[i], max_xyz[i]) for i in range(3)]
-    
-    # Create grid
-    x = jnp.linspace(range_xyz[0][0], range_xyz[0][1], grid_points)
-    y = jnp.linspace(range_xyz[1][0], range_xyz[1][1], grid_points)
-    z = jnp.linspace(range_xyz[2][0], range_xyz[2][1], grid_points)
-    
-    # Initialize density array
-    density = jnp.zeros((grid_points, grid_points, grid_points))
-    
-    # Simple histogram approach for electron density
-    x_indices = jnp.clip(jnp.floor((all_positions[:, 0] - range_xyz[0][0]) / 
-                          (range_xyz[0][1] - range_xyz[0][0]) * grid_points).astype(jnp.int32), 
-                          0, grid_points-1)
-    y_indices = jnp.clip(jnp.floor((all_positions[:, 1] - range_xyz[1][0]) / 
-                          (range_xyz[1][1] - range_xyz[1][0]) * grid_points).astype(jnp.int32), 
-                          0, grid_points-1)
-    z_indices = jnp.clip(jnp.floor((all_positions[:, 2] - range_xyz[2][0]) / 
-                          (range_xyz[2][1] - range_xyz[2][0]) * grid_points).astype(jnp.int32), 
-                          0, grid_points-1)
-    
-    # Use numpy for histogram generation since jax doesn't have an equivalent
-    import numpy as np
-    density_np = np.zeros((grid_points, grid_points, grid_points))
-    
-    # Convert JAX arrays to numpy
-    x_indices_np = np.array(x_indices)
-    y_indices_np = np.array(y_indices)
-    z_indices_np = np.array(z_indices)
-    
-    # Count electrons in each grid cell
-    for i in range(len(x_indices_np)):
-        density_np[x_indices_np[i], y_indices_np[i], z_indices_np[i]] += 1
-    
-    # Normalize
-    density = jnp.array(density_np) / len(all_positions)
-    
-    return density, (x, y, z)
-
 def prepare_sampling_results(samples, energies, acceptance_rates, walkers, step_times):
     """Prepare standardized sampling results dictionary.
     

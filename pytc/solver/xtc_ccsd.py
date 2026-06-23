@@ -161,27 +161,6 @@ class RCCSD(rccsd.RCCSD):
         
         return new_cc
 
-def _next_vvvv_panel_key(p0, p_blksize, r0, r_blksize, nvir):
-    """Return the next `(p0, p1, r0, r1)` tile key in row-major order."""
-    next_r0 = r0 + r_blksize
-    if next_r0 < nvir:
-        return (
-            p0,
-            min(p0 + p_blksize, nvir),
-            next_r0,
-            min(next_r0 + r_blksize, nvir),
-        )
-
-    next_p0 = p0 + p_blksize
-    if next_p0 < nvir:
-        return (
-            next_p0,
-            min(next_p0 + p_blksize, nvir),
-            0,
-            min(r_blksize, nvir),
-        )
-    return None
-
 
 # GPU pipeline primitives are imported at the top of the module (see
 # pytc.utils.gpu_pipeline) and include _AsyncHDF5Writer used by the

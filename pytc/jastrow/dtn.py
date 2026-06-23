@@ -427,12 +427,6 @@ class DTN(Jastrow):
     def _compute(self, r1, r2, params):
         return self._compute_forward(r1, r2, params)
 
-    def get_param_count(self):
-        return (self.n_types + 1 +   # rc_en_raw (n_types), rc_ee_raw (1)
-                self.n_ee_terms +    # c_ee_raw (global)
-                self.n_types * self.n_en_terms +
-                self.n_types * self.n_een_terms)
-
     def flatten_params(self, params):
         return jnp.concatenate([
             params['rc_en_raw'].ravel(),
