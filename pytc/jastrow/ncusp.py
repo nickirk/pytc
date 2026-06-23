@@ -31,109 +31,16 @@ class NuclearCusp(Jastrow):
     @classmethod
     def create(cls, mol, name=None, n_radial=1000):
         nelectron = mol.nelectron
-        
-        # Convert coordinates and charges to JAX arrays
-        coords = jnp.array(mol.atom_coords())
-        charges = jnp.array(mol.atom_charges())
-        n_nuclei = len(charges)
-        
-        # Convert atomic charges to indices using array ops
-        unique_Z = jnp.sort(jnp.unique(charges))
-        n_types = len(unique_Z)
-        
-        # Set rc ranges for each nucleus type: 0.8/Z to 1.2/Z
-        rc_range_list = []
-        for Z in unique_Z:
-            min_rc = 0.8/float(Z)
-            max_rc = 1.2/float(Z)
-            rc_range_list.append((min_rc, max_rc))
-        rc_range = jnp.array(rc_range_list)
-        
-        # Create reverse mapping array: Z -> idx
-        max_Z = int(jnp.max(unique_Z))
-        Z_to_idx = -jnp.ones(max_Z + 1, dtype=jnp.int32)
-        for i, Z in enumerate(unique_Z):
-            Z_to_idx = Z_to_idx.at[int(Z)].set(jnp.int32(i))
 
-        # Create radial grids for each nucleus
-        r_grids_list = []
-        ao_values_list = []
-        
-        for atom_id in range(n_nuclei):
-            r_grid = jnp.linspace(1e-8, 1.5, n_radial)
-            coords_r = jnp.zeros((n_radial, 3))
-            coords_r = coords_r.at[:,0].set(r_grid)
-            coords_r = coords_r + coords[atom_id]
-            
-            # Get all basis function indices for this atom
-            shell_ids = []
-            for i in range(mol.nbas):
-                if mol.bas_atom(i) == atom_id:
-                    shell_ids.append(i)
-            
-            # Find s-type shells
-            s_shells = []
-            for i in range(mol.nbas):
-                if i in shell_ids and mol.bas_angular(i) == 0:
-                    s_shells.append(i)
-            
-            # Evaluate s-type AOs using shls_slice
-            if s_shells:  # Only evaluate if we have s-type shells
-                shls_slice = (min(s_shells), max(s_shells) + 1)
-                ao_values_r = mol.eval_gto('GTOval_sph', coords_r, shls_slice=shls_slice)
-                # Ensure we have correct shape (ngrids, nao)
-                if ao_values_r.ndim == 1:
-                    ao_values_r = ao_values_r.reshape(-1, 1)
-            else:
-                # Create empty array if no s-type orbitals
-                ao_values_r = jnp.zeros((n_radial, 0))
-                
-            r_grids_list.append(r_grid)
-            ao_values_list.append(ao_values_r)
-        
-        r_grids = jnp.array(r_grids_list)
-        
-        # Instead of MO transformation, just use 1s orbital values
-        sao_sums = []
-        for atom_id in range(n_nuclei):
-            s_ao_vals = jnp.array(ao_values_list[atom_id])  # (n_radial, n_s_orbs)
-            # For now, just take the first s-orbital (1s) contribution
-            # Assuming first s-orbital in the basis set is 1s
-            sao_sum = s_ao_vals[:, 0] if s_ao_vals.shape[1] > 0 else jnp.zeros(n_radial)
-            sao_sums.append(sao_sum)
-        
-        # Instead of storing CubicSpline objects, store their coefficients
-        spline_coeffs_list = []
-        spline_xs_list = []
-        phi_0_list = []
-        for i in range(n_nuclei):
-            x = np.array(r_grids[i])
-            y = np.array(sao_sums[i])
-            spline = CubicSpline(x, y, bc_type='natural')
-            spline_xs_list.append(jnp.array(x))
-            spline_coeffs_list.append(jnp.array(spline.c))
-            phi_0_list.append(spline(0.0))
-            
-        spline_xs = jnp.stack(spline_xs_list)
-        spline_coeffs = jnp.stack(spline_coeffs_list)
-        
-        # Add mapping from Z_idx to first nucleus of that type
-        Z_idx_to_nucleus_list = []
-        X4_range_list = []
-        for Z_idx, Z in enumerate(unique_Z):
-            nucleus_idx = int(np.where(charges == Z)[0][0])
-            Z_idx_to_nucleus_list.append(nucleus_idx)
-            
-            # Compute X4 range
-            phi_0 = phi_0_list[nucleus_idx]
-            initial_X4 = np.log(np.abs(phi_0 * 1.1))
-            min_X4 = min(0.8 * initial_X4, 1.4 * initial_X4)
-            max_X4 = max(0.8 * initial_X4, 1.4 * initial_X4)
-            X4_range_list.append((min_X4, max_X4))
-            
-        Z_idx_to_nucleus = jnp.array(Z_idx_to_nucleus_list)
-        X4_range = jnp.array(X4_range_list)
-        
+        coords, charges, unique_Z, n_nuclei, n_types, rc_range, Z_to_idx = (
+            cls._build_atom_data(mol))
+
+        r_grids, spline_xs, spline_coeffs, phi_0_list = (
+            cls._build_splines(mol, coords, n_nuclei, n_radial))
+
+        Z_idx_to_nucleus, X4_range = (
+            cls._build_param_ranges(charges, unique_Z, phi_0_list))
+
         return cls(
             name=name,
             coords=coords,
@@ -151,6 +58,104 @@ class NuclearCusp(Jastrow):
             n_radial=n_radial,
             X4_range=X4_range
         )
+
+    @staticmethod
+    def _build_atom_data(mol):
+        coords = jnp.array(mol.atom_coords())
+        charges = jnp.array(mol.atom_charges())
+        n_nuclei = len(charges)
+
+        unique_Z = jnp.sort(jnp.unique(charges))
+        n_types = len(unique_Z)
+
+        rc_range_list = []
+        for Z in unique_Z:
+            min_rc = 0.8 / float(Z)
+            max_rc = 1.2 / float(Z)
+            rc_range_list.append((min_rc, max_rc))
+        rc_range = jnp.array(rc_range_list)
+
+        max_Z = int(jnp.max(unique_Z))
+        Z_to_idx = -jnp.ones(max_Z + 1, dtype=jnp.int32)
+        for i, Z in enumerate(unique_Z):
+            Z_to_idx = Z_to_idx.at[int(Z)].set(jnp.int32(i))
+
+        return coords, charges, unique_Z, n_nuclei, n_types, rc_range, Z_to_idx
+
+    @staticmethod
+    def _build_splines(mol, coords, n_nuclei, n_radial):
+        r_grids_list = []
+        ao_values_list = []
+
+        for atom_id in range(n_nuclei):
+            r_grid = jnp.linspace(1e-8, 1.5, n_radial)
+            coords_r = jnp.zeros((n_radial, 3))
+            coords_r = coords_r.at[:, 0].set(r_grid)
+            coords_r = coords_r + coords[atom_id]
+
+            shell_ids = []
+            for i in range(mol.nbas):
+                if mol.bas_atom(i) == atom_id:
+                    shell_ids.append(i)
+
+            s_shells = []
+            for i in range(mol.nbas):
+                if i in shell_ids and mol.bas_angular(i) == 0:
+                    s_shells.append(i)
+
+            if s_shells:
+                shls_slice = (min(s_shells), max(s_shells) + 1)
+                ao_values_r = mol.eval_gto('GTOval_sph', coords_r, shls_slice=shls_slice)
+                if ao_values_r.ndim == 1:
+                    ao_values_r = ao_values_r.reshape(-1, 1)
+            else:
+                ao_values_r = jnp.zeros((n_radial, 0))
+
+            r_grids_list.append(r_grid)
+            ao_values_list.append(ao_values_r)
+
+        r_grids = jnp.array(r_grids_list)
+
+        sao_sums = []
+        for atom_id in range(n_nuclei):
+            s_ao_vals = jnp.array(ao_values_list[atom_id])
+            sao_sum = s_ao_vals[:, 0] if s_ao_vals.shape[1] > 0 else jnp.zeros(n_radial)
+            sao_sums.append(sao_sum)
+
+        spline_coeffs_list = []
+        spline_xs_list = []
+        phi_0_list = []
+        for i in range(n_nuclei):
+            x = np.array(r_grids[i])
+            y = np.array(sao_sums[i])
+            spline = CubicSpline(x, y, bc_type='natural')
+            spline_xs_list.append(jnp.array(x))
+            spline_coeffs_list.append(jnp.array(spline.c))
+            phi_0_list.append(spline(0.0))
+
+        spline_xs = jnp.stack(spline_xs_list)
+        spline_coeffs = jnp.stack(spline_coeffs_list)
+
+        return r_grids, spline_xs, spline_coeffs, phi_0_list
+
+    @staticmethod
+    def _build_param_ranges(charges, unique_Z, phi_0_list):
+        Z_idx_to_nucleus_list = []
+        X4_range_list = []
+        for Z_idx, Z in enumerate(unique_Z):
+            nucleus_idx = int(np.where(charges == Z)[0][0])
+            Z_idx_to_nucleus_list.append(nucleus_idx)
+
+            phi_0 = phi_0_list[nucleus_idx]
+            initial_X4 = np.log(np.abs(phi_0 * 1.1))
+            min_X4 = min(0.8 * initial_X4, 1.4 * initial_X4)
+            max_X4 = max(0.8 * initial_X4, 1.4 * initial_X4)
+            X4_range_list.append((min_X4, max_X4))
+
+        Z_idx_to_nucleus = jnp.array(Z_idx_to_nucleus_list)
+        X4_range = jnp.array(X4_range_list)
+
+        return Z_idx_to_nucleus, X4_range
         
     def _clip_params(self, params):
         """Clip parameters to valid ranges for each nucleus type."""
