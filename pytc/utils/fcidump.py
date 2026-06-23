@@ -13,32 +13,30 @@ def write(filename, h1e, h2e, ecore, n_orb, n_elec):
     n_elec (int): Number of electrons.
     """
     with open(filename, 'w') as f:
-        # Write header in the new format
         header = "&FCI NORB={:4d},NELEC= {:d},MS2=0,\n".format(n_orb, n_elec)
         header += "  ORBSYM={}\n".format("1," * n_orb)
         header += "  ISYM=1,\n &END\n"
         f.write(header)
 
-        # Write 2-body integrals
-        for i in range(n_orb):
-            for j in range(n_orb):
-                for k in range(n_orb):
-                    for l in range(n_orb):
-                        # Only write if (i,j) is not greater than (k,l) to avoid duplicates.
-                        if (i, j) > (k, l):
-                            continue
-                        if abs(h2e[i, j, k, l]) > 1e-15:
-                            f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(
-                            h2e[i, j, k, l], i + 1, j + 1, k + 1, l + 1))
+        ii, jj, kk, ll = np.meshgrid(
+            np.arange(n_orb), np.arange(n_orb),
+            np.arange(n_orb), np.arange(n_orb), indexing='ij')
+        ii = ii.ravel(); jj = jj.ravel(); kk = kk.ravel(); ll = ll.ravel()
 
-        # Write 1-body integrals
-        for i in range(n_orb):
-            for j in range(i,n_orb):
-                if abs(h1e[i, j]) > 1e-15:
-                    f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(h1e[i, j], i + 1, j + 1, 0, 0))
+        pair_le = (ii < kk) | ((ii == kk) & (jj <= ll))
+        vals = h2e[ii, jj, kk, ll]
+        mask = pair_le & (np.abs(vals) > 1e-15)
+        for v, i, j, k, l in zip(vals[mask], ii[mask], jj[mask], kk[mask], ll[mask]):
+            f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(
+                v, i + 1, j + 1, k + 1, l + 1))
 
-        
-        # Write core energy
+        i_1b, j_1b = np.triu_indices(n_orb)
+        vals_1b = h1e[i_1b, j_1b]
+        mask_1b = np.abs(vals_1b) > 1e-15
+        for v, i, j in zip(vals_1b[mask_1b], i_1b[mask_1b], j_1b[mask_1b]):
+            f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(
+                v, i + 1, j + 1, 0, 0))
+
         f.write('{:22.15E} {:3d} {:3d} {:3d} {:3d}\n'.format(ecore, 0, 0, 0, 0))
 
 
