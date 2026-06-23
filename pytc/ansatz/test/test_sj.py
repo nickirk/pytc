@@ -562,8 +562,85 @@ class TestLocalEnergyWithWalker(unittest.TestCase):
         # Verify energies are reasonable (finite and bounded)
         self.assertTrue(jnp.all(jnp.isfinite(energies)))
         self.assertTrue(jnp.all(jnp.abs(energies) < 100.0))  # Should be reasonable magnitude
-        
-        
+
+
+class TestMultiDetEvaluation(unittest.TestCase):
+    """Test multi-determinant combination logic in eval_sj."""
+
+    def setUp(self):
+        self.mol = gto.M(
+            atom='H 0 0 0; H 0 0 0.742',
+            basis='sto3g',
+            unit='bohr',
+        )
+        self.mf = scf.RHF(self.mol)
+        self.mf.kernel()
+        self.det = SlaterDet.create(self.mol, self.mf.mo_coeff)
+        self.jastrow = Poly()
+        self.jastrow_params = jnp.array([0.5])
+        self.test_pos = jnp.array([
+            [0.0, 0.1, 0.0],
+            [0.0, 0.1, 0.742],
+        ])
+
+    def test_multi_det_two_identical(self):
+        """Two identical dets with coeffs summing to 1 should equal single det with coeff 1."""
+        single_ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det])
+        multi_ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det, self.det])
+
+        walker = create_test_walker(self.test_pos, self.det)
+
+        single_params = (self.jastrow_params, jnp.array([1.0]))
+        single_psi, _ = single_ansatz(walker, single_params)
+        single_val = single_psi[0] * jnp.exp(single_psi[1])
+
+        multi_params = (self.jastrow_params, jnp.array([0.3, 0.7]))
+        multi_psi, _ = multi_ansatz(walker, multi_params)
+        multi_val = multi_psi[0] * jnp.exp(multi_psi[1])
+
+        np.testing.assert_allclose(float(multi_val), float(single_val), rtol=1e-10)
+
+    def test_multi_det_value_matches_manual(self):
+        """Multi-det combination value matches manual sum(coeffs * det_values)."""
+        from pytc.ansatz.det import value_and_grad
+        from pytc.ansatz.sj import compute_jastrow_log_value
+
+        coeffs = jnp.array([0.3, 0.7])
+        ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det, self.det])
+        walker = create_test_walker(self.test_pos, self.det)
+
+        psi, _ = ansatz(walker, (self.jastrow_params, coeffs))
+        actual_val = psi[0] * jnp.exp(psi[1])
+
+        det_val, _ = value_and_grad(self.det, walker)
+        det_scalar = det_val[0] * jnp.exp(det_val[1])
+        log_j = compute_jastrow_log_value(ansatz, self.test_pos, self.jastrow_params)
+        expected_val = jnp.exp(log_j) * jnp.sum(coeffs * det_scalar)
+
+        np.testing.assert_allclose(float(actual_val), float(expected_val), rtol=1e-10)
+
+    def test_multi_det_cancellation(self):
+        """Coeffs [1, -1] with identical dets should give near-zero value."""
+        ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det, self.det])
+        walker = create_test_walker(self.test_pos, self.det)
+
+        cancel_params = (self.jastrow_params, jnp.array([1.0, -1.0]))
+        psi, _ = ansatz(walker, cancel_params)
+        val = psi[0] * jnp.exp(psi[1])
+
+        self.assertAlmostEqual(float(val), 0.0, places=80)
+
+    def test_multi_det_walker_cache(self):
+        """Multi-det eval_sj caches psi values in the walker."""
+        ansatz = SlaterJastrow.create(self.mol, self.jastrow, [self.det, self.det])
+        walker = create_test_walker(self.test_pos, self.det)
+
+        psi, updated_walker = ansatz(walker, (self.jastrow_params, jnp.array([1.0, 0.5])))
+
+        psi_sign, psi_logabs = psi
+        self.assertAlmostEqual(float(updated_walker.log_psi), float(psi_logabs), places=10)
+        self.assertAlmostEqual(float(updated_walker.psi_sign), float(psi_sign), places=10)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -150,47 +150,59 @@ def update_jastrow_one_electron(sj: SlaterJastrow, old_positions, new_positions,
     return old_log_jastrow + delta_log_j
 
 
+def _combine_multi_dets(dets, walker, linear_coeffs):
+    """Combine multiple determinants with linear coefficients.
+
+    Evaluates each determinant, converts to scalar values, and computes
+    the signed linear combination in log space.
+
+    Returns:
+        ((sign, logabs), walker_from_first_det)
+    """
+    det_vals_list = []
+    final_updated_walker = None
+
+    for i, det in enumerate(dets):
+        det_val, updated_walker = value_and_grad(det, walker)
+        det_sign, det_logabs = det_val
+        det_val_scalar = det_sign * jnp.exp(det_logabs)
+        det_vals_list.append(det_val_scalar)
+        if i == 0:
+            final_updated_walker = updated_walker
+
+    det_vals_array = jnp.array(det_vals_list)
+    linear_combo = jnp.sum(linear_coeffs * det_vals_array)
+    linear_combo_sign = jnp.sign(linear_combo)
+    linear_combo_logabs = jnp.log(jnp.abs(linear_combo) + 1e-100)
+
+    return (linear_combo_sign, linear_combo_logabs), final_updated_walker
+
+
 def eval_sj(sj: SlaterJastrow, walker, params):
     """Evaluate wavefunction for a single walker with explicit parameters."""
     jastrow_params, linear_coeffs = params
-    
-    # Compute Jastrow value for single walker
+
     log_jastrow_val = compute_jastrow_log_value(sj, walker.positions, jastrow_params)
-    
-    # Compute determinant values
+
     if len(sj.dets) == 1:
         det_val, final_updated_walker = value_and_grad(sj.dets[0], walker)
         det_sign, det_logabs = det_val
         linear_combo_sign = jnp.sign(linear_coeffs[0]) * det_sign
         linear_combo_logabs = jnp.log(jnp.abs(linear_coeffs[0])) + det_logabs
     else:
-        det_vals_list = []
-        final_updated_walker = None
-        
-        for i, det in enumerate(sj.dets):
-            det_val, updated_walker = value_and_grad(det, walker)
-            det_sign, det_logabs = det_val
-            det_val_scalar = det_sign * jnp.exp(det_logabs)
-            det_vals_list.append(det_val_scalar)
-            if i == 0:
-                final_updated_walker = updated_walker
-        
-        det_vals_array = jnp.array(det_vals_list)
-        linear_combo = jnp.sum(linear_coeffs * det_vals_array)
-        linear_combo_sign = jnp.sign(linear_combo)
-        linear_combo_logabs = jnp.log(jnp.abs(linear_combo) + 1e-100)
-    
+        (linear_combo_sign, linear_combo_logabs), final_updated_walker = (
+            _combine_multi_dets(sj.dets, walker, linear_coeffs))
+
     psi_sign = linear_combo_sign
     psi_logabs = log_jastrow_val + linear_combo_logabs
     psi_values = (psi_sign, psi_logabs)
-    
-    # Cache psi values and Jastrow in the walker for MCMC reuse
+
     final_updated_walker = final_updated_walker.replace(
         log_psi=psi_logabs,
         psi_sign=psi_sign,
         log_jastrow=log_jastrow_val,
     )
-    
+
     return psi_values, final_updated_walker
 
 from pytc.vmc.hamiltonian import (
