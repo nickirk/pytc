@@ -760,8 +760,15 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
     # ---- make_eris + CCSD kernel ----
     # Opt-out per system (H30_minimal stress vehicle skips this: at 30 electrons
     # make_eris/ccsd is enormous and isn't where the HBM-tiling lives anyway).
-    if cfg.get("skip_eris", False):
-        print(f"[{name}] skipping make_eris/ccsd_kernel (skip_eris=True)", flush=True)
+    # --vmc-focus also skips this: it needs xtc (built only in the non-vmc-focus
+    # arm above) and isn't on the VMC measurement path (Rick #25 re-review).
+    if cfg.get("skip_eris", False) or getattr(args, "vmc_focus", False):
+        if cfg.get("skip_eris", False):
+            print(f"[{name}] skipping make_eris/ccsd_kernel (skip_eris=True)",
+                  flush=True)
+        if getattr(args, "vmc_focus", False) and not cfg.get("skip_eris", False):
+            print(f"[{name}] skipping make_eris/ccsd_kernel (--vmc-focus)",
+                  flush=True)
     else:
         try:
             def _eris():
