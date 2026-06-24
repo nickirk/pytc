@@ -565,6 +565,7 @@ def _bench_vmc(mol, mf, walkers: int, steps: int, burnin: int,
                           use_importance_sampling=False)
 
         # warmup (compile) both traces, then paired repeats
+        pre_peak = _peak_hbm_now()
         for _ in range(max(0, warmup)):
             _sync(_call(steps, burnin))
             _sync(_call(0, burnin))
@@ -578,10 +579,16 @@ def _bench_vmc(mol, mf, walkers: int, steps: int, burnin: int,
             full_times.append(t_full)
             per_step.append((t_full - t_burn) / max(1, steps))
         arr = np.asarray(per_step)
-        out["vmc_sample_step"] = {"med": float(np.median(arr)),
-                                  "min": float(np.min(arr)),
-                                  "max": float(np.max(arr)),
-                                  "n": int(arr.size)}
+        vmc_step: Dict[str, Any] = {"med": float(np.median(arr)),
+                                    "min": float(np.min(arr)),
+                                    "max": float(np.max(arr)),
+                                    "n": int(arr.size)}
+        post_peak = _peak_hbm_now()
+        if post_peak is not None:
+            vmc_step["peak_hbm_bytes"] = post_peak
+            if pre_peak is not None:
+                vmc_step["peak_hbm_delta_from_pre"] = post_peak - pre_peak
+        out["vmc_sample_step"] = vmc_step
         out["vmc_sample_total_med"] = float(np.median(np.asarray(full_times)))
         out["vmc_burnin_only_med"] = None  # paired: no separate burn median
     except Exception as exc:
@@ -647,7 +654,10 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
         ixtc = None
 
     # ---- K integrals + ISDF delta_U sub-kernels (mirror existing benchmark) ----
-    if ixtc is not None:
+    # --vmc-focus skips these (l_aux dominates H30 wall at ~40 min/repeat and
+    # isn't touched by jastrow/ansatz PRs; Woke + Rick agreed on VMC-focused
+    # H30 profiling for the jastrow phase, reserving full sweep for kernel PRs).
+    if ixtc is not None and not getattr(args, "vmc_focus", False):
         try:
             def _kmat():
                 return ixtc.compute_kmat_kernels(jp, batch_size=args.batch_size,
@@ -1066,6 +1076,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--no-vmc", action="store_true", help="skip VMC step timing")
+    p.add_argument("--vmc-focus", action="store_true",
+                   help="skip ISDF sub-kernels (kmat/l_aux/d_kernel/x_kernel) "
+                        "for VMC-focused profiling; l_aux dominates H30 wall "
+                        "(~40 min/repeat) and isn't touched by jastrow PRs")
     p.add_argument("--vmc-walkers", type=int, default=256)
     p.add_argument("--vmc-steps", type=int, default=50)
     p.add_argument("--vmc-burnin", type=int, default=50)
@@ -1115,7 +1129,7 @@ def main() -> None:
                          ("grid_lvl", "n_rank_factor", "alpha", "batch_size",
                           "host_grid_block", "x_block", "warmup", "repeats",
                           "vmc_walkers", "vmc_steps", "vmc_burnin", "no_vmc",
-                          "basis_override", "threshold")},
+                          "basis_override", "threshold", "vmc_focus")},
               "compare_policy": COMPARE_POLICY,
               "required_paths": {s: sorted(p) for s, p in REQUIRED_PATHS.items()},
               "required_sanity": {s: sorted(k) for s, k in REQUIRED_SANITY.items()},
