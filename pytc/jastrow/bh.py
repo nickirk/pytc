@@ -46,7 +46,19 @@ class BoysHandy(Jastrow):
     name: str = struct.field(pytree_node=False, default=None)
 
     @classmethod
-    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None):
+    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None,
+               analytical_gradients=True):
+        if analytical_gradients and cls is BoysHandy:
+            nuclear_charges = jnp.array(mol.atom_charges())
+            n_types = len(jnp.unique(nuclear_charges))
+            has_ecp = bool(getattr(mol, '_ecp', {}) or getattr(mol, '_pseudo', {}))
+            if n_types == 1 and not has_ecp:
+                from pytc.jastrow.bha import BoysHandyAnalytical
+                return BoysHandyAnalytical.create(
+                    mol, terms_per_nucleus=terms_per_nucleus,
+                    epsilon=epsilon, name=name,
+                )
+
         nelectron = mol.nelectron
         nuclear_pos = jnp.array(mol.atom_coords())
         nuclear_charges = jnp.array(mol.atom_charges())

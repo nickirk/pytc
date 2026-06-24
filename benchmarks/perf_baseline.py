@@ -521,9 +521,11 @@ def _build_vmc_ansatz(mol, mf, jastrow_type: str = "ncusp"):
 
     Returns (ansatz, params, key) or None. ``jastrow_type`` selects the Jastrow
     factor: ``ncusp`` (default, NuclearCusp), ``bh`` (BoysHandy, vmap-over-atoms
-    forward + folx autodiff), or ``bha`` (BoysHandyAnalytical, take_along_axis
-    forward + hand-written analytical gradients). The bh/bha pair is the PR12
-    profiling comparison (ke-liao's less-HBM-and-faster rule).
+    forward + folx autodiff — bypasses the production guard to profile the
+    legacy folx path), or ``bha`` (BoysHandyAnalytical, take_along_axis
+    forward + hand-written analytical gradients). Note: production
+    ``BoysHandy.create()`` now routes single-type/non-ECP molecules to BHA
+    automatically; ``bh`` here forces the folx path for A/B comparison.
     """
     try:
         from pytc.ansatz.sj import SlaterJastrow
@@ -533,7 +535,7 @@ def _build_vmc_ansatz(mol, mf, jastrow_type: str = "ncusp"):
         det = SlaterDet.create(mol, mf.mo_coeff)
         if jastrow_type == "bh":
             from pytc.jastrow.bh import BoysHandy
-            j = BoysHandy.create(mol, name="bh")
+            j = BoysHandy.create(mol, name="bh", analytical_gradients=False)
         elif jastrow_type == "bha":
             from pytc.jastrow.bha import BoysHandyAnalytical
             j = BoysHandyAnalytical.create(mol, name="bha")
