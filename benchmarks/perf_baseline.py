@@ -169,7 +169,7 @@ COMPARE_POLICY: Dict[str, Any] = {
         "config": ["grid_lvl", "n_rank_factor", "alpha", "batch_size",
                    "host_grid_block", "x_block", "warmup", "repeats",
                    "vmc_walkers", "vmc_steps", "vmc_burnin", "no_vmc",
-                   "basis_override"],
+                   "basis_override", "jastrow_type"],
     },
 }
 
@@ -516,16 +516,31 @@ def precision_probe() -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # VMC setup (best-effort; ansatz API may vary)
 # --------------------------------------------------------------------------- #
-def _build_vmc_ansatz(mol, mf):
-    """Build a minimal Slater-Jastrow ansatz for VMC timing. Returns (ansatz, params, key) or None."""
+def _build_vmc_ansatz(mol, mf, jastrow_type: str = "ncusp"):
+    """Build a minimal Slater-Jastrow ansatz for VMC timing.
+
+    Returns (ansatz, params, key) or None. ``jastrow_type`` selects the Jastrow
+    factor: ``ncusp`` (default, NuclearCusp), ``bh`` (BoysHandy, vmap-over-atoms
+    forward + folx autodiff), or ``bha`` (BoysHandyAnalytical, take_along_axis
+    forward + hand-written analytical gradients). The bh/bha pair is the PR12
+    profiling comparison (ke-liao's less-HBM-and-faster rule).
+    """
     try:
         from pytc.ansatz.sj import SlaterJastrow
         from pytc.ansatz.det import SlaterDet
-        from pytc.jastrow import CompositeJastrow, NuclearCusp
+        from pytc.jastrow import CompositeJastrow
         from jax import random
         det = SlaterDet.create(mol, mf.mo_coeff)
-        jncusp = NuclearCusp.create(mol, name="ncusp")
-        jastrow = CompositeJastrow.create([jncusp])
+        if jastrow_type == "bh":
+            from pytc.jastrow.bh import BoysHandy
+            j = BoysHandy.create(mol, name="bh")
+        elif jastrow_type == "bha":
+            from pytc.jastrow.bha import BoysHandyAnalytical
+            j = BoysHandyAnalytical.create(mol, name="bha")
+        else:
+            from pytc.jastrow import NuclearCusp
+            j = NuclearCusp.create(mol, name="ncusp")
+        jastrow = CompositeJastrow.create([j])
         jp = jastrow.init_params()
         lin = jnp.ones(1)
         ansatz = SlaterJastrow.create(mol, jastrow, [det])
@@ -533,12 +548,14 @@ def _build_vmc_ansatz(mol, mf):
         key = random.PRNGKey(43)
         return ansatz, params, key
     except Exception as exc:
-        pytc_logger.warning("VMC ansatz setup failed: %s", exc)
+        pytc_logger.warning("VMC ansatz setup failed (jastrow=%s): %s",
+                            jastrow_type, exc)
         return None
 
 
 def _bench_vmc(mol, mf, walkers: int, steps: int, burnin: int,
-               warmup: int, repeats: int) -> Dict[str, Any]:
+               warmup: int, repeats: int,
+               jastrow_type: str = "ncusp") -> Dict[str, Any]:
     """Time one steady-state VMC sampling step, excluding compile + burn-in.
 
     ``pytc.vmc.sample`` runs burn-in and sampling in one call. We isolate the
@@ -551,9 +568,9 @@ def _bench_vmc(mol, mf, walkers: int, steps: int, burnin: int,
     ``sample(n_steps=0)`` is unsupported.
     """
     out: Dict[str, Any] = {}
-    built = _build_vmc_ansatz(mol, mf)
+    built = _build_vmc_ansatz(mol, mf, jastrow_type=jastrow_type)
     if built is None:
-        return {"error": "ansatz setup unavailable"}
+        return {"error": f"ansatz setup unavailable (jastrow={jastrow_type})"}
     ansatz, params, key = built
     try:
         from pytc.vmc import sample
@@ -736,7 +753,8 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
         try:
             vmc = _bench_vmc(mol, mf, args.vmc_walkers, args.vmc_steps,
                              args.vmc_burnin, warmup=args.warmup,
-                             repeats=min(args.repeats, 3))
+                             repeats=min(args.repeats, 3),
+                             jastrow_type=getattr(args, "jastrow_type", "ncusp"))
             timings.update(vmc)
         except Exception as exc:
             timings["vmc_sample_step"] = _err(exc)
@@ -811,6 +829,15 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
             for k in sorted(set(bv) | set(hv)):
                 if k in bv:
                     _policy_diff(bv[k], hv.get(k), f"{prefix}.{k}")
+        elif isinstance(bv, list) and isinstance(hv, list):
+            # Additive: baseline items must be a subset of harness items (new
+            # fields added to a compat/sanity list make the guard stricter, not
+            # weaker). Only flag items in the baseline that the harness dropped.
+            extra = set(bv) - set(hv)
+            if extra:
+                policy_diffs.append(
+                    f"  compare_policy.{prefix}: baseline has items not in "
+                    f"harness: {sorted(extra)}")
         elif bv != hv:
             policy_diffs.append(f"  compare_policy.{prefix}: baseline={bv!r} != harness={hv!r}")
 
@@ -841,10 +868,15 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
                                    COMPARE_POLICY["sanity"]["delta_U_maxabs_atol"]))
     hbm_tol = float(san.get("peak_hbm_drift_rel_tol",
                             COMPARE_POLICY["sanity"]["peak_hbm_drift_rel_tol"]))
-    compat_meta = policy.get("compat", {}).get("metadata",
-                                               COMPARE_POLICY["compat"]["metadata"])
-    compat_cfg = policy.get("compat", {}).get("config",
-                                              COMPARE_POLICY["compat"]["config"])
+    # Compat field lists: always use the HARNESS's COMPARE_POLICY, not the
+    # baseline's. The additive policy check already verified that the baseline's
+    # declared fields are a subset of the harness's, so using the harness list
+    # is always at least as strict (checks every field the baseline declared +
+    # any new field the harness added). This ensures new compat fields like
+    # jastrow_type are actually enforced even when comparing against an old
+    # baseline that predates them (Rick review: no silent apples-to-oranges).
+    compat_meta = COMPARE_POLICY["compat"]["metadata"]
+    compat_cfg = COMPARE_POLICY["compat"]["config"]
     # Timing threshold is self-describing (Rick R2.5): if the caller did not
     # override (--threshold), read it from the baseline's own policy.
     if thr is None:
@@ -889,9 +921,20 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
             failures.append(
                 f"compat/metadata.{field}: base={bmeta.get(field)!r} new={nmeta.get(field)!r}")
     for field in compat_cfg:
-        if bcg.get(field) != ncg.get(field):
+        bv = bcg.get(field)
+        nv = ncg.get(field)
+        # Backward compat: old baselines/runs predate jastrow_type (always
+        # ncusp, the CLI default). Default the missing field to "ncusp" on
+        # both sides so existing baselines stay valid while still rejecting
+        # a new run that explicitly changes the jastrow (Rick review).
+        if field == "jastrow_type":
+            if bv is None:
+                bv = "ncusp"
+            if nv is None:
+                nv = "ncusp"
+        if bv != nv:
             failures.append(
-                f"compat/config.{field}: base={bcg.get(field)!r} new={ncg.get(field)!r}")
+                f"compat/config.{field}: base={bv!r} new={nv!r}")
 
     # ---- 2. COVERAGE (against declared required-path matrix) ---------------
     for sname in base_sys:
@@ -1080,6 +1123,12 @@ def _parse_args() -> argparse.Namespace:
                    help="skip ISDF sub-kernels (kmat/l_aux/d_kernel/x_kernel) "
                         "for VMC-focused profiling; l_aux dominates H30 wall "
                         "(~40 min/repeat) and isn't touched by jastrow PRs")
+    p.add_argument("--jastrow-type", type=str, default="ncusp",
+                   choices=["ncusp", "bh", "bha"],
+                   help="Jastrow factor for the VMC step: ncusp (default), "
+                        "bh (BoysHandy vmap-over-atoms + folx autodiff), or "
+                        "bha (BoysHandyAnalytical take_along_axis + analytical "
+                        "gradients). bh/bha = PR12 profiling comparison.")
     p.add_argument("--vmc-walkers", type=int, default=256)
     p.add_argument("--vmc-steps", type=int, default=50)
     p.add_argument("--vmc-burnin", type=int, default=50)
@@ -1129,7 +1178,8 @@ def main() -> None:
                          ("grid_lvl", "n_rank_factor", "alpha", "batch_size",
                           "host_grid_block", "x_block", "warmup", "repeats",
                           "vmc_walkers", "vmc_steps", "vmc_burnin", "no_vmc",
-                          "basis_override", "threshold", "vmc_focus")},
+                          "basis_override", "threshold", "vmc_focus",
+                          "jastrow_type")},
               "compare_policy": COMPARE_POLICY,
               "required_paths": {s: sorted(p) for s, p in REQUIRED_PATHS.items()},
               "required_sanity": {s: sorted(k) for s, k in REQUIRED_SANITY.items()},
