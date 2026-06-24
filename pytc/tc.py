@@ -29,6 +29,37 @@ logger = logging.getLogger(__name__)
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
 
+
+def _panel_blk_overrides():
+    """Read optional process-wide panel/block-size overrides from the env.
+
+    Returns ``(panel_blk, gpu_max_memory_mb)`` where each is ``None`` when the
+    corresponding env var is unset (the default), so the autotuned behaviour is
+    unchanged unless a caller opts in. These are quick config knobs (Woke #24
+    FNO nkeep=300 limit-push) for shrinking the direct-tile / K-stream panel on
+    systems that would otherwise over-allocate ahead of the 80 GB A100 ceiling;
+    the permanent fix is to make the delta_U direct tile honour
+    ``SAFE_TILE_BYTES_CEILING`` like the CCSD vvvv path (separate change).
+
+      PYTC_PANEL_BLK          cap on the K-stream panel_size AND the
+                              rank_block_size (must be ≥ 1; ignored otherwise).
+      PYTC_GPU_MAX_MEMORY_MB  authoritative total-GPU budget (MiB) fed into
+                              ``adaptive_rank_block_size``'s budget path.
+    """
+    try:
+        pb = os.environ.get("PYTC_PANEL_BLK")
+        panel_blk = int(pb) if pb is not None and pb.strip() else None
+    except (TypeError, ValueError):
+        panel_blk = None
+    try:
+        gm = os.environ.get("PYTC_GPU_MAX_MEMORY_MB")
+        gpu_max_memory_mb = float(gm) if gm is not None and gm.strip() else None
+    except (TypeError, ValueError):
+        gpu_max_memory_mb = None
+    if panel_blk is not None and panel_blk < 1:
+        panel_blk = None
+    return panel_blk, gpu_max_memory_mb
+
 # ----------------------------------------------------------------------
 # Per-(ISDFTC instance, device) cache of device-resident phi_isdf /
 # grad_phi_isdf / TC kernels / D so the per-tile dispatch path doesn't
@@ -158,6 +189,15 @@ def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
     bytes_per_axis1 = u1.shape[0] * 3 * 8
     panel_size = max(1024, panel_bytes_cap // max(bytes_per_axis1, 1))
     panel_size = min(int(panel_size), n_fused)
+    panel_blk = _panel_blk_overrides()[0]
+    if panel_blk is not None:
+        panel_size = min(panel_size, max(1, int(panel_blk)))
+        logger.info(
+            "PYTC_PANEL_BLK=%d capping K-stream panel_size=%d (autotuned=%d)",
+            panel_blk, panel_size,
+            min(int(max(1024, panel_bytes_cap // max(bytes_per_axis1, 1))),
+                n_fused),
+        )
     return False, panel_size
 
 
@@ -762,10 +802,14 @@ class ISDFTC(TC):
                 n_orb=self.n_orb, n_fused=N_fused,
                 k_stream_panel=k_stream_panel if streaming else None,
             )
+            panel_blk, gpu_max_memory_mb = _panel_blk_overrides()
             rbs = adaptive_rank_block_size(
                 self.n_orb, self.n_orb, N_fused,
                 resident_bytes=resident_bytes,
+                gpu_max_memory_mb=gpu_max_memory_mb,
             )
+            if panel_blk is not None:
+                rbs = min(rbs, max(1, int(panel_blk)))
             try:
                 budget_gib = _get_gpu_free_bytes() / (1024 ** 3)
             except Exception:
@@ -773,11 +817,14 @@ class ISDFTC(TC):
             logger.info(
                 "  Fixed rank_block_size = %d "
                 "(n_orb=%d, N_fused=%d, streaming=%s, panel=%s, "
-                "resident=%.1f GiB, free=%.1f GiB)",
+                "resident=%.1f GiB, free=%.1f GiB%s%s)",
                 rbs, self.n_orb, N_fused, streaming,
                 k_stream_panel if streaming else "n/a",
                 resident_bytes / (1024 ** 3),
                 budget_gib,
+                f", PYTC_PANEL_BLK={panel_blk}" if panel_blk is not None else "",
+                f", PYTC_GPU_MAX_MEMORY_MB={gpu_max_memory_mb}"
+                if gpu_max_memory_mb is not None else "",
             )
             _FIXED_RBS_CACHE[key] = rbs
         return _FIXED_RBS_CACHE[key]
