@@ -192,19 +192,17 @@ class NuclearCusp(Jastrow):
     def _compute_X_values(self, Z_idx, rc, X4):
         """Compute all X values given rc and X4."""
         Z = self.unique_Z[Z_idx]
-        # Use pre-computed mapping instead of jnp.where
         nucleus_idx = self.Z_idx_to_nucleus[Z_idx]
-        
+
         phi_rc_vals = self._get_phi_s_derivatives(nucleus_idx, rc)
-        
-        X = jnp.zeros(5)
-        X = X.at[0].set(jnp.log(abs(phi_rc_vals[0])))  # X₁ = ln|φ(rc)|
-        X = X.at[1].set(phi_rc_vals[1]/phi_rc_vals[0])  # X₂ = φ'(rc)/φ(rc)
-        X = X.at[2].set(phi_rc_vals[2]/phi_rc_vals[0])  # X₃ = φ''(rc)/φ(rc)
-        X = X.at[3].set(-Z)  # X₄ = -Z (cusp condition)
-        X = X.at[4].set(X4)  # X₅ = ln|φ(0)|
-        
-        return X
+
+        return jnp.array([
+            jnp.log(abs(phi_rc_vals[0])),   # X₁ = ln|φ(rc)|
+            phi_rc_vals[1] / phi_rc_vals[0], # X₂ = φ'(rc)/φ(rc)
+            phi_rc_vals[2] / phi_rc_vals[0], # X₃ = φ''(rc)/φ(rc)
+            -Z,                              # X₄ = -Z (cusp condition)
+            X4,                              # X₅ = ln|φ(0)|
+        ])
 
     def _cutoff_function(self, r, rc):
         """Smooth cutoff function using inverse polynomial.
@@ -237,14 +235,15 @@ class NuclearCusp(Jastrow):
         This only depends on ``params``, not on electron positions, so it
         should be evaluated *once* and reused across all electron pairs.
         """
-        poly_coeffs = jnp.zeros((self.n_types, 5))
-        for Z_idx, Z in enumerate(self.unique_Z):
-            rc = clipped_params['rc'][Z_idx]
-            X4 = clipped_params['X4'][Z_idx]
+        rcs = clipped_params['rc']
+        X4s = clipped_params['X4']
+
+        def compute_one(Z_idx, rc, X4):
+            Z = self.unique_Z[Z_idx]
             X = self._compute_X_values(Z_idx, rc, X4)
-            alpha = self._compute_alpha_coeffs(Z, rc, X)
-            poly_coeffs = poly_coeffs.at[Z_idx].set(alpha)
-        return poly_coeffs
+            return self._compute_alpha_coeffs(Z, rc, X)
+
+        return jax.vmap(compute_one)(jnp.arange(self.n_types), rcs, X4s)
 
     def _compute_inner(self, r1, r2, clipped_params, poly_coeffs):
         """Core per-pair computation with pre-supplied polynomial coefficients.
@@ -396,32 +395,21 @@ class NuclearCusp(Jastrow):
 
     def _compute_alpha_coeffs(self, Z, rc, X_vals):
         """Compute α coefficients from X values and rc.
-        
+
         Args:
             Z: Nuclear charge
             rc: Cutoff radius
             X_vals: Array of X1-X5 values
-            
+
         Returns:
             Array of α coefficients [α₀, α₁, α₂, α₃, α₄]
         """
         X1, X2, X3, X4, X5 = X_vals
-        
-        alpha = jnp.zeros(5)
-        # α₀ = X₅
-        alpha = alpha.at[0].set(X5)
-        # α₁ = X₄
-        alpha = alpha.at[1].set(X4)
-        # α₂ = 6X₁/rc² - 3X₂/rc + X₃/2 - 3X₄/rc - 6X₅/rc² - X₂²/2
-        alpha = alpha.at[2].set(
-            6*X1/rc**2 - 3*X2/rc + X3/2 - 3*X4/rc - 6*X5/rc**2 - X2**2/2
-        )
-        # α₃ = -8X₁/rc³ + 5X₂/rc² - X₃/rc + 3X₄/rc² + 8X₅/rc³ + X₂²/rc
-        alpha = alpha.at[3].set(
-            -8*X1/rc**3 + 5*X2/rc**2 - X3/rc + 3*X4/rc**2 + 8*X5/rc**3 + X2**2/rc
-        )
-        # α₄ = 3X₁/rc⁴ - 2X₂/rc³ + X₃/(2rc²) - X₄/rc³ - 3X₅/rc⁴ - X₂²/(2rc²)
-        alpha = alpha.at[4].set(
-            3*X1/rc**4 - 2*X2/rc**3 + X3/(2*rc**2) - X4/rc**3 - 3*X5/rc**4 - X2**2/(2*rc**2)
-        )
-        return alpha
+
+        return jnp.array([
+            X5,                                                              # α₀
+            X4,                                                              # α₁
+            6*X1/rc**2 - 3*X2/rc + X3/2 - 3*X4/rc - 6*X5/rc**2 - X2**2/2,    # α₂
+            -8*X1/rc**3 + 5*X2/rc**2 - X3/rc + 3*X4/rc**2 + 8*X5/rc**3 + X2**2/rc,  # α₃
+            3*X1/rc**4 - 2*X2/rc**3 + X3/(2*rc**2) - X4/rc**3 - 3*X5/rc**4 - X2**2/(2*rc**2),  # α₄
+        ])
