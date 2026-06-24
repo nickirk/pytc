@@ -95,7 +95,7 @@ SYSTEMS: Dict[str, Dict[str, Any]] = {
     # the pre-existing key (kept stable); the larger chains are registered
     # after _h_chain_geom() is defined below.
 }
-_H_CHAIN_SIZES = (30, 60, 80, 100)
+_H_CHAIN_SIZES = (30, 60, 80, 100, 150, 200, 300)
 
 
 def _benzene_geom(cc: float = 1.397, ch: float = 1.084) -> str:
@@ -673,14 +673,23 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
         timings["delta_U_exact"] = _err(exc)
 
     # ---- ISDF decompose ----
-    def _new_isdf():
-        return ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
-    try:
-        timings["isdf_decompose"] = _time(_new_isdf, args.warmup, args.repeats)
-        ixtc = ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
-    except Exception as exc:
-        timings["isdf_decompose"] = _err(exc)
+    # --vmc-focus skips this too: the VMC ansatz (_build_vmc_ansatz) is built
+    # from mol + mf.mo_coeff and does NOT consume ixtc, so building the ISDF
+    # decomposition under --vmc-focus is wasted work that would OOM on large
+    # H-chains (huge grid) before the VMC-step HBM measurement (the actual
+    # point of the --vmc-focus run). ixtc stays None; the kernel block below
+    # already gates on `ixtc is not None`.
+    if getattr(args, "vmc_focus", False):
         ixtc = None
+    else:
+        def _new_isdf():
+            return ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
+        try:
+            timings["isdf_decompose"] = _time(_new_isdf, args.warmup, args.repeats)
+            ixtc = ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
+        except Exception as exc:
+            timings["isdf_decompose"] = _err(exc)
+            ixtc = None
 
     # ---- K integrals + ISDF delta_U sub-kernels (mirror existing benchmark) ----
     # --vmc-focus skips these (l_aux dominates H30 wall at ~40 min/repeat and
