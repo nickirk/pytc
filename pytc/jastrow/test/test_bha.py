@@ -31,7 +31,8 @@ class TestBoysHandyAnalytical(unittest.TestCase):
             BHTerm(2, 0, 0, -0.1),
             BHTerm(2, 0, 2, 1e-5),
         ]]
-        self.bh = BoysHandy.create(self.mol, terms_per_nucleus=self.terms)
+        self.bh = BoysHandy.create(self.mol, terms_per_nucleus=self.terms,
+                                   analytical_gradients=False)
         self.bha = BoysHandyAnalytical.create(self.mol, terms_per_nucleus=self.terms)
         self.params = self.bh.init_params(key=self.key)
 
@@ -79,6 +80,30 @@ class TestBoysHandyAnalytical(unittest.TestCase):
         grads = jax.grad(energy_fn)(self.params)
         for key in grads:
             self.assertFalse(jnp.any(jnp.isnan(grads[key])), f"NaN found in parameter gradient for {key}")
+
+
+class TestBoysHandyRoutingGuard(unittest.TestCase):
+    """Assert the production guard routes correctly based on atom types."""
+
+    def test_single_type_defaults_to_bha(self):
+        mol = get_h2_molecule()
+        j = BoysHandy.create(mol)
+        self.assertIsInstance(j, BoysHandyAnalytical)
+
+    def test_single_type_forced_bh(self):
+        mol = get_h2_molecule()
+        j = BoysHandy.create(mol, analytical_gradients=False)
+        self.assertIs(type(j), BoysHandy)
+
+    def test_multi_type_defaults_to_bh(self):
+        mol = get_h2o_molecule()
+        j = BoysHandy.create(mol)
+        self.assertIs(type(j), BoysHandy)
+
+    def test_multi_type_explicit_bha_still_works(self):
+        mol = get_h2o_molecule()
+        j = BoysHandyAnalytical.create(mol)
+        self.assertIs(type(j), BoysHandyAnalytical)
 
 
 def get_h2o_molecule():
