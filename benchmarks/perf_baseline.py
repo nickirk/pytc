@@ -647,42 +647,53 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
     dtypes["jp_alpha"] = _dtype(jp["alpha"])
 
     # ---- XTC init (setup; not guarded) ----
-    t = _time(lambda: XTC.from_pyscf(mf, jas, grid_lvl=args.grid_lvl), 0, 1)
-    xtc = XTC.from_pyscf(mf, jas, grid_lvl=args.grid_lvl)
-    _sync(xtc.phi)
-    dtypes["xtc_phi"] = _dtype(xtc.phi)
-    timings["xtc_init"] = t["med"]
-
-    n_orb = xtc.n_orb
-    n_grid = int(xtc.grid_points.shape[0])
-    n_rank = max(4, int(args.n_rank_factor * n_orb))
-    sanity["n_orb"] = int(n_orb)
-    sanity["n_grid"] = n_grid
-    sanity["n_rank"] = int(n_rank)
-    result["shape"] = dict(sanity)
-
-    # ---- delta_U exact ----
-    def _du_exact():
-        return xtc.get_delta_U(jp)
-    try:
-        du = np.asarray(_sync_block(_du_exact))
-        timings["delta_U_exact"] = _time(_du_exact, args.warmup, args.repeats)
-        sanity["delta_U_maxabs"] = float(np.max(np.abs(du)))
-        dtypes["delta_U_exact"] = _dtype(du)
-    except Exception as exc:
-        timings["delta_U_exact"] = _err(exc)
-
-    # ---- ISDF decompose ----
-    # --vmc-focus skips this too: the VMC ansatz (_build_vmc_ansatz) is built
-    # from mol + mf.mo_coeff and does NOT consume ixtc, so building the ISDF
-    # decomposition under --vmc-focus is wasted work that would OOM on large
-    # H-chains (huge grid) before the VMC-step HBM measurement (the actual
-    # point of the --vmc-focus run). ixtc stays None; the kernel block below
-    # already gates on `ixtc is not None`.
+    # --vmc-focus skips XTC init + delta_U_exact + ISDF decompose entirely:
+    # the VMC ansatz (_build_vmc_ansatz) is built from mol + mf.mo_coeff and
+    # does not consume xtc/ixtc. XTC.from_pyscf + get_delta_U are eager and
+    # would OOM before the VMC-step HBM measurement at large electron counts
+    # (delta_U_exact returns an (n,n,n,n) f64 tensor: ~64.8 GB at H300).
+    # Only the VMC measurement path runs under --vmc-focus (Rick #25).
     if getattr(args, "vmc_focus", False):
+        xtc = None
         ixtc = None
+        # Sanity shape from the SCF (n_orb = nao) so the JSON stays self-describing
+        # even without the XTC build. n_grid is unknown here (depends on XTC grid);
+        # left unset rather than fabricated.
+        n_orb = int(mol.nao_nr())
+        n_grid = -1  # unknown under --vmc-focus (XTC grid not built)
+        n_rank = max(4, int(args.n_rank_factor * n_orb))
+        sanity["n_orb"] = n_orb
+        sanity["n_grid"] = n_grid
+        sanity["n_rank"] = int(n_rank)
+        result["shape"] = dict(sanity)
     else:
-        def _new_isdf():
+        t = _time(lambda: XTC.from_pyscf(mf, jas, grid_lvl=args.grid_lvl), 0, 1)
+        xtc = XTC.from_pyscf(mf, jas, grid_lvl=args.grid_lvl)
+        _sync(xtc.phi)
+        dtypes["xtc_phi"] = _dtype(xtc.phi)
+        timings["xtc_init"] = t["med"]
+
+        n_orb = xtc.n_orb
+        n_grid = int(xtc.grid_points.shape[0])
+        n_rank = max(4, int(args.n_rank_factor * n_orb))
+        sanity["n_orb"] = int(n_orb)
+        sanity["n_grid"] = n_grid
+        sanity["n_rank"] = int(n_rank)
+        result["shape"] = dict(sanity)
+
+        # ---- delta_U exact ----
+        def _du_exact():
+            return xtc.get_delta_U(jp)
+        try:
+            du = np.asarray(_sync_block(_du_exact))
+            timings["delta_U_exact"] = _time(_du_exact, args.warmup, args.repeats)
+            sanity["delta_U_maxabs"] = float(np.max(np.abs(du)))
+            dtypes["delta_U_exact"] = _dtype(du)
+        except Exception as exc:
+            timings["delta_U_exact"] = _err(exc)
+
+        # ---- ISDF decompose ----
+        def _new_isdf():  # only built when NOT --vmc-focus (else block above)
             return ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
         try:
             timings["isdf_decompose"] = _time(_new_isdf, args.warmup, args.repeats)
