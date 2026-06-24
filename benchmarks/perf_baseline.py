@@ -82,21 +82,20 @@ SYSTEMS: Dict[str, Dict[str, Any]] = {
         # Standard convention: cc-pCVDZ on C, cc-pVDZ on H.
         "basis": {"C": "ccpcvdz", "H": "ccpvdz"},
     },
-    # H30/minimal-basis stress vehicle (ke-liao + Woke, kernel-phase guardrail).
-    # 30 H atoms in a linear chain: 30 electrons + a long-chain grid stresses
-    # the grid-based ISDF/scan/tile paths (exactly the HBM-frugal code), while
-    # the STO-3G basis keeps the orbital count modest. ISDF + VMC paths only
-    # (make_eris/ccsd at 30 electrons would be enormous and aren't where the
-    # HBM-tiling lives). Opt-in: not in the default --systems list, not in
-    # REQUIRED_PATHS (would invalidate the existing canonical baseline).
-    "H30_minimal": {
-        "atom": None,  # filled by _h30_chain_geom() below
-        "basis": "sto3g",
-        # Skip make_eris/ccsd_kernel: at 30 electrons those are enormous and
-        # aren't where the HBM-tiling code lives (Woke). ISDF + VMC only.
-        "skip_eris": True,
-    },
+    # H-chain/minimal-basis stress vehicle (ke-liao + Woke, kernel-phase
+    # guardrail). n H atoms in a linear chain: n electrons + a long-chain grid
+    # stresses the grid-based ISDF/scan/tile paths (exactly the HBM-frugal
+    # code), while the STO-3G basis keeps the orbital count modest. ISDF + VMC
+    # paths only (make_eris/ccsd at n electrons would be enormous and aren't
+    # where the HBM-tiling lives). Opt-in: not in the default --systems list,
+    # not in REQUIRED_PATHS (would invalidate the existing canonical baseline).
+    # The family is parameterized so we can sweep H30/H60/H80/H100 to scale the
+    # bh-folx forward_laplacian HBM (which grows with electron count) against
+    # the flat bha-analytical footprint (Woke #24 calibration). H30_minimal is
+    # the pre-existing key (kept stable); the larger chains are registered
+    # after _h_chain_geom() is defined below.
 }
+_H_CHAIN_SIZES = (30, 60, 80, 100)
 
 
 def _benzene_geom(cc: float = 1.397, ch: float = 1.084) -> str:
@@ -113,14 +112,25 @@ def _benzene_geom(cc: float = 1.397, ch: float = 1.084) -> str:
     return "; ".join(atoms)
 
 
-def _h30_chain_geom(spacing_ang: float = 1.0, n_atoms: int = 30) -> str:
+def _h_chain_geom(spacing_ang: float = 1.0, n_atoms: int = 30) -> str:
     """Linear hydrogen chain H_{n_atoms} equally spaced along x (Angstrom)."""
     return "; ".join(
         f"H {i*spacing_ang:.6f} 0 0" for i in range(n_atoms))
 
 
 SYSTEMS["benzene_ccpCVDZ"]["atom"] = _benzene_geom()
-SYSTEMS["H30_minimal"]["atom"] = _h30_chain_geom()
+# Register the H-chain minimal-basis stress family. All share the same shape
+# (linear H-chain, STO-3G, skip_eris=True); only n_atoms differs. H30_minimal
+# is the pre-existing key (kept stable for backward compat with old baselines
+# that reference it); H60/80/100_minimal extend the sweep for #24 calibration.
+for _n in _H_CHAIN_SIZES:
+    SYSTEMS[f"H{_n}_minimal"] = {
+        "atom": _h_chain_geom(n_atoms=_n),
+        "basis": "sto3g",
+        # Skip make_eris/ccsd_kernel: at n electrons those are enormous and
+        # aren't where the HBM-tiling code lives (Woke). ISDF + VMC only.
+        "skip_eris": True,
+    }
 
 # Paths whose regression is guarded in --compare (kernel paths; excludes setup).
 GUARDED_PATHS = {
@@ -1110,7 +1120,13 @@ def _parse_args() -> argparse.Namespace:
                         "stress/diagnostic vehicles, not in the canonical set)")
     p.add_argument("--with-h30", action="store_true",
                    help="append H30_minimal (STO-3G stress vehicle) to --systems "
-                        "for the memory-sensitive --compare (ke-liao + Woke)")
+                        "for the memory-sensitive --compare (ke-liao + Woke). "
+                        "Alias for --with-h-chain 30.")
+    p.add_argument("--with-h-chain", type=int, nargs="+", default=[],
+                   metavar="N ...",
+                   help="append H{N}_minimal STO-3G stress vehicles for the "
+                        "given chain lengths (e.g. --with-h-chain 30 60 80 100). "
+                        "H{N}_minimal must already be registered in SYSTEMS.")
     p.add_argument("--grid-lvl", type=int, default=2)
     p.add_argument("--n-rank-factor", type=float, default=6.0,
                    help="n_rank = int(n_rank_factor * n_orb)")
@@ -1165,6 +1181,16 @@ def main() -> None:
     selected = list(args.systems)
     if getattr(args, "with_h30", False) and "H30_minimal" not in selected:
         selected.append("H30_minimal")
+    # --with-h-chain N ... appends arbitrary H-chain sizes (Woke #24 sweep).
+    for _n in getattr(args, "with_h_chain", []) or []:
+        _name = f"H{_n}_minimal"
+        if _name not in SYSTEMS:
+            sys.exit(
+                f"unknown stress system {_name!r}: --with-h-chain currently "
+                f"supports the registered family "
+                f"{[f'H{n}_minimal' for n in _H_CHAIN_SIZES]}")
+        if _name not in selected:
+            selected.append(_name)
 
     systems: Dict[str, Any] = {}
     for sname in selected:
