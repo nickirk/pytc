@@ -800,18 +800,19 @@ class ISDFTC(TC):
                 streaming = True
                 k_stream_panel = None
 
-        key = (int(self.n_orb), int(N_fused), bool(streaming), int(k_stream_panel or 0))
+        panel_blk, gpu_max_memory_mb = _panel_blk_overrides()
+        # Rick #26: env overrides MUST be part of the cache key, else a
+        # same-process env change (unset -> PYTC_PANEL_BLK=64) reuses a stale
+        # uncapped rbs (probe: 300 -> set 64 -> still 300). Build the FULL key
+        # once (incl. overrides) and use it for BOTH lookup and store, so
+        # repeated same-env calls hit the cache (not just recompute + relog).
+        key = (int(self.n_orb), int(N_fused), bool(streaming),
+               int(k_stream_panel or 0), panel_blk, gpu_max_memory_mb)
         if key not in _FIXED_RBS_CACHE:
             resident_bytes = estimate_tc_contract_resident_bytes(
                 n_orb=self.n_orb, n_fused=N_fused,
                 k_stream_panel=k_stream_panel if streaming else None,
             )
-            panel_blk, gpu_max_memory_mb = _panel_blk_overrides()
-            # Rick #26: env overrides MUST be part of the cache key, else a
-            # same-process env change (unset -> PYTC_PANEL_BLK=64) reuses a
-            # stale uncapped rbs (probe: 300 -> set 64 -> still 300). Include
-            # the normalized overrides so the key changes with the env.
-            key = (key + (panel_blk, gpu_max_memory_mb))
             rbs = adaptive_rank_block_size(
                 self.n_orb, self.n_orb, N_fused,
                 resident_bytes=resident_bytes,

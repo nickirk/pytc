@@ -51,54 +51,101 @@ class TestPanelBlkOverrides(unittest.TestCase):
 
 class TestFixedRbsCacheKey(unittest.TestCase):
     """Rick #26: env overrides MUST be part of the cache key, else a
-    same-process env change reuses a stale uncapped rank_block_size."""
+    same-process env change reuses a stale uncapped rank_block_size. Also
+    (Rick #26 re-review): the cache must actually HIT on repeated same-env
+    calls — previously the base key was used for lookup but the extended key
+    for store, so the production cache never hit and adaptive_rank_block_size
+    was re-entered + re-logged on every call.
+
+    These tests call the REAL ``ISDFTC._get_fixed_rank_block_size`` method
+    (via a stub instance) and assert that repeated same-env calls do not
+    re-enter ``adaptive_rank_block_size``, while an env change produces a
+    distinct cached value.
+    """
 
     def tearDown(self):
         tc._FIXED_RBS_CACHE.clear()
         for k in ("PYTC_PANEL_BLK", "PYTC_GPU_MAX_MEMORY_MB"):
             os.environ.pop(k, None)
 
-    def _rbs_for(self, n_orb, N_fused, streaming=False, k_stream_panel=None):
-        # Mirror the _get_fixed_rank_block_size cache path exactly.
-        key = (int(n_orb), int(N_fused), bool(streaming), int(k_stream_panel or 0))
-        panel_blk, gpu_max_memory_mb = tc._panel_blk_overrides()
-        key = key + (panel_blk, gpu_max_memory_mb)
-        if key not in tc._FIXED_RBS_CACHE:
-            rbs = adaptive_rank_block_size(
-                n_orb, n_orb, N_fused,
-                resident_bytes=0,
-                gpu_max_memory_mb=gpu_max_memory_mb,
-            )
-            if panel_blk is not None:
-                rbs = min(rbs, max(1, int(panel_blk)))
-            tc._FIXED_RBS_CACHE[key] = rbs
-        return tc._FIXED_RBS_CACHE[key]
+    def _make_stub(self, n_orb=137, n_fused=300):
+        # Minimal object exposing the attrs the real method reads.
+        import jax.numpy as jnp
+        class _Stub:
+            pass
+        s = _Stub()
+        s.n_orb = n_orb
+        s.phi_isdf = jnp.ones((n_orb, n_fused))  # sets N_fused = n_fused
+        s.isdf_kernels = None                   # -> streaming=False
+        return s
+
+    def _install_counter(self):
+        # Count re-entries into adaptive_rank_block_size via both the
+        # gpu_memory module attr and tc's bound name.
+        from pytc.utils import gpu_memory
+        calls = {"n": 0}
+        _orig = gpu_memory.adaptive_rank_block_size
+        def _counting(*a, **k):
+            calls["n"] += 1
+            return _orig(*a, **k)
+        gpu_memory.adaptive_rank_block_size = _counting
+        tc.adaptive_rank_block_size = _counting
+        self.addCleanup(setattr, gpu_memory, "adaptive_rank_block_size", _orig)
+        return calls
+
+    def _method(self):
+        return tc.ISDFTC._get_fixed_rank_block_size
+
+    def test_repeated_same_env_calls_hit_cache(self):
+        calls = self._install_counter()
+        m = self._method()
+        s = self._make_stub()
+        r1 = m(s); r2 = m(s); r3 = m(s)
+        # Same env -> cache hits after the first call: adaptive called once.
+        self.assertEqual((r1, r2, r3), (300, 300, 300))
+        self.assertEqual(calls["n"], 1,
+                         f"expected 1 adaptive call, got {calls['n']} (cache miss)")
 
     def test_env_change_same_process_invalidates_stale_rbs(self):
-        # Unset -> autotuned (300 for n_orb=137, N_fused=300).
-        r_unset = self._rbs_for(137, 300)
+        calls = self._install_counter()
+        m = self._method()
+        s = self._make_stub()
+        r_unset = m(s)
         self.assertEqual(r_unset, 300)
-        # Set PYTC_PANEL_BLK=64 in the SAME process -> must be 64, not 300.
         os.environ["PYTC_PANEL_BLK"] = "64"
-        r_capped = self._rbs_for(137, 300)
+        r_capped = m(s)
         self.assertEqual(r_capped, 64)
-        # Unset again -> back to 300 (cache key changes with the env).
+        # New key -> adaptive re-entered.
+        self.assertEqual(calls["n"], 2)
         os.environ.pop("PYTC_PANEL_BLK")
-        r_unset2 = self._rbs_for(137, 300)
+        r_unset2 = m(s)
+        # Default key still cached from the first call -> cache hit (no new call).
         self.assertEqual(r_unset2, 300)
+        self.assertEqual(calls["n"], 2)
 
-    def test_gpu_max_memory_mb_change_invalidates_stale_rbs(self):
-        r_default = self._rbs_for(137, 300)
+    def test_env_change_repeat_capped_calls_hit_cache(self):
+        calls = self._install_counter()
+        m = self._method()
+        s = self._make_stub()
+        os.environ["PYTC_PANEL_BLK"] = "64"
+        r1 = m(s); r2 = m(s)
+        self.assertEqual((r1, r2), (64, 64))
+        self.assertEqual(calls["n"], 1,
+                         f"capped repeat should hit cache; adaptive={calls['n']}")
+
+    def test_gpu_max_memory_mb_change_produces_distinct_cache_entry(self):
+        calls = self._install_counter()
+        m = self._method()
+        s = self._make_stub()
+        r_default = m(s)
         os.environ["PYTC_GPU_MAX_MEMORY_MB"] = "40000"
-        r_budget = self._rbs_for(137, 300)
-        # Different key -> a distinct cache entry is created (not silently
-        # reusing the default-key entry). The default entry's continued
-        # presence is fine; what matters is that the budget-keyed entry exists
-        # separately so the env change is reflected.
-        self.assertIn(
-            (137, 300, False, 0, None, 40000.0), tc._FIXED_RBS_CACHE)
-        # And the two keys are distinct (not the same object).
-        self.assertEqual(len(tc._FIXED_RBS_CACHE), 2)
+        r_budget = m(s)
+        # Different key -> adaptive re-entered.
+        self.assertEqual(calls["n"], 2)
+        # Both keys are cached distinctly (2 entries for this (n_orb, N_fused)).
+        self.assertEqual(
+            len([k for k in tc._FIXED_RBS_CACHE
+                 if k[0] == 137 and k[1] == 300]), 2)
 
 
 if __name__ == "__main__":
