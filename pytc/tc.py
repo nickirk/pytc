@@ -56,6 +56,10 @@ def _panel_blk_overrides():
         gpu_max_memory_mb = float(gm) if gm is not None and gm.strip() else None
     except (TypeError, ValueError):
         gpu_max_memory_mb = None
+    if gpu_max_memory_mb is not None and not (gpu_max_memory_mb > 0 and
+                                           gpu_max_memory_mb != float('inf')):
+        # Reject non-positive / non-finite (nan, inf, -inf) so they degrade to no-op.
+        gpu_max_memory_mb = None
     if panel_blk is not None and panel_blk < 1:
         panel_blk = None
     return panel_blk, gpu_max_memory_mb
@@ -803,6 +807,11 @@ class ISDFTC(TC):
                 k_stream_panel=k_stream_panel if streaming else None,
             )
             panel_blk, gpu_max_memory_mb = _panel_blk_overrides()
+            # Rick #26: env overrides MUST be part of the cache key, else a
+            # same-process env change (unset -> PYTC_PANEL_BLK=64) reuses a
+            # stale uncapped rbs (probe: 300 -> set 64 -> still 300). Include
+            # the normalized overrides so the key changes with the env.
+            key = (key + (panel_blk, gpu_max_memory_mb))
             rbs = adaptive_rank_block_size(
                 self.n_orb, self.n_orb, N_fused,
                 resident_bytes=resident_bytes,
