@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import folx
 from typing import Generator, Tuple
 from pyscf import gto
 from flax import struct
@@ -163,9 +164,8 @@ def eval_gto_grad(mol_gto: MolGTO, xyz: jax.Array) -> jax.Array:
     return jax.jacfwd(lambda x: eval_gto(mol_gto, x))(xyz)
 
 def eval_gto_lap(mol_gto: MolGTO, xyz: jax.Array) -> jax.Array:
-    """Evaluate laplacian."""
-    hess = jax.jacfwd(lambda x: eval_gto_grad(mol_gto, x))(xyz)
-    return jnp.trace(hess, axis1=1, axis2=2)
+    """Evaluate laplacian via folx forward-mode (no full Hessian)."""
+    return folx.forward_laplacian(lambda x: eval_gto(mol_gto, x))(xyz).laplacian
 
 def eval_gto_value_and_grad(mol_gto: MolGTO, xyz: jax.Array):
     """Evaluate value and gradient."""
@@ -174,11 +174,10 @@ def eval_gto_value_and_grad(mol_gto: MolGTO, xyz: jax.Array):
     return val, grad
 
 def eval_gto_all(mol_gto: MolGTO, xyz: jax.Array):
-    """Evaluate value, gradient, and laplacian."""
-    val = eval_gto(mol_gto, xyz)
-    grad = eval_gto_grad(mol_gto, xyz)
-    lap = eval_gto_lap(mol_gto, xyz)
-    return val, grad, lap
+    """Evaluate value, gradient, and laplacian in one folx forward pass."""
+    result = folx.forward_laplacian(lambda x: eval_gto(mol_gto, x))(xyz)
+    # jacobian.data shape: (3, nao) → transpose to (nao, 3) to match jacfwd convention
+    return result.x, jnp.transpose(result.jacobian.data), result.laplacian
 
 def eval_ao(mol_gto: MolGTO, pos: jax.Array, deriv=0):
     """
@@ -199,9 +198,11 @@ def eval_ao(mol_gto: MolGTO, pos: jax.Array, deriv=0):
         return vals.reshape(batch_shape + (-1,)), grads.reshape(batch_shape + (-1, 3))
         
     elif deriv == 2:
-        vmap_eval_all = jax.vmap(lambda x: eval_gto_all(mol_gto, x))
-        vals, grads, laps = vmap_eval_all(pos_flat)
-        return vals.reshape(batch_shape + (-1,)), grads.reshape(batch_shape + (-1, 3)), laps.reshape(batch_shape + (-1,))
+        fwd_lap = folx.forward_laplacian(lambda x: eval_gto(mol_gto, x))
+        res = jax.vmap(fwd_lap)(pos_flat)
+        # jacobian.data: (batch, 3, nao) → transpose to (batch, nao, 3)
+        grads = jnp.transpose(res.jacobian.data, (0, 2, 1))
+        return res.x.reshape(batch_shape + (-1,)), grads.reshape(batch_shape + (-1, 3)), res.laplacian.reshape(batch_shape + (-1,))
         
     else:
         raise ValueError("Unsupported derivative order")
