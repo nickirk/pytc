@@ -983,6 +983,21 @@ def resolve_v3o_panel_block_size(nocc, nvir, *,
     )
     panel_blk = block_size or auto_blk
     panel_blk = max(1, min(int(panel_blk), nvir))
+
+    # Honor PYTC_SOLVER_BLK as a hard cap (same knob as resolve_vvvv_panel_block_sizes).
+    sb = os.environ.get("PYTC_SOLVER_BLK")
+    if sb is not None and sb.strip():
+        try:
+            solver_blk = int(sb)
+            if solver_blk >= 1:
+                panel_blk = min(panel_blk, solver_blk)
+                logger.debug(
+                    "PYTC_SOLVER_BLK=%d capping v3o panel_blk=%d (auto=%d)",
+                    solver_blk, panel_blk, auto_blk,
+                )
+        except ValueError:
+            pass
+
     logger.debug(
         "Resolved square V3O panel block: panel_blk=%d (auto=%d)",
         panel_blk, auto_blk,

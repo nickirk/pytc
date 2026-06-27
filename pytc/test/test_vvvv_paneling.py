@@ -271,6 +271,15 @@ class TestV3OPanelSizing(unittest.TestCase):
         # For a tiny system the full nvir should fit in one tile
         self.assertEqual(blk, 50, f"Expected blk=nvir=50, got {blk}")
 
+    def test_pytc_solver_blk_caps_v3o(self):
+        """PYTC_SOLVER_BLK caps resolve_v3o_panel_block_size just like vvvv."""
+        with (
+            mock.patch.object(gpu_memory, "estimate_v3o_panel_blksize", return_value=(136, 1024)),
+            mock.patch.dict("os.environ", {"PYTC_SOLVER_BLK": "130"}),
+        ):
+            blk = gpu_memory.resolve_v3o_panel_block_size(5, 137)
+        self.assertEqual(blk, 130)
+
 
 class TestBroadcastToDevices(unittest.TestCase):
     """Unit tests for xtc_ccsd.broadcast_to_devices."""
