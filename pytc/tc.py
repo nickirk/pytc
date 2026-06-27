@@ -46,7 +46,9 @@ def _panel_blk_overrides():
       PYTC_GPU_MAX_MEMORY_MB  authoritative total-GPU budget (MiB) fed into
                               ``adaptive_rank_block_size``'s budget path.
       PYTC_SOLVER_BLK         cap on the CCSD vvvv tile panel_size in
-                              ``resolve_vvvv_panel_block_sizes`` (must be ≥ 1).
+                              ``resolve_vvvv_panel_block_sizes`` AND the v3o
+                              (large-blocks) tile in
+                              ``resolve_v3o_panel_block_size`` (must be ≥ 1).
                               Use when the delta_U direct-tile pre-flight is
                               borderline; reduces tile size O(blk²).
     """

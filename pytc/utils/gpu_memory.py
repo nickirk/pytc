@@ -12,6 +12,33 @@ block-size based on:
 3. Phase-specific workspace formulas so we know *exactly* how much VRAM
    a single block of a given size will consume.
 
+Runtime memory knobs
+--------------------
+Three environment variables let you override the auto-sizing on tight-GPU
+systems (e.g. nkeep=300 on an 80 GB A100).  All are optional; omit them to
+get fully automatic behaviour.
+
+PYTC_GPU_MAX_MEMORY_MB
+    Authoritative total-GPU budget in MiB.  When set, ``adaptive_rank_block_size``
+    uses this as the assumed device capacity instead of querying XLA.
+    Example: ``PYTC_GPU_MAX_MEMORY_MB=40000`` for an 80 GB A100 with
+    ~40 GB reserved for XLA caches and resident kernels.
+    *Does not affect ``_get_delta_u_direct_tile``'s own free-memory check.*
+
+PYTC_PANEL_BLK
+    Hard cap (integer ≥ 1) on the K-stream ``panel_size`` and
+    ``rank_block_size`` in ``tc.py``.  Use when the ISDF K-stream
+    pre-allocation would exceed available HBM.
+    Example: ``PYTC_PANEL_BLK=64``.
+
+PYTC_SOLVER_BLK
+    Hard cap (integer ≥ 1) on the CCSD tile ``panel_blk`` returned by
+    ``resolve_vvvv_panel_block_sizes`` (vvvv path) and
+    ``resolve_v3o_panel_block_size`` (v3o / large-blocks path).  Use when
+    the delta_U direct-tile pre-flight would otherwise reject the auto-sized
+    tile; tile memory scales O(blk²).
+    Example: ``PYTC_SOLVER_BLK=130`` for nkeep=300 on an 80 GB A100.
+
 Usage
 -----
 >>> from pytc.utils.gpu_memory import estimate_blksize
