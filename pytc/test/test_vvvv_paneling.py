@@ -116,6 +116,28 @@ class TestVVVVPanelSizing(unittest.TestCase):
                 r_block_size=cc.vvvv_r_block_size,
                 gpu_max_memory_mb=cc.gpu_max_memory)
 
+    def test_pytc_solver_blk_caps_auto(self):
+        """PYTC_SOLVER_BLK caps auto-estimated panel_blk."""
+        with mock.patch.object(gpu_memory, "estimate_vvvv_panel_blksize", return_value=(7, 1024)):
+            with mock.patch.dict("os.environ", {"PYTC_SOLVER_BLK": "5"}):
+                p_blk, r_blk = gpu_memory.resolve_vvvv_panel_block_sizes(2, 11)
+        self.assertEqual((p_blk, r_blk), (5, 5))
+
+    def test_pytc_solver_blk_caps_explicit_override(self):
+        """PYTC_SOLVER_BLK further caps an explicit p_block_size override."""
+        with mock.patch.object(gpu_memory, "estimate_vvvv_panel_blksize", return_value=(7, 1024)):
+            with mock.patch.dict("os.environ", {"PYTC_SOLVER_BLK": "5"}):
+                p_blk, r_blk = gpu_memory.resolve_vvvv_panel_block_sizes(
+                    2, 11, p_block_size=8)
+        self.assertEqual((p_blk, r_blk), (5, 5))
+
+    def test_pytc_solver_blk_does_not_raise_auto(self):
+        """PYTC_SOLVER_BLK larger than auto has no effect."""
+        with mock.patch.object(gpu_memory, "estimate_vvvv_panel_blksize", return_value=(7, 1024)):
+            with mock.patch.dict("os.environ", {"PYTC_SOLVER_BLK": "20"}):
+                p_blk, r_blk = gpu_memory.resolve_vvvv_panel_block_sizes(2, 11)
+        self.assertEqual((p_blk, r_blk), (7, 7))
+
 
 class TestTileMemory(unittest.TestCase):
     """Unit tests for pytc.utils.tile_memory — the canonical ISDF memory model."""

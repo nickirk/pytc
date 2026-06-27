@@ -45,6 +45,10 @@ def _panel_blk_overrides():
                               rank_block_size (must be ≥ 1; ignored otherwise).
       PYTC_GPU_MAX_MEMORY_MB  authoritative total-GPU budget (MiB) fed into
                               ``adaptive_rank_block_size``'s budget path.
+      PYTC_SOLVER_BLK         cap on the CCSD vvvv tile panel_size in
+                              ``resolve_vvvv_panel_block_sizes`` (must be ≥ 1).
+                              Use when the delta_U direct-tile pre-flight is
+                              borderline; reduces tile size O(blk²).
     """
     try:
         pb = os.environ.get("PYTC_PANEL_BLK")

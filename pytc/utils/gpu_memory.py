@@ -20,6 +20,7 @@ Usage
 """
 
 import logging
+import os
 import numpy as np
 
 from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize  # noqa: F401 (re-exported)
@@ -856,6 +857,24 @@ def resolve_vvvv_panel_block_sizes(nocc, nvir, *,
 
     panel_blk = p_block_size or r_block_size or auto_blk
     panel_blk = max(1, min(int(panel_blk), nvir))
+
+    # Honor PYTC_SOLVER_BLK as a hard cap on the CCSD vvvv tile panel_size.
+    # Useful when the delta_U direct-tile pre-flight is borderline (e.g. 100 MB
+    # short): reducing blk from nvir to a smaller value shrinks the tile O(blk²)
+    # without changing correctness.
+    sb = os.environ.get("PYTC_SOLVER_BLK")
+    if sb is not None and sb.strip():
+        try:
+            solver_blk = int(sb)
+            if solver_blk >= 1:
+                panel_blk = min(panel_blk, solver_blk)
+                logger.debug(
+                    "PYTC_SOLVER_BLK=%d capping vvvv panel_blk=%d (auto=%d)",
+                    solver_blk, panel_blk, auto_blk,
+                )
+        except ValueError:
+            pass
+
     logger.debug(
         "Resolved square VVVV panel block: panel_blk=%d (auto=%d)",
         panel_blk, auto_blk,
