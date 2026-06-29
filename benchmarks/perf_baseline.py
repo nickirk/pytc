@@ -1,6 +1,6 @@
 """Performance-baseline harness for ISDF-XTC-CCSD + VMC kernels.
 
-Times the guardrail paths Felix designated, on the canonical systems:
+Times the guarded benchmark paths on the canonical systems:
     1. ISDF build      - ISDFXTC.from_xtc (decomposition)
     2. K integrals     - compute_kmat_kernels (K1/K3)
     3. ISDF dU kernels - L_aux / D / X (sub-steps of the ISDF delta_U path)
@@ -17,7 +17,7 @@ Modes:
 
 Methodology: warmup pass (discard JAX compile) then median of --repeats (default 5),
 _sync() (block_until_ready) on all JAX outputs, lib.num_threads(1) for reproducibility.
-Machine-agnostic: runs on CPU (dev) or GPU (canonical baseline via Grace's cluster).
+Machine-agnostic: runs on CPU (dev) or GPU (canonical baseline on the target accelerator cluster).
 """
 
 from __future__ import annotations

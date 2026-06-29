@@ -45,7 +45,7 @@ key, with lookup and store using the same key. A cache that returns a stale
 value when any input changes is a correctness bug.
 
 **5. Review context is transient — do not fossilise it.**
-Person-tagged comments ("Rick #26", "Woke #24", "task #N", "PR…") age
+Person-tagged comments ("Alice #26", "Bob #24", "task #N", "PR…") age
 into noise. Convert each into a neutral, maintainable explanation or,
 better, the test it was protecting. Run metadata (hashes, job IDs, commit
 pins) belongs in commit messages or run logs, not in source files.
