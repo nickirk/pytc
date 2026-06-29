@@ -27,6 +27,11 @@ calcs
 *.hdf5
 *.h5
 
+# Benchmark run artifacts — generated locally, not tracked in the repo
+benchmarks/*.json
+benchmarks/results/
+artifacts/
+
 *.vscode/
 *.venv/
 

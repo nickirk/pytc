@@ -1,11 +1,10 @@
 """Focused tests for the PYTC_PANEL_BLK / PYTC_GPU_MAX_MEMORY_MB env-var
-panel/block-size overrides and the _FIXED_RBS_CACHE cache-key fix (Rick #26).
+panel/block-size overrides and the _FIXED_RBS_CACHE cache-key invariants.
 
 Covers:
 - _panel_blk_overrides() parsing (default None, set values, bad values).
-- The cache-key fix: a same-process env change (unset -> PYTC_PANEL_BLK=64)
-  invalidates the stale uncapped rank_block_size (Rick's probe: previously
-  returned 300 after setting 64 because the env was not part of the key).
+- Cache-key correctness: a same-process env change invalidates a stale cached
+  rank_block_size, and repeated same-env calls hit the cache without recompute.
 """
 import os
 import unittest
@@ -50,17 +49,15 @@ class TestPanelBlkOverrides(unittest.TestCase):
 
 
 class TestFixedRbsCacheKey(unittest.TestCase):
-    """Rick #26: env overrides MUST be part of the cache key, else a
-    same-process env change reuses a stale uncapped rank_block_size. Also
-    (Rick #26 re-review): the cache must actually HIT on repeated same-env
-    calls — previously the base key was used for lookup but the extended key
-    for store, so the production cache never hit and adaptive_rank_block_size
-    was re-entered + re-logged on every call.
+    """Cache-key correctness for _FIXED_RBS_CACHE.
 
-    These tests call the REAL ``ISDFTC._get_fixed_rank_block_size`` method
-    (via a stub instance) and assert that repeated same-env calls do not
-    re-enter ``adaptive_rank_block_size``, while an env change produces a
-    distinct cached value.
+    Env overrides must be part of the cache key: a same-process env change
+    must invalidate the stale cached rank_block_size and return a fresh value.
+    Repeated same-env calls must hit the cache without re-entering
+    adaptive_rank_block_size.
+
+    These tests call the real ``ISDFTC._get_fixed_rank_block_size`` method
+    via a stub instance.
     """
 
     def tearDown(self):

@@ -35,9 +35,8 @@ def _panel_blk_overrides():
 
     Returns ``(panel_blk, gpu_max_memory_mb)`` where each is ``None`` when the
     corresponding env var is unset (the default), so the autotuned behaviour is
-    unchanged unless a caller opts in. These are quick config knobs (Woke #24
-    FNO nkeep=300 limit-push) for shrinking the direct-tile / K-stream panel on
-    systems that would otherwise over-allocate ahead of the 80 GB A100 ceiling;
+    unchanged unless a caller opts in. These are expert escape hatches for
+    shrinking the direct-tile / K-stream panel on memory-constrained systems;
     the permanent fix is to make the delta_U direct tile honour
     ``SAFE_TILE_BYTES_CEILING`` like the CCSD vvvv path (separate change).
 
@@ -807,11 +806,9 @@ class ISDFTC(TC):
                 k_stream_panel = None
 
         panel_blk, gpu_max_memory_mb = _panel_blk_overrides()
-        # Rick #26: env overrides MUST be part of the cache key, else a
-        # same-process env change (unset -> PYTC_PANEL_BLK=64) reuses a stale
-        # uncapped rbs (probe: 300 -> set 64 -> still 300). Build the FULL key
-        # once (incl. overrides) and use it for BOTH lookup and store, so
-        # repeated same-env calls hit the cache (not just recompute + relog).
+        # Env overrides are part of the cache key so a same-process env change
+        # is honoured without a stale hit. Build the full key once for both
+        # lookup and store; repeated same-env calls then hit the cache.
         key = (int(self.n_orb), int(N_fused), bool(streaming),
                int(k_stream_panel or 0), panel_blk, gpu_max_memory_mb)
         if key not in _FIXED_RBS_CACHE:

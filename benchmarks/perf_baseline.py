@@ -1,4 +1,4 @@
-"""Performance-baseline harness for ISDF-XTC-CCSD + VMC kernels (task #16, Phase 1a).
+"""Performance-baseline harness for ISDF-XTC-CCSD + VMC kernels.
 
 Times the guardrail paths Felix designated, on the canonical systems:
     1. ISDF build      - ISDFXTC.from_xtc (decomposition)
@@ -91,7 +91,7 @@ SYSTEMS: Dict[str, Dict[str, Any]] = {
     # not in REQUIRED_PATHS (would invalidate the existing canonical baseline).
     # The family is parameterized so we can sweep H30/H60/H80/H100 to scale the
     # bh-folx forward_laplacian HBM (which grows with electron count) against
-    # the flat bha-analytical footprint (Woke #24 calibration). H30_minimal is
+    # the flat bha-analytical footprint. H30_minimal is
     # the pre-existing key (kept stable); the larger chains are registered
     # after _h_chain_geom() is defined below.
 }
@@ -139,8 +139,8 @@ GUARDED_PATHS = {
 }
 
 # Self-describing comparison policy, stored in every baseline JSON so that
-# `--compare` carries its own tolerances (Rick #21 detail). `compare()` reads
-# these from the baseline unless a CLI flag overrides.
+# `--compare` carries its own tolerances. `compare()` reads these from the
+# baseline unless a CLI flag overrides.
 COMPARE_POLICY: Dict[str, Any] = {
     "timing": {"guarded_threshold_pct": 20.0},
     "sanity": {
@@ -652,7 +652,7 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
     # does not consume xtc/ixtc. XTC.from_pyscf + get_delta_U are eager and
     # would OOM before the VMC-step HBM measurement at large electron counts
     # (delta_U_exact returns an (n,n,n,n) f64 tensor: ~64.8 GB at H300).
-    # Only the VMC measurement path runs under --vmc-focus (Rick #25).
+    # Only the VMC measurement path runs under --vmc-focus.
     if getattr(args, "vmc_focus", False):
         xtc = None
         ixtc = None
@@ -761,7 +761,7 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
     # Opt-out per system (H30_minimal stress vehicle skips this: at 30 electrons
     # make_eris/ccsd is enormous and isn't where the HBM-tiling lives anyway).
     # --vmc-focus also skips this: it needs xtc (built only in the non-vmc-focus
-    # arm above) and isn't on the VMC measurement path (Rick #25 re-review).
+    # arm above) and isn't on the VMC measurement path.
     if cfg.get("skip_eris", False) or getattr(args, "vmc_focus", False):
         if cfg.get("skip_eris", False):
             print(f"[{name}] skipping make_eris/ccsd_kernel (skip_eris=True)",
@@ -820,7 +820,7 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
     Gates (any failure -> exit 1), in order:
       1. COMPAT  — experiment-defining metadata/config fields must match
                    (accelerator model/count, JAX+jaxlib, PySCF, precision/XLA
-                   flags, thread count, full harness config). Per Rick #21:
+                   flags, thread count, full harness config).
                    hostname/job/partition are provenance only, not gated.
       2. COVERAGE — every baseline system and its guarded paths that were valid
                     in the baseline must be present and non-error in the new run
@@ -1140,7 +1140,7 @@ _DEFAULT_SYSTEMS = ["H2O_ccpVDZ", "C2H4_ccpVDZ", "C2H4_ccpVTZ"]
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ISDF-XTC-CCSD+VMC perf baseline (task #16 Phase 1a)")
+    p = argparse.ArgumentParser(description="ISDF-XTC-CCSD+VMC performance baseline")
     p.add_argument("--systems", nargs="+", default=list(_DEFAULT_SYSTEMS),
                    choices=list(SYSTEMS.keys()),
                    help="subset of systems to run (H30_minimal/benzene are opt-in "
@@ -1177,7 +1177,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vmc-walkers", type=int, default=256)
     p.add_argument("--vmc-steps", type=int, default=50)
     p.add_argument("--vmc-burnin", type=int, default=50)
-    p.add_argument("--out", type=str, default="benchmarks/perf-baseline.json",
+    p.add_argument("--out", type=str, default="artifacts/perf-baseline.json",
                    help="output JSON path (record mode)")
     p.add_argument("--compare", type=str, default=None,
                    help="baseline JSON to diff against (compare mode)")
@@ -1208,7 +1208,7 @@ def main() -> None:
     selected = list(args.systems)
     if getattr(args, "with_h30", False) and "H30_minimal" not in selected:
         selected.append("H30_minimal")
-    # --with-h-chain N ... appends arbitrary H-chain sizes (Woke #24 sweep).
+    # --with-h-chain N ... appends arbitrary H-chain sizes.
     for _n in getattr(args, "with_h_chain", []) or []:
         _name = f"H{_n}_minimal"
         if _name not in SYSTEMS:
@@ -1255,6 +1255,9 @@ def main() -> None:
             sys.exit(2)
         print("\n=== canonical validation: all required paths/sanity/self-policy checks passed ===")
 
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(record, f, indent=2)
     print(f"\nWrote {args.out}")
