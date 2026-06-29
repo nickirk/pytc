@@ -45,8 +45,7 @@ jax.config.update("jax_enable_x64", True)
 # Experimental GPU config: request full-precision matmuls (avoids XLA:GPU's
 # TF32-on-f32 default). Whether TF32 was actually the cause of the prior
 # isdf_dU_err gap is NOT yet established -- it is characterized by the f32
-# probe + per-system dtype audit in precision_probe() (Rick R2.4: characterize,
-# don't assert).
+# probe + per-system dtype audit in precision_probe().
 jax.config.update("jax_default_matmul_precision", "highest")
 
 # --------------------------------------------------------------------------- #
@@ -82,16 +81,16 @@ SYSTEMS: Dict[str, Dict[str, Any]] = {
         # Standard convention: cc-pCVDZ on C, cc-pVDZ on H.
         "basis": {"C": "ccpcvdz", "H": "ccpvdz"},
     },
-    # H-chain/minimal-basis stress vehicle (ke-liao + Woke, kernel-phase
-    # guardrail). n H atoms in a linear chain: n electrons + a long-chain grid
+    # H-chain/minimal-basis stress vehicle for kernel-phase guardrail.
+    # n H atoms in a linear chain: n electrons + a long-chain grid
     # stresses the grid-based ISDF/scan/tile paths (exactly the HBM-frugal
     # code), while the STO-3G basis keeps the orbital count modest. ISDF + VMC
     # paths only (make_eris/ccsd at n electrons would be enormous and aren't
     # where the HBM-tiling lives). Opt-in: not in the default --systems list,
     # not in REQUIRED_PATHS (would invalidate the existing canonical baseline).
-    # The family is parameterized so we can sweep H30/H60/H80/H100 to scale the
+    # The family is parameterized so we can sweep H30/H60/H80/H100 to scale
     # bh-folx forward_laplacian HBM (which grows with electron count) against
-    # the flat bha-analytical footprint. H30_minimal is
+    # the flat bha-analytical footprint; H30_minimal is
     # the pre-existing key (kept stable); the larger chains are registered
     # after _h_chain_geom() is defined below.
 }
@@ -122,13 +121,13 @@ SYSTEMS["benzene_ccpCVDZ"]["atom"] = _benzene_geom()
 # Register the H-chain minimal-basis stress family. All share the same shape
 # (linear H-chain, STO-3G, skip_eris=True); only n_atoms differs. H30_minimal
 # is the pre-existing key (kept stable for backward compat with old baselines
-# that reference it); H60/80/100_minimal extend the sweep for #24 calibration.
+# that reference it); H60/80/100_minimal extend the sweep.
 for _n in _H_CHAIN_SIZES:
     SYSTEMS[f"H{_n}_minimal"] = {
         "atom": _h_chain_geom(n_atoms=_n),
         "basis": "sto3g",
         # Skip make_eris/ccsd_kernel: at n electrons those are enormous and
-        # aren't where the HBM-tiling code lives (Woke). ISDF + VMC only.
+        # aren't where the HBM-tiling code lives. ISDF + VMC only.
         "skip_eris": True,
     }
 
@@ -160,16 +159,16 @@ COMPARE_POLICY: Dict[str, Any] = {
         # delta_U_maxabs: magnitude sanity (O(0.1-1)); absolute drift tolerance.
         "delta_U_maxabs_atol": 1e-8,
         # peak HBM (peak_bytes_in_use) drift tolerance per path. Relative:
-        # ke-liao's "less HBM AND/OR faster" rule is enforced as "no path
-        # grows peak HBM by more than this fraction" (default 10%). Only
-        # enforced when both baseline and new runs reported a peak_hbm_bytes
-        # for that path (i.e. a GPU run). The drift check is the load-bearing
-        # memory guardrail for the kernel-phase vectorizations (PR12+).
+        # Relative peak-HBM drift: enforced as "no path grows peak HBM by more
+        # than this fraction" (default 10%). Only enforced when both baseline
+        # and new runs reported a peak_hbm_bytes for that path (i.e. a GPU run).
+        # The drift check is the load-bearing memory guardrail for kernel-phase
+        # vectorizations.
         "peak_hbm_drift_rel_tol": 0.10,
     },
-    # Experiment-defining fields: a mismatch here FAILS compare outright (Rick:
-    # accelerator model/count, JAX+jaxlib, PySCF, precision/XLA flags, threads,
-    # full harness config). hostname/job/partition are provenance only.
+    # Experiment-defining fields: a mismatch here FAILS compare outright.
+    # Covers accelerator model/count, JAX+jaxlib, PySCF, precision/XLA flags,
+    # threads, full harness config. hostname/job/partition are provenance only.
     "compat": {
         "metadata": ["jax", "jaxlib", "pyscf", "device_kinds", "n_devices",
                      "jax_enable_x64", "default_matmul_precision",
@@ -183,8 +182,8 @@ COMPARE_POLICY: Dict[str, Any] = {
     },
 }
 
-# Explicit per-system required-path matrix (Rick R2.1): the baseline contract is
-# DECLARED, not inferred from whichever paths happened to succeed. A canonical
+# Explicit per-system required-path matrix: the baseline contract is DECLARED,
+# not inferred from whichever paths happened to succeed. A canonical
 # baseline is rejected (record --canonical exits nonzero) if a required path
 # errored; compare() fails if a required path is missing/errored in the new run.
 # C2H4-TZ intentionally excludes make_eris/ccsd_kernel (the cc-pVTZ pytc bug is
@@ -267,14 +266,14 @@ def validate_against_matrix(record: Dict[str, Any]) -> List[str]:
 
     Returns a list of violation strings (empty = valid). Used in canonical
     record mode (reject weak baselines) and conceptually mirrors what compare()
-    enforces against the baseline's declared matrix. Rules (Rick R3.1/R3.2):
+    enforces against the baseline's declared matrix. Rules:
       * the system set must EXACTLY match REQUIRED_PATHS (no partial baselines);
       * each required path's ``med`` must be a finite scalar > 0;
       * each required sanity value must be present and finite.
     """
     violations: List[str] = []
     systems = record.get("systems", {})
-    # R3.1: a canonical baseline must carry the FULL declared system set.
+    # A canonical baseline must carry the FULL declared system set.
     if set(systems) != set(REQUIRED_PATHS):
         violations.append(
             f"system set {sorted(systems)} != required {sorted(REQUIRED_PATHS)}; "
@@ -293,7 +292,7 @@ def validate_against_matrix(record: Dict[str, Any]) -> List[str]:
                     f"{sname}/{path}: required path missing or errored: {p}")
                 continue
             med = p["med"]
-            # R3.2: a NaN/inf/<=0 med would yield pct=NaN in compare -> false-green.
+            # A NaN/inf/<=0 med would yield pct=NaN in compare -> false-green.
             if not _is_finite_scalar(med) or float(med) <= 0:
                 violations.append(
                     f"{sname}/{path}: required timing med not finite/>0: {med!r}")
@@ -426,7 +425,7 @@ def collect_env() -> Dict[str, Any]:
         "processor": platform.processor(),
         "hostname": socket.gethostname(),
         "num_threads": lib.num_threads(),
-        # accelerator identity (defines the experiment per Rick's #21 detail)
+        # accelerator identity (experiment-defining)
         "devices": [str(d) for d in jax.devices()],
         "device_kinds": sorted({getattr(d, "device_kind", d.platform)
                                 for d in jax.devices()}),
@@ -465,13 +464,13 @@ def _safe(fn: Callable[[], Any]) -> Any:
 
 def precision_probe() -> Dict[str, Any]:
     """Characterize matmul/dot precision on the active device. Reports findings;
-    does NOT assert attribution of ISDF numerical errors (see review #21).
+    does NOT assert attribution of ISDF numerical errors.
 
     Two probes, kept strictly separate:
       * f64-operand probe: float64 in -> vs NumPy float64 truth. Documents whether
         a float64 matmul runs accurately on this device. A near-zero error only
         proves *this isolated f64 op* is accurate; it CANNOT detect or rule out
-        TF32, which only applies to f32 inputs (Rick finding #2).
+        TF32, which only applies to f32 inputs.
       * f32-operand probe: float32 in -> vs NumPy float64 truth. This is what
         characterizes TF32: rel_err ~1e-3 => TF32 (10-bit mantissa); ~1e-6 =>
         true f32 accumulate; ~1e-7 => f32 with good conditioning.
@@ -498,7 +497,7 @@ def precision_probe() -> Dict[str, Any]:
     out["f64_matmul_rel_err"] = float(
         np.max(np.abs(got_f64 - ref64)) / max(mref, 1e-30))
     # -- f32-operand probe (isolates GPU *compute* precision from input ------
-    #    quantization, per Rick R2.4): reference is the quantized operands
+    #    quantization): reference is the quantized operands
     #    multiplied in exact float64, so the error is the device's matmul
     #    reduction precision only (TF32 ~1e-3; true f32 accumulate ~1e-7).
     a32, b32 = a64.astype(np.float32), b64.astype(np.float32)
@@ -571,7 +570,7 @@ def _bench_vmc(mol, mf, walkers: int, steps: int, burnin: int,
     """Time one steady-state VMC sampling step, excluding compile + burn-in.
 
     ``pytc.vmc.sample`` runs burn-in and sampling in one call. We isolate the
-    sampling-step cost with PAIRED samples (Rick R2.5): each repeat times a full
+    sampling-step cost with PAIRED samples: each repeat times a full
     call (burnin+steps) and a burn-only call (burnin) back-to-back and subtracts,
     so the per-step distribution reflects genuine per-repeat variance (not two
     independent medians). No clamping; min/max are the real extrema (a negative
@@ -704,8 +703,8 @@ def bench_system(name: str, cfg: Dict[str, Any], args) -> Dict[str, Any]:
 
     # ---- K integrals + ISDF delta_U sub-kernels (mirror existing benchmark) ----
     # --vmc-focus skips these (l_aux dominates H30 wall at ~40 min/repeat and
-    # isn't touched by jastrow/ansatz PRs; Woke + Rick agreed on VMC-focused
-    # H30 profiling for the jastrow phase, reserving full sweep for kernel PRs).
+    # isn't touched by jastrow/ansatz PRs; --vmc-focus confines profiling to
+    # the VMC measurement path, reserving the full sweep for kernel PRs).
     if ixtc is not None and not getattr(args, "vmc_focus", False):
         try:
             def _kmat():
@@ -824,18 +823,18 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
                    hostname/job/partition are provenance only, not gated.
       2. COVERAGE — every baseline system and its guarded paths that were valid
                     in the baseline must be present and non-error in the new run
-                    (Rick finding #1: no silent skip of missing/errored paths).
+                    (no silent skip of missing/errored paths).
       3. SANITY   — e_corr within absolute tol; isdf_dU_err bounded drift
                     vs baseline; native_residual_gap below determinism ceiling
-      4. TIMING   — guarded-path %Δ within threshold (Rick: relative is fine for
-                    timings which are O(1), unlike near-zero sanity scalars).
+      4. TIMING   — guarded-path %Δ within threshold (relative is appropriate
+                    for timings which are O(1), unlike near-zero sanity scalars).
     Policy is read from the baseline's ``compare_policy`` (self-describing);
     ``--threshold`` overrides the timing gate only.
     """
     with open(baseline_path) as f:
         base = json.load(f)
 
-    # ---- 0. BASELINE SCHEMA VALIDATION (Rick R4: don't trust the baseline) --
+    # ---- 0. BASELINE SCHEMA VALIDATION (validate baseline before trusting it) -
     # The baseline itself must pass the same canonical schema/self-policy gates
     # that a new canonical record requires.  This closes the class where a
     # weakened/tampered baseline silently erodes the guard.
@@ -913,16 +912,16 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
     # is always at least as strict (checks every field the baseline declared +
     # any new field the harness added). This ensures new compat fields like
     # jastrow_type are actually enforced even when comparing against an old
-    # baseline that predates them (Rick review: no silent apples-to-oranges).
+    # baseline that predates them (no silent apples-to-oranges comparison).
     compat_meta = COMPARE_POLICY["compat"]["metadata"]
     compat_cfg = COMPARE_POLICY["compat"]["config"]
-    # Timing threshold is self-describing (Rick R2.5): if the caller did not
+    # Timing threshold is self-describing: if the caller did not
     # override (--threshold), read it from the baseline's own policy.
     if thr is None:
         thr = float(policy.get("timing", {}).get(
             "guarded_threshold_pct",
             COMPARE_POLICY["timing"]["guarded_threshold_pct"]))
-    # Declared required-path / required-sanity matrix (Rick R2.1): coverage is
+    # Declared required-path / required-sanity matrix: coverage is
     # checked against this contract, NOT inferred from baseline's successes.
     base_req_paths = {s: set(p) for s, p in base.get(
         "required_paths", {s: sorted(required_paths_for(s))
@@ -935,7 +934,7 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
     bcg, ncg = base.get("config", {}), new.get("config", {})
     base_sys, new_sys = base.get("systems", {}), new.get("systems", {})
 
-    # R3.1: reject a baseline whose DECLARED contract was weakened vs the harness
+    # Reject a baseline whose DECLARED contract was weakened vs the harness
     # constants (a tampered/deleted system+matrix entry must not erode the guard).
     for sname in REQUIRED_PATHS:
         if set(base_req_paths.get(sname, set())) != required_paths_for(sname):
@@ -965,7 +964,7 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
         # Backward compat: old baselines/runs predate jastrow_type (always
         # ncusp, the CLI default). Default the missing field to "ncusp" on
         # both sides so existing baselines stay valid while still rejecting
-        # a new run that explicitly changes the jastrow (Rick review).
+        # a new run that explicitly changes the jastrow.
         if field == "jastrow_type":
             if bv is None:
                 bv = "ncusp"
@@ -994,7 +993,7 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
                     f"coverage: required '{sname}/{path}' missing/errored in new "
                     f"run: {pn}")
                 continue
-            # R3.2: a non-finite/<=0 med would yield pct=NaN -> false-green.
+            # A non-finite/<=0 med would yield pct=NaN -> false-green.
             med = pn["med"]
             if not _is_finite_scalar(med) or float(med) <= 0:
                 failures.append(
@@ -1027,8 +1026,8 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
                 failures.append(
                     f"timing: '{sname}/{path}' regressed {pct:+.1f}% "
                     f"(threshold +{thr:.0f}%)")
-            # Peak-HBM drift check (only when both runs reported it; ke-liao
-            # memory guardrail). Relative drift vs peak_hbm_drift_rel_tol.
+            # Peak-HBM drift check (only when both runs reported it).
+            # Relative drift vs peak_hbm_drift_rel_tol.
             phb_b = pb.get("peak_hbm_bytes")
             phb_n = pn.get("peak_hbm_bytes")
             if (phb_b is not None and phb_n is not None
@@ -1049,7 +1048,7 @@ def compare(new: Dict[str, Any], baseline_path: str, threshold: float) -> int:
     print(f"  worst guarded regression: {worst:+.1f}% (threshold +{thr:.0f}%)")
     if peak_hbm_regressions:
         print(f"  peak-HBM regressions: {len(peak_hbm_regressions)} path(s) "
-              f"grew HBM > +{hbm_tol*100:.0f}% (ke-liao memory guardrail)")
+              f"grew HBM > +{hbm_tol*100:.0f}% (peak-HBM drift guardrail)")
 
     # ---- 4. SANITY (required keys must be present+finite; drift vs policy) --
     print("--- sanity ---")
@@ -1147,7 +1146,7 @@ def _parse_args() -> argparse.Namespace:
                         "stress/diagnostic vehicles, not in the canonical set)")
     p.add_argument("--with-h30", action="store_true",
                    help="append H30_minimal (STO-3G stress vehicle) to --systems "
-                        "for the memory-sensitive --compare (ke-liao + Woke). "
+                        "for memory-sensitive --compare runs. "
                         "Alias for --with-h-chain 30.")
     p.add_argument("--with-h-chain", type=int, nargs="+", default=[],
                    metavar="N ...",
@@ -1173,7 +1172,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Jastrow factor for the VMC step: ncusp (default), "
                         "bh (BoysHandy vmap-over-atoms + folx autodiff), or "
                         "bha (BoysHandyAnalytical take_along_axis + analytical "
-                        "gradients). bh/bha = PR12 profiling comparison.")
+                        "gradients). bh/bha are for profiling comparison.")
     p.add_argument("--vmc-walkers", type=int, default=256)
     p.add_argument("--vmc-steps", type=int, default=50)
     p.add_argument("--vmc-burnin", type=int, default=50)
