@@ -12,11 +12,11 @@ CCSD tiles, delta-U direct tiles), PyTC queries the device's current
 free memory and picks the largest block size that fits within a 70%
 threshold of that free memory.
 
-For the CCSD VVVV panel the estimate accounts for all buffers that are
+For the CCSD VVVV panel the estimate accounts for the buffers that are
 concurrently live during `_assemble_2b_tile`: the tile output, the
 `tc_tile` result that is already resident when delta-U is computed, and
-the element-wise sum of the two — so the chosen block size is safe by
-construction and matches what you would pick manually.
+the element-wise sum of the two — giving a conservative best-effort
+estimate that typically matches what you would set manually.
 
 If another process consumes GPU memory between setup and dispatch (a
 genuine OOM), PyTC raises a `RuntimeError` with a message that names
