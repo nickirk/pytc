@@ -8,6 +8,7 @@ Python TransCorrelation package (to be released soon...)
 
 installation
 quickstart
+gpu-memory
 ```
 
 ```{toctree}
