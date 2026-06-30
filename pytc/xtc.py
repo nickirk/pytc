@@ -2410,7 +2410,7 @@ class ISDFXTC(XTC, ISDFTC):
 
             safe_ps = _find_max_blksize(_tile_bytes, lo=1, hi=panel_size,
                                         gpu_target=threshold_bytes)
-            # _pad_axis can only pad UP (target > cur raises ValueError).
+            # _pad_axis raises ValueError when target < current length (pad up only).
             # The genuine-OOM guard must therefore check only the PADDED axes —
             # axes not in panel_layout are passed at their full slice length and
             # never padded, so safe_ps < that length is fine.
