@@ -138,6 +138,32 @@ class TestVVVVPanelSizing(unittest.TestCase):
                 p_blk, r_blk = gpu_memory.resolve_vvvv_panel_block_sizes(2, 11)
         self.assertEqual((p_blk, r_blk), (7, 7))
 
+    def test_extra_tile_bytes_fn_reduces_blksize(self):
+        """extra_tile_bytes_fn accounts for concurrent live tiles and reduces blksize."""
+        nocc, nvir, n_fused = 5, 40, 50
+        blk_no_extra, _ = gpu_memory.estimate_vvvv_panel_blksize(
+            nocc, nvir, n_fused=n_fused, gpu_max_memory_mb=4096)
+        blk_with_extra, _ = gpu_memory.estimate_vvvv_panel_blksize(
+            nocc, nvir, n_fused=n_fused, gpu_max_memory_mb=4096,
+            extra_tile_bytes_fn=lambda blk: 2 * blk * nvir * blk * nvir * 8,
+        )
+        self.assertLessEqual(blk_with_extra, blk_no_extra,
+                             "extra_tile_bytes_fn must reduce or maintain blksize")
+
+    def test_extra_tile_bytes_fn_forwarded_by_resolve(self):
+        """resolve_vvvv_panel_block_sizes passes extra_tile_bytes_fn through."""
+        calls = []
+
+        def capturing_estimate(no, nv, **kwargs):
+            calls.append(kwargs.get("extra_tile_bytes_fn"))
+            return (7, 1024)
+
+        fn = lambda blk: blk * 8
+        with mock.patch.object(gpu_memory, "estimate_vvvv_panel_blksize",
+                                side_effect=capturing_estimate):
+            gpu_memory.resolve_vvvv_panel_block_sizes(2, 11, extra_tile_bytes_fn=fn)
+        self.assertIs(calls[0], fn, "extra_tile_bytes_fn must be forwarded to estimator")
+
 
 class TestTileMemory(unittest.TestCase):
     """Unit tests for pytc.utils.tile_memory — the canonical ISDF memory model."""

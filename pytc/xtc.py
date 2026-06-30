@@ -23,6 +23,8 @@ from .tc import (
     _pad_axis,
     trim_panel,
 )
+from .utils.tile_memory import isdf_tile_peak_bytes as _isdf_tile_peak_bytes
+from .utils.tile_memory import find_max_blksize as _find_max_blksize
 from . import tc_helper
 from . import kmat as kmat_jax
 from .utils import sharding_core
@@ -144,6 +146,9 @@ def issue_stage_stats_scope():
 _X_HDF5_CACHE = OrderedDict()
 _DELTA_U_DIRECT_TILE_PROFILED = set()
 _ASSEMBLE_2B_TILE_PROFILED = set()
+# Keys added when the auto-shrink warning has been emitted for a device so
+# we log once per device per run, not once per tile on the CCSD hot path.
+_DELTA_U_AUTOSHRINK_WARNED = set()
 
 
 def _read_X_slice(X, slice_r, slice_s):
@@ -228,13 +233,12 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank, *, include_d=Tru
     effectively doubling its contribution and triggering spurious "tile
     exceeds device memory" refusals.
     """
-    from pytc.utils.tile_memory import isdf_tile_peak_bytes as _peak
     B = 8
     d_size_bytes   = int(N_rank * N_rank * B)
     x_size_bytes   = int(Nr * Ns * N_rank * B)
     cpq_size_bytes = int(Np * Nq * N_rank * B)
     out_size_bytes = int(Np * Nq * Nr * Ns * B)
-    total = _peak(Np, Nq, Nr, Ns, N_rank, include_d=include_d)
+    total = _isdf_tile_peak_bytes(Np, Nq, Nr, Ns, N_rank, include_d=include_d)
     return {
         "D":   d_size_bytes,
         "X":   x_size_bytes,
@@ -2378,7 +2382,62 @@ class ISDFXTC(XTC, ISDFTC):
     def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None,
                                panel_layout="pr"):
         """Assemble and symmetrize one finished Delta U tile."""
+        global _DELTA_U_AUTOSHRINK_WARNED
         panel_layout = _normalize_panel_layout(panel_layout)
+
+        # Auto-shrink panel_size to fit current free memory before dispatching
+        # either direct-tile call.  The size is resolved once here so both
+        # calls below use identical dimensions — required for the symmetrize
+        # step (direct + tmp.transpose(2,3,0,1)) to produce matching shapes.
+        if panel_size is not None:
+            device_key = getattr(device, "id", "host")
+            nmo = self.phi_isdf.shape[0]
+            slice_p, slice_q, slice_r, slice_s = ranges
+            p_len = (slice_p.stop or nmo) - (slice_p.start or 0)
+            q_len = (slice_q.stop or nmo) - (slice_q.start or 0)
+            r_len = (slice_r.stop or nmo) - (slice_r.start or 0)
+            s_len = (slice_s.stop or nmo) - (slice_s.start or 0)
+            N_rank = kernels['D'].shape[0]
+            free_bytes = _get_device_free_bytes(device)
+            threshold_bytes = int(free_bytes * 0.7)
+
+            def _tile_bytes(ps):
+                Np = ps if "p" in panel_layout else p_len
+                Nq = ps if "q" in panel_layout else q_len
+                Nr = ps if "r" in panel_layout else r_len
+                Ns = ps if "s" in panel_layout else s_len
+                return _isdf_tile_peak_bytes(Np, Nq, Nr, Ns, N_rank, include_d=True)
+
+            safe_ps = _find_max_blksize(_tile_bytes, lo=1, hi=panel_size,
+                                        gpu_target=threshold_bytes)
+            if safe_ps < p_len:
+                # Even the actual slice size doesn't fit — genuine OOM.
+                # (The setup-time estimate should have prevented p_len > safe_ps;
+                # this can happen if another process consumed GPU memory between
+                # setup and dispatch.)
+                raise RuntimeError(
+                    f"_assemble_delta_u_tile: GPU memory too low for current tile "
+                    f"slice (p_len={p_len}, r_len={r_len}): need at least "
+                    f"{_tile_bytes(p_len) / 2**30:.2f} GiB but only "
+                    f"{threshold_bytes / 2**30:.2f} GiB available "
+                    f"({free_bytes / 2**30:.2f} GiB free, device={device_key}). "
+                    "Reduce n_fused/nkeep or use a larger GPU."
+                )
+            if safe_ps < panel_size:
+                if device_key not in _DELTA_U_AUTOSHRINK_WARNED:
+                    _DELTA_U_AUTOSHRINK_WARNED.add(device_key)
+                    logger.warning(
+                        "_assemble_delta_u_tile: dispatch-time shrink panel_size "
+                        "%d → %d (%.2f GiB free after tc_tile, device=%s). "
+                        "Set PYTC_SOLVER_BLK=%d to pin this size and avoid JAX "
+                        "recompiles.",
+                        panel_size, safe_ps,
+                        free_bytes / 2**30,
+                        device_key,
+                        safe_ps,
+                    )
+                panel_size = safe_ps
+
         direct = self._get_delta_u_direct_tile(
             kernels, ranges, device=device, panel_size=panel_size,
             panel_layout=panel_layout)
