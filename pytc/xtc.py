@@ -2410,16 +2410,26 @@ class ISDFXTC(XTC, ISDFTC):
 
             safe_ps = _find_max_blksize(_tile_bytes, lo=1, hi=panel_size,
                                         gpu_target=threshold_bytes)
-            if safe_ps < p_len:
-                # Even the actual slice size doesn't fit — genuine OOM.
-                # (The setup-time estimate should have prevented p_len > safe_ps;
-                # this can happen if another process consumed GPU memory between
-                # setup and dispatch.)
+            # _pad_axis can only pad UP (target > cur raises ValueError).
+            # The genuine-OOM guard must therefore check only the PADDED axes —
+            # axes not in panel_layout are passed at their full slice length and
+            # never padded, so safe_ps < that length is fine.
+            min_padded = max(
+                p_len if "p" in panel_layout else 0,
+                q_len if "q" in panel_layout else 0,
+                r_len if "r" in panel_layout else 0,
+                s_len if "s" in panel_layout else 0,
+            )
+            if safe_ps < min_padded:
+                # Even the minimum padded tile doesn't fit — genuine OOM.
+                # (The setup-time estimate should have prevented this; it can
+                # happen if another process consumed GPU memory between setup
+                # and dispatch.)
                 raise RuntimeError(
                     f"_assemble_delta_u_tile: GPU memory too low for current tile "
-                    f"slice (p_len={p_len}, r_len={r_len}): need at least "
-                    f"{_tile_bytes(p_len) / 2**30:.2f} GiB but only "
-                    f"{threshold_bytes / 2**30:.2f} GiB available "
+                    f"(layout={panel_layout!r}, min_padded={min_padded}): "
+                    f"need at least {_tile_bytes(min_padded) / 2**30:.2f} GiB "
+                    f"but only {threshold_bytes / 2**30:.2f} GiB available "
                     f"({free_bytes / 2**30:.2f} GiB free, device={device_key}). "
                     "Reduce n_fused/nkeep or use a larger GPU."
                 )

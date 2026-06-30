@@ -63,5 +63,90 @@ class TestDeltaUChunking(unittest.TestCase):
         self.assertGreater(len(read_calls), 1)
 
 
+class TestDeltaUAutoshrinkGuard(unittest.TestCase):
+    """Regression tests for the layout-aware genuine-OOM guard in _assemble_delta_u_tile."""
+
+    def _make_fake_isdfxtc(self, nmo, n_rank):
+        """Return a minimal ISDFXTC-duck with phi_isdf and bound methods."""
+        rng = np.random.default_rng(42)
+        phi = rng.normal(size=(nmo, n_rank)).astype(np.float64)
+        fake = _FakeISDF(phi)
+        # Wire up _assemble_delta_u_tile from the real class so the guard runs.
+        import types
+        fake._assemble_delta_u_tile = types.MethodType(
+            xtc_mod.ISDFXTC._assemble_delta_u_tile, fake
+        )
+        fake._get_delta_u_direct_tile = types.MethodType(
+            xtc_mod.ISDFXTC._get_delta_u_direct_tile, fake
+        )
+        fake._get_isdf_device_cache = None
+        return fake
+
+    def _make_kernels(self, nmo, n_rank):
+        rng = np.random.default_rng(7)
+        D = rng.normal(size=(n_rank, n_rank)).astype(np.float64)
+        X_arr = rng.normal(size=(nmo, nmo, n_rank)).astype(np.float64)
+        import tempfile, h5py, os
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "x.h5")
+        fh = h5py.File(path, "w")
+        X = fh.create_dataset("X", data=X_arr)
+        return {"D": D, "X": X}, fh
+
+    def test_qr_layout_guard_does_not_raise_when_padded_axes_fit(self):
+        # "qr" layout: p is NOT padded (full nvir), only q and r are padded.
+        # safe_ps can be < p_len; the guard must NOT raise in that case.
+        nmo, n_rank = 12, 4
+        nocc, nvir = 2, 10  # p_len = nvir = 10; panel_size = max(nocc, blk) = 3
+        panel_size = 3       # q_len = r_len = 3 ≤ panel_size → safe_ps = 3 ≥ 3 = min_padded
+        fake = self._make_fake_isdfxtc(nmo, n_rank)
+        kernels, fh = self._make_kernels(nmo, n_rank)
+
+        # ranges for "qr" layout: slice_p covers all virtual (full nvir), slice_q and
+        # slice_r are sub-panels of size panel_size.
+        ranges = (
+            slice(nocc, nmo),        # p — full virtual, NOT padded in "qr"
+            slice(nocc, nocc + 3),   # q — padded axis, length 3 = panel_size
+            slice(nocc, nocc + 3),   # r — padded axis, length 3 = panel_size
+            slice(nocc, nmo),        # s — NOT padded in "qr" (only q and r are)
+        )
+
+        # Stub a large-enough free budget so isdf_tile_peak_bytes(3, ...) fits
+        large_free = 10 * 1024 ** 3  # 10 GiB — easily fits a tiny tile
+        with mock.patch("pytc.xtc._get_device_free_bytes", return_value=large_free):
+            with mock.patch("pytc.utils.gpu_memory._get_gpu_free_bytes",
+                            return_value=large_free):
+                # Should not raise: safe_ps >= max(q_len=3, r_len=3) = 3
+                result = fake._assemble_delta_u_tile(
+                    kernels, ranges, device=None,
+                    panel_size=panel_size, panel_layout="qr"
+                )
+        self.assertIsNotNone(result)
+        fh.close()
+
+    def test_pr_layout_genuine_oom_raises_with_layout_in_message(self):
+        # When safe_ps < min_padded (here both p and r are padded and too large
+        # to fit), RuntimeError must fire and mention the layout.
+        nmo, n_rank = 8, 4
+        panel_size = 6
+        fake = self._make_fake_isdfxtc(nmo, n_rank)
+        kernels, fh = self._make_kernels(nmo, n_rank)
+        ranges = (
+            slice(0, 6), slice(0, 8),
+            slice(0, 6), slice(0, 8),
+        )
+        # Stub tiny free memory so no tile fits.
+        tiny_free = 1  # 1 byte — nothing will fit
+        with mock.patch("pytc.xtc._get_device_free_bytes", return_value=tiny_free):
+            with self.assertRaises(RuntimeError) as ctx:
+                fake._assemble_delta_u_tile(
+                    kernels, ranges, device=None,
+                    panel_size=panel_size, panel_layout="pr"
+                )
+        self.assertIn("layout=", str(ctx.exception))
+        self.assertIn("min_padded=", str(ctx.exception))
+        fh.close()
+
+
 if __name__ == "__main__":
     unittest.main()
