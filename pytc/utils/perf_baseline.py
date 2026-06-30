@@ -18,6 +18,19 @@ Modes:
 Methodology: warmup pass (discard JAX compile) then median of --repeats (default 5),
 _sync() (block_until_ready) on all JAX outputs, lib.num_threads(1) for reproducibility.
 Machine-agnostic: runs on CPU (dev) or GPU (canonical baseline on the target accelerator cluster).
+
+Usage::
+
+    # Record a new baseline (default output: artifacts/perf-baseline.json):
+    python -m pytc.utils.perf_baseline --out baseline.json
+
+    # Compare against a saved baseline (exit nonzero on regression > threshold %):
+    python -m pytc.utils.perf_baseline --compare baseline.json --threshold 20
+
+    # Run a subset of systems:
+    python -m pytc.utils.perf_baseline --systems H2O_ccpVDZ C2H4_ccpVTZ
+
+    # Other options: --repeats N (default 5), --no-vmc, --log-level DEBUG
 """
 
 from __future__ import annotations
