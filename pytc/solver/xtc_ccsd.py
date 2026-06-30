@@ -539,6 +539,15 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
+    # For ISDF-XTC, _assemble_2b_tile holds a tc_tile output live while the
+    # delta_u tile is computed, then a sum result while both are live.  Each is
+    # (blk, nvir, blk, nvir) × f64 = blk²·nvir²·8 bytes.  Add both to the
+    # per-tile budget so the setup-time estimate is conservative enough.
+    _extra_tile_fn = None
+    if _n_fused is not None:
+        _isdf_nvir = nvir
+        def _extra_tile_fn(blk, _V=_isdf_nvir):
+            return 2 * blk * _V * blk * _V * 8
     p_blksize, r_blksize = resolve_vvvv_panel_block_sizes(
         nocc, nvir,
         p_block_size=getattr(cc, 'vvvv_p_block_size', None),
@@ -548,6 +557,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         n_fused=_n_fused,
         include_eris=False,
         include_accumulators=False,
+        extra_tile_bytes_fn=_extra_tile_fn,
     )
     panel_size = p_blksize
 

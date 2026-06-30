@@ -14,16 +14,19 @@ block-size based on:
 
 Runtime memory knobs
 --------------------
-Three environment variables let you override the auto-sizing on tight-GPU
-systems (e.g. nkeep=300 on an 80 GB A100).  All are optional; omit them to
-get fully automatic behaviour.
+GPU tile sizes auto-fit at dispatch time: ``_assemble_delta_u_tile`` probes
+free memory just before issuing each tile pair and shrinks ``panel_size`` if
+the auto-sized tile would not fit.  A normal run should never need any of
+the env vars below; omit them to get fully automatic behaviour.
+
+Three environment variables are provided as expert escape hatches for
+advanced tuning or diagnostics.
 
 PYTC_GPU_MAX_MEMORY_MB
     Authoritative total-GPU budget in MiB.  When set, ``adaptive_rank_block_size``
     uses this as the assumed device capacity instead of querying XLA.
     Example: ``PYTC_GPU_MAX_MEMORY_MB=40000`` for an 80 GB A100 with
     ~40 GB reserved for XLA caches and resident kernels.
-    *Does not affect ``_get_delta_u_direct_tile``'s own free-memory check.*
 
 PYTC_PANEL_BLK
     Hard cap (integer ≥ 1) on the K-stream ``panel_size`` and
@@ -32,11 +35,10 @@ PYTC_PANEL_BLK
     Example: ``PYTC_PANEL_BLK=64``.
 
 PYTC_SOLVER_BLK
-    Hard cap (integer ≥ 1) on the CCSD tile ``panel_blk`` returned by
+    Hard cap (integer ≥ 1) on the initial CCSD tile ``panel_blk`` returned by
     ``resolve_vvvv_panel_block_sizes`` (vvvv path) and
-    ``resolve_v3o_panel_block_size`` (v3o / large-blocks path).  Use when
-    the delta_U direct-tile pre-flight would otherwise reject the auto-sized
-    tile; tile memory scales O(blk²).
+    ``resolve_v3o_panel_block_size`` (v3o / large-blocks path).  Useful to
+    pre-set a known-good size and avoid JAX recompiles from repeated auto-shrink.
     Example: ``PYTC_SOLVER_BLK=130`` for nkeep=300 on an 80 GB A100.
 
 Usage
@@ -802,6 +804,7 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
                                 include_accumulators=False,
                                 naux=None,
                                 n_fused=None,
+                                extra_tile_bytes_fn=None,
                                 safety_factor=0.5):
     """Estimate a safe square ``(p, r)`` tile size for panelised VVVV work.
 
@@ -812,6 +815,14 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
       :func:`~pytc.utils.tile_memory.isdf_tile_peak_bytes`
     - DF operands ``L_p`` and ``L_r``: ``2 × blk × V × naux``
     - CCSD contraction output ``t2new[:, :, blk, blk]``: ``O² × blk²``
+
+    Parameters
+    ----------
+    extra_tile_bytes_fn : callable or None
+        Optional ``(blk) -> int`` that returns additional bytes that will be
+        live concurrently with the tile computation (e.g. a tc_tile output
+        and a sum result for ISDF-XTC, each ``blk² × nvir² × 8`` bytes).
+        Pass ``None`` (default) when no extra concurrent buffers exist.
     """
     O, V, B = nocc, nvir, 8
     Nf = n_fused if n_fused is not None else 0
@@ -825,7 +836,8 @@ def estimate_vvvv_panel_blksize(nocc, nvir, *,
         isdf   = isdf_tile_peak_bytes(blk, V, blk, V, Nf) if Nf > 0 else 2 * blk * V * blk * V * B
         df     = 2 * blk * V * naux * B if (naux is not None and naux > 0) else 0
         ccsd   = O * O * blk * blk * B   # t2new slice on GPU
-        return isdf + df + ccsd
+        extra  = extra_tile_bytes_fn(blk) if extra_tile_bytes_fn is not None else 0
+        return isdf + df + ccsd + extra
 
     # VVVV tile is a symmetric (blk, V, blk, V) shape that empirically does
     # not hit the cuBLAS autotune cliff even when total tile bytes exceed
@@ -866,7 +878,8 @@ def resolve_vvvv_panel_block_sizes(nocc, nvir, *,
                                    include_eris=False,
                                    include_accumulators=False,
                                    naux=None,
-                                   n_fused=None):
+                                   n_fused=None,
+                                   extra_tile_bytes_fn=None):
     """Resolve one square VVVV panel size from overrides or a VRAM estimate."""
     auto_blk, _ = estimate_vvvv_panel_blksize(
         nocc, nvir,
@@ -875,6 +888,7 @@ def resolve_vvvv_panel_block_sizes(nocc, nvir, *,
         include_accumulators=include_accumulators,
         naux=naux,
         n_fused=n_fused,
+        extra_tile_bytes_fn=extra_tile_bytes_fn,
     )
     if p_block_size is not None and r_block_size is not None and int(p_block_size) != int(r_block_size):
         raise ValueError(
