@@ -1,16 +1,21 @@
 # GPU Memory Management
 
-PyTC auto-sizes all GPU tile and panel allocations at runtime.
+PyTC auto-sizes GPU tile and panel allocations for the main compute
+paths — ISDF K-stream, xTC-CCSD VVVV/vovv/ovvv tiles, and delta-U
+direct tiles.
 For most workloads you do not need to set anything — the defaults are
 designed to use available VRAM safely while leaving headroom for JAX
 caches and resident kernels.
 
 ## How auto-sizing works
 
-Before each major computation phase (ISDF K-stream, VVVV/vovv/ovvv
-CCSD tiles, delta-U direct tiles), PyTC queries the device's current
-free memory and picks the largest block size that fits within a 70%
-threshold of that free memory.
+At each relevant sizing point, PyTC combines runtime free-memory and
+budget information (from the device or `PYTC_GPU_MAX_MEMORY_MB`) with
+an analytical tile-size model, then picks a conservative block size
+within a 70% threshold of the available budget. Dispatch-time adaptive
+shrink (the delta-U autoshrink path) additionally checks free memory
+immediately before the kernel launch and can tighten the block size
+further if another process consumed VRAM after setup.
 
 For the CCSD VVVV panel the estimate accounts for the buffers that are
 concurrently live during `_assemble_2b_tile`: the tile output, the
@@ -58,7 +63,7 @@ Tile memory scales O(blk²), so halving this value quarters the
 per-tile peak.
 
 ```bash
-export PYTC_SOLVER_BLK=64   # safe default for nkeep=300 on an 80 GB A100
+export PYTC_SOLVER_BLK=64   # value used for H10/QZ-FNO acceptance runs on an 80 GB A100
 ```
 
 ## When to use the overrides
