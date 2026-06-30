@@ -22,7 +22,7 @@ python benchmarks/perf_baseline.py --compare baseline.json --threshold 20
 ```
 Exit code is nonzero if any guarded path regresses by more than `--threshold` percent (default 20 %).
 
-**Other options:** `--repeats N` (default 5), `--no-vmc`, `--systems H2O C2H4`, `--log-level DEBUG`.
+**Other options:** `--repeats N` (default 5), `--no-vmc`, `--systems H2O_ccpVDZ C2H4_ccpVTZ`, `--log-level DEBUG`.
 
 ## Notes
 
