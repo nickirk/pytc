@@ -49,7 +49,7 @@ def get_pytc_version() -> str:
     """
     try:
         from importlib.metadata import version
-        return version('pytc')
+        return version('pytc-qc')
     except Exception:
         pass
 
