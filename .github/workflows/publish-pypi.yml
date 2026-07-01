@@ -1,0 +1,30 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for OIDC Trusted Publishing
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build
+
+      # Publishes dist/ via OIDC Trusted Publishing — no API token needed.
+      # Rick: consider SHA-pinning this action for supply-chain hardening,
+      # e.g. pypa/gh-action-pypi-publish@SHA instead of @release/v1.
+      - uses: pypa/gh-action-pypi-publish@release/v1
