@@ -51,7 +51,7 @@ python -m pip install pytc-qc
 python -m pip install -U "jax[cuda12]"
 ```
 
-For source checkout / development install, see [docs/installation.md](docs/installation.md).
+For source checkout / development install, see [docs/installation.md](https://github.com/nickirk/pytc/blob/main/docs/installation.md).
 
 ## Quick Start
 
@@ -88,7 +88,7 @@ mycc = cc.rccsd.RCCSD(mf)
 e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 ```
 
-See [docs/quickstart.md](docs/quickstart.md) for additional examples and explanations.
+See [docs/quickstart.md](https://github.com/nickirk/pytc/blob/main/docs/quickstart.md) for additional examples and explanations.
 
 ## Code Overview
 
