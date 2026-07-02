@@ -34,22 +34,15 @@
 
 ## Installation
 
-**Requirements**: Python 3.10 or higher
+**Requirements**: Python >= 3.10
 
-Install the released package from PyPI:
+Install from PyPI:
 
 ```bash
 python -m pip install pytc-qc
 ```
 
-The PyPI distribution is named `pytc-qc`; the Python import package remains
-`pytc`.
-
-To install the package from a source checkout in editable mode:
-
-```bash
-python -m pip install -e .
-```
+The PyPI distribution is named `pytc-qc`; the Python import package remains `pytc`.
 
 For GPU support (CUDA 12):
 
@@ -58,52 +51,9 @@ python -m pip install pytc-qc
 python -m pip install -U "jax[cuda12]"
 ```
 
+For source checkout / development install, see [docs/installation.md](docs/installation.md).
+
 ## Quick Start
-
-### VMC-based Jastrow Optimization with xTC-CCSD
-
-```python
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-from pyscf import gto, scf
-
-from pytc.vmc import optimize_ref_var
-from pytc.ansatz.sj import SlaterJastrow
-from pytc.ansatz.det import SlaterDet
-from pytc.jastrow import CompositeJastrow, NuclearCusp, BoysHandy
-
-# Set up a molecule with PySCF
-mol = gto.Mole()
-mol.atom = "Be 0 0 0"
-mol.basis = 'cc-pVDZ'
-mol.build()
-
-mf = scf.RHF(mol)
-mf.kernel()
-
-# Create Slater determinant and Jastrow factors
-det = SlaterDet.create(mol, mf.mo_coeff)
-jncusp = NuclearCusp.create(mol, name="ncusp")
-jbh = BoysHandy.create(mol, name="bh")
-jastrow = CompositeJastrow.create([jncusp, jbh])
-
-# Create Slater-Jastrow ansatz
-sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
-params = [jastrow.init_params(), jnp.ones(1)]
-
-# Optimize with VMC
-opt_results = optimize_ref_var(
-    sj_ansatz,
-    params=params,
-    n_walkers=5000,
-    n_steps=50,
-    n_opt_steps=10,
-    optimizer_type='newton',
-)
-```
-
-### ISDF-accelerated xTC Integrals
 
 ```python
 import jax
@@ -137,6 +87,8 @@ eris_isdf = my_isdf_xtc.make_eris(mf, jastrow_params)
 mycc = cc.rccsd.RCCSD(mf)
 e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 ```
+
+See [docs/quickstart.md](docs/quickstart.md) for additional examples and explanations.
 
 ## Code Overview
 
@@ -183,8 +135,10 @@ flowchart TD
 
 See the `pytc/examples/` directory for complete examples:
 - `Be_vmc_ref_opt_xtc_ccsd.py` — VMC optimization with xTC-CCSD
+- `co2_simple_jastrow_xtc_ccsd.py` — xTC-CCSD on CO₂ with a simple Jastrow factor
 - `h2o_jastrow_xtc_isdf_ccsd.py` — ISDF convergence study
 - `h2o_jax_isdf_xtc.py` — JAX-based ISDF example
+- `benchmark_isdf_xtc_kdx.py` — stage-wise wall-clock benchmark for ISDF and K-kernel builds
 
 To run the tests:
 ```bash

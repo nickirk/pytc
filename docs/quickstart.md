@@ -1,6 +1,6 @@
 # Quick Start
 
-## VMC-based Jastrow Optimization with xTC-CCSD
+## VMC-based Jastrow Optimization
 
 ```python
 import jax
@@ -83,5 +83,7 @@ e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 See the `pytc/examples/` directory for more complete examples:
 
 - `Be_vmc_ref_opt_xtc_ccsd.py` — VMC optimization with xTC-CCSD
+- `co2_simple_jastrow_xtc_ccsd.py` — xTC-CCSD on CO₂ with a simple Jastrow factor
 - `h2o_jastrow_xtc_isdf_ccsd.py` — ISDF convergence study
 - `h2o_jax_isdf_xtc.py` — JAX-based ISDF example
+- `benchmark_isdf_xtc_kdx.py` — stage-wise wall-clock benchmark for ISDF and K-kernel builds
