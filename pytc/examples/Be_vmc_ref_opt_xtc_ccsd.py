@@ -138,14 +138,15 @@ def main():
     do_ccsd(mf, jastrow_phase1, opt_params[0])
 
 def do_ccsd(mf, jastrow_factor, params):
-    from pyscf.cc import rccsd, CCSD
+    from pyscf.cc import CCSD
     import numpy as np
     from functools import reduce
 
     from pytc.xtc import XTC
     from pytc.tc_helper import get_eri
+    from pytc.solver import jax_xtc_ccsd
     # only need the jastrow params
-    xtc = XTC(mf, jastrow_factor, grid_lvl=2)
+    xtc = XTC.from_pyscf(mf, jastrow_factor, grid_lvl=2)
 
     mycc = CCSD(mf)
     e_corr, t1, t2 = mycc.kernel()
@@ -155,7 +156,7 @@ def do_ccsd(mf, jastrow_factor, params):
     t = mycc.amplitudes_to_vector(t1, t2)
     print("|t2| = ", np.linalg.norm(t2))
     print("|t1+t2| = ", np.linalg.norm(t))
-    eri1 = get_eri(xtc.mf, xtc.mo_coeff)
+    eri1 = get_eri(mf, xtc.mo_coeff)
     h1e = mycc._scf.get_hcore()
     h1e = reduce(np.dot, (xtc.mo_coeff.T, h1e, xtc.mo_coeff))
     
@@ -165,9 +166,11 @@ def do_ccsd(mf, jastrow_factor, params):
     e_hf_0 += (e_dir + e_ex) + mycc._scf.energy_nuc()
     print("Check e_hf = ",  e_hf_0)
 
-    myrcc = rccsd.RCCSD(mf)
-    #myrcc.verbose = 5
-    eris = xtc.make_eris(params)  # Add params
+    # Use pytc's own JAX-native xTC-CCSD solver, which correctly handles the
+    # non-Hermitian transcorrelated integrals (PySCF's stock RCCSD assumes
+    # ERI symmetries that don't hold here and silently gives the wrong energy).
+    myrcc = jax_xtc_ccsd.RCCSD(mf, xtc, params)
+    eris = xtc.make_eris(mf, params)
     tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
     t = myrcc.amplitudes_to_vector(t1, t2)
     print("|t2| = ", np.linalg.norm(t2))
