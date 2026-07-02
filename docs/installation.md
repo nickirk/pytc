@@ -10,7 +10,7 @@
 - scipy
 - jax (autodiff and GPU acceleration)
 - flax (neural network)
-- folx (latest version from GitHub required for multi-GPU sharding fixes)
+- folx (≥0.2.22, installed automatically as a dependency)
 - optax (machine learning optimizers)
 - pyscf
 
