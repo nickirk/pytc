@@ -44,6 +44,10 @@ jobs:
           path: docs/_build/html
 
   deploy:
+    # GitHub Pages deploy only runs on a public repo. While the repo is private,
+    # Pages publishing is gated/unreliable, so skip deploy to keep the workflow
+    # green; it starts deploying automatically once the repo becomes public.
+    if: ${{ github.event.repository.private == false }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
