@@ -29,7 +29,6 @@
   > ```
 - flax (neural network)
 - folx (≥0.2.22, installed automatically as a dependency)
- 
 - optax (machine learning optimizers)
 - pyscf
 
@@ -37,15 +36,26 @@
 
 **Requirements**: Python 3.10 or higher
 
-To install the package in editable mode:
+Install the released package from PyPI:
+
 ```bash
-pip install -e .
+python -m pip install pytc-qc
+```
+
+The PyPI distribution is named `pytc-qc`; the Python import package remains
+`pytc`.
+
+To install the package from a source checkout in editable mode:
+
+```bash
+python -m pip install -e .
 ```
 
 For GPU support (CUDA 12):
+
 ```bash
-pip install -e .
-pip install -U "jax[cuda12]"
+python -m pip install pytc-qc
+python -m pip install -U "jax[cuda12]"
 ```
 
 ## Quick Start
