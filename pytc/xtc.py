@@ -2398,15 +2398,27 @@ class ISDFXTC(XTC, ISDFTC):
             r_len = (slice_r.stop or nmo) - (slice_r.start or 0)
             s_len = (slice_s.stop or nmo) - (slice_s.start or 0)
             N_rank = kernels['D'].shape[0]
+            # Mirror _get_delta_u_direct_tile: D is already excluded from
+            # free_bytes when it's resident in the device cache, so only
+            # add it to the estimate when it's NOT resident — otherwise the
+            # double-count can over-shrink panel_size or falsely trigger the
+            # genuine-OOM guard on later tiles.
+            _cache_getter = getattr(self, "_get_isdf_device_cache", None)
+            _cache = (
+                _cache_getter(kernels, device=device,
+                              include_grad=False, include_delta_u=True)
+                if callable(_cache_getter) else None
+            )
+            _D_resident = _cache.get("D") if _cache is not None else None
             free_bytes = _get_device_free_bytes(device)
             threshold_bytes = int(free_bytes * 0.7)
 
-            def _tile_bytes(ps):
+            def _tile_bytes(ps, _incl_d=(_D_resident is None)):
                 Np = ps if "p" in panel_layout else p_len
                 Nq = ps if "q" in panel_layout else q_len
                 Nr = ps if "r" in panel_layout else r_len
                 Ns = ps if "s" in panel_layout else s_len
-                return _isdf_tile_peak_bytes(Np, Nq, Nr, Ns, N_rank, include_d=True)
+                return _isdf_tile_peak_bytes(Np, Nq, Nr, Ns, N_rank, include_d=_incl_d)
 
             safe_ps = _find_max_blksize(_tile_bytes, lo=1, hi=panel_size,
                                         gpu_target=threshold_bytes)

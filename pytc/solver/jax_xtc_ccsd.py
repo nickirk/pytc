@@ -1038,6 +1038,15 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
+    # Mirror xtc_ccsd.py: forward the concurrent tc_tile + sum buffer overhead
+    # so the JAX solver's initial estimate is as conservative as the NumPy path.
+    # Without this, the JAX vvvv_gpu path under-budgets and relies on the
+    # dispatch-time shrink to correct — causing avoidable JAX shape recompiles.
+    _extra_tile_fn = None
+    if _n_fused is not None:
+        _isdf_nvir = nvir
+        def _extra_tile_fn(blk, _V=_isdf_nvir):
+            return 2 * blk * _V * blk * _V * 8
 
     p_blksize, r_blksize = resolve_vvvv_panel_block_sizes(
         nocc, nvir,
@@ -1048,6 +1057,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
         n_fused=_n_fused,
         include_eris=True,
         include_accumulators=False,
+        extra_tile_bytes_fn=_extra_tile_fn,
     )
     panel_size = p_blksize
     logger.debug(

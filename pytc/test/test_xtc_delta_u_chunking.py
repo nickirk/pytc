@@ -86,9 +86,9 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
         rng = np.random.default_rng(7)
         D = rng.normal(size=(n_rank, n_rank)).astype(np.float64)
         X_arr = rng.normal(size=(nmo, nmo, n_rank)).astype(np.float64)
-        import tempfile, h5py, os
-        tmpdir = tempfile.mkdtemp()
-        path = os.path.join(tmpdir, "x.h5")
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        path = os.path.join(tmpdir.name, "x.h5")
         fh = h5py.File(path, "w")
         X = fh.create_dataset("X", data=X_arr)
         return {"D": D, "X": X}, fh
@@ -145,6 +145,56 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
                 )
         self.assertIn("layout=", str(ctx.exception))
         self.assertIn("min_padded=", str(ctx.exception))
+        fh.close()
+
+    def test_resident_d_not_double_counted_in_shrink_guard(self):
+        # When D is already resident in the device cache, _get_device_free_bytes
+        # has already excluded D's bytes from the free total.  The pre-dispatch
+        # shrink guard must use include_d=False — otherwise it double-counts D
+        # and can over-shrink panel_size or falsely trip the genuine-OOM guard.
+        #
+        # We wire a fake _get_isdf_device_cache that reports D as resident, then
+        # record the include_d argument that _isdf_tile_peak_bytes receives from
+        # the guard's _tile_bytes closure.  All calls must use include_d=False.
+        nmo, n_rank = 8, 3
+        panel_size = 4
+        fake = self._make_fake_isdfxtc(nmo, n_rank)
+        kernels, fh = self._make_kernels(nmo, n_rank)
+        ranges = (slice(0, 4), slice(0, 8), slice(0, 4), slice(0, 8))
+
+        D_sentinel = object()  # truthy sentinel — D is "resident"
+
+        def fake_cache_getter(kernels, device=None,
+                              include_grad=False, include_delta_u=False):
+            # Must include phi_isdf so _get_delta_u_direct_tile can slice it.
+            return {"D": D_sentinel, "phi_isdf": fake.phi_isdf}
+
+        fake._get_isdf_device_cache = fake_cache_getter
+
+        recorded_include_d = []
+        original_tile_peak = xtc_mod._isdf_tile_peak_bytes
+
+        def recording_tile_peak(Np, Nq, Nr, Ns, N_rank, include_d=True):
+            recorded_include_d.append(include_d)
+            return original_tile_peak(Np, Nq, Nr, Ns, N_rank, include_d=include_d)
+
+        large_free = 10 * 1024 ** 3
+        with mock.patch("pytc.xtc._isdf_tile_peak_bytes",
+                        side_effect=recording_tile_peak):
+            with mock.patch("pytc.xtc._get_device_free_bytes",
+                            return_value=large_free):
+                with mock.patch("pytc.utils.gpu_memory._get_gpu_free_bytes",
+                                return_value=large_free):
+                    fake._assemble_delta_u_tile(
+                        kernels, ranges, device=None,
+                        panel_size=panel_size, panel_layout="pr"
+                    )
+
+        self.assertTrue(recorded_include_d, "Expected _isdf_tile_peak_bytes to be called")
+        self.assertTrue(
+            all(not incl_d for incl_d in recorded_include_d),
+            f"include_d=True seen — D was double-counted: {recorded_include_d}",
+        )
         fh.close()
 
 
