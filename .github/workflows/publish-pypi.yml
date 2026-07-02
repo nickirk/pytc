@@ -25,4 +25,7 @@ jobs:
           python -m build
 
       # Publishes dist/ via OIDC Trusted Publishing — no API token needed.
-      - uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d  # v1.14.0
+      # NB: this is a Docker action; its images are tagged by version, not by git
+      # commit SHA, so git-SHA pinning breaks image resolution. pypa maintains
+      # `release/v1` as the security-reviewed stable ref — use it, not a commit SHA.
+      - uses: pypa/gh-action-pypi-publish@release/v1
