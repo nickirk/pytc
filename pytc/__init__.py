@@ -1,7 +1,13 @@
 import logging
 import os
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+try:
+    __version__ = version("pytc-qc")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 # Create logs directory if it doesn't exist
 log_dir = Path(__file__).parent.parent / 'logs'

@@ -1,19 +1,22 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pytc"
+name = "pytc-qc"
 version = "0.1.0"
 description = "Python TransCorrelation package"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     {name = "Ke Liao", email = "ke.liao.whu@gmail.com"}
 ]
 keywords = [
-    "quantum-chemistry", 
-    "transcorrelation", 
-    "jastrow-factors", 
-    "monte-carlo", 
+    "quantum-chemistry",
+    "transcorrelation",
+    "jastrow-factors",
+    "monte-carlo",
     "computational-chemistry"
 ]
 requires-python = ">=3.10"
@@ -23,7 +26,7 @@ dependencies = [
     "jax",
     "optax",
     "flax",
-    "folx @ git+https://github.com/microsoft/folx.git@67e7e8a",
+    "folx>=0.2.22",
 
     "pyscf",
 ]
@@ -32,7 +35,11 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Physics",
     "Topic :: Scientific/Engineering :: Chemistry",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
 ]
 
 [project.optional-dependencies]
@@ -51,7 +58,7 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nickirk/pytc"
+Homepage = "https://pypi.org/project/pytc-qc/"
 
 [tool.setuptools.packages.find]
 where = ["."]

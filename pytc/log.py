@@ -8,6 +8,7 @@ This module provides centralized logging functionality including:
 
 import logging
 import subprocess
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -49,8 +50,8 @@ def get_pytc_version() -> str:
     """
     try:
         from importlib.metadata import version
-        return version('pytc')
-    except Exception:
+        return version('pytc-qc')
+    except PackageNotFoundError:
         pass
 
     # Fallback: try to read from pyproject.toml
