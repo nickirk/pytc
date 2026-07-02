@@ -49,10 +49,11 @@ opt_results = optimize_ref_var(
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from pyscf import gto, scf, cc
+from pyscf import gto, scf
 
 from pytc import xtc
 from pytc.jastrow import rexp
+from pytc.solver import jax_xtc_ccsd
 
 # Set up molecule
 mol = gto.M(atom='O 0 0 0; H 0 1 0; H 0 0 1', basis='ccpvdz')
@@ -73,8 +74,8 @@ my_isdf_xtc = xtc.ISDFXTC.from_xtc(my_xtc, n_rank=n_rank)
 my_isdf_xtc = my_isdf_xtc.isdf(jastrow_params)
 eris_isdf = my_isdf_xtc.make_eris(mf, jastrow_params)
 
-# Run xTC-CCSD with PySCF
-mycc = cc.rccsd.RCCSD(mf)
+# Run xTC-CCSD with pytc's own JAX-native solver
+mycc = jax_xtc_ccsd.RCCSD(mf, my_isdf_xtc, jastrow_params)
 e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 ```
 
