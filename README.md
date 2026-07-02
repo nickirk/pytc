@@ -13,7 +13,7 @@
 - **Deterministic Jastrow optimization** via second-quantized optimization algorithm
 - **GPU acceleration** via JAX for both VMC sampling and integral calculations using multiple GPUs
 - **Transcorrelated integrals**: K1, K2, K3 two-body and xTC approximated three-body integrals
-- **Interpolative Separable Density Fitting (ISDF)** for efficient integral calculations—up to 800+ orbitals with controlled accuracy
+- **Interpolative Separable Density Fitting (ISDF)** for efficient integral calculations — empirical T ∝ n_orb^1.76 scaling, demonstrated past 1200 orbitals on a single B200 GPU
 - **Seamless PySCF integration**: Works directly with PySCF mean-field objects and CCSD solvers
 
 ## Dependencies
