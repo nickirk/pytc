@@ -2,10 +2,11 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
-from pyscf import gto, scf, cc, lib
+from pyscf import gto, scf, lib
 
 from pytc import xtc
 from pytc.jastrow import rexp
+from pytc.solver import jax_xtc_ccsd
 
 # Set number of threads for PySCF/NumPy
 lib.num_threads(1)
@@ -32,7 +33,7 @@ print("Making exact XTC eris...")
 eris_exact = my_xtc.make_eris(mf, jastrow_params)
 
 print("Running exact XTC CCSD...")
-mycc_exact = cc.rccsd.RCCSD(mf)
+mycc_exact = jax_xtc_ccsd.RCCSD(mf, my_xtc, jastrow_params)
 tc_e_corr_exact, t1_exact, t2_exact = mycc_exact.kernel(eris=eris_exact)
 
 # Calculating HF energy with xtc integrals manually
@@ -72,7 +73,7 @@ for factor in factors:
     mae_oovv = np.max(np.abs(eris_isdf.oovv - eris_exact.oovv))
 
     print("Running ISDF XTC CCSD...")
-    mycc_isdf = cc.rccsd.RCCSD(mf)
+    mycc_isdf = jax_xtc_ccsd.RCCSD(mf, my_isdf_xtc, jastrow_params)
     tc_e_corr_isdf, t1_isdf, t2_isdf = mycc_isdf.kernel(eris=eris_isdf)
 
     # Calculate HF energy for ISDF XTC
