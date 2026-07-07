@@ -43,6 +43,48 @@ opt_results = optimize_ref_var(
 )
 ```
 
+## Design Note: Functional, Immutable Data Structures
+
+pytc's core objects — Jastrow factors, Slater determinants, ansätze, walkers,
+and xTC/ISDF state — are immutable JAX pytrees (`flax.struct.dataclass`), not
+stateful classes you construct and then mutate. Two conventions follow
+directly from that choice:
+
+- **Construction goes through a factory — a `.create()`/`.from_*()`
+  classmethod, or a dedicated module-level function (e.g. `initialize_walkers(...)`
+  for `Walker` state) — not ad hoc field-by-field assignment.** A factory
+  builds a fully-initialized, ready-to-use instance in one step, so there is
+  never an intermediate state where some attributes are set and others are
+  not.
+- **Updates return a new instance via `.replace(...)`; nothing is mutated in
+  place.** Every field is set once, at creation. To change a field, call
+  `.replace(field=new_value)`, which returns a new object with only that
+  field changed — the original is left untouched.
+
+This is deliberate, not incidental. JAX transformations (`jit`, `grad`,
+`vmap`, multi-device sharding) trace and cache functions of their inputs'
+*pytree structure*. In-place mutation breaks that model outright — a mutated
+attribute is invisible to an already-traced function, and aliasing a mutable
+object across a `vmap` batch or a sharded device mesh is unsafe. Frozen,
+factory-built dataclasses avoid both problems: every pytc object can be
+passed into jitted or vmapped code, shared across walkers, or updated via
+`.replace(...)`, without ever invalidating a trace.
+
+Revisiting the snippet above:
+
+```python
+det = SlaterDet.create(mol, mf.mo_coeff)
+jncusp = NuclearCusp.create(mol, name="ncusp")
+jbh = BoysHandy.create(mol, name="bh")
+jastrow = CompositeJastrow.create([jncusp, jbh])
+```
+
+Each `.create()` call fully builds one immutable component; `CompositeJastrow.create([jncusp, jbh])`
+then combines them into a single Jastrow factor without modifying `jncusp`
+or `jbh`. There is no mutable-builder equivalent — no
+`jastrow = CompositeJastrow(); jastrow.add(jncusp)` — that pattern does not
+exist in pytc by design.
+
 ## ISDF-accelerated xTC Integrals
 
 ```python
