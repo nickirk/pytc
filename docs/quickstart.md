@@ -50,10 +50,12 @@ and xTC/ISDF state — are immutable JAX pytrees (`flax.struct.dataclass`), not
 stateful classes you construct and then mutate. Two conventions follow
 directly from that choice:
 
-- **Construction goes through a `.create()` (or `.from_*()`) classmethod, not
-  a bare constructor.** A `.create()` call builds a fully-initialized,
-  ready-to-use instance in one step, so there is never an intermediate state
-  where some attributes are set and others are not.
+- **Construction goes through a factory — a `.create()`/`.from_*()`
+  classmethod, or a dedicated module-level function (e.g. `initialize_walkers(...)`
+  for `Walker` state) — not ad hoc field-by-field assignment.** A factory
+  builds a fully-initialized, ready-to-use instance in one step, so there is
+  never an intermediate state where some attributes are set and others are
+  not.
 - **Updates return a new instance via `.replace(...)`; nothing is mutated in
   place.** Every field is set once, at creation. To change a field, call
   `.replace(field=new_value)`, which returns a new object with only that
@@ -64,7 +66,7 @@ This is deliberate, not incidental. JAX transformations (`jit`, `grad`,
 *pytree structure*. In-place mutation breaks that model outright — a mutated
 attribute is invisible to an already-traced function, and aliasing a mutable
 object across a `vmap` batch or a sharded device mesh is unsafe. Frozen,
-`.create()`-built dataclasses avoid both problems: every pytc object can be
+factory-built dataclasses avoid both problems: every pytc object can be
 passed into jitted or vmapped code, shared across walkers, or updated via
 `.replace(...)`, without ever invalidating a trace.
 
