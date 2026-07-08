@@ -18,7 +18,6 @@ PyTC was initiated in Prof. Ali Alavi's group at the Max Planck Institute for So
 - **Modular Jastrow factors**: Boys-Handy, Nuclear Cusp, Neural Network (EE/EN/EEN), REXP, Polynomial, and Composite
 - **JAX-based automatic differentiation** for Jastrow gradients and Laplacians via [folx](https://github.com/microsoft/folx)
 - **VMC-based Jastrow optimization** with second-order Newton and first-order machine learning optimizers, e.g. Adam
-- **Deterministic Jastrow optimization** via second-quantized optimization algorithm
 - **GPU acceleration** via JAX for both VMC sampling and integral calculations using multiple GPUs
 - **Transcorrelated integrals**: K1, K2, K3 two-body and xTC approximated three-body integrals
 - **Interpolative Separable Density Fitting (ISDF)** for efficient integral calculations — empirical T ∝ n_orb^1.76 scaling, demonstrated past 1200 orbitals on a single B200 GPU
