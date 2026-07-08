@@ -1,7 +1,7 @@
 # PyTC
 
 <p align="center">
-  <img src="docs/_static/pytc-logo.svg" alt="PyTC logo" width="180">
+  <img src="https://raw.githubusercontent.com/nickirk/pytc/main/docs/_static/pytc-logo.svg" alt="PyTC logo" width="280">
 </p>
 
 ![CI](https://github.com/nickirk/pytc/actions/workflows/ci.yml/badge.svg)
