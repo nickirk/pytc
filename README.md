@@ -5,6 +5,10 @@
 
 **Py**thon **T**rans**C**orrelation package
 
+## Development provenance
+
+PyTC was initiated in Prof. Ali Alavi's group at the Max Planck Institute for Solid State Research, where the early-stage development of the transcorrelated-method infrastructure took place. Its current development is based in Prof. Tianyu Zhu's group at Yale University.
+
 ## Features
 
 - **Modular Jastrow factors**: Boys-Handy, Nuclear Cusp, Neural Network (EE/EN/EEN), REXP, Polynomial, and Composite
