@@ -129,4 +129,3 @@ See the `pytc/examples/` directory for more complete examples:
 - `co2_simple_jastrow_xtc_ccsd.py` — xTC-CCSD on CO₂ with a simple Jastrow factor
 - `h2o_jastrow_xtc_isdf_ccsd.py` — ISDF convergence study
 - `h2o_jax_isdf_xtc.py` — JAX-based ISDF example
-- `benchmark_isdf_xtc_kdx.py` — stage-wise wall-clock benchmark for ISDF and K-kernel builds
