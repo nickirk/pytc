@@ -38,11 +38,8 @@ N_KEEP_LIST = [10, 20, 30, 40]
 
 
 def run_one(mf, jastrow, n_keep):
-    if n_keep is None:
-        mf_run = mf
-    else:
-        fno = make_fno_mo_coeff(mf, n_keep=n_keep)
-        mf_run = fno.mf
+    fno = make_fno_mo_coeff(mf, n_keep=n_keep)
+    mf_run = fno.mf
 
     xtc_obj = xtc.XTC.from_pyscf(mf_run, jastrow, grid_lvl=2)
     n_rank = xtc_obj.n_orb * 15  # production ISDF-rank setting
@@ -71,7 +68,7 @@ def main():
 
     results = []
     for n_keep in N_KEEP_LIST:
-        label = "full" if n_keep is None else f"nkeep={n_keep}"
+        label = f"nkeep={n_keep}"
         e_tot, n_orb = run_one(mf, jastrow, n_keep)
         results.append((label, n_orb, e_tot))
         print(f"{label:>10s}  n_orb={n_orb:3d}  E_tot={e_tot:.6f}")

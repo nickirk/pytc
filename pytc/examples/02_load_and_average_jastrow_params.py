@@ -4,14 +4,17 @@ The manuscript's production runs use Polyak-Ruppert averaging: rather than
 taking the very last optimization step's (noisy) parameters, average the
 last N steps of the phase-B trajectory to cancel out stochastic VMC noise.
 This mirrors `load_averaged_jastrow_params()` in
-`isdf-data/hchain/scripts/isdf_xtc_fno.py` (production uses the last 500 of
+`tc-isdf-data/hchain/scripts/isdf_xtc_fno.py` (production uses the last 500 of
 2000 phase-B steps; here we average the last few of our much shorter run).
 
 Requires `h2o_phase_b_hist.h5` from 01_vmc_optimize_jastrow.py to exist in
 the working directory.
 
-The printed averaged parameters are what 03/04/05 hardcode directly (rather
-than re-loading this HDF5 file at runtime, so those examples run standalone).
+This averaging step completes the VMC-optimization half of the walkthrough and
+is exactly what the production FNO scripts do before consuming a Jastrow (see
+``tc-isdf-data``). The downstream examples 03-05 use a simpler fixed REXP
+correlator (laptop-CPU-tractable; see the README's CPU-vs-GPU note), so they do
+not re-use these BoysHandy parameters directly.
 
 Run: python 02_load_and_average_jastrow_params.py
 """
@@ -47,8 +50,10 @@ def main():
     print(f"  {jastrow_params!r}")
     print(f"\nLinear coefficients: {linear_coeffs!r}")
     print(
-        "\nCopy the dict above into 03_dense_xtc_ccsd.py / "
-        "04_isdf_xtc_ccsd.py / 05_make_fno_xtc_ccsd.py's JASTROW_PARAMS."
+        "\nThese averaged parameters are the production-style Jastrow (what the "
+        "tc-isdf-data FNO scripts consume). Examples 03-05 use a fixed REXP "
+        "correlator instead, so they don't need this dict -- it's shown here to "
+        "demonstrate the averaging step end-to-end."
     )
 
 

@@ -123,9 +123,12 @@ e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 
 ## Examples
 
-See the `pytc/examples/` directory for more complete examples:
+See the `pytc/examples/` directory for a numbered walkthrough of the full
+methodology on H₂O (Jastrow VMC optimization → averaging → dense → ISDF → FNO
+xTC-CCSD):
 
-- `Be_vmc_ref_opt_xtc_ccsd.py` — VMC optimization with xTC-CCSD
-- `co2_simple_jastrow_xtc_ccsd.py` — xTC-CCSD on CO₂ with a simple Jastrow factor
-- `h2o_jastrow_xtc_isdf_ccsd.py` — ISDF convergence study
-- `h2o_jax_isdf_xtc.py` — JAX-based ISDF example
+- `01_vmc_optimize_jastrow.py` — reference-variance VMC Jastrow optimization
+- `02_load_and_average_jastrow_params.py` — Polyak–Ruppert parameter averaging
+- `03_dense_xtc_ccsd.py` — dense (non-ISDF) xTC-CCSD
+- `04_isdf_xtc_ccsd.py` — ISDF xTC-CCSD (vs. 03's dense reference)
+- `05_make_fno_xtc_ccsd.py` — FNO (MP2 natural-orbital) truncation scan

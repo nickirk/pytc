@@ -14,10 +14,11 @@ self-check.
 | `04_isdf_xtc_ccsd.py` | ISDF-approximated xTC-CCSD, vs. 03's dense reference | Interpolative Separable Density Fitting (ISDF) |
 | `05_make_fno_xtc_ccsd.py` | FNO (MP2 natural orbital) virtual-space truncation scan, via ISDF | Frozen/truncated natural orbitals (FNO) |
 
-A sixth example (a deterministic, non-stochastic alternative to `01` via
-`pytc.optimize.optimize_jastrow`) is deferred: that function is currently
-broken on `main` for reasons unrelated to this examples pass -- see the
-tracked bug for details. It'll be added once that's fixed.
+A sixth example -- a deterministic, non-stochastic alternative to `01` -- is
+deferred. It relied on a Jastrow optimizer that was found to be broken on
+`main` (a downstream host-array materialization severs its JAX gradient path)
+and has been removed from `main` pending a fix; see the tracked bug (task #49).
+The example will be added once the optimizer is reintroduced.
 
 ## Two honestly-separate threads
 
@@ -82,7 +83,7 @@ These examples mirror the same pipeline used for the manuscript's actual
 results, at H2O/small-basis scale instead of H-chain/cc-pV5Z or
 benzene/cc-pCV5Z scale:
 
-| Example | Production analogue (isdf-data repo) |
+| Example | Production analogue (tc-isdf-data repo) |
 |---|---|
 | `01` | `hchain/scripts/run_opt.py` |
 | `02`'s averaging | `load_averaged_jastrow_params()` in `hchain/scripts/isdf_xtc_fno.py` |
