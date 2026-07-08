@@ -1,5 +1,5 @@
 <p align="left">
-  <img src="https://raw.githubusercontent.com/nickirk/pytc/main/docs/_static/pytc-logo.svg" alt="PyTC logo" width="280">
+  <img src="docs/_static/pytc-logo.svg" alt="PyTC logo" width="280">
 </p>
 
 # PyTC
