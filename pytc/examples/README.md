@@ -35,17 +35,10 @@ impractically slow off-cluster:
 
 ## Why 03-05 don't reuse 01/02's optimized Jastrow
 
-Empirically, BoysHandy's dense (real-space quadrature) two-body construction
-is impractically slow off-cluster: H2O/cc-pVDZ (21,952 grid points) never
-finished after 35+ minutes, and even a single He atom (4,488 grid points,
-just to rule out a per-nucleus-count effect) took >19x longer than REXP on
-the identical grid before being killed. This is BoysHandy's per-grid-point
-polynomial cost (~34 coefficients per nucleus, evaluated at every point
-pair), not a grid-size effect -- ISDF avoids exactly this pairwise
-quadrature, but even ISDF's own point-evaluation step inherits enough of
-BoysHandy's per-point cost to make it impractically slow too (>8 minutes,
-killed). REXP's single-parameter form is what's actually fast enough for a
-laptop "run it now" example:
+BoysHandy's dense (real-space quadrature) two-body construction is
+impractically slow on a laptop CPU -- the production runs that use it were
+all on GPUs -- so `03`-`05` use the fast single-parameter `REXP` correlator
+instead. Measured wall times:
 
 | System | Jastrow | Path | Grid points | Wall time |
 |---|---|---|---|---|
@@ -55,19 +48,6 @@ laptop "run it now" example:
 | He/cc-pVDZ | BoysHandy+NuclearCusp | dense | 4,488 | killed after 4m44s (>19x REXP) |
 | H2/cc-pVDZ | BoysHandy+NuclearCusp | dense, grid_lvl=2 | -- | killed after ~20 min |
 | H2/cc-pVDZ | BoysHandy+NuclearCusp | dense, grid_lvl=1 | -- | killed after ~9.5 min |
-
-Neither a smaller molecule (He, 1 nucleus; H2, 2 nuclei) nor a coarser grid
-(`grid_lvl=1`) rescues BoysHandy's dense-mode cost -- it isn't a
-nucleus-count or grid-density effect. The production dense/ISDF runs that
-actually use BoysHandy+NuclearCusp all ran on GPUs; this CPU-only laptop
-quickstart implicitly can't match that, so **REXP is the correlator that
-demonstrates the dense -> ISDF -> FNO pipeline within a laptop CPU's
-budget**, while BoysHandy+NuclearCusp (01/02) is the flexible correlator
-you'd actually optimize and then run on a GPU in production. REXP also has
-no electron-nucleus cusp and empirically diverges to NaN under VMC sampling
-(a walker landing near a nucleus blows up the local energy) -- the separate
-reason `01`'s VMC route needs BoysHandy+NuclearCusp rather than REXP in the
-first place.
 
 ## Ordering
 
