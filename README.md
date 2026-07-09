@@ -18,7 +18,6 @@ PyTC was initiated in Prof. Ali Alavi's group at the Max Planck Institute for So
 - **Modular Jastrow factors**: Boys-Handy, Nuclear Cusp, Neural Network (EE/EN/EEN), REXP, Polynomial, and Composite
 - **JAX-based automatic differentiation** for Jastrow gradients and Laplacians via [folx](https://github.com/microsoft/folx)
 - **VMC-based Jastrow optimization** with second-order Newton and first-order machine learning optimizers, e.g. Adam
-- **Deterministic Jastrow optimization** via second-quantized optimization algorithm
 - **GPU acceleration** via JAX for both VMC sampling and integral calculations using multiple GPUs
 - **Transcorrelated integrals**: K1, K2, K3 two-body and xTC approximated three-body integrals
 - **Interpolative Separable Density Fitting (ISDF)** for efficient integral calculations — empirical T ∝ n_orb^1.76 scaling, demonstrated past 1200 orbitals on a single B200 GPU
@@ -142,11 +141,14 @@ flowchart TD
 
 ## Usage
 
-See the `pytc/examples/` directory for complete examples:
-- `Be_vmc_ref_opt_xtc_ccsd.py` — VMC optimization with xTC-CCSD
-- `co2_simple_jastrow_xtc_ccsd.py` — xTC-CCSD on CO₂ with a simple Jastrow factor
-- `h2o_jastrow_xtc_isdf_ccsd.py` — ISDF convergence study
-- `h2o_jax_isdf_xtc.py` — JAX-based ISDF example
+See the `pytc/examples/` directory for a numbered walkthrough of the full
+methodology on H₂O (Jastrow VMC optimization → averaging → dense → ISDF → FNO
+xTC-CCSD):
+- `01_vmc_optimize_jastrow.py` — reference-variance VMC Jastrow optimization
+- `02_load_and_average_jastrow_params.py` — Polyak–Ruppert parameter averaging
+- `03_dense_xtc_ccsd.py` — dense (non-ISDF) xTC-CCSD
+- `04_isdf_xtc_ccsd.py` — ISDF xTC-CCSD (vs. 03's dense reference)
+- `05_make_fno_xtc_ccsd.py` — FNO (MP2 natural-orbital) truncation scan
 
 To run the tests:
 ```bash
