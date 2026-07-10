@@ -462,5 +462,63 @@ H -0.757 -0.586  2.900
         self._check(mol)
 
 
+class TestJastrowTermsAutoResolution(unittest.TestCase):
+    """"auto" (the new default) must resolve to "contracted" at N >=
+    AUTO_CONTRACTED_MIN_ELECTRONS and "pairwise" below it, and the
+    resolved result must be bit-identical to requesting that impl
+    explicitly (auto is a dispatch choice, not a different computation).
+    """
+
+    def test_resolve_below_threshold(self):
+        from pytc.vmc.hamiltonian import (
+            _resolve_jastrow_terms_impl, AUTO_CONTRACTED_MIN_ELECTRONS,
+        )
+        self.assertEqual(
+            _resolve_jastrow_terms_impl("auto", AUTO_CONTRACTED_MIN_ELECTRONS - 1),
+            "pairwise",
+        )
+
+    def test_resolve_at_and_above_threshold(self):
+        from pytc.vmc.hamiltonian import (
+            _resolve_jastrow_terms_impl, AUTO_CONTRACTED_MIN_ELECTRONS,
+        )
+        self.assertEqual(
+            _resolve_jastrow_terms_impl("auto", AUTO_CONTRACTED_MIN_ELECTRONS),
+            "contracted",
+        )
+        self.assertEqual(
+            _resolve_jastrow_terms_impl("auto", AUTO_CONTRACTED_MIN_ELECTRONS + 10),
+            "contracted",
+        )
+
+    def test_explicit_impl_bypasses_auto(self):
+        from pytc.vmc.hamiltonian import _resolve_jastrow_terms_impl
+        self.assertEqual(_resolve_jastrow_terms_impl("pairwise", 1000), "pairwise")
+        self.assertEqual(_resolve_jastrow_terms_impl("contracted", 1), "contracted")
+
+    def test_auto_matches_explicit_below_threshold(self):
+        # (H2O)2 = 20 electrons, below AUTO_CONTRACTED_MIN_ELECTRONS=32:
+        # auto must produce the same E_L as explicit "pairwise".
+        mol = gto.M(atom="O 0 0 0; H 0 -1.4 1.1; H 0 1.4 1.1",
+                     basis="sto-3g", unit="Bohr", verbose=0)
+        from pytc.jastrow.bha import BoysHandyAnalytical
+        mf = scf.RHF(mol).density_fit()
+        mf.kernel()
+        det = SlaterDet.create(mol, mf.mo_coeff)
+        bha = BoysHandyAnalytical.create(mol)
+        ncusp = NuclearCusp.create(mol, name="ncusp")
+        jastrow = CompositeJastrow.create([ncusp, bha])
+        params = jastrow.init_params()
+        ansatz = SlaterJastrow.create(mol, jastrow, [det])
+        key = random.PRNGKey(13)
+        walkers = initialize_walkers(ansatz, 3, key=key)
+        for w in range(3):
+            walker_w = jax.tree_util.tree_map(lambda x: x[w], walkers)
+            e_auto = compute_single_walker_energy(ansatz, walker_w, params)
+            e_pairwise = compute_single_walker_energy(
+                ansatz, walker_w, params, jastrow_terms_impl="pairwise")
+            np.testing.assert_allclose(float(e_auto), float(e_pairwise), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()
