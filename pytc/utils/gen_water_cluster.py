@@ -101,6 +101,15 @@ def _min_intermonomer_distance(atoms):
     return dmin
 
 
+def build_water_cluster(n_monomers):
+    """Return a PySCF-compatible atom spec string (same convention as the
+    H-chain `h_chain()` helper: "El x y z; El x y z; ...", coordinates in
+    Angstrom) for use as `gto.M(atom=build_water_cluster(n), unit="Angstrom")`.
+    """
+    atoms = generate_water_cluster(n_monomers)
+    return "; ".join(f"{el} {x:.6f} {y:.6f} {z:.6f}" for el, x, y, z, _idx in atoms)
+
+
 def write_xyz(atoms, output_file, n_monomers):
     with open(output_file, "w") as f:
         f.write(f"{len(atoms)}\n")
