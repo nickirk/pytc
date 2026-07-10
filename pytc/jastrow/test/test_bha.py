@@ -286,5 +286,42 @@ class TestBoysHandyAnalyticalMultiTypeLiH(unittest.TestCase):
             err_msg="BHA lap != FD lap on LiH")
 
 
+class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
+    """Tests for get_pair_grid_grad_lap (task #5 PR-B, whole-electron-set
+    contraction) against the reference per-pair vmap grid it replaces.
+    """
+
+    def _reference_pair_grid(self, bha, elec_coords, params):
+        def compute_pair(r_i, r_j):
+            return bha.get_log_grads_r1(r_i, r_j, params)
+        inner = jax.vmap(compute_pair, in_axes=(None, 0))
+        outer = jax.vmap(inner, in_axes=(0, None))
+        return outer(elec_coords, elec_coords)
+
+    def _check(self, mol, n_elec, key_seed):
+        bh = BoysHandy.create(mol, analytical_gradients=False)
+        bha = BoysHandyAnalytical.create(mol)
+        params = bh.init_params()
+        key = random.PRNGKey(key_seed)
+        elec_coords = random.normal(key, (n_elec, 3)) * 1.5
+
+        g_ref, l_ref = self._reference_pair_grid(bha, elec_coords, params)
+        g_new, l_new = bha.get_pair_grid_grad_lap(elec_coords, params)
+
+        np.testing.assert_allclose(np.array(g_new), np.array(g_ref), rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(np.array(l_new), np.array(l_ref), rtol=1e-10, atol=1e-10)
+
+    def test_pair_grid_matches_reference_lih(self):
+        self._check(get_lih_molecule(), n_elec=4, key_seed=5)
+
+    def test_pair_grid_matches_reference_h2o(self):
+        self._check(get_h2o_molecule(), n_elec=10, key_seed=6)
+
+    def test_pair_grid_matches_reference_single_type(self):
+        # Sanity: single-type systems (natom=1 type) must also work --
+        # the scan degenerates to iterating over a single atom's type.
+        self._check(get_h2_molecule(), n_elec=2, key_seed=7)
+
+
 if __name__ == "__main__":
     unittest.main()
