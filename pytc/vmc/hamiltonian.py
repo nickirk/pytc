@@ -4,80 +4,20 @@ import jax
 import jax.numpy as jnp
 
 
-def _pair_grid_vmap(jastrow, elec_coords, params):
-    """Reference per-pair vmap grid: O(N^2) calls, each recomputing any
-    per-electron quantities from scratch (see compute_jastrow_terms)."""
-    def compute_pair_grads(r_i, r_j):
-        return jastrow.get_log_grads_r1(r_i, r_j, params)
-
-    inner_vmap = jax.vmap(compute_pair_grads, in_axes=(None, 0))
-    outer_vmap = jax.vmap(inner_vmap, in_axes=(0, None))
-    return outer_vmap(elec_coords, elec_coords)
-
-
-def _pair_grid_for_component(jastrow, elec_coords, params, jastrow_terms_impl):
-    """Return the (N,N,3)/(N,N) pair grid for one Jastrow component.
-
-    Uses the component's ``get_pair_grid_grad_lap`` (whole-electron-set,
-    precompute-once-per-electron contraction, task #5 PR-B) when the
-    component implements it and ``jastrow_terms_impl == "contracted"``;
-    otherwise falls back to the reference per-pair vmap grid.
-    """
-    has_fast_path = jastrow_terms_impl == "contracted" and hasattr(
-        jastrow, "get_pair_grid_grad_lap"
-    )
-    if has_fast_path:
-        return jastrow.get_pair_grid_grad_lap(elec_coords, params)
-    return _pair_grid_vmap(jastrow, elec_coords, params)
-
-
-# Empirical crossover between the two impls, measured on real A100 hardware
-# across H-chains and water clusters (task #5 PR-B, #pro-pytc-efficiency-
-# refactor): contracted wins on both speed and Jacobian-phase memory from
-# N=40 up (at N=80 it's the difference between OOM and comfortably fitting),
-# while pairwise wins at N=20 (fixed scan/remat overhead not yet amortized).
-# 32 is the empirical midpoint of that measured N=20..N=40 crossover, not a
-# theoretically derived value -- revisit if new hardware/systems shift it.
-AUTO_CONTRACTED_MIN_ELECTRONS = 32
-
-
-_VALID_JASTROW_TERMS_IMPLS = ("auto", "pairwise", "contracted")
-
-
-def _resolve_jastrow_terms_impl(jastrow_terms_impl, n_electrons):
-    if jastrow_terms_impl not in _VALID_JASTROW_TERMS_IMPLS:
-        raise ValueError(
-            f"jastrow_terms_impl={jastrow_terms_impl!r} is not one of "
-            f"{_VALID_JASTROW_TERMS_IMPLS} (typo?)."
-        )
-    if jastrow_terms_impl != "auto":
-        return jastrow_terms_impl
-    return "contracted" if n_electrons >= AUTO_CONTRACTED_MIN_ELECTRONS else "pairwise"
-
-
-def compute_jastrow_terms(sj, elec_coords, jastrow_params, jastrow_terms_impl="auto"):
+def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     """Compute ∇J/J and ∇²J/J with explicit parameters.
 
-    Args:
-        jastrow_terms_impl: "auto" (default) picks "contracted" for
-            N >= AUTO_CONTRACTED_MIN_ELECTRONS electrons and "pairwise"
-            below, per the measured A100 crossover (see
-            AUTO_CONTRACTED_MIN_ELECTRONS docstring). "pairwise" uses the
-            O(N^2*M) per-pair vmap grid for every component, recomputing
-            each electron's atom-distance table on every pair it appears
-            in. "contracted" uses each component's whole-electron-set fast
-            path (``get_pair_grid_grad_lap``) when available -- precomputes
-            per-electron tables once, O(N*M), and assembles the pair grid
-            via an atom-scan instead of a materialized O(N^2*M*T) tensor
-            (task #5 PR-B, #pro-pytc-efficiency-refactor). Components
-            without a fast path (e.g. NuclearCusp) fall back to the
-            per-pair grid regardless of this flag. "contracted" is
-            mathematically identical to "pairwise" -- verified to ~1e-16
-            relative agreement on H2O/(H2O)2/LiH; the flag only changes
-            evaluation order/cost, never the result.
+    Dispatch between the reference per-pair grid and a Jastrow-specific
+    fast path (e.g. BoysHandyAnalytical's whole-electron-set contraction,
+    task #5 PR-B) is pure polymorphism via ``jastrow.get_pair_grid_grad_lap``
+    -- no flag, no branching here. Class choice is the only dispatch:
+    construct ``BoysHandyAnalytical`` for the fast override, generic
+    ``BoysHandy`` for the base-class reference implementation (explicit
+    choice over silent substitution, per Ke's direction,
+    #proj-pytc-efficiency-refactor). Both give mathematically identical
+    results -- verified to ~1e-16 relative agreement on H2O/(H2O)2/LiH.
     """
     n_electrons = elec_coords.shape[0]
-    jastrow_terms_impl = _resolve_jastrow_terms_impl(jastrow_terms_impl, n_electrons)
 
     # Fully vectorized implementation (O(N^2) parallelism)
     # Optimized for symmetric Jastrow factors (u(r1, r2) = u(r2, r1))
@@ -85,9 +25,8 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params, jastrow_terms_impl="a
     jastrow = sj.jastrow
     components = getattr(jastrow, "jastrows", None)
     if components is not None:
-        # CompositeJastrow: sum each sub-jastrow's pair grid, using the
-        # fast path per-component where available (params is a list
-        # matching components, one entry per sub-jastrow).
+        # CompositeJastrow: sum each sub-jastrow's pair grid (params is a
+        # list matching components, one entry per sub-jastrow).
         if len(jastrow_params) != len(components):
             raise ValueError(
                 f"CompositeJastrow has {len(components)} components but "
@@ -98,15 +37,11 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params, jastrow_terms_impl="a
         g1s = None
         l1s = None
         for component, component_params in zip(components, jastrow_params):
-            g1, l1 = _pair_grid_for_component(
-                component, elec_coords, component_params, jastrow_terms_impl
-            )
+            g1, l1 = component.get_pair_grid_grad_lap(elec_coords, component_params)
             g1s = g1 if g1s is None else g1s + g1
             l1s = l1 if l1s is None else l1s + l1
     else:
-        g1s, l1s = _pair_grid_for_component(
-            jastrow, elec_coords, jastrow_params, jastrow_terms_impl
-        )
+        g1s, l1s = jastrow.get_pair_grid_grad_lap(elec_coords, jastrow_params)
 
     # 3. Mask diagonal (i == j)
     mask = 1.0 - jnp.eye(n_electrons)
@@ -178,14 +113,13 @@ def compute_potential_matrix(sj, elec_coords, slater_alpha, slater_beta):
     return B_alpha, B_beta
 
 
-def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl="auto"):
+def compute_single_walker_energy(sj, walker, jastrow_params):
     """Compute energy for a single walker.
 
     Args:
         sj: SlaterJastrow ansatz object
         walker: Walker object containing positions and Slater matrices
         jastrow_params: Jastrow parameters
-        jastrow_terms_impl: forwarded to compute_jastrow_terms -- see there.
 
     Returns:
         Local energy value
@@ -194,7 +128,7 @@ def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl=
 
     # Compute Jastrow terms internally
     grad_J_over_J, lap_J_over_J = compute_jastrow_terms(
-        sj, walker.positions, jastrow_params, jastrow_terms_impl=jastrow_terms_impl
+        sj, walker.positions, jastrow_params
     )
     
     grad_J_alpha = grad_J_over_J[:n_alpha]
@@ -229,20 +163,17 @@ def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl=
     return jnp.real(E_L)
 
 
-def eval_local_energy(sj, walker, params, jastrow_terms_impl="auto"):
+def eval_local_energy(sj, walker, params):
     """Evaluate local energy for a SlaterJastrow ansatz.
 
     Args:
         sj: SlaterJastrow ansatz object
         walker: Walker object
         params: Tuple of (jastrow_params, linear_coeffs)
-        jastrow_terms_impl: forwarded to compute_jastrow_terms -- see there.
 
     Returns:
         Tuple of (energy, walker)
     """
     jastrow_params, linear_coeffs = params
-    energy = compute_single_walker_energy(
-        sj, walker, jastrow_params, jastrow_terms_impl=jastrow_terms_impl
-    )
+    energy = compute_single_walker_energy(sj, walker, jastrow_params)
     return energy, walker

@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from jax import random
 from pyscf import gto
 
+from pytc.jastrow.jastrow import Jastrow
 from pytc.jastrow.bh import BoysHandy, BHTerm
 from pytc.jastrow.bha import BoysHandyAnalytical
 
@@ -287,15 +288,12 @@ class TestBoysHandyAnalyticalMultiTypeLiH(unittest.TestCase):
 
 class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
     """Tests for get_pair_grid_grad_lap (task #5 PR-B, whole-electron-set
-    contraction) against the reference per-pair vmap grid it replaces.
+    contraction) against the Jastrow base class's default per-pair
+    implementation it overrides -- called explicitly on the SAME
+    BoysHandyAnalytical instance via ``Jastrow.get_pair_grid_grad_lap(bha,
+    ...)`` (bypassing the override) so this is a genuine base-vs-override
+    comparison, not two different objects.
     """
-
-    def _reference_pair_grid(self, bha, elec_coords, params):
-        def compute_pair(r_i, r_j):
-            return bha.get_log_grads_r1(r_i, r_j, params)
-        inner = jax.vmap(compute_pair, in_axes=(None, 0))
-        outer = jax.vmap(inner, in_axes=(0, None))
-        return outer(elec_coords, elec_coords)
 
     def _check(self, mol, n_elec, key_seed):
         bh = BoysHandy.create(mol)
@@ -304,7 +302,7 @@ class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
         key = random.PRNGKey(key_seed)
         elec_coords = random.normal(key, (n_elec, 3)) * 1.5
 
-        g_ref, l_ref = self._reference_pair_grid(bha, elec_coords, params)
+        g_ref, l_ref = Jastrow.get_pair_grid_grad_lap(bha, elec_coords, params)
         g_new, l_new = bha.get_pair_grid_grad_lap(elec_coords, params)
 
         np.testing.assert_allclose(np.array(g_new), np.array(g_ref), rtol=1e-10, atol=1e-10)
