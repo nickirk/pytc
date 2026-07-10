@@ -19,6 +19,7 @@ Usage:
         --n-walkers 1000 --system water --out h2o4_w1000.json
 """
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -93,6 +94,42 @@ def git_commit():
         return "unknown"
 
 
+def run_scf(mol, atom, basis, unit, cache_dir):
+    """Run RHF+density-fit SCF on ``mol``, caching converged
+    mo_coeff/mo_energy/mo_occ to a PySCF chkfile keyed by (atom, basis,
+    unit) so repeated harness runs on the same system (Wave-2 reruns after
+    a batch-size/knob change, for instance) skip the SCF entirely instead
+    of re-paying it -- H300-class systems have cost multiple hours of sunk
+    SCF time across reruns (Felix, #proj-pytc-efficiency-refactor).
+
+    Returns (mf, scf_time_s, was_cached). Pass cache_dir=None/"" to disable.
+    """
+    mf = scf.RHF(mol).density_fit()
+
+    if not cache_dir:
+        t0 = time.time()
+        mf.kernel()
+        return mf, time.time() - t0, False
+
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_key = hashlib.sha256(f"{atom}|{basis}|{unit}".encode()).hexdigest()[:16]
+    cache_path = os.path.join(cache_dir, f"{cache_key}.h5")
+
+    t0 = time.time()
+    if os.path.exists(cache_path):
+        loaded = scf.chkfile.load(cache_path, "scf")
+        mf.mo_coeff = loaded["mo_coeff"]
+        mf.mo_energy = loaded["mo_energy"]
+        mf.mo_occ = loaded["mo_occ"]
+        mf.e_tot = loaded["e_tot"]
+        mf.converged = True
+        return mf, time.time() - t0, True
+
+    mf.chkfile = cache_path
+    mf.kernel()
+    return mf, time.time() - t0, False
+
+
 def build_system(args):
     if args.system == "h-chain":
         atom = h_chain(args.n_atoms)
@@ -137,6 +174,15 @@ def main():
                          "the unbatched failure. Same knob optimize_ref_var "
                          "itself exposes; not wired into this harness until "
                          "now.")
+    p.add_argument("--scf-cache-dir",
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"),
+                    help="Directory for cached SCF results (PySCF chkfiles), keyed "
+                         "by (atom, basis, unit). Repeated runs on the same system "
+                         "(e.g. rerunning a Wave after a batch-size change) load the "
+                         "converged mo_coeff/mo_energy/mo_occ instead of re-running "
+                         "SCF from scratch -- large basis systems have cost multiple "
+                         "hours of sunk SCF time across reruns. Pass an empty string "
+                         "to disable caching.")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -151,11 +197,10 @@ def main():
         "vmap_batch_size": args.vmap_batch_size,
     }
 
-    t0 = time.time()
     mol = gto.M(atom=atom, basis=args.basis, unit=unit, verbose=0)
-    mf = scf.RHF(mol).density_fit()
-    mf.kernel()
-    result["scf_time_s"] = time.time() - t0
+    mf, scf_time_s, scf_cached = run_scf(mol, atom, args.basis, unit, args.scf_cache_dir)
+    result["scf_time_s"] = scf_time_s
+    result["scf_cached"] = scf_cached
     result["n_orb"] = int(mol.nao)
     result["n_elec"] = int(mol.nelectron)
 
