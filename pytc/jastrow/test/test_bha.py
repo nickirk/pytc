@@ -219,7 +219,7 @@ class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
         return outer(elec_coords, elec_coords)
 
     def _check(self, mol, n_elec, key_seed):
-        bh = BoysHandy.create(mol, analytical_gradients=False)
+        bh = BoysHandy.create(mol)
         bha = BoysHandyAnalytical.create(mol)
         params = bh.init_params()
         key = random.PRNGKey(key_seed)
