@@ -34,7 +34,7 @@ from pyscf import gto, scf
 
 from pytc.vmc.sampling import burn_in
 from pytc.vmc.metropolis import make_mcmc_step
-from pytc.vmc.hamiltonian import eval_local_energy
+from pytc.vmc.hamiltonian import eval_local_energy, _resolve_jastrow_terms_impl
 from pytc.vmc.walker import initialize_walkers
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
@@ -91,11 +91,17 @@ def main():
                          "(optimizer.py:187-297, NewtonOptimizer's max_vmap_batch_size "
                          "branch) instead of a full-batch vmap. Needed for W/N combos "
                          "that OOM unbatched (task #4).")
-    p.add_argument("--jastrow-impl", choices=["pairwise", "contracted"], default="pairwise",
+    p.add_argument("--jastrow-impl", choices=["auto", "pairwise", "contracted"], default="auto",
                     help="jastrow_terms_impl forwarded to eval_local_energy (task #5 "
-                         "PR-B). 'contracted' uses BoysHandyAnalytical's whole-electron-"
-                         "set get_pair_grid_grad_lap fast path; NuclearCusp still falls "
-                         "back to the per-pair grid regardless (no fast path for it yet).")
+                         "PR-B). 'auto' (default, matches the library default) resolves "
+                         "to 'contracted' for N>=AUTO_CONTRACTED_MIN_ELECTRONS and "
+                         "'pairwise' below, via the library's own "
+                         "_resolve_jastrow_terms_impl -- exercises the actual dispatch "
+                         "mechanism production uses, not just an equivalent answer by "
+                         "coincidence. 'contracted' uses BoysHandyAnalytical's whole-"
+                         "electron-set get_pair_grid_grad_lap fast path; NuclearCusp "
+                         "still falls back to the per-pair grid regardless (no fast "
+                         "path for it yet).")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -117,6 +123,9 @@ def main():
     result["scf_time_s"] = time.time() - t0
     result["n_orb"] = int(mol.nao)
     result["n_elec"] = int(mol.nelectron)
+    result["jastrow_impl_resolved"] = _resolve_jastrow_terms_impl(
+        args.jastrow_impl, mol.nelectron
+    )
 
     det = SlaterDet.create(mol, mf.mo_coeff)
     bh = BoysHandy.create(mol)
