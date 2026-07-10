@@ -27,6 +27,7 @@ import time
 
 import jax
 jax.config.update("jax_enable_x64", True)
+import jax.flatten_util
 import jax.numpy as jnp
 from jax import random
 from pyscf import gto, scf
@@ -85,6 +86,11 @@ def main():
     p.add_argument("--n-newton-steps", type=int, default=10)
     p.add_argument("--step-size", type=float, default=0.02)
     p.add_argument("--damping", type=float, default=1e-6)
+    p.add_argument("--jac-batch-size", type=int, default=0,
+                    help="If >0, use the batched scan-accumulator Jacobian path "
+                         "(optimizer.py:187-297, NewtonOptimizer's max_vmap_batch_size "
+                         "branch) instead of a full-batch vmap. Needed for W/N combos "
+                         "that OOM unbatched (task #4).")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -161,49 +167,154 @@ def main():
     result["acceptance_rate"] = sum(accs) / len(accs)
 
     # --- E_L + Jacobian build (Gauss-Newton path, matches optimizer.py) ---
-    # Use the same vmap pattern as NewtonOptimizer's gauss_newton path, jitted
-    # as a whole -- production runs this inside the jitted training_step
-    # (optimization.py:776); an eager vmap would overstate this phase's cost
-    # with per-op dispatch overhead, which is precisely the number R1 hinges on.
-    el_grad_jit = jax.jit(jax.vmap(
-        lambda w, p: jax.value_and_grad(lambda pp: eval_local_energy(sj_ansatz, w, pp)[0])(p),
-        in_axes=(0, None),
-    ))
+    def single_local_energy_and_grad(w, p):
+        return jax.value_and_grad(lambda pp: eval_local_energy(sj_ansatz, w, pp)[0])(p)
 
-    t0 = time.time()
-    (energies, grads) = el_grad_jit(walkers, params)
-    energies, grads = block(energies), block(grads)
-    result["jacobian_build_compile_time_s"] = time.time() - t0
+    result["jac_batch_size"] = args.jac_batch_size
 
-    t0 = time.time()
-    (energies, grads) = el_grad_jit(walkers, params)
-    energies, grads = block(energies), block(grads)
-    result["jacobian_build_steady_time_s"] = time.time() - t0
+    if args.jac_batch_size > 0:
+        # Batched scan-accumulator path, matching optimizer.py:187-297
+        # (NewtonOptimizer's max_vmap_batch_size>0 branch): accumulates
+        # sum_e/sum_e2/sum_j/sum_jte/sum_jtj per batch instead of
+        # materializing the full (W,P) Jacobian + reverse-mode residuals
+        # for all walkers at once -- the latter is what OOMs past ~40
+        # electrons at W=1000 on a single A100 (task #4, Wave-1 diagnosis).
+        batch_size = min(args.jac_batch_size, args.n_walkers)
+        n_batches = (args.n_walkers + batch_size - 1) // batch_size
+        padded_n = n_batches * batch_size
+        pad_count = padded_n - args.n_walkers
+        result["jac_n_batches"] = n_batches
 
-    # --- Newton solve (curvature matrix assembly + linear solve) ---
-    grads_flat, treedef = jax.tree_util.tree_flatten(grads)
-    jac_mat = jnp.concatenate(
-        [jnp.reshape(leaf, (args.n_walkers, -1)) for leaf in grads_flat], axis=1
-    )
+        params_vec, _ = jax.flatten_util.ravel_pytree(params)
+        param_dtype = params_vec.dtype
 
-    def newton_solve(jac_mat, energies, damping):
+        def pad_walkers(w):
+            if pad_count == 0:
+                return w, jnp.ones((padded_n,), dtype=bool)
+            padded = jax.tree_util.tree_map(
+                lambda x: jnp.concatenate(
+                    [x, jnp.repeat(x[:1], pad_count, axis=0)], axis=0
+                ),
+                w,
+            )
+            mask = jnp.concatenate(
+                [jnp.ones((args.n_walkers,), dtype=bool),
+                 jnp.zeros((pad_count,), dtype=bool)]
+            )
+            return padded, mask
+
+        def flatten_jacobian(jac, n):
+            jac_flat, _ = jax.tree_util.tree_flatten(jac)
+            return jnp.concatenate(
+                [jnp.reshape(leaf, (n, -1)) for leaf in jac_flat], axis=1
+            )
+
+        def masked_energy_jacobian_batch(batch_walkers, batch_mask):
+            energies_batch, jac_batch = jax.vmap(
+                single_local_energy_and_grad, in_axes=(0, None)
+            )(batch_walkers, params)
+            energies_batch = jnp.where(batch_mask, energies_batch, 0.0)
+            jac_mat_batch = flatten_jacobian(jac_batch, batch_size)
+            jac_mat_batch = jnp.where(batch_mask[:, None], jac_mat_batch, 0.0)
+            return energies_batch, jac_mat_batch
+
+        def stats_scan_body(carry, xs):
+            sum_e, sum_e2, sum_j, sum_jte, sum_jtj = carry
+            batch_walkers, batch_mask = xs
+            energies_batch, jac_mat_batch = masked_energy_jacobian_batch(
+                batch_walkers, batch_mask
+            )
+            sum_e = sum_e + jnp.sum(energies_batch)
+            sum_e2 = sum_e2 + jnp.sum(energies_batch ** 2)
+            sum_j = sum_j + jnp.sum(jac_mat_batch, axis=0)
+            sum_jte = sum_jte + jac_mat_batch.T @ energies_batch
+            sum_jtj = sum_jtj + jac_mat_batch.T @ jac_mat_batch
+            return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), None
+
+        @jax.jit
+        def batched_jacobian_pass(walkers):
+            padded_walkers, mask = pad_walkers(walkers)
+            batched_walkers = jax.tree_util.tree_map(
+                lambda x: x.reshape((n_batches, batch_size) + x.shape[1:]),
+                padded_walkers,
+            )
+            batched_mask = mask.reshape((n_batches, batch_size))
+            init_carry = (
+                jnp.array(0.0, dtype=param_dtype),
+                jnp.array(0.0, dtype=param_dtype),
+                jnp.zeros_like(params_vec),
+                jnp.zeros_like(params_vec),
+                jnp.zeros((params_vec.shape[0], params_vec.shape[0]), dtype=param_dtype),
+            )
+            return jax.lax.scan(
+                stats_scan_body, init_carry, (batched_walkers, batched_mask)
+            )[0]
+
+        t0 = time.time()
+        sum_e, sum_e2, sum_j, sum_jte, sum_jtj = block(batched_jacobian_pass(walkers))
+        result["jacobian_build_compile_time_s"] = time.time() - t0
+
+        t0 = time.time()
+        sum_e, sum_e2, sum_j, sum_jte, sum_jtj = block(batched_jacobian_pass(walkers))
+        result["jacobian_build_steady_time_s"] = time.time() - t0
+
+        # Same normalization as optimizer.py:292-297 (2/(n-1) for the
+        # gradient, 2/n for the curvature matrix -- not a typo, matches
+        # production exactly for this path).
+        n_w = args.n_walkers
+        e_mean = sum_e / n_w
+        mean_j = sum_j / n_w
+        grads_vec = (2.0 / (n_w - 1)) * (sum_jte - n_w * mean_j * e_mean)
+        curvature_mat = (2.0 / n_w) * (sum_jtj - n_w * jnp.outer(mean_j, mean_j))
+    else:
+        # Unbatched path: jitted as a whole -- production runs this inside
+        # the jitted training_step (optimization.py:776); an eager vmap
+        # would overstate this phase's cost with per-op dispatch overhead,
+        # which is precisely the number R1 hinges on.
+        el_grad_jit = jax.jit(jax.vmap(single_local_energy_and_grad, in_axes=(0, None)))
+
+        t0 = time.time()
+        (energies, grads) = el_grad_jit(walkers, params)
+        energies, grads = block(energies), block(grads)
+        result["jacobian_build_compile_time_s"] = time.time() - t0
+
+        t0 = time.time()
+        (energies, grads) = el_grad_jit(walkers, params)
+        energies, grads = block(energies), block(grads)
+        result["jacobian_build_steady_time_s"] = time.time() - t0
+
+        grads_flat, _ = jax.tree_util.tree_flatten(grads)
+        jac_mat = jnp.concatenate(
+            [jnp.reshape(leaf, (args.n_walkers, -1)) for leaf in grads_flat], axis=1
+        )
         jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
         e_centered = energies - jnp.mean(energies)
         n_w = jac_mat.shape[0]
-        curvature = (2.0 / (n_w - 1)) * (jac_centered.T @ jac_centered)
-        grad_var = (2.0 / (n_w - 1)) * (jac_centered.T @ e_centered)
-        p = curvature.shape[0]
-        damped = curvature + damping * jnp.eye(p)
-        delta = jnp.linalg.solve(damped, -grad_var)
-        return delta
+        curvature_mat = (2.0 / (n_w - 1)) * (jac_centered.T @ jac_centered)
+        grads_vec = (2.0 / (n_w - 1)) * (jac_centered.T @ e_centered)
 
-    newton_solve_jit = jax.jit(newton_solve)
+    # Peak device memory right after the Jacobian phase (GPU only), before
+    # the (much smaller) Newton solve allocates anything more.
+    dev = jax.local_devices()[0]
+    try:
+        stats = dev.memory_stats()
+        result["jacobian_build_peak_mem_bytes"] = stats.get("peak_bytes_in_use") if stats else None
+    except Exception:
+        result["jacobian_build_peak_mem_bytes"] = None
+
+    # --- Newton solve (linear solve only; curvature/grad already assembled above) ---
+    def solve_delta(curvature_mat, grads_vec, damping):
+        p = curvature_mat.shape[0]
+        damped = curvature_mat + damping * jnp.eye(p)
+        return jnp.linalg.solve(damped, -grads_vec)
+
+    solve_delta_jit = jax.jit(solve_delta)
     t0 = time.time()
-    delta = block(newton_solve_jit(jac_mat, energies, args.damping))
+    delta = block(solve_delta_jit(curvature_mat, grads_vec, args.damping))
     result["newton_solve_compile_time_s"] = time.time() - t0
 
     t0 = time.time()
-    delta = block(newton_solve_jit(jac_mat, energies, args.damping))
+    delta = block(solve_delta_jit(curvature_mat, grads_vec, args.damping))
     result["newton_solve_steady_time_s"] = time.time() - t0
 
     # --- Peak device memory (GPU only; empty dict on CPU) ---
