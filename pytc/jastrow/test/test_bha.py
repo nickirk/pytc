@@ -31,8 +31,7 @@ class TestBoysHandyAnalytical(unittest.TestCase):
             BHTerm(2, 0, 0, -0.1),
             BHTerm(2, 0, 2, 1e-5),
         ]]
-        self.bh = BoysHandy.create(self.mol, terms_per_nucleus=self.terms,
-                                   analytical_gradients=False)
+        self.bh = BoysHandy.create(self.mol, terms_per_nucleus=self.terms)
         self.bha = BoysHandyAnalytical.create(self.mol, terms_per_nucleus=self.terms)
         self.params = self.bh.init_params(key=self.key)
 
@@ -83,31 +82,29 @@ class TestBoysHandyAnalytical(unittest.TestCase):
 
 
 class TestBoysHandyRoutingGuard(unittest.TestCase):
-    """Assert the production guard routes correctly: BoysHandyAnalytical for
-    any non-ECP molecule (single- or multi-type), generic BoysHandy (folx)
-    otherwise -- atom-type count no longer gates the routing decision."""
+    """BoysHandy.create() always returns generic BoysHandy -- no implicit
+    substitution to BoysHandyAnalytical, regardless of atom-type count or
+    ECP status. Explicit choice over silent routing (Ke's direction,
+    2026-07-10; reverts d21d7ed's original single-type auto-routing, not
+    just task #5 PR-A's multi-type extension). BoysHandyAnalytical.create()
+    is the only way to get the analytic-derivative implementation."""
 
-    def test_single_type_defaults_to_bha(self):
+    def test_single_type_always_generic(self):
         mol = get_h2_molecule()
         j = BoysHandy.create(mol)
-        self.assertIsInstance(j, BoysHandyAnalytical)
-
-    def test_single_type_forced_bh(self):
-        mol = get_h2_molecule()
-        j = BoysHandy.create(mol, analytical_gradients=False)
         self.assertIs(type(j), BoysHandy)
 
-    def test_multi_type_defaults_to_bha(self):
+    def test_multi_type_always_generic(self):
         mol = get_h2o_molecule()
         j = BoysHandy.create(mol)
-        self.assertIsInstance(j, BoysHandyAnalytical)
-
-    def test_multi_type_forced_bh(self):
-        mol = get_h2o_molecule()
-        j = BoysHandy.create(mol, analytical_gradients=False)
         self.assertIs(type(j), BoysHandy)
 
-    def test_multi_type_explicit_bha_still_works(self):
+    def test_single_type_explicit_bha_construction(self):
+        mol = get_h2_molecule()
+        j = BoysHandyAnalytical.create(mol)
+        self.assertIs(type(j), BoysHandyAnalytical)
+
+    def test_multi_type_explicit_bha_construction(self):
         mol = get_h2o_molecule()
         j = BoysHandyAnalytical.create(mol)
         self.assertIs(type(j), BoysHandyAnalytical)
@@ -134,7 +131,7 @@ class TestBoysHandyAnalyticalMultiType(unittest.TestCase):
     def setUp(self):
         self.key = random.PRNGKey(42)
         self.mol = get_h2o_molecule()
-        self.bh = BoysHandy.create(self.mol, analytical_gradients=False)
+        self.bh = BoysHandy.create(self.mol)
         self.bha = BoysHandyAnalytical.create(self.mol)
         self.params = self.bh.init_params(key=self.key)
 
@@ -223,7 +220,7 @@ class TestBoysHandyAnalyticalMultiTypeLiH(unittest.TestCase):
     def setUp(self):
         self.key = random.PRNGKey(7)
         self.mol = get_lih_molecule()
-        self.bh = BoysHandy.create(self.mol, analytical_gradients=False)
+        self.bh = BoysHandy.create(self.mol)
         self.bha = BoysHandyAnalytical.create(self.mol)
         self.params = self.bh.init_params(key=self.key)
 
