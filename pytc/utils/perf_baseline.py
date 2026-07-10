@@ -546,8 +546,9 @@ def _build_vmc_ansatz(mol, mf, jastrow_type: str = "ncusp"):
     forward + folx autodiff — bypasses the production guard to profile the
     legacy folx path), or ``bha`` (BoysHandyAnalytical, take_along_axis
     forward + hand-written analytical gradients). Note: production
-    ``BoysHandy.create()`` now routes single-type/non-ECP molecules to BHA
-    automatically; ``bh`` here forces the folx path for A/B comparison.
+    ``BoysHandy.create()`` now routes all non-ECP molecules (single- or
+    multi-type) to BHA automatically; ``bh`` here forces the folx path for
+    A/B comparison.
     """
     try:
         from pytc.ansatz.sj import SlaterJastrow

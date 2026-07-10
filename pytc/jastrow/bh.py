@@ -49,10 +49,13 @@ class BoysHandy(Jastrow):
     def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None,
                analytical_gradients=True):
         if analytical_gradients and cls is BoysHandy:
-            nuclear_charges = jnp.array(mol.atom_charges())
-            n_types = len(jnp.unique(nuclear_charges))
             has_ecp = bool(getattr(mol, '_ecp', {}) or getattr(mol, '_pseudo', {}))
-            if n_types == 1 and not has_ecp:
+            # BoysHandyAnalytical's derivative math operates generically over
+            # the (n_types, max_nuclei, 3) padded nuclei array -- nothing in
+            # it assumes a single atom type. It was previously gated to
+            # n_types==1 only because multi-type correctness was untested;
+            # see test_bha.py's multi-type cases for the validation.
+            if not has_ecp:
                 from pytc.jastrow.bha import BoysHandyAnalytical
                 return BoysHandyAnalytical.create(
                     mol, terms_per_nucleus=terms_per_nucleus,
