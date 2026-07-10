@@ -102,6 +102,19 @@ def main():
                          "electron-set get_pair_grid_grad_lap fast path; NuclearCusp "
                          "still falls back to the per-pair grid regardless (no fast "
                          "path for it yet).")
+    p.add_argument("--vmap-batch-size", type=int, default=256,
+                    help="max_vmap_batch_size forwarded to burn_in and "
+                         "make_mcmc_step (routes through folx.batched_vmap "
+                         "instead of a plain full-batch vmap for the AO/"
+                         "determinant eval in _warmup_ansatz and each MCMC "
+                         "step). Unbatched (0, the underlying library "
+                         "default) OOMs or hits an XLA autotune-reject at "
+                         "large N or W (Wave-2 finding, task #6) -- this "
+                         "harness defaults to 256 instead so new waves don't "
+                         "hit the same wall; pass 0 explicitly to reproduce "
+                         "the unbatched failure. Same knob optimize_ref_var "
+                         "itself exposes; not wired into this harness until "
+                         "now.")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -114,6 +127,7 @@ def main():
         "burn_in_steps": args.burn_in,
         "n_newton_steps": args.n_newton_steps,
         "jastrow_impl": args.jastrow_impl,
+        "vmap_batch_size": args.vmap_batch_size,
     }
 
     t0 = time.time()
@@ -155,6 +169,7 @@ def main():
     walkers, _acc_hist, key, adapted_step_size = burn_in(
         det, walkers, n_steps=args.burn_in, step_size=args.step_size,
         key=subkey, params=params, report_interval=10 ** 9,
+        max_vmap_batch_size=args.vmap_batch_size,
     )
     walkers = block(walkers)
     result["burn_in_total_time_s"] = time.time() - t0
@@ -163,7 +178,8 @@ def main():
     # --- One MCMC step (compile + steady-state, averaged over 20 steps) ---
     # Use the burn-in-adapted step_size, matching production (optimization.py:747-748),
     # so acceptance_rate here is comparable to a real run.
-    mcmc_step = make_mcmc_step(det, adapted_step_size, move_type="one")
+    mcmc_step = make_mcmc_step(det, adapted_step_size, move_type="one",
+                                max_vmap_batch_size=args.vmap_batch_size)
     key, subkey = random.split(key)
     t0 = time.time()
     walkers, acc = mcmc_step(det, walkers, subkey, params)
