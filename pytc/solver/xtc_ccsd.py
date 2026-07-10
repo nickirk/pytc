@@ -294,13 +294,15 @@ def _make_xtc_eris(cc, mo_coeff=None):
         
         # Prepare 3-index tensors L_pq = (L|pq)
         naux = with_df.get_naoaux()
-        Loo, Lov = _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff)
-        
 
-        # Unpack Lvv to RAM if possible (approx 5-10GB for 800 orbitals)
-        L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
-        Lov_reshaped = Lov.reshape(naux, nocc, nvir)
-        
+        # Resolved before _init_df_eris (rather than after, as originally)
+        # so the panel geometry is known before eris.feri is opened --
+        # lets us size the HDF5 chunk cache to the aligned ovvv/vovv chunk
+        # (see rdcc_nbytes below), instead of falling through to h5py's
+        # 1 MiB library default, which can't hold even one aligned chunk
+        # at production panel sizes (~tens of MB) and left aligned
+        # chunking measuring *slower* than default auto-chunking in
+        # benchmarking (see bench_hdf5_chunk_alignment.py).
         _n_fused = None
         if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
             _n_fused = xtc_obj.phi_isdf.shape[1]
@@ -315,6 +317,30 @@ def _make_xtc_eris(cc, mo_coeff=None):
             include_accumulators=False,
         )
 
+        # Axes 1 and 3 are chunked at 64 each so a single chunk is ~15 MB
+        # for typical (nocc, nvir, panel_blk) — a good HDF5 compromise
+        # between per-chunk overhead (favours bigger) and chunk cache hit
+        # rate (favours smaller). Axis 2 is chunked at panel_blk itself
+        # (see the dataset-creation comment below).
+        _ax13 = min(64, nvir)
+        _ax2 = min(panel_blk, nvir)
+        # HDF5's default chunk cache (rdcc_nbytes) is 1 MiB, far smaller
+        # than one ovvv/vovv chunk at production panel sizes -- every
+        # access then bypasses the cache and goes straight to disk,
+        # which measured *slower* than h5py's own (much smaller) default
+        # auto-chunking despite the aligned chunks avoiding read-modify-
+        # write (see bench_hdf5_chunk_alignment.py). Sizing the cache to
+        # a couple of chunks restores the expected win.
+        _chunk_bytes = nocc * _ax13 * _ax2 * _ax13 * 8
+        _rdcc_nbytes = 2 * _chunk_bytes
+
+        Loo, Lov = _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff,
+                                 rdcc_nbytes=_rdcc_nbytes)
+
+        # Unpack Lvv to RAM if possible (approx 5-10GB for 800 orbitals)
+        L_vv_full = lib.unpack_tril(eris.vvL[:], axis=0) # (nvir, nvir, naux)
+        Lov_reshaped = Lov.reshape(naux, nocc, nvir)
+
         # Create HDF5 datasets for large blocks.
         #
         # Both ovvv and vovv are WRITTEN as [:, :, r0:r1, :] slabs in chunks
@@ -326,13 +352,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # HDF5 writes the pipeline bottleneck (consume threads held the
         # acc_lock for the full RMW, blocking all other consume threads and
         # eventually stalling the main dispatch thread on host_sem).
-        #
-        # Axes 1 and 3 are chunked at 64 each so a single chunk is ~15 MB
-        # for typical (nocc, nvir, panel_blk) — a good HDF5 compromise
-        # between per-chunk overhead (favours bigger) and chunk cache hit
-        # rate (favours smaller).
-        _ax13 = min(64, nvir)
-        _ax2  = min(panel_blk, nvir)
         eris_blocks = {
             'ovvv': ((nocc, nvir, nvir, nvir),
                      (nocc, _ax13, _ax2, _ax13)),
@@ -977,14 +996,23 @@ def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, b0, b1)
 
     logger.debug("chunk %d:%d done in %.3f s", b0, b1, time.perf_counter()-t0)
 
-def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
-    """Initialize DF tensors and HDF5 file."""
+def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff, rdcc_nbytes=None):
+    """Initialize DF tensors and HDF5 file.
+
+    Args:
+        rdcc_nbytes: HDF5 raw-data chunk cache size (bytes) for eris.feri.
+            The h5py/HDF5 default is 1 MiB, too small to hold even one
+            ovvv/vovv chunk at production panel sizes -- pass a size
+            covering a couple of those chunks so the aligned-chunking
+            write path actually benefits from caching. None uses the
+            library default.
+    """
     if isinstance(with_df._cderi, str):
         import h5py
-        eris.feri = h5py.File(with_df._cderi, 'a')
+        eris.feri = h5py.File(with_df._cderi, 'a', rdcc_nbytes=rdcc_nbytes)
     elif isinstance(getattr(with_df, '_cderi_to_save', None), str):
         import h5py
-        eris.feri = h5py.File(with_df._cderi_to_save, 'a')
+        eris.feri = h5py.File(with_df._cderi_to_save, 'a', rdcc_nbytes=rdcc_nbytes)
     else:
         eris.feri = lib.H5TmpFile()
         
