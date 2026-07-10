@@ -406,40 +406,42 @@ class TestHamiltonianGrad(unittest.TestCase):
         self.assertLess(mem_increase, 1000, "Gradient memory usage too high (>1GB)")
 
 
-class TestJastrowTermsContracted(unittest.TestCase):
-    """compute_jastrow_terms's jastrow_terms_impl="contracted" path (task
-    #5 PR-B) must give bit-identical results to the default "pairwise"
-    path through the full E_L call chain, on multi-type systems with the
-    same CompositeJastrow (NuclearCusp + BoysHandyAnalytical) production
-    uses. See pytc/jastrow/test/test_bha.py for the lower-level
-    get_pair_grid_grad_lap-vs-reference check.
+class TestJastrowTermsPolymorphicDispatch(unittest.TestCase):
+    """BoysHandyAnalytical's get_pair_grid_grad_lap override (the fast
+    whole-electron-set path) must give bit-identical full-E_L results to
+    the Jastrow base class's default per-pair implementation (inherited
+    unchanged by generic BoysHandy), on multi-type systems with the same
+    CompositeJastrow (NuclearCusp + BH) structure production uses. There
+    is no flag -- class choice (BoysHandyAnalytical vs BoysHandy) is the
+    only dispatch (task #5 PR-B). See pytc/jastrow/test/test_bha.py for
+    the lower-level, same-instance base-vs-override check.
     """
 
-    def _build(self, mol):
-        from pytc.jastrow.bha import BoysHandyAnalytical
+    def _build(self, mol, jastrow_cls):
         mf = scf.RHF(mol).density_fit()
         mf.kernel()
         det = SlaterDet.create(mol, mf.mo_coeff)
-        bha = BoysHandyAnalytical.create(mol)
+        bh = jastrow_cls.create(mol)
         ncusp = NuclearCusp.create(mol, name="ncusp")
-        jastrow = CompositeJastrow.create([ncusp, bha])
+        jastrow = CompositeJastrow.create([ncusp, bh])
         params = jastrow.init_params()
         ansatz = SlaterJastrow.create(mol, jastrow, [det])
         return ansatz, params
 
     def _check(self, mol, n_walkers=4, seed=11):
-        ansatz, params = self._build(mol)
+        from pytc.jastrow.bha import BoysHandyAnalytical
+        ansatz_base, params_base = self._build(mol, BoysHandy)
+        ansatz_override, params_override = self._build(mol, BoysHandyAnalytical)
         key = random.PRNGKey(seed)
-        walkers = initialize_walkers(ansatz, n_walkers, key=key)
+        walkers = initialize_walkers(ansatz_base, n_walkers, key=key)
         for w in range(n_walkers):
             walker_w = jax.tree_util.tree_map(lambda x: x[w], walkers)
-            e_pairwise = compute_single_walker_energy(
-                ansatz, walker_w, params, jastrow_terms_impl="pairwise")
-            e_contracted = compute_single_walker_energy(
-                ansatz, walker_w, params, jastrow_terms_impl="contracted")
+            e_base = compute_single_walker_energy(ansatz_base, walker_w, params_base)
+            e_override = compute_single_walker_energy(
+                ansatz_override, walker_w, params_override)
             np.testing.assert_allclose(
-                float(e_contracted), float(e_pairwise), rtol=0, atol=0,
-                err_msg=f"walker {w}: contracted E_L != pairwise E_L")
+                float(e_override), float(e_base), rtol=0, atol=0,
+                err_msg=f"walker {w}: BoysHandyAnalytical E_L != generic BoysHandy E_L")
 
     def test_lih(self):
         mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)
@@ -460,79 +462,6 @@ H  0.757 -0.586  2.900
 H -0.757 -0.586  2.900
 """, basis="cc-pVDZ", unit="Angstrom", verbose=0)
         self._check(mol)
-
-
-class TestJastrowTermsAutoResolution(unittest.TestCase):
-    """"auto" (the new default) must resolve to "contracted" at N >=
-    AUTO_CONTRACTED_MIN_ELECTRONS and "pairwise" below it, and the
-    resolved result must be bit-identical to requesting that impl
-    explicitly (auto is a dispatch choice, not a different computation).
-    """
-
-    def test_resolve_below_threshold(self):
-        from pytc.vmc.hamiltonian import (
-            _resolve_jastrow_terms_impl, AUTO_CONTRACTED_MIN_ELECTRONS,
-        )
-        self.assertEqual(
-            _resolve_jastrow_terms_impl("auto", AUTO_CONTRACTED_MIN_ELECTRONS - 1),
-            "pairwise",
-        )
-
-    def test_resolve_at_and_above_threshold(self):
-        from pytc.vmc.hamiltonian import (
-            _resolve_jastrow_terms_impl, AUTO_CONTRACTED_MIN_ELECTRONS,
-        )
-        self.assertEqual(
-            _resolve_jastrow_terms_impl("auto", AUTO_CONTRACTED_MIN_ELECTRONS),
-            "contracted",
-        )
-        self.assertEqual(
-            _resolve_jastrow_terms_impl("auto", AUTO_CONTRACTED_MIN_ELECTRONS + 10),
-            "contracted",
-        )
-
-    def test_explicit_impl_bypasses_auto(self):
-        from pytc.vmc.hamiltonian import _resolve_jastrow_terms_impl
-        self.assertEqual(_resolve_jastrow_terms_impl("pairwise", 1000), "pairwise")
-        self.assertEqual(_resolve_jastrow_terms_impl("contracted", 1), "contracted")
-
-    def test_auto_matches_explicit_below_threshold(self):
-        # (H2O)2 = 20 electrons, below AUTO_CONTRACTED_MIN_ELECTRONS=32:
-        # auto must produce the same E_L as explicit "pairwise".
-        mol = gto.M(atom="O 0 0 0; H 0 -1.4 1.1; H 0 1.4 1.1",
-                     basis="sto-3g", unit="Bohr", verbose=0)
-        from pytc.jastrow.bha import BoysHandyAnalytical
-        mf = scf.RHF(mol).density_fit()
-        mf.kernel()
-        det = SlaterDet.create(mol, mf.mo_coeff)
-        bha = BoysHandyAnalytical.create(mol)
-        ncusp = NuclearCusp.create(mol, name="ncusp")
-        jastrow = CompositeJastrow.create([ncusp, bha])
-        params = jastrow.init_params()
-        ansatz = SlaterJastrow.create(mol, jastrow, [det])
-        key = random.PRNGKey(13)
-        walkers = initialize_walkers(ansatz, 3, key=key)
-        for w in range(3):
-            walker_w = jax.tree_util.tree_map(lambda x: x[w], walkers)
-            e_auto = compute_single_walker_energy(ansatz, walker_w, params)
-            e_pairwise = compute_single_walker_energy(
-                ansatz, walker_w, params, jastrow_terms_impl="pairwise")
-            np.testing.assert_allclose(float(e_auto), float(e_pairwise), rtol=0, atol=0)
-
-
-class TestJastrowTermsImplValidation(unittest.TestCase):
-    """jastrow_terms_impl must reject unknown values instead of silently
-    falling back to "pairwise" on a typo (GitHub review, task #5 PR-B)."""
-
-    def test_invalid_impl_raises(self):
-        from pytc.vmc.hamiltonian import _resolve_jastrow_terms_impl
-        with self.assertRaises(ValueError):
-            _resolve_jastrow_terms_impl("contrated", 100)
-
-    def test_valid_impls_do_not_raise(self):
-        from pytc.vmc.hamiltonian import _resolve_jastrow_terms_impl
-        for impl in ("auto", "pairwise", "contracted"):
-            _resolve_jastrow_terms_impl(impl, 10)  # must not raise
 
 
 class TestJastrowTermsCompositeLengthMismatch(unittest.TestCase):
