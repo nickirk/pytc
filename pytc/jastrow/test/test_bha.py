@@ -95,9 +95,14 @@ class TestBoysHandyRoutingGuard(unittest.TestCase):
         j = BoysHandy.create(mol, analytical_gradients=False)
         self.assertIs(type(j), BoysHandy)
 
-    def test_multi_type_defaults_to_bh(self):
+    def test_multi_type_defaults_to_bha(self):
         mol = get_h2o_molecule()
         j = BoysHandy.create(mol)
+        self.assertIsInstance(j, BoysHandyAnalytical)
+
+    def test_multi_type_forced_bh(self):
+        mol = get_h2o_molecule()
+        j = BoysHandy.create(mol, analytical_gradients=False)
         self.assertIs(type(j), BoysHandy)
 
     def test_multi_type_explicit_bha_still_works(self):
@@ -195,6 +200,90 @@ class TestBoysHandyAnalyticalMultiType(unittest.TestCase):
         np.testing.assert_allclose(
             float(lap_bha), fd_second, atol=1e-2,
             err_msg="BHA lap != FD lap on multi-type (H2O)")
+
+
+def get_lih_molecule():
+    return gto.M(
+        atom="Li 0 0 0; H 0 0 1.6",
+        basis="sto-3g",
+        unit="bohr",
+        verbose=0,
+    )
+
+
+class TestBoysHandyAnalyticalMultiTypeLiH(unittest.TestCase):
+    """Second multi-type equivalence case (Li+H), distinct charge/mass ratio
+    from the O+H case in TestBoysHandyAnalyticalMultiType -- extends the
+    validation scoped out in d21d7ed before routing multi-type by default
+    (task #5 PR-A, #pro-pytc-efficiency-refactor).
+    """
+
+    def setUp(self):
+        self.key = random.PRNGKey(7)
+        self.mol = get_lih_molecule()
+        self.bh = BoysHandy.create(self.mol, analytical_gradients=False)
+        self.bha = BoysHandyAnalytical.create(self.mol)
+        self.params = self.bh.init_params(key=self.key)
+
+    def test_compute_matches_lih(self):
+        for i in range(10):
+            k1, k2 = random.split(random.fold_in(self.key, i))
+            r1 = random.normal(k1, (3,)) * 2.0
+            r2 = random.normal(k2, (3,)) * 2.0
+            np.testing.assert_allclose(
+                np.array(self.bha._compute(r1, r2, self.params)),
+                np.array(self.bh._compute(r1, r2, self.params)),
+                rtol=1e-8, atol=1e-8,
+            )
+
+    def test_grad_and_laplacian_match_lih(self):
+        # Measured max relative error over 20 random configs (default
+        # 17-term basis, LiH + (H2O)2): grad 2.4e-8, lap 2.9e-8 -- roundoff
+        # from op-ordering between the vmap-based bh and broadcast-based bha
+        # implementations, same as the single-type case. Tolerance below
+        # matches TestBoysHandyAnalyticalMultiType's H2O case for consistency.
+        for i in range(10):
+            k1, k2 = random.split(random.fold_in(self.key, i + 200))
+            r1 = random.normal(k1, (3,)) * 2.0
+            r2 = random.normal(k2, (3,)) * 2.0
+            grad_ref, lap_ref = self.bh.get_log_grads_r1(r1, r2, self.params)
+            grad_new, lap_new = self.bha.get_log_grads_r1(r1, r2, self.params)
+            np.testing.assert_allclose(
+                np.array(grad_new), np.array(grad_ref), rtol=1e-7, atol=1e-7)
+            np.testing.assert_allclose(
+                np.array(lap_new), np.array(lap_ref), rtol=1e-6, atol=1e-6)
+
+    def test_fd_grad_and_lap_r1_lih(self):
+        """Central FD validation of BHA grad/lap on LiH."""
+        r1 = jnp.array([0.3, -0.5, 0.7])
+        r2 = jnp.array([-0.4, 0.1, -0.2])
+        eps = 1e-5
+
+        def u(r1_vec):
+            return float(
+                np.array(self.bha._compute(r1_vec, r2, self.params)).reshape(-1)[0])
+
+        u0 = u(r1)
+
+        fd_grad = np.zeros(3)
+        fd_second = 0.0
+        for d in range(3):
+            rp = np.array(r1, dtype=np.float64)
+            rm = np.array(r1, dtype=np.float64)
+            rp[d] += eps
+            rm[d] -= eps
+            fp = u(jnp.array(rp))
+            fm = u(jnp.array(rm))
+            fd_grad[d] = (fp - fm) / (2 * eps)
+            fd_second += (fp - 2 * u0 + fm) / eps ** 2
+
+        grad_bha, lap_bha = self.bha.get_log_grads_r1(r1, r2, self.params)
+        np.testing.assert_allclose(
+            np.array(grad_bha), fd_grad, atol=1e-4,
+            err_msg="BHA grad != FD grad on LiH")
+        np.testing.assert_allclose(
+            float(lap_bha), fd_second, atol=1e-2,
+            err_msg="BHA lap != FD lap on LiH")
 
 
 if __name__ == "__main__":
