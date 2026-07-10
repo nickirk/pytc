@@ -332,5 +332,13 @@ class BoysHandyAnalytical(BoysHandy):
             jnp.moveaxis(xn_val, 1, 0), jnp.moveaxis(grad_xn, 1, 0), jnp.moveaxis(lap_xn, 1, 0),
             atom_type_map, weight_atom, cusp_mask_atom, d_atom,
         )
-        (grad_pair, lap_pair), _ = jax.lax.scan(scan_body, init_carry, xs)
+        # jax.checkpoint (rematerialization): without this, reverse-mode AD
+        # through lax.scan stores each step's forward intermediates (here,
+        # O(N^2*n_terms) per atom) for ALL natom steps to compute the
+        # backward pass -- reintroducing the O(N^2*natom*n_terms) memory
+        # blowup the scan's O(N^2) carry was designed to avoid, just moved
+        # from the forward pass to the backward pass. checkpoint trades
+        # that storage for recomputing each step's forward pass during the
+        # backward pass instead.
+        (grad_pair, lap_pair), _ = jax.lax.scan(jax.checkpoint(scan_body), init_carry, xs)
         return grad_pair, lap_pair
