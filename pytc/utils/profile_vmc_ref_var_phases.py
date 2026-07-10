@@ -47,6 +47,38 @@ def block(x):
     return x
 
 
+def mem_stats():
+    """Return (bytes_in_use, peak_bytes_in_use) from the first local device,
+    or (None, None) on CPU / if unavailable."""
+    dev = jax.local_devices()[0]
+    try:
+        stats = dev.memory_stats()
+        if not stats:
+            return None, None
+        return stats.get("bytes_in_use"), stats.get("peak_bytes_in_use")
+    except Exception:
+        return None, None
+
+
+def record_mem_checkpoint(result, phase, prev_peak):
+    """Sample memory after a phase boundary (call AFTER block()-ing that
+    phase's output). Records live bytes-in-use for the phase, plus how much
+    the CUMULATIVE peak grew during it -- peak_bytes_in_use never resets
+    between phases, so a raw peak reading conflates "what this phase used"
+    with "the highest-water-mark of everything before it" (see the W=5000
+    Wave-2 case: an unbatched burn-in's peak outlived and masked the later,
+    smaller, properly-batched Jacobian phase's own peak). Returns the new
+    prev_peak for the next call.
+    """
+    bytes_in_use, peak = mem_stats()
+    result[f"{phase}_mem_bytes_in_use"] = bytes_in_use
+    if peak is not None and prev_peak is not None:
+        result[f"{phase}_mem_peak_growth_bytes"] = peak - prev_peak
+    else:
+        result[f"{phase}_mem_peak_growth_bytes"] = None
+    return peak if peak is not None else prev_peak
+
+
 def h_chain(n, sep=1.8):
     return "; ".join(f"H 0 0 {i*sep}" for i in range(n))
 
@@ -153,10 +185,13 @@ def main():
     key = random.PRNGKey(43)
     key, subkey = random.split(key)
 
+    prev_peak = mem_stats()[1] or 0  # baseline before any VMC-specific allocation
+
     # --- Walker init ---
     t0 = time.time()
     walkers = block(initialize_walkers(sj_ansatz, args.n_walkers, key=subkey))
     result["walker_init_time_s"] = time.time() - t0
+    prev_peak = record_mem_checkpoint(result, "walker_init", prev_peak)
 
     # --- Burn-in ---
     # NOTE: calling burn_in() twice in a row on already-warmed-up walkers hits
@@ -174,6 +209,7 @@ def main():
     walkers = block(walkers)
     result["burn_in_total_time_s"] = time.time() - t0
     result["burn_in_time_per_step_s"] = result["burn_in_total_time_s"] / args.burn_in
+    prev_peak = record_mem_checkpoint(result, "burn_in", prev_peak)
 
     # --- One MCMC step (compile + steady-state, averaged over 20 steps) ---
     # Use the burn-in-adapted step_size, matching production (optimization.py:747-748),
@@ -196,6 +232,7 @@ def main():
         accs.append(float(acc))
     result["mcmc_step_steady_time_s"] = (time.time() - t0) / n_mcmc_avg
     result["acceptance_rate"] = sum(accs) / len(accs)
+    prev_peak = record_mem_checkpoint(result, "mcmc_step", prev_peak)
 
     # --- E_L + Jacobian build (Gauss-Newton path, matches optimizer.py) ---
     def single_local_energy_and_grad(w, p):
@@ -327,13 +364,12 @@ def main():
         grads_vec = (2.0 / (n_w - 1)) * (jac_centered.T @ e_centered)
 
     # Peak device memory right after the Jacobian phase (GPU only), before
-    # the (much smaller) Newton solve allocates anything more.
-    dev = jax.local_devices()[0]
-    try:
-        stats = dev.memory_stats()
-        result["jacobian_build_peak_mem_bytes"] = stats.get("peak_bytes_in_use") if stats else None
-    except Exception:
-        result["jacobian_build_peak_mem_bytes"] = None
+    # the (much smaller) Newton solve allocates anything more. Field name
+    # kept for backward compat with existing analysis; still a cumulative
+    # high-water-mark, not phase-isolated -- use jacobian_build_mem_bytes_in_use
+    # / jacobian_build_mem_peak_growth_bytes below for that.
+    result["jacobian_build_peak_mem_bytes"] = mem_stats()[1]
+    prev_peak = record_mem_checkpoint(result, "jacobian_build", prev_peak)
 
     # --- Newton solve (linear solve only; curvature/grad already assembled above) ---
     def solve_delta(curvature_mat, grads_vec, damping):
@@ -349,14 +385,11 @@ def main():
     t0 = time.time()
     delta = block(solve_delta_jit(curvature_mat, grads_vec, args.damping))
     result["newton_solve_steady_time_s"] = time.time() - t0
+    record_mem_checkpoint(result, "newton_solve", prev_peak)
 
     # --- Peak device memory (GPU only; empty dict on CPU) ---
     dev = jax.local_devices()[0]
-    try:
-        stats = dev.memory_stats()
-        result["peak_device_memory_bytes"] = stats.get("peak_bytes_in_use") if stats else None
-    except Exception:
-        result["peak_device_memory_bytes"] = None
+    result["peak_device_memory_bytes"] = mem_stats()[1]
     result["device_kind"] = dev.device_kind
 
     out = json.dumps(result, indent=2)
