@@ -38,7 +38,8 @@ from pytc.vmc.hamiltonian import eval_local_energy, _resolve_jastrow_terms_impl
 from pytc.vmc.walker import initialize_walkers
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
-from pytc.jastrow import BoysHandy, NuclearCusp, CompositeJastrow
+from pytc.jastrow import NuclearCusp, CompositeJastrow
+from pytc.jastrow.bha import BoysHandyAnalytical
 
 
 def block(x):
@@ -174,7 +175,12 @@ def main():
     )
 
     det = SlaterDet.create(mol, mf.mo_coeff)
-    bh = BoysHandy.create(mol)
+    # Explicit construction, not BoysHandy.create(mol): BoysHandy.create()
+    # no longer implicitly routes to BoysHandyAnalytical (Ke's direction,
+    # 2026-07-10 -- explicit choice over silent substitution). This harness
+    # wants the analytic path (that's what "contracted" needs to exist at
+    # all), so it opts in directly.
+    bh = BoysHandyAnalytical.create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
     jastrow_params = jastrow.init_params()
