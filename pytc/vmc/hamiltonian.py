@@ -141,8 +141,11 @@ def compute_single_walker_energy(sj, walker, jastrow_params):
         sj, walker.positions, walker.slater_up, walker.slater_down
     )
     
-    E_L = (jnp.trace(walker.inv_up @ (B_kin_alpha + B_pot_alpha)) + 
-           jnp.trace(walker.inv_down @ (B_kin_beta + B_pot_beta)))
+    # trace(inv @ B) == sum(inv.T * B): avoids materializing the full (N/2)x(N/2)
+    # matmul (O((N/2)^3)) for a scalar trace, computing only the O((N/2)^2)
+    # elementwise contraction instead. Exactly equal, not an approximation.
+    E_L = (jnp.sum(walker.inv_up.T * (B_kin_alpha + B_pot_alpha)) +
+           jnp.sum(walker.inv_down.T * (B_kin_beta + B_pot_beta)))
     
     E_L = E_L + sj.ion_ion_potential
     
