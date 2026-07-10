@@ -91,6 +91,11 @@ def main():
                          "(optimizer.py:187-297, NewtonOptimizer's max_vmap_batch_size "
                          "branch) instead of a full-batch vmap. Needed for W/N combos "
                          "that OOM unbatched (task #4).")
+    p.add_argument("--jastrow-impl", choices=["pairwise", "contracted"], default="pairwise",
+                    help="jastrow_terms_impl forwarded to eval_local_energy (task #5 "
+                         "PR-B). 'contracted' uses BoysHandyAnalytical's whole-electron-"
+                         "set get_pair_grid_grad_lap fast path; NuclearCusp still falls "
+                         "back to the per-pair grid regardless (no fast path for it yet).")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -102,6 +107,7 @@ def main():
         "n_walkers": args.n_walkers,
         "burn_in_steps": args.burn_in,
         "n_newton_steps": args.n_newton_steps,
+        "jastrow_impl": args.jastrow_impl,
     }
 
     t0 = time.time()
@@ -168,7 +174,9 @@ def main():
 
     # --- E_L + Jacobian build (Gauss-Newton path, matches optimizer.py) ---
     def single_local_energy_and_grad(w, p):
-        return jax.value_and_grad(lambda pp: eval_local_energy(sj_ansatz, w, pp)[0])(p)
+        return jax.value_and_grad(
+            lambda pp: eval_local_energy(sj_ansatz, w, pp, jastrow_terms_impl=args.jastrow_impl)[0]
+        )(p)
 
     result["jac_batch_size"] = args.jac_batch_size
 
