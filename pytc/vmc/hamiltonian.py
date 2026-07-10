@@ -191,17 +191,20 @@ def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl=
     return jnp.real(E_L)
 
 
-def eval_local_energy(sj, walker, params):
+def eval_local_energy(sj, walker, params, jastrow_terms_impl="pairwise"):
     """Evaluate local energy for a SlaterJastrow ansatz.
-    
+
     Args:
         sj: SlaterJastrow ansatz object
         walker: Walker object
         params: Tuple of (jastrow_params, linear_coeffs)
-        
+        jastrow_terms_impl: forwarded to compute_jastrow_terms -- see there.
+
     Returns:
         Tuple of (energy, walker)
     """
     jastrow_params, linear_coeffs = params
-    energy = compute_single_walker_energy(sj, walker, jastrow_params)
+    energy = compute_single_walker_energy(
+        sj, walker, jastrow_params, jastrow_terms_impl=jastrow_terms_impl
+    )
     return energy, walker
