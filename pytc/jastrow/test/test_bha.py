@@ -83,7 +83,9 @@ class TestBoysHandyAnalytical(unittest.TestCase):
 
 
 class TestBoysHandyRoutingGuard(unittest.TestCase):
-    """Assert the production guard routes correctly based on atom types."""
+    """Assert the production guard routes correctly: BoysHandyAnalytical for
+    any non-ECP molecule (single- or multi-type), generic BoysHandy (folx)
+    otherwise -- atom-type count no longer gates the routing decision."""
 
     def test_single_type_defaults_to_bha(self):
         mol = get_h2_molecule()
