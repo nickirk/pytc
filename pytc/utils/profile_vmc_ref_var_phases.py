@@ -34,7 +34,7 @@ from pyscf import gto, scf
 
 from pytc.vmc.sampling import burn_in
 from pytc.vmc.metropolis import make_mcmc_step
-from pytc.vmc.hamiltonian import eval_local_energy, _resolve_jastrow_terms_impl
+from pytc.vmc.hamiltonian import eval_local_energy
 from pytc.vmc.walker import initialize_walkers
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
@@ -124,17 +124,6 @@ def main():
                          "(optimizer.py:187-297, NewtonOptimizer's max_vmap_batch_size "
                          "branch) instead of a full-batch vmap. Needed for W/N combos "
                          "that OOM unbatched (task #4).")
-    p.add_argument("--jastrow-impl", choices=["auto", "pairwise", "contracted"], default="auto",
-                    help="jastrow_terms_impl forwarded to eval_local_energy (task #5 "
-                         "PR-B). 'auto' (default, matches the library default) resolves "
-                         "to 'contracted' for N>=AUTO_CONTRACTED_MIN_ELECTRONS and "
-                         "'pairwise' below, via the library's own "
-                         "_resolve_jastrow_terms_impl -- exercises the actual dispatch "
-                         "mechanism production uses, not just an equivalent answer by "
-                         "coincidence. 'contracted' uses BoysHandyAnalytical's whole-"
-                         "electron-set get_pair_grid_grad_lap fast path; NuclearCusp "
-                         "still falls back to the per-pair grid regardless (no fast "
-                         "path for it yet).")
     p.add_argument("--vmap-batch-size", type=int, default=256,
                     help="max_vmap_batch_size forwarded to burn_in and "
                          "make_mcmc_step (routes through folx.batched_vmap "
@@ -159,7 +148,6 @@ def main():
         "n_walkers": args.n_walkers,
         "burn_in_steps": args.burn_in,
         "n_newton_steps": args.n_newton_steps,
-        "jastrow_impl": args.jastrow_impl,
         "vmap_batch_size": args.vmap_batch_size,
     }
 
@@ -170,16 +158,14 @@ def main():
     result["scf_time_s"] = time.time() - t0
     result["n_orb"] = int(mol.nao)
     result["n_elec"] = int(mol.nelectron)
-    result["jastrow_impl_resolved"] = _resolve_jastrow_terms_impl(
-        args.jastrow_impl, mol.nelectron
-    )
 
     det = SlaterDet.create(mol, mf.mo_coeff)
     # Explicit construction, not BoysHandy.create(mol): BoysHandy.create()
     # no longer implicitly routes to BoysHandyAnalytical (Ke's direction,
     # 2026-07-10 -- explicit choice over silent substitution). This harness
-    # wants the analytic path (that's what "contracted" needs to exist at
-    # all), so it opts in directly.
+    # wants the analytic path (BoysHandyAnalytical's get_pair_grid_grad_lap
+    # override), so it opts in directly -- there is no flag to select it,
+    # class choice is the only dispatch (task #5 PR-B).
     bh = BoysHandyAnalytical.create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
@@ -187,6 +173,9 @@ def main():
     sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
     linear_coeffs = jnp.ones(1)
     params = [jastrow_params, linear_coeffs]
+    # Provenance: which Jastrow classes actually ran, for anyone reading
+    # the JSON later without the script in front of them.
+    result["jastrow_component_classes"] = [type(j).__name__ for j in jastrow.jastrows]
 
     key = random.PRNGKey(43)
     key, subkey = random.split(key)
@@ -243,7 +232,7 @@ def main():
     # --- E_L + Jacobian build (Gauss-Newton path, matches optimizer.py) ---
     def single_local_energy_and_grad(w, p):
         return jax.value_and_grad(
-            lambda pp: eval_local_energy(sj_ansatz, w, pp, jastrow_terms_impl=args.jastrow_impl)[0]
+            lambda pp: eval_local_energy(sj_ansatz, w, pp)[0]
         )(p)
 
     result["jac_batch_size"] = args.jac_batch_size
