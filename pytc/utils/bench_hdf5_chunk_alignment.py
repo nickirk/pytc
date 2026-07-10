@@ -45,8 +45,16 @@ import h5py
 import numpy as np
 
 
-def run_write_bench(path, shape, chunks, panel_blk, label):
-    """Write the full ovvv tensor in tiles of panel_blk slabs on axis 2."""
+def run_write_bench(path, shape, chunks, panel_blk, label, rdcc_nbytes=None):
+    """Write the full ovvv tensor in tiles of panel_blk slabs on axis 2.
+
+    ``rdcc_nbytes``: HDF5's raw-data chunk cache size in bytes. The C
+    library default is 1 MiB -- far smaller than a single ~89 MB aligned
+    chunk at production panel sizes, so aligned chunks may get *no*
+    caching benefit unless this is explicitly raised. ``None`` uses the
+    library default (h5py's out-of-the-box behaviour, what production
+    code gets today since ``xtc_ccsd.py`` never overrides it).
+    """
     nocc, nvir_1, nvir_2, nvir_3 = shape
     tile = np.random.default_rng(0).standard_normal(
         (nocc, nvir_1, panel_blk, nvir_3), dtype=np.float64
@@ -56,8 +64,12 @@ def run_write_bench(path, shape, chunks, panel_blk, label):
     if os.path.exists(path):
         os.remove(path)
 
+    file_kwargs = {}
+    if rdcc_nbytes is not None:
+        file_kwargs["rdcc_nbytes"] = rdcc_nbytes
+
     t_open = time.perf_counter()
-    with h5py.File(path, "w") as f:
+    with h5py.File(path, "w", **file_kwargs) as f:
         dset = f.create_dataset("ovvv", shape, dtype="f8", chunks=chunks)
         actual_chunks = dset.chunks
         t_create = time.perf_counter()
@@ -101,6 +113,15 @@ def main():
                         help="r-slab tile size (default 22 -- mimics resolve_v3o_panel_block_size)")
     parser.add_argument("--tmpdir", default=None,
                         help="Directory for temp HDF5 files (default system tmp)")
+    parser.add_argument("--rdcc-nbytes", type=int, default=None,
+                        help="HDF5 raw-data chunk cache size in bytes, applied to BOTH "
+                             "arms for a fair comparison. Default: library default (1 MiB), "
+                             "matching what production code gets today since xtc_ccsd.py "
+                             "never overrides it. The aligned chunk shape here is "
+                             "typically tens of MB, so the 1 MiB default can't hold even "
+                             "one full chunk -- pass e.g. 268435456 (256 MiB) to test "
+                             "whether that's actually the cause of any aligned-vs-default "
+                             "gap, rather than the chunk-boundary alignment itself.")
     args = parser.parse_args()
 
     nocc, nvir, panel_blk = args.nocc, args.nvir, args.panel_blk
@@ -111,6 +132,7 @@ def main():
     total_bytes = np.prod(shape) * 8
     print(f"Benchmark: ovvv shape={shape}  ({total_bytes / 1e9:.2f} GB on disk)")
     print(f"           panel_blk={panel_blk}  tiles={-(-nvir // panel_blk)}")
+    print(f"           rdcc_nbytes={args.rdcc_nbytes if args.rdcc_nbytes is not None else 'library default (1 MiB)'}")
     print()
 
     tmpdir = args.tmpdir or tempfile.gettempdir()
@@ -118,9 +140,11 @@ def main():
     path_aligned = os.path.join(tmpdir, "bench_ovvv_aligned.h5")
 
     t_default = run_write_bench(path_default, shape, True, panel_blk,
-                                "DEFAULT (h5py auto-chunk, chunks=True)")
+                                "DEFAULT (h5py auto-chunk, chunks=True)",
+                                rdcc_nbytes=args.rdcc_nbytes)
     t_aligned = run_write_bench(path_aligned, shape, aligned_chunks, panel_blk,
-                                "ALIGNED (panel_blk on axis-2)")
+                                "ALIGNED (panel_blk on axis-2)",
+                                rdcc_nbytes=args.rdcc_nbytes)
 
     print("-" * 60)
     print(f"  speedup (DEFAULT / ALIGNED): {t_default / t_aligned:.2f}x")
