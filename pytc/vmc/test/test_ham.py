@@ -405,5 +405,62 @@ class TestHamiltonianGrad(unittest.TestCase):
         self.assertLess(execution_time, 5.0, "Gradient computation took too long (>5s)")
         self.assertLess(mem_increase, 1000, "Gradient memory usage too high (>1GB)")
 
+
+class TestJastrowTermsContracted(unittest.TestCase):
+    """compute_jastrow_terms's jastrow_terms_impl="contracted" path (task
+    #5 PR-B) must give bit-identical results to the default "pairwise"
+    path through the full E_L call chain, on multi-type systems with the
+    same CompositeJastrow (NuclearCusp + BoysHandyAnalytical) production
+    uses. See pytc/jastrow/test/test_bha.py for the lower-level
+    get_pair_grid_grad_lap-vs-reference check.
+    """
+
+    def _build(self, mol):
+        from pytc.jastrow.bha import BoysHandyAnalytical
+        mf = scf.RHF(mol).density_fit()
+        mf.kernel()
+        det = SlaterDet.create(mol, mf.mo_coeff)
+        bha = BoysHandyAnalytical.create(mol)
+        ncusp = NuclearCusp.create(mol, name="ncusp")
+        jastrow = CompositeJastrow.create([ncusp, bha])
+        params = jastrow.init_params()
+        ansatz = SlaterJastrow.create(mol, jastrow, [det])
+        return ansatz, params
+
+    def _check(self, mol, n_walkers=4, seed=11):
+        ansatz, params = self._build(mol)
+        key = random.PRNGKey(seed)
+        walkers = initialize_walkers(ansatz, n_walkers, key=key)
+        for w in range(n_walkers):
+            walker_w = jax.tree_util.tree_map(lambda x: x[w], walkers)
+            e_pairwise = compute_single_walker_energy(
+                ansatz, walker_w, params, jastrow_terms_impl="pairwise")
+            e_contracted = compute_single_walker_energy(
+                ansatz, walker_w, params, jastrow_terms_impl="contracted")
+            np.testing.assert_allclose(
+                float(e_contracted), float(e_pairwise), rtol=0, atol=0,
+                err_msg=f"walker {w}: contracted E_L != pairwise E_L")
+
+    def test_lih(self):
+        mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)
+        self._check(mol)
+
+    def test_h2o(self):
+        mol = gto.M(atom="O 0 0 0; H 0 -1.4 1.1; H 0 1.4 1.1",
+                     basis="sto-3g", unit="Bohr", verbose=0)
+        self._check(mol)
+
+    def test_water_dimer(self):
+        mol = gto.M(atom="""
+O  0.000  0.000  0.000
+H  0.757  0.586  0.000
+H -0.757  0.586  0.000
+O  0.000  0.000  2.900
+H  0.757 -0.586  2.900
+H -0.757 -0.586  2.900
+""", basis="cc-pVDZ", unit="Angstrom", verbose=0)
+        self._check(mol)
+
+
 if __name__ == "__main__":
     unittest.main()
