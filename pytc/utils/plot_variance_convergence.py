@@ -10,7 +10,7 @@ Uses optimize_ref_var's own history tracking (result["cost"]/["energies"]/
 Usage:
     python plot_variance_convergence.py --system water --n-water 25 \
         --basis cc-pVTZ --n-walkers 1000 --n-opt-steps 100 \
-        --jac-batch-size 64 --vmap-batch-size 256 \
+        --jac-batch-size 64 \
         --out h2o25_convergence.json --plot h2o25_convergence.png
 """
 import argparse
@@ -112,16 +112,12 @@ def main():
     p.add_argument("--learning-rate", type=float, default=0.1)
     p.add_argument("--damping", type=float, default=1e-6)
     p.add_argument("--jac-batch-size", type=int, default=0,
-                    help="max_vmap_batch_size passed to optimize_ref_var's Newton "
-                         "optimizer -- match to whatever fits per task #6's Wave-2 "
-                         "per-system sizing (e.g. 64 for (H2O)25, 32 for H300).")
-    p.add_argument("--vmap-batch-size", type=int, default=256,
-                    help="Forwarded as n_mcmc_per_opt's underlying burn-in/MCMC "
-                         "batching is NOT independently exposed by optimize_ref_var "
-                         "today -- this flag is accepted for interface parity with "
-                         "the timing harness but currently only affects burn_in via "
-                         "optimize_ref_var's own internal call; verify against the "
-                         "library signature if burn-in OOMs at this system size.")
+                    help="max_vmap_batch_size passed to optimize_ref_var -- unlike "
+                         "the timing harness, optimize_ref_var exposes only ONE "
+                         "combined batch-size knob shared by burn_in/MCMC/Jacobian, "
+                         "so this sizes all three. Match to whatever fits per task "
+                         "#6's Wave-2 per-system sizing (e.g. 64 for (H2O)25 at "
+                         "moderate W, 32 for W=5000+).")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"),
                     help="Same cache as profile_vmc_ref_var_phases.py; empty string disables.")
