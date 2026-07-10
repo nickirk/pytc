@@ -20,6 +20,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -52,7 +53,7 @@ def h_chain(n, sep=1.8):
 def git_commit():
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=__file__.rsplit("/", 3)[0]
+            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__))
         ).decode().strip()
     except Exception:
         return "unknown"
@@ -130,7 +131,7 @@ def main():
     # compile/steady-state split until that's fixed.
     key, subkey = random.split(key)
     t0 = time.time()
-    walkers, _acc_hist, key, _step_size = burn_in(
+    walkers, _acc_hist, key, adapted_step_size = burn_in(
         det, walkers, n_steps=args.burn_in, step_size=args.step_size,
         key=subkey, params=params, report_interval=10 ** 9,
     )
@@ -138,35 +139,44 @@ def main():
     result["burn_in_total_time_s"] = time.time() - t0
     result["burn_in_time_per_step_s"] = result["burn_in_total_time_s"] / args.burn_in
 
-    # --- One MCMC step (compile + steady-state) ---
-    mcmc_step = make_mcmc_step(det, args.step_size, move_type="one")
+    # --- One MCMC step (compile + steady-state, averaged over 20 steps) ---
+    # Use the burn-in-adapted step_size, matching production (optimization.py:747-748),
+    # so acceptance_rate here is comparable to a real run.
+    mcmc_step = make_mcmc_step(det, adapted_step_size, move_type="one")
     key, subkey = random.split(key)
     t0 = time.time()
     walkers, acc = mcmc_step(det, walkers, subkey, params)
     walkers, acc = block(walkers), block(acc)
     result["mcmc_step_compile_time_s"] = time.time() - t0
 
-    key, subkey = random.split(key)
+    n_mcmc_avg = 20
+    accs = []
     t0 = time.time()
-    walkers, acc = mcmc_step(det, walkers, subkey, params)
-    walkers, acc = block(walkers), block(acc)
-    result["mcmc_step_steady_time_s"] = time.time() - t0
-    result["acceptance_rate"] = float(acc)
+    for _ in range(n_mcmc_avg):
+        key, subkey = random.split(key)
+        walkers, acc = mcmc_step(det, walkers, subkey, params)
+        walkers, acc = block(walkers), block(acc)
+        accs.append(float(acc))
+    result["mcmc_step_steady_time_s"] = (time.time() - t0) / n_mcmc_avg
+    result["acceptance_rate"] = sum(accs) / len(accs)
 
     # --- E_L + Jacobian build (Gauss-Newton path, matches optimizer.py) ---
-    # Use the same vmap pattern as NewtonOptimizer's gauss_newton path.
-    el_grad_vmap = jax.vmap(
+    # Use the same vmap pattern as NewtonOptimizer's gauss_newton path, jitted
+    # as a whole -- production runs this inside the jitted training_step
+    # (optimization.py:776); an eager vmap would overstate this phase's cost
+    # with per-op dispatch overhead, which is precisely the number R1 hinges on.
+    el_grad_jit = jax.jit(jax.vmap(
         lambda w, p: jax.value_and_grad(lambda pp: eval_local_energy(sj_ansatz, w, pp)[0])(p),
         in_axes=(0, None),
-    )
+    ))
 
     t0 = time.time()
-    (energies, grads) = el_grad_vmap(walkers, params)
+    (energies, grads) = el_grad_jit(walkers, params)
     energies, grads = block(energies), block(grads)
     result["jacobian_build_compile_time_s"] = time.time() - t0
 
     t0 = time.time()
-    (energies, grads) = el_grad_vmap(walkers, params)
+    (energies, grads) = el_grad_jit(walkers, params)
     energies, grads = block(energies), block(grads)
     result["jacobian_build_steady_time_s"] = time.time() - t0
 
