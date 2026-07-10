@@ -41,7 +41,15 @@ def _pair_grid_for_component(jastrow, elec_coords, params, jastrow_terms_impl):
 AUTO_CONTRACTED_MIN_ELECTRONS = 32
 
 
+_VALID_JASTROW_TERMS_IMPLS = ("auto", "pairwise", "contracted")
+
+
 def _resolve_jastrow_terms_impl(jastrow_terms_impl, n_electrons):
+    if jastrow_terms_impl not in _VALID_JASTROW_TERMS_IMPLS:
+        raise ValueError(
+            f"jastrow_terms_impl={jastrow_terms_impl!r} is not one of "
+            f"{_VALID_JASTROW_TERMS_IMPLS} (typo?)."
+        )
     if jastrow_terms_impl != "auto":
         return jastrow_terms_impl
     return "contracted" if n_electrons >= AUTO_CONTRACTED_MIN_ELECTRONS else "pairwise"
@@ -80,6 +88,13 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params, jastrow_terms_impl="a
         # CompositeJastrow: sum each sub-jastrow's pair grid, using the
         # fast path per-component where available (params is a list
         # matching components, one entry per sub-jastrow).
+        if len(jastrow_params) != len(components):
+            raise ValueError(
+                f"CompositeJastrow has {len(components)} components but "
+                f"jastrow_params has {len(jastrow_params)} entries -- "
+                f"zip() would silently drop the extras/truncate rather than "
+                f"erroring, producing a wrong (partial) energy with no signal."
+            )
         g1s = None
         l1s = None
         for component, component_params in zip(components, jastrow_params):

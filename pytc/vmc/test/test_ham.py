@@ -520,5 +520,44 @@ class TestJastrowTermsAutoResolution(unittest.TestCase):
             np.testing.assert_allclose(float(e_auto), float(e_pairwise), rtol=0, atol=0)
 
 
+class TestJastrowTermsImplValidation(unittest.TestCase):
+    """jastrow_terms_impl must reject unknown values instead of silently
+    falling back to "pairwise" on a typo (GitHub review, task #5 PR-B)."""
+
+    def test_invalid_impl_raises(self):
+        from pytc.vmc.hamiltonian import _resolve_jastrow_terms_impl
+        with self.assertRaises(ValueError):
+            _resolve_jastrow_terms_impl("contrated", 100)
+
+    def test_valid_impls_do_not_raise(self):
+        from pytc.vmc.hamiltonian import _resolve_jastrow_terms_impl
+        for impl in ("auto", "pairwise", "contracted"):
+            _resolve_jastrow_terms_impl(impl, 10)  # must not raise
+
+
+class TestJastrowTermsCompositeLengthMismatch(unittest.TestCase):
+    """A CompositeJastrow/params length mismatch must raise, not silently
+    truncate via zip() and return a wrong (partial) energy (GitHub review,
+    task #5 PR-B)."""
+
+    def test_extra_component_raises(self):
+        mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)
+        from pytc.jastrow.bha import BoysHandyAnalytical
+        mf = scf.RHF(mol).density_fit()
+        mf.kernel()
+        det = SlaterDet.create(mol, mf.mo_coeff)
+        bha = BoysHandyAnalytical.create(mol)
+        ncusp = NuclearCusp.create(mol, name="ncusp")
+        jastrow = CompositeJastrow.create([ncusp, bha])
+        params = jastrow.init_params()
+        ansatz = SlaterJastrow.create(mol, jastrow, [det])
+        key = random.PRNGKey(17)
+        walkers = initialize_walkers(ansatz, 1, key=key)
+        walker_0 = jax.tree_util.tree_map(lambda x: x[0], walkers)
+        truncated_params = params[:1]  # drop the BHA entry
+        with self.assertRaises(ValueError):
+            compute_single_walker_energy(ansatz, walker_0, truncated_params)
+
+
 if __name__ == "__main__":
     unittest.main()
