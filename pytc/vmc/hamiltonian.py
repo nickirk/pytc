@@ -31,25 +31,45 @@ def _pair_grid_for_component(jastrow, elec_coords, params, jastrow_terms_impl):
     return _pair_grid_vmap(jastrow, elec_coords, params)
 
 
-def compute_jastrow_terms(sj, elec_coords, jastrow_params, jastrow_terms_impl="pairwise"):
+# Empirical crossover between the two impls, measured on real A100 hardware
+# across H-chains and water clusters (task #5 PR-B, #pro-pytc-efficiency-
+# refactor): contracted wins on both speed and Jacobian-phase memory from
+# N=40 up (at N=80 it's the difference between OOM and comfortably fitting),
+# while pairwise wins at N=20 (fixed scan/remat overhead not yet amortized).
+# 32 is the empirical midpoint of that measured N=20..N=40 crossover, not a
+# theoretically derived value -- revisit if new hardware/systems shift it.
+AUTO_CONTRACTED_MIN_ELECTRONS = 32
+
+
+def _resolve_jastrow_terms_impl(jastrow_terms_impl, n_electrons):
+    if jastrow_terms_impl != "auto":
+        return jastrow_terms_impl
+    return "contracted" if n_electrons >= AUTO_CONTRACTED_MIN_ELECTRONS else "pairwise"
+
+
+def compute_jastrow_terms(sj, elec_coords, jastrow_params, jastrow_terms_impl="auto"):
     """Compute ∇J/J and ∇²J/J with explicit parameters.
 
     Args:
-        jastrow_terms_impl: "pairwise" (default) uses the O(N^2*M) per-pair
-            vmap grid for every component, recomputing each electron's
-            atom-distance table on every pair it appears in. "contracted"
-            uses each component's whole-electron-set fast path
-            (``get_pair_grid_grad_lap``) when available -- precomputes
+        jastrow_terms_impl: "auto" (default) picks "contracted" for
+            N >= AUTO_CONTRACTED_MIN_ELECTRONS electrons and "pairwise"
+            below, per the measured A100 crossover (see
+            AUTO_CONTRACTED_MIN_ELECTRONS docstring). "pairwise" uses the
+            O(N^2*M) per-pair vmap grid for every component, recomputing
+            each electron's atom-distance table on every pair it appears
+            in. "contracted" uses each component's whole-electron-set fast
+            path (``get_pair_grid_grad_lap``) when available -- precomputes
             per-electron tables once, O(N*M), and assembles the pair grid
             via an atom-scan instead of a materialized O(N^2*M*T) tensor
             (task #5 PR-B, #pro-pytc-efficiency-refactor). Components
             without a fast path (e.g. NuclearCusp) fall back to the
-            per-pair grid regardless of this flag. Mathematically
-            identical to "pairwise" -- verified to ~1e-16 relative
-            agreement on H2O/(H2O)2/LiH; this flag changes evaluation
-            order/cost only, not the result.
+            per-pair grid regardless of this flag. "contracted" is
+            mathematically identical to "pairwise" -- verified to ~1e-16
+            relative agreement on H2O/(H2O)2/LiH; the flag only changes
+            evaluation order/cost, never the result.
     """
     n_electrons = elec_coords.shape[0]
+    jastrow_terms_impl = _resolve_jastrow_terms_impl(jastrow_terms_impl, n_electrons)
 
     # Fully vectorized implementation (O(N^2) parallelism)
     # Optimized for symmetric Jastrow factors (u(r1, r2) = u(r2, r1))
@@ -143,7 +163,7 @@ def compute_potential_matrix(sj, elec_coords, slater_alpha, slater_beta):
     return B_alpha, B_beta
 
 
-def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl="pairwise"):
+def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl="auto"):
     """Compute energy for a single walker.
 
     Args:
@@ -194,7 +214,7 @@ def compute_single_walker_energy(sj, walker, jastrow_params, jastrow_terms_impl=
     return jnp.real(E_L)
 
 
-def eval_local_energy(sj, walker, params, jastrow_terms_impl="pairwise"):
+def eval_local_energy(sj, walker, params, jastrow_terms_impl="auto"):
     """Evaluate local energy for a SlaterJastrow ansatz.
 
     Args:

@@ -53,7 +53,7 @@ class SlaterJastrow:
     def __call__(self, walker, params):
         return eval_sj(self, walker, params)
 
-    def local_energy(self, walker, params, jastrow_terms_impl="pairwise"):
+    def local_energy(self, walker, params, jastrow_terms_impl="auto"):
         return eval_local_energy(self, walker, params, jastrow_terms_impl=jastrow_terms_impl)
     
     def quantum_force(self, walker, params, cutoff=5.0):
