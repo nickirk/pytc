@@ -45,6 +45,7 @@ from pytc.jastrow.bha import BoysHandyAnalytical
 from pytc.vmc.walker import initialize_walkers
 from pytc.vmc.sampling import burn_in
 from pytc.vmc.hamiltonian import eval_local_energy
+from pytc.vmc.sharding import get_vmap_fn
 
 
 def build_system(n_water, basis, scf_cache_dir):
@@ -89,6 +90,19 @@ def census(energies, label):
     return n_nan, n_inf
 
 
+def inv_norm_census(walkers, label):
+    """Per-walker max|inv_up|/max|inv_down| -- near-degenerate Sherman-Morrison
+    states (a walker close to a nodal-surface crossing) show up here as a
+    large-magnitude inverse entry well before the walker's E_L actually
+    goes non-finite, so this is a leading indicator, not just a post-hoc check."""
+    inv_up_max = np.asarray(jnp.max(jnp.abs(walkers.inv_up), axis=(1, 2)))
+    inv_dn_max = np.asarray(jnp.max(jnp.abs(walkers.inv_down), axis=(1, 2)))
+    print(f"  [{label}] max|inv_up| over walkers: {inv_up_max.max():.6e}  "
+          f"(top-5: {np.sort(inv_up_max)[-5:][::-1]})")
+    print(f"  [{label}] max|inv_down| over walkers: {inv_dn_max.max():.6e}  "
+          f"(top-5: {np.sort(inv_dn_max)[-5:][::-1]})")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-water", type=int, default=25)
@@ -120,9 +134,16 @@ def main():
     linear_coeffs = jnp.ones(1)
     params = [jastrow_params, linear_coeffs]
 
-    batch_eval_energy = jax.jit(jax.vmap(
+    # Grace's W=5000 run OOM'd here (682GB) -- this was a plain unbatched
+    # jax.vmap materializing the whole walker batch at once. Same bug
+    # class as Wave-1's Jacobian phase and Wave-2's burn-in warmup (Felix's
+    # "batching is opt-in per call site" pattern note) -- fixed by reusing
+    # the same get_vmap_fn/folx.batched_vmap helper burn_in already uses,
+    # matched to --vmap-batch-size rather than a separate unbatched vmap.
+    _vmap_fn = get_vmap_fn(max_vmap_batch_size=args.vmap_batch_size)
+    batch_eval_energy = _vmap_fn(
         lambda w, p: eval_local_energy(sj_ansatz, w, p)[0], in_axes=(0, None)
-    ))
+    )
 
     key = random.PRNGKey(0)
     key, subkey = random.split(key)
@@ -142,7 +163,13 @@ def main():
 
         energies = batch_eval_energy(walkers, params)
         jax.block_until_ready(energies)
-        census(energies, f"burn_in_steps={cumulative_steps}")
+        label = f"burn_in_steps={cumulative_steps}"
+        if cumulative_steps == 0:
+            print(f"  [{label}] NOTE: fresh walkers have zeroed Slater caches "
+                  f"-- E_L here is just the ion-ion constant, not a real "
+                  f"pre-burn-in data point (Felix).")
+        census(energies, label)
+        inv_norm_census(walkers, label)
 
 
 if __name__ == "__main__":
