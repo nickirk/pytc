@@ -37,6 +37,24 @@ def h_chain(n, sep=1.8):
     return "; ".join(f"H 0 0 {i*sep}" for i in range(n))
 
 
+def resolve_scf_max_memory(explicit_mb):
+    """PySCF's Mole.max_memory defaults to 4000 MB -- at large nao (e.g.
+    H300, nao~4200) the DF integral build degenerates into tiny batches
+    sized to that tiny budget, becoming I/O-bound instead of BLAS-bound
+    (Felix's diagnosis, 2026-07-11, H300 SCF bottleneck). Read the actual
+    SLURM allocation so PySCF sizes its batches to the real node memory.
+    """
+    if explicit_mb is not None:
+        return explicit_mb
+    slurm_mb = os.environ.get("SLURM_MEM_PER_NODE")
+    if slurm_mb:
+        try:
+            return int(slurm_mb)
+        except ValueError:
+            pass
+    return 64000  # 64 GB fallback for non-SLURM/local runs
+
+
 def git_commit():
     try:
         return subprocess.check_output(
@@ -145,6 +163,18 @@ def main():
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"),
                     help="Same cache as profile_vmc_ref_var_phases.py; empty string disables.")
+    p.add_argument("--scf-max-memory", type=int, default=None,
+                    help="PySCF Mole.max_memory in MB. Default: auto-detect from "
+                         "SLURM_MEM_PER_NODE, else 64000 (64GB) fallback. PySCF's "
+                         "own default is 4000MB, which at large nao (e.g. H300) "
+                         "degenerates the DF integral build into tiny I/O-bound "
+                         "batches (Felix's H300 SCF-bottleneck diagnosis, "
+                         "2026-07-11).")
+    p.add_argument("--scf-log", default=None,
+                    help="Redirect PySCF's own verbose=4 SCF log to this file path "
+                         "(kept off stdout to avoid flooding repeated diagnostic "
+                         "runs). None = PySCF stays silent (verbose=0), matching "
+                         "prior behavior.")
     p.add_argument("--out", default=None, help="Write raw history JSON here.")
     p.add_argument("--plot", default=None, help="Write convergence plot PNG here.")
     p.add_argument("--save-h5", default=None,
@@ -172,7 +202,14 @@ def main():
         "jac_batch_size": args.jac_batch_size,
     }
 
-    mol = gto.M(atom=atom, basis=args.basis, unit=unit, verbose=0)
+    scf_max_memory = resolve_scf_max_memory(args.scf_max_memory)
+    result_meta["scf_max_memory_mb"] = scf_max_memory
+    mol_kwargs = dict(atom=atom, basis=args.basis, unit=unit, max_memory=scf_max_memory)
+    if args.scf_log:
+        mol_kwargs.update(verbose=4, output=args.scf_log)
+    else:
+        mol_kwargs.update(verbose=0)
+    mol = gto.M(**mol_kwargs)
     mf, scf_time_s, scf_cached = run_scf(mol, atom, args.basis, unit, args.scf_cache_dir)
     result_meta["scf_time_s"] = scf_time_s
     result_meta["scf_cached"] = scf_cached
