@@ -130,6 +130,18 @@ def main():
                          "so this sizes all three. Match to whatever fits per task "
                          "#6's Wave-2 per-system sizing (e.g. 64 for (H2O)25 at "
                          "moderate W, 32 for W=5000+).")
+    p.add_argument("--n-mcmc-per-opt", type=int, default=20,
+                    help="Wired to optimize_ref_var(n_mcmc_per_opt=..., "
+                         "n_opt_per_mcmc=1) -- 20 MCMC decorrelation steps between "
+                         "each Newton update, matching production's cadence "
+                         "(confirmed from the H-chain campaign's run.sh). Without "
+                         "this, optimize_ref_var's legacy default "
+                         "(n_mcmc_per_opt unset -> n_opt_per_mcmc=n_steps=20) runs "
+                         "the OPPOSITE pattern -- 20 Newton substeps chained on the "
+                         "SAME frozen walkers per outer step (1000 total Jacobian "
+                         "builds for 50 outer steps, ~35h+, and the exact stale-"
+                         "walker pathology that caused the 2026-07-11 NaN "
+                         "investigation in the first place). Felix's catch.")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"),
                     help="Same cache as profile_vmc_ref_var_phases.py; empty string disables.")
@@ -179,6 +191,8 @@ def main():
         learning_rate=args.learning_rate,
         opt_kwargs={"damping": args.damping, "solver": "exact"},
         key=key,
+        n_mcmc_per_opt=args.n_mcmc_per_opt,
+        n_opt_per_mcmc=1,
     )
     result_meta["total_optimize_time_s"] = time.time() - t0
 
