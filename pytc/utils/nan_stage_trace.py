@@ -1,4 +1,4 @@
-"""Stagewise NaN trace through one Newton/GN optimizer step, matching the
+"""Stagewise NaN trace through the Newton/GN optimizer, matching the
 exact config of the broken (H2O)25 variance-convergence run
 (#proj-pytc-efficiency-refactor, Felix's spec) -- reports isnan/isinf at
 each intermediate stage of the batched Gauss-Newton exact-solver path
@@ -8,17 +8,33 @@ max_vmap_batch_size>0, ``pytc/vmc/optimizer.py:187-297,338-364``):
     energies (inside the loss) -> jac_mat/sum_jtj -> grads_vec ->
     curvature_mat -> solved delta -> updated params
 
-The first stage that goes non-finite is the actual break point. This
-mirrors optimizer.py's math directly (same formulas, same scan structure)
-rather than monkeypatching production code, so it stays a read-only
-diagnostic -- no library changes.
+**Critical structural point (Felix, independently confirmed from code):**
+``optimize_ref_var``'s printed "Step 0" is NOT one Newton update. With
+the default cadence (``n_mcmc_per_opt``/``n_opt_per_mcmc`` both
+unset -> ``n_opt_per_mcmc = n_steps = 20``),
+``make_second_order_training_step``'s Pattern 2
+(``optimization.py:250-274``) chains 20 sequential ``optimizer.step()``
+calls via ``jax.lax.scan`` on the SAME frozen walkers (no MCMC move
+between them), params updating each iteration, and only logs the LAST
+(20th) iteration's stats. A single-Newton-step trace only tests
+iteration 1 -- clean by itself does not mean the whole 20-substep chain
+stays clean. This script iterates the full chain and reports magnitudes
+(not just isnan) at every iteration, since a huge-but-finite delta at
+step 5 can compound into overflow by step 15-20 even though step 1
+alone looks fine.
+
+The first iteration whose per-walker E_L or optimizer stage goes
+non-finite is the actual break point. This mirrors optimizer.py's math
+directly (same formulas, same scan structure, same learning-rate
+schedule) rather than monkeypatching production code, so it stays a
+read-only diagnostic -- no library changes.
 
 Usage (run AFTER nan_census.py has shown clean E_L through the same
 burn-in depth, on the same W/N/basis, so this picks up where that left
 off):
     python -m pytc.utils.nan_stage_trace --n-water 25 --basis cc-pVTZ \
         --n-walkers 5000 --burn-in-steps 1000 --jac-batch-size 32 \
-        --damping 1e-6
+        --damping 1e-6 --n-newton-substeps 20
 """
 import argparse
 import os
@@ -86,9 +102,23 @@ def main():
     p.add_argument("--damping", type=float, default=1e-6)
     p.add_argument("--clip-multiplier", type=float, default=5.0)
     p.add_argument("--learning-rate", type=float, default=0.1)
+    p.add_argument("--min-learning-rate", type=float, default=0.01,
+                    help="NewtonOptimizer's default min_learning_rate floor.")
+    p.add_argument("--lr-decay-rate", type=float, default=1.0)
+    p.add_argument("--lr-transition-steps", type=int, default=100)
+    p.add_argument("--n-newton-substeps", type=int, default=20,
+                    help="Number of chained optimizer.step() calls on the SAME "
+                         "frozen walkers, mirroring Pattern 2's scan (default "
+                         "matches optimize_ref_var's n_opt_per_mcmc=n_steps=20 "
+                         "when neither cadence arg is set).")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"))
     args = p.parse_args()
+
+    def newton_lr(step):
+        """Mirrors create_optimizer's newton_schedule exactly."""
+        base = args.learning_rate / (1.0 + (step / args.lr_transition_steps) * args.lr_decay_rate)
+        return max(base, args.min_learning_rate)
 
     mol, mf = build_system(args.n_water, args.basis, args.scf_cache_dir)
     det = SlaterDet.create(mol, mf.mo_coeff)
@@ -138,12 +168,12 @@ def main():
 
     batch_vmap_fn = jax.vmap
 
-    def masked_energy_batch(bw, bm):
-        e = batch_vmap_fn(single_local_energy, in_axes=(0, None))(bw, params)
+    def masked_energy_batch(bw, bm, p):
+        e = batch_vmap_fn(single_local_energy, in_axes=(0, None))(bw, p)
         return jnp.where(bm, e, 0.0)
 
-    def masked_energy_jacobian_batch(bw, bm, clip_lo, clip_hi):
-        e, jac = batch_vmap_fn(single_local_energy_and_grad, in_axes=(0, None))(bw, params)
+    def masked_energy_jacobian_batch(bw, bm, p, clip_lo, clip_hi):
+        e, jac = batch_vmap_fn(single_local_energy_and_grad, in_axes=(0, None))(bw, p)
         e = jnp.where(bm, e, 0.0)
         if clip_lo is not None:
             e = jnp.where(bm, jnp.clip(e, clip_lo, clip_hi), 0.0)
@@ -152,66 +182,107 @@ def main():
         jac_mat = jnp.where(bm[:, None], jac_mat, 0.0)
         return e, jac_mat
 
-    ok = True
+    _, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
-    # Stage 1: raw energies (unclipped, per-batch scan for the mean/MAD)
-    raw_energies = []
-    for i in range(n_batches):
-        bw_i = jax.tree_util.tree_map(lambda x: x[i], batched_walkers)
-        raw_energies.append(np.asarray(masked_energy_batch(bw_i, batched_mask[i])))
-    raw_energies = np.concatenate(raw_energies)[:n_walkers]
-    ok &= report("stage1_raw_energies", raw_energies)
+    def component_maxabs(p, name):
+        jastrow_params = p[0]
+        # jastrow_params is a list of per-component dicts (CompositeJastrow);
+        # find the BoysHandyAnalytical component's b_raw/d_raw/c_raw.
+        for comp in jastrow_params:
+            if isinstance(comp, dict) and name in comp:
+                return float(jnp.max(jnp.abs(comp[name])))
+        return float("nan")
 
-    e_mean_raw = raw_energies.mean()
-    e_std_raw = np.abs(raw_energies - e_mean_raw).mean()
-    clip_lo = e_mean_raw - args.clip_multiplier * e_std_raw
-    clip_hi = e_mean_raw + args.clip_multiplier * e_std_raw
-    print(f"  (clip bounds: [{clip_lo:.4f}, {clip_hi:.4f}], "
-          f"raw mean={e_mean_raw:.4f}, raw MAD={e_std_raw:.4f})")
+    def run_substep(p, opt_state_step, verbose_stage_report=False):
+        """One Pattern-2 optimizer.step() equivalent on the SAME frozen
+        walkers. Returns (new_p, delta_vec, loss, ok)."""
+        ok = True
 
-    # Stage 2: energies + Jacobian per batch, accumulated
-    params_vec, unravel_fn = jax.flatten_util.ravel_pytree(params)
-    sum_e = sum_e2 = 0.0
-    sum_j = jnp.zeros_like(params_vec)
-    sum_jte = jnp.zeros_like(params_vec)
-    sum_jtj = jnp.zeros((params_vec.shape[0], params_vec.shape[0]))
-    all_jac_finite = True
-    for i in range(n_batches):
-        bw = jax.tree_util.tree_map(lambda x: x[i], batched_walkers)
-        bm = batched_mask[i]
-        e_b, jac_b = masked_energy_jacobian_batch(bw, bm, clip_lo, clip_hi)
-        if not report(f"stage2_batch{i}_energies", e_b):
-            all_jac_finite = False
-        if not report(f"stage2_batch{i}_jacobian", jac_b):
-            all_jac_finite = False
-        sum_e = sum_e + jnp.sum(e_b)
-        sum_e2 = sum_e2 + jnp.sum(e_b**2)
-        sum_j = sum_j + jnp.sum(jac_b, axis=0)
-        sum_jte = sum_jte + jac_b.T @ e_b
-        sum_jtj = sum_jtj + jac_b.T @ jac_b
-    ok &= all_jac_finite
-    ok &= report("stage3_sum_jtj", sum_jtj)
+        raw_energies = []
+        for i in range(n_batches):
+            bw_i = jax.tree_util.tree_map(lambda x: x[i], batched_walkers)
+            raw_energies.append(np.asarray(masked_energy_batch(bw_i, batched_mask[i], p)))
+        raw_energies = np.concatenate(raw_energies)[:n_walkers]
+        if verbose_stage_report:
+            ok &= report("stage1_raw_energies", raw_energies)
 
-    e_mean = sum_e / n_walkers
-    mean_j = sum_j / n_walkers
-    loss = (sum_e2 - n_walkers * e_mean**2) / (n_walkers - 1)
-    ok &= report("stage3_loss", jnp.array([loss]))
+        e_mean_raw = raw_energies.mean()
+        e_std_raw = np.abs(raw_energies - e_mean_raw).mean()
+        clip_lo = e_mean_raw - args.clip_multiplier * e_std_raw
+        clip_hi = e_mean_raw + args.clip_multiplier * e_std_raw
 
-    grads_vec = (2.0 / (n_walkers - 1)) * (sum_jte - n_walkers * mean_j * e_mean)
-    ok &= report("stage4_grads_vec", grads_vec)
+        params_vec, _ = jax.flatten_util.ravel_pytree(p)
+        sum_e = sum_e2 = 0.0
+        sum_j = jnp.zeros_like(params_vec)
+        sum_jte = jnp.zeros_like(params_vec)
+        sum_jtj = jnp.zeros((params_vec.shape[0], params_vec.shape[0]))
+        for i in range(n_batches):
+            bw = jax.tree_util.tree_map(lambda x: x[i], batched_walkers)
+            bm = batched_mask[i]
+            e_b, jac_b = masked_energy_jacobian_batch(bw, bm, p, clip_lo, clip_hi)
+            if verbose_stage_report:
+                ok &= report(f"stage2_batch{i}_energies", e_b)
+                ok &= report(f"stage2_batch{i}_jacobian", jac_b)
+            sum_e = sum_e + jnp.sum(e_b)
+            sum_e2 = sum_e2 + jnp.sum(e_b**2)
+            sum_j = sum_j + jnp.sum(jac_b, axis=0)
+            sum_jte = sum_jte + jac_b.T @ e_b
+            sum_jtj = sum_jtj + jac_b.T @ jac_b
 
-    curvature_mat = (2.0 / n_walkers) * (sum_jtj - n_walkers * jnp.outer(mean_j, mean_j))
-    curvature_mat = curvature_mat + args.damping * jnp.eye(curvature_mat.shape[0])
-    ok &= report("stage5_curvature_mat", curvature_mat)
+        e_mean = sum_e / n_walkers
+        mean_j = sum_j / n_walkers
+        loss = (sum_e2 - n_walkers * e_mean**2) / (n_walkers - 1)
 
-    delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, assume_a="pos")
-    ok &= report("stage6_delta_vec", delta_vec)
+        grads_vec = (2.0 / (n_walkers - 1)) * (sum_jte - n_walkers * mean_j * e_mean)
+        curvature_mat = (2.0 / n_walkers) * (sum_jtj - n_walkers * jnp.outer(mean_j, mean_j))
+        curvature_mat = curvature_mat + args.damping * jnp.eye(curvature_mat.shape[0])
+        delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, assume_a="pos")
 
-    new_params_vec = params_vec + args.learning_rate * delta_vec
-    ok &= report("stage7_new_params", new_params_vec)
+        lr = newton_lr(opt_state_step)
+        new_params_vec = params_vec + lr * delta_vec
+        new_p = unravel_fn(new_params_vec)
 
+        if verbose_stage_report:
+            ok &= report("stage3_sum_jtj", sum_jtj)
+            ok &= report("stage3_loss", jnp.array([loss]))
+            ok &= report("stage4_grads_vec", grads_vec)
+            ok &= report("stage5_curvature_mat", curvature_mat)
+            ok &= report("stage6_delta_vec", delta_vec)
+            ok &= report("stage7_new_params", new_params_vec)
+
+        return new_p, delta_vec, float(loss), lr, ok
+
+    print(f"Chaining {args.n_newton_substeps} optimizer.step() calls on the SAME "
+          f"frozen walkers (Pattern 2), params updating each iteration...")
     print()
-    print("ALL STAGES FINITE" if ok else "NON-FINITE DETECTED -- see the first *** flagged stage above")
+
+    cur_params = params
+    for substep in range(args.n_newton_substeps):
+        verbose = (substep == 0)  # full per-stage report only for iteration 1
+        new_params, delta_vec, loss, lr, ok = run_substep(
+            cur_params, substep, verbose_stage_report=verbose
+        )
+        delta_norm = float(jnp.linalg.norm(delta_vec))
+        b_max = component_maxabs(new_params, "b_raw")
+        d_max = component_maxabs(new_params, "d_raw")
+        c_max = component_maxabs(new_params, "c_raw")
+        status = "OK" if ok else "*** NON-FINITE (see stage report above) ***"
+        print(f"  [substep {substep:2d}] lr={lr:.4f}  loss={loss:.6e}  "
+              f"‖delta‖={delta_norm:.6e}  max|b_raw|={b_max:.6e}  "
+              f"max|d_raw|={d_max:.6e}  max|c_raw|={c_max:.6e}  {status}")
+
+        if not ok or not np.isfinite(loss) or not np.isfinite(delta_norm):
+            print()
+            print(f"NON-FINITE DETECTED at substep {substep} -- see the stage "
+                  f"report above (only printed for substep 0; rerun with "
+                  f"--n-newton-substeps {substep+1} to get the full per-stage "
+                  f"breakdown for the failing substep).")
+            break
+
+        cur_params = new_params
+    else:
+        print()
+        print("ALL SUBSTEPS FINITE through the full chain")
 
 
 if __name__ == "__main__":
