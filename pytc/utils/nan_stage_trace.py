@@ -111,6 +111,14 @@ def main():
                          "frozen walkers, mirroring Pattern 2's scan (default "
                          "matches optimize_ref_var's n_opt_per_mcmc=n_steps=20 "
                          "when neither cadence arg is set).")
+    p.add_argument("--jac-row-clip-multiplier", type=float, default=5.0,
+                    help="Mirrors NewtonOptimizer's jac_row_clip_multiplier fix "
+                         "(0 disables) -- clips each walker's Jacobian row to "
+                         "clip_multiplier*median(row_norm) before accumulation.")
+    p.add_argument("--max-delta-norm", type=float, default=10.0,
+                    help="Mirrors NewtonOptimizer's max_delta_norm trust-region "
+                         "cap (0/negative disables) -- rescales the solved delta "
+                         "if its norm exceeds this.")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"))
     args = p.parse_args()
@@ -184,6 +192,17 @@ def main():
 
     _, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
+    def clip_jac_rows(jac_mat, bm):
+        """Mirrors NewtonOptimizer._clip_jacobian_rows exactly."""
+        if args.jac_row_clip_multiplier is None or args.jac_row_clip_multiplier <= 0:
+            return jac_mat
+        row_norm = jnp.linalg.norm(jac_mat, axis=1)
+        valid_norm = jnp.where(bm, row_norm, jnp.nan)
+        median_norm = jnp.nanmedian(valid_norm)
+        threshold = args.jac_row_clip_multiplier * median_norm
+        scale = jnp.minimum(1.0, threshold / jnp.maximum(row_norm, 1e-300))
+        return jac_mat * scale[:, None]
+
     def component_maxabs(p, name):
         jastrow_params = p[0]
         # jastrow_params is a list of per-component dicts (CompositeJastrow);
@@ -220,6 +239,7 @@ def main():
             bw = jax.tree_util.tree_map(lambda x: x[i], batched_walkers)
             bm = batched_mask[i]
             e_b, jac_b = masked_energy_jacobian_batch(bw, bm, p, clip_lo, clip_hi)
+            jac_b = clip_jac_rows(jac_b, bm)
             if verbose_stage_report:
                 ok &= report(f"stage2_batch{i}_energies", e_b)
                 ok &= report(f"stage2_batch{i}_jacobian", jac_b)
@@ -237,6 +257,11 @@ def main():
         curvature_mat = (2.0 / n_walkers) * (sum_jtj - n_walkers * jnp.outer(mean_j, mean_j))
         curvature_mat = curvature_mat + args.damping * jnp.eye(curvature_mat.shape[0])
         delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, assume_a="pos")
+
+        if args.max_delta_norm is not None and args.max_delta_norm > 0:
+            delta_norm_pre = jnp.linalg.norm(delta_vec)
+            delta_scale = jnp.minimum(1.0, args.max_delta_norm / jnp.maximum(delta_norm_pre, 1e-300))
+            delta_vec = delta_vec * delta_scale
 
         lr = newton_lr(opt_state_step)
         new_params_vec = params_vec + lr * delta_vec

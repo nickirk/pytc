@@ -27,7 +27,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=5.0, max_delta_norm=10.0):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -38,6 +38,18 @@ class NewtonOptimizer:
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
         self.jacobian_sample_size = jacobian_sample_size
         self.clip_multiplier = clip_multiplier
+        # Hardening for the near-nodal walker population that is a
+        # permanent feature of |Det|^2 sampling (goal-1 VMC-scaling NaN
+        # hunt, #proj-pytc-efficiency-refactor): a walker whose Slater
+        # inverse is huge-but-finite (mid nodal-surface crossing) can
+        # still contribute a huge-but-finite Jacobian row, which can pull
+        # a near-flat GN curvature direction to near-zero and produce an
+        # enormous Newton step (observed empirically: |delta|~1770 at a
+        # 43-param (H2O)25/W=5000 production point, loss exploding 3600x
+        # in the very next chained sub-step). Both defaults are Felix's
+        # values from that diagnosis; 0/None disables either independently.
+        self.jac_row_clip_multiplier = jac_row_clip_multiplier
+        self.max_delta_norm = max_delta_norm
 
     def _get_vmap(self):
         """Return the appropriate vmap implementation.
@@ -105,6 +117,34 @@ class NewtonOptimizer:
             [jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat],
             axis=1,
         )
+
+    @staticmethod
+    def _clip_jacobian_rows(jac_mat, clip_multiplier, mask=None):
+        """Clip each walker's Jacobian row to at most
+        ``clip_multiplier * median(row_norm)`` (over the unmasked rows),
+        rescaling the whole row down (direction preserved) rather than
+        clamping individual entries -- same spirit as the existing
+        energy MAD-clipping, applied to row *scale* so a single
+        near-nodal walker's huge-but-finite row can't dominate
+        ``sum_jte``/``sum_jtj``. Median (not mean) since it is itself
+        robust to the exact walkers this is meant to guard against.
+        Statistics are computed within the same batch/set being clipped
+        (no extra Jacobian pass) -- cheap, at the cost of being a local
+        rather than a whole-walker-population estimate.
+        """
+        if clip_multiplier is None or clip_multiplier <= 0:
+            return jac_mat
+        row_norm = jnp.linalg.norm(jac_mat, axis=1)
+        if mask is not None:
+            # Masked (padding) rows are already zero; excluding them from
+            # the median keeps the threshold meaningful under padding.
+            valid_norm = jnp.where(mask, row_norm, jnp.nan)
+            median_norm = jnp.nanmedian(valid_norm)
+        else:
+            median_norm = jnp.median(row_norm)
+        threshold = clip_multiplier * median_norm
+        scale = jnp.minimum(1.0, threshold / jnp.maximum(row_norm, 1e-300))
+        return jac_mat * scale[:, None]
 
     def init(self, params, rng, batch):
         return jnp.array(0, dtype=jnp.int32)  # step count
@@ -217,6 +257,9 @@ class NewtonOptimizer:
                             energies_batch = jnp.where(batch_mask, clipped, 0.0)
                         jac_mat_batch = self._flatten_jacobian(jac_batch, batch_size)
                         jac_mat_batch = jnp.where(batch_mask[:, None], jac_mat_batch, 0.0)
+                        jac_mat_batch = self._clip_jacobian_rows(
+                            jac_mat_batch, self.jac_row_clip_multiplier, mask=batch_mask
+                        )
                         return energies_batch, jac_mat_batch
 
                     clip_lo = None
@@ -316,6 +359,7 @@ class NewtonOptimizer:
                         )
 
                     jac_mat = self._flatten_jacobian(jac, n_walkers)
+                    jac_mat = self._clip_jacobian_rows(jac_mat, self.jac_row_clip_multiplier)
 
                     # Compute variance loss and auxiliary data analytically from energies
                     e_mean = jnp.mean(energies)
@@ -353,7 +397,19 @@ class NewtonOptimizer:
                 solve_kwargs["assume_a"] = "pos"
                 
             delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, **solve_kwargs)
-            
+
+            # Trust-region cap: a near-flat curvature direction (small
+            # eigenvalue relative to damping) can produce an enormous
+            # step even though the solve itself stays finite -- observed
+            # empirically at production scale (|delta|~1770 for a
+            # 43-param GN system, loss exploding 3600x the very next
+            # chained sub-step). Rescale the whole step (direction
+            # preserved) rather than clamp components.
+            if self.max_delta_norm is not None and self.max_delta_norm > 0:
+                delta_norm = jnp.linalg.norm(delta_vec)
+                delta_scale = jnp.minimum(1.0, self.max_delta_norm / jnp.maximum(delta_norm, 1e-300))
+                delta_vec = delta_vec * delta_scale
+
             # Unflatten delta to match params structure
             delta = unravel_fn(delta_vec)
             
@@ -525,6 +581,8 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             solve_kwargs=merged_kwargs.get("solve_kwargs", None),
             jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
             clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
+            jac_row_clip_multiplier=merged_kwargs.get("jac_row_clip_multiplier", 5.0),
+            max_delta_norm=merged_kwargs.get("max_delta_norm", 10.0),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
