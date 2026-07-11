@@ -109,8 +109,20 @@ def main():
                     help="Felix's spec for the first GPU convergence run: 50 steps, "
                          "extend later if the curve looks healthy.")
     p.add_argument("--step-size", type=float, default=0.02)
-    p.add_argument("--learning-rate", type=float, default=0.1)
-    p.add_argument("--damping", type=float, default=1e-6)
+    p.add_argument("--learning-rate", type=float, default=0.01,
+                    help="Matches production's phase-B learning rate (confirmed "
+                         "from the H-chain campaign's run.sh COMMON_FLAGS). The "
+                         "original 0.1 default was an untracked choice from an "
+                         "early small-molecule stability note that never matched "
+                         "production practice -- 10x too large, part of what drove "
+                         "the (H2O)25/W=5000 Newton step into the b/d-saturation "
+                         "plateau (2026-07-11 NaN investigation).")
+    p.add_argument("--damping", type=float, default=1e-3,
+                    help="Matches production's effective damping (create_optimizer's "
+                         "own default -- production's run_opt.py never overrides "
+                         "it). The original 1e-6 default was 1000x less "
+                         "regularization than production practice, same "
+                         "untracked-default issue as learning-rate above.")
     p.add_argument("--jac-batch-size", type=int, default=0,
                     help="max_vmap_batch_size passed to optimize_ref_var -- unlike "
                          "the timing harness, optimize_ref_var exposes only ONE "
