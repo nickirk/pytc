@@ -39,7 +39,7 @@ from jax import random
 from pyscf import gto, scf
 
 from pytc.ansatz.sj import SlaterJastrow
-from pytc.ansatz.det import SlaterDet
+from pytc.ansatz.det import SlaterDet, eval_det_value_and_grad
 from pytc.jastrow import NuclearCusp, CompositeJastrow
 from pytc.jastrow.bha import BoysHandyAnalytical
 from pytc.vmc.walker import initialize_walkers
@@ -101,6 +101,55 @@ def inv_norm_census(walkers, label):
           f"(top-5: {np.sort(inv_up_max)[-5:][::-1]})")
     print(f"  [{label}] max|inv_down| over walkers: {inv_dn_max.max():.6e}  "
           f"(top-5: {np.sort(inv_dn_max)[-5:][::-1]})")
+    return np.maximum(inv_up_max, inv_dn_max)
+
+
+def exact_vs_sm_comparison(det, sj_ansatz, walkers, params, worst_norms, label, top_k=10):
+    """For the top_k walkers by SM inv-norm, recompute the EXACT inverse
+    (jnp.linalg.inv, via eval_det_value_and_grad -- no rank-1 updates
+    involved) from the same positions, and compare against the cached
+    SM-updated inv.
+
+    Distinguishes (Felix):
+      - genuinely near a nodal surface: exact inv is ALSO huge -> the SM
+        divide-by-small-ratio is doing the right thing given the physics,
+        fix belongs at move time (a ratio guard -> recompute that walker
+        exactly instead of SM-updating it).
+      - accumulated SM drift over many rank-1 updates: exact inv is
+        O(1)-O(10) -> the cached state is simply wrong from roundoff
+        accumulation, fix is periodic exact recomputation every K steps.
+    """
+    idx = np.argsort(worst_norms)[-top_k:][::-1]
+    idx_arr = jnp.asarray(idx)
+    sub_walkers = jax.tree_util.tree_map(lambda x: x[idx_arr], walkers)
+
+    (_, _), exact_walkers = eval_det_value_and_grad(det, sub_walkers)
+
+    inv_up_sm = np.asarray(sub_walkers.inv_up)
+    inv_dn_sm = np.asarray(sub_walkers.inv_down)
+    inv_up_exact = np.asarray(exact_walkers.inv_up)
+    inv_dn_exact = np.asarray(exact_walkers.inv_down)
+
+    e_sm = np.asarray(jax.vmap(
+        lambda w, p: eval_local_energy(sj_ansatz, w, p)[0], in_axes=(0, None)
+    )(sub_walkers, params))
+    e_exact = np.asarray(jax.vmap(
+        lambda w, p: eval_local_energy(sj_ansatz, w, p)[0], in_axes=(0, None)
+    )(exact_walkers, params))
+
+    print(f"  [{label}] exact-vs-SM inverse comparison, top-{top_k} by inv-norm:")
+    print(f"    {'walker':>8}  {'|inv_SM|':>12}  {'|inv_exact|':>12}  "
+          f"{'rel_err_up':>12}  {'rel_err_dn':>12}  {'E_L(SM)':>14}  {'E_L(exact)':>14}")
+    for k in range(top_k):
+        w = idx[k]
+        norm_exact_up = np.linalg.norm(inv_up_exact[k])
+        norm_exact_dn = np.linalg.norm(inv_dn_exact[k])
+        rel_err_up = np.linalg.norm(inv_up_sm[k] - inv_up_exact[k]) / max(norm_exact_up, 1e-300)
+        rel_err_dn = np.linalg.norm(inv_dn_sm[k] - inv_dn_exact[k]) / max(norm_exact_dn, 1e-300)
+        print(f"    {w:>8d}  {worst_norms[w]:>12.4e}  "
+              f"{max(norm_exact_up, norm_exact_dn):>12.4e}  "
+              f"{rel_err_up:>12.4e}  {rel_err_dn:>12.4e}  "
+              f"{e_sm[k]:>14.4f}  {e_exact[k]:>14.4f}")
 
 
 def main():
@@ -112,6 +161,12 @@ def main():
                     help="Comma-separated cumulative burn-in step counts to census at.")
     p.add_argument("--step-size", type=float, default=0.02)
     p.add_argument("--vmap-batch-size", type=int, default=256)
+    p.add_argument("--exact-vs-sm-top-k", type=int, default=10,
+                    help="Recompute the exact inverse (no SM rank-1 updates) for "
+                         "the top-K walkers by SM inv-norm at each checkpoint, and "
+                         "compare vs the cached SM state + E_L(SM) vs E_L(exact) "
+                         "(Felix's decisive test -- distinguishes 'genuinely near a "
+                         "nodal surface' from 'accumulated SM drift'). 0 disables.")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"))
     args = p.parse_args()
@@ -169,7 +224,10 @@ def main():
                   f"-- E_L here is just the ion-ion constant, not a real "
                   f"pre-burn-in data point (Felix).")
         census(energies, label)
-        inv_norm_census(walkers, label)
+        worst_norms = inv_norm_census(walkers, label)
+        if args.exact_vs_sm_top_k > 0 and cumulative_steps > 0:
+            exact_vs_sm_comparison(det, sj_ansatz, walkers, params, worst_norms,
+                                   label, top_k=args.exact_vs_sm_top_k)
 
 
 if __name__ == "__main__":
