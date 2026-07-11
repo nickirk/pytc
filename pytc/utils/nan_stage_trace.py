@@ -115,10 +115,11 @@ def main():
                     help="Mirrors NewtonOptimizer's jac_row_clip_multiplier fix "
                          "(0 disables) -- clips each walker's Jacobian row to "
                          "clip_multiplier*median(row_norm) before accumulation.")
-    p.add_argument("--max-delta-norm", type=float, default=10.0,
-                    help="Mirrors NewtonOptimizer's max_delta_norm trust-region "
-                         "cap (0/negative disables) -- rescales the solved delta "
-                         "if its norm exceeds this.")
+    p.add_argument("--max-delta-norm", type=float, default=0.5,
+                    help="Mirrors NewtonOptimizer's max_delta_norm -- a RELATIVE "
+                         "trust-region radius multiplier (trust_radius = "
+                         "max_delta_norm * max(1, ||params||)), 0/negative "
+                         "disables. NOT a fixed delta-norm cap.")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"))
     args = p.parse_args()
@@ -178,22 +179,31 @@ def main():
 
     def masked_energy_batch(bw, bm, p):
         e = batch_vmap_fn(single_local_energy, in_axes=(0, None))(bw, p)
+        bm = bm & jnp.isfinite(e)
         return jnp.where(bm, e, 0.0)
 
     def masked_energy_jacobian_batch(bw, bm, p, clip_lo, clip_hi):
+        orig_bm = bm
         e, jac = batch_vmap_fn(single_local_energy_and_grad, in_axes=(0, None))(bw, p)
+        jac_flat, _ = jax.tree_util.tree_flatten(jac)
+        jac_mat = jnp.concatenate([jnp.reshape(leaf, (batch_size, -1)) for leaf in jac_flat], axis=1)
+        # Exclude genuinely non-finite walkers (energy OR any jacobian
+        # component) BEFORE any clipping runs -- mirrors NewtonOptimizer's
+        # finite-masking fix. Clipping can only rescale huge-but-finite
+        # values, not NaN/inf.
+        bm = orig_bm & jnp.isfinite(e) & jnp.all(jnp.isfinite(jac_mat), axis=1)
+        n_dropped = jnp.sum((~bm) & orig_bm).astype(jnp.int32)
         e = jnp.where(bm, e, 0.0)
         if clip_lo is not None:
             e = jnp.where(bm, jnp.clip(e, clip_lo, clip_hi), 0.0)
-        jac_flat, _ = jax.tree_util.tree_flatten(jac)
-        jac_mat = jnp.concatenate([jnp.reshape(leaf, (batch_size, -1)) for leaf in jac_flat], axis=1)
         jac_mat = jnp.where(bm[:, None], jac_mat, 0.0)
-        return e, jac_mat
+        return e, jac_mat, bm, n_dropped
 
     _, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
     def clip_jac_rows(jac_mat, bm):
-        """Mirrors NewtonOptimizer._clip_jacobian_rows exactly."""
+        """Mirrors NewtonOptimizer._clip_jacobian_rows exactly (bm here is
+        already finite-masked by the caller)."""
         if args.jac_row_clip_multiplier is None or args.jac_row_clip_multiplier <= 0:
             return jac_mat
         row_norm = jnp.linalg.norm(jac_mat, axis=1)
@@ -235,11 +245,13 @@ def main():
         sum_j = jnp.zeros_like(params_vec)
         sum_jte = jnp.zeros_like(params_vec)
         sum_jtj = jnp.zeros((params_vec.shape[0], params_vec.shape[0]))
+        n_dropped_total = 0
         for i in range(n_batches):
             bw = jax.tree_util.tree_map(lambda x: x[i], batched_walkers)
             bm = batched_mask[i]
-            e_b, jac_b = masked_energy_jacobian_batch(bw, bm, p, clip_lo, clip_hi)
-            jac_b = clip_jac_rows(jac_b, bm)
+            e_b, jac_b, finite_bm, n_dropped_batch = masked_energy_jacobian_batch(bw, bm, p, clip_lo, clip_hi)
+            jac_b = clip_jac_rows(jac_b, finite_bm)
+            n_dropped_total = n_dropped_total + n_dropped_batch
             if verbose_stage_report:
                 ok &= report(f"stage2_batch{i}_energies", e_b)
                 ok &= report(f"stage2_batch{i}_jacobian", jac_b)
@@ -259,8 +271,12 @@ def main():
         delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, assume_a="pos")
 
         if args.max_delta_norm is not None and args.max_delta_norm > 0:
+            # Relative trust-region radius (Felix): a fixed constant derived
+            # from already-diverged deltas stays enormous once params are
+            # back to a normal ~O(1) scale.
+            trust_radius = args.max_delta_norm * max(1.0, float(jnp.linalg.norm(params_vec)))
             delta_norm_pre = jnp.linalg.norm(delta_vec)
-            delta_scale = jnp.minimum(1.0, args.max_delta_norm / jnp.maximum(delta_norm_pre, 1e-300))
+            delta_scale = jnp.minimum(1.0, trust_radius / jnp.maximum(delta_norm_pre, 1e-300))
             delta_vec = delta_vec * delta_scale
 
         lr = newton_lr(opt_state_step)
@@ -275,7 +291,7 @@ def main():
             ok &= report("stage6_delta_vec", delta_vec)
             ok &= report("stage7_new_params", new_params_vec)
 
-        return new_p, delta_vec, float(loss), lr, ok
+        return new_p, delta_vec, float(loss), lr, ok, int(n_dropped_total)
 
     print(f"Chaining {args.n_newton_substeps} optimizer.step() calls on the SAME "
           f"frozen walkers (Pattern 2), params updating each iteration...")
@@ -284,7 +300,7 @@ def main():
     cur_params = params
     for substep in range(args.n_newton_substeps):
         verbose = (substep == 0)  # full per-stage report only for iteration 1
-        new_params, delta_vec, loss, lr, ok = run_substep(
+        new_params, delta_vec, loss, lr, ok, n_dropped = run_substep(
             cur_params, substep, verbose_stage_report=verbose
         )
         delta_norm = float(jnp.linalg.norm(delta_vec))
@@ -294,7 +310,7 @@ def main():
         status = "OK" if ok else "*** NON-FINITE (see stage report above) ***"
         print(f"  [substep {substep:2d}] lr={lr:.4f}  loss={loss:.6e}  "
               f"‖delta‖={delta_norm:.6e}  max|b_raw|={b_max:.6e}  "
-              f"max|d_raw|={d_max:.6e}  max|c_raw|={c_max:.6e}  {status}")
+              f"max|d_raw|={d_max:.6e}  max|c_raw|={c_max:.6e}  n_dropped={n_dropped}  {status}")
 
         if not ok or not np.isfinite(loss) or not np.isfinite(delta_norm):
             print()
