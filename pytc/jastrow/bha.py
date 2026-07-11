@@ -18,7 +18,7 @@ class BoysHandyAnalytical(BoysHandy):
     nuclei_mask_by_type: jax.Array = struct.field(default=None)
 
     @classmethod
-    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-8, name=None):
+    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None):
         inst = super().create(
             mol,
             terms_per_nucleus=terms_per_nucleus,
@@ -49,7 +49,15 @@ class BoysHandyAnalytical(BoysHandy):
         )
 
     def _scaled_r_and_derivs(self, r_ref, r_target, scale):
-        """Return scaled distance plus gradient/laplacian wrt ``r_ref``."""
+        """Return scaled distance plus gradient/laplacian wrt ``r_ref``.
+
+        ``lap`` includes a ``2*f_d1/dist`` term -- ``dist`` (from
+        ``_safe_norm``) must not be floored above the true near-coalescence
+        scale this is meant to capture, or the laplacian incorrectly
+        plateaus instead of diverging as r->0 (the correct cusp behavior;
+        confirmed against BoysHandy's autodiff reference). This is why
+        ``epsilon`` must match BoysHandy's convention (see ``create``).
+        """
         diff = r_ref - r_target
         dist = self._safe_norm(diff)
         denom = 1.0 + scale * dist

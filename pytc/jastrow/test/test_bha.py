@@ -320,5 +320,128 @@ class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
         self._check(get_h2_molecule(), n_elec=2, key_seed=7)
 
 
+class TestBoysHandyAnalyticalNearCoalescence(unittest.TestCase):
+    """Regression suite for the epsilon-default bug (2026-07-11,
+    #proj-pytc-efficiency-refactor): ``BoysHandyAnalytical.create()``
+    defaulted ``epsilon=1e-8`` while ``BoysHandy.create()`` defaults to
+    ``1e-16``. ``_safe_norm``'s epsilon floors the e-e distance at
+    ``sqrt(epsilon)`` -- with the mismatched default, BHA's Laplacian
+    (which has an explicit ``2*f_d1/dist`` term) incorrectly PLATEAUED
+    instead of diverging as two electrons approach coalescence, while BH's
+    reference kept the correct ``1/r`` cusp growth. Diverged to a
+    completely different value (including sign flips) from BH by
+    separations as mild as 1e-4 bohr, with the tighter epsilon default
+    now fixed. This suite locks BH-vs-BHA agreement across the whole
+    near-coalescence regime, in both VALUES and PARAMETER GRADIENTS --
+    the original validation gap: the pre-existing pair-grid test only
+    checked forward values at random (not near-degenerate) configurations,
+    and no test differentiated w.r.t. Jastrow params at all, so this
+    exact bug shipped undetected.
+    """
+
+    EPS_SERIES = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
+    # Below this scale both BH (floor ~1e-8) and BHA (now matched) hit
+    # their own shared numerical floor symmetrically -- that's expected
+    # convergence of the safety mechanism itself, not a BH-vs-BHA gap,
+    # so it's intentionally excluded from the regression tolerance below.
+
+    def _make_pair(self, mol, n_elec, key_seed, eps, electron_idx=1):
+        bh = BoysHandy.create(mol)
+        bha = BoysHandyAnalytical.create(mol)
+        self.assertEqual(bha.epsilon, bh.epsilon,
+                          "BoysHandyAnalytical.create()'s default epsilon must "
+                          "match BoysHandy.create()'s -- this is exactly the "
+                          "regression this suite guards against.")
+        params = bh.init_params()
+        key = random.PRNGKey(key_seed)
+        elec_coords = random.normal(key, (n_elec, 3)) * 1.5
+        elec_coords = elec_coords.at[electron_idx].set(
+            elec_coords[0] + jnp.array([eps, 0.0, 0.0])
+        )
+        return bh, bha, params, elec_coords
+
+    def _check_values(self, mol, n_elec, key_seed):
+        n = n_elec
+        mask = 1.0 - jnp.eye(n)
+        for eps in self.EPS_SERIES:
+            bh, bha, params, ec = self._make_pair(mol, n, key_seed, eps)
+            g_bh, l_bh = bh.get_pair_grid_grad_lap(ec, params)
+            g_bha, l_bha = bha.get_pair_grid_grad_lap(ec, params)
+            # Diagonal (i==j self-pair, r=0 exactly) is meaningless and
+            # masked out by compute_jastrow_terms before use in
+            # production -- mask it here too so the comparison matches
+            # what actually reaches E_L.
+            g_bh_m, g_bha_m = g_bh * mask[:, :, None], g_bha * mask[:, :, None]
+            l_bh_m, l_bha_m = l_bh * mask, l_bha * mask
+            np.testing.assert_allclose(
+                np.array(g_bha_m), np.array(g_bh_m), rtol=1e-4, atol=1e-4,
+                err_msg=f"grad mismatch at eps={eps:.0e}",
+            )
+            np.testing.assert_allclose(
+                np.array(l_bha_m), np.array(l_bh_m), rtol=1e-4, atol=1e-4,
+                err_msg=f"laplacian mismatch at eps={eps:.0e}",
+            )
+
+    def _check_param_grads(self, mol, n_elec, key_seed):
+        for eps in self.EPS_SERIES:
+            bh, bha, params, ec = self._make_pair(mol, n_elec, key_seed, eps)
+            n = n_elec
+            mask = 1.0 - jnp.eye(n)
+
+            def scalar(get_fn, p):
+                g, l = get_fn(ec, p)
+                return jnp.sum((g * mask[:, :, None]) ** 2) + jnp.sum((l * mask) ** 2)
+
+            _, grad_bh = jax.value_and_grad(lambda p: scalar(bh.get_pair_grid_grad_lap, p))(params)
+            _, grad_bha = jax.value_and_grad(lambda p: scalar(bha.get_pair_grid_grad_lap, p))(params)
+            for key_name in grad_bh:
+                gb, ga = grad_bh[key_name], grad_bha[key_name]
+                self.assertFalse(bool(jnp.any(jnp.isnan(ga))), f"{key_name} grad NaN at eps={eps:.0e}")
+                self.assertFalse(bool(jnp.any(jnp.isinf(ga))), f"{key_name} grad Inf at eps={eps:.0e}")
+                np.testing.assert_allclose(
+                    np.array(ga), np.array(gb), rtol=1e-3, atol=1e-3,
+                    err_msg=f"{key_name} param-gradient mismatch at eps={eps:.0e}",
+                )
+
+    def test_values_same_spin_pair_h2o(self):
+        # electron_idx=1: both indices 0,1 fall in the same spin block for
+        # H2O (5 up / 5 down) -- same-spin coalescence.
+        self._check_values(get_h2o_molecule(), n_elec=10, key_seed=10)
+
+    def test_values_opposite_spin_pair_h2o(self):
+        # electron_idx=5: index 0 (alpha block) vs index 5 (beta block,
+        # first beta electron for 5up/5down H2O) -- opposite-spin coalescence.
+        n = 10
+        bh = BoysHandy.create(get_h2o_molecule())
+        bha = BoysHandyAnalytical.create(get_h2o_molecule())
+        params = bh.init_params()
+        mask = 1.0 - jnp.eye(n)
+        for eps in self.EPS_SERIES:
+            key = random.PRNGKey(11)
+            elec_coords = random.normal(key, (n, 3)) * 1.5
+            elec_coords = elec_coords.at[5].set(elec_coords[0] + jnp.array([eps, 0.0, 0.0]))
+            g_bh, l_bh = bh.get_pair_grid_grad_lap(elec_coords, params)
+            g_bha, l_bha = bha.get_pair_grid_grad_lap(elec_coords, params)
+            np.testing.assert_allclose(
+                np.array(g_bha * mask[:, :, None]), np.array(g_bh * mask[:, :, None]),
+                rtol=1e-4, atol=1e-4, err_msg=f"opposite-spin grad mismatch at eps={eps:.0e}",
+            )
+            np.testing.assert_allclose(
+                np.array(l_bha * mask), np.array(l_bh * mask),
+                rtol=1e-4, atol=1e-4, err_msg=f"opposite-spin laplacian mismatch at eps={eps:.0e}",
+            )
+
+    def test_param_gradients_near_coalescence_h2o(self):
+        self._check_param_grads(get_h2o_molecule(), n_elec=10, key_seed=10)
+
+    def test_epsilon_defaults_match(self):
+        """Direct guard on the actual bug: the two classes' create()
+        defaults must agree, or _safe_norm's floor silently diverges
+        between the reference and fast paths again."""
+        bh = BoysHandy.create(get_h2o_molecule())
+        bha = BoysHandyAnalytical.create(get_h2o_molecule())
+        self.assertEqual(bh.epsilon, bha.epsilon)
+
+
 if __name__ == "__main__":
     unittest.main()
