@@ -147,6 +147,18 @@ def main():
                     help="Same cache as profile_vmc_ref_var_phases.py; empty string disables.")
     p.add_argument("--out", default=None, help="Write raw history JSON here.")
     p.add_argument("--plot", default=None, help="Write convergence plot PNG here.")
+    p.add_argument("--save-h5", default=None,
+                    help="Write the FULL optimization history (including every "
+                         "step's params, via save_optimization_history) to this "
+                         "HDF5 path -- the JSON --out only saves cost/energies/"
+                         "stds/acceptance, not params, so this is what a "
+                         "subsequent --init-params-from run needs.")
+    p.add_argument("--init-params-from", default=None,
+                    help="Warm-start from a prior run's saved HDF5 history "
+                         "(--save-h5 output) -- uses that run's LAST step's "
+                         "params instead of jastrow.init_params(), for chaining "
+                         "an aggressive phase-A run into a phase-B refinement "
+                         "(Felix's two-phase production recipe, 2026-07-11).")
     args = p.parse_args()
 
     atom, unit, label = build_system(args)
@@ -171,10 +183,20 @@ def main():
     bh = BoysHandyAnalytical.create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
-    jastrow_params = jastrow.init_params()
     sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
-    linear_coeffs = jnp.ones(1)
-    params = [jastrow_params, linear_coeffs]
+
+    if args.init_params_from:
+        from pytc.vmc.mcmc_utils import load_optimization_history
+        prior = load_optimization_history(args.init_params_from)
+        # params leaves are stacked along axis 0 (the step) -- take the last.
+        params = jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf[-1]), prior["params"])
+        result_meta["init_params_from"] = args.init_params_from
+        print(f"Warm-starting from {args.init_params_from} (last of "
+              f"{jax.tree_util.tree_leaves(prior['params'])[0].shape[0]} saved steps)")
+    else:
+        jastrow_params = jastrow.init_params()
+        linear_coeffs = jnp.ones(1)
+        params = [jastrow_params, linear_coeffs]
 
     key = random.PRNGKey(43)
 
@@ -195,6 +217,11 @@ def main():
         n_opt_per_mcmc=1,
     )
     result_meta["total_optimize_time_s"] = time.time() - t0
+
+    if args.save_h5:
+        from pytc.vmc.mcmc_utils import save_optimization_history
+        save_optimization_history(opt_result, args.save_h5)
+        print(f"Wrote {args.save_h5}")
 
     cost = np.asarray(opt_result["cost"])
     energies = np.asarray(opt_result["energies"])
