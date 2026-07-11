@@ -49,14 +49,21 @@ from pyscf import gto, scf
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
 from pytc.jastrow import NuclearCusp, CompositeJastrow
+from pytc.jastrow.bh import BoysHandy
 from pytc.jastrow.bha import BoysHandyAnalytical
 from pytc.vmc.walker import initialize_walkers
 from pytc.vmc.sampling import burn_in
 
 
+_SINGLE_H2O_GEOM = "O 0.000000 0.000000 0.117300; H 0.000000 0.757200 -0.469200; H 0.000000 -0.757200 -0.469200"
+
+
 def build_system(n_water, basis, scf_cache_dir):
-    from pytc.utils.gen_water_cluster import build_water_cluster
-    atom = build_water_cluster(n_water)
+    if n_water == 1:
+        atom = _SINGLE_H2O_GEOM
+    else:
+        from pytc.utils.gen_water_cluster import build_water_cluster
+        atom = build_water_cluster(n_water)
     mol = gto.M(atom=atom, basis=basis, unit="Angstrom", verbose=0)
     mf = scf.RHF(mol).density_fit()
     cache_path = None
@@ -122,6 +129,13 @@ def main():
                          "disables. NOT a fixed delta-norm cap.")
     p.add_argument("--scf-cache-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scf_cache"))
+    p.add_argument("--jastrow-class", choices=["bh", "bha"], default="bha",
+                    help="bh = original BoysHandy per-pair vmap path (pre-R1-"
+                         "refactor behavior); bha = BoysHandyAnalytical, the R1 "
+                         "fast contracted-tensor override. Ke's hypothesis "
+                         "(2026-07-11): the NaN may be a bug introduced by the "
+                         "R1 refactor, not a Newton-optimizer numerics issue -- "
+                         "run both and compare.")
     args = p.parse_args()
 
     def newton_lr(step):
@@ -131,7 +145,7 @@ def main():
 
     mol, mf = build_system(args.n_water, args.basis, args.scf_cache_dir)
     det = SlaterDet.create(mol, mf.mo_coeff)
-    bh = BoysHandyAnalytical.create(mol)
+    bh = (BoysHandy if args.jastrow_class == "bh" else BoysHandyAnalytical).create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
     jastrow_params = jastrow.init_params()
