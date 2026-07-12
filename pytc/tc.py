@@ -369,15 +369,18 @@ class TC:
     nocc: int = struct.field(pytree_node=False, default=None)
 
     @classmethod
-    def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
+    def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2, grid_chunk_size=None):
         """Initialize TC object from PySCF mean-field object.
-        
+
         Args:
             mf: PySCF mean-field object
             jastrow_factor: JAX Jastrow factor instance
             mo_coeff: Optional molecular orbital coefficients
             grid_lvl: Grid level for numerical integration
-            
+            grid_chunk_size: Number of grid points to transform to MO basis
+                at a time (see below). None (default) auto-sizes from a
+                fixed ~2GiB per-chunk gradient-buffer target.
+
         Returns:
             TC: Initialized TC object
         """
@@ -386,17 +389,17 @@ class TC:
             mo_coeff = mf.mo_coeff
         n_orb = mo_coeff.shape[1]
         nocc = int(np.sum(mf.mo_occ > 0))
-        
+
         logger.info(f"TC: Initializing grid with level {grid_lvl}")
         start_time = time.perf_counter()
         grids = dft.gen_grid.Grids(mol)
         grids.level = grid_lvl
         grids.build()
         logger.debug(f"TC: Grid initialized in {time.perf_counter() - start_time:.3f} seconds")
-        
+
         grid_points = jnp.asarray(grids.coords)
         weights = jnp.asarray(grids.weights)
-        
+
         # Evaluate basis on grid
         # Use PySCF to evaluate AOs with numpy arrays
         logger.info(f"TC: Evaluating basis on grid")
@@ -405,29 +408,62 @@ class TC:
         ao_values = ao[0].T  # (N_ao, N_grid)
         ao_gradients = ao[1:4].transpose(2, 1, 0)  # (N_ao, N_grid, 3)
         logger.debug(f"TC: AO basis evaluated in {time.perf_counter() - start_time:.3f} seconds")
-        
-        # Transform to MO basis using JAX/GPU for speed
-        logger.info(f"TC: Transforming to MO basis (GPU)")
+
+        # Transform to MO basis using JAX/GPU for speed, in grid-dimension
+        # chunks -- the unchunked version held up to 3 full-size
+        # (n_ao, n_grid, 3) buffers on-device simultaneously (the
+        # transpose-forced-contiguous copy from jnp.asarray, a
+        # non-aliasing .reshape, and the grad_phi output itself), which at
+        # H50/cc-pV5Z scale (n_ao=2750, n_grid=268600) is ~16.5GiB PER
+        # buffer -- ~33-50GiB of avoidable transient peak on top of
+        # whatever SCF/ISDF already left resident, and this transform is
+        # single-device/unsharded so extra GPUs don't help it (Grace's
+        # diagnosis, 2026-07-12, #research-pytc, H50 R=1.6/R=2.4 2xA100
+        # OOMs). Chunking keeps only one chunk's worth of transient buffers
+        # alive at a time; the final phi/grad_phi outputs are unchanged in
+        # size (this doesn't shrink the necessary result, only the
+        # unnecessary transient copies). Mirrors the host_grid_block_size
+        # chunking pattern already used for K1/K3 kernel construction
+        # elsewhere in this file (see solve_tile_sizes-driven callers).
+        logger.info(f"TC: Transforming to MO basis (GPU, chunked)")
         start_time = time.perf_counter()
-        
-        # Move to GPU
+
         mo_coeff_jax = jnp.asarray(mo_coeff)
-        ao_values_jax = jnp.asarray(ao_values)
-        ao_gradients_jax = jnp.asarray(ao_gradients)
-        
-        # phi = mo_coeff.T @ ao_values
-        phi = jnp.matmul(mo_coeff_jax.T, ao_values_jax)
-        
-        # grad_phi = mo_coeff.T @ ao_gradients (reshaped)
         n_mo = mo_coeff.shape[1]
         n_ao = mo_coeff.shape[0]
         n_grid = grid_points.shape[0]
-        
-        # Reshape ao_gradients to (n_ao, n_grid * 3) for matmul
-        ao_grad_reshaped = ao_gradients_jax.reshape(n_ao, -1)
-        grad_phi_reshaped = jnp.matmul(mo_coeff_jax.T, ao_grad_reshaped)
-        grad_phi = grad_phi_reshaped.reshape(n_mo, n_grid, 3)
-        
+
+        if grid_chunk_size is None:
+            # Target ~2GiB for the dominant per-chunk buffer
+            # (n_ao * chunk * 3 * 8 bytes) -- a fixed byte target rather
+            # than one scaled to total GPU memory, since the fix here is
+            # about eliminating an unnecessarily large single-shot
+            # transient, not about using all available memory; a modest
+            # constant target keeps chunk counts small (tens, not
+            # thousands) across the whole range of system sizes this
+            # module targets.
+            target_chunk_bytes = 2 * 1024 ** 3
+            bytes_per_grid_point = n_ao * 3 * 8
+            grid_chunk_size = max(1, target_chunk_bytes // bytes_per_grid_point)
+        grid_chunk_size = min(grid_chunk_size, n_grid)
+
+        phi_chunks = []
+        grad_phi_chunks = []
+        for g0 in range(0, n_grid, grid_chunk_size):
+            g1 = min(g0 + grid_chunk_size, n_grid)
+
+            ao_values_chunk = jnp.asarray(ao_values[:, g0:g1])
+            phi_chunks.append(jnp.matmul(mo_coeff_jax.T, ao_values_chunk))
+
+            ao_gradients_chunk = jnp.asarray(ao_gradients[:, g0:g1, :])
+            n_chunk = g1 - g0
+            ao_grad_reshaped = ao_gradients_chunk.reshape(n_ao, -1)
+            grad_phi_reshaped = jnp.matmul(mo_coeff_jax.T, ao_grad_reshaped)
+            grad_phi_chunks.append(grad_phi_reshaped.reshape(n_mo, n_chunk, 3))
+
+        phi = jnp.concatenate(phi_chunks, axis=1)
+        grad_phi = jnp.concatenate(grad_phi_chunks, axis=1)
+
         logger.debug(f"TC: MO basis transformed in {time.perf_counter() - start_time:.3f} seconds")
         
         return cls(
