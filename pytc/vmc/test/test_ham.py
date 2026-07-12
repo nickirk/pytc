@@ -413,7 +413,7 @@ class TestJastrowTermsPolymorphicDispatch(unittest.TestCase):
     unchanged by generic BoysHandy), on multi-type systems with the same
     CompositeJastrow (NuclearCusp + BH) structure production uses. There
     is no flag -- class choice (BoysHandyAnalytical vs BoysHandy) is the
-    only dispatch (task #5 PR-B). See pytc/jastrow/test/test_bha.py for
+    only dispatch. See pytc/jastrow/test/test_bha.py for
     the lower-level, same-instance base-vs-override check.
     """
 
@@ -467,7 +467,7 @@ H -0.757 -0.586  2.900
 class TestJastrowTermsCompositeLengthMismatch(unittest.TestCase):
     """A CompositeJastrow/params length mismatch must raise, not silently
     truncate via zip() and return a wrong (partial) energy (GitHub review,
-    task #5 PR-B)."""
+    whole-electron-set contraction)."""
 
     def test_extra_component_raises(self):
         mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)

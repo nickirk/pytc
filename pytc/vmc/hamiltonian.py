@@ -8,14 +8,10 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     """Compute ∇J/J and ∇²J/J with explicit parameters.
 
     Dispatch between the reference per-pair grid and a Jastrow-specific
-    fast path (e.g. BoysHandyAnalytical's whole-electron-set contraction,
-    task #5 PR-B) is pure polymorphism via ``jastrow.get_pair_grid_grad_lap``
-    -- no flag, no branching here. Class choice is the only dispatch:
-    construct ``BoysHandyAnalytical`` for the fast override, generic
-    ``BoysHandy`` for the base-class reference implementation (explicit
-    choice over silent substitution, per Ke's direction,
-    #proj-pytc-efficiency-refactor). Both give mathematically identical
-    results -- verified to ~1e-16 relative agreement on H2O/(H2O)2/LiH.
+    fast path (e.g. BoysHandyAnalytical's whole-electron-set contraction)
+    is pure polymorphism via ``jastrow.get_pair_grid_grad_lap`` -- class
+    choice is the only dispatch. Both paths give mathematically identical
+    results (verified to ~1e-16 relative agreement on H2O/(H2O)2/LiH).
     """
     n_electrons = elec_coords.shape[0]
 

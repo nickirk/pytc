@@ -108,7 +108,7 @@ class TestMCMCUtils(unittest.TestCase):
     def test_save_load_walkers(self):
         """Round-trip a Walker's full state (positions plus cached
         psi/det/grad/lap fields, and the det_up/det_down (sign, log|det|)
-        tuples) through save_walkers/load_walkers -- task #12(b)'s
+        tuples) through save_walkers/load_walkers -- the
         continued-walkers checkpoint mechanism.
         """
         n_walkers, n_alpha, n_beta = 4, 2, 1
@@ -156,7 +156,7 @@ class TestMCMCUtils(unittest.TestCase):
         walkers, (b) reset the cached psi/det/grad/lap fields (same
         convention as a cold init, since jittered positions invalidate
         them), and (c) place each resampled position near (not exactly
-        on top of) one of the source positions -- task #12 tier-1.
+        on top of) one of the source positions.
         """
         ansatz = _FakeDetAnsatz()
         source_n = 5

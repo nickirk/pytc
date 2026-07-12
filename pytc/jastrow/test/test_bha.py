@@ -85,10 +85,8 @@ class TestBoysHandyAnalytical(unittest.TestCase):
 class TestBoysHandyRoutingGuard(unittest.TestCase):
     """BoysHandy.create() always returns generic BoysHandy -- no implicit
     substitution to BoysHandyAnalytical, regardless of atom-type count or
-    ECP status. Explicit choice over silent routing (Ke's direction,
-    2026-07-10; reverts d21d7ed's original single-type auto-routing, not
-    just task #5 PR-A's multi-type extension). BoysHandyAnalytical.create()
-    is the only way to get the analytic-derivative implementation."""
+    ECP status. BoysHandyAnalytical.create() is the only way to get the
+    analytic-derivative implementation."""
 
     def test_single_type_always_generic(self):
         mol = get_h2_molecule()
@@ -212,10 +210,8 @@ def get_lih_molecule():
 
 
 class TestBoysHandyAnalyticalMultiTypeLiH(unittest.TestCase):
-    """Second multi-type equivalence case (Li+H), distinct charge/mass ratio
-    from the O+H case in TestBoysHandyAnalyticalMultiType -- extends the
-    validation scoped out in d21d7ed before routing multi-type by default
-    (task #5 PR-A, #pro-pytc-efficiency-refactor).
+    """Second multi-type equivalence case (Li+H), distinct charge/mass
+    ratio from the O+H case in TestBoysHandyAnalyticalMultiType.
     """
 
     def setUp(self):
@@ -287,8 +283,8 @@ class TestBoysHandyAnalyticalMultiTypeLiH(unittest.TestCase):
 
 
 class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
-    """Tests for get_pair_grid_grad_lap (task #5 PR-B, whole-electron-set
-    contraction) against the Jastrow base class's default per-pair
+    """Tests for get_pair_grid_grad_lap (whole-electron-set contraction)
+    against the Jastrow base class's default per-pair
     implementation it overrides -- called explicitly on the SAME
     BoysHandyAnalytical instance via ``Jastrow.get_pair_grid_grad_lap(bha,
     ...)`` (bypassing the override) so this is a genuine base-vs-override
@@ -321,8 +317,8 @@ class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
 
 
 class TestBoysHandyAnalyticalNearCoalescence(unittest.TestCase):
-    """Regression suite for the epsilon-default bug (2026-07-11,
-    #proj-pytc-efficiency-refactor): ``BoysHandyAnalytical.create()``
+    """Regression suite for the epsilon-default bug:
+    ``BoysHandyAnalytical.create()``
     defaulted ``epsilon=1e-8`` while ``BoysHandy.create()`` defaults to
     ``1e-16``. ``_safe_norm``'s epsilon floors the e-e distance at
     ``sqrt(epsilon)`` -- with the mismatched default, BHA's Laplacian

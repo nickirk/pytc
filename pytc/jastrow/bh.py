@@ -47,14 +47,10 @@ class BoysHandy(Jastrow):
 
     @classmethod
     def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None):
-        """Always returns a generic (folx-autodiff) BoysHandy.
+        """Always returns the generic (folx-autodiff) BoysHandy.
 
-        No implicit substitution to BoysHandyAnalytical -- callers who want
-        the analytic-derivative implementation construct it directly via
-        ``BoysHandyAnalytical.create(mol, ...)``. (Explicit choice over
-        silent routing, per Ke's direction 2026-07-10; this also reverts
-        d21d7ed's earlier single-type auto-routing, not just the multi-type
-        extension from task #5 PR-A.)
+        No implicit substitution: callers who want the analytic-derivative
+        implementation construct ``BoysHandyAnalytical`` directly.
         """
         nelectron = mol.nelectron
         nuclear_pos = jnp.array(mol.atom_coords())

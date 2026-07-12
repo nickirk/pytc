@@ -104,14 +104,11 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None, log_in
 
     # If initial_walkers is already a Walker, return it -- but only if its
     # walker count actually matches n_walkers. Silently returning a
-    # checkpoint's Walker with the WRONG count used to corrupt any
-    # downstream W-dependent computation (damping, batch shapes,
-    # statistics) with no error signal -- this exact silent-mismatch class
-    # caused the task #12 burn-in-deficit investigation to nearly
-    # misattribute a phase-A/phase-B jump before it was traced to
-    # equilibration (2026-07-12). Callers that actually want a different
-    # walker count than a saved checkpoint must resample explicitly first
-    # (see mcmc_utils.resample_walkers), not rely on this silently no-op-ing.
+    # checkpoint's Walker with the WRONG count corrupts every downstream
+    # W-dependent computation (damping, batch shapes, statistics) with no
+    # error signal. Callers that want a different walker count than a
+    # saved checkpoint must resample explicitly first
+    # (see mcmc_utils.resample_walkers).
     if isinstance(initial_walkers, Walker):
         actual_n = initial_walkers.positions.shape[0]
         if actual_n != n_walkers:

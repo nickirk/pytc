@@ -1,5 +1,3 @@
-import os
-
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -10,11 +8,10 @@ from .bh import BoysHandy, BHTerm
 
 @struct.dataclass
 class BoysHandyAnalytical(BoysHandy):
-    """Work area for an analytical Boys-Handy implementation.
+    """Boys-Handy Jastrow with hand-coded analytic derivatives.
 
-    This class is kept separate from ``BoysHandy`` so the original autodiff
-    implementation remains available as a reference baseline for numerical
-    comparisons while the analytical derivative path is developed.
+    Kept separate from ``BoysHandy`` so the autodiff implementation remains
+    available as a reference baseline for numerical comparison.
     """
     padded_nuclei_by_type: jax.Array = struct.field(default=None)
     nuclei_mask_by_type: jax.Array = struct.field(default=None)
@@ -228,7 +225,7 @@ class BoysHandyAnalytical(BoysHandy):
         the pair grid is assembled by scanning over atoms and accumulating
         into an (N,N,3)/(N,N) carry, so the O(n_terms) factor stays a
         per-step transient rather than a permanent O(N^2*natom*n_terms)
-        tensor (task #5 PR-B, #pro-pytc-efficiency-refactor).
+        tensor.
 
         Args:
             elec_coords: (N, 3) all electron positions.
@@ -248,8 +245,7 @@ class BoysHandyAnalytical(BoysHandy):
         terms). The crossover is between N=20 and N=40; users targeting
         small systems who care about that margin can construct generic
         ``BoysHandy`` instead. No implicit switching between the two --
-        class choice is the only dispatch, per pytc's explicit-choice
-        design (task #5, #proj-pytc-efficiency-refactor).
+        class choice is the only dispatch.
         """
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])
@@ -352,28 +348,12 @@ class BoysHandyAnalytical(BoysHandy):
             jnp.moveaxis(xn_val, 1, 0), jnp.moveaxis(grad_xn, 1, 0), jnp.moveaxis(lap_xn, 1, 0),
             atom_type_map, weight_atom, cusp_mask_atom, d_atom,
         )
-        # jax.checkpoint (rematerialization): without this, reverse-mode AD
-        # through lax.scan stores each step's forward intermediates (here,
-        # O(N^2*n_terms) per atom) for ALL natom steps to compute the
-        # backward pass -- reintroducing the O(N^2*natom*n_terms) memory
-        # blowup the scan's O(N^2) carry was designed to avoid, just moved
-        # from the forward pass to the backward pass. checkpoint trades
-        # that storage for recomputing each step's forward pass during the
-        # backward pass instead.
-        #
-        # PYTC_BHA_DISABLE_CHECKPOINT=1 is a measurement-only ablation
-        # toggle (task #13 phase-2 scoping, 2026-07-12): at profiled scales
-        # (H80/W=5000, batch=64) peak memory was 2.9-4.5GiB against 80GB
-        # cards, so this checkpoint may be pure legacy conservatism from a
-        # smaller-memory-budget era -- if disabling it recovers a large
-        # slice of the 99.82%-of-Jacobian-build cost BHA accounts for, that
-        # may end the closed-form-c_raw-Jacobian question on its own, at
-        # near-zero code risk. Read once per call (env var), not cached, so
-        # a single process can be re-profiled either way without a restart.
-        # Default (unset) preserves exactly today's behavior.
-        scan_step = (
-            scan_body if os.environ.get("PYTC_BHA_DISABLE_CHECKPOINT") == "1"
-            else jax.checkpoint(scan_body)
-        )
-        (grad_pair, lap_pair), _ = jax.lax.scan(scan_step, init_carry, xs)
+        # jax.checkpoint is load-bearing here: without it, reverse-mode AD
+        # through the scan retains several O(N^2*n_terms)-scale forward
+        # intermediates for all natom steps simultaneously (measured ~80GiB
+        # at H80/W=5000, jac batch 64), reintroducing the memory blowup the
+        # O(N^2) carry exists to avoid. It trades that storage for one
+        # forward recompute per step during the backward pass.
+        (grad_pair, lap_pair), _ = jax.lax.scan(
+            jax.checkpoint(scan_body), init_carry, xs)
         return grad_pair, lap_pair

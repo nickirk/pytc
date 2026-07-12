@@ -154,46 +154,35 @@ def adaptive_burn_in(
     """Burn in until the ensemble's E_L/Var estimates stabilize, instead of
     a fixed step count.
 
-    Tier-2 (safety net) of the two-tier burn-in-deficit fix (task #12,
-    2026-07-12): a fixed burn-in count that's tuned for one system size
-    silently under-provisions a larger one -- Grace's H40/W=30000 sweep
-    showed the production default (500) leaves Var 21x too high, and even
-    10,000 sweeps hadn't plateaued (true plateau: ~15,000-20,000 sweeps).
-    Equilibration time should grow with system size, so this replaces the
-    guess with a real termination criterion: run in chunks of
-    `chunk_size` sweeps (reusing burn_in() unmodified -- this function
-    only orchestrates repeated calls to it, it does not change burn_in's
-    own behavior), and after each chunk:
+    A fixed burn-in count tuned for one system size silently
+    under-provisions a larger one (equilibration time grows with system
+    size; measured at H40/W=30000, the true plateau is ~15,000-20,000
+    sweeps where the old default provided 500). This replaces the guess
+    with a termination criterion: run in chunks of `chunk_size` sweeps
+    (orchestrating repeated unmodified burn_in() calls), and after each
+    chunk:
 
-    1. PRE-GATE on acceptance being within `acceptance_tol` of
-       `acceptance_target`. Acceptance reflects the MCMC step size's own
-       adaptive calibration reaching target, NOT global |Psi|^2 mixing --
-       Grace's sweep is a direct counter-example to using it as a
-       sufficient criterion alone (acceptance was already ~0.50 by
-       burn-in=2000 while E kept moving substantially through
-       burn-in=10000), so this is a necessary cheap pre-check, not the
-       stopping decision itself.
+    1. PRE-GATE on acceptance within `acceptance_tol` of
+       `acceptance_target`. Acceptance only reflects the step-size
+       adaptation reaching its target, not global |Psi|^2 mixing
+       (measured: acceptance locks to ~0.50 thousands of sweeps before E
+       stops drifting), so it is a necessary cheap pre-check, not the
+       stopping decision.
     2. Once the pre-gate passes, compute batch-mean E_L and Var via
-       `full_ansatz` (the actual physical trial wavefunction, i.e. the
-       jastrow-dressed ansatz -- NOT `ref_det`, which only defines the
-       MCMC proposal/target distribution the walkers are drawn from) and
-       append to a sliding window of the last `stability_window` chunks.
-       Terminate once E has stayed within `energy_stability_atol` (an
-       ABSOLUTE tolerance, not relative -- E crosses zero over this
-       campaign's trajectories, so a relative tolerance is either
-       trivially satisfied or meaninglessly strict near the crossing,
-       Felix's refinement 2026-07-12) and Var has stayed within
-       `variance_stability_rtol` (relative -- Var is strictly >= 0, no
-       zero-crossing issue) across the full window.
-    3. Hard-capped at `max_steps` total sweeps regardless, so a system
-       that never stabilizes (or a badly-set tolerance) can't hang.
+       `full_ansatz` (the physical trial wavefunction -- NOT `ref_det`,
+       which only defines the sampling distribution) over a sliding
+       window of the last `stability_window` chunks. Terminate once E has
+       stayed within `energy_stability_atol` (absolute: E crosses zero
+       during equilibration, so a relative tolerance degenerates near the
+       crossing) and Var within `variance_stability_rtol` (relative: Var
+       is strictly positive) across the window.
+    3. Hard-capped at `max_steps` total sweeps so a system that never
+       stabilizes (or a badly-set tolerance) can't hang.
 
     If `walkers` came from `mcmc_utils.resample_walkers`, this function's
-    own sweep counter IS "sweeps since resample" by construction (it has
-    no knowledge of any burn-in the walkers may have already had before
-    being passed in) -- exactly the accounting Felix's resample-design
-    refinement asked for, so the stability window can't read "stable" off
-    still-correlated bootstrap duplicates.
+    sweep counter is "sweeps since resample" by construction, so the
+    stability window can't read "stable" off still-correlated bootstrap
+    duplicates.
 
     Args:
         ref_det: The determinant (or other) ansatz that defines the MCMC
@@ -207,47 +196,30 @@ def adaptive_burn_in(
         step_size: Initial MCMC proposal step size.
         key: PRNG key.
         move_type, max_vmap_batch_size, mesh: forwarded to burn_in.
-        chunk_size: Sweeps per chunk (same role as burn_in's
-                report_interval -- one step-size adaptation per chunk).
-                Default 500: Grace's H40/W=30000 plateau sweep found the
-                real equilibration timescale is ~15,000-20,000 sweeps
-                (2026-07-12), so a 100-sweep chunk would mean ~150-200
-                separate E_L-batch evaluations before termination -- 500
-                trades some termination-point precision for 5x fewer
-                evals at that scale.
-        max_steps: Hard cap on total sweeps. Default 50000: comfortably
-                above Grace's measured H40/W=30000 plateau point
-                (20,000-40,000 sweeps) so the stability criterion, not
-                this cap, is what normally terminates -- a cap close to
-                the expected equilibration time would mask whether the
-                mechanism actually works. Systems slower than H40 may
-                still need this raised.
+        chunk_size: Sweeps per chunk (one step-size adaptation and one
+                stability check per chunk). Default 500 trades some
+                termination-point precision for ~5x fewer E_L-batch
+                evaluations at the measured 15,000-20,000-sweep
+                equilibration timescale.
+        max_steps: Hard cap on total sweeps. Default 50000 sits
+                comfortably above the measured H40/W=30000 plateau so the
+                stability criterion, not the cap, normally terminates;
+                slower systems may need it raised.
         acceptance_target: Pre-gate center. Default 0.5, matching
                 burn_in's own step-size adaptation target.
-        acceptance_tol: Pre-gate band. Default 0.02: Grace's equilibrated
-                H40 readings cluster 0.499-0.513 (max deviation ~0.013
-                from target) vs 0.672 unequilibrated -- 0.02 covers the
-                observed equilibrated spread with a little margin while
-                staying far below the unequilibrated value (Felix
-                suggested ~0.01 as a starting point, 2026-07-12; widened
-                slightly so the pre-gate doesn't reject the 0.513 reading
-                actually observed at the validated plateau).
+        acceptance_tol: Pre-gate band. Default 0.02 covers the measured
+                equilibrated spread (0.499-0.513) with margin while
+                staying far below unequilibrated readings (~0.67).
         stability_window: Number of consecutive chunks required stable.
         energy_stability_atol: Absolute energy tolerance (Ha) for the
-                window range. Default 0.05 Ha: Felix's framing from
-                Grace's H40 plateau residual, parameterized as an
-                absolute (not per-atom) Ha value here -- callers on
-                larger systems should scale this up (e.g. tolerance-per-
-                atom * n_atoms) since equilibrium energy fluctuations
-                grow with system size, pending a real H80/H160
-                calibration point (2026-07-12).
+                window range. Default 0.05 Ha from the measured H40
+                plateau residual; callers on larger systems should scale
+                it (e.g. tolerance-per-atom * n_atoms) since equilibrium
+                fluctuations grow with system size.
         variance_stability_rtol: Relative tolerance for Var's window
-                range. Default 0.02 (2%): Grace's plateau data shows a
-                clean separation -- pre-plateau relative changes are
-                20-130% (5000->10000->20000 sweeps), while the actual
-                plateau (20,000->40,000 sweeps) shows Var changing only
-                0.83%. 2% sits comfortably above that plateau noise floor
-                and well below the transition region.
+                range. Default 0.02: measured pre-plateau relative
+                changes are 20-130% vs 0.83% on the plateau, so 2% sits
+                above the plateau noise floor and below the transition.
 
     Returns:
         Tuple of (equilibrated_walkers, chunk_history, new_key, step_size,

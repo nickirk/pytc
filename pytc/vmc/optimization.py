@@ -664,11 +664,8 @@ def optimize_ref_var(
                         `schedule_lr`) at this value instead of 0 -- lets a
                         warm-started run (`params` loaded from a prior run's
                         history) continue that run's LR decay instead of
-                        restarting it at full `learning_rate` (Felix's
-                        continuity fix, 2026-07-11: a silently-restarting
-                        schedule at each wall-clock chunk boundary is exactly
-                        the untracked-config-becomes-invisible-variable bug
-                        class that caused this campaign's NaN investigation).
+                        silently restarting it at full `learning_rate` at
+                        each wall-clock chunk boundary.
 
     Returns:
         Dictionary with optimization results and statistics. Includes
@@ -956,7 +953,7 @@ def evaluate_ref_var(
     """Evaluate reference-variance / local-energy statistics at FIXED params.
 
     Unlike ``optimize_ref_var``, this never updates ``params`` -- it exists
-    for controlled experiments (task #12) where the params must be held
+    for controlled experiments where the params must be held
     bit-identical across runs to isolate a single variable (walker count,
     burn-in, warm-start convention). It also surfaces the raw local-energy
     tail (clipped fraction, max|E_L|) that the production loss function

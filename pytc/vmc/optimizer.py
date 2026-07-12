@@ -63,9 +63,8 @@ class NewtonOptimizer:
         # instance instead of get_vmap_fn/shard_vmap silently re-deriving
         # one via create_mesh() when mesh=None. Re-derivation was already
         # correct on a stable single-node device topology (create_mesh()
-        # is deterministic over jax.devices()), so this closes a latent
-        # fragility rather than a live bug (Felix, 2026-07-12,
-        # #proj-pytc-efficiency-refactor).
+        # is deterministic over jax.devices()), so passing it explicitly
+        # closes a latent fragility rather than a live bug.
         self.mesh = mesh
 
     def _get_vmap(self):
@@ -209,8 +208,8 @@ class NewtonOptimizer:
                 # S = 1/N * J.T @ J
                 n_walkers = walkers.shape[0]
                 curvature_mat = (jac_centered.T @ jac_centered) / n_walkers
-                # Finite-masking/row-clipping (below) is gauss_newton-specific
-                # per Felix's spec -- no dropped-walker tracking on this path.
+                # Finite-masking/row-clipping (below) is gauss_newton-specific;
+                # no dropped-walker tracking on this path.
                 n_dropped = jnp.array(0, dtype=jnp.int32)
 
             elif self.curvature_type == "gauss_newton":
@@ -490,7 +489,7 @@ class NewtonOptimizer:
             # current param scale (0.5 * max(1, ||params||)), not a fixed
             # constant -- an earlier fixed max_delta_norm=10 was derived
             # from already-diverged post-explosion deltas, not the actual
-            # param landscape (Felix), and stayed enormous relative to
+            # param landscape, and stayed enormous relative to
             # params of magnitude ~1.
             if self.max_delta_norm is not None and self.max_delta_norm > 0:
                 params_vec_for_scale, _ = jax.flatten_util.ravel_pytree(params)

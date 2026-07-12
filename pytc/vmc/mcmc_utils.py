@@ -431,12 +431,10 @@ def resample_walkers(ansatz, walkers, target_n_walkers, step_size, jitter_scale=
     """Bootstrap-resample a smaller (already-equilibrated) walker ensemble
     up to a larger target size.
 
-    Tier-1 of the burn-in-deficit fix (task #12, 2026-07-12): initializing
-    a large phase-B ensemble by replicating phase-A's equilibrated
-    positions inherits most of its equilibration, instead of paying the
-    full cold-start diffusion cost -- Felix's cost math: cold-start burn-in
-    at H300/W=30000 is ~12h (2.2s/sweep), vs minutes for a short
-    decorrelation pass after resampling.
+    Initializing a large ensemble by replicating a smaller, already
+    equilibrated one inherits most of its equilibration instead of paying
+    the full cold-start diffusion cost (cold-start burn-in at H300/W=30000
+    is ~12h at 2.2s/sweep, vs minutes of decorrelation after resampling).
 
     Args:
         ansatz: Wavefunction object with molecular info (drives
@@ -445,7 +443,7 @@ def resample_walkers(ansatz, walkers, target_n_walkers, step_size, jitter_scale=
         target_n_walkers: Desired walker count -- need not be an exact
                 multiple of the source count (sampled with replacement).
         step_size: The SOURCE ensemble's adapted MCMC step size. Jitter
-                sigma is tied to this (Felix's refinement, 2026-07-12):
+                sigma is tied to this because
                 resampled positions are exact duplicates until jittered,
                 and the chain's own adapted step size is what's already
                 known to move a walker within its typical set over a few
@@ -464,8 +462,8 @@ def resample_walkers(ansatz, walkers, target_n_walkers, step_size, jitter_scale=
         samples until MCMC has had a chance to separate them, so callers
         must still run a short decorrelation pass afterward. Track that
         as sweeps-SINCE-resample when applying any stability criterion on
-        top of this (Felix's refinement) -- checking raw step/batch count
-        instead risks reading "stable" off still-correlated duplicates.
+        top of this -- checking raw step/batch count instead risks reading
+        "stable" off still-correlated duplicates.
     """
     from .walker import initialize_walker_state
 
