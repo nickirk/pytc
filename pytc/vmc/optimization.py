@@ -624,6 +624,7 @@ def optimize_ref_var(
     save_path: Optional[str] = None,
     n_mcmc_per_opt: Optional[int] = None,
     n_opt_per_mcmc: Optional[int] = None,
+    initial_opt_state: Optional[int] = None,
 ):
     """Perform variational Monte Carlo optimization using MCMC sampling.
 
@@ -656,12 +657,33 @@ def optimize_ref_var(
                         optimization update.
         n_opt_per_mcmc: Optional explicit number of optimization steps before
                         each MCMC refresh.
+        initial_opt_state: Newton optimizer only. If provided, seeds the
+                        optimizer's internal step counter (which drives the
+                        learning-rate decay schedule, see create_optimizer's
+                        `schedule_lr`) at this value instead of 0 -- lets a
+                        warm-started run (`params` loaded from a prior run's
+                        history) continue that run's LR decay instead of
+                        restarting it at full `learning_rate` (Felix's
+                        continuity fix, 2026-07-11: a silently-restarting
+                        schedule at each wall-clock chunk boundary is exactly
+                        the untracked-config-becomes-invisible-variable bug
+                        class that caused this campaign's NaN investigation).
 
     Returns:
-        Dictionary with optimization results and statistics
+        Dictionary with optimization results and statistics. Includes
+        "final_opt_state" (int, Newton only) -- the optimizer's step counter
+        after the last update, for chaining into a subsequent warm-started
+        run's `initial_opt_state`.
     """
     if key is None:
         key = random.PRNGKey(int(time.time()))
+
+    if initial_opt_state is not None and optimizer_type.lower() != "newton":
+        raise ValueError(
+            "`initial_opt_state` is only supported for optimizer_type='newton' "
+            f"(got {optimizer_type!r}) -- it seeds NewtonOptimizer's internal "
+            "step counter, which other optimizer types don't expose this way."
+        )
 
     if opt_kwargs is None:
         opt_kwargs = {}
@@ -762,10 +784,13 @@ def optimize_ref_var(
             opt_kwargs["jacobian_sample_size"] = jacobian_sample_size
         
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
-        
+
         key, subkey = random.split(key)
-        opt_state = optimizer.init(params, subkey, (walkers, ansatz))
-        
+        if initial_opt_state is not None:
+            opt_state = jnp.array(initial_opt_state, dtype=jnp.int32)
+        else:
+            opt_state = optimizer.init(params, subkey, (walkers, ansatz))
+
         training_step = make_second_order_training_step(
             mcmc_step,
             optimizer,
@@ -897,10 +922,15 @@ def optimize_ref_var(
     logger.info("Optimization complete!")
     
     
+    final_opt_state = (
+        int(jax.device_get(opt_state)) if optimizer_type.lower() == "newton" else None
+    )
+
     return {
         "cost": np.array(losses),
         "energies": np.array(energies),
         "stds": np.array(stds),
         "acceptance": np.array(acceptances),
-        "params": params_history
+        "params": params_history,
+        "final_opt_state": final_opt_state,
     }

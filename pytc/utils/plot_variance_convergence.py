@@ -223,7 +223,19 @@ def main():
                          "(--save-h5 output) -- uses that run's LAST step's "
                          "params instead of jastrow.init_params(), for chaining "
                          "an aggressive phase-A run into a phase-B refinement "
-                         "(Felix's two-phase production recipe, 2026-07-11).")
+                         "(Felix's two-phase production recipe, 2026-07-11). "
+                         "By default also resumes the LR decay schedule from "
+                         "the prior run's final step (see --reset-lr-schedule).")
+    p.add_argument("--reset-lr-schedule", action="store_true",
+                    help="With --init-params-from, restart the LR decay "
+                         "schedule at full --learning-rate instead of "
+                         "resuming from the prior run's final step. Use this "
+                         "when deliberately starting a new phase at a "
+                         "different learning rate (e.g. phase-A -> phase-B); "
+                         "leave unset when just chaining a single long "
+                         "optimization across wall-clock/job boundaries, "
+                         "which is the default (Felix's continuity fix, "
+                         "2026-07-11).")
     args = p.parse_args()
 
     atom, unit, label = build_system(args)
@@ -259,6 +271,7 @@ def main():
     jastrow = CompositeJastrow.create([ncusp, bh])
     sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])
 
+    initial_opt_state = None
     if args.init_params_from:
         from pytc.vmc.mcmc_utils import load_optimization_history
         prior = load_optimization_history(args.init_params_from)
@@ -267,6 +280,21 @@ def main():
         result_meta["init_params_from"] = args.init_params_from
         print(f"Warm-starting from {args.init_params_from} (last of "
               f"{jax.tree_util.tree_leaves(prior['params'])[0].shape[0]} saved steps)")
+        if args.reset_lr_schedule:
+            print("--reset-lr-schedule set: LR schedule restarts at full "
+                  "--learning-rate despite warm-started params.")
+        else:
+            prior_final_state = prior.get("final_opt_state")
+            if prior_final_state is not None:
+                initial_opt_state = int(prior_final_state)
+                result_meta["initial_opt_state"] = initial_opt_state
+                print(f"Resuming LR schedule from step {initial_opt_state} "
+                      "(pass --reset-lr-schedule to restart at full "
+                      "--learning-rate instead).")
+            else:
+                print("Warning: prior history has no 'final_opt_state' "
+                      "(saved before this feature existed) -- LR schedule "
+                      "restarts at full --learning-rate.")
     else:
         jastrow_params = jastrow.init_params()
         linear_coeffs = jnp.ones(1)
@@ -289,6 +317,7 @@ def main():
         key=key,
         n_mcmc_per_opt=args.n_mcmc_per_opt,
         n_opt_per_mcmc=1,
+        initial_opt_state=initial_opt_state,
     )
     result_meta["total_optimize_time_s"] = time.time() - t0
 
