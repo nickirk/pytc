@@ -52,7 +52,7 @@ class TestPivotSelection(unittest.TestCase):
         shift = 1e-12 * jnp.max(jnp.abs(diag_err**2))
 
         via_sector_api = select_sector_pivots(mo_weighted, mo_weighted, n_rank, shift)
-        via_shared_primitive = pivoted_cholesky_pair_pivots(mo_weighted, mo_weighted, n_rank, shift)
+        via_shared_primitive, _effective_rank = pivoted_cholesky_pair_pivots(mo_weighted, mo_weighted, n_rank, shift)
         via_original_wrapper = _pivoted_cholesky_phi(mo_weighted, n_rank, shift)
 
         np.testing.assert_array_equal(np.asarray(via_sector_api), np.asarray(via_shared_primitive))
@@ -89,10 +89,9 @@ class TestPivotSelection(unittest.TestCase):
         """More interpolation points should reconstruct the pair-product
         Gram matrix at least as well -- the monotonicity a rank-curve is
         supposed to show."""
-        mo_weighted = weight_mo_values(self.mo_values, self.weights)
-        occ_weighted = mo_weighted[:self.n_occ]
+        occ_raw = self.mo_values[:self.n_occ]
 
-        curve = rank_curve(occ_weighted, occ_weighted, ranks=[1, 2, 4, 8])
+        curve = rank_curve(occ_raw, occ_raw, self.weights, ranks=[1, 2, 4, 8])
         self.assertEqual(len(curve), 4)
         errors = [err for _, err, _ in curve]
         cond_S_values = [cond_s for _, _, cond_s in curve]
@@ -106,28 +105,28 @@ class TestPivotSelection(unittest.TestCase):
             self.assertGreaterEqual(err, 0.0)
 
     def test_reconstruction_error_near_zero_at_full_rank(self):
-        """Selecting n_grid pivots (all of them) must reconstruct the
-        Gram matrix to within pinv's own numerical precision on this
-        matrix.
+        """Selecting all pivots (n_grid of them) must reconstruct the
+        Gram matrix to within pinv's own numerical precision on that
+        matrix -- G @ pinv(G) @ G == G exactly for the Moore-Penrose
+        pseudoinverse regardless of rank.
 
-        Mathematically G @ pinv(G) @ G == G exactly for the Moore-Penrose
-        pseudoinverse regardless of rank, but this particular Gram matrix
-        is large (n_grid x n_grid, here ~10^4) and highly rank-deficient
-        (rank = n_mo^2 for the same-factor case, here 7^2=49 at most,
-        measured 28) with a condition number of ~8e4 (measured directly
-        via SVD, 2026-07-12) -- np.linalg.pinv's SVD-based computation on
-        a matrix this size/conditioning has a real, non-negligible
-        floating-point error floor (measured ~4e-5 relative, both via
-        this function and independently via a direct G@pinv(G)@G-G
-        check), not the ~1e-14 one might expect from float64 alone. Use
-        a threshold with real margin above that measured floor rather
-        than an idealized exact-arithmetic bound.
+        Uses a small SYNTHETIC factor matrix (n_grid=60, n_feature=4),
+        not the real ~10^4-grid-point H2O system: the real-system
+        version of this test explicitly materializes an (n_grid,
+        n_grid) Gram matrix and pinv's it, which is O(n_grid^3) and
+        stalled a combined test run at that size (Alice's task #6
+        review, 2026-07-12, item 5 -- CI-safety). This synthetic matrix
+        reproduces the same rank-deficient, moderately-ill-conditioned
+        shape (n_grid=60 >> rank<=n_feature^2=16) that makes the
+        near-zero-but-not-exact-zero assertion meaningful, without the
+        cubic cost.
         """
-        mo_weighted = weight_mo_values(self.mo_values, self.weights)
-        n_grid = mo_weighted.shape[1]
+        rng = np.random.default_rng(0)
+        n_grid, n_feature = 60, 4
+        factor = jnp.asarray(rng.standard_normal((n_feature, n_grid)))
         pivots = np.arange(n_grid)
-        error = pair_collocation_reconstruction_error(mo_weighted, mo_weighted, pivots)
-        self.assertLess(error, 1e-3)
+        error = pair_collocation_reconstruction_error(factor, factor, pivots)
+        self.assertLess(error, 1e-8)
 
 
 if __name__ == "__main__":

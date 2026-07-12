@@ -69,7 +69,8 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
     if shift is None:
         diag_err = jnp.sum(factor_p_weighted**2, axis=0) * jnp.sum(factor_q_weighted**2, axis=0)
         shift = 1e-12 * jnp.max(jnp.abs(diag_err))
-    return pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift)
+    pivots, _effective_rank = pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift)
+    return pivots
 
 
 def select_pivots_oo_ov_vv(mo_values, n_occ, weights, n_rank_oo, n_rank_ov, n_rank_vv, shift=None):
@@ -158,7 +159,7 @@ def pair_collocation_reconstruction_error(factor_p_weighted, factor_q_weighted, 
     return float(np.linalg.norm(gram - gram_hat) / denom)
 
 
-def rank_curve(factor_p_weighted, factor_q_weighted, ranks, shift=None):
+def rank_curve(factor_p, factor_q, weights, ranks, shift=None):
     """Rank-convergence curve stub for validation ladder step 1: for
     each candidate rank, select that many pivots and report the
     pair-collocation reconstruction error AND cond(S) (S = P P^dagger
@@ -174,6 +175,17 @@ def rank_curve(factor_p_weighted, factor_q_weighted, ranks, shift=None):
     sizing should stay meaningfully below pair-space saturation, and
     this number is how a caller would notice they're not.
 
+    Takes RAW (unweighted) factors + weights, not pre-weighted arrays
+    (Alice's task #6 review, 2026-07-12): pivot SELECTION and the
+    reconstruction-error diagnostic both legitimately operate in
+    weighted space (that's the space pivoted_cholesky_pair_pivots
+    itself factors), but cond(S) must characterize the SAME S that
+    compute_Z will actually invert in production -- which is built from
+    RAW pair-collocation values (see pair_collocation_at_pivots's
+    docstring). Weighting only the selection step, not the P/cond(S)
+    computation, keeps this diagnostic representative of what compute_Z
+    will see.
+
     Small-system diagnostic tool (see pair_collocation_reconstruction_error's
     docstring on its (n_grid, n_grid) materialization) -- not intended
     for production-scale rank selection, only for characterizing how
@@ -181,9 +193,12 @@ def rank_curve(factor_p_weighted, factor_q_weighted, ranks, shift=None):
     to inform fixed-rank choices elsewhere.
 
     Args:
-        factor_p_weighted, factor_q_weighted: (n_p/n_q, n_grid) weighted
-            MO values defining the sector (pass the same array twice
-            for "oo"/"vv"; different arrays for "ov").
+        factor_p, factor_q: (n_p/n_q, n_grid) RAW (unweighted) MO
+            values defining the sector (pass the same array twice for
+            "oo"/"vv"; different arrays for "ov").
+        weights: (n_grid,) integration weights, used only for pivot
+            selection and the weighted-space reconstruction-error
+            diagnostic.
         ranks: Iterable of candidate n_rank values, ascending.
         shift: Forwarded to select_sector_pivots (None auto-derives).
 
@@ -192,13 +207,15 @@ def rank_curve(factor_p_weighted, factor_q_weighted, ranks, shift=None):
     """
     from pytc.coulomb.molecular_df_reference import pair_collocation_at_pivots
 
-    factor_p_weighted = np.asarray(factor_p_weighted)
-    factor_q_weighted = np.asarray(factor_q_weighted)
+    factor_p = np.asarray(factor_p)
+    factor_q = np.asarray(factor_q)
+    factor_p_weighted = np.asarray(weight_mo_values(factor_p, weights))
+    factor_q_weighted = np.asarray(weight_mo_values(factor_q, weights))
     results = []
     for n_rank in ranks:
         pivots = np.asarray(select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift))
         error = pair_collocation_reconstruction_error(factor_p_weighted, factor_q_weighted, pivots)
-        P = pair_collocation_at_pivots(factor_p_weighted[:, pivots], factor_q_weighted[:, pivots])
+        P = pair_collocation_at_pivots(factor_p[:, pivots], factor_q[:, pivots])
         S = P @ P.conj().T
         cond_S = float(np.linalg.cond(S))
         results.append((n_rank, error, cond_S))

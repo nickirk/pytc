@@ -21,6 +21,7 @@ from pytc.coulomb.molecular_df_reference import (
     pair_collocation_at_pivots,
     compute_C_streamed,
     compute_Z,
+    compute_Z_cross,
     reconstruct_eri_block,
 )
 
@@ -39,7 +40,10 @@ class TestMolecularDFReference(unittest.TestCase):
         cls.n_vir = cls.mo_vir.shape[1]
 
         ao_values, weights, coords = get_grid_ao_values_and_weights(cls.mf, grid_lvl=2)
+        cls.weights = weights
         mo_values = (ao_values @ mo_coeff).T
+        cls.occ_raw = mo_values[:cls.n_occ]
+        cls.vir_raw = mo_values[cls.n_occ:]
         mo_weighted = weight_mo_values(mo_values, weights)
         cls.occ_weighted = mo_weighted[:cls.n_occ]
         cls.vir_weighted = mo_weighted[cls.n_occ:]
@@ -49,8 +53,11 @@ class TestMolecularDFReference(unittest.TestCase):
         cls.n_rank = 300
         pivots = np.asarray(select_sector_pivots(
             cls.occ_weighted, cls.vir_weighted, cls.n_rank))
-        occ_at_piv = np.asarray(cls.occ_weighted)[:, pivots]
-        vir_at_piv = np.asarray(cls.vir_weighted)[:, pivots]
+        # RAW (unweighted) values at the pivots for P -- pair_collocation_at_pivots
+        # must not see the sqrt(weight) scaling used for pivot selection
+        # (Alice's task #6 review, 2026-07-12; see its docstring).
+        occ_at_piv = np.asarray(cls.occ_raw)[:, pivots]
+        vir_at_piv = np.asarray(cls.vir_raw)[:, pivots]
         cls.P = pair_collocation_at_pivots(occ_at_piv, vir_at_piv)
         cls.C = compute_C_streamed(cls.mf, cls.P, cls.mo_occ, cls.mo_vir, auxbasis="weigend")
         cls.Z = compute_Z(cls.P, cls.C)
@@ -58,6 +65,32 @@ class TestMolecularDFReference(unittest.TestCase):
         cls.eri_ovov_exact = cls.mf.with_df.ao2mo(
             (cls.mo_occ, cls.mo_vir, cls.mo_occ, cls.mo_vir), compact=False
         ).reshape(cls.n_occ, cls.n_vir, cls.n_occ, cls.n_vir)
+
+        # oo and vv sectors, independently pivoted (per
+        # pivot_selection.select_pivots_oo_ov_vv's convention) -- needed
+        # to exercise compute_Z_cross for the oo|vv and ov|vv blocks
+        # CCSD needs but MP2's ov|ov-only validation never touches
+        # (Alice's task #6 review, 2026-07-12, blocker item 2).
+        cls.n_rank_oo = 75  # >> n_pair_oo = n_occ**2 = 25
+        pivots_oo = np.asarray(select_sector_pivots(
+            cls.occ_weighted, cls.occ_weighted, cls.n_rank_oo))
+        occ_at_piv_oo = np.asarray(cls.occ_raw)[:, pivots_oo]
+        cls.P_oo = pair_collocation_at_pivots(occ_at_piv_oo, occ_at_piv_oo)
+        cls.C_oo = compute_C_streamed(cls.mf, cls.P_oo, cls.mo_occ, cls.mo_occ, auxbasis="weigend")
+
+        cls.n_rank_vv = 380  # > n_pair_vv = n_vir**2 = 361
+        pivots_vv = np.asarray(select_sector_pivots(
+            cls.vir_weighted, cls.vir_weighted, cls.n_rank_vv))
+        vir_at_piv_vv = np.asarray(cls.vir_raw)[:, pivots_vv]
+        cls.P_vv = pair_collocation_at_pivots(vir_at_piv_vv, vir_at_piv_vv)
+        cls.C_vv = compute_C_streamed(cls.mf, cls.P_vv, cls.mo_vir, cls.mo_vir, auxbasis="weigend")
+
+        cls.eri_oovv_exact = cls.mf.with_df.ao2mo(
+            (cls.mo_occ, cls.mo_occ, cls.mo_vir, cls.mo_vir), compact=False
+        ).reshape(cls.n_occ, cls.n_occ, cls.n_vir, cls.n_vir)
+        cls.eri_ovvv_exact = cls.mf.with_df.ao2mo(
+            (cls.mo_occ, cls.mo_vir, cls.mo_vir, cls.mo_vir), compact=False
+        ).reshape(cls.n_occ, cls.n_vir, cls.n_vir, cls.n_vir)
 
     def test_C_streamed_matches_direct_PVPdagger(self):
         """C C^dagger must equal P V P^dagger exactly (pure algebra, no
@@ -79,7 +112,7 @@ class TestMolecularDFReference(unittest.TestCase):
             self.n_occ, self.n_vir, self.n_occ, self.n_vir)
         rel_err = (np.linalg.norm(eri_isdf - self.eri_ovov_exact)
                    / np.linalg.norm(self.eri_ovov_exact))
-        self.assertLess(rel_err, 0.01)  # measured ~0.0014 on this system
+        self.assertLess(rel_err, 0.01)  # measured ~1.2e-6 with raw P + numpy's default rcond
 
     def test_isdf_mp2_matches_exact_dfmp2_validation_ladder_step2(self):
         """Validation ladder step 2: ISDF-MP2 vs exact DF-MP2 one-number
@@ -102,6 +135,72 @@ class TestMolecularDFReference(unittest.TestCase):
         # real margin while still being a meaningful acceptance bound
         # (well inside the ~1 mHa/atom manuscript-relevant scale).
         self.assertLess(abs(e_corr_isdf - pt.e_corr), 5e-4)
+
+    def test_cross_sector_oovv_reconstruction_matches_exact_df(self):
+        """compute_Z_cross must reconstruct the oo|vv ERI block -- a
+        cross-sector block MP2's ov|ov-only validation never exercises,
+        but CCSD needs (Alice's task #6 review, blocker item 2)."""
+        Z_oovv = compute_Z_cross(self.P_oo, self.C_oo, self.P_vv, self.C_vv)
+        eri_isdf = reconstruct_eri_block(self.P_oo, Z_oovv, self.P_vv).reshape(
+            self.n_occ, self.n_occ, self.n_vir, self.n_vir)
+        rel_err = (np.linalg.norm(eri_isdf - self.eri_oovv_exact)
+                   / np.linalg.norm(self.eri_oovv_exact))
+        self.assertLess(rel_err, 0.05)
+
+    def test_cross_sector_ovvv_reconstruction_matches_exact_df(self):
+        """compute_Z_cross must reconstruct the ov|vv ERI block -- the
+        other cross-sector block CCSD needs (Alice's task #6 review,
+        blocker item 2)."""
+        Z_ovvv = compute_Z_cross(self.P, self.C, self.P_vv, self.C_vv)
+        eri_isdf = reconstruct_eri_block(self.P, Z_ovvv, self.P_vv).reshape(
+            self.n_occ, self.n_vir, self.n_vir, self.n_vir)
+        rel_err = (np.linalg.norm(eri_isdf - self.eri_ovvv_exact)
+                   / np.linalg.norm(self.eri_ovvv_exact))
+        self.assertLess(rel_err, 0.05)
+
+    def test_cross_sector_Z_matches_same_sector_Z_special_case(self):
+        """compute_Z_cross(P, C, P, C) must equal compute_Z(P, C) exactly
+        -- compute_Z is documented as compute_Z_cross's same-sector
+        special case, so this identity must hold bit-for-bit (same
+        pinv calls, same inputs), not just approximately."""
+        Z_cross_same = compute_Z_cross(self.P, self.C, self.P, self.C)
+        np.testing.assert_allclose(Z_cross_same, self.Z, atol=1e-12)
+
+    def test_P_independent_of_weight_scale(self):
+        """Rescaling the integration weights by a positive constant must
+        not change which pivots pivot SELECTION picks (the pivoted-
+        Cholesky argmax/shift/tie-break-ramp are all scale-covariant)
+        or the resulting RAW-value P (which doesn't depend on weights
+        at all once selection is done -- Alice's task #6 review,
+        blocker item 1: weighting must be confined to pivot selection,
+        never touching the actual interpolation factors). A regression
+        here would mean weighting leaked back into P's construction.
+
+        Uses a SMALL rank (20, well below the ov pair space's true rank
+        of 95) rather than self.n_rank=300: past the true rank, the
+        residual is floating-point noise and which noise-dominated
+        index argmax picks next is inherently scale-sensitive (verified
+        separately -- not a bug, just not what this test is checking).
+        Within the true rank, selection order reflects real signal and
+        must be scale-invariant.
+        """
+        scale = 7.0
+        n_rank_small = 20
+        occ_weighted_scaled = weight_mo_values(self.occ_raw, self.weights * scale)
+        vir_weighted_scaled = weight_mo_values(self.vir_raw, self.weights * scale)
+        pivots_scaled = np.asarray(select_sector_pivots(
+            occ_weighted_scaled, vir_weighted_scaled, n_rank_small))
+        pivots_orig = np.asarray(select_sector_pivots(
+            self.occ_weighted, self.vir_weighted, n_rank_small))
+        np.testing.assert_array_equal(pivots_scaled, pivots_orig)
+
+        occ_at_piv_scaled = np.asarray(self.occ_raw)[:, pivots_scaled]
+        vir_at_piv_scaled = np.asarray(self.vir_raw)[:, pivots_scaled]
+        P_scaled = pair_collocation_at_pivots(occ_at_piv_scaled, vir_at_piv_scaled)
+        occ_at_piv_orig = np.asarray(self.occ_raw)[:, pivots_orig]
+        vir_at_piv_orig = np.asarray(self.vir_raw)[:, pivots_orig]
+        P_orig = pair_collocation_at_pivots(occ_at_piv_orig, vir_at_piv_orig)
+        np.testing.assert_allclose(P_scaled, P_orig, atol=1e-12)
 
 
 if __name__ == "__main__":

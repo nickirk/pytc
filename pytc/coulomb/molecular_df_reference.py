@@ -26,11 +26,25 @@ def pair_collocation_at_pivots(factor_p_at_pivots, factor_q_at_pivots):
     -- the pair-collocation matrix evaluated ONLY at the (already-
     selected) interpolation points, not the full grid.
 
+    Callers must pass RAW (unweighted) MO values here, not the
+    sqrt(weight)-scaled values used for pivot SELECTION -- matching
+    pytc.df.isdf_decompose's own convention (``phi_piv = phi[:,
+    pivots]``, raw phi, even though pivots were chosen via
+    ``phi_weighted``). Weighting is a numerical device for the
+    pivoted-Cholesky selection step only; ISDF's actual interpolation
+    formula operates on the real orbital values at the interpolation
+    points, and the ERI reconstruction (compute_Z/reconstruct_eri_block)
+    downstream of this P must reproduce the true (unweighted) integral
+    (Alice's task #6 review, 2026-07-12: passing weighted values here
+    instead made compute_Z's rcond default silently depend on the grid
+    quadrature's weight scale/level, a portability bug).
+
     Args:
-        factor_p_at_pivots: (n_p, n_pivots) weighted values at the
-            pivot points (e.g. occ_weighted[:, pivots]).
-        factor_q_at_pivots: (n_q, n_pivots) weighted values at the
-            pivot points for the pair's other factor.
+        factor_p_at_pivots: (n_p, n_pivots) RAW (unweighted) values at
+            the pivot points (e.g. mo_occ_values[:, pivots], not
+            occ_weighted[:, pivots]).
+        factor_q_at_pivots: (n_q, n_pivots) RAW values at the pivot
+            points for the pair's other factor.
 
     Returns:
         P: (n_pivots, n_p * n_q), row-major flattening of the (p, q)
@@ -91,7 +105,7 @@ def compute_C_streamed(mf, P, mo_coeff_p, mo_coeff_q, auxbasis="weigend", blksiz
     return np.concatenate(c_chunks, axis=1)
 
 
-def compute_Z(P, C, rcond=1e-6):
+def compute_Z(P, C, rcond=None):
     """Z = S^-1 C C^dagger S^-1, S = P P^dagger.
 
     Uses the Moore-Penrose pseudoinverse (not a direct solve) since S
@@ -102,23 +116,34 @@ def compute_Z(P, C, rcond=1e-6):
     (task #5, 2026-07-12), so treating S as exactly invertible would be
     the wrong default here.
 
-    rcond matters a lot here, not just as a safety margin: on an H2O/
-    cc-pVDZ ov-sector test (n_pivots=300, n_pair=95), S measured
-    rank~76-95 out of 300 but condition number ~2e24 -- numpy's default
-    pinv rcond (~1e-15, tuned for "ordinary" ill-conditioning) retains
-    orders of magnitude too many near-zero singular values as if they
-    were real signal, giving reconstruction errors >>1 (nonsense) instead
-    of the correct sub-percent error. Swept rcond empirically on that
-    same test: default/1e-12 -> 39x relative error (nonsense), 1e-6 ->
-    1.4e-3 (good), continuing to shrink rcond past ~3e-7 makes it worse
-    again (readmits noise). Default here (1e-6) is the empirically-
-    verified sweet spot for that test, not a generic numpy default --
-    expose it so callers can re-tune per system if needed.
+    History: this function originally took WEIGHTED (sqrt(w_g)-scaled)
+    values into pair_collocation_at_pivots's P, and needed a hand-tuned,
+    NON-MONOTONIC rcond sweet spot (default 1e-6) to avoid a real
+    catastrophic failure mode -- numpy's own default pinv rcond gave
+    39x relative error (nonsense) on an H2O/cc-pVDZ ov-sector test
+    (n_pivots=300, n_pair=95, cond(S)~2e24), and rcond tightened much
+    past ~3e-7 made it WORSE again (readmitted noise). Alice's task #6
+    review (2026-07-12, blocker item 1) identified the root cause: P
+    should be built from RAW (unweighted) values (see
+    pair_collocation_at_pivots's docstring) -- weighting is a pivot-
+    SELECTION device, not part of the actual interpolation formula.
+    With that fix, S on the same test has rank EXACTLY equal to
+    n_pair=95 (no numerical rank inflation from the weight scaling) and
+    the rcond sweep becomes well-behaved: error falls MONOTONICALLY as
+    rcond shrinks from 1e-4 (23%) through 1e-6 (2.5%) down to a
+    ~1e-6-relative-error plateau at rcond<=3e-10 (no readmitted-noise
+    regime observed down to 1e-15) -- numpy's own default rcond
+    (~6.7e-14 for this matrix size) already sits on that plateau,
+    measured 1.2e-6 relative ERI error. So the numpy default is now the
+    right default; rcond is still exposed for callers who need to
+    re-tune per system (e.g. much larger/differently-conditioned S).
 
     Args:
-        P: (n_pivots, n_pair) pair-collocation matrix at the pivots.
+        P: (n_pivots, n_pair) pair-collocation matrix at the pivots
+            (RAW/unweighted values -- see pair_collocation_at_pivots).
         C: (n_pivots, n_aux) from compute_C_streamed.
         rcond: Relative singular-value cutoff for S's pseudoinverse.
+            None (default) uses numpy's own pinv default.
 
     Returns:
         Z: (n_pivots, n_pivots).
@@ -130,16 +155,85 @@ def compute_Z(P, C, rcond=1e-6):
     return S_inv @ (C @ C.conj().T) @ S_inv
 
 
-def reconstruct_eri_block(P_row, Z, P_col):
-    """V ~= P^dagger Z P for a given pair of (possibly different) sectors'
-    pair-collocation matrices -- e.g. P_row from the "ov" sector and
-    P_col from the "ov" sector again gives the (ia|jb) block MP2 needs.
+def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None):
+    """Z_AB = S_A^-1 C_A C_B^dagger S_B^-1, S_A = P_A P_A^dagger, S_B = P_B
+    P_B^dagger -- the cross-sector generalization of compute_Z, needed
+    when the ERI block's bra and ket pair indices come from DIFFERENT
+    MO-pair sectors with their OWN independently-selected pivot sets
+    (e.g. CCSD's oo|vv and ov|vv blocks: sector A's pivots need not
+    equal, or even overlap with, sector B's pivots -- see
+    pivot_selection.select_pivots_oo_ov_vv, which selects oo/ov/vv
+    pivots independently).
+
+    compute_Z(P, C, rcond) is exactly this function's same-sector
+    special case (P_A=P_B=P, C_A=C_B=C); kept as a separate simpler
+    entry point since same-sector Z is CCSD's most common need (oo|oo,
+    ov|ov, vv|vv) and callers there shouldn't have to pass every
+    argument twice.
+
+    Derivation: with V_AB the exact (n_pair_A, n_pair_B) ERI block
+    between sectors A and B, and B_A/B_B the DF Cholesky factors
+    restricted to each sector's MO-pair space (both built from the SAME
+    3-center integrals via compute_C_streamed, just different
+    mo_coeff_p/mo_coeff_q), C_A = P_A B_A^dagger and C_B = P_B
+    B_B^dagger give C_A C_B^dagger = P_A (B_A^dagger B_B) P_B^dagger =
+    P_A V_AB P_B^dagger -- a pure algebraic identity, independent of
+    any ISDF approximation quality (mirrors compute_Z's own
+    C C^dagger = P V P^dagger identity, the basis of this module's
+    test_C_streamed_matches_direct_PVPdagger regression test).
 
     Args:
-        P_row: (n_pivots, n_pair_row) pair-collocation at the pivots
-            for the ERI's bra pair index.
-        Z: (n_pivots, n_pivots) from compute_Z.
-        P_col: (n_pivots, n_pair_col) for the ERI's ket pair index.
+        P_A: (n_pivots_A, n_pair_A) pair-collocation matrix at sector
+            A's pivots (RAW factors, see pair_collocation_at_pivots).
+        C_A: (n_pivots_A, n_aux) from compute_C_streamed for sector A.
+        P_B: (n_pivots_B, n_pair_B) pair-collocation matrix at sector
+            B's pivots.
+        C_B: (n_pivots_B, n_aux) from compute_C_streamed for sector B
+            -- must share the SAME n_aux axis as C_A (same mf, same
+            auxbasis).
+        rcond: Relative singular-value cutoff for S_A's and S_B's
+            pseudoinverses. None (default) uses numpy's own pinv
+            default (see compute_Z's docstring on why this is now the
+            right default, once P is built from raw/unweighted values).
+
+    Returns:
+        Z_AB: (n_pivots_A, n_pivots_B).
+    """
+    P_A = np.asarray(P_A)
+    C_A = np.asarray(C_A)
+    P_B = np.asarray(P_B)
+    C_B = np.asarray(C_B)
+    S_A = P_A @ P_A.conj().T
+    S_B = P_B @ P_B.conj().T
+    S_A_inv = np.linalg.pinv(S_A, rcond=rcond)
+    S_B_inv = np.linalg.pinv(S_B, rcond=rcond)
+    return S_A_inv @ (C_A @ C_B.conj().T) @ S_B_inv
+
+
+def reconstruct_eri_block(P_row, Z, P_col):
+    """V ~= P_row^dagger Z P_col.
+
+    Z must match P_row's and P_col's pivot sets: for a SAME-sector
+    block (e.g. ov|ov, both bra and ket from the "ov" sector's own
+    pivots), pass P_row=P_col=that sector's P and Z=compute_Z(P, C).
+    For a CROSS-sector block (e.g. oo|vv, ov|vv -- bra and ket from
+    two INDEPENDENTLY pivoted sectors, see
+    pivot_selection.select_pivots_oo_ov_vv), pass P_row from sector A,
+    P_col from sector B, and Z=compute_Z_cross(P_A, C_A, P_B, C_B) --
+    a same-sector Z (square, built from one sector's own P/C) is NOT
+    interchangeable with a cross-sector one (rectangular in general,
+    built from both sectors' P/C together); passing mismatched P_row/
+    P_col/Z shapes will fail at the matmul (Alice's task #6 review,
+    2026-07-12 -- this docstring previously implied a same-sector Z
+    could serve any P_row/P_col pairing).
+
+    Args:
+        P_row: (n_pivots_A, n_pair_row) pair-collocation at sector A's
+            pivots, for the ERI's bra pair index.
+        Z: (n_pivots_A, n_pivots_B) from compute_Z (n_pivots_A ==
+            n_pivots_B, same-sector) or compute_Z_cross (general case).
+        P_col: (n_pivots_B, n_pair_col) pair-collocation at sector B's
+            pivots, for the ERI's ket pair index.
 
     Returns:
         (n_pair_row, n_pair_col) reconstructed ERI block (flattened

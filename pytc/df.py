@@ -114,8 +114,7 @@ def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
 
 
 @partial(jax.jit, static_argnames=('n_rank',))
-@partial(jax.jit, static_argnames=('n_rank',))
-def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift):
+def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_rank, shift):
     """Matrix-free pivoted-Cholesky selection of grid/interpolation points
     that best span the pair-product space ``A[g,(p,q)] = factor_p[p,g] *
     factor_q[q,g]``, without ever forming ``A`` (task #5,
@@ -149,16 +148,49 @@ def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, s
             path's "oo"/"vv" sectors); pass a different array for a
             mixed pair space (the Coulomb path's "ov" sector; TC's
             phi/grad_phi pairing, factor_q pre-flattened to 2-D).
-        n_rank: Number of interpolation points (pivots) to select.
+        n_rank: Number of interpolation points (pivots) to select. Must be
+            <= n_grid (validated).
         shift: Tikhonov-style regularization added to the diagonal
             before each pivot selection (numerically pins near-zero/
             near-degenerate residuals to exactly zero rather than
             leaving them as noise-dominated candidates).
 
     Returns:
-        pivots: (n_rank,) selected grid-point indices, in selection order.
+        (pivots, effective_rank): pivots is (n_rank,) selected grid-point
+        indices, in selection order, GUARANTEED unique (see below).
+        effective_rank (Python int, host-side) is how many of those
+        selections had real numerical signal (pivot_val >= 1e-12,
+        matching the existing is_small threshold) before the residual
+        was numerically exhausted -- steps beyond effective_rank are
+        still unique grid indices (never duplicates), but are picking
+        among residual-exhausted candidates rather than genuine
+        interpolation-quality points, i.e. requesting n_rank beyond the
+        pair space's true numerical rank pads with numerically-arbitrary
+        (not duplicate, but not meaningful) extra points.
+
+    Bug found + fixed during task #6 review (Alice, 2026-07-12): the
+    original per-step zeroing (``diag_err.at[pivot].set(0.0)`` only
+    inside the ``is_small`` branch) relied on the Cholesky update's OWN
+    arithmetic driving the just-selected index's residual to exactly
+    zero -- which floating-point rounding doesn't guarantee after many
+    iterations, so once the residual was numerically exhausted,
+    ``argmax`` could re-select an EARLIER pivot instead of a fresh index
+    (measured: requesting 300 pivots on a 95-dim H2O/cc-pVDZ pair space
+    returned only 274 unique). This affects the shared primitive both
+    the TC pipeline (via _pivoted_cholesky_phi/_pivoted_cholesky_grad,
+    which discard effective_rank to preserve their pre-existing
+    single-array-return contract with isdf_decompose) and the Coulomb
+    path -- fixed here with an explicit selected-mask instead of relying
+    on the residual reaching exact zero, so duplicates are now
+    impossible by construction, not just numerically unlikely.
     """
     n_grid = factor_p_weighted.shape[1]
+    if n_rank > n_grid:
+        raise ValueError(
+            f"n_rank={n_rank} exceeds n_grid={n_grid} -- cannot select "
+            f"more interpolation points than there are candidate grid "
+            f"points."
+        )
 
     # Deterministic tie-break ramp for argmax (GPU/CPU pivot selection).
     # GPU tree-reduction in sum(factor**2,axis=0) produces diag_err values
@@ -175,12 +207,20 @@ def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, s
     # Storage for L factor (N_grid, n_rank)
     L = jnp.zeros((n_grid, n_rank))
     pivots = jnp.zeros(n_rank, dtype=int)
+    selected_mask = jnp.zeros(n_grid, dtype=bool)
+    n_effective = jnp.array(0, dtype=int)
 
     def body_fn(step, state):
-        diag_err, L, pivots = state
-        pivot = jnp.argmax(diag_err)
+        diag_err, L, pivots, selected_mask, n_effective = state
+        # Force already-selected indices to -inf before argmax --
+        # duplicates are now impossible by construction, not dependent
+        # on the residual reaching exactly zero.
+        candidate_err = jnp.where(selected_mask, -jnp.inf, diag_err)
+        pivot = jnp.argmax(candidate_err)
         pivots = pivots.at[step].set(pivot)
+        selected_mask = selected_mask.at[pivot].set(True)
         pivot_val = diag_err[pivot]
+        n_effective = n_effective + jnp.where(pivot_val >= 1e-12, 1, 0)
 
         A_col = jnp.dot(factor_p_weighted.T, factor_p_weighted[:, pivot])
         B_col = jnp.dot(factor_q_weighted.T, factor_q_weighted[:, pivot])
@@ -196,12 +236,32 @@ def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, s
         l_col = jnp.where(is_small, 0.0, l_col)
         L = L.at[:, step].set(l_col)
         diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        diag_err = diag_err.at[pivot].set(0.0)
 
-        return diag_err, L, pivots
+        return diag_err, L, pivots, selected_mask, n_effective
 
-    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
-    return final_pivots
+    _, _, final_pivots, _, final_n_effective = jax.lax.fori_loop(
+        0, n_rank, body_fn, (diag_err, L, pivots, selected_mask, n_effective))
+    return final_pivots, final_n_effective
+
+
+def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift):
+    """Host-level wrapper around ``_pivoted_cholesky_pair_pivots_core``.
+
+    The core is ``@jax.jit``-compiled and can only return JAX arrays (a
+    traced ``effective_rank`` can't be converted with Python's ``int()``
+    inside a jitted function -- that raises ConcretizationTypeError under
+    tracing). This wrapper calls the jitted core, then does the host-side
+    ``int()`` conversion on the (by then concrete) result. See the core's
+    docstring for the algorithm, bug history, and return-value semantics.
+
+    Returns:
+        (pivots, effective_rank): pivots is a (n_rank,) JAX array of
+        selected grid-point indices; effective_rank is a plain Python int.
+    """
+    final_pivots, final_n_effective = _pivoted_cholesky_pair_pivots_core(
+        factor_p_weighted, factor_q_weighted, n_rank, shift)
+    return final_pivots, int(final_n_effective)
 
 
 def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
@@ -211,8 +271,13 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
     ``pivoted_cholesky_pair_pivots`` (see its docstring). Kept as a
     distinct name at TC's existing call site rather than inlining, so
     that site's intent stays self-documenting.
+
+    Discards the ``effective_rank`` half of the shared primitive's
+    ``(pivots, effective_rank)`` return to preserve this wrapper's
+    pre-existing single-array-return contract with ``isdf_decompose``.
     """
-    return pivoted_cholesky_pair_pivots(phi_weighted, phi_weighted, n_rank, shift)
+    pivots, _effective_rank = pivoted_cholesky_pair_pivots(phi_weighted, phi_weighted, n_rank, shift)
+    return pivots
 
 
 def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
@@ -225,10 +290,15 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
     transpose-then-reshape collapses (orb, xyz) into one feature axis
     so the dot-product reduction still sums over exactly what the
     original per-component ``for c in range(3)`` loop summed over.
+
+    Discards the ``effective_rank`` half of the shared primitive's
+    ``(pivots, effective_rank)`` return to preserve this wrapper's
+    pre-existing single-array-return contract with ``isdf_decompose``.
     """
     n_orb, n_grid, _ = grad_phi_weighted.shape
     grad_flat = grad_phi_weighted.transpose(0, 2, 1).reshape(n_orb * 3, n_grid)
-    return pivoted_cholesky_pair_pivots(phi_weighted, grad_flat, n_rank, shift)
+    pivots, _effective_rank = pivoted_cholesky_pair_pivots(phi_weighted, grad_flat, n_rank, shift)
+    return pivots
 
 
 

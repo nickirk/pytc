@@ -23,6 +23,7 @@ from .molecular_df_reference import (
     pair_collocation_at_pivots,
     compute_C_streamed,
     compute_Z,
+    compute_Z_cross,
     reconstruct_eri_block,
 )
 
@@ -39,5 +40,6 @@ __all__ = [
     "pair_collocation_at_pivots",
     "compute_C_streamed",
     "compute_Z",
+    "compute_Z_cross",
     "reconstruct_eri_block",
 ]
