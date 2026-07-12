@@ -121,6 +121,15 @@ def _preload_gpu4pyscf_cusolver():
     return so_path
 
 
+def _n_lindep_removed(mf, threshold):
+    """Ground-truth count of overlap-matrix eigenvalues below ``threshold``,
+    computed directly from the matrix itself (not parsed from any
+    backend's log output)."""
+    s = np.asarray(_to_host(mf.get_ovlp()))
+    eigvals = np.linalg.eigvalsh(s)
+    return int(np.sum(eigvals < threshold))
+
+
 def _pin_lindep_threshold(mf, threshold, backend):
     """Apply canonical orthogonalization at an explicit, documented
     threshold instead of inheriting each backend's own default overlap-
@@ -129,46 +138,39 @@ def _pin_lindep_threshold(mf, threshold, backend):
     Different backends' default eigensolvers can drop a different number
     of near-linearly-dependent overlap eigenvectors at the same system
     (observed: pyscf CPU dropped 0, gpu4pyscf dropped 7, on the same
-    H160/cc-pVTZ overlap matrix) -- a real, backend-dependent difference
-    in the retained orbital space, not roundoff (Grace/Felix, 2026-07-12,
+    H160/cc-pVTZ overlap matrix, using its OWN internal
+    ``overlap_zero_eigenvalue_threshold`` default of 1e-6 -- a real
+    policy difference between backends, not roundoff; confirmed via
+    gpu4pyscf's public source, Grace/Felix, 2026-07-12,
     #proj-pytc-efficiency-refactor). Same overlap matrix + same explicit
     threshold makes the retained space backend-independent by construction.
 
-    n_removed is computed directly from the overlap matrix's own
-    eigenvalues (not parsed from backend log output) BEFORE deciding
-    whether to touch the SCF object at all, so the common case (nothing
-    to remove -- true for cc-pVTZ-scale systems at the pinned default)
-    never calls pyscf.scf.addons.remove_linear_dep_ and is safe on any
-    backend. That addon is numpy-only end to end (it installs a custom
-    eigensolver used on every SCF cycle, including on the Fock matrix,
-    not just the diagnostic check) -- calling it on a gpu4pyscf object
-    with n_removed > 0 crashes (numpy.linalg.cond has no cupy dispatch),
-    confirmed on real GPU hardware (Grace, 2026-07-12). Only the pyscf
-    backend can currently apply an actual non-zero removal; gpu4pyscf
-    with n_removed > 0 raises rather than silently doing something
-    unverified.
+    ``pyscf``: pyscf.scf.addons.remove_linear_dep_ is numpy-only end to
+    end (it installs a custom eigensolver used on every SCF cycle,
+    including the Fock matrix), so it's only called when actually
+    needed (n_removed > 0) -- the common case (nothing to remove, true
+    for cc-pVTZ-scale systems at the pinned default) skips it entirely.
+
+    ``gpu4pyscf``: it has its own module-level
+    ``gpu4pyscf.scf.hf.overlap_zero_eigenvalue_threshold``, read at SCF-
+    cycle time by its (cupy-native) ``check_linear_dependency`` -- set
+    directly to our pinned threshold so gpu4pyscf's own internal
+    machinery honors it end-to-end, no pyscf/numpy interop needed.
+
+    Returns n_lindep_removed (ground truth, computed independently of
+    either backend's internal accounting).
     """
-    s = np.asarray(_to_host(mf.get_ovlp()))
-    eigvals = np.linalg.eigvalsh(s)
-    n_removed = int(np.sum(eigvals < threshold))
-    if n_removed > 0:
-        if backend != "pyscf":
-            raise NotImplementedError(
-                f"--scf-backend {backend} has {n_removed} overlap-matrix "
-                f"eigenvalues below --scf-lindep-threshold={threshold}, but "
-                f"pyscf.scf.addons.remove_linear_dep_ only works on numpy-"
-                f"backed SCF objects -- it installs a numpy-based "
-                f"eigensolver used every SCF cycle, which crashes on "
-                f"{backend}'s cupy arrays. Not yet implemented for this "
-                f"backend at a threshold that actually removes directions: "
-                f"either raise --scf-lindep-threshold below this system's "
-                f"smallest overlap eigenvalue (keeps n_removed=0, no "
-                f"truncation needed, the common case), or extend this "
-                f"function with a cupy-native canonical-orthogonalization "
-                f"eigensolver for {backend}."
-            )
-        scf.addons.remove_linear_dep_(mf, threshold=threshold)
-    return n_removed
+    if backend == "pyscf":
+        n_removed = _n_lindep_removed(mf, threshold)
+        if n_removed > 0:
+            scf.addons.remove_linear_dep_(mf, threshold=threshold)
+        return n_removed
+    elif backend == "gpu4pyscf":
+        import gpu4pyscf.scf.hf as gpu4pyscf_hf
+        gpu4pyscf_hf.overlap_zero_eigenvalue_threshold = threshold
+        return _n_lindep_removed(mf, threshold)
+    else:
+        raise ValueError(f"Unknown --scf-backend: {backend!r}")
 
 
 def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8):
