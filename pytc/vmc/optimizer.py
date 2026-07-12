@@ -27,7 +27,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=5.0, max_delta_norm=0.5):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=5.0, max_delta_norm=0.5, mesh=None):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -57,6 +57,16 @@ class NewtonOptimizer:
         # 0/None disables jac_row_clip_multiplier/max_delta_norm independently.
         self.jac_row_clip_multiplier = jac_row_clip_multiplier
         self.max_delta_norm = max_delta_norm
+        # The Mesh optimize_ref_var/optimize build for sharded walkers
+        # (walker init, MCMC via make_mcmc_step) -- threaded through
+        # explicitly so _get_vmap/_get_unbatched_vmap use the SAME mesh
+        # instance instead of get_vmap_fn/shard_vmap silently re-deriving
+        # one via create_mesh() when mesh=None. Re-derivation was already
+        # correct on a stable single-node device topology (create_mesh()
+        # is deterministic over jax.devices()), so this closes a latent
+        # fragility rather than a live bug (Felix, 2026-07-12,
+        # #proj-pytc-efficiency-refactor).
+        self.mesh = mesh
 
     def _get_vmap(self):
         """Return the appropriate vmap implementation.
@@ -64,12 +74,12 @@ class NewtonOptimizer:
         Automatically detects multi-GPU environments via get_vmap_fn.
         """
         from .sharding import get_vmap_fn
-        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size)
+        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size, mesh=self.mesh)
 
     def _get_unbatched_vmap(self):
         """Return a per-batch vmap without nested folx batching."""
         from .sharding import get_vmap_fn
-        return get_vmap_fn(max_vmap_batch_size=0)
+        return get_vmap_fn(max_vmap_batch_size=0, mesh=self.mesh)
 
     def _get_effective_batch_size(self, n_walkers: int) -> int:
         """Return a batch size compatible with the current execution mode."""
@@ -648,6 +658,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
             jac_row_clip_multiplier=merged_kwargs.get("jac_row_clip_multiplier", 5.0),
             max_delta_norm=merged_kwargs.get("max_delta_norm", 0.5),
+            mesh=merged_kwargs.get("mesh", None),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")

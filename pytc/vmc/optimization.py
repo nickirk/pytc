@@ -453,6 +453,7 @@ def optimize(
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "fisher" # Energy minimization uses Fisher
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
+        opt_kwargs["mesh"] = mesh
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
@@ -778,7 +779,8 @@ def optimize_ref_var(
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
-        
+        opt_kwargs["mesh"] = mesh
+
         # Add jacobian_sample_size if provided
         if jacobian_sample_size is not None:
             opt_kwargs["jacobian_sample_size"] = jacobian_sample_size
