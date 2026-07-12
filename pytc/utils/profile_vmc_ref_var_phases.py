@@ -222,7 +222,23 @@ def _pin_lindep_threshold(mf, threshold, backend):
         raise ValueError(f"Unknown --scf-backend: {backend!r}")
 
 
-def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8):
+def _apply_scf_convergence_settings(mf, max_cycle, level_shift, diis_space):
+    """Plain passthrough to the mf object -- same attribute names on both
+    pyscf and gpu4pyscf (confirmed against gpu4pyscf's source: max_cycle/
+    diis_space/level_shift all mirror pyscf.scf.hf.SCF's). None means
+    "leave at the backend's own default," not "explicitly set to a
+    falsy value."
+    """
+    if max_cycle is not None:
+        mf.max_cycle = max_cycle
+    if level_shift is not None:
+        mf.level_shift = level_shift
+    if diis_space is not None:
+        mf.diis_space = diis_space
+
+
+def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8,
+             max_cycle=None, level_shift=None, diis_space=None):
     """Construct the density-fitted RHF object for the requested SCF backend.
 
     ``pyscf`` (default) is the existing CPU DF-RHF path, byte-for-byte
@@ -232,12 +248,19 @@ def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8):
     1.39x, far short of the hoped-for 10-50x. Import is lazy so choosing
     "pyscf" never requires gpu4pyscf (a CUDA-only package) to be installed.
 
+    max_cycle/level_shift/diis_space: None (default) leaves the
+    backend's own default; explicit values are passed straight through.
+    Needed for systems with near-degenerate frontier orbitals (e.g.
+    H300/cc-pVTZ) where the default SCF settings oscillate instead of
+    converging (Grace/Felix, 2026-07-12, #proj-pytc-efficiency-refactor).
+
     Returns (mf, cusolver_preload_path, n_lindep_removed). The preload
     path is None for the pyscf backend, or for gpu4pyscf if no preload
     was needed/found.
     """
     if backend == "pyscf":
         mf = scf.RHF(mol).density_fit()
+        _apply_scf_convergence_settings(mf, max_cycle, level_shift, diis_space)
         n_lindep_removed = _pin_lindep_threshold(mf, lindep_threshold, backend)
         return mf, None, n_lindep_removed
     elif backend == "gpu4pyscf":
@@ -250,13 +273,15 @@ def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8):
                 "(GPU-only, needs CUDA) -- not installed in this environment."
             ) from e
         mf = gpu_scf.RHF(mol).density_fit()
+        _apply_scf_convergence_settings(mf, max_cycle, level_shift, diis_space)
         n_lindep_removed = _pin_lindep_threshold(mf, lindep_threshold, backend)
         return mf, preload_path, n_lindep_removed
     else:
         raise ValueError(f"Unknown --scf-backend: {backend!r}")
 
 
-def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold=1e-8):
+def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold=1e-8,
+            max_cycle=None, level_shift=None, diis_space=None):
     """Run RHF+density-fit SCF on ``mol``, caching converged
     mo_coeff/mo_energy/mo_occ to a PySCF chkfile keyed by (atom, basis,
     unit) so repeated harness runs on the same system (Wave-2 reruns after
@@ -267,7 +292,8 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold
     Returns (mf, scf_time_s, was_cached, cusolver_preload_path,
     n_lindep_removed). Pass cache_dir=None/"" to disable caching.
     """
-    mf, preload_path, n_lindep_removed = make_rhf(mol, backend, lindep_threshold)
+    mf, preload_path, n_lindep_removed = make_rhf(
+        mol, backend, lindep_threshold, max_cycle, level_shift, diis_space)
 
     if not cache_dir:
         t0 = time.time()
@@ -277,8 +303,13 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold
         return mf, time.time() - t0, False, preload_path, n_lindep_removed
 
     os.makedirs(cache_dir, exist_ok=True)
+    # max_cycle/level_shift/diis_space affect the optimization trajectory,
+    # not just speed -- for near-degenerate systems a different path can
+    # converge to a different local solution, so they're part of the
+    # cache key too (same principle as backend/lindep_threshold above).
     cache_key = hashlib.sha256(
-        f"{atom}|{basis}|{unit}|{backend}|{lindep_threshold}".encode()
+        f"{atom}|{basis}|{unit}|{backend}|{lindep_threshold}|"
+        f"{max_cycle}|{level_shift}|{diis_space}".encode()
     ).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{cache_key}.h5")
     converged_marker = cache_path + ".converged"
@@ -410,6 +441,22 @@ def main():
                          "matrix (pyscf: 0, gpu4pyscf: 7, same H160 system) "
                          "-- a real difference in retained orbital space, "
                          "not roundoff (2026-07-12).")
+    p.add_argument("--scf-max-cycle", type=int, default=None,
+                    help="SCF max_cycle, passed straight through to the mf "
+                         "object (both backends). None = backend default "
+                         "(50). Needed for systems with near-degenerate "
+                         "frontier orbitals (e.g. H300/cc-pVTZ) where the "
+                         "default oscillates instead of converging within "
+                         "50 cycles (2026-07-12).")
+    p.add_argument("--scf-level-shift", type=float, default=None,
+                    help="SCF level_shift (Ha), passed straight through. "
+                         "None = backend default (0, no shift). A positive "
+                         "shift damps oscillation from near-degenerate "
+                         "HOMO/LUMO by artificially raising virtual-orbital "
+                         "energies during the iteration (2026-07-12).")
+    p.add_argument("--scf-diis-space", type=int, default=None,
+                    help="SCF diis_space, passed straight through. None = "
+                         "backend default (8).")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -434,9 +481,13 @@ def main():
     mol = gto.M(**mol_kwargs)
     result["scf_backend"] = args.scf_backend
     result["scf_lindep_threshold"] = args.scf_lindep_threshold
+    result["scf_max_cycle"] = args.scf_max_cycle
+    result["scf_level_shift"] = args.scf_level_shift
+    result["scf_diis_space"] = args.scf_diis_space
     mf, scf_time_s, scf_cached, cusolver_preload_path, n_lindep_removed = run_scf(
         mol, atom, args.basis, unit, args.scf_cache_dir, backend=args.scf_backend,
-        lindep_threshold=args.scf_lindep_threshold)
+        lindep_threshold=args.scf_lindep_threshold, max_cycle=args.scf_max_cycle,
+        level_shift=args.scf_level_shift, diis_space=args.scf_diis_space)
     result["scf_time_s"] = scf_time_s
     result["scf_cached"] = scf_cached
     result["cusolver_preload_path"] = cusolver_preload_path
