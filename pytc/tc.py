@@ -409,21 +409,8 @@ class TC:
         ao_gradients = ao[1:4].transpose(2, 1, 0)  # (N_ao, N_grid, 3)
         logger.debug(f"TC: AO basis evaluated in {time.perf_counter() - start_time:.3f} seconds")
 
-        # Transform to MO basis using JAX/GPU for speed, in grid-dimension
-        # chunks -- the unchunked version held up to 3 full-size
-        # (n_ao, n_grid, 3) buffers on-device simultaneously (the
-        # transpose-forced-contiguous copy from jnp.asarray, a
-        # non-aliasing .reshape, and the grad_phi output itself). This
-        # tensor is unavoidably AO-basis-sized (not MO-basis-sized) since
-        # it's PySCF's raw eval_ao output, evaluated before any MO
-        # transform -- at large nao this is many GiB per buffer, and the
-        # step is single-device/unsharded so extra GPUs don't help it.
-        # Chunking keeps only one chunk's worth of transient buffers alive
-        # at a time; the final phi/grad_phi outputs are unchanged in size
-        # (this doesn't shrink the necessary result, only the unnecessary
-        # transient copies). Mirrors the host_grid_block_size chunking
-        # pattern already used for K1/K3 kernel construction elsewhere in
-        # this file (see solve_tile_sizes-driven callers).
+        # Chunk the grid transform so the full AO-gradient intermediate is
+        # never held on-device (it's AO-basis-sized and unsharded).
         logger.info(f"TC: Transforming to MO basis (GPU, chunked)")
         start_time = time.perf_counter()
 
@@ -433,14 +420,7 @@ class TC:
         n_grid = grid_points.shape[0]
 
         if grid_chunk_size is None:
-            # Target ~2GiB for the dominant per-chunk buffer
-            # (n_ao * chunk * 3 * itemsize) -- a fixed byte target rather
-            # than one scaled to total GPU memory, since the fix here is
-            # about eliminating an unnecessarily large single-shot
-            # transient, not about using all available memory; a modest
-            # constant target keeps chunk counts small (tens, not
-            # thousands) across the whole range of system sizes this
-            # module targets.
+            # Auto-size from a fixed ~2GiB per-chunk target.
             target_chunk_bytes = 2 * 1024 ** 3
             bytes_per_grid_point = n_ao * 3 * ao_gradients.dtype.itemsize
             grid_chunk_size = max(1, target_chunk_bytes // bytes_per_grid_point)
