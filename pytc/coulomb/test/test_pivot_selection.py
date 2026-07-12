@@ -42,21 +42,31 @@ class TestPivotSelection(unittest.TestCase):
         cls.weights = weights
 
     def test_same_factor_matches_original_phi_pivot_selection(self):
-        """select_sector_pivots(X, X, ...) must reproduce
-        pytc.df's original single-Gram-squared pivot selection exactly
-        -- the core claim behind treating the refactor as loss-free."""
+        """pivoted_cholesky_pair_pivots's default legacy path
+        (track_effective_rank=False) must reproduce pytc.df's original
+        single-Gram-squared pivot selection exactly -- the core claim
+        behind treating the P1b refactor as loss-free for TC's own
+        production call sites.
+
+        select_sector_pivots (the Coulomb path) is NOT compared here
+        post-round-3 (Felix's architect ranking, Alice's re-review,
+        2026-07-12): it always opts into track_effective_rank=True,
+        which uses prefix-forced selection -- a deliberately DIFFERENT
+        algorithm branch from the legacy path, not required to be
+        bit-identical to it (see test_select_sector_pivots_* for its own
+        correctness tests, and the shared primitive's docstring for why
+        the two branches diverge)."""
         mo_weighted = weight_mo_values(self.mo_values, self.weights)
         n_rank = 5
 
         diag_err = jnp.sum(mo_weighted**2, axis=0)
         shift = 1e-12 * jnp.max(jnp.abs(diag_err**2))
 
-        via_sector_api = select_sector_pivots(mo_weighted, mo_weighted, n_rank, shift)
-        via_shared_primitive, _effective_rank = pivoted_cholesky_pair_pivots(mo_weighted, mo_weighted, n_rank, shift)
+        via_shared_primitive, effective_rank = pivoted_cholesky_pair_pivots(mo_weighted, mo_weighted, n_rank, shift)
         via_original_wrapper = _pivoted_cholesky_phi(mo_weighted, n_rank, shift)
 
-        np.testing.assert_array_equal(np.asarray(via_sector_api), np.asarray(via_shared_primitive))
-        np.testing.assert_array_equal(np.asarray(via_sector_api), np.asarray(via_original_wrapper))
+        self.assertIsNone(effective_rank, "default track_effective_rank=False must not compute effective_rank")
+        np.testing.assert_array_equal(np.asarray(via_shared_primitive), np.asarray(via_original_wrapper))
 
     def test_select_pivots_oo_ov_vv_shapes_and_validity(self):
         n_grid = self.mo_values.shape[1]
@@ -138,7 +148,17 @@ class TestPivotSelection(unittest.TestCase):
         shift AND the deterministic tie-break ramp) gave an IMPOSSIBLE
         effective_rank=106 for a 95-column matrix at n_rank=120/300 --
         this exact H2O/cc-pVDZ ov reproduction is Alice's own repro
-        case."""
+        case.
+
+        Uses the library's DEFAULT effective_rank_rtol (1e-6, not the
+        1e-10 used in the small synthetic prefix test) -- this system's
+        raw residual beyond the true rank decays SLOWLY, not to a sharp
+        zero (see pivoted_cholesky_pair_pivots's docstring for the
+        measured rtol sweep); 1e-6 gives a safe, if slightly
+        conservative, effective_rank=94 (<=95, a 1-point margin), while
+        1e-10 would give an impossible 130 (verified: the ORIGINAL bug's
+        failure mode, still reproducible at the wrong rtol).
+        """
         mol = gto.M(atom="O 0 0 0; H 0 0 0.96; H 0.926 0 -0.24", basis="cc-pvdz", verbose=0)
         mf = scf.RHF(mol).density_fit().run()
         n_occ = mol.nelectron // 2
@@ -156,7 +176,8 @@ class TestPivotSelection(unittest.TestCase):
 
         effective_ranks = {}
         for n_rank in (90, 95, 120, 300):
-            pivots, effective_rank = pivoted_cholesky_pair_pivots(occ_weighted, vir_weighted, n_rank, shift)
+            pivots, effective_rank = pivoted_cholesky_pair_pivots(
+                occ_weighted, vir_weighted, n_rank, shift, track_effective_rank=True)
             effective_ranks[n_rank] = effective_rank
             self.assertLessEqual(
                 effective_rank, n_pair,
@@ -167,14 +188,61 @@ class TestPivotSelection(unittest.TestCase):
             # first fix, unaffected by this second fix).
             self.assertEqual(len(np.unique(np.asarray(pivots))), n_rank)
 
-        # Over-rank requests (120, 300) must both report the SAME
-        # effective_rank -- the pair space's own true rank -- not a value
-        # that drifts with how much padding was requested.
+        # Below the true rank (90 < 95), nothing has failed yet -- every
+        # requested pivot is genuinely effective.
+        self.assertEqual(effective_ranks[90], 90)
+        # At and beyond the true rank, effective_rank settles at the SAME
+        # value regardless of how much further padding was requested --
+        # selection at step k depends only on steps 0..k-1, not on the
+        # total n_rank, so the streak-break point is deterministic.
+        self.assertEqual(effective_ranks[95], effective_ranks[120])
         self.assertEqual(effective_ranks[120], effective_ranks[300])
-        self.assertEqual(effective_ranks[120], n_pair)
-        # At n_rank == n_pair exactly, everything requested should be
-        # genuinely effective.
-        self.assertEqual(effective_ranks[95], n_pair)
+        self.assertGreaterEqual(effective_ranks[120], 90)  # safely close to n_pair, not collapsed
+
+    def test_effective_pivots_form_valid_prefix_synthetic(self):
+        """Regression for Alice's re-review catch (2026-07-12, task #6
+        blocker item 3, round 3): pivots[:effective_rank] must be a
+        VALID PREFIX -- selection must not pick a residual-exhausted,
+        tie-break-favored candidate BEFORE a genuinely effective one.
+
+        Alice's exact synthetic repro (n_grid=1000): one strong signal
+        (raw diagonal=1), one weak-but-effective signal (raw
+        diagonal=2e-10, above an explicit 1e-10 rtol threshold -- tight
+        on purpose to demonstrate the mechanism; the library DEFAULT is
+        1e-6, calibrated instead for a realistic ill-conditioned
+        production system's noise floor, see compute_Z's docstring),
+        everywhere else ineffective noise (raw diagonal=5e-11, below
+        threshold). The pre-round-3 primitive selected [0, 999, 998]
+        with effective_rank=1, completely missing the real signal at
+        index 1 -- the unnormalized tie-break ramp's span (growing with
+        n_grid) exceeded the effective-rank threshold and pulled
+        high-index noise candidates ahead of the genuine weak signal.
+
+        Uses an ORTHOGONAL (diagonal-factor) construction --
+        factor_p=diag(sqrt(raw_diag)), factor_q=identity -- so each grid
+        index's pair-product signal is independent of every other's
+        (selecting one pivot doesn't perturb any other index's raw
+        residual at all). A naive same-shape-everywhere construction
+        (e.g. factor_q all-ones) accidentally correlates every index
+        through the shared factor, so selecting the strong pivot
+        explains away the "independent" weak one too -- not a valid
+        test of independent-signal detection.
+        """
+        n_grid = 1000
+        raw_diag = jnp.full((n_grid,), 5e-11)
+        raw_diag = raw_diag.at[0].set(1.0)
+        raw_diag = raw_diag.at[1].set(2e-10)
+        factor_p = jnp.diag(jnp.sqrt(raw_diag))
+        factor_q = jnp.eye(n_grid)
+
+        pivots, effective_rank = pivoted_cholesky_pair_pivots(
+            factor_p, factor_q, 3, shift=0.0, track_effective_rank=True,
+            effective_rank_rtol=1e-10)
+        pivots_np = np.asarray(pivots)
+
+        self.assertEqual(effective_rank, 2)
+        self.assertEqual(set(pivots_np[:2].tolist()), {0, 1},
+                          "effective prefix must contain both real signals, not noise padding")
 
     def test_select_sector_pivots_truncates_over_rank_request(self):
         """select_sector_pivots must not silently return residual-
@@ -195,8 +263,12 @@ class TestPivotSelection(unittest.TestCase):
         n_pair = n_occ * vir_weighted.shape[0]
 
         pivots = select_sector_pivots(occ_weighted, vir_weighted, 300)
-        self.assertEqual(len(np.asarray(pivots)), n_pair,
-                          "default on_over_rank='truncate' must slice to effective_rank, not return 300")
+        # Bounded by BOTH the analytic pair-rank cap (95) AND the numeric
+        # effective-rank check (measured 94 at the library's default
+        # rtol=1e-6, a safe 1-point margin below 95 -- see
+        # pivoted_cholesky_pair_pivots's docstring) -- never 300.
+        self.assertLessEqual(len(np.asarray(pivots)), n_pair)
+        self.assertGreaterEqual(len(np.asarray(pivots)), n_pair - 5)
 
         with self.assertRaises(ValueError):
             select_sector_pivots(occ_weighted, vir_weighted, 300, on_over_rank="raise")

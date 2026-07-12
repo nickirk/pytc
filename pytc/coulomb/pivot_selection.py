@@ -45,7 +45,7 @@ def weight_mo_values(mo_values, weights):
 
 
 def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=None,
-                          on_over_rank="truncate"):
+                          on_over_rank="truncate", same_factor=False):
     """Select interpolation points for one MO-pair sector, at most n_rank
     of them.
 
@@ -74,20 +74,47 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
             arbitrary residual-exhausted pivots are never silently
             returned as if they were production-quality interpolation
             points (Alice's task #6 re-review, 2026-07-12, blocker 3).
+        same_factor: True for a symmetric sector ("oo", "vv" -- same MO
+            subset on both sides of the pair). Symmetric sectors have an
+            EXACT pair-product-space rank of n*(n+1)/2, not n**2 --
+            phi_p*phi_q == phi_q*phi_p as functions on the grid, so
+            (p,q) and (q,p) are literally identical columns of the pair
+            matrix. Used to analytically pre-cap n_rank before calling
+            the numerical primitive, so effective-rank tracking only
+            has to arbitrate the genuinely uncertain margin below that
+            exact bound (Felix's architect ranking on Alice's re-review,
+            2026-07-12). False (default) uses the generic n_p*n_q upper
+            bound.
 
     Returns:
-        pivots: (k,) selected grid-point indices, k = min(n_rank,
-        effective_rank).
+        pivots: (k,) selected grid-point indices, k <= n_rank (bounded
+        by both the analytic pair-rank cap and effective_rank).
     """
     if on_over_rank not in ("truncate", "raise"):
         raise ValueError(f"on_over_rank must be 'truncate' or 'raise', got {on_over_rank!r}")
     factor_p_weighted = jnp.asarray(factor_p_weighted)
     factor_q_weighted = jnp.asarray(factor_q_weighted)
+
+    n_p = factor_p_weighted.shape[0]
+    n_q = factor_q_weighted.shape[0]
+    analytic_rank_bound = n_p * (n_p + 1) // 2 if same_factor else n_p * n_q
+    n_rank_capped = min(n_rank, analytic_rank_bound)
+    if n_rank_capped < n_rank:
+        logger.info(
+            f"select_sector_pivots: n_rank={n_rank} exceeds the sector's "
+            f"exact analytic pair-rank bound ({analytic_rank_bound}"
+            f"{'=n*(n+1)/2, symmetric sector' if same_factor else '=n_p*n_q'}) "
+            f"-- pre-capping the request to {n_rank_capped} before pivot "
+            f"selection rather than asking the numerical primitive to "
+            f"discover an already-known bound."
+        )
+
     if shift is None:
         diag_err = jnp.sum(factor_p_weighted**2, axis=0) * jnp.sum(factor_q_weighted**2, axis=0)
         shift = 1e-12 * jnp.max(jnp.abs(diag_err))
-    pivots, effective_rank = pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift)
-    if effective_rank < n_rank:
+    pivots, effective_rank = pivoted_cholesky_pair_pivots(
+        factor_p_weighted, factor_q_weighted, n_rank_capped, shift, track_effective_rank=True)
+    if effective_rank < n_rank_capped:
         if on_over_rank == "raise":
             raise ValueError(
                 f"n_rank={n_rank} exceeds this sector's true numerical rank "
@@ -95,12 +122,18 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
                 f"n_rank or pass on_over_rank='truncate'."
             )
         logger.warning(
-            f"select_sector_pivots: n_rank={n_rank} requested but only "
-            f"effective_rank={effective_rank} pivots carry real numerical "
+            f"select_sector_pivots: n_rank_capped={n_rank_capped} requested but "
+            f"only effective_rank={effective_rank} pivots carry real numerical "
             f"signal -- truncating to {effective_rank} pivots rather than "
             f"returning residual-exhausted, numerically-arbitrary padding."
         )
         pivots = pivots[:effective_rank]
+    elif n_rank_capped < n_rank and on_over_rank == "raise":
+        raise ValueError(
+            f"n_rank={n_rank} exceeds this sector's exact analytic pair-rank "
+            f"bound ({analytic_rank_bound}) -- request a smaller n_rank or "
+            f"pass on_over_rank='truncate'."
+        )
     return pivots
 
 
@@ -134,9 +167,9 @@ def select_pivots_oo_ov_vv(mo_values, n_occ, weights, n_rank_oo, n_rank_ov, n_ra
     virt_weighted = mo_weighted[n_occ:]
 
     return {
-        "oo": select_sector_pivots(occ_weighted, occ_weighted, n_rank_oo, shift),
+        "oo": select_sector_pivots(occ_weighted, occ_weighted, n_rank_oo, shift, same_factor=True),
         "ov": select_sector_pivots(occ_weighted, virt_weighted, n_rank_ov, shift),
-        "vv": select_sector_pivots(virt_weighted, virt_weighted, n_rank_vv, shift),
+        "vv": select_sector_pivots(virt_weighted, virt_weighted, n_rank_vv, shift, same_factor=True),
     }
 
 
