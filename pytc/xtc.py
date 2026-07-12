@@ -299,10 +299,10 @@ class XTC(TC):
     energy_nuc: float = struct.field(pytree_node=False, default=0.0)
 
     @classmethod
-    def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
+    def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2, grid_chunk_size=None):
         """Initialize XTC object from PySCF mean-field object."""
         # Create base TC object
-        tc_obj = super().from_pyscf(mf, jastrow_factor, mo_coeff, grid_lvl)
+        tc_obj = super().from_pyscf(mf, jastrow_factor, mo_coeff, grid_lvl, grid_chunk_size)
         
         # Extract additional fields
         mo_occ = jnp.asarray(mf.mo_occ)

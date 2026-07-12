@@ -78,7 +78,34 @@ class TestTC(unittest.TestCase):
             rtol=1e-5, atol=1e-5,
             err_msg="JAX and numpy basis gradients don't match"
         )
-        
+
+    def test_from_pyscf_grid_chunking_matches_unchunked(self):
+        """Chunked and effectively-unchunked from_pyscf must agree exactly.
+
+        Guards the grid-chunked AO->MO transform (task: H50 2xA100 OOM fix)
+        against regression: a tiny explicit grid_chunk_size forces many
+        chunks, an oversized one forces a single chunk (the old,
+        unchunked behavior); both must produce identical phi/grad_phi.
+        """
+        tc_unchunked = TC_jax.from_pyscf(self.mf, self.jastrow_jax, grid_chunk_size=10**9)
+        tc_chunked = TC_jax.from_pyscf(self.mf, self.jastrow_jax, grid_chunk_size=3)
+
+        np.testing.assert_array_equal(
+            np.asarray(tc_chunked.phi), np.asarray(tc_unchunked.phi),
+            err_msg="Chunked phi doesn't exactly match unchunked phi"
+        )
+        np.testing.assert_array_equal(
+            np.asarray(tc_chunked.grad_phi), np.asarray(tc_unchunked.grad_phi),
+            err_msg="Chunked grad_phi doesn't exactly match unchunked grad_phi"
+        )
+
+    def test_from_pyscf_grid_chunk_size_validation(self):
+        """Non-positive grid_chunk_size raises a clear error, not a confusing one."""
+        with self.assertRaises(ValueError):
+            TC_jax.from_pyscf(self.mf, self.jastrow_jax, grid_chunk_size=0)
+        with self.assertRaises(ValueError):
+            TC_jax.from_pyscf(self.mf, self.jastrow_jax, grid_chunk_size=-5)
+
     def test_get_2b_against_numpy(self):
         """Test two-body term calculation against numpy version."""
         # Compute two-body correction with explicit parameter passing
