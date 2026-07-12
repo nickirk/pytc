@@ -169,6 +169,10 @@ class NewtonOptimizer:
         valid_norm = jnp.where(mask, row_norm, jnp.nan)
         median_norm = jnp.nanmedian(valid_norm)
         threshold = clip_multiplier * median_norm
+        # If every row is masked/non-finite, nanmedian is NaN and the clip
+        # would itself manufacture NaNs; fall back to "no clipping" and let
+        # the finite-masking above (rows already zeroed) carry the batch.
+        threshold = jnp.where(jnp.isfinite(threshold), threshold, jnp.inf)
         scale = jnp.minimum(1.0, threshold / jnp.maximum(row_norm, 1e-300))
         return jac_mat * scale[:, None]
 
@@ -380,16 +384,21 @@ class NewtonOptimizer:
                         (batched_walkers, batched_mask),
                     )
 
-                    e_mean = sum_e / n_walkers
-                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_walkers - e_mean**2, 0.0))
-                    mean_j = sum_j / n_walkers
-                    loss = (sum_e2 - n_walkers * e_mean**2) / (n_walkers - 1)
+                    # Dropped (non-finite) walkers contribute zeros to every
+                    # sum above; dividing by the full n_walkers would treat
+                    # them as real zero-energy/zero-Jacobian samples and bias
+                    # the step. Use the valid count (floored to avoid /0).
+                    n_valid = jnp.maximum(n_walkers - n_dropped, 2)
+                    e_mean = sum_e / n_valid
+                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_valid - e_mean**2, 0.0))
+                    mean_j = sum_j / n_valid
+                    loss = (sum_e2 - n_valid * e_mean**2) / (n_valid - 1)
                     aux_data = (e_mean, e_std)
-                    grads_vec = (2.0 / (n_walkers - 1)) * (
-                        sum_jte - n_walkers * mean_j * e_mean
+                    grads_vec = (2.0 / (n_valid - 1)) * (
+                        sum_jte - n_valid * mean_j * e_mean
                     )
-                    curvature_mat = (2.0 / n_walkers) * (
-                        sum_jtj - n_walkers * jnp.outer(mean_j, mean_j)
+                    curvature_mat = (2.0 / n_valid) * (
+                        sum_jtj - n_valid * jnp.outer(mean_j, mean_j)
                     )
                 else:
                     # Compute energies and Jacobian for (sub-sampled) walkers
@@ -429,20 +438,25 @@ class NewtonOptimizer:
 
                     jac_mat = self._clip_jacobian_rows(jac_mat, self.jac_row_clip_multiplier, mask=finite_mask)
 
-                    # Compute variance loss and auxiliary data analytically from energies
-                    e_mean = jnp.mean(energies)
-                    e_std = jnp.std(energies)
-                    energy_diff = energies - e_mean
-                    loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
+                    # Compute variance loss and auxiliary data analytically
+                    # from energies. Dropped walkers were zeroed above, so
+                    # denominators use the valid count and centered
+                    # quantities are re-masked to keep dropped rows at zero.
+                    n_valid = jnp.maximum(jnp.sum(finite_mask), 2)
+                    e_mean = jnp.sum(energies) / n_valid
+                    energy_diff = jnp.where(finite_mask, energies - e_mean, 0.0)
+                    e_std = jnp.sqrt(jnp.sum(energy_diff**2) / n_valid)
+                    loss = jnp.sum(energy_diff**2) / (n_valid - 1)
                     aux_data = (e_mean, e_std)
 
                     # Compute variance gradient analytically:
                     # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
-                    grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
+                    grads_vec = (2.0 / (n_valid - 1)) * (jac_mat.T @ energy_diff)
 
                     # Center the Jacobian for curvature matrix
-                    jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
-                    curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
+                    mean_jac = jnp.sum(jac_mat, axis=0, keepdims=True) / n_valid
+                    jac_centered = jnp.where(finite_mask[:, None], jac_mat - mean_jac, 0.0)
+                    curvature_mat = (2.0 / n_valid) * (jac_centered.T @ jac_centered)
             
             else:
                 raise ValueError(f"Unknown curvature type: {self.curvature_type}")

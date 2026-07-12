@@ -21,7 +21,6 @@ from .metropolis import (
 )
 from .walker import initialize_walkers
 from .mcmc_utils import prepare_sampling_results, report_progress
-from .hamiltonian import eval_local_energy
 from functools import partial
 from .sharding import (
     get_vmap_fn, shard_map_wrap,

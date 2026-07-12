@@ -1,6 +1,7 @@
 """Utility functions for analyzing quantum Monte Carlo samples."""
 
 import logging
+import time
 import numpy as np
 import jax.numpy as jnp
 from jax import random
