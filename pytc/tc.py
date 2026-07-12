@@ -413,18 +413,17 @@ class TC:
         # chunks -- the unchunked version held up to 3 full-size
         # (n_ao, n_grid, 3) buffers on-device simultaneously (the
         # transpose-forced-contiguous copy from jnp.asarray, a
-        # non-aliasing .reshape, and the grad_phi output itself), which at
-        # H50/cc-pV5Z scale (n_ao=2750, n_grid=268600) is ~16.5GiB PER
-        # buffer -- ~33-50GiB of avoidable transient peak on top of
-        # whatever SCF/ISDF already left resident, and this transform is
-        # single-device/unsharded so extra GPUs don't help it (Grace's
-        # diagnosis, 2026-07-12, #research-pytc, H50 R=1.6/R=2.4 2xA100
-        # OOMs). Chunking keeps only one chunk's worth of transient buffers
-        # alive at a time; the final phi/grad_phi outputs are unchanged in
-        # size (this doesn't shrink the necessary result, only the
-        # unnecessary transient copies). Mirrors the host_grid_block_size
-        # chunking pattern already used for K1/K3 kernel construction
-        # elsewhere in this file (see solve_tile_sizes-driven callers).
+        # non-aliasing .reshape, and the grad_phi output itself). This
+        # tensor is unavoidably AO-basis-sized (not MO-basis-sized) since
+        # it's PySCF's raw eval_ao output, evaluated before any MO
+        # transform -- at large nao this is many GiB per buffer, and the
+        # step is single-device/unsharded so extra GPUs don't help it.
+        # Chunking keeps only one chunk's worth of transient buffers alive
+        # at a time; the final phi/grad_phi outputs are unchanged in size
+        # (this doesn't shrink the necessary result, only the unnecessary
+        # transient copies). Mirrors the host_grid_block_size chunking
+        # pattern already used for K1/K3 kernel construction elsewhere in
+        # this file (see solve_tile_sizes-driven callers).
         logger.info(f"TC: Transforming to MO basis (GPU, chunked)")
         start_time = time.perf_counter()
 
@@ -435,7 +434,7 @@ class TC:
 
         if grid_chunk_size is None:
             # Target ~2GiB for the dominant per-chunk buffer
-            # (n_ao * chunk * 3 * 8 bytes) -- a fixed byte target rather
+            # (n_ao * chunk * 3 * itemsize) -- a fixed byte target rather
             # than one scaled to total GPU memory, since the fix here is
             # about eliminating an unnecessarily large single-shot
             # transient, not about using all available memory; a modest
@@ -443,8 +442,14 @@ class TC:
             # thousands) across the whole range of system sizes this
             # module targets.
             target_chunk_bytes = 2 * 1024 ** 3
-            bytes_per_grid_point = n_ao * 3 * 8
+            bytes_per_grid_point = n_ao * 3 * ao_gradients.dtype.itemsize
             grid_chunk_size = max(1, target_chunk_bytes // bytes_per_grid_point)
+        else:
+            grid_chunk_size = int(grid_chunk_size)
+            if grid_chunk_size < 1:
+                raise ValueError(
+                    f"grid_chunk_size must be a positive integer, got {grid_chunk_size!r}"
+                )
         grid_chunk_size = min(grid_chunk_size, n_grid)
 
         phi_chunks = []
