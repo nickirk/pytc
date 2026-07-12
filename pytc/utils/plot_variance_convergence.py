@@ -64,6 +64,18 @@ def git_commit():
         return "unknown"
 
 
+def _to_host(x):
+    """Convert a GPU-resident array (e.g. cupy, from gpu4pyscf) to host.
+
+    ``mf.dump_chk``/``scf.chkfile.dump_scf`` write via h5py, which can't
+    serialize device arrays directly. cupy arrays expose ``.get()``;
+    plain numpy arrays/Python scalars don't, so they pass through
+    unchanged -- this is backend-agnostic without importing cupy.
+    """
+    get = getattr(x, "get", None)
+    return get() if callable(get) else x
+
+
 def _preload_gpu4pyscf_cusolver():
     """Explicitly dlopen the real cusolver .so before gpu4pyscf imports it.
 
@@ -176,14 +188,20 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
     # chkfile writes are what leaves partial files behind on interrupted
     # runs, and whether that mechanism even fires reliably through
     # density_fit()'s decorator is version-dependent. Explicitly dump the
-    # final converged state ourselves, once, via dump_chk's direct-path
-    # form (writes regardless of decoration, bypasses the .chkfile
-    # attribute-propagation question entirely).
+    # final converged state ourselves, once, via scf.chkfile.dump_scf
+    # directly (same call mf.dump_chk's string-path form makes
+    # internally) with each array passed through _to_host first, since
+    # gpu4pyscf's mo_coeff/mo_energy/mo_occ may be cupy device arrays
+    # that h5py can't serialize.
     mf.kernel()
     print(f"SCF: converged={mf.converged}  e_tot={mf.e_tot}  "
           f"elapsed={time.time() - t0:.1f}s", flush=True)
     if mf.converged:
-        mf.dump_chk(cache_path)
+        scf.chkfile.dump_scf(
+            mf.mol, cache_path,
+            _to_host(mf.e_tot), _to_host(mf.mo_energy),
+            _to_host(mf.mo_coeff), _to_host(mf.mo_occ),
+        )
         open(converged_marker, "w").close()
     return mf, time.time() - t0, False, preload_path
 
