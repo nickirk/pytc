@@ -64,6 +64,51 @@ def git_commit():
         return "unknown"
 
 
+def _preload_gpu4pyscf_cusolver():
+    """Explicitly dlopen the real cusolver .so before gpu4pyscf imports it.
+
+    gpu4pyscf's ``lib/cusolver.py`` resolves the library via
+    ``ctypes.util.find_library('cusolver')``, which returns None for
+    pip-installed ``nvidia-cusolver-cu12`` wheels (they sit in
+    site-packages, never registered in ldconfig's cache). gpu4pyscf then
+    calls ``ctypes.CDLL(None)``, which silently binds to the current
+    process's own global symbol table instead of raising -- it "works"
+    for symbols something else (e.g. jax's own CUDA libs) already
+    exported, and fails opaquely on ones nothing else happens to export
+    (``cusolverDnDsygvd_bufferSize`` was the one that broke here). The
+    wheel itself is fine (confirmed via ``nm -D``) -- it's purely a
+    dlopen-resolution miss, not a version conflict (Grace's diagnosis,
+    2026-07-12, #proj-pytc-efficiency-refactor).
+
+    Loading the real .so here with RTLD_GLOBAL beforehand makes gpu4pyscf's
+    own (broken) lookup a no-op, so no launch-time LD_PRELOAD env var is
+    required -- self-contained in code instead of operator-remembered
+    launch state (Felix's call: same untracked-config bug class as the
+    damping/LR-schedule episodes this campaign already hit twice).
+
+    Returns the preloaded .so path, or None if the nvidia-cusolver-cu12
+    package wasn't found (gpu4pyscf's own import is left to fail with its
+    usual error in that case).
+    """
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("nvidia.cusolver")
+    except ModuleNotFoundError:
+        # find_spec raises (rather than returning None) when the parent
+        # package itself isn't importable, e.g. no "nvidia" namespace
+        # package present at all (a CPU-only host).
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    cusolver_dir = spec.submodule_search_locations[0]
+    so_path = os.path.join(cusolver_dir, "lib", "libcusolver.so.11")
+    if not os.path.exists(so_path):
+        return None
+    import ctypes
+    ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+    return so_path
+
+
 def make_rhf(mol, backend="pyscf"):
     """Construct the density-fitted RHF object for the requested SCF backend.
 
@@ -73,10 +118,14 @@ def make_rhf(mol, backend="pyscf"):
     for H300's bottleneck, since CPU max_memory sizing alone only bought
     1.39x, far short of the hoped-for 10-50x. Import is lazy so choosing
     "pyscf" never requires gpu4pyscf (a CUDA-only package) to be installed.
+
+    Returns (mf, cusolver_preload_path) -- the latter is None for the
+    pyscf backend, or for gpu4pyscf if no preload was needed/found.
     """
     if backend == "pyscf":
-        return scf.RHF(mol).density_fit()
+        return scf.RHF(mol).density_fit(), None
     elif backend == "gpu4pyscf":
+        preload_path = _preload_gpu4pyscf_cusolver()
         try:
             from gpu4pyscf import scf as gpu_scf
         except ImportError as e:
@@ -84,19 +133,21 @@ def make_rhf(mol, backend="pyscf"):
                 "--scf-backend gpu4pyscf requires the gpu4pyscf package "
                 "(GPU-only, needs CUDA) -- not installed in this environment."
             ) from e
-        return gpu_scf.RHF(mol).density_fit()
+        return gpu_scf.RHF(mol).density_fit(), preload_path
     else:
         raise ValueError(f"Unknown --scf-backend: {backend!r}")
 
 
 def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
     """Same caching pattern as profile_vmc_ref_var_phases.py -- large
-    systems shouldn't re-pay SCF on every convergence-plot rerun either."""
-    mf = make_rhf(mol, backend)
+    systems shouldn't re-pay SCF on every convergence-plot rerun either.
+
+    Returns (mf, scf_time_s, was_cached, cusolver_preload_path)."""
+    mf, preload_path = make_rhf(mol, backend)
     if not cache_dir:
         t0 = time.time()
         mf.kernel()
-        return mf, time.time() - t0, False
+        return mf, time.time() - t0, False, preload_path
     os.makedirs(cache_dir, exist_ok=True)
     import hashlib
     cache_key = hashlib.sha256(f"{atom}|{basis}|{unit}|{backend}".encode()).hexdigest()[:16]
@@ -109,10 +160,10 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
         mf.mo_occ = loaded["mo_occ"]
         mf.e_tot = loaded["e_tot"]
         mf.converged = True
-        return mf, time.time() - t0, True
+        return mf, time.time() - t0, True, preload_path
     mf.chkfile = cache_path
     mf.kernel()
-    return mf, time.time() - t0, False
+    return mf, time.time() - t0, False, preload_path
 
 
 def save_figure(fig, path, meta):
@@ -258,10 +309,17 @@ def main():
         mol_kwargs.update(verbose=0)
     mol = gto.M(**mol_kwargs)
     result_meta["scf_backend"] = args.scf_backend
-    mf, scf_time_s, scf_cached = run_scf(mol, atom, args.basis, unit, args.scf_cache_dir,
-                                          backend=args.scf_backend)
+    mf, scf_time_s, scf_cached, cusolver_preload_path = run_scf(
+        mol, atom, args.basis, unit, args.scf_cache_dir, backend=args.scf_backend)
     result_meta["scf_time_s"] = scf_time_s
     result_meta["scf_cached"] = scf_cached
+    result_meta["cusolver_preload_path"] = cusolver_preload_path
+    result_meta["scf_e_tot"] = float(mf.e_tot)
+    result_meta["scf_converged"] = bool(mf.converged)
+    # mf.cycles defaults to 0 (class-level) even when .kernel() was never
+    # called, e.g. the cached-SCF path -- None here means "not applicable
+    # this run" rather than a misleading literal 0.
+    result_meta["scf_n_cycles"] = None if scf_cached else getattr(mf, "cycles", None)
     result_meta["n_orb"] = int(mol.nao)
     result_meta["n_elec"] = int(mol.nelectron)
 
