@@ -30,6 +30,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.flatten_util
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 from pyscf import gto, scf
 
@@ -169,7 +170,31 @@ def _preload_gpu4pyscf_cusolver():
     return so_path
 
 
-def make_rhf(mol, backend="pyscf"):
+def _pin_lindep_threshold(mf, threshold):
+    """Apply canonical orthogonalization at an explicit, documented
+    threshold instead of inheriting each backend's own default overlap-
+    matrix conditioning behavior.
+
+    Different backends' default eigensolvers can drop a different number
+    of near-linearly-dependent overlap eigenvectors at the same system
+    (observed: pyscf CPU dropped 0, gpu4pyscf dropped 7, on the same
+    H160/cc-pVTZ overlap matrix) -- a real, backend-dependent difference
+    in the retained orbital space, not roundoff (Grace/Felix, 2026-07-12,
+    #proj-pytc-efficiency-refactor). Same overlap matrix + same explicit
+    threshold makes the retained space backend-independent by construction.
+
+    Returns n_removed: the number of overlap-matrix eigenvalues below
+    ``threshold``, computed directly (not parsed from log output) so it's
+    a ground-truth count independent of what any backend's internals
+    report.
+    """
+    scf.addons.remove_linear_dep_(mf, threshold=threshold)
+    s = np.asarray(_to_host(mf.get_ovlp()))
+    eigvals = np.linalg.eigvalsh(s)
+    return int(np.sum(eigvals < threshold))
+
+
+def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8):
     """Construct the density-fitted RHF object for the requested SCF backend.
 
     ``pyscf`` (default) is the existing CPU DF-RHF path, byte-for-byte
@@ -179,11 +204,14 @@ def make_rhf(mol, backend="pyscf"):
     1.39x, far short of the hoped-for 10-50x. Import is lazy so choosing
     "pyscf" never requires gpu4pyscf (a CUDA-only package) to be installed.
 
-    Returns (mf, cusolver_preload_path) -- the latter is None for the
-    pyscf backend, or for gpu4pyscf if no preload was needed/found.
+    Returns (mf, cusolver_preload_path, n_lindep_removed). The preload
+    path is None for the pyscf backend, or for gpu4pyscf if no preload
+    was needed/found.
     """
     if backend == "pyscf":
-        return scf.RHF(mol).density_fit(), None
+        mf = scf.RHF(mol).density_fit()
+        n_lindep_removed = _pin_lindep_threshold(mf, lindep_threshold)
+        return mf, None, n_lindep_removed
     elif backend == "gpu4pyscf":
         preload_path = _preload_gpu4pyscf_cusolver()
         try:
@@ -193,12 +221,14 @@ def make_rhf(mol, backend="pyscf"):
                 "--scf-backend gpu4pyscf requires the gpu4pyscf package "
                 "(GPU-only, needs CUDA) -- not installed in this environment."
             ) from e
-        return gpu_scf.RHF(mol).density_fit(), preload_path
+        mf = gpu_scf.RHF(mol).density_fit()
+        n_lindep_removed = _pin_lindep_threshold(mf, lindep_threshold)
+        return mf, preload_path, n_lindep_removed
     else:
         raise ValueError(f"Unknown --scf-backend: {backend!r}")
 
 
-def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
+def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold=1e-8):
     """Run RHF+density-fit SCF on ``mol``, caching converged
     mo_coeff/mo_energy/mo_occ to a PySCF chkfile keyed by (atom, basis,
     unit) so repeated harness runs on the same system (Wave-2 reruns after
@@ -206,20 +236,22 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
     of re-paying it -- H300-class systems have cost multiple hours of sunk
     SCF time across reruns (Felix, #proj-pytc-efficiency-refactor).
 
-    Returns (mf, scf_time_s, was_cached, cusolver_preload_path). Pass
-    cache_dir=None/"" to disable caching.
+    Returns (mf, scf_time_s, was_cached, cusolver_preload_path,
+    n_lindep_removed). Pass cache_dir=None/"" to disable caching.
     """
-    mf, preload_path = make_rhf(mol, backend)
+    mf, preload_path, n_lindep_removed = make_rhf(mol, backend, lindep_threshold)
 
     if not cache_dir:
         t0 = time.time()
         mf.kernel()
         print(f"SCF: converged={mf.converged}  e_tot={mf.e_tot}  "
               f"elapsed={time.time() - t0:.1f}s", flush=True)
-        return mf, time.time() - t0, False, preload_path
+        return mf, time.time() - t0, False, preload_path, n_lindep_removed
 
     os.makedirs(cache_dir, exist_ok=True)
-    cache_key = hashlib.sha256(f"{atom}|{basis}|{unit}|{backend}".encode()).hexdigest()[:16]
+    cache_key = hashlib.sha256(
+        f"{atom}|{basis}|{unit}|{backend}|{lindep_threshold}".encode()
+    ).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{cache_key}.h5")
     converged_marker = cache_path + ".converged"
 
@@ -239,7 +271,7 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
         mf.mo_occ = loaded["mo_occ"]
         mf.e_tot = loaded["e_tot"]
         mf.converged = True
-        return mf, time.time() - t0, True, preload_path
+        return mf, time.time() - t0, True, preload_path, n_lindep_removed
 
     # Don't pre-set mf.chkfile -- PySCF's during-kernel() incremental
     # chkfile writes are what leaves partial files behind on interrupted
@@ -260,7 +292,7 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
             _to_host(mf.mo_coeff), _to_host(mf.mo_occ),
         )
         open(converged_marker, "w").close()
-    return mf, time.time() - t0, False, preload_path
+    return mf, time.time() - t0, False, preload_path, n_lindep_removed
 
 
 def build_system(args):
@@ -338,6 +370,18 @@ def main():
                          "only bought 1.39x (2026-07-11). Validate smallest-"
                          "first: single H2O correctness vs CPU before trusting "
                          "larger systems.")
+    p.add_argument("--scf-lindep-threshold", type=float, default=1e-8,
+                    help="Overlap-matrix eigenvalue threshold below which "
+                         "canonical orthogonalization discards a direction "
+                         "(pyscf.scf.addons.remove_linear_dep_). Pinned "
+                         "explicitly (default: PySCF's own standard 1e-8) "
+                         "rather than left to each backend's own default, "
+                         "since different backends' eigensolvers were "
+                         "observed to drop a different number of near-"
+                         "linearly-dependent directions on the same overlap "
+                         "matrix (pyscf: 0, gpu4pyscf: 7, same H160 system) "
+                         "-- a real difference in retained orbital space, "
+                         "not roundoff (2026-07-12).")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -361,11 +405,14 @@ def main():
         mol_kwargs.update(verbose=0)
     mol = gto.M(**mol_kwargs)
     result["scf_backend"] = args.scf_backend
-    mf, scf_time_s, scf_cached, cusolver_preload_path = run_scf(
-        mol, atom, args.basis, unit, args.scf_cache_dir, backend=args.scf_backend)
+    result["scf_lindep_threshold"] = args.scf_lindep_threshold
+    mf, scf_time_s, scf_cached, cusolver_preload_path, n_lindep_removed = run_scf(
+        mol, atom, args.basis, unit, args.scf_cache_dir, backend=args.scf_backend,
+        lindep_threshold=args.scf_lindep_threshold)
     result["scf_time_s"] = scf_time_s
     result["scf_cached"] = scf_cached
     result["cusolver_preload_path"] = cusolver_preload_path
+    result["n_lindep_removed"] = n_lindep_removed
     result["scf_e_tot"] = float(mf.e_tot)
     result["scf_converged"] = bool(mf.converged)
     # mf.cycles defaults to 0 (class-level) even when .kernel() was never
