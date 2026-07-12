@@ -147,13 +147,24 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
     if not cache_dir:
         t0 = time.time()
         mf.kernel()
+        print(f"SCF: converged={mf.converged}  e_tot={mf.e_tot}  "
+              f"elapsed={time.time() - t0:.1f}s", flush=True)
         return mf, time.time() - t0, False, preload_path
     os.makedirs(cache_dir, exist_ok=True)
     import hashlib
     cache_key = hashlib.sha256(f"{atom}|{basis}|{unit}|{backend}".encode()).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{cache_key}.h5")
+    converged_marker = cache_path + ".converged"
     t0 = time.time()
-    if os.path.exists(cache_path):
+    cache_hit = os.path.exists(cache_path) and os.path.exists(converged_marker)
+    print(f"SCF cache: key={cache_key}  path={cache_path}  "
+          f"{'HIT' if cache_hit else 'MISS'}", flush=True)
+    # PySCF writes the chkfile every SCF cycle, so a job killed mid-SCF
+    # leaves a chkfile with partial, unconverged orbitals. Only trust the
+    # cache if the converged-marker is present too -- it's written below
+    # only after mf.kernel() actually returns with mf.converged True, so
+    # its absence means "don't trust this," not "converged, load it."
+    if cache_hit:
         loaded = scf.chkfile.load(cache_path, "scf")
         mf.mo_coeff = loaded["mo_coeff"]
         mf.mo_energy = loaded["mo_energy"]
@@ -161,8 +172,19 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
         mf.e_tot = loaded["e_tot"]
         mf.converged = True
         return mf, time.time() - t0, True, preload_path
-    mf.chkfile = cache_path
+    # Don't pre-set mf.chkfile -- PySCF's during-kernel() incremental
+    # chkfile writes are what leaves partial files behind on interrupted
+    # runs, and whether that mechanism even fires reliably through
+    # density_fit()'s decorator is version-dependent. Explicitly dump the
+    # final converged state ourselves, once, via dump_chk's direct-path
+    # form (writes regardless of decoration, bypasses the .chkfile
+    # attribute-propagation question entirely).
     mf.kernel()
+    print(f"SCF: converged={mf.converged}  e_tot={mf.e_tot}  "
+          f"elapsed={time.time() - t0:.1f}s", flush=True)
+    if mf.converged:
+        mf.dump_chk(cache_path)
+        open(converged_marker, "w").close()
     return mf, time.time() - t0, False, preload_path
 
 
