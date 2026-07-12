@@ -128,6 +128,86 @@ class TestPivotSelection(unittest.TestCase):
         error = pair_collocation_reconstruction_error(factor, factor, pivots)
         self.assertLess(error, 1e-8)
 
+    def test_effective_rank_capped_at_true_pair_rank_h2o_ov(self):
+        """Regression for Alice's re-review catch (2026-07-12, task #6
+        blocker item 3): effective_rank must never exceed the sector's
+        TRUE pair-space rank (n_occ*n_vir=95 for this H2O/cc-pVDZ ov
+        sector) regardless of how much n_rank overshoots it. The
+        original effective-rank accounting (counting diag_err[pivot] >=
+        1e-12 against diag_err ITSELF, which includes the Tikhonov
+        shift AND the deterministic tie-break ramp) gave an IMPOSSIBLE
+        effective_rank=106 for a 95-column matrix at n_rank=120/300 --
+        this exact H2O/cc-pVDZ ov reproduction is Alice's own repro
+        case."""
+        mol = gto.M(atom="O 0 0 0; H 0 0 0.96; H 0.926 0 -0.24", basis="cc-pvdz", verbose=0)
+        mf = scf.RHF(mol).density_fit().run()
+        n_occ = mol.nelectron // 2
+        mo_coeff = get_mo_coeff(mf)
+        ao_values, weights, coords = get_grid_ao_values_and_weights(mf, grid_lvl=2)
+        mo_values = (ao_values @ mo_coeff).T
+        mo_weighted = weight_mo_values(mo_values, weights)
+        occ_weighted = mo_weighted[:n_occ]
+        vir_weighted = mo_weighted[n_occ:]
+        n_vir = vir_weighted.shape[0]
+        n_pair = n_occ * n_vir  # 95
+
+        diag_err = jnp.sum(occ_weighted**2, axis=0) * jnp.sum(vir_weighted**2, axis=0)
+        shift = 1e-12 * jnp.max(jnp.abs(diag_err))
+
+        effective_ranks = {}
+        for n_rank in (90, 95, 120, 300):
+            pivots, effective_rank = pivoted_cholesky_pair_pivots(occ_weighted, vir_weighted, n_rank, shift)
+            effective_ranks[n_rank] = effective_rank
+            self.assertLessEqual(
+                effective_rank, n_pair,
+                f"effective_rank={effective_rank} exceeds true pair rank "
+                f"n_pair={n_pair} at n_rank={n_rank} -- impossible.")
+            self.assertLessEqual(effective_rank, n_rank)
+            # Still no duplicates regardless of over-rank padding (item 3's
+            # first fix, unaffected by this second fix).
+            self.assertEqual(len(np.unique(np.asarray(pivots))), n_rank)
+
+        # Over-rank requests (120, 300) must both report the SAME
+        # effective_rank -- the pair space's own true rank -- not a value
+        # that drifts with how much padding was requested.
+        self.assertEqual(effective_ranks[120], effective_ranks[300])
+        self.assertEqual(effective_ranks[120], n_pair)
+        # At n_rank == n_pair exactly, everything requested should be
+        # genuinely effective.
+        self.assertEqual(effective_ranks[95], n_pair)
+
+    def test_select_sector_pivots_truncates_over_rank_request(self):
+        """select_sector_pivots must not silently return residual-
+        exhausted, numerically-arbitrary pivots as if they were
+        production-quality interpolation points (Alice's task #6
+        re-review, blocker item 3: 'surface it through
+        select_sector_pivots and either slice to effective pivots or
+        explicitly reject/stop over-rank requests')."""
+        mol = gto.M(atom="O 0 0 0; H 0 0 0.96; H 0.926 0 -0.24", basis="cc-pvdz", verbose=0)
+        mf = scf.RHF(mol).density_fit().run()
+        n_occ = mol.nelectron // 2
+        mo_coeff = get_mo_coeff(mf)
+        ao_values, weights, coords = get_grid_ao_values_and_weights(mf, grid_lvl=2)
+        mo_values = (ao_values @ mo_coeff).T
+        mo_weighted = weight_mo_values(mo_values, weights)
+        occ_weighted = mo_weighted[:n_occ]
+        vir_weighted = mo_weighted[n_occ:]
+        n_pair = n_occ * vir_weighted.shape[0]
+
+        pivots = select_sector_pivots(occ_weighted, vir_weighted, 300)
+        self.assertEqual(len(np.asarray(pivots)), n_pair,
+                          "default on_over_rank='truncate' must slice to effective_rank, not return 300")
+
+        with self.assertRaises(ValueError):
+            select_sector_pivots(occ_weighted, vir_weighted, 300, on_over_rank="raise")
+
+        with self.assertRaises(ValueError):
+            select_sector_pivots(occ_weighted, vir_weighted, 5, on_over_rank="not-a-real-mode")
+
+        # Not-over-rank requests are returned in full, untouched.
+        pivots_small = select_sector_pivots(occ_weighted, vir_weighted, 10)
+        self.assertEqual(len(np.asarray(pivots_small)), 10)
+
 
 if __name__ == "__main__":
     unittest.main()

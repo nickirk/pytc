@@ -48,8 +48,13 @@ class TestMolecularDFReference(unittest.TestCase):
         cls.occ_weighted = mo_weighted[:cls.n_occ]
         cls.vir_weighted = mo_weighted[cls.n_occ:]
 
-        # n_rank=300 >> n_pair=95 (n_occ*n_vir) -- deliberately overcomplete
-        # so the ISDF approximation should be accurate, not just plausible.
+        # n_rank=300 requested >> n_pair=95 (n_occ*n_vir) -- deliberately
+        # over-asked so select_sector_pivots's over-rank truncation (Alice's
+        # task #6 re-review, 2026-07-12, blocker item 3) kicks in and cls.P
+        # ends up with exactly n_pair=95 pivots, the sector's true rank --
+        # the near-exact regime this fixture is FOR (see
+        # test_cross_sector_*_compressed_rank for the genuinely-compressed
+        # regime these near-exact fixtures don't cover).
         cls.n_rank = 300
         pivots = np.asarray(select_sector_pivots(
             cls.occ_weighted, cls.vir_weighted, cls.n_rank))
@@ -71,14 +76,21 @@ class TestMolecularDFReference(unittest.TestCase):
         # to exercise compute_Z_cross for the oo|vv and ov|vv blocks
         # CCSD needs but MP2's ov|ov-only validation never touches
         # (Alice's task #6 review, 2026-07-12, blocker item 2).
-        cls.n_rank_oo = 75  # >> n_pair_oo = n_occ**2 = 25
+        # oo's pair-product space is SYMMETRIC (phi_p*phi_q == phi_q*phi_p
+        # as functions on the grid for p,q both occupied) so its true rank
+        # is the triangular number n_occ*(n_occ+1)/2=15, not n_occ**2=25 --
+        # 75 requested truncates down to 15 (the sector's true rank).
+        cls.n_rank_oo = 75
         pivots_oo = np.asarray(select_sector_pivots(
             cls.occ_weighted, cls.occ_weighted, cls.n_rank_oo))
         occ_at_piv_oo = np.asarray(cls.occ_raw)[:, pivots_oo]
         cls.P_oo = pair_collocation_at_pivots(occ_at_piv_oo, occ_at_piv_oo)
         cls.C_oo = compute_C_streamed(cls.mf, cls.P_oo, cls.mo_occ, cls.mo_occ, auxbasis="weigend")
 
-        cls.n_rank_vv = 380  # > n_pair_vv = n_vir**2 = 361
+        # Same symmetric-sector argument as oo: vv's true rank is
+        # n_vir*(n_vir+1)/2=190, not n_vir**2=361 -- 380 requested
+        # truncates down to 190.
+        cls.n_rank_vv = 380
         pivots_vv = np.asarray(select_sector_pivots(
             cls.vir_weighted, cls.vir_weighted, cls.n_rank_vv))
         vir_at_piv_vv = np.asarray(cls.vir_raw)[:, pivots_vv]
@@ -157,6 +169,46 @@ class TestMolecularDFReference(unittest.TestCase):
         rel_err = (np.linalg.norm(eri_isdf - self.eri_ovvv_exact)
                    / np.linalg.norm(self.eri_ovvv_exact))
         self.assertLess(rel_err, 0.05)
+
+    def test_cross_sector_ovvv_reconstruction_compressed_rank(self):
+        """The near-exact setUpClass fixtures (n_rank_oo/n_rank_vv chosen
+        deliberately overcomplete, now truncated by select_sector_pivots
+        to exactly the sector's true rank -- see blocker item 3) only
+        validate the cross-sector interface in the near-exact full-pair
+        regime. CCSD production runs deliberately use fewer pivots than
+        the full pair rank for efficiency -- this test exercises that
+        actually-compressed regime (n_rank_ov=50 < true rank 95,
+        n_rank_vv=100 < true rank 190) and checks the reconstruction
+        degrades GRACEFULLY (finite, well below the 1.0-relative-error
+        nonsense floor), not that it's near-exact (Alice's task #6
+        re-review, 2026-07-12, blocker item 4)."""
+        n_rank_ov_compressed = 50
+        n_rank_vv_compressed = 100
+        pivots_ov = np.asarray(select_sector_pivots(
+            self.occ_weighted, self.vir_weighted, n_rank_ov_compressed))
+        self.assertEqual(len(pivots_ov), n_rank_ov_compressed,
+                          "n_rank_ov_compressed must be below the true rank -- no truncation expected")
+        P_ov = pair_collocation_at_pivots(
+            np.asarray(self.occ_raw)[:, pivots_ov], np.asarray(self.vir_raw)[:, pivots_ov])
+        C_ov = compute_C_streamed(self.mf, P_ov, self.mo_occ, self.mo_vir, auxbasis="weigend")
+
+        pivots_vv = np.asarray(select_sector_pivots(
+            self.vir_weighted, self.vir_weighted, n_rank_vv_compressed))
+        self.assertEqual(len(pivots_vv), n_rank_vv_compressed,
+                          "n_rank_vv_compressed must be below the true rank -- no truncation expected")
+        P_vv = pair_collocation_at_pivots(
+            np.asarray(self.vir_raw)[:, pivots_vv], np.asarray(self.vir_raw)[:, pivots_vv])
+        C_vv = compute_C_streamed(self.mf, P_vv, self.mo_vir, self.mo_vir, auxbasis="weigend")
+
+        Z_ovvv = compute_Z_cross(P_ov, C_ov, P_vv, C_vv)
+        eri_isdf = reconstruct_eri_block(P_ov, Z_ovvv, P_vv).reshape(
+            self.n_occ, self.n_vir, self.n_vir, self.n_vir)
+        rel_err = (np.linalg.norm(eri_isdf - self.eri_ovvv_exact)
+                   / np.linalg.norm(self.eri_ovvv_exact))
+        self.assertTrue(np.isfinite(rel_err))
+        # measured ~0.27 at these ranks -- generous margin, this is a
+        # sanity/regime check, not a tight acceptance bound.
+        self.assertLess(rel_err, 0.6)
 
     def test_cross_sector_Z_matches_same_sector_Z_special_case(self):
         """compute_Z_cross(P, C, P, C) must equal compute_Z(P, C) exactly

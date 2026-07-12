@@ -113,8 +113,9 @@ def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
     return jsp_linalg.cho_solve((chol, lower), atb)
 
 
-@partial(jax.jit, static_argnames=('n_rank',))
-def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_rank, shift):
+@partial(jax.jit, static_argnames=('n_rank', 'effective_rank_rtol'))
+def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_rank, shift,
+                                        effective_rank_rtol=1e-10):
     """Matrix-free pivoted-Cholesky selection of grid/interpolation points
     that best span the pair-product space ``A[g,(p,q)] = factor_p[p,g] *
     factor_q[q,g]``, without ever forming ``A`` (task #5,
@@ -154,16 +155,18 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
             before each pivot selection (numerically pins near-zero/
             near-degenerate residuals to exactly zero rather than
             leaving them as noise-dominated candidates).
+        effective_rank_rtol: Relative tolerance (fraction of the
+            UNREGULARIZED diagonal's own max) for counting a selection
+            as carrying real signal -- see effective_rank below.
 
     Returns:
         (pivots, effective_rank): pivots is (n_rank,) selected grid-point
         indices, in selection order, GUARANTEED unique (see below).
         effective_rank (Python int, host-side) is how many of those
-        selections had real numerical signal (pivot_val >= 1e-12,
-        matching the existing is_small threshold) before the residual
-        was numerically exhausted -- steps beyond effective_rank are
-        still unique grid indices (never duplicates), but are picking
-        among residual-exhausted candidates rather than genuine
+        selections had real numerical signal before the residual was
+        numerically exhausted -- steps beyond effective_rank are still
+        unique grid indices (never duplicates), but are picking among
+        residual-exhausted candidates rather than genuine
         interpolation-quality points, i.e. requesting n_rank beyond the
         pair space's true numerical rank pads with numerically-arbitrary
         (not duplicate, but not meaningful) extra points.
@@ -183,6 +186,25 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     path -- fixed here with an explicit selected-mask instead of relying
     on the residual reaching exact zero, so duplicates are now
     impossible by construction, not just numerically unlikely.
+
+    Second bug found + fixed, same review round (Alice's re-review,
+    2026-07-12): the FIRST version of effective_rank counted
+    ``diag_err[pivot] >= 1e-12`` against ``diag_err`` itself -- which
+    includes BOTH the Tikhonov ``shift`` AND the deterministic tie-break
+    ramp (``1e-12 * arange(n_grid) * max(|diag_err|)``, see above). For
+    large-index candidates late in an over-rank request, the ramp alone
+    (up to ``1e-12 * n_grid * max_diag``) can exceed the absolute 1e-12
+    threshold even with zero real signal left -- Alice measured
+    effective_rank=106 for a true-rank-95 matrix, an impossible result
+    (rank can't exceed n_pair). Fixed by tracking a SEPARATE parallel
+    Cholesky decomposition on the UNREGULARIZED diagonal (``raw_diag_err
+    = A_diag * B_diag``, no shift, no ramp) using the SAME pivot order
+    (pivots are still chosen from the regularized/ramped ``diag_err`` --
+    only the effective-rank ACCOUNTING changes), and counting a
+    selection as effective only if its raw residual exceeds a
+    SCALE-RELATIVE tolerance (``effective_rank_rtol`` fraction of the
+    raw diagonal's own initial max), not an absolute constant that
+    implicitly assumed an O(1) diagonal scale.
     """
     n_grid = factor_p_weighted.shape[1]
     if n_rank > n_grid:
@@ -201,17 +223,29 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     # deterministically on both devices.
     A_diag = jnp.sum(factor_p_weighted**2, axis=0)
     B_diag = jnp.sum(factor_q_weighted**2, axis=0)
-    diag_err = A_diag * B_diag + shift
+    # UNREGULARIZED diagonal (no shift, no tie-break ramp) -- tracked in
+    # parallel purely for the effective-rank diagnostic, never used for
+    # pivot SELECTION itself (selection still uses the ramped/shifted
+    # diag_err below, for the GPU/CPU-determinism reasons in the comment
+    # above).
+    raw_diag_err_init = A_diag * B_diag
+    raw_scale = jnp.max(raw_diag_err_init)
+    eff_tol = effective_rank_rtol * raw_scale
+
+    diag_err = raw_diag_err_init + shift
     diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
 
-    # Storage for L factor (N_grid, n_rank)
+    # Storage for L factor (N_grid, n_rank), and a parallel L_raw for the
+    # unregularized residual used only to compute effective_rank.
     L = jnp.zeros((n_grid, n_rank))
+    L_raw = jnp.zeros((n_grid, n_rank))
     pivots = jnp.zeros(n_rank, dtype=int)
     selected_mask = jnp.zeros(n_grid, dtype=bool)
     n_effective = jnp.array(0, dtype=int)
+    raw_diag_err = raw_diag_err_init
 
     def body_fn(step, state):
-        diag_err, L, pivots, selected_mask, n_effective = state
+        diag_err, L, raw_diag_err, L_raw, pivots, selected_mask, n_effective = state
         # Force already-selected indices to -inf before argmax --
         # duplicates are now impossible by construction, not dependent
         # on the residual reaching exactly zero.
@@ -220,32 +254,52 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         pivots = pivots.at[step].set(pivot)
         selected_mask = selected_mask.at[pivot].set(True)
         pivot_val = diag_err[pivot]
-        n_effective = n_effective + jnp.where(pivot_val >= 1e-12, 1, 0)
+
+        # Effective-rank accounting uses the UNREGULARIZED residual at
+        # this pivot against a scale-relative tolerance -- excludes both
+        # the Tikhonov shift and the tie-break ramp, which otherwise
+        # inflate diag_err[pivot] above an absolute threshold even with
+        # no real signal left (Alice's re-review, 2026-07-12).
+        pivot_val_raw = raw_diag_err[pivot]
+        n_effective = n_effective + jnp.where(pivot_val_raw >= eff_tol, 1, 0)
 
         A_col = jnp.dot(factor_p_weighted.T, factor_p_weighted[:, pivot])
         B_col = jnp.dot(factor_q_weighted.T, factor_q_weighted[:, pivot])
         S_col = A_col * B_col
-        S_col = S_col.at[pivot].add(shift)
+        S_col_shifted = S_col.at[pivot].add(shift)
 
         dot_prod = jnp.dot(L, L[pivot])
         is_small = pivot_val < 1e-12
         safe_pivot = jnp.where(is_small, 1.0, pivot_val)
         inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
 
-        l_col = (S_col - dot_prod) * inv_sqrt_pivot
+        l_col = (S_col_shifted - dot_prod) * inv_sqrt_pivot
         l_col = jnp.where(is_small, 0.0, l_col)
         L = L.at[:, step].set(l_col)
         diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
         diag_err = diag_err.at[pivot].set(0.0)
 
-        return diag_err, L, pivots, selected_mask, n_effective
+        # Parallel UNregularized Cholesky bookkeeping (diagnostic only,
+        # never fed back into pivot selection or the L used above).
+        dot_prod_raw = jnp.dot(L_raw, L_raw[pivot])
+        is_small_raw = pivot_val_raw < eff_tol
+        safe_pivot_raw = jnp.where(is_small_raw, 1.0, pivot_val_raw)
+        inv_sqrt_pivot_raw = jax.lax.rsqrt(safe_pivot_raw)
+        l_col_raw = (S_col - dot_prod_raw) * inv_sqrt_pivot_raw
+        l_col_raw = jnp.where(is_small_raw, 0.0, l_col_raw)
+        L_raw = L_raw.at[:, step].set(l_col_raw)
+        raw_diag_err = jnp.maximum(raw_diag_err - l_col_raw**2, 0.0)
+        raw_diag_err = raw_diag_err.at[pivot].set(0.0)
 
-    _, _, final_pivots, _, final_n_effective = jax.lax.fori_loop(
-        0, n_rank, body_fn, (diag_err, L, pivots, selected_mask, n_effective))
+        return diag_err, L, raw_diag_err, L_raw, pivots, selected_mask, n_effective
+
+    _, _, _, _, final_pivots, _, final_n_effective = jax.lax.fori_loop(
+        0, n_rank, body_fn, (diag_err, L, raw_diag_err, L_raw, pivots, selected_mask, n_effective))
     return final_pivots, final_n_effective
 
 
-def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift):
+def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift,
+                                  effective_rank_rtol=1e-10):
     """Host-level wrapper around ``_pivoted_cholesky_pair_pivots_core``.
 
     The core is ``@jax.jit``-compiled and can only return JAX arrays (a
@@ -255,12 +309,17 @@ def pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, s
     ``int()`` conversion on the (by then concrete) result. See the core's
     docstring for the algorithm, bug history, and return-value semantics.
 
+    Args:
+        effective_rank_rtol: forwarded to the core -- relative tolerance
+            (fraction of the unregularized diagonal's own max) for
+            counting a selection as carrying real signal.
+
     Returns:
         (pivots, effective_rank): pivots is a (n_rank,) JAX array of
         selected grid-point indices; effective_rank is a plain Python int.
     """
     final_pivots, final_n_effective = _pivoted_cholesky_pair_pivots_core(
-        factor_p_weighted, factor_q_weighted, n_rank, shift)
+        factor_p_weighted, factor_q_weighted, n_rank, shift, effective_rank_rtol)
     return final_pivots, int(final_n_effective)
 
 

@@ -17,10 +17,14 @@ materializing A itself -- see pivoted_cholesky_pair_pivots's docstring
 for the algebraic identity that makes this matrix-free.
 """
 
+import logging
+
 import jax.numpy as jnp
 import numpy as np
 
 from pytc.df import pivoted_cholesky_pair_pivots
+
+logger = logging.getLogger(__name__)
 
 
 def weight_mo_values(mo_values, weights):
@@ -40,8 +44,10 @@ def weight_mo_values(mo_values, weights):
     return jnp.asarray(mo_values) * w_sqrt[None, :]
 
 
-def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=None):
-    """Select n_rank interpolation points for one MO-pair sector.
+def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=None,
+                          on_over_rank="truncate"):
+    """Select interpolation points for one MO-pair sector, at most n_rank
+    of them.
 
     Args:
         factor_p_weighted: (n_p, n_grid) weighted MO values for the
@@ -50,7 +56,7 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
             pair's second index set. Pass factor_p_weighted itself for
             a same-set sector ("oo", "vv"); pass a different array for
             a mixed sector ("ov").
-        n_rank: Fixed rank (number of interpolation points) for this
+        n_rank: Requested rank (number of interpolation points) for this
             sector -- phase-1 uses one rank per sector, not an
             adaptive/error-driven stopping rule (validation ladder step
             1 measures how error actually falls with rank; that data
@@ -60,16 +66,41 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
             1e-12 * max(|diag_err|), computed from the actual inputs
             rather than a fixed constant, so it scales with the
             sector's own numerical range.
+        on_over_rank: What to do if n_rank exceeds the sector's true
+            numerical rank (pytc.df.pivoted_cholesky_pair_pivots's
+            effective_rank) -- "truncate" (default) returns only the
+            effective_rank genuinely meaningful pivots, logging a
+            warning; "raise" raises ValueError instead. Either way,
+            arbitrary residual-exhausted pivots are never silently
+            returned as if they were production-quality interpolation
+            points (Alice's task #6 re-review, 2026-07-12, blocker 3).
 
     Returns:
-        pivots: (n_rank,) selected grid-point indices.
+        pivots: (k,) selected grid-point indices, k = min(n_rank,
+        effective_rank).
     """
+    if on_over_rank not in ("truncate", "raise"):
+        raise ValueError(f"on_over_rank must be 'truncate' or 'raise', got {on_over_rank!r}")
     factor_p_weighted = jnp.asarray(factor_p_weighted)
     factor_q_weighted = jnp.asarray(factor_q_weighted)
     if shift is None:
         diag_err = jnp.sum(factor_p_weighted**2, axis=0) * jnp.sum(factor_q_weighted**2, axis=0)
         shift = 1e-12 * jnp.max(jnp.abs(diag_err))
-    pivots, _effective_rank = pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift)
+    pivots, effective_rank = pivoted_cholesky_pair_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift)
+    if effective_rank < n_rank:
+        if on_over_rank == "raise":
+            raise ValueError(
+                f"n_rank={n_rank} exceeds this sector's true numerical rank "
+                f"(effective_rank={effective_rank}) -- request a smaller "
+                f"n_rank or pass on_over_rank='truncate'."
+            )
+        logger.warning(
+            f"select_sector_pivots: n_rank={n_rank} requested but only "
+            f"effective_rank={effective_rank} pivots carry real numerical "
+            f"signal -- truncating to {effective_rank} pivots rather than "
+            f"returning residual-exhausted, numerically-arbitrary padding."
+        )
+        pivots = pivots[:effective_rank]
     return pivots
 
 
