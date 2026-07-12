@@ -573,7 +573,52 @@ def main():
                          "optimization across wall-clock/job boundaries, "
                          "which is the default (Felix's continuity fix, "
                          "2026-07-11).")
+    p.add_argument("--init-params-select", choices=["final", "averaged"], default="final",
+                    help="With --init-params-from, which step(s) of the saved "
+                         "trajectory to use. 'final' (default, unchanged "
+                         "behavior) = last saved step. 'averaged' = Polyak "
+                         "average over --init-params-avg-window trailing "
+                         "steps -- task #12(c)'s handoff-convention "
+                         "experiment (2026-07-12).")
+    p.add_argument("--init-params-avg-window", type=int, default=None,
+                    help="With --init-params-select averaged, number of "
+                         "trailing saved steps to average over. None = last "
+                         "half of the saved trajectory (standard Polyak-"
+                         "averaging convention: skip the pre-convergence "
+                         "transient).")
+    p.add_argument("--eval-only", action="store_true",
+                    help="Evaluate sigma^2/E_L statistics at FIXED params -- "
+                         "no optimizer updates. For task #12's controlled "
+                         "experiments, where params must be held identical "
+                         "across runs to isolate a single variable (walker "
+                         "count, burn-in, warm-start convention). Uses "
+                         "evaluate_ref_var instead of optimize_ref_var; "
+                         "requires --init-params-from (frozen params must "
+                         "come from somewhere) (2026-07-12).")
+    p.add_argument("--n-eval-batches", type=int, default=1,
+                    help="With --eval-only, number of independent stat "
+                         "batches to record (each separated by "
+                         "--n-mcmc-per-eval decorrelation steps).")
+    p.add_argument("--n-mcmc-per-eval", type=int, default=1,
+                    help="With --eval-only, MCMC steps between eval batches.")
+    p.add_argument("--continue-walkers-from", default=None,
+                    help="Load a prior run's saved walker checkpoint "
+                         "(--save-walkers output) as the starting walkers "
+                         "instead of fresh nucleus-centered initialization. "
+                         "Pass --burn-in 0 alongside this to skip re-burn-in "
+                         "entirely (task #12(b)'s continued-vs-fresh-walkers "
+                         "experiment) -- leaving --burn-in nonzero re-"
+                         "equilibrates on top of the loaded state instead.")
+    p.add_argument("--save-walkers", default=None,
+                    help="Save the final walker state (positions plus "
+                         "cached psi/det/grad/lap fields) to this HDF5 path "
+                         "via mcmc_utils.save_walkers, for a later "
+                         "--continue-walkers-from run.")
     args = p.parse_args()
+
+    if args.eval_only and not args.init_params_from:
+        p.error("--eval-only requires --init-params-from (frozen params "
+                 "must be loaded from a prior run, not freshly initialized).")
 
     atom, unit, label = build_system(args)
     result_meta = {
@@ -584,6 +629,7 @@ def main():
         "burn_in_steps": args.burn_in,
         "n_opt_steps": args.n_opt_steps,
         "jac_batch_size": args.jac_batch_size,
+        "eval_only": args.eval_only,
     }
 
     scf_max_memory = resolve_scf_max_memory(args.scf_max_memory)
@@ -632,11 +678,26 @@ def main():
     if args.init_params_from:
         from pytc.vmc.mcmc_utils import load_optimization_history
         prior = load_optimization_history(args.init_params_from)
-        # params leaves are stacked along axis 0 (the step) -- take the last.
-        params = jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf[-1]), prior["params"])
+        n_saved_steps = jax.tree_util.tree_leaves(prior["params"])[0].shape[0]
+        result_meta["init_params_select"] = args.init_params_select
+        if args.init_params_select == "averaged":
+            window = args.init_params_avg_window or max(1, n_saved_steps // 2)
+            window = min(window, n_saved_steps)
+            result_meta["init_params_avg_window"] = window
+            # Polyak average over the trailing `window` saved steps -- skips
+            # the pre-convergence transient by default (last half) rather
+            # than diluting the average with early high-loss params
+            # (task #12(c), 2026-07-12).
+            params = jax.tree_util.tree_map(
+                lambda leaf: jnp.asarray(leaf[-window:]).mean(axis=0), prior["params"])
+            print(f"Warm-starting from {args.init_params_from} (Polyak "
+                  f"average of last {window}/{n_saved_steps} saved steps)")
+        else:
+            # params leaves are stacked along axis 0 (the step) -- take the last.
+            params = jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf[-1]), prior["params"])
+            print(f"Warm-starting from {args.init_params_from} (last of "
+                  f"{n_saved_steps} saved steps)")
         result_meta["init_params_from"] = args.init_params_from
-        print(f"Warm-starting from {args.init_params_from} (last of "
-              f"{jax.tree_util.tree_leaves(prior['params'])[0].shape[0]} saved steps)")
         if args.reset_lr_schedule:
             print("--reset-lr-schedule set: LR schedule restarts at full "
                   "--learning-rate despite warm-started params.")
@@ -657,7 +718,55 @@ def main():
         linear_coeffs = jnp.ones(1)
         params = [jastrow_params, linear_coeffs]
 
+    initial_walkers = None
+    if args.continue_walkers_from:
+        from pytc.vmc.mcmc_utils import load_walkers
+        initial_walkers = load_walkers(args.continue_walkers_from)
+        result_meta["continue_walkers_from"] = args.continue_walkers_from
+        if args.burn_in > 0:
+            print(f"Continuing walkers from {args.continue_walkers_from} "
+                  f"(--burn-in {args.burn_in} additional steps on top of "
+                  "the loaded state; pass --burn-in 0 to use them as-is).")
+        else:
+            print(f"Continuing walkers from {args.continue_walkers_from} "
+                  "as-is (--burn-in 0).")
+
     key = random.PRNGKey(43)
+
+    if args.eval_only:
+        from pytc.vmc.optimization import evaluate_ref_var
+        from pytc.vmc.mcmc_utils import save_walkers
+
+        t0 = time.time()
+        eval_result = evaluate_ref_var(
+            sj_ansatz,
+            params=params,
+            n_walkers=args.n_walkers,
+            burn_in_steps=args.burn_in,
+            step_size=args.step_size,
+            initial_walkers=initial_walkers,
+            key=key,
+            max_vmap_batch_size=args.jac_batch_size,
+            n_eval_batches=args.n_eval_batches,
+            n_mcmc_per_eval=args.n_mcmc_per_eval,
+        )
+        result_meta["total_eval_time_s"] = time.time() - t0
+        result_meta["n_eval_batches"] = args.n_eval_batches
+        result_meta["n_mcmc_per_eval"] = args.n_mcmc_per_eval
+
+        if args.save_walkers:
+            save_walkers(eval_result["final_walkers"], args.save_walkers)
+            print(f"Wrote {args.save_walkers}")
+
+        out_payload = {**result_meta, "batches": eval_result["batches"]}
+        out_json = json.dumps(out_payload, indent=2)
+        if args.out:
+            with open(args.out, "w") as f:
+                f.write(out_json)
+            print(f"Wrote {args.out}")
+        else:
+            print(out_json)
+        return
 
     t0 = time.time()
     opt_result = optimize_ref_var(
@@ -675,6 +784,7 @@ def main():
         n_mcmc_per_opt=args.n_mcmc_per_opt,
         n_opt_per_mcmc=1,
         initial_opt_state=initial_opt_state,
+        initial_walkers=initial_walkers,
     )
     result_meta["total_optimize_time_s"] = time.time() - t0
 
@@ -682,6 +792,11 @@ def main():
         from pytc.vmc.mcmc_utils import save_optimization_history
         save_optimization_history(opt_result, args.save_h5)
         print(f"Wrote {args.save_h5}")
+
+    if args.save_walkers:
+        from pytc.vmc.mcmc_utils import save_walkers
+        save_walkers(opt_result["final_walkers"], args.save_walkers)
+        print(f"Wrote {args.save_walkers}")
 
     cost = np.asarray(opt_result["cost"])
     energies = np.asarray(opt_result["energies"])

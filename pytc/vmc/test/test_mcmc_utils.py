@@ -2,8 +2,13 @@ import tempfile
 import unittest
 import numpy as np
 import jax
+import jax.numpy as jnp
 
-from pytc.vmc.mcmc_utils import save_optimization_history, load_optimization_history
+from pytc.vmc.mcmc_utils import (
+    save_optimization_history, load_optimization_history,
+    save_walkers, load_walkers,
+)
+from pytc.vmc.walker import Walker
 
 class TestMCMCUtils(unittest.TestCase):
     def test_save_load_optimization_history(self):
@@ -90,6 +95,53 @@ class TestMCMCUtils(unittest.TestCase):
             self.assertTrue(isinstance(last_params, tuple))
             np.testing.assert_array_almost_equal(last_params[0]["weight"], np.array([5.0, 6.0]))
             np.testing.assert_array_almost_equal(last_params[1][0], np.array([5+3j, 6-3j]))
+
+    def test_save_load_walkers(self):
+        """Round-trip a Walker's full state (positions plus cached
+        psi/det/grad/lap fields, and the det_up/det_down (sign, log|det|)
+        tuples) through save_walkers/load_walkers -- task #12(b)'s
+        continued-walkers checkpoint mechanism.
+        """
+        n_walkers, n_alpha, n_beta = 4, 2, 1
+        n_electrons = n_alpha + n_beta
+        walkers = Walker(
+            positions=jnp.arange(n_walkers * n_electrons * 3, dtype=jnp.float64).reshape(
+                n_walkers, n_electrons, 3),
+            det_up=(jnp.ones(n_walkers), jnp.full(n_walkers, -0.5)),
+            det_down=(jnp.ones(n_walkers), jnp.full(n_walkers, -0.25)),
+            slater_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
+            slater_down=jnp.zeros((n_walkers, n_beta, n_beta)),
+            inv_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
+            inv_down=jnp.zeros((n_walkers, n_beta, n_beta)),
+            grad_up=jnp.zeros((n_walkers, n_alpha, n_alpha, 3)),
+            grad_down=jnp.zeros((n_walkers, n_beta, n_beta, 3)),
+            lap_up=jnp.zeros((n_walkers, n_alpha, n_alpha)),
+            lap_down=jnp.zeros((n_walkers, n_beta, n_beta)),
+            move_mask=jnp.ones((n_walkers, n_electrons), dtype=bool),
+            log_psi=jnp.linspace(-3.0, -1.0, n_walkers),
+            psi_sign=jnp.ones(n_walkers),
+            log_jastrow=jnp.linspace(0.1, 0.4, n_walkers),
+        )
+
+        with tempfile.NamedTemporaryFile(suffix='.h5') as tmp:
+            filepath = tmp.name
+            saved_path = save_walkers(walkers, filepath)
+            self.assertEqual(saved_path, filepath)
+
+            loaded = load_walkers(filepath)
+
+        self.assertIsInstance(loaded, Walker)
+        np.testing.assert_array_almost_equal(loaded.positions, walkers.positions)
+        np.testing.assert_array_almost_equal(loaded.log_psi, walkers.log_psi)
+        np.testing.assert_array_almost_equal(loaded.log_jastrow, walkers.log_jastrow)
+        np.testing.assert_array_equal(loaded.move_mask, walkers.move_mask)
+        # det_up/det_down are (sign, log|det|) tuples -- confirm the tuple
+        # structure survives, not just the leaf values.
+        self.assertIsInstance(loaded.det_up, tuple)
+        self.assertEqual(len(loaded.det_up), 2)
+        np.testing.assert_array_almost_equal(loaded.det_up[1], walkers.det_up[1])
+        np.testing.assert_array_almost_equal(loaded.det_down[1], walkers.det_down[1])
+
 
 if __name__ == '__main__':
     unittest.main()
