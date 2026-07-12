@@ -733,6 +733,24 @@ def main():
                          "its fused cost differ from the sum of isolated "
                          "marginals (2026-07-12); the measured full-config "
                          "time remains ground truth.")
+    p.add_argument("--jac-batch-size-bh", type=int, default=64,
+                    help="Batch size for the folx-overhead comparison pair "
+                         "(det+BoysHandy vs det+BoysHandyAnalytical), run "
+                         "SEPARATELY from the 3 production-ranking legs "
+                         "(which stay at --jac-batch-size). Legacy BH's "
+                         "folx-autodiff path has a much larger per-walker "
+                         "memory footprint than BHA's analytic path at the "
+                         "SAME batch size -- confirmed OOMing at "
+                         "batch=256/W=5000 on H80 (task #13, 2026-07-12; "
+                         "task #6 already found legacy needs batch<=64 to "
+                         "fit even at W=1000, so 64 is a starting guess, "
+                         "not a guarantee at larger W -- shrink further if "
+                         "it still OOMs). Both legs of the folx comparison "
+                         "always run at THIS SAME batch size (Felix's "
+                         "framing, 2026-07-12: the folx question is a "
+                         "same-batch ratio, not a production-time "
+                         "measurement) -- never cross-compared against the "
+                         "production legs' --jac-batch-size numbers.")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -999,29 +1017,54 @@ def main():
         # (bha) for the (i)/(ii) split regardless of --jastrow-class, so the
         # decomposition stays internally consistent even when the main
         # timed run above used --jastrow-class bh.
+        #
+        # Two separate batch sizes, per Felix (2026-07-12): the production-
+        # ranking legs (det / det+BHA / det+NuclearCusp+BHA) answer "where
+        # does production time go" and MUST run at the real --jac-batch-size
+        # (e.g. 256) to be meaningful. The folx-vs-analytic question is a
+        # RATIO between two alternative implementations of the SAME
+        # component (BoysHandy's generic folx-autodiff path vs
+        # BoysHandyAnalytical's hand-coded analytic path), which needs a
+        # same-batch partner, not the production batch -- legacy BH's much
+        # larger per-walker footprint OOMs at 256/W=5000 (confirmed on
+        # H80, task #13). So det+BHA is run TWICE: once at --jac-batch-size
+        # for the production ranking, once at --jac-batch-size-bh paired
+        # with det+BH for the folx ratio. Never cross-compared.
         det_alone = CompositeJastrow.create([_ZeroJastrow()])
         bha_cj = CompositeJastrow.create([BoysHandyAnalytical.create(mol)])
         bh_cj = CompositeJastrow.create([BoysHandy.create(mol)])
         ncusp_bha_cj = CompositeJastrow.create([ncusp, BoysHandyAnalytical.create(mol)])
 
-        variants = {
+        production_variants = {
             "det_alone": det_alone,
             "det_plus_bha": bha_cj,
-            "det_plus_bh_folx": bh_cj,
             "det_plus_ncusp_plus_bha": ncusp_bha_cj,
         }
         breakdown = {}
-        for var_name, cj in variants.items():
+        for var_name, cj in production_variants.items():
             var_ansatz = SlaterJastrow.create(mol, cj, [det])
             var_params = [cj.init_params(), linear_coeffs]
             c_t, s_t = time_jacobian_build(
                 var_ansatz, var_params, walkers, args.jac_batch_size, args.n_walkers)
             breakdown[var_name] = {"compile_time_s": c_t, "steady_time_s": s_t}
 
+        folx_ratio_variants = {
+            "det_plus_bha_at_bh_batch": bha_cj,
+            "det_plus_bh_folx_at_bh_batch": bh_cj,
+        }
+        folx_ratio = {}
+        for var_name, cj in folx_ratio_variants.items():
+            var_ansatz = SlaterJastrow.create(mol, cj, [det])
+            var_params = [cj.init_params(), linear_coeffs]
+            c_t, s_t = time_jacobian_build(
+                var_ansatz, var_params, walkers, args.jac_batch_size_bh, args.n_walkers)
+            folx_ratio[var_name] = {"compile_time_s": c_t, "steady_time_s": s_t}
+
         det_s = breakdown["det_alone"]["steady_time_s"]
         bha_s = breakdown["det_plus_bha"]["steady_time_s"]
-        bh_s = breakdown["det_plus_bh_folx"]["steady_time_s"]
         full_s = breakdown["det_plus_ncusp_plus_bha"]["steady_time_s"]
+        bha_at_bh_batch_s = folx_ratio["det_plus_bha_at_bh_batch"]["steady_time_s"]
+        bh_s = folx_ratio["det_plus_bh_folx_at_bh_batch"]["steady_time_s"]
 
         marginal_s = {
             # (iv) Slater/determinant side.
@@ -1038,6 +1081,8 @@ def main():
             "nuclear_cusp_generic_folx_path": max(0.0, full_s - bha_s),
         }
         result["jac_component_breakdown"] = {
+            "jac_batch_size_production_legs": args.jac_batch_size,
+            "jac_batch_size_folx_ratio_legs": args.jac_batch_size_bh,
             "variants_steady_time_s": {k: v["steady_time_s"] for k, v in breakdown.items()},
             "variants_compile_time_s": {k: v["compile_time_s"] for k, v in breakdown.items()},
             "marginal_steady_time_s": marginal_s,
@@ -1050,15 +1095,17 @@ def main():
                 {k: 100.0 * v / full_s for k, v in marginal_s.items()}
                 if full_s > 0 else None
             ),
-            # (iii) folx forward-Laplacian overhead estimate: same physics
-            # (single pair-jastrow term, no cusp) evaluated via BoysHandy's
-            # generic folx-autodiff path (bh_s) vs BoysHandyAnalytical's
-            # hand-coded analytic path (bha_s) -- directly reuses this
-            # harness's own --jastrow-class A/B instead of an artificial
-            # value-only-forward proxy. NOT part of the additive percentage
-            # split above (bh/bha are alternative implementations of the
-            # SAME component, not separate components).
-            "folx_overhead_estimate_bh_vs_bha_steady_time_s": max(0.0, bh_s - bha_s),
+            # (iii) folx forward-Laplacian overhead: det+BHA vs det+BH, BOTH
+            # at --jac-batch-size-bh (same physics, same batch size --
+            # Felix's ratio framing, 2026-07-12). Deliberately NOT compared
+            # against the 256-batch production legs above.
+            "folx_ratio_variants_steady_time_s": {
+                k: v["steady_time_s"] for k, v in folx_ratio.items()
+            },
+            "folx_overhead_estimate_bh_vs_bha_steady_time_s": max(0.0, bh_s - bha_at_bh_batch_s),
+            "folx_overhead_estimate_ratio": (
+                bh_s / bha_at_bh_batch_s if bha_at_bh_batch_s > 0 else None
+            ),
         }
 
     # --- Newton solve (linear solve only; curvature/grad already assembled above) ---
