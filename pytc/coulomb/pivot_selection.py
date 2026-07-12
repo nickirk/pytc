@@ -161,7 +161,18 @@ def pair_collocation_reconstruction_error(factor_p_weighted, factor_q_weighted, 
 def rank_curve(factor_p_weighted, factor_q_weighted, ranks, shift=None):
     """Rank-convergence curve stub for validation ladder step 1: for
     each candidate rank, select that many pivots and report the
-    pair-collocation reconstruction error.
+    pair-collocation reconstruction error AND cond(S) (S = P P^dagger
+    at that rank).
+
+    cond(S) is included alongside the error deliberately (Felix,
+    2026-07-12, following task #6's rcond debugging): rank
+    recommendations that only report reconstruction error can pick a
+    rank that happens to work numerically by accident of pivot
+    selection, without flagging that S is already astronomically
+    ill-conditioned at that rank (task #6 measured cond(S)~2e24 at
+    rank=300 for a 95-dim H2O/cc-pVDZ pair space) -- production rank
+    sizing should stay meaningfully below pair-space saturation, and
+    this number is how a caller would notice they're not.
 
     Small-system diagnostic tool (see pair_collocation_reconstruction_error's
     docstring on its (n_grid, n_grid) materialization) -- not intended
@@ -177,11 +188,18 @@ def rank_curve(factor_p_weighted, factor_q_weighted, ranks, shift=None):
         shift: Forwarded to select_sector_pivots (None auto-derives).
 
     Returns:
-        List of (rank, relative_error) tuples, one per input rank.
+        List of (rank, relative_error, cond_S) tuples, one per input rank.
     """
+    from pytc.coulomb.molecular_df_reference import pair_collocation_at_pivots
+
+    factor_p_weighted = np.asarray(factor_p_weighted)
+    factor_q_weighted = np.asarray(factor_q_weighted)
     results = []
     for n_rank in ranks:
-        pivots = select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift)
+        pivots = np.asarray(select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift))
         error = pair_collocation_reconstruction_error(factor_p_weighted, factor_q_weighted, pivots)
-        results.append((n_rank, error))
+        P = pair_collocation_at_pivots(factor_p_weighted[:, pivots], factor_q_weighted[:, pivots])
+        S = P @ P.conj().T
+        cond_S = float(np.linalg.cond(S))
+        results.append((n_rank, error, cond_S))
     return results

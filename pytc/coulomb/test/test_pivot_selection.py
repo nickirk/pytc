@@ -94,7 +94,11 @@ class TestPivotSelection(unittest.TestCase):
 
         curve = rank_curve(occ_weighted, occ_weighted, ranks=[1, 2, 4, 8])
         self.assertEqual(len(curve), 4)
-        errors = [err for _, err in curve]
+        errors = [err for _, err, _ in curve]
+        cond_S_values = [cond_s for _, _, cond_s in curve]
+        for cond_s in cond_S_values:
+            self.assertTrue(np.isfinite(cond_s))
+            self.assertGreaterEqual(cond_s, 1.0)
         # Non-increasing overall (allow tiny numerical noise at any single
         # step, but the endpoints must show real improvement).
         self.assertLess(errors[-1], errors[0])
