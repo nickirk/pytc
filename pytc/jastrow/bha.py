@@ -1,3 +1,5 @@
+import os
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -358,5 +360,20 @@ class BoysHandyAnalytical(BoysHandy):
         # from the forward pass to the backward pass. checkpoint trades
         # that storage for recomputing each step's forward pass during the
         # backward pass instead.
-        (grad_pair, lap_pair), _ = jax.lax.scan(jax.checkpoint(scan_body), init_carry, xs)
+        #
+        # PYTC_BHA_DISABLE_CHECKPOINT=1 is a measurement-only ablation
+        # toggle (task #13 phase-2 scoping, 2026-07-12): at profiled scales
+        # (H80/W=5000, batch=64) peak memory was 2.9-4.5GiB against 80GB
+        # cards, so this checkpoint may be pure legacy conservatism from a
+        # smaller-memory-budget era -- if disabling it recovers a large
+        # slice of the 99.82%-of-Jacobian-build cost BHA accounts for, that
+        # may end the closed-form-c_raw-Jacobian question on its own, at
+        # near-zero code risk. Read once per call (env var), not cached, so
+        # a single process can be re-profiled either way without a restart.
+        # Default (unset) preserves exactly today's behavior.
+        scan_step = (
+            scan_body if os.environ.get("PYTC_BHA_DISABLE_CHECKPOINT") == "1"
+            else jax.checkpoint(scan_body)
+        )
+        (grad_pair, lap_pair), _ = jax.lax.scan(scan_step, init_carry, xs)
         return grad_pair, lap_pair
