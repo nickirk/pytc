@@ -29,7 +29,8 @@ from pyscf import gto, scf
 from pytc.vmc import optimize_ref_var
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
-from pytc.jastrow import BoysHandy, NuclearCusp, CompositeJastrow
+from pytc.jastrow import NuclearCusp, CompositeJastrow
+from pytc.jastrow.bha import BoysHandyAnalytical
 
 
 def main():
@@ -45,7 +46,10 @@ def main():
     # optimizer diverges to NaN on H2O with it. 03-06's deterministic
     # (non-sampling) xTC-CCSD calculations use plain REXP just fine -- the
     # instability is specific to VMC sampling near the nuclei.
-    bh = BoysHandy.create(mol)
+    # BoysHandyAnalytical: hand-written analytic derivatives, faster than
+    # the generic BoysHandy's folx-autodiff path. Construct it directly --
+    # BoysHandy.create() no longer implicitly substitutes it.
+    bh = BoysHandyAnalytical.create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
     jastrow_params = jastrow.init_params()

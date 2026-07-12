@@ -158,3 +158,34 @@ class Jastrow:
     def init_params(self, **kwargs):
         """Initialize parameters. Subclasses should implement this."""
         pass
+
+    def get_pair_grid_grad_lap(self, elec_coords, params):
+        """Compute grad_1/lap_1 of u(r_i, r_j) wrt r_i for ALL (i, j) pairs
+        at once.
+
+        Default implementation: a per-pair vmap grid built directly from
+        ``get_log_grads_r1`` -- correct for any subclass, but recomputes
+        each electron's per-pair quantities independently for every one of
+        the N pairs it appears in (O(N^2*M) redundant work for Jastrows
+        with atom-dependent structure). Subclasses with a cheaper
+        whole-electron-set formulation (e.g. ``BoysHandyAnalytical``,
+        which precomputes per-electron tables once and assembles the pair
+        grid via a scan) should override this method; callers never branch
+        on which implementation is in use -- polymorphism handles it.
+
+        Args:
+            elec_coords: (N, 3) all electron positions.
+            params: Jastrow parameters.
+
+        Returns:
+            (grad_pair, lap_pair): grad_pair has shape (N, N, 3) and
+            lap_pair has shape (N, N), where [i, j] holds grad_1/lap_1 of
+            u(r_i, r_j) wrt r_i. Diagonal (i == j) entries are meaningless
+            and are masked out by the caller.
+        """
+        def compute_pair(r_i, r_j):
+            return self.get_log_grads_r1(r_i, r_j, params)
+
+        inner = jax.vmap(compute_pair, in_axes=(None, 0))
+        outer = jax.vmap(inner, in_axes=(0, None))
+        return outer(elec_coords, elec_coords)
