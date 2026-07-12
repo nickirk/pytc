@@ -188,8 +188,38 @@ def _apply_scf_convergence_settings(mf, max_cycle, level_shift, diis_space):
         mf.diis_space = diis_space
 
 
+def dump_scf_restart(mf, path):
+    """Save the current density matrix for a later --scf-init-dm-from
+    restart.
+
+    Unlike the converged-only chkfile cache, this is written
+    unconditionally regardless of mf.converged -- its whole purpose is
+    chaining an unconverged/partial SCF into a fresh follow-up run (the
+    standard shift-then-release recipe for oscillatory near-degenerate
+    systems: converge shifted to a loose tolerance, then restart
+    unshifted from that density, usually finishing in tens of cycles
+    instead of a marathon single run). Deliberately a separate path
+    from the converged-only cache, per Felix's call, 2026-07-12,
+    #proj-pytc-efficiency-refactor.
+    """
+    import h5py
+    dm = np.asarray(_to_host(mf.make_rdm1()))
+    with h5py.File(path, "w") as f:
+        f.create_dataset("dm", data=dm)
+
+
+def load_scf_restart(path):
+    """Load a density matrix saved by dump_scf_restart, for --scf-init-
+    dm-from. Returns a plain host numpy array; gpu4pyscf's own kernel()
+    converts host dm0 arrays to device internally (same pattern it uses
+    for its own initial-guess construction)."""
+    import h5py
+    with h5py.File(path, "r") as f:
+        return f["dm"][()]
+
+
 def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8,
-             max_cycle=None, level_shift=None, diis_space=None):
+             max_cycle=None, level_shift=None, diis_space=None, solver="diis"):
     """Construct the density-fitted RHF object for the requested SCF backend.
 
     ``pyscf`` (default) is the existing CPU DF-RHF path, byte-for-byte
@@ -205,14 +235,28 @@ def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8,
     H300/cc-pVTZ) where the default SCF settings oscillate instead of
     converging (Grace/Felix, 2026-07-12, #proj-pytc-efficiency-refactor).
 
+    solver: "diis" (default, unchanged) or "newton" -- wraps the mf
+    object with second-order (Newton/SOSCF) convergence via the
+    backend's own ``mf.newton()`` (both pyscf and gpu4pyscf expose the
+    identical bound method; gpu4pyscf's is cupy-native, confirmed via
+    its public source). Applied last so the wrap inherits the already-
+    configured max_cycle/level_shift/diis_space/lindep state. Second-
+    order SCF is the standard closer for oscillatory near-degenerate
+    cases -- a real alternative to the level-shift dance, not just
+    another knob.
+
     Returns (mf, cusolver_preload_path, n_lindep_removed). The preload
     path is None for the pyscf backend, or for gpu4pyscf if no preload
     was needed/found.
     """
+    if solver not in ("diis", "newton"):
+        raise ValueError(f"Unknown --scf-solver: {solver!r}")
     if backend == "pyscf":
         mf = scf.RHF(mol).density_fit()
         _apply_scf_convergence_settings(mf, max_cycle, level_shift, diis_space)
         n_lindep_removed = _pin_lindep_threshold(mf, lindep_threshold, backend)
+        if solver == "newton":
+            mf = mf.newton()
         return mf, None, n_lindep_removed
     elif backend == "gpu4pyscf":
         preload_path = _preload_gpu4pyscf_cusolver()
@@ -226,35 +270,48 @@ def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8,
         mf = gpu_scf.RHF(mol).density_fit()
         _apply_scf_convergence_settings(mf, max_cycle, level_shift, diis_space)
         n_lindep_removed = _pin_lindep_threshold(mf, lindep_threshold, backend)
+        if solver == "newton":
+            mf = mf.newton()
         return mf, preload_path, n_lindep_removed
     else:
         raise ValueError(f"Unknown --scf-backend: {backend!r}")
 
 
 def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold=1e-8,
-            max_cycle=None, level_shift=None, diis_space=None):
+            max_cycle=None, level_shift=None, diis_space=None, solver="diis",
+            init_dm_from=None, dump_restart_to=None):
     """Same caching pattern as profile_vmc_ref_var_phases.py -- large
     systems shouldn't re-pay SCF on every convergence-plot rerun either.
+
+    init_dm_from/dump_restart_to: the shift-then-release restart chain,
+    separate from the converged-only cache (see dump_scf_restart's
+    docstring) -- init_dm_from loads a prior run's density matrix as
+    the initial guess (mf.kernel(dm0=...)); dump_restart_to saves the
+    current density matrix after kernel() regardless of convergence.
 
     Returns (mf, scf_time_s, was_cached, cusolver_preload_path,
     n_lindep_removed)."""
     mf, preload_path, n_lindep_removed = make_rhf(
-        mol, backend, lindep_threshold, max_cycle, level_shift, diis_space)
+        mol, backend, lindep_threshold, max_cycle, level_shift, diis_space, solver)
+    dm0 = load_scf_restart(init_dm_from) if init_dm_from else None
     if not cache_dir:
         t0 = time.time()
-        mf.kernel()
+        mf.kernel(dm0=dm0)
         print(f"SCF: converged={mf.converged}  e_tot={mf.e_tot}  "
               f"elapsed={time.time() - t0:.1f}s", flush=True)
+        if dump_restart_to:
+            dump_scf_restart(mf, dump_restart_to)
         return mf, time.time() - t0, False, preload_path, n_lindep_removed
     os.makedirs(cache_dir, exist_ok=True)
     import hashlib
-    # max_cycle/level_shift/diis_space affect the optimization trajectory,
-    # not just speed -- for near-degenerate systems a different path can
-    # converge to a different local solution, so they're part of the
-    # cache key too (same principle as backend/lindep_threshold above).
+    # max_cycle/level_shift/diis_space/solver affect the optimization
+    # trajectory, not just speed -- for near-degenerate systems a
+    # different path can converge to a different local solution, so
+    # they're part of the cache key too (same principle as backend/
+    # lindep_threshold above).
     cache_key = hashlib.sha256(
         f"{atom}|{basis}|{unit}|{backend}|{lindep_threshold}|"
-        f"{max_cycle}|{level_shift}|{diis_space}".encode()
+        f"{max_cycle}|{level_shift}|{diis_space}|{solver}".encode()
     ).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{cache_key}.h5")
     converged_marker = cache_path + ".converged"
@@ -284,9 +341,11 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold
     # internally) with each array passed through _to_host first, since
     # gpu4pyscf's mo_coeff/mo_energy/mo_occ may be cupy device arrays
     # that h5py can't serialize.
-    mf.kernel()
+    mf.kernel(dm0=dm0)
     print(f"SCF: converged={mf.converged}  e_tot={mf.e_tot}  "
           f"elapsed={time.time() - t0:.1f}s", flush=True)
+    if dump_restart_to:
+        dump_scf_restart(mf, dump_restart_to)
     if mf.converged:
         scf.chkfile.dump_scf(
             mf.mol, cache_path,
@@ -420,6 +479,32 @@ def main():
     p.add_argument("--scf-diis-space", type=int, default=None,
                     help="SCF diis_space, passed straight through. None = "
                          "backend default (8).")
+    p.add_argument("--scf-solver", choices=["diis", "newton"], default="diis",
+                    help="SCF convergence algorithm. 'diis' (default) is "
+                         "the standard first-order DIIS-accelerated SCF. "
+                         "'newton' wraps the mf object with second-order "
+                         "(Newton/SOSCF) convergence via mf.newton() -- "
+                         "the standard closer for oscillatory near-"
+                         "degenerate cases (e.g. H300/cc-pVTZ), a real "
+                         "alternative to level-shifting, not just another "
+                         "knob. Works identically on both backends "
+                         "(2026-07-12).")
+    p.add_argument("--scf-init-dm-from", default=None,
+                    help="Warm-start SCF from a prior run's saved density "
+                         "matrix (--scf-dump-restart output). For the "
+                         "shift-then-release recipe: converge shifted to a "
+                         "loose tolerance, save via --scf-dump-restart, "
+                         "then restart unshifted from that density -- "
+                         "usually finishes in tens of cycles instead of a "
+                         "marathon single run (2026-07-12). Separate "
+                         "mechanism from the converged-only SCF cache.")
+    p.add_argument("--scf-dump-restart", default=None,
+                    help="Save the density matrix after SCF (regardless "
+                         "of convergence) to this path, for a later "
+                         "--scf-init-dm-from restart. Separate from the "
+                         "converged-only SCF cache -- this is meant for "
+                         "chaining an unconverged/partial SCF into a "
+                         "follow-up run (2026-07-12).")
     p.add_argument("--out", default=None, help="Write raw history JSON here.")
     p.add_argument("--plot", default=None, help="Write convergence plot PNG here.")
     p.add_argument("--save-h5", default=None,
@@ -472,10 +557,15 @@ def main():
     result_meta["scf_max_cycle"] = args.scf_max_cycle
     result_meta["scf_level_shift"] = args.scf_level_shift
     result_meta["scf_diis_space"] = args.scf_diis_space
+    result_meta["scf_solver"] = args.scf_solver
+    result_meta["scf_init_dm_from"] = args.scf_init_dm_from
+    result_meta["scf_dump_restart"] = args.scf_dump_restart
     mf, scf_time_s, scf_cached, cusolver_preload_path, n_lindep_removed = run_scf(
         mol, atom, args.basis, unit, args.scf_cache_dir, backend=args.scf_backend,
         lindep_threshold=args.scf_lindep_threshold, max_cycle=args.scf_max_cycle,
-        level_shift=args.scf_level_shift, diis_space=args.scf_diis_space)
+        level_shift=args.scf_level_shift, diis_space=args.scf_diis_space,
+        solver=args.scf_solver, init_dm_from=args.scf_init_dm_from,
+        dump_restart_to=args.scf_dump_restart)
     result_meta["scf_time_s"] = scf_time_s
     result_meta["scf_cached"] = scf_cached
     result_meta["cusolver_preload_path"] = cusolver_preload_path
