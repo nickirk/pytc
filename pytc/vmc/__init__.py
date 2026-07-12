@@ -8,7 +8,7 @@ from .sampling import burn_in, burn_in_with_importance, sample
 from .optimization import optimize, optimize_ref_var, evaluate_ref_var
 from .mcmc_utils import (
     prepare_sampling_results, report_progress,
-    init_electron_configs, save_walkers, load_walkers
+    init_electron_configs, save_walkers, load_walkers, resample_walkers
 )
 from .optimizer import create_optimizer, create_gradient_mask
 from .blocking import block_analysis, analyze_optimization_history
@@ -33,7 +33,7 @@ __all__ = [
     # Utility functions
     'prepare_sampling_results', 'report_progress', 'create_optimizer',
     'init_electron_configs', 'create_gradient_mask',
-    'save_walkers', 'load_walkers',
+    'save_walkers', 'load_walkers', 'resample_walkers',
     'block_analysis', 'analyze_optimization_history',
     # Sharding utilities
     'create_mesh', 'shard_walker', 'replicate',

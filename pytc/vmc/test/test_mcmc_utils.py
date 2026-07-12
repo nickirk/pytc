@@ -6,9 +6,18 @@ import jax.numpy as jnp
 
 from pytc.vmc.mcmc_utils import (
     save_optimization_history, load_optimization_history,
-    save_walkers, load_walkers,
+    save_walkers, load_walkers, resample_walkers,
 )
-from pytc.vmc.walker import Walker
+from pytc.vmc.walker import Walker, initialize_walker_state
+
+
+class _FakeDetAnsatz:
+    """Minimal ansatz stub -- initialize_walker_state only reads these
+    four attributes."""
+    atom_coords = jnp.array([[0.0, 0.0, 0.0]])
+    atom_charges = jnp.array([1.0])
+    n_electrons = 3
+    n_alpha = 2
 
 class TestMCMCUtils(unittest.TestCase):
     def test_save_load_optimization_history(self):
@@ -141,6 +150,41 @@ class TestMCMCUtils(unittest.TestCase):
         self.assertEqual(len(loaded.det_up), 2)
         np.testing.assert_array_almost_equal(loaded.det_up[1], walkers.det_up[1])
         np.testing.assert_array_almost_equal(loaded.det_down[1], walkers.det_down[1])
+
+    def test_resample_walkers_upsamples_and_jitters(self):
+        """resample_walkers should (a) produce exactly target_n_walkers
+        walkers, (b) reset the cached psi/det/grad/lap fields (same
+        convention as a cold init, since jittered positions invalidate
+        them), and (c) place each resampled position near (not exactly
+        on top of) one of the source positions -- task #12 tier-1.
+        """
+        ansatz = _FakeDetAnsatz()
+        source_n = 5
+        source_positions = jnp.arange(
+            source_n * ansatz.n_electrons * 3, dtype=jnp.float32
+        ).reshape(source_n, ansatz.n_electrons, 3)
+        source = initialize_walker_state(ansatz, source_positions)
+
+        target_n = 23  # deliberately not a multiple of source_n
+        step_size = 0.05
+        resampled = resample_walkers(
+            ansatz, source, target_n_walkers=target_n, step_size=step_size,
+            key=jax.random.PRNGKey(7))
+
+        self.assertEqual(resampled.positions.shape, (target_n, ansatz.n_electrons, 3))
+        # Cached fields must be invalidated -- jittered positions make the
+        # copied cache values wrong, and move_mask=True signals "recompute".
+        self.assertTrue(bool(jnp.all(resampled.move_mask)))
+        self.assertTrue(bool(jnp.all(resampled.log_psi == 0)))
+
+        # Each resampled walker's position should be within a small
+        # multiple of step_size of SOME source position (bootstrap +
+        # jitter, not an arbitrary new location).
+        deltas = resampled.positions[:, None, :, :] - source_positions[None, :, :, :]
+        nearest_dist = jnp.min(jnp.sqrt(jnp.sum(deltas ** 2, axis=(-1, -2))), axis=1)
+        self.assertTrue(bool(jnp.all(nearest_dist < 10 * step_size)))
+        # And it shouldn't be an EXACT duplicate (jitter actually applied).
+        self.assertTrue(bool(jnp.all(nearest_dist > 0)))
 
 
 if __name__ == '__main__':
