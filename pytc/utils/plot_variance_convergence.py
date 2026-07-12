@@ -804,6 +804,21 @@ def main():
               "before use (see --adaptive-burn-in).")
 
     burn_in_steps = args.burn_in
+    # The step size actually fed to optimize_ref_var/evaluate_ref_var below
+    # -- overridden as each stage below adapts it, so the final MCMC
+    # sampling never silently falls back to the --step-size CLI default
+    # once something better is known.
+    effective_step_size = args.step_size
+    if args.resample_walkers_from:
+        # The resampled ensemble's positions are (jittered copies of) the
+        # SOURCE checkpoint's own equilibrated positions -- its adapted
+        # step size is the right scale to start proposals from, not the
+        # generic --step-size default (Felix's step-size-handoff bug,
+        # 2026-07-12: seeding from the wrong scale forces adaptive_burn_in
+        # to spend chunks re-converging step size before any real
+        # decorrelation happens, inflating its sweep count).
+        effective_step_size = args.resample_jitter_step_size
+
     if args.adaptive_burn_in:
         from pytc.vmc.sampling import adaptive_burn_in
         key, subkey = random.split(key)
@@ -812,9 +827,9 @@ def main():
             else initialize_walkers(det, args.n_walkers, key=subkey)
         )
         t0 = time.time()
-        initial_walkers, chunk_history, key, adapted_step_size, adaptive_steps_run = adaptive_burn_in(
+        initial_walkers, chunk_history, key, effective_step_size, adaptive_steps_run = adaptive_burn_in(
             det, sj_ansatz, pre_burn_walkers, params,
-            step_size=args.step_size, key=key,
+            step_size=effective_step_size, key=key,
             max_vmap_batch_size=args.jac_batch_size,
             chunk_size=args.adaptive_burn_in_chunk_size,
             max_steps=args.adaptive_burn_in_max_steps,
@@ -826,7 +841,9 @@ def main():
         result_meta["adaptive_burn_in_time_s"] = time.time() - t0
         result_meta["adaptive_burn_in_steps"] = adaptive_steps_run
         result_meta["adaptive_burn_in_chunk_history"] = chunk_history
-        print(f"adaptive_burn_in: {adaptive_steps_run} sweeps "
+        result_meta["adaptive_burn_in_final_step_size"] = effective_step_size
+        print(f"adaptive_burn_in: {adaptive_steps_run} sweeps, "
+              f"final step_size={effective_step_size:.5f} "
               f"({'converged' if chunk_history and chunk_history[-1]['mean_energy'] is not None and adaptive_steps_run < args.adaptive_burn_in_max_steps else 'hit max_steps'})")
         # optimize_ref_var/evaluate_ref_var must not burn in again on top
         # of an already-equilibrated ensemble.
@@ -842,7 +859,7 @@ def main():
             params=params,
             n_walkers=args.n_walkers,
             burn_in_steps=burn_in_steps,
-            step_size=args.step_size,
+            step_size=effective_step_size,
             initial_walkers=initial_walkers,
             key=key,
             max_vmap_batch_size=args.jac_batch_size,
@@ -874,7 +891,7 @@ def main():
         n_walkers=args.n_walkers,
         n_opt_steps=args.n_opt_steps,
         burn_in_steps=burn_in_steps,
-        step_size=args.step_size,
+        step_size=effective_step_size,
         max_vmap_batch_size=args.jac_batch_size,
         optimizer_type="newton",
         learning_rate=args.learning_rate,
