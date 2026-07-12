@@ -86,6 +86,17 @@ def h_chain(n, sep=1.8):
     return "; ".join(f"H 0 0 {i*sep}" for i in range(n))
 
 
+# Bump whenever the SCF cache key's hash-input string changes (a new
+# field added/removed/reordered) -- lets a future cache-entry survive
+# code updates that don't actually change the key, and gives migration
+# tooling something to key off. Two undocumented schema changes already
+# happened before this existed (433341a added backend/lindep_threshold,
+# bf8263e added solver), both silently orphaning old entries with no
+# record of why -- this is meant to end that "key archaeology" pattern
+# (Felix, 2026-07-12, #proj-pytc-efficiency-refactor).
+SCF_CACHE_KEY_SCHEMA_VERSION = 1
+
+
 def resolve_scf_max_memory(explicit_mb):
     """PySCF's Mole.max_memory defaults to 4000 MB -- at large nao (e.g.
     H300, nao~4200) the DF integral build degenerates into tiny batches
@@ -267,6 +278,21 @@ def load_scf_restart(path):
         return f["dm"][()]
 
 
+def write_converged_marker(path, cache_params):
+    """Write the SCF cache-key schema version + the full param dict that
+    produced this cache entry into the ``.converged`` marker (previously
+    an empty touch-file). Makes an entry self-describing -- ``cat`` the
+    marker instead of reconstructing the hash input offline to find out
+    what a stale/orphaned cache entry actually was (Felix, 2026-07-12,
+    #proj-pytc-efficiency-refactor, after two cache-key schema changes
+    in one night needed exactly that reconstruction)."""
+    with open(path, "w") as f:
+        json.dump({
+            "cache_key_schema_version": SCF_CACHE_KEY_SCHEMA_VERSION,
+            **cache_params,
+        }, f, indent=2)
+
+
 def make_rhf(mol, backend="pyscf", lindep_threshold=1e-8,
              max_cycle=None, level_shift=None, diis_space=None, solver="diis"):
     """Construct the density-fitted RHF object for the requested SCF backend.
@@ -409,7 +435,12 @@ def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf", lindep_threshold
             _to_host(mf.e_tot), _to_host(mf.mo_energy),
             _to_host(mf.mo_coeff), _to_host(mf.mo_occ),
         )
-        open(converged_marker, "w").close()
+        write_converged_marker(converged_marker, {
+            "atom": atom, "basis": basis, "unit": unit, "backend": backend,
+            "lindep_threshold": lindep_threshold, "max_cycle": max_cycle,
+            "level_shift": level_shift, "diis_space": diis_space,
+            "solver": solver, "e_tot": float(_to_host(mf.e_tot)),
+        })
     return mf, time.time() - t0, False, preload_path, n_lindep_removed
 
 
