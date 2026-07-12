@@ -34,6 +34,8 @@ import numpy as np
 from jax import random
 from pyscf import gto, scf
 
+from flax import struct
+
 from pytc.vmc.sampling import burn_in
 from pytc.vmc.metropolis import make_mcmc_step
 from pytc.vmc.hamiltonian import eval_local_energy
@@ -42,6 +44,32 @@ from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
 from pytc.jastrow import NuclearCusp, CompositeJastrow, BoysHandy
 from pytc.jastrow.bha import BoysHandyAnalytical
+from pytc.jastrow.jastrow import Jastrow
+
+
+@struct.dataclass
+class _ZeroJastrow(Jastrow):
+    """Task #13 ablation helper: contributes exactly zero, for isolating
+    the Slater/determinant-side cost. hamiltonian.compute_jastrow_terms
+    crashes on CompositeJastrow.create([]) (None-initialized accumulators
+    with no components to fill them) -- rather than patch that production
+    code path for a diagnostic harness, use a real (non-empty) component
+    whose _compute correctly autodiffs to zero grad/lap through the SAME
+    generic per-pair get_pair_grid_grad_lap default (jastrow.py)
+    NuclearCusp/BoysHandy use, so this exercises real infrastructure
+    rather than being special-cased away. _compute must actually DEPEND
+    on r1/r2 (not a bare literal constant) -- folx.forward_laplacian's
+    dual-number tracing on a literal-constant function doesn't produce a
+    proper HessianTracer result (AttributeError on fwd_lapl.jacobian),
+    so multiply by zero instead of returning a zero literal.
+    """
+    name: str = struct.field(pytree_node=False, default="zero")
+
+    def _compute(self, r1, r2, params):
+        return 0.0 * (jnp.sum(r1) + jnp.sum(r2))
+
+    def init_params(self, **kwargs):
+        return {}
 
 
 def block(x):
@@ -459,6 +487,114 @@ def build_system(args):
     return atom, unit, label
 
 
+def time_jacobian_build(sj_ansatz, params, walkers, jac_batch_size, n_walkers):
+    """Time one E_L+Jacobian build pass (task #13's component-cost ablation).
+
+    Mirrors main()'s own batched/unbatched Jacobian-build timing exactly
+    (same eval_local_energy call, same batched scan-accumulator path when
+    jac_batch_size>0), but returns only (compile_time_s, steady_time_s) --
+    ablation callers don't need the downstream curvature_mat/grads_vec,
+    only wall-clock. Kept as a separate function (not shared with main()'s
+    inline version) so ablation-variant runs can't silently regress the
+    harness's own primary per-phase timing numbers.
+    """
+    def single_local_energy_and_grad(w, p):
+        return jax.value_and_grad(
+            lambda pp: eval_local_energy(sj_ansatz, w, pp)[0]
+        )(p)
+
+    if jac_batch_size > 0:
+        batch_size = min(jac_batch_size, n_walkers)
+        n_batches = (n_walkers + batch_size - 1) // batch_size
+        padded_n = n_batches * batch_size
+        pad_count = padded_n - n_walkers
+
+        params_vec, _ = jax.flatten_util.ravel_pytree(params)
+        param_dtype = params_vec.dtype
+
+        def pad_walkers(w):
+            if pad_count == 0:
+                return w, jnp.ones((padded_n,), dtype=bool)
+            padded = jax.tree_util.tree_map(
+                lambda x: jnp.concatenate(
+                    [x, jnp.repeat(x[:1], pad_count, axis=0)], axis=0
+                ),
+                w,
+            )
+            mask = jnp.concatenate(
+                [jnp.ones((n_walkers,), dtype=bool),
+                 jnp.zeros((pad_count,), dtype=bool)]
+            )
+            return padded, mask
+
+        def flatten_jacobian(jac, n):
+            jac_flat, _ = jax.tree_util.tree_flatten(jac)
+            return jnp.concatenate(
+                [jnp.reshape(leaf, (n, -1)) for leaf in jac_flat], axis=1
+            )
+
+        def masked_energy_jacobian_batch(batch_walkers, batch_mask):
+            energies_batch, jac_batch = jax.vmap(
+                single_local_energy_and_grad, in_axes=(0, None)
+            )(batch_walkers, params)
+            energies_batch = jnp.where(batch_mask, energies_batch, 0.0)
+            jac_mat_batch = flatten_jacobian(jac_batch, batch_size)
+            jac_mat_batch = jnp.where(batch_mask[:, None], jac_mat_batch, 0.0)
+            return energies_batch, jac_mat_batch
+
+        def stats_scan_body(carry, xs):
+            sum_e, sum_e2, sum_j, sum_jte, sum_jtj = carry
+            batch_walkers, batch_mask = xs
+            energies_batch, jac_mat_batch = masked_energy_jacobian_batch(
+                batch_walkers, batch_mask
+            )
+            sum_e = sum_e + jnp.sum(energies_batch)
+            sum_e2 = sum_e2 + jnp.sum(energies_batch ** 2)
+            sum_j = sum_j + jnp.sum(jac_mat_batch, axis=0)
+            sum_jte = sum_jte + jac_mat_batch.T @ energies_batch
+            sum_jtj = sum_jtj + jac_mat_batch.T @ jac_mat_batch
+            return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), None
+
+        @jax.jit
+        def batched_jacobian_pass(walkers):
+            padded_walkers, mask = pad_walkers(walkers)
+            batched_walkers = jax.tree_util.tree_map(
+                lambda x: x.reshape((n_batches, batch_size) + x.shape[1:]),
+                padded_walkers,
+            )
+            batched_mask = mask.reshape((n_batches, batch_size))
+            init_carry = (
+                jnp.array(0.0, dtype=param_dtype),
+                jnp.array(0.0, dtype=param_dtype),
+                jnp.zeros_like(params_vec),
+                jnp.zeros_like(params_vec),
+                jnp.zeros((params_vec.shape[0], params_vec.shape[0]), dtype=param_dtype),
+            )
+            return jax.lax.scan(
+                stats_scan_body, init_carry, (batched_walkers, batched_mask)
+            )[0]
+
+        t0 = time.time()
+        block(batched_jacobian_pass(walkers))
+        compile_time_s = time.time() - t0
+
+        t0 = time.time()
+        block(batched_jacobian_pass(walkers))
+        steady_time_s = time.time() - t0
+    else:
+        el_grad_jit = jax.jit(jax.vmap(single_local_energy_and_grad, in_axes=(0, None)))
+
+        t0 = time.time()
+        block(el_grad_jit(walkers, params))
+        compile_time_s = time.time() - t0
+
+        t0 = time.time()
+        block(el_grad_jit(walkers, params))
+        steady_time_s = time.time() - t0
+
+    return compile_time_s, steady_time_s
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--system", choices=["h-chain", "water"], required=True)
@@ -584,6 +720,19 @@ def main():
                          "existing convention. Does not affect the SCF cache "
                          "key (implementation choice, not SCF physics) "
                          "(2026-07-12).")
+    p.add_argument("--jac-component-breakdown", action="store_true",
+                    help="Task #13 Phase 1: after the main Jacobian-build "
+                         "timing, additionally time 4 ablation configs "
+                         "(det alone, det+BoysHandyAnalytical, det+BoysHandy "
+                         "[generic folx-autodiff path, pre-R1], "
+                         "det+NuclearCusp+BoysHandyAnalytical) on the SAME "
+                         "burned-in walkers, and report the per-component "
+                         "marginal wall-clock split. Component marginals are "
+                         "a decomposition estimate, not an exact invariant "
+                         "-- XLA fusion across a composited ansatz can make "
+                         "its fused cost differ from the sum of isolated "
+                         "marginals (2026-07-12); the measured full-config "
+                         "time remains ground truth.")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -838,6 +987,79 @@ def main():
     # / jacobian_build_mem_peak_growth_bytes below for that.
     result["jacobian_build_peak_mem_bytes"] = mem_stats()[1]
     prev_peak = record_mem_checkpoint(result, "jacobian_build", prev_peak)
+
+    if args.jac_component_breakdown:
+        # Task #13 Phase 1: component-level cost. Reuses the SAME burned-in
+        # `walkers` for every variant -- Walker.grad_up/lap_up/slater_up are
+        # Slater-determinant-only fields (see hamiltonian.py's
+        # compute_single_walker_energy: jastrow's grad/lap are computed
+        # fresh from walker.positions, independent of these cached fields),
+        # so swapping the jastrow component list doesn't require re-running
+        # burn-in per variant. Always built against BoysHandyAnalytical
+        # (bha) for the (i)/(ii) split regardless of --jastrow-class, so the
+        # decomposition stays internally consistent even when the main
+        # timed run above used --jastrow-class bh.
+        det_alone = CompositeJastrow.create([_ZeroJastrow()])
+        bha_cj = CompositeJastrow.create([BoysHandyAnalytical.create(mol)])
+        bh_cj = CompositeJastrow.create([BoysHandy.create(mol)])
+        ncusp_bha_cj = CompositeJastrow.create([ncusp, BoysHandyAnalytical.create(mol)])
+
+        variants = {
+            "det_alone": det_alone,
+            "det_plus_bha": bha_cj,
+            "det_plus_bh_folx": bh_cj,
+            "det_plus_ncusp_plus_bha": ncusp_bha_cj,
+        }
+        breakdown = {}
+        for var_name, cj in variants.items():
+            var_ansatz = SlaterJastrow.create(mol, cj, [det])
+            var_params = [cj.init_params(), linear_coeffs]
+            c_t, s_t = time_jacobian_build(
+                var_ansatz, var_params, walkers, args.jac_batch_size, args.n_walkers)
+            breakdown[var_name] = {"compile_time_s": c_t, "steady_time_s": s_t}
+
+        det_s = breakdown["det_alone"]["steady_time_s"]
+        bha_s = breakdown["det_plus_bha"]["steady_time_s"]
+        bh_s = breakdown["det_plus_bh_folx"]["steady_time_s"]
+        full_s = breakdown["det_plus_ncusp_plus_bha"]["steady_time_s"]
+
+        marginal_s = {
+            # (iv) Slater/determinant side.
+            "slater_det_side": det_s,
+            # (i) BHA's hand-coded analytic pair-jastrow gradient/laplacian
+            # (bha.py overrides the generic base-class method -- no folx).
+            "bha_contracted_pair_terms": max(0.0, bha_s - det_s),
+            # (ii) NuclearCusp's marginal cost. NuclearCusp uses the generic
+            # base-class Jastrow.get_log_grads_r1 (jastrow.py:95-152), the
+            # SAME folx.forward_laplacian-based per-pair path BoysHandy
+            # (pre-R1) used -- confirmed by grep, not the vectorized
+            # one-body path Ke asked about. This is the direct answer to
+            # that question, not a guess.
+            "nuclear_cusp_generic_folx_path": max(0.0, full_s - bha_s),
+        }
+        result["jac_component_breakdown"] = {
+            "variants_steady_time_s": {k: v["steady_time_s"] for k, v in breakdown.items()},
+            "variants_compile_time_s": {k: v["compile_time_s"] for k, v in breakdown.items()},
+            "marginal_steady_time_s": marginal_s,
+            # Normalized against the REAL measured full-config time (det+
+            # ncusp+bha), not the sum of marginals -- Felix's framing note:
+            # marginals are ranking evidence, not an exact invariant, since
+            # XLA fusion across the composited ansatz can make the fused
+            # cost differ from the sum of isolated pieces (2026-07-12).
+            "marginal_pct_of_full_config": (
+                {k: 100.0 * v / full_s for k, v in marginal_s.items()}
+                if full_s > 0 else None
+            ),
+            # (iii) folx forward-Laplacian overhead estimate: same physics
+            # (single pair-jastrow term, no cusp) evaluated via BoysHandy's
+            # generic folx-autodiff path (bh_s) vs BoysHandyAnalytical's
+            # hand-coded analytic path (bha_s) -- directly reuses this
+            # harness's own --jastrow-class A/B instead of an artificial
+            # value-only-forward proxy. NOT part of the additive percentage
+            # split above (bh/bha are alternative implementations of the
+            # SAME component, not separate components).
+            "folx_overhead_estimate_bh_vs_bha_steady_time_s": max(0.0, bh_s - bha_s),
+        }
 
     # --- Newton solve (linear solve only; curvature/grad already assembled above) ---
     def solve_delta(curvature_mat, grads_vec, damping):
