@@ -64,17 +64,42 @@ def git_commit():
         return "unknown"
 
 
-def run_scf(mol, atom, basis, unit, cache_dir):
+def make_rhf(mol, backend="pyscf"):
+    """Construct the density-fitted RHF object for the requested SCF backend.
+
+    ``pyscf`` (default) is the existing CPU DF-RHF path, byte-for-byte
+    unchanged. ``gpu4pyscf`` swaps in gpu4pyscf's GPU-accelerated RHF --
+    Felix's spike (2026-07-11) to test whether GPU DF-SCF is the real fix
+    for H300's bottleneck, since CPU max_memory sizing alone only bought
+    1.39x, far short of the hoped-for 10-50x. Import is lazy so choosing
+    "pyscf" never requires gpu4pyscf (a CUDA-only package) to be installed.
+    """
+    if backend == "pyscf":
+        return scf.RHF(mol).density_fit()
+    elif backend == "gpu4pyscf":
+        try:
+            from gpu4pyscf import scf as gpu_scf
+        except ImportError as e:
+            raise ImportError(
+                "--scf-backend gpu4pyscf requires the gpu4pyscf package "
+                "(GPU-only, needs CUDA) -- not installed in this environment."
+            ) from e
+        return gpu_scf.RHF(mol).density_fit()
+    else:
+        raise ValueError(f"Unknown --scf-backend: {backend!r}")
+
+
+def run_scf(mol, atom, basis, unit, cache_dir, backend="pyscf"):
     """Same caching pattern as profile_vmc_ref_var_phases.py -- large
     systems shouldn't re-pay SCF on every convergence-plot rerun either."""
-    mf = scf.RHF(mol).density_fit()
+    mf = make_rhf(mol, backend)
     if not cache_dir:
         t0 = time.time()
         mf.kernel()
         return mf, time.time() - t0, False
     os.makedirs(cache_dir, exist_ok=True)
     import hashlib
-    cache_key = hashlib.sha256(f"{atom}|{basis}|{unit}".encode()).hexdigest()[:16]
+    cache_key = hashlib.sha256(f"{atom}|{basis}|{unit}|{backend}".encode()).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{cache_key}.h5")
     t0 = time.time()
     if os.path.exists(cache_path):
@@ -175,6 +200,16 @@ def main():
                          "(kept off stdout to avoid flooding repeated diagnostic "
                          "runs). None = PySCF stays silent (verbose=0), matching "
                          "prior behavior.")
+    p.add_argument("--scf-backend", choices=["pyscf", "gpu4pyscf"], default="pyscf",
+                    help="SCF backend for the density-fitted RHF calculation. "
+                         "'pyscf' (default) is the existing CPU path, unchanged. "
+                         "'gpu4pyscf' uses gpu4pyscf's GPU-accelerated DF-RHF "
+                         "(requires the gpu4pyscf package + CUDA GPU) -- Felix's "
+                         "spike to test whether GPU SCF is the real fix for "
+                         "H300's bottleneck, since CPU max_memory sizing alone "
+                         "only bought 1.39x (2026-07-11). Validate smallest-"
+                         "first: single H2O correctness vs CPU before trusting "
+                         "larger systems.")
     p.add_argument("--out", default=None, help="Write raw history JSON here.")
     p.add_argument("--plot", default=None, help="Write convergence plot PNG here.")
     p.add_argument("--save-h5", default=None,
@@ -210,7 +245,9 @@ def main():
     else:
         mol_kwargs.update(verbose=0)
     mol = gto.M(**mol_kwargs)
-    mf, scf_time_s, scf_cached = run_scf(mol, atom, args.basis, unit, args.scf_cache_dir)
+    result_meta["scf_backend"] = args.scf_backend
+    mf, scf_time_s, scf_cached = run_scf(mol, atom, args.basis, unit, args.scf_cache_dir,
+                                          backend=args.scf_backend)
     result_meta["scf_time_s"] = scf_time_s
     result_meta["scf_cached"] = scf_cached
     result_meta["n_orb"] = int(mol.nao)
