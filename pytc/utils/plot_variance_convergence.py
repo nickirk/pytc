@@ -27,6 +27,7 @@ from jax import random
 from pyscf import gto, scf
 
 from pytc.vmc import optimize_ref_var
+from pytc.vmc.walker import initialize_walkers
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
 from pytc.jastrow import NuclearCusp, CompositeJastrow, BoysHandy
@@ -614,7 +615,62 @@ def main():
                          "cached psi/det/grad/lap fields) to this HDF5 path "
                          "via mcmc_utils.save_walkers, for a later "
                          "--continue-walkers-from run.")
+    p.add_argument("--resample-walkers-from", default=None,
+                    help="Task #12 tier-1: load a SMALLER, already-"
+                         "equilibrated walker checkpoint (--save-walkers "
+                         "output) and bootstrap-resample it up to "
+                         "--n-walkers instead of cold-starting from "
+                         "nucleus-centered init -- inherits most of the "
+                         "equilibration cost instead of paying it again "
+                         "(mcmc_utils.resample_walkers). Requires "
+                         "--resample-jitter-step-size. Mutually exclusive "
+                         "with --continue-walkers-from (2026-07-12).")
+    p.add_argument("--resample-jitter-step-size", type=float, default=None,
+                    help="The SOURCE checkpoint's own adapted MCMC step "
+                         "size (printed in that run's log as 'Final step "
+                         "size'), used to scale the resample jitter so "
+                         "duplicated positions separate within a few "
+                         "sweeps without leaving the typical set. Required "
+                         "with --resample-walkers-from.")
+    p.add_argument("--adaptive-burn-in", action="store_true",
+                    help="Task #12 tier-2: replace the fixed --burn-in "
+                         "step count with vmc.sampling.adaptive_burn_in's "
+                         "acceptance-pre-gate -> windowed-E/Var-stability "
+                         "-> hard-cap termination. Runs BEFORE "
+                         "optimize_ref_var/evaluate_ref_var, which then "
+                         "receive the equilibrated walkers via "
+                         "initial_walkers with burn_in_steps=0 (no double "
+                         "burn-in). --burn-in is ignored when this is set. "
+                         "Composes with --resample-walkers-from: the "
+                         "adaptive pass then measures sweeps-since-"
+                         "resample, not sweeps-since-cold-start "
+                         "(2026-07-12).")
+    p.add_argument("--adaptive-burn-in-chunk-size", type=int, default=500,
+                    help="See vmc.sampling.adaptive_burn_in's chunk_size.")
+    p.add_argument("--adaptive-burn-in-max-steps", type=int, default=50000,
+                    help="See vmc.sampling.adaptive_burn_in's max_steps.")
+    p.add_argument("--adaptive-burn-in-acceptance-tol", type=float, default=0.02,
+                    help="See vmc.sampling.adaptive_burn_in's acceptance_tol.")
+    p.add_argument("--adaptive-burn-in-stability-window", type=int, default=3,
+                    help="See vmc.sampling.adaptive_burn_in's stability_window.")
+    p.add_argument("--adaptive-burn-in-energy-atol", type=float, default=0.05,
+                    help="See vmc.sampling.adaptive_burn_in's "
+                         "energy_stability_atol (Ha, absolute -- scale up "
+                         "for systems larger than the H40 default was "
+                         "tuned against).")
+    p.add_argument("--adaptive-burn-in-variance-rtol", type=float, default=0.02,
+                    help="See vmc.sampling.adaptive_burn_in's "
+                         "variance_stability_rtol.")
     args = p.parse_args()
+
+    if args.resample_walkers_from and args.continue_walkers_from:
+        p.error("--resample-walkers-from and --continue-walkers-from are "
+                 "mutually exclusive -- resample builds a NEW, larger "
+                 "ensemble from a smaller checkpoint; continue reuses a "
+                 "checkpoint's walkers as-is at the same count.")
+    if args.resample_walkers_from and args.resample_jitter_step_size is None:
+        p.error("--resample-walkers-from requires --resample-jitter-step-size "
+                 "(the source checkpoint's own adapted MCMC step size).")
 
     if args.eval_only and not args.init_params_from:
         p.error("--eval-only requires --init-params-from (frozen params "
@@ -718,6 +774,8 @@ def main():
         linear_coeffs = jnp.ones(1)
         params = [jastrow_params, linear_coeffs]
 
+    key = random.PRNGKey(43)
+
     initial_walkers = None
     if args.continue_walkers_from:
         from pytc.vmc.mcmc_utils import load_walkers
@@ -730,8 +788,49 @@ def main():
         else:
             print(f"Continuing walkers from {args.continue_walkers_from} "
                   "as-is (--burn-in 0).")
+    elif args.resample_walkers_from:
+        from pytc.vmc.mcmc_utils import load_walkers, resample_walkers
+        key, subkey = random.split(key)
+        source_walkers = load_walkers(args.resample_walkers_from)
+        initial_walkers = resample_walkers(
+            det, source_walkers, target_n_walkers=args.n_walkers,
+            step_size=args.resample_jitter_step_size, key=subkey)
+        result_meta["resample_walkers_from"] = args.resample_walkers_from
+        result_meta["resample_jitter_step_size"] = args.resample_jitter_step_size
+        print(f"Resampled {source_walkers.positions.shape[0]} walkers from "
+              f"{args.resample_walkers_from} up to {args.n_walkers} "
+              f"(jitter step size {args.resample_jitter_step_size}). "
+              "Cached fields reset -- still needs decorrelation burn-in "
+              "before use (see --adaptive-burn-in).")
 
-    key = random.PRNGKey(43)
+    burn_in_steps = args.burn_in
+    if args.adaptive_burn_in:
+        from pytc.vmc.sampling import adaptive_burn_in
+        key, subkey = random.split(key)
+        pre_burn_walkers = (
+            initial_walkers if initial_walkers is not None
+            else initialize_walkers(det, args.n_walkers, key=subkey)
+        )
+        t0 = time.time()
+        initial_walkers, chunk_history, key, adapted_step_size, adaptive_steps_run = adaptive_burn_in(
+            det, sj_ansatz, pre_burn_walkers, params,
+            step_size=args.step_size, key=key,
+            max_vmap_batch_size=args.jac_batch_size,
+            chunk_size=args.adaptive_burn_in_chunk_size,
+            max_steps=args.adaptive_burn_in_max_steps,
+            acceptance_tol=args.adaptive_burn_in_acceptance_tol,
+            stability_window=args.adaptive_burn_in_stability_window,
+            energy_stability_atol=args.adaptive_burn_in_energy_atol,
+            variance_stability_rtol=args.adaptive_burn_in_variance_rtol,
+        )
+        result_meta["adaptive_burn_in_time_s"] = time.time() - t0
+        result_meta["adaptive_burn_in_steps"] = adaptive_steps_run
+        result_meta["adaptive_burn_in_chunk_history"] = chunk_history
+        print(f"adaptive_burn_in: {adaptive_steps_run} sweeps "
+              f"({'converged' if chunk_history and chunk_history[-1]['mean_energy'] is not None and adaptive_steps_run < args.adaptive_burn_in_max_steps else 'hit max_steps'})")
+        # optimize_ref_var/evaluate_ref_var must not burn in again on top
+        # of an already-equilibrated ensemble.
+        burn_in_steps = 0
 
     if args.eval_only:
         from pytc.vmc.optimization import evaluate_ref_var
@@ -742,7 +841,7 @@ def main():
             sj_ansatz,
             params=params,
             n_walkers=args.n_walkers,
-            burn_in_steps=args.burn_in,
+            burn_in_steps=burn_in_steps,
             step_size=args.step_size,
             initial_walkers=initial_walkers,
             key=key,
@@ -774,7 +873,7 @@ def main():
         params=params,
         n_walkers=args.n_walkers,
         n_opt_steps=args.n_opt_steps,
-        burn_in_steps=args.burn_in,
+        burn_in_steps=burn_in_steps,
         step_size=args.step_size,
         max_vmap_batch_size=args.jac_batch_size,
         optimizer_type="newton",
