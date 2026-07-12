@@ -29,7 +29,7 @@ from pyscf import gto, scf
 from pytc.vmc import optimize_ref_var
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
-from pytc.jastrow import NuclearCusp, CompositeJastrow
+from pytc.jastrow import NuclearCusp, CompositeJastrow, BoysHandy
 from pytc.jastrow.bha import BoysHandyAnalytical
 
 
@@ -536,6 +536,17 @@ def main():
                          "converged-only SCF cache -- this is meant for "
                          "chaining an unconverged/partial SCF into a "
                          "follow-up run (2026-07-12).")
+    p.add_argument("--jastrow-class", choices=["bh", "bha"], default="bha",
+                    help="bh = original BoysHandy per-pair vmap path (pre-R1-"
+                         "refactor behavior); bha = BoysHandyAnalytical, the "
+                         "R1 fast contracted-tensor override (default, current "
+                         "production behavior). Dispatch is pure class choice "
+                         "since commit 12405eb removed the jastrow_terms_impl "
+                         "flag -- this CLI flag just selects which class the "
+                         "harness constructs, matching nan_stage_trace.py's "
+                         "existing convention. Does not affect the SCF cache "
+                         "key (implementation choice, not SCF physics) "
+                         "(2026-07-12).")
     p.add_argument("--out", default=None, help="Write raw history JSON here.")
     p.add_argument("--plot", default=None, help="Write convergence plot PNG here.")
     p.add_argument("--save-h5", default=None,
@@ -611,7 +622,8 @@ def main():
     result_meta["n_elec"] = int(mol.nelectron)
 
     det = SlaterDet.create(mol, mf.mo_coeff)
-    bh = BoysHandyAnalytical.create(mol)
+    result_meta["jastrow_class"] = args.jastrow_class
+    bh = (BoysHandy if args.jastrow_class == "bh" else BoysHandyAnalytical).create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
     sj_ansatz = SlaterJastrow.create(mol, jastrow, [det])

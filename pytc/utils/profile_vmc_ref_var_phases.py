@@ -40,7 +40,7 @@ from pytc.vmc.hamiltonian import eval_local_energy
 from pytc.vmc.walker import initialize_walkers
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
-from pytc.jastrow import NuclearCusp, CompositeJastrow
+from pytc.jastrow import NuclearCusp, CompositeJastrow, BoysHandy
 from pytc.jastrow.bha import BoysHandyAnalytical
 
 
@@ -573,6 +573,17 @@ def main():
                          "converged-only SCF cache -- this is meant for "
                          "chaining an unconverged/partial SCF into a "
                          "follow-up run (2026-07-12).")
+    p.add_argument("--jastrow-class", choices=["bh", "bha"], default="bha",
+                    help="bh = original BoysHandy per-pair vmap path (pre-R1-"
+                         "refactor behavior); bha = BoysHandyAnalytical, the "
+                         "R1 fast contracted-tensor override (default, current "
+                         "production behavior). Dispatch is pure class choice "
+                         "since commit 12405eb removed the jastrow_terms_impl "
+                         "flag -- this CLI flag just selects which class the "
+                         "harness constructs, matching nan_stage_trace.py's "
+                         "existing convention. Does not affect the SCF cache "
+                         "key (implementation choice, not SCF physics) "
+                         "(2026-07-12).")
     p.add_argument("--out", default=None, help="Write JSON here (default: stdout)")
     args = p.parse_args()
 
@@ -623,13 +634,12 @@ def main():
     result["n_elec"] = int(mol.nelectron)
 
     det = SlaterDet.create(mol, mf.mo_coeff)
-    # Explicit construction, not BoysHandy.create(mol): BoysHandy.create()
-    # no longer implicitly routes to BoysHandyAnalytical (Ke's direction,
-    # 2026-07-10 -- explicit choice over silent substitution). This harness
-    # wants the analytic path (BoysHandyAnalytical's get_pair_grid_grad_lap
-    # override), so it opts in directly -- there is no flag to select it,
-    # class choice is the only dispatch (task #5 PR-B).
-    bh = BoysHandyAnalytical.create(mol)
+    # Class choice is the only dispatch (task #5 PR-B; BoysHandy.create()
+    # doesn't implicitly route to BoysHandyAnalytical, Ke's direction,
+    # 2026-07-10). --jastrow-class selects which class this harness
+    # constructs, matching nan_stage_trace.py's existing convention.
+    result["jastrow_class"] = args.jastrow_class
+    bh = (BoysHandy if args.jastrow_class == "bh" else BoysHandyAnalytical).create(mol)
     ncusp = NuclearCusp.create(mol, name="ncusp")
     jastrow = CompositeJastrow.create([ncusp, bh])
     jastrow_params = jastrow.init_params()
