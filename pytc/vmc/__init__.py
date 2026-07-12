@@ -4,7 +4,7 @@
 from .walker import Walker, initialize_walker_state, initialize_walkers
 from .moves import _all_electron_move, _one_electron_move, _compute_green_function
 from .metropolis import metropolis_hastings, metropolis_hastings_importance_sampling
-from .sampling import burn_in, burn_in_with_importance, sample
+from .sampling import burn_in, burn_in_with_importance, sample, adaptive_burn_in
 from .optimization import optimize, optimize_ref_var, evaluate_ref_var
 from .mcmc_utils import (
     prepare_sampling_results, report_progress,
@@ -27,7 +27,7 @@ __all__ = [
     # Metropolis algorithms
     'metropolis_hastings', 'metropolis_hastings_importance_sampling',
     # Sampling functions
-    'burn_in', 'burn_in_with_importance', 'sample',
+    'burn_in', 'burn_in_with_importance', 'sample', 'adaptive_burn_in',
     # Optimization functions
     'optimize', 'optimize_ref_var', 'evaluate_ref_var',
     # Utility functions
