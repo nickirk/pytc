@@ -466,7 +466,7 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=Non
 @jax.jit
 def _hermitian_sandwich_solve_core(Pi, V, rtol):
     """Fixed-shape, jitted, device-resident core of
-    hermitian_sandwich_solve_device (task #24, design v2.1 sections 5+6/7).
+    hermitian_sandwich_solve_device (design v2.1 sections 5+6/7).
     Reproduces hermitian_sandwich_solve's math exactly, restructured so
     retained-rank truncation is a boolean MASK over the full n-dimensional
     eigenbasis rather than a dynamic-size slice (eigvecs[:, :n_retained]),
@@ -527,7 +527,7 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol):
 
 def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-8):
     """Device (JAX, fixed-shape, jitted) counterpart of
-    hermitian_sandwich_solve (task #24, design v2.1 sections 5+6/7): the
+    hermitian_sandwich_solve (design v2.1 sections 5+6/7): the
     same two-sided Hermitian sandwich solve, restructured to avoid
     dynamic-shape slicing so the whole computation is one fixed-shape
     jax.jit graph, entirely device-resident -- see

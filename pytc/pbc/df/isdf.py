@@ -1,15 +1,14 @@
-"""Periodic ISDF fit machinery (task #21, #proj-isdf-periodic, design
-v2.1 sections 3-5): a generic, matrix-free Hermitian-PSD pivoted
-Cholesky selector, the Pi^q/eta^q metric/RHS builders, and a minimal
-plain-NumPy raw-kernel-apply-and-solve function needed to close the V2
-reference-replay gate at the CPU/NumPy oracle level (Flinn's ruling,
-task #21 thread, 2026-07-13: correctness oracles must close before
-device work starts, so B1 owns this; the formal KernelProvider class
-protocol -- device/jit path, pluggable ibp slot, provenance dict -- is
-Phase C's job and will formalize/wrap this function, not replace it).
+"""Periodic ISDF fit machinery (design v2.1 sections 3-5): a generic,
+matrix-free Hermitian-PSD pivoted Cholesky selector, the Pi^q/eta^q
+metric/RHS builders, and a minimal plain-NumPy raw-kernel-apply-and-solve
+function needed to close the V2 reference-replay gate at the CPU/NumPy
+oracle level (correctness oracles close before device work starts; the
+formal KernelProvider class protocol -- device/jit path, pluggable ibp
+slot, provenance dict -- formalizes/wraps this function below, not
+replacing it).
 
-Design decision (Alice's option (a), design v2.1 section 3): the
-existing pytc.df.pivots molecular pair core
+Design decision (design v2.1 section 3): the existing pytc.df.pivots
+molecular pair core
 (_pivoted_cholesky_pair_pivots_core) is one JIT with semantics far
 richer than a (diag, col_eval) skeleton -- dual Cholesky states,
 normalized/legacy tie-break ramps, a latched effective-rank prefix, and
@@ -377,12 +376,12 @@ def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_me
 
 
 # ---------------------------------------------------------------------------
-# C1 (task #24, design v2.1 section 7): device path, KernelProvider protocol.
+# Device path, KernelProvider protocol (design v2.1 section 7).
 #
-# Flinn's seam ruling (task #24 thread, msg 6916c47c) on top of the
-# apply_raw_kernel_and_solve oracle above: KernelProvider.apply(q_index, lq)
-# is a LINEAR q-momentum kernel operator applied to a PRE-PHASED (Nip, Ng)
-# slab, returning v_q BEFORE the final conjugate -- the Bloch-phase multiply
+# On top of the apply_raw_kernel_and_solve oracle above: KernelProvider.apply
+# (q_index, lq) is a LINEAR q-momentum kernel operator applied to a
+# PRE-PHASED (Nip, Ng) slab, returning v_q BEFORE the final conjugate -- the
+# Bloch-phase multiply
 # (eta_q -> lq) and the outer conjugate (v_q -> rq) are pipeline glue that
 # does not vary between providers, not part of the provider contract. The
 # vol/Ng normalization stays INSIDE the provider (it is part of "kernel on
@@ -561,13 +560,12 @@ def apply_kernel_and_solve_device(
             section 5: "machine-tier, HARD gate <=1e-10 at c128") on
             solve_info["retained_solve_residual"], checked AFTER the
             jitted solve returns. Also hard-fails if n_retained == 0.
-            Per Flinn's ruling (task #24 thread, msg 5923b019):
             hermitian_sandwich_solve_device cannot raise from inside its
             own jax.jit graph on a traced value (n_retained==0 there
             silently degrades to W=0), so THIS host wrapper is
             responsible for turning that degradation into a precise
             error at the source -- not a confusing physics mismatch
-            surfacing two stages downstream at V3.
+            surfacing downstream in a consumer-level parity gate.
 
     Returns:
         (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 jax
@@ -604,10 +602,10 @@ def apply_kernel_and_solve_device(
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
     W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
 
-    # Host-side gate (Flinn's ruling, msg 5923b019): the jitted solve
-    # cannot raise on a traced value, so degeneracy is turned into a
-    # precise, q-indexed error HERE rather than surfacing as a silent
-    # W_q=0 that would only be caught two stages downstream at V3.
+    # Host-side gate: the jitted solve cannot raise on a traced value,
+    # so degeneracy is turned into a precise, q-indexed error HERE
+    # rather than surfacing as a silent W_q=0 that would only be caught
+    # downstream at a consumer-level parity gate.
     if solve_info["n_retained"] == 0:
         raise ValueError(
             f"apply_kernel_and_solve_device: q_index={q_index} retained ZERO modes of "

@@ -1,6 +1,4 @@
-"""Tests for the device-path KernelProvider seam (task #24,
-#proj-isdf-periodic, design v2.1 section 7, Flinn's refined seam ruling
-in the task #24 thread, msg 6916c47c):
+"""Tests for the device-path KernelProvider seam (design v2.1 section 7):
 - raw_kernel_apply's derived q<->-q dagger law at the pre-phased,
   pre-conjugate seam.
 - RawKernelProvider is a thin, correct wrapper around raw_kernel_apply.
@@ -183,10 +181,9 @@ class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
             np.testing.assert_allclose(W_np, W_np.conj().T, atol=1e-8, err_msg=f"q={q}")
 
     def test_zero_retained_modes_raises_with_q_index(self):
-        # Flinn's ruling (task #24 thread, msg 5923b019): the device
-        # solve cannot raise on a traced value internally, so this host
-        # wrapper must turn n_retained==0 into a precise, q-indexed
-        # error rather than a silent W_q=0.
+        # The device solve cannot raise on a traced value internally, so
+        # this host wrapper must turn n_retained==0 into a precise,
+        # q-indexed error rather than a silent W_q=0.
         cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
         provider = RawKernelProvider(
             cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh

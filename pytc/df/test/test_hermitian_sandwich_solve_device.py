@@ -1,8 +1,7 @@
 """Device (JAX, jitted) parity tests for
 pytc.df.solvers.hermitian_sandwich_solve_device against the NumPy oracle
-hermitian_sandwich_solve (task #24, #proj-isdf-periodic, design v2.1
-sections 5+6/7, V3's "JAX device path vs NumPy oracle bit-tier <=1e-12"
-sub-gate)."""
+hermitian_sandwich_solve (design v2.1 sections 5+6/7, V3's "JAX device
+path vs NumPy oracle bit-tier <=1e-12" sub-gate)."""
 
 import unittest
 
