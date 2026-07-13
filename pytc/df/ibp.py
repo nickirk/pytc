@@ -291,15 +291,101 @@ def _deep_freeze(obj, _path="<root>"):
     )
 
 
+def _canonical_encode(obj, buf):
+    """Append a deterministic, type-tagged canonical byte encoding of obj
+    (already routed through _deep_freeze, or a plain scalar) to buf, a
+    list of bytes fragments -- for provenance hashing.
+
+    Deliberately NOT repr()-based (Alice's review, task #5,
+    2026-07-13): repr(frozenset(...)) iterates in the set's internal
+    hash-table order, which depends on PYTHONHASHSEED for str elements
+    (randomized per process by default) -- the same logical
+    construction_metadata could hash differently across runs, and
+    Alice's repro even showed builder vs __post_init__ disagreeing
+    WITHIN one construction (re-freezing a frozenset rebuilds its
+    internal table). repr() on a large ndarray also silently truncates
+    (numpy's summarized repr), so two arrays differing only in their
+    untruncated middle content could hash identically. This encoder
+    instead: sorts dict keys (str, per _deep_freeze's closed schema);
+    preserves tuple/list element order; for frozenset/set, encodes each
+    element independently and sorts the resulting BYTE strings (well-
+    defined regardless of hash-seed-dependent iteration order); and
+    hashes an ndarray's FULL raw bytes (never a summarized repr)."""
+    if isinstance(obj, types.MappingProxyType):
+        obj = dict(obj)
+    if isinstance(obj, dict):
+        buf.append(b"dict{")
+        for k in sorted(obj):
+            if not isinstance(k, str):
+                raise TypeError(f"_canonical_encode: mapping key must be str, got {k!r}.")
+            buf.append(b"k:")
+            _canonical_encode(k, buf)
+            buf.append(b"=")
+            _canonical_encode(obj[k], buf)
+            buf.append(b";")
+        buf.append(b"}")
+        return
+    if isinstance(obj, (list, tuple)):
+        buf.append(b"seq[")
+        for v in obj:
+            _canonical_encode(v, buf)
+            buf.append(b",")
+        buf.append(b"]")
+        return
+    if isinstance(obj, (set, frozenset)):
+        encoded_elements = []
+        for v in obj:
+            sub = []
+            _canonical_encode(v, sub)
+            encoded_elements.append(b"".join(sub))
+        encoded_elements.sort()
+        buf.append(b"set{")
+        for e in encoded_elements:
+            buf.append(e)
+            buf.append(b",")
+        buf.append(b"}")
+        return
+    if isinstance(obj, np.ndarray):
+        if obj.dtype.hasobject:
+            raise TypeError(f"_canonical_encode: unsupported object-dtype array {obj.dtype}.")
+        a = np.ascontiguousarray(obj)
+        buf.append(b"ndarray(" + str(a.dtype).encode() + b"," + repr(a.shape).encode() + b")")
+        buf.append(a.tobytes())
+        return
+    if isinstance(obj, np.generic):
+        _canonical_encode(obj.item(), buf)
+        return
+    if obj is None:
+        buf.append(b"none")
+        return
+    if isinstance(obj, bool):
+        buf.append(b"bool:" + (b"1" if obj else b"0"))
+        return
+    if isinstance(obj, (int, float, complex)):
+        buf.append(type(obj).__name__.encode() + b":" + repr(obj).encode())
+        return
+    if isinstance(obj, str):
+        buf.append(b"str:" + obj.encode("utf-8", errors="surrogatepass"))
+        return
+    if isinstance(obj, bytes):
+        buf.append(b"bytes:" + obj)
+        return
+    raise TypeError(
+        f"_canonical_encode: unsupported type {type(obj).__name__} for provenance hashing "
+        f"({obj!r})."
+    )
+
+
 def _canonical_spec_sha256(fields):
-    """SHA-256 over a canonical repr of small scalar/string specification
-    fields only -- never touches large array data (grid coordinate/weight
-    identities enter as their own pre-computed hash-or-caller-attested
-    string fields, not raw bytes), so this is cheap and backend-agnostic."""
+    """SHA-256 over a canonical, type-tagged encoding of specification
+    fields (see _canonical_encode) -- deterministic across processes/
+    hash seeds and never truncates large array data."""
     h = hashlib.sha256()
     for key in sorted(fields):
         h.update(key.encode())
-        h.update(repr(fields[key]).encode())
+        buf = []
+        _canonical_encode(fields[key], buf)
+        h.update(b"".join(buf))
     return h.hexdigest()
 
 
@@ -463,7 +549,7 @@ class IBPGrid:
             "coords_sha256": self.coords_sha256, "weights_sha256": self.weights_sha256,
             "numpy_version": self.numpy_version, "jax_version": self.jax_version,
             "schema_version": self.schema_version,
-            "construction_metadata_repr": repr(self.construction_metadata),
+            "construction_metadata": self.construction_metadata,
         })
         if recomputed_spec != self.grid_spec_sha256:
             raise ValueError(
@@ -587,7 +673,7 @@ def build_ibp_grid(coords, weights, *, backend="numpy",
         "coords_sha256": coords_sha256, "weights_sha256": weights_sha256,
         "numpy_version": np.__version__, "jax_version": jax_version,
         "schema_version": _IBP_GRID_SCHEMA_VERSION,
-        "construction_metadata_repr": repr(frozen_metadata),
+        "construction_metadata": frozen_metadata,
     })
 
     return IBPGrid(
@@ -678,7 +764,7 @@ class IBPOperatorPlan:
             "method": self.method, "eval_block_size": self.eval_block_size,
             "source_block_size": self.source_block_size, "tolerance": self.tolerance,
             "backend": self.backend, "device": self.device, "dtype": self.dtype,
-            "method_version": self.method_version, "provenance_repr": repr(self.provenance),
+            "method_version": self.method_version, "provenance": self.provenance,
         })
         if recomputed_spec != self.operator_spec_sha256:
             raise ValueError(
@@ -735,7 +821,7 @@ def build_ibp_operator_plan(grid, *, method="direct", tolerance=None,
         "method": method, "eval_block_size": eval_block_size,
         "source_block_size": source_block_size, "tolerance": tolerance,
         "backend": grid.backend, "device": grid.device, "dtype": grid.dtype,
-        "method_version": _IBP_OPERATOR_PLAN_VERSION, "provenance_repr": repr(frozen_provenance),
+        "method_version": _IBP_OPERATOR_PLAN_VERSION, "provenance": frozen_provenance,
     })
 
     return IBPOperatorPlan(

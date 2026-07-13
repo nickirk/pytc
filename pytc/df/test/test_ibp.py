@@ -12,6 +12,9 @@ unchanged against pytc.df.ibp via the benchmark's import.
 
 import dataclasses
 import hashlib
+import os
+import subprocess
+import sys
 import types
 import unittest
 
@@ -449,6 +452,72 @@ class TestIBPOperatorPlan(unittest.TestCase):
         # float64, and building this plan does none of that work.
         plan = build_ibp_operator_plan(grid, eval_block_size=128, source_block_size=4096)
         self.assertEqual(plan.grid.n_grid, n)
+
+
+class TestIBPProvenanceCanonicalEncoding(unittest.TestCase):
+    """Regressions for Alice's task #5 review finding: repr()-based
+    provenance hashing is hash-seed-dependent for sets/frozensets (a
+    single construction could even disagree with itself) and silently
+    truncates large ndarray content -- fixed by _canonical_encode."""
+
+    def _grid_with_metadata(self, construction_metadata):
+        rng = np.random.default_rng(9)
+        coords = rng.normal(size=(4, 3))
+        weights = rng.normal(size=4)
+        return build_ibp_grid(coords, weights, construction_metadata=construction_metadata)
+
+    def test_cross_process_hash_seed_determinism(self):
+        script = (
+            "import numpy as np\n"
+            "from pytc.df.ibp import build_ibp_grid\n"
+            "c = np.arange(12, dtype=float).reshape(4, 3)\n"
+            "w = np.ones(4)\n"
+            "g = build_ibp_grid(c, w, construction_metadata="
+            "{'labels': {'alpha', 'beta', 'gamma', 'delta'}})\n"
+            "print(g.grid_spec_sha256)\n"
+        )
+        digests = set()
+        for seed in ("1", "2", "3", "4", "0", "100"):
+            full_env = dict(os.environ)
+            full_env["PYTHONHASHSEED"] = seed
+            result = subprocess.run(
+                [sys.executable, "-W", "error", "-c", script],
+                capture_output=True, text=True, env=full_env, check=True,
+            )
+            # pytc's own startup banner logs to stdout too; the digest is
+            # always the last line since it's the script's final print().
+            digests.add(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(len(digests), 1, f"hash-seed-dependent digests: {digests}")
+
+    def test_dict_key_insertion_order_does_not_affect_hash(self):
+        grid_a = self._grid_with_metadata({"a": 1, "b": 2, "c": 3})
+        grid_b = self._grid_with_metadata({"c": 3, "a": 1, "b": 2})
+        self.assertEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
+    def test_set_construction_order_does_not_affect_hash(self):
+        grid_a = self._grid_with_metadata({"labels": {"alpha", "beta", "gamma", "delta"}})
+        grid_b = self._grid_with_metadata({"labels": {"delta", "gamma", "beta", "alpha"}})
+        self.assertEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
+    def test_distinct_set_content_gives_distinct_hash(self):
+        grid_a = self._grid_with_metadata({"labels": {"alpha", "beta"}})
+        grid_b = self._grid_with_metadata({"labels": {"alpha", "gamma"}})
+        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
+    def test_large_array_middle_content_is_not_truncated(self):
+        # repr()'s numpy summarization would show "..." in the middle and
+        # hide a difference confined entirely to the middle of a long array.
+        base = np.arange(2000, dtype=np.float64)
+        modified = base.copy()
+        modified[1000] += 1.0
+        grid_a = self._grid_with_metadata({"payload": base})
+        grid_b = self._grid_with_metadata({"payload": modified})
+        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
+    def test_tuple_element_order_is_preserved_and_sensitive(self):
+        grid_a = self._grid_with_metadata({"seq": (1, 2, 3)})
+        grid_b = self._grid_with_metadata({"seq": (3, 2, 1)})
+        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
 
 
 if __name__ == "__main__":
