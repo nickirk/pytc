@@ -45,7 +45,7 @@ def weight_mo_values(mo_values, weights):
 
 
 def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=None,
-                          on_over_rank="truncate", same_factor=False):
+                          on_over_rank="truncate", same_factor=False, effective_rank_rtol=1e-6):
     """Select interpolation points for one MO-pair sector, at most n_rank
     of them.
 
@@ -75,16 +75,23 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
             returned as if they were production-quality interpolation
             points (Alice's task #6 re-review, 2026-07-12, blocker 3).
         same_factor: True for a symmetric sector ("oo", "vv" -- same MO
-            subset on both sides of the pair). Symmetric sectors have an
-            EXACT pair-product-space rank of n*(n+1)/2, not n**2 --
+            subset on both sides of the pair). Symmetric sectors have a
+            pair-product-space rank of AT MOST n*(n+1)/2, not n**2 --
             phi_p*phi_q == phi_q*phi_p as functions on the grid, so
             (p,q) and (q,p) are literally identical columns of the pair
-            matrix. Used to analytically pre-cap n_rank before calling
-            the numerical primitive, so effective-rank tracking only
-            has to arbitrate the genuinely uncertain margin below that
-            exact bound (Felix's architect ranking on Alice's re-review,
-            2026-07-12). False (default) uses the generic n_p*n_q upper
-            bound.
+            matrix. This is an UPPER bound, not necessarily the exact
+            rank (additional grid/orbital degeneracies can reduce it
+            further, which is exactly why the numerical effective_rank
+            check still runs even after this analytic pre-cap -- Alice's
+            re-review, 2026-07-12). False (default) uses the generic
+            n_p*n_q upper bound.
+        effective_rank_rtol: Forwarded to pivoted_cholesky_pair_pivots --
+            relative tolerance (fraction of the raw diagonal's own max)
+            for counting a selection as carrying real signal. Default
+            1e-6 matches the library default (see that function's
+            docstring for the empirical calibration); expose here so
+            callers can re-tune per system without reaching past this
+            wrapper.
 
     Returns:
         pivots: (k,) selected grid-point indices, k <= n_rank (bounded
@@ -102,7 +109,7 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
     if n_rank_capped < n_rank:
         logger.info(
             f"select_sector_pivots: n_rank={n_rank} exceeds the sector's "
-            f"exact analytic pair-rank bound ({analytic_rank_bound}"
+            f"analytic pair-rank upper bound ({analytic_rank_bound}"
             f"{'=n*(n+1)/2, symmetric sector' if same_factor else '=n_p*n_q'}) "
             f"-- pre-capping the request to {n_rank_capped} before pivot "
             f"selection rather than asking the numerical primitive to "
@@ -113,7 +120,8 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
         diag_err = jnp.sum(factor_p_weighted**2, axis=0) * jnp.sum(factor_q_weighted**2, axis=0)
         shift = 1e-12 * jnp.max(jnp.abs(diag_err))
     pivots, effective_rank = pivoted_cholesky_pair_pivots(
-        factor_p_weighted, factor_q_weighted, n_rank_capped, shift, track_effective_rank=True)
+        factor_p_weighted, factor_q_weighted, n_rank_capped, shift,
+        track_effective_rank=True, effective_rank_rtol=effective_rank_rtol)
     if effective_rank < n_rank_capped:
         if on_over_rank == "raise":
             raise ValueError(
@@ -130,9 +138,9 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
         pivots = pivots[:effective_rank]
     elif n_rank_capped < n_rank and on_over_rank == "raise":
         raise ValueError(
-            f"n_rank={n_rank} exceeds this sector's exact analytic pair-rank "
-            f"bound ({analytic_rank_bound}) -- request a smaller n_rank or "
-            f"pass on_over_rank='truncate'."
+            f"n_rank={n_rank} exceeds this sector's analytic pair-rank "
+            f"upper bound ({analytic_rank_bound}) -- request a smaller n_rank "
+            f"or pass on_over_rank='truncate'."
         )
     return pivots
 

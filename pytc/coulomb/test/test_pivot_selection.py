@@ -244,6 +244,46 @@ class TestPivotSelection(unittest.TestCase):
         self.assertEqual(set(pivots_np[:2].tolist()), {0, 1},
                           "effective prefix must contain both real signals, not noise padding")
 
+    def test_effective_rank_invariant_under_global_rescale(self):
+        """Regression for Alice's 3rd re-review catch (2026-07-12, task
+        #6 blocker item 3, round 4): the tracked branch's internal
+        numerical-safety guards (is_small/is_small_raw) used to be
+        ABSOLUTE (``pivot_val < 1e-12``) while effective_rank itself is
+        defined by the SCALE-RELATIVE ``effective_rank_rtol * max_diag``
+        -- rescaling the factor matrices by a positive constant (same
+        mathematical row space, Gram merely scales) shifted max_diag by
+        the same factor but left the guards fixed, so a small enough
+        global rescale (e.g. 1e-4) could push EVERY pivot_val below the
+        absolute 1e-12 floor, permanently disabling the Cholesky
+        deflation update -- a duplicate/correlated column was then never
+        deflated after its twin was selected, and got counted as a
+        SECOND independent effective signal instead of being recognized
+        as redundant.
+
+        Alice's exact repro: one-feature rank-1 factors with two
+        identical nonzero grid columns (indices 0 and 2) -- analytically
+        rank 1 (a single feature can only span a 1-dimensional pair
+        space), so effective_rank must be 1 regardless of global scale,
+        not 2.
+        """
+        factor_p = jnp.array([[1.0, 0.0, 1.0, 0.0, 0.0]])
+        factor_q = jnp.array([[1.0, 0.0, 1.0, 0.0, 0.0]])
+
+        results = {}
+        for scale in (1.0, 1e-4):
+            fp = factor_p * scale
+            fq = factor_q * scale
+            diag_err = jnp.sum(fp**2, axis=0) * jnp.sum(fq**2, axis=0)
+            shift = 1e-12 * jnp.max(jnp.abs(diag_err))
+            pivots, effective_rank = pivoted_cholesky_pair_pivots(
+                fp, fq, 2, shift, track_effective_rank=True)
+            results[scale] = (np.asarray(pivots).tolist(), effective_rank)
+            self.assertEqual(effective_rank, 1,
+                              f"scale={scale}: analytically rank-1 problem must report effective_rank=1")
+
+        # Same prefix (up to the effective_rank=1 point) regardless of scale.
+        self.assertEqual(results[1.0][0][0], results[1e-4][0][0])
+
     def test_select_sector_pivots_truncates_over_rank_request(self):
         """select_sector_pivots must not silently return residual-
         exhausted, numerically-arbitrary pivots as if they were

@@ -257,6 +257,32 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     Selection is therefore UNRESTRICTED on both paths (always argmax
     over the full unselected pool via the official ramped/shifted
     diag_err) -- only the accounting differs.
+
+    Round-4 fix (Alice's 3rd re-review, 2026-07-12): the tracked branch's
+    internal numerical-safety guards (``is_small``/``is_small_raw``, used
+    to protect ``rsqrt`` from a near-zero pivot) were still ABSOLUTE
+    (``pivot_val < 1e-12``) even though effective_rank itself is defined
+    by the SCALE-RELATIVE ``eff_tol = effective_rank_rtol * max_diag`` --
+    rescaling the factor matrices by a positive constant (same
+    mathematical row space, the Gram merely scales) shifts max_diag by
+    the same factor but left the absolute guards fixed. A small enough
+    global rescale (Alice's repro: 1e-4, one-feature rank-1 factors with
+    two identical nonzero columns) pushed EVERY pivot_val below the
+    absolute 1e-12 floor, permanently disabling the Cholesky deflation
+    update entirely -- a duplicate/correlated column was then never
+    deflated after its twin was selected, and was counted as a SECOND
+    independent effective signal for an analytically rank-1 problem.
+    Fixed with two DIFFERENT scale-relative criteria (only on the
+    track_effective_rank=True path -- the legacy path's absolute 1e-12
+    is untouched, matching Felix's "bit-identical to Round 1" mandate):
+    ``is_small`` (official L, numerical-safety concern) now uses
+    ``100 * eps * max_diag`` (machine-epsilon-relative, as tight as
+    numerically defensible); ``is_small_raw`` (the L_raw diagnostic)
+    reuses ``eff_tol`` itself -- once a selection's raw residual falls
+    below eff_tol, ``still_effective`` has already latched False and no
+    further raw-track precision is scientifically needed; above that
+    threshold, the raw pivot is ALWAYS genuinely deflated regardless of
+    how small it looks in absolute terms.
     """
     n_grid = factor_p_weighted.shape[1]
     if n_rank > n_grid:
@@ -294,6 +320,20 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     # guarantees prefix validity without touching selection at all.
     if track_effective_rank:
         eff_tol = effective_rank_rtol * max_diag
+        # Numerical-safety floor for rsqrt (distinct from eff_tol's
+        # SCIENTIFIC-significance threshold): scale-relative to max_diag,
+        # using machine epsilon with a 100x safety margin, not the
+        # absolute ``1e-12`` the legacy path below uses. A rescaled
+        # problem (e.g. factor matrices multiplied by 1e-4, same
+        # mathematical row space) shifts max_diag by the same factor, so
+        # this floor tracks it -- the absolute 1e-12 version did not,
+        # and could classify EVERY pivot as "small" on a rescaled
+        # problem, permanently disabling the Cholesky deflation entirely
+        # and letting duplicate/correlated signal go undetected (Alice's
+        # 3rd re-review, 2026-07-12: one-feature rank-1 factors with two
+        # identical nonzero columns, rescaled by 1e-4, wrongly reported
+        # effective_rank=2 for an analytically rank-1 problem).
+        small_eps = 100.0 * jnp.finfo(diag_err.dtype).eps * max_diag
         # Tie-break ramp span normalized to stay ~1e-12*max_diag
         # REGARDLESS of n_grid (divide by n_grid-1) -- the previous
         # unnormalized ``1e-12 * arange(n_grid)`` had a span growing with
@@ -305,6 +345,7 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
                                 * jnp.arange(n_grid, dtype=diag_err.dtype) * max_diag)
     else:
         eff_tol = 0.0
+        small_eps = 0.0
         diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * max_diag
 
     L = jnp.zeros((n_grid, n_rank))
@@ -355,7 +396,9 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
             S_col_shifted = S_col.at[pivot].add(shift)
 
             dot_prod = jnp.dot(L, L[pivot])
-            is_small = pivot_val < 1e-12
+            # Scale-relative numerical-safety floor (see small_eps's
+            # definition above) -- NOT the legacy path's absolute 1e-12.
+            is_small = pivot_val < small_eps
             safe_pivot = jnp.where(is_small, 1.0, pivot_val)
             inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
             l_col = (S_col_shifted - dot_prod) * inv_sqrt_pivot
@@ -366,8 +409,19 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
 
             # Parallel unshifted/unramped Cholesky update (diagnostic
             # only, never fed back into selection or the L above).
+            # Latch-consistent skip criterion (Alice's re-review,
+            # 2026-07-12): once pivot_val_raw < eff_tol, still_effective
+            # has ALREADY closed (or is closing this step) and no
+            # further raw update is scientifically needed. Below that,
+            # the raw pivot must be genuinely divided/updated even when
+            # its ABSOLUTE magnitude is tiny (e.g. a globally rescaled
+            # problem) -- reusing eff_tol here (not a separate absolute
+            # constant) keeps this consistent with what "effective"
+            # means, and is always safely above small_eps's
+            # machine-epsilon floor since effective_rank_rtol is many
+            # orders larger than eps.
             dot_prod_raw = jnp.dot(L_raw, L_raw[pivot])
-            is_small_raw = pivot_val_raw < 1e-12
+            is_small_raw = pivot_val_raw < eff_tol
             safe_pivot_raw = jnp.where(is_small_raw, 1.0, pivot_val_raw)
             inv_sqrt_pivot_raw = jax.lax.rsqrt(safe_pivot_raw)
             l_col_raw = (S_col - dot_prod_raw) * inv_sqrt_pivot_raw
