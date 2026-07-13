@@ -532,7 +532,10 @@ class RawKernelProvider:
         }
 
 
-def apply_kernel_and_solve_device(provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-8):
+def apply_kernel_and_solve_device(
+    provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-8,
+    retained_solve_residual_gate=1e-10,
+):
     """S4 pipeline glue (design v2.1 section 6), device-resident,
     provider-agnostic: Bloch-phase multiply -> provider.apply(q_index,
     lq) -> outer conjugate -> ZGEMM contract to (Nip,Nip) -> device
@@ -554,12 +557,29 @@ def apply_kernel_and_solve_device(provider, q_index, Pi_q, eta_q, *, grid_coords
         grid_coords: (Ng, 3) real-space grid point coordinates, same
             flattened order as eta_q's grid axis.
         rtol: forwarded to the device sandwich solve.
+        retained_solve_residual_gate: HARD host-side gate (design v2.1
+            section 5: "machine-tier, HARD gate <=1e-10 at c128") on
+            solve_info["retained_solve_residual"], checked AFTER the
+            jitted solve returns. Also hard-fails if n_retained == 0.
+            Per Flinn's ruling (task #24 thread, msg 5923b019):
+            hermitian_sandwich_solve_device cannot raise from inside its
+            own jax.jit graph on a traced value (n_retained==0 there
+            silently degrades to W=0), so THIS host wrapper is
+            responsible for turning that degradation into a precise
+            error at the source -- not a confusing physics mismatch
+            surfacing two stages downstream at V3.
 
     Returns:
         (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 jax
         array (the solved kernel matrix); kern_q is the raw (Nip, Nip)
         contracted kernel before the sandwich solve; solve_info is the
         device sandwich solve's own info dict.
+
+    Raises:
+        ValueError: malformed shapes, or (post-solve) n_retained == 0 or
+            solve_info["retained_solve_residual"] exceeds
+            retained_solve_residual_gate -- both include q_index in the
+            message.
     """
     from pytc.df.solvers import hermitian_sandwich_solve_device
 
@@ -583,5 +603,117 @@ def apply_kernel_and_solve_device(provider, q_index, Pi_q, eta_q, *, grid_coords
 
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
     W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
+
+    # Host-side gate (Flinn's ruling, msg 5923b019): the jitted solve
+    # cannot raise on a traced value, so degeneracy is turned into a
+    # precise, q-indexed error HERE rather than surfacing as a silent
+    # W_q=0 that would only be caught two stages downstream at V3.
+    if solve_info["n_retained"] == 0:
+        raise ValueError(
+            f"apply_kernel_and_solve_device: q_index={q_index} retained ZERO modes of "
+            f"Pi_q in the device sandwich solve (Pi_q is non-PSD, the zero matrix, or "
+            f"rtol={rtol} is too large) -- W_q would be silently zero; refusing to "
+            f"proceed. Validate Pi_q against the NumPy oracle (hermitian_sandwich_solve) "
+            f"for a precise diagnosis."
+        )
+    if solve_info["retained_solve_residual"] > retained_solve_residual_gate:
+        raise ValueError(
+            f"apply_kernel_and_solve_device: q_index={q_index} retained-space solve "
+            f"residual {solve_info['retained_solve_residual']:.3e} exceeds the hard "
+            f"machine-tier gate {retained_solve_residual_gate:.1e} (design v2.1 section "
+            f"5) -- this is a numerical sanity check on the eigendecomposition/solve "
+            f"arithmetic itself, not the (separately reported, ungated here) truncation "
+            f"residual; something is wrong with this q's Pi_q/kern_q inputs or dtype."
+        )
+
     W_q = jnp.sqrt(n_grid) * W_q_unscaled
     return W_q, kern_q, solve_info
+
+
+def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-8,
+                           retained_solve_residual_gate=1e-10):
+    """S4 orchestration (design v2.1 section 6): build the full coul_kpt
+    array (Nk, Nip, Nip) by calling apply_kernel_and_solve_device once
+    per UNIQUE {q, neg[q]} pair, exploiting the q<->-q conjugate closure
+    to halve the FFT/coulG/solve work -- "S4 streams per-q (and its
+    neg[q] partner, processed together to exploit the conjugate
+    relation)".
+
+    For self-paired q (neg[q] == q -- Gamma, and any other BZ-edge
+    self-paired point), the pipeline runs directly. For a genuine pair
+    {q, neg[q]} with neg[q] != q, only the LOWER-indexed member runs
+    through the pipeline; the other is set by direct conjugation:
+        W[neg[q]]    = conj(W[q])
+        kern[neg[q]] = conj(kern[q])
+    This is an EXACT identity, not an approximation -- it follows from
+    Pi[neg[q]] = conj(Pi[q]) and eta[neg[q]] = conj(eta[q])
+    (pair_convolve's own q<->-q closure) propagating through: lq[neg[q]]
+    = conj(lq[q]) (module-level comment above), kern[neg[q]] =
+    conj(kern[q]) (same derivation extended one ZGEMM further), and
+    hermitian_sandwich_solve's W = Pi^+ V Pi^+ conjugating cleanly
+    because eigh(conj(M)) has the same eigenvalues with conjugated
+    eigenvectors. Verified against INDEPENDENTLY computed neg[q] builds
+    (not just self-consistency) in
+    test_build_coul_kpt_device_conjugate_shortcut_matches_independent_build.
+
+    Args:
+        provider: KernelProvider (e.g. RawKernelProvider), already
+            constructed against mesh_obj.canonical_kpts/grid_mesh.
+        Pi: (Nk, Nip, Nip) complex128, e.g. from build_pi_eta.
+        eta: (Nk, Nip, Ng) complex128, e.g. from build_pi_eta.
+        grid_coords: (Ng, 3) real-space grid point coordinates.
+        mesh_obj: pytc.pbc.df.kpts.KptsMesh (uses .neg, .n_kpts).
+        rtol: forwarded to the device sandwich solve.
+        retained_solve_residual_gate: forwarded to
+            apply_kernel_and_solve_device.
+
+    Returns:
+        (coul_kpt, kern_kpt, infos, n_pipeline_calls): coul_kpt/kern_kpt
+        are (Nk, Nip, Nip) jax arrays; infos is a length-Nk list of solve
+        info dicts (a conjugated q shares its pair partner's dict object
+        -- no independent solve ran for it, so there is no separate info
+        to report); n_pipeline_calls is the number of q's that actually
+        ran the FFT/coulG/solve pipeline (<=Nk, the measured efficiency
+        win from the conjugate shortcut, recorded for provenance).
+
+    Raises:
+        ValueError: malformed shapes, or forwarded from
+            apply_kernel_and_solve_device for any q that runs the
+            pipeline directly.
+    """
+    n_kpts = mesh_obj.n_kpts
+    Pi = np.asarray(Pi)
+    eta = np.asarray(eta)
+    if Pi.shape[0] != n_kpts:
+        raise ValueError(f"Pi.shape[0]={Pi.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
+    if eta.shape[0] != n_kpts:
+        raise ValueError(f"eta.shape[0]={eta.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
+
+    neg = mesh_obj.neg
+    coul_kpt = [None] * n_kpts
+    kern_kpt = [None] * n_kpts
+    infos = [None] * n_kpts
+    done = [False] * n_kpts
+    n_pipeline_calls = 0
+
+    for q in range(n_kpts):
+        if done[q]:
+            continue
+        W_q, kern_q, info_q = apply_kernel_and_solve_device(
+            provider, q, Pi[q], eta[q], grid_coords=grid_coords, rtol=rtol,
+            retained_solve_residual_gate=retained_solve_residual_gate,
+        )
+        coul_kpt[q] = W_q
+        kern_kpt[q] = kern_q
+        infos[q] = info_q
+        done[q] = True
+        n_pipeline_calls += 1
+
+        nq = int(neg[q])
+        if nq != q and not done[nq]:
+            coul_kpt[nq] = jnp.conj(W_q)
+            kern_kpt[nq] = jnp.conj(kern_q)
+            infos[nq] = info_q
+            done[nq] = True
+
+    return jnp.stack(coul_kpt, axis=0), jnp.stack(kern_kpt, axis=0), infos, n_pipeline_calls

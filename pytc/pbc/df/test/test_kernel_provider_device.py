@@ -20,6 +20,7 @@ from pytc.pbc.df.isdf import (
     RawKernelProvider,
     apply_kernel_and_solve_device,
     apply_raw_kernel_and_solve,
+    build_coul_kpt_device,
     build_pi_eta,
     raw_kernel_apply,
 )
@@ -180,6 +181,107 @@ class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
             )
             W_np = np.asarray(W_dev)
             np.testing.assert_allclose(W_np, W_np.conj().T, atol=1e-8, err_msg=f"q={q}")
+
+    def test_zero_retained_modes_raises_with_q_index(self):
+        # Flinn's ruling (task #24 thread, msg 5923b019): the device
+        # solve cannot raise on a traced value internally, so this host
+        # wrapper must turn n_retained==0 into a precise, q-indexed
+        # error rather than a silent W_q=0.
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        n_ip = Pi.shape[1]
+        Pi_zero = np.zeros((n_ip, n_ip), dtype=np.complex128)
+        with self.assertRaises(ValueError) as ctx:
+            apply_kernel_and_solve_device(
+                provider, 1, Pi_zero, eta[1], grid_coords=grids, rtol=1e-8,
+            )
+        self.assertIn("q_index=1", str(ctx.exception))
+
+    def test_retained_solve_residual_gate_is_enforced(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        # A normal, well-conditioned q passes at the default gate...
+        apply_kernel_and_solve_device(
+            provider, 0, Pi[0], eta[0], grid_coords=grids, rtol=1e-8,
+        )
+        # ...but must raise if the gate is tightened below any possible
+        # residual, proving the gate is actually enforced, not a no-op.
+        with self.assertRaises(ValueError) as ctx:
+            apply_kernel_and_solve_device(
+                provider, 0, Pi[0], eta[0], grid_coords=grids, rtol=1e-8,
+                retained_solve_residual_gate=-1.0,
+            )
+        self.assertIn("q_index=0", str(ctx.exception))
+
+
+class TestBuildCoulKptDevice(unittest.TestCase):
+    def _setup(self, kmesh, seed=90, n_ip=3):
+        cell = _make_cell()
+        rng = np.random.default_rng(seed)
+        kpts = cell.make_kpts(kmesh, wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grids = cell.get_uniform_grids(cell.mesh)
+        X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
+        ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (grids.shape[0], cell.nao))
+        Pi, eta = build_pi_eta(X, ao, mesh_obj.kmesh)
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        return cell, mesh_obj, grids, Pi, eta, provider
+
+    def test_matches_numpy_oracle_looped_over_all_q(self):
+        cell, mesh_obj, grids, Pi, eta, provider = self._setup([1, 1, 3])
+        coul_kpt, kern_kpt, infos, n_calls = build_coul_kpt_device(
+            provider, Pi, eta, grids, mesh_obj, rtol=1e-8,
+        )
+        for q in range(mesh_obj.n_kpts):
+            W_np, kern_np, _ = apply_raw_kernel_and_solve(
+                Pi[q], eta[q], cell=cell, q_kpt=mesh_obj.canonical_kpts[q],
+                grid_coords=grids, grid_mesh=cell.mesh, rtol=1e-8,
+            )
+            np.testing.assert_allclose(np.asarray(kern_kpt[q]), kern_np, atol=1e-12, err_msg=f"q={q}")
+            np.testing.assert_allclose(np.asarray(coul_kpt[q]), W_np, atol=1e-10, err_msg=f"q={q}")
+
+    def test_conjugate_shortcut_matches_independent_build(self):
+        # The strongest test: verify the SKIPPED neg[q] value against an
+        # INDEPENDENT direct pipeline call at neg[q] (its own inputs,
+        # not derived from q's result), not just self-consistency with
+        # the shortcut's own output.
+        cell, mesh_obj, grids, Pi, eta, provider = self._setup([1, 1, 3])
+        coul_kpt, kern_kpt, infos, n_calls = build_coul_kpt_device(
+            provider, Pi, eta, grids, mesh_obj, rtol=1e-8,
+        )
+        neg = mesh_obj.neg
+        paired_q = next(q for q in range(mesh_obj.n_kpts) if int(neg[q]) != q)
+        nq = int(neg[paired_q])
+        W_independent, kern_independent, _ = apply_kernel_and_solve_device(
+            provider, nq, Pi[nq], eta[nq], grid_coords=grids, rtol=1e-8,
+        )
+        np.testing.assert_allclose(
+            np.asarray(coul_kpt[nq]), np.asarray(W_independent), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(kern_kpt[nq]), np.asarray(kern_independent), atol=1e-12
+        )
+
+    def test_efficiency_count_is_half_plus_self_paired(self):
+        cell, mesh_obj, grids, Pi, eta, provider = self._setup([1, 1, 3])
+        neg = mesh_obj.neg
+        n_self_paired = sum(1 for q in range(mesh_obj.n_kpts) if int(neg[q]) == q)
+        n_pairs = (mesh_obj.n_kpts - n_self_paired) // 2
+        expected_calls = n_self_paired + n_pairs
+        _, _, _, n_calls = build_coul_kpt_device(provider, Pi, eta, grids, mesh_obj, rtol=1e-8)
+        self.assertEqual(n_calls, expected_calls)
+        self.assertLess(n_calls, mesh_obj.n_kpts)
+
+    def test_rejects_mismatched_leading_dimension(self):
+        cell, mesh_obj, grids, Pi, eta, provider = self._setup([1, 1, 2])
+        with self.assertRaises(ValueError):
+            build_coul_kpt_device(provider, Pi[:1], eta, grids, mesh_obj, rtol=1e-8)
 
 
 if __name__ == "__main__":
