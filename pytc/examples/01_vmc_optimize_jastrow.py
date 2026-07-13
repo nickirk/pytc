@@ -7,6 +7,18 @@ NuclearCusp Jastrow factor for H2O/cc-pVDZ. This is the same
 H-chain and benzene runs (see `isdf-data/hchain/scripts/run_opt.py`), scaled
 down to run in a few minutes on a laptop CPU rather than hours on a cluster.
 
+Walker equilibration uses the current production workflow: a cold start is
+equilibrated with `adaptive_burn_in` (which certifies equilibration via an
+acceptance pre-gate plus a sliding-window E/Var stability criterion,
+instead of guessing a fixed sweep count), and phase B is seeded directly
+with phase A's final, already-equilibrated walkers (`initial_walkers=...,
+burn_in_steps=0`) rather than paying a second cold start. When phase B
+needs MORE walkers than phase A (the production pattern, e.g. 3000 -> 30000),
+seed it with `resample_walkers(...)` -- bootstrap-replicating the
+equilibrated ensemble plus decorrelation jitter -- before the adaptive
+burn-in; here both phases use the same count, so a direct carry-over is
+all that's needed.
+
 Note: REXP (the simplest Jastrow, used in 03-06) has no electron-nucleus
 cusp, and empirically diverges to NaN under this reference-variance VMC
 optimizer -- BoysHandy+NuclearCusp (the same combination the production
@@ -16,7 +28,7 @@ The saved phase-B history (`h2o_phase_b_hist.h5`, NOT committed to git --
 see .gitignore) is consumed by 02_load_and_average_jastrow_params.py, which
 prints the averaged parameters to hardcode into 03-05.
 
-Run: python 01_vmc_optimize_jastrow.py   (~4 minutes)
+Run: python 01_vmc_optimize_jastrow.py   (~6 minutes)
 """
 import time
 
@@ -26,7 +38,8 @@ import jax.numpy as jnp
 from jax import random
 from pyscf import gto, scf
 
-from pytc.vmc import optimize_ref_var
+from pytc.vmc import optimize_ref_var, adaptive_burn_in
+from pytc.vmc.walker import initialize_walkers
 from pytc.ansatz.sj import SlaterJastrow
 from pytc.ansatz.det import SlaterDet
 from pytc.jastrow import NuclearCusp, CompositeJastrow
@@ -61,6 +74,36 @@ def main():
     # learning_rate here destabilizes the reference-variance optimizer.
     key = random.PRNGKey(43)
 
+    # Cold-start equilibration, certified rather than guessed: walkers
+    # sample the reference determinant, and adaptive_burn_in runs until
+    # acceptance sits at its target AND the batch E/Var have been stable
+    # across a sliding window -- returning the equilibrated ensemble and
+    # the sampler's adapted step size, both of which are then handed to
+    # the optimizer (burn_in_steps=0: equilibration is already done).
+    key, subkey = random.split(key)
+    walkers = initialize_walkers(det, 1000, key=subkey)
+    print("\nAdaptive burn-in (cold start)...")
+    t0 = time.time()
+    # Two calibration notes, both measured for this system:
+    # (1) start step_size near its adapted value (~0.37 for H2O) -- from
+    #     0.02 the acceptance pre-gate spends ~3500 sweeps just waiting
+    #     for step-size adaptation before any stability check can run;
+    # (2) stability tolerances must scale with the batch-mean noise
+    #     sqrt(Var/W). The library defaults assume production walker
+    #     counts (W=30000); here W=1000 and the UNOPTIMIZED jastrow has
+    #     Var ~ 100 Ha^2, so batch means fluctuate by ~0.3 Ha and a
+    #     3-chunk window legitimately spans ~1-1.5 Ha.
+    walkers, _, key, step_size, n_sweeps = adaptive_burn_in(
+        det, sj_ansatz, walkers, [jastrow_params, linear_coeffs],
+        step_size=0.3, key=key,
+        acceptance_tol=0.03,
+        energy_stability_atol=1.5,
+        variance_stability_rtol=0.35,
+        max_steps=8000,
+    )
+    print(f"Equilibrated in {n_sweeps} sweeps ({time.time() - t0:.1f}s), "
+          f"adapted step size {step_size:.4f}")
+
     print("\nPhase A: coarse optimization...")
     t0 = time.time()
     phase_a = optimize_ref_var(
@@ -68,8 +111,9 @@ def main():
         params=[jastrow_params, linear_coeffs],
         n_walkers=1000,
         n_opt_steps=10,
-        burn_in_steps=2000,
-        step_size=0.02,
+        burn_in_steps=0,
+        initial_walkers=walkers,
+        step_size=step_size,
         optimizer_type="newton",
         learning_rate=0.1,
         opt_kwargs={"damping": 1e-6, "solver": "exact"},
@@ -81,13 +125,19 @@ def main():
     print("\nPhase B: refine + save parameter trajectory...")
     t0 = time.time()
     phase_b_params = phase_a["params"][-1]
+    # Seed phase B with phase A's final walkers: they are already
+    # equilibrated and have tracked the slowly-moving parameters, so no
+    # second cold start (previously another 2000-sweep burn-in) is paid.
+    # For a walker-count INCREASE between phases, use resample_walkers
+    # (+ a short adaptive_burn_in on the resampled ensemble) instead.
     phase_b = optimize_ref_var(
         sj_ansatz,
         params=phase_b_params,
         n_walkers=1000,
         n_opt_steps=20,
-        burn_in_steps=2000,
-        step_size=0.02,
+        burn_in_steps=0,
+        initial_walkers=phase_a["final_walkers"],
+        step_size=step_size,
         optimizer_type="newton",
         learning_rate=0.1,
         opt_kwargs={"damping": 1e-6, "solver": "exact"},
