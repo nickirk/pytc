@@ -26,13 +26,22 @@ sections above it):
      immutable, provenance-carrying artifacts; build_sector/build_core
      assemble a complete, reproducible LS-THC/ISDF core for one sector
      (same-sector) or a pair of sectors (cross-sector).
+  5. Free-space Poisson solver -- isolated/free-space FFT Poisson
+     backend on a uniform Cartesian mesh (task #13, isdf-coulomb-cuda,
+     P2a). Kernel-independent, low-level: no mf/DF/CCSD dependency,
+     pure array-in-array-out. A SEPARATE, independent mesh type from
+     the DFT quadrature grid used in section 1 -- both are "grids" in
+     this file but serve unrelated purposes (irregular pruned
+     quadrature vs. a uniform Cartesian FFT mesh).
 """
 
 import dataclasses
 import hashlib
 import logging
+import math
 import types
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pyscf
@@ -67,6 +76,11 @@ __all__ = [
     "CoreArtifact",
     "build_sector",
     "build_core",
+    "FreeSpacePoissonMesh",
+    "FreeSpacePoissonKernel",
+    "build_free_space_poisson_kernel",
+    "solve_free_space_poisson",
+    "free_space_poisson_direct_sum_oracle",
 ]
 
 
@@ -1191,3 +1205,588 @@ def build_core(left, right=None, rcond=None, solver="cholesky_jitter", **solver_
             "right_sector": right.provenance,
         }
     return CoreArtifact(Z=_readonly_copy(Z), provenance=_deep_freeze(provenance))
+
+
+# ===========================================================================
+# 5. Free-space Poisson solver
+# ===========================================================================
+"""Isolated/free-space FFT Poisson backend on a uniform Cartesian mesh
+(task #13, isdf-coulomb-cuda, P2a, 2026-07-13 -- 3 review rounds with
+Alice before implementation, see the design-proposal thread for the
+full derivation history).
+
+Solves the free-space Poisson equation on a uniform Cartesian mesh,
+equivalently v_i = dV * sum_j rho_j / |r_i - r_j| under the documented
+finite-cell discretization (dV = dx*dy*dz). This is a genuinely
+SEPARATE mesh type from the DFT quadrature grid used in section 1
+(get_grid_ao_values_and_weights) -- both are "grids" in this file but
+serve unrelated purposes (irregular pruned quadrature vs. this
+uniform Cartesian FFT mesh). Zero mf/DF/CCSD dependency: pure
+array-in-array-out, a reusable low-level backend.
+
+Zero-padding for LINEAR (not circular/periodic) convolution: rho is
+placed at the padded array's origin corner (no shift), padded_shape >=
+2*shape-1 per axis (pad_factor=2 default). Cropping the result back to
+v_padded[...,:Nx,:Ny,:Nz] recovers the exact open-boundary sum: for any
+i,j in the physical region, |i-j| < N <= P/2, so (i-j) mod P never
+aliases (verified both algebraically and via a 1D numerical toy problem
+during design).
+
+Self-cell (r=0) term: two schemes.
+- "rectangular_cell" (default, production): the EXACT closed-form
+  Newton potential of a rectangular prism (the mesh cell itself)
+  evaluated at its own center -- see _rectangular_cell_self_potential's
+  docstring for the derivation/verification. Numerically stable for any
+  valid (positive) cell dimensions, no branching needed.
+- "equivalent_sphere" (diagnostic/comparison only, NOT the default):
+  models the cell's charge as uniformly spread over a sphere of equal
+  volume -- a real, shape-dependent APPROXIMATION whose error grows
+  sharply with cell anisotropy (measured: +1.59% at an isotropic cube,
+  +23.96% at 1:1:4, +66.74% at 1:1:10 -- see
+  test_free_space_poisson.py's rectangular-cell-vs-equivalent-sphere
+  test for the permanent regression check). Kept only because it is a
+  useful independent cross-check, not because it is accurate for
+  anisotropic meshes.
+
+Kernel construction uses the FFT-standard *wrapped* integer coordinate
+convention (_wrapped_integer_offsets) so the padded real-space kernel
+represents the correct (non-aliased) physical separation for every
+pair of points within the zero-padded linear-convolution regime.
+
+Typed, immutable, provenance-carrying artifacts:
+- FreeSpacePoissonMesh: pure geometry (shape/spacing/origin/
+  padded_shape/self_cell_scheme/fft_normalization), fully validated.
+  origin is provenance-only metadata -- it does NOT enter the
+  translation-invariant kernel itself.
+- FreeSpacePoissonKernel: the cached, expensive-to-build spectrum
+  artifact -- ONE per (mesh, fft_kind, backend, dtype). fft_kind is
+  explicit ("rfft" for real densities, "fft" for complex) because
+  rfftn/fftn produce genuinely different spectrum shapes; separate
+  cached artifacts are built for each, never guessed/shared. Backend-
+  preserving: a NumPy spectrum is a defensive read-only copy; a JAX
+  spectrum stays an untouched (already-immutable) jax.Array on its
+  actual device -- never forced through a NumPy-only helper, which
+  would silently transfer/duplicate the full padded spectrum on host.
+  input_dtype/spectrum_dtype are recorded as distinct concepts (e.g.
+  rfft(float64) legitimately produces a complex128 spectrum -- a
+  different, expected dtype, not a promotion failure) -- both are the
+  REALIZED facts (verified after construction), not merely requested
+  strings; JAX silently truncating a requested float64/complex128 to
+  float32/complex64 because jax_enable_x64 is disabled raises
+  ValueError immediately rather than returning a downgraded-precision
+  kernel with only a JAX UserWarning to notice it by.
+
+build_free_space_poisson_kernel does the expensive one-time spectrum
+build; solve_free_space_poisson batches many density solves against an
+already-built kernel with zero rebuild cost, rejecting fft_kind/shape/
+backend/dtype mismatches explicitly rather than silently coercing.
+free_space_poisson_direct_sum_oracle is an O(N_g^2) NumPy-only
+brute-force reference for small-system correctness testing, sharing
+the exact same scalar self-cell-aware kernel-value helper
+(_coulomb_kernel_values) as the FFT path, so the two agree on the
+self-cell convention by construction, not coincidence -- never intended
+for production use.
+"""
+
+_FREE_SPACE_POISSON_SOLVER_VERSION = "1"
+
+_REAL_COMPUTE_DTYPE_FOR_INPUT = {
+    np.dtype(np.float32): np.dtype(np.float32),
+    np.dtype(np.complex64): np.dtype(np.float32),
+    np.dtype(np.float64): np.dtype(np.float64),
+    np.dtype(np.complex128): np.dtype(np.float64),
+}
+
+
+def _wrapped_integer_offsets(P):
+    """Pure-integer FFT wrapped-coordinate offsets -- NOT
+    (np.fft.fftfreq(P)*P).astype(int), which risks float-roundoff
+    truncation (Alice's review, task #13 design round 2, 2026-07-13).
+    idx[i] = i for i <= (P-1)//2, else i - P. Verified identical to the
+    float version for P in {1,2,7,8,9,16,17} (odd/even/small/edge
+    cases) -- this version does zero floating-point arithmetic, so
+    there is no roundoff-truncation risk at any P."""
+    idx = np.arange(P)
+    return np.where(idx > (P - 1) // 2, idx - P, idx)
+
+
+def _coulomb_kernel_values(offset_x, offset_y, offset_z, K_self):
+    """Vectorized scalar Coulomb kernel: 1/|offset| everywhere except
+    exactly at the zero offset, where the resolved self-cell value
+    K_self is used instead. Shared by BOTH the padded FFT kernel
+    builder and free_space_poisson_direct_sum_oracle, so the two paths
+    agree on the self-cell convention by construction, not by
+    coincidence."""
+    self_mask = (offset_x == 0) & (offset_y == 0) & (offset_z == 0)
+    r2 = offset_x**2 + offset_y**2 + offset_z**2
+    r_safe = np.where(self_mask, 1.0, np.sqrt(r2))
+    return np.where(self_mask, K_self, 1.0 / r_safe)
+
+
+def _rectangular_cell_self_potential(dx, dy, dz):
+    """K_self via the EXACT closed-form Newton potential of a
+    rectangular prism (the classical gravity/magnetics "prism
+    potential" antiderivative), evaluated at the prism's own center.
+
+    Derivation (task #13 design round 3, 2026-07-13 -- symbolically
+    derived and verified via `uv run --with sympy`, not transcribed
+    from memory): with half-widths x=dx/2, y=dy/2, z=dz/2 and
+    R=sqrt(x^2+y^2+z^2),
+
+        F(x,y,z) = x*y*asinh(z/sqrt(x^2+y^2)) + y*z*asinh(x/sqrt(y^2+z^2))
+                   + z*x*asinh(y/sqrt(z^2+x^2))
+                   - x^2/2*atan(y*z/(x*R)) - y^2/2*atan(z*x/(y*R))
+                   - z^2/2*atan(x*y/(z*R))
+
+    satisfies d^3F/dx dy dz = 1/R EXACTLY (sympy simplifies the
+    residual to 0 -- verified, not assumed). The box self-potential
+    integral, evaluated via the standard 8-corner inclusion-exclusion
+    over this triple antiderivative, has EVERY corner term with at
+    least one zero coordinate vanish exactly (also sympy-verified via
+    proper limits, not epsilon substitution) -- collapsing to a single
+    non-singular evaluation:
+
+        self_cell_integral I = 8 * F(dx/2, dy/2, dz/2)
+
+    Since dx,dy,dz > 0 always (mesh spacing is validated positive), F
+    is evaluated ONLY at a fully generic, non-singular point --
+    unconditionally numerically stable, no piecewise/degenerate-corner
+    branching needed for any valid mesh.
+
+    Cross-validated against an independent scipy adaptive quadrature
+    (singularity excluded as a tiny ball, added back analytically) for
+    an isotropic cube and two anisotropic ratios (1:1:4, 1:1:10) --
+    exact agreement to quadrature precision -- plus an exact scale-
+    homogeneity identity I(s*dx,s*dy,s*dz) = s^2*I(dx,dy,dz) (matches
+    to 1.8e-15, machine precision).
+
+    Returns (self_cell_integral I, K_self = I/dV) -- K_self is the
+    volume-AVERAGED value that belongs in the kernel's own origin
+    entry (the solver's separate explicit dV factor then makes a
+    single occupied cell's self-potential contribution I*rho, not
+    dV*K_self*rho*dV -- do not double up the volume factor)."""
+    x, y, z = dx / 2.0, dy / 2.0, dz / 2.0
+    R = math.sqrt(x * x + y * y + z * z)
+    F = (x * y * math.asinh(z / math.sqrt(x * x + y * y))
+         + y * z * math.asinh(x / math.sqrt(y * y + z * z))
+         + z * x * math.asinh(y / math.sqrt(z * z + x * x))
+         - x * x / 2 * math.atan(y * z / (x * R))
+         - y * y / 2 * math.atan(z * x / (y * R))
+         - z * z / 2 * math.atan(x * y / (z * R)))
+    I = 8.0 * F
+    dV = dx * dy * dz
+    return I, I / dV
+
+
+def _equivalent_sphere_self_potential(dx, dy, dz):
+    """K_self via the equivalent-sphere approximation: models the
+    cell's own charge as uniformly spread over a sphere of the SAME
+    VOLUME as the cell, using the exact potential such a uniform
+    sphere produces at its own center (3Q/(2R), a standard
+    electrostatics closed form, verified during design against a
+    direct numerical integration of the uniform-ball potential to
+    1e-16).
+
+    This is a documented, real, SHAPE-DEPENDENT APPROXIMATION to the
+    true rectangular-cell self-term, not an alternative exact scheme --
+    measured error vs _rectangular_cell_self_potential: +1.59% at an
+    isotropic cube, growing to +23.96% at a 1:1:4 anisotropic cell and
+    +66.74% at 1:1:10 (task #13 design round 3, 2026-07-13). Kept as an
+    explicit diagnostic/comparison scheme only -- NOT the production
+    default (see _rectangular_cell_self_potential).
+
+    Returns (self_cell_integral I, K_self, equivalent_sphere_radius R).
+    """
+    dV = dx * dy * dz
+    R = (3.0 * dV / (4.0 * math.pi)) ** (1.0 / 3.0)
+    K_self = 3.0 / (2.0 * R)
+    I = K_self * dV
+    return I, K_self, R
+
+
+def _self_cell_values(self_cell_scheme, dx, dy, dz):
+    """Dispatch to the requested self-cell scheme. Returns
+    (self_cell_integral, K_self, equivalent_sphere_radius) --
+    equivalent_sphere_radius is None for "rectangular_cell" (that
+    scheme has no such radius; never fabricate a stale/foreign value)."""
+    if self_cell_scheme == "rectangular_cell":
+        I, K_self = _rectangular_cell_self_potential(dx, dy, dz)
+        return I, K_self, None
+    if self_cell_scheme == "equivalent_sphere":
+        return _equivalent_sphere_self_potential(dx, dy, dz)
+    raise ValueError(f"Unsupported self_cell_scheme={self_cell_scheme!r}.")
+
+
+def _kernel_spec_sha256(fields):
+    """SHA-256 over a canonical repr of small scalar/string kernel-
+    specification fields only (mesh geometry, scheme, resolved
+    self-cell values, fft_kind, backend, versions, dtypes) -- deliberately
+    never touches the full spectrum array, which may live on a JAX
+    device (hashing/copying it would force an unwanted host transfer,
+    defeating device placement -- Alice's review, task #13 design round
+    3, 2026-07-13)."""
+    h = hashlib.sha256()
+    for key in sorted(fields):
+        h.update(key.encode())
+        h.update(repr(fields[key]).encode())
+    return h.hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class FreeSpacePoissonMesh:
+    """Pure geometry for a free-space Poisson solve on a fixed uniform
+    Cartesian mesh -- no spectrum/dtype/backend content (that lives on
+    FreeSpacePoissonKernel). shape/padded_shape are corner-anchored:
+    grid index (i,j,k) sits at physical coordinate
+    origin + (i*dx, j*dy, k*dz). origin is PROVENANCE ONLY -- it does
+    not enter the translation-invariant kernel itself."""
+    shape: tuple
+    spacing: tuple
+    origin: tuple
+    padded_shape: tuple
+    self_cell_scheme: str
+    fft_normalization: str
+
+    def __post_init__(self):
+        shape = tuple(int(s) for s in self.shape)
+        spacing = tuple(float(s) for s in self.spacing)
+        origin = tuple(float(o) for o in self.origin)
+        padded_shape = tuple(int(s) for s in self.padded_shape)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "spacing", spacing)
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "padded_shape", padded_shape)
+
+        if len(shape) != 3 or any(s <= 0 for s in shape):
+            raise ValueError(f"shape must be 3 positive integers, got {shape}.")
+        if len(spacing) != 3 or any((not math.isfinite(d)) or d <= 0.0 for d in spacing):
+            raise ValueError(f"spacing must be 3 finite positive floats, got {spacing}.")
+        if len(origin) != 3 or any(not math.isfinite(o) for o in origin):
+            raise ValueError(f"origin must be 3 finite floats, got {origin}.")
+        if len(padded_shape) != 3:
+            raise ValueError(f"padded_shape must have length 3, got {padded_shape}.")
+        for p, n in zip(padded_shape, shape):
+            if p < 2 * n - 1:
+                raise ValueError(
+                    f"padded_shape entry {p} < 2*{n}-1={2 * n - 1} -- insufficient "
+                    f"zero-padding for a correct linear (non-wrapping) convolution."
+                )
+        if self.self_cell_scheme not in ("rectangular_cell", "equivalent_sphere"):
+            raise ValueError(f"Unsupported self_cell_scheme={self.self_cell_scheme!r}.")
+        if self.fft_normalization != "backward":
+            raise ValueError(
+                f"Only fft_normalization='backward' is supported, got "
+                f"{self.fft_normalization!r}."
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class FreeSpacePoissonKernel:
+    """Cached, expensive-to-build spectrum artifact for a FIXED
+    (mesh, fft_kind, backend, dtype) -- built once via
+    build_free_space_poisson_kernel, reused across many
+    solve_free_space_poisson calls with zero rebuild cost.
+
+    spectrum: NumPy backend -> defensive read-only copy (via this
+    file's _readonly_copy). JAX backend -> the untouched (already-
+    immutable) jax.Array, left on its actual device -- never forced
+    through a NumPy-only helper.
+    input_dtype/spectrum_dtype: distinct, REALIZED (verified after
+    construction) facts, not merely requested strings -- e.g.
+    rfft(float64) legitimately produces a complex128 spectrum.
+    equivalent_sphere_radius: only meaningful for
+    self_cell_scheme="equivalent_sphere"; None for "rectangular_cell"
+    (never a fabricated/foreign value)."""
+    mesh: object
+    spectrum: object
+    fft_kind: str
+    backend: str
+    input_dtype: str
+    spectrum_dtype: str
+    device: str
+    numpy_version: str
+    jax_version: object
+    self_cell_integral: float
+    K_self: float
+    equivalent_sphere_radius: object
+    kernel_spec_sha256: str
+    solver_version: str
+
+    def __post_init__(self):
+        if self.fft_kind not in ("rfft", "fft"):
+            raise ValueError(f"Unsupported fft_kind={self.fft_kind!r}.")
+        if self.backend not in ("numpy", "jax"):
+            raise ValueError(f"Unsupported backend={self.backend!r}.")
+        expected_shape = (
+            (*self.mesh.padded_shape[:-1], self.mesh.padded_shape[-1] // 2 + 1)
+            if self.fft_kind == "rfft" else self.mesh.padded_shape
+        )
+        if tuple(self.spectrum.shape) != expected_shape:
+            raise ValueError(
+                f"spectrum shape {tuple(self.spectrum.shape)} does not match the "
+                f"expected {self.fft_kind} shape {expected_shape} for padded_shape "
+                f"{self.mesh.padded_shape}."
+            )
+
+
+def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,
+                                     pad_factor=2, self_cell_scheme="rectangular_cell",
+                                     fft_kind="rfft", backend="numpy", dtype=None):
+    """Build (once per fixed mesh) the padded reciprocal-space
+    convolution kernel -- the expensive part, done once and reused
+    across every density solve via solve_free_space_poisson.
+
+    Args:
+        shape: (Nx, Ny, Nz) physical (unpadded) mesh, positive integers.
+        spacing: (dx, dy, dz), finite positive floats -- anisotropic
+            supported, no isotropy assumption anywhere in the math.
+        origin: (x0, y0, z0), physical coordinates of grid index
+            (0,0,0) -- provenance only, does not affect the kernel.
+        pad_factor: padded_shape = pad_factor * shape per axis. Must be
+            >= 2 (zero-padding sufficient for a correct linear, non-
+            wrapping convolution).
+        self_cell_scheme: "rectangular_cell" (default, exact closed
+            form) or "equivalent_sphere" (diagnostic-only approximation,
+            see _equivalent_sphere_self_potential).
+        fft_kind: "rfft" (default, for real densities) or "fft" (for
+            complex densities) -- explicit, since rfftn/fftn produce
+            different spectrum shapes; build a SEPARATE kernel for each
+            density family, never shared/guessed.
+        backend: "numpy" or "jax".
+        dtype: density family dtype. None defaults to float64 for
+            fft_kind="rfft", complex128 for fft_kind="fft". Must match
+            fft_kind's real/complex family. For backend="jax", raises
+            ValueError immediately if a requested float64/complex128
+            dtype would be silently truncated to float32/complex64
+            because jax_enable_x64 is disabled (JAX itself only warns).
+
+    Returns:
+        FreeSpacePoissonKernel.
+    """
+    if backend not in ("numpy", "jax"):
+        raise ValueError(f"Unsupported backend={backend!r}, must be 'numpy' or 'jax'.")
+    if fft_kind not in ("rfft", "fft"):
+        raise ValueError(f"Unsupported fft_kind={fft_kind!r}, must be 'rfft' or 'fft'.")
+    if pad_factor < 2:
+        raise ValueError(
+            f"pad_factor={pad_factor} must be >= 2 -- zero-padding sufficient for a "
+            f"correct linear (non-wrapping) convolution."
+        )
+
+    shape = tuple(int(s) for s in shape)
+    if len(shape) != 3 or any(s <= 0 for s in shape):
+        raise ValueError(f"shape must be 3 positive integers, got {shape}.")
+    padded_shape = tuple(int(pad_factor) * s for s in shape)
+
+    dtype = (np.dtype(dtype) if dtype is not None
+              else (np.dtype(np.float64) if fft_kind == "rfft" else np.dtype(np.complex128)))
+    if fft_kind == "rfft" and not np.issubdtype(dtype, np.floating):
+        raise ValueError(f"fft_kind='rfft' requires a real dtype, got {dtype}.")
+    if fft_kind == "fft" and not np.issubdtype(dtype, np.complexfloating):
+        raise ValueError(f"fft_kind='fft' requires a complex dtype, got {dtype}.")
+    if dtype not in _REAL_COMPUTE_DTYPE_FOR_INPUT:
+        raise ValueError(
+            f"Unsupported dtype={dtype} -- must be one of float32/float64/"
+            f"complex64/complex128."
+        )
+    real_compute_dtype = _REAL_COMPUTE_DTYPE_FOR_INPUT[dtype]
+
+    if backend == "jax":
+        probe = jnp.zeros((), dtype=dtype)
+        if probe.dtype != dtype:
+            raise ValueError(
+                f"Requested dtype {dtype} was silently downgraded to {probe.dtype} by "
+                f"JAX (jax_enable_x64 is disabled) -- call "
+                f"jax.config.update('jax_enable_x64', True) before requesting a "
+                f"float64/complex128 kernel, or request a 32-bit dtype explicitly."
+            )
+
+    dx, dy, dz = (float(s) for s in spacing)
+    self_cell_integral, K_self, equivalent_sphere_radius = _self_cell_values(
+        self_cell_scheme, dx, dy, dz)
+
+    mesh = FreeSpacePoissonMesh(
+        shape=shape, spacing=(dx, dy, dz), origin=tuple(float(o) for o in origin),
+        padded_shape=padded_shape, self_cell_scheme=self_cell_scheme,
+        fft_normalization="backward",
+    )
+
+    Px, Py, Pz = mesh.padded_shape
+    ix = _wrapped_integer_offsets(Px)
+    iy = _wrapped_integer_offsets(Py)
+    iz = _wrapped_integer_offsets(Pz)
+    OX = (ix[:, None, None] * dx).astype(real_compute_dtype)
+    OY = (iy[None, :, None] * dy).astype(real_compute_dtype)
+    OZ = (iz[None, None, :] * dz).astype(real_compute_dtype)
+    K_padded = _coulomb_kernel_values(OX, OY, OZ, K_self).astype(real_compute_dtype)
+
+    if backend == "jax":
+        K_padded_b = jnp.asarray(K_padded)
+        fft_ns = jnp.fft
+    else:
+        K_padded_b = K_padded
+        fft_ns = np.fft
+
+    if fft_kind == "rfft":
+        spectrum = fft_ns.rfftn(K_padded_b, s=mesh.padded_shape, axes=(0, 1, 2), norm="backward")
+    else:
+        K_padded_b = K_padded_b.astype(dtype)
+        spectrum = fft_ns.fftn(K_padded_b, s=mesh.padded_shape, axes=(0, 1, 2), norm="backward")
+
+    if backend == "numpy":
+        spectrum = _readonly_copy(spectrum)
+        device = "cpu"
+    else:
+        device = str(spectrum.device)
+
+    spectrum_dtype = str(spectrum.dtype)
+    jax_version_str = jax.__version__ if backend == "jax" else None
+
+    kernel_spec_sha256 = _kernel_spec_sha256({
+        "shape": mesh.shape, "spacing": mesh.spacing, "padded_shape": mesh.padded_shape,
+        "self_cell_scheme": self_cell_scheme, "fft_normalization": mesh.fft_normalization,
+        "self_cell_integral": self_cell_integral, "K_self": K_self,
+        "equivalent_sphere_radius": equivalent_sphere_radius,
+        "fft_kind": fft_kind, "backend": backend,
+        "input_dtype": str(dtype), "spectrum_dtype": spectrum_dtype,
+        "numpy_version": np.__version__, "jax_version": jax_version_str,
+        "solver_version": _FREE_SPACE_POISSON_SOLVER_VERSION,
+    })
+
+    return FreeSpacePoissonKernel(
+        mesh=mesh, spectrum=spectrum, fft_kind=fft_kind, backend=backend,
+        input_dtype=str(dtype), spectrum_dtype=spectrum_dtype, device=device,
+        numpy_version=np.__version__, jax_version=jax_version_str,
+        self_cell_integral=float(self_cell_integral), K_self=float(K_self),
+        equivalent_sphere_radius=(
+            float(equivalent_sphere_radius) if equivalent_sphere_radius is not None else None
+        ),
+        kernel_spec_sha256=kernel_spec_sha256,
+        solver_version=_FREE_SPACE_POISSON_SOLVER_VERSION,
+    )
+
+
+def solve_free_space_poisson(rho, kernel):
+    """Solve the free-space Poisson equation for a (batched) density
+    against an already-built FreeSpacePoissonKernel -- no kernel
+    rebuild, batched over arbitrary leading axes.
+
+    Args:
+        rho: (..., Nx, Ny, Nz) array matching kernel.mesh.shape, real
+            (for an fft_kind="rfft" kernel) or complex (for "fft").
+            Input dtype must exactly match kernel.input_dtype and the
+            array's backend (NumPy/JAX) must match kernel.backend --
+            both are validated explicitly, never silently coerced.
+        kernel: FreeSpacePoissonKernel from build_free_space_poisson_kernel.
+
+    Returns:
+        v: potential array of the same shape/dtype as rho.
+
+    Raises:
+        TypeError: kernel is not a FreeSpacePoissonKernel.
+        ValueError: backend, shape, dtype, or real/complex-kind mismatch.
+    """
+    if not isinstance(kernel, FreeSpacePoissonKernel):
+        raise TypeError(
+            "kernel must be a FreeSpacePoissonKernel from build_free_space_poisson_kernel."
+        )
+
+    is_jax_array = isinstance(rho, jax.Array)
+    is_numpy_array = isinstance(rho, np.ndarray)
+    if kernel.backend == "numpy" and is_jax_array:
+        raise ValueError(
+            "kernel.backend='numpy' but rho is a JAX array -- build a backend='jax' "
+            "kernel for JAX inputs."
+        )
+    if kernel.backend == "jax" and is_numpy_array:
+        raise ValueError(
+            "kernel.backend='jax' but rho is a NumPy array -- build a backend='numpy' "
+            "kernel, or pass a JAX array."
+        )
+
+    xp = jnp if kernel.backend == "jax" else np
+    fft_ns = jnp.fft if kernel.backend == "jax" else np.fft
+    rho = xp.asarray(rho)
+
+    input_dtype = np.dtype(kernel.input_dtype)
+    if rho.dtype != input_dtype:
+        raise ValueError(f"rho.dtype={rho.dtype} != kernel.input_dtype={input_dtype}.")
+
+    mesh = kernel.mesh
+    Nx, Ny, Nz = mesh.shape
+    Px, Py, Pz = mesh.padded_shape
+    if tuple(rho.shape[-3:]) != (Nx, Ny, Nz):
+        raise ValueError(
+            f"rho's trailing 3 axes {tuple(rho.shape[-3:])} != mesh.shape {(Nx, Ny, Nz)}."
+        )
+
+    is_complex_kernel = kernel.fft_kind == "fft"
+    rho_is_complex = np.issubdtype(rho.dtype, np.complexfloating)
+    if is_complex_kernel != rho_is_complex:
+        raise ValueError(
+            f"kernel.fft_kind={kernel.fft_kind!r} but rho.dtype={rho.dtype} "
+            f"({'complex' if rho_is_complex else 'real'}) -- fft_kind='rfft' needs real "
+            f"rho, fft_kind='fft' needs complex rho."
+        )
+
+    batch_shape = tuple(rho.shape[:-3])
+    padded_shape_full = batch_shape + (Px, Py, Pz)
+
+    if kernel.backend == "jax":
+        rho_padded = jnp.zeros(padded_shape_full, dtype=rho.dtype)
+        rho_padded = rho_padded.at[..., :Nx, :Ny, :Nz].set(rho)
+    else:
+        rho_padded = np.zeros(padded_shape_full, dtype=rho.dtype)
+        rho_padded[..., :Nx, :Ny, :Nz] = rho
+
+    if kernel.fft_kind == "rfft":
+        rho_hat = fft_ns.rfftn(rho_padded, s=(Px, Py, Pz), axes=(-3, -2, -1), norm="backward")
+        v_padded = fft_ns.irfftn(
+            rho_hat * kernel.spectrum, s=(Px, Py, Pz), axes=(-3, -2, -1), norm="backward")
+    else:
+        rho_hat = fft_ns.fftn(rho_padded, s=(Px, Py, Pz), axes=(-3, -2, -1), norm="backward")
+        v_padded = fft_ns.ifftn(
+            rho_hat * kernel.spectrum, s=(Px, Py, Pz), axes=(-3, -2, -1), norm="backward")
+
+    dV = mesh.spacing[0] * mesh.spacing[1] * mesh.spacing[2]
+    v = v_padded[..., :Nx, :Ny, :Nz] * dV
+    return v.astype(rho.dtype)
+
+
+def free_space_poisson_direct_sum_oracle(rho, mesh):
+    """O(N_g^2) NumPy-only brute-force reference sum, using the SAME
+    scalar kernel-value helper (_coulomb_kernel_values, same
+    self_cell_scheme branch) as build_free_space_poisson_kernel --
+    small systems only, for correctness testing, never production.
+
+    Args:
+        rho: (..., Nx, Ny, Nz) array matching mesh.shape, real or complex.
+        mesh: FreeSpacePoissonMesh (geometry + self_cell_scheme only --
+            no kernel/spectrum needed for this direct-sum path).
+
+    Returns:
+        v: potential array of the same shape as rho.
+    """
+    if not isinstance(mesh, FreeSpacePoissonMesh):
+        raise TypeError("mesh must be a FreeSpacePoissonMesh.")
+    rho = np.asarray(rho)
+    Nx, Ny, Nz = mesh.shape
+    if tuple(rho.shape[-3:]) != (Nx, Ny, Nz):
+        raise ValueError(
+            f"rho's trailing 3 axes {tuple(rho.shape[-3:])} != mesh.shape {(Nx, Ny, Nz)}."
+        )
+
+    dx, dy, dz = mesh.spacing
+    _, K_self, _ = _self_cell_values(mesh.self_cell_scheme, dx, dy, dz)
+
+    ii, jj, kk = np.meshgrid(np.arange(Nx), np.arange(Ny), np.arange(Nz), indexing="ij")
+    coords = np.stack([ii.ravel() * dx, jj.ravel() * dy, kk.ravel() * dz], axis=-1)  # (Ng,3)
+    diff = coords[:, None, :] - coords[None, :, :]  # (Ng,Ng,3)
+    K = _coulomb_kernel_values(diff[..., 0], diff[..., 1], diff[..., 2], K_self)  # (Ng,Ng)
+
+    Ng = coords.shape[0]
+    dV = dx * dy * dz
+    batch_shape = rho.shape[:-3]
+    rho_flat = rho.reshape(batch_shape + (Ng,))
+    v_flat = dV * np.einsum("...j,ij->...i", rho_flat, K)
+    return v_flat.reshape(rho.shape)
