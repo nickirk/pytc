@@ -133,6 +133,151 @@ def burn_in(ansatz,
     return walkers, acceptance_history, key, step_size
 
 
+def adaptive_burn_in(
+    ref_det,
+    full_ansatz,
+    walkers,
+    params,
+    step_size=0.01,
+    key=None,
+    move_type="one",
+    max_vmap_batch_size=0,
+    mesh=None,
+    chunk_size=500,
+    max_steps=50000,
+    acceptance_target=0.5,
+    acceptance_tol=0.02,
+    stability_window=3,
+    energy_stability_atol=0.05,
+    variance_stability_rtol=0.02,
+):
+    """Burn in until the ensemble's E_L/Var estimates stabilize, instead of
+    a fixed step count (a count tuned for one system size under-provisions
+    a larger one, since equilibration time grows with system size).
+
+    Runs in chunks of `chunk_size` sweeps; after each chunk:
+
+    1. PRE-GATE on acceptance within `acceptance_tol` of
+       `acceptance_target`. Acceptance reflects only step-size
+       adaptation, not global |Psi|^2 mixing -- a cheap pre-check, not
+       the stopping decision.
+    2. Once the pre-gate passes, compute batch-mean E_L and Var via
+       `full_ansatz` (the physical trial wavefunction -- NOT `ref_det`,
+       which only defines the sampling distribution) over a sliding
+       window of the last `stability_window` chunks. Terminate once E is
+       within `energy_stability_atol` (absolute: E crosses zero during
+       equilibration) and Var within `variance_stability_rtol`
+       (relative: Var is strictly positive) across the window.
+    3. Hard-capped at `max_steps` total sweeps.
+
+    If `walkers` came from `mcmc_utils.resample_walkers`, this function's
+    sweep counter is "sweeps since resample" by construction, so the
+    stability window can't read "stable" off still-correlated bootstrap
+    duplicates.
+
+    Args:
+        ref_det: The determinant (or other) ansatz that defines the MCMC
+                proposal/target distribution -- same role as `ansatz` in
+                `burn_in`.
+        full_ansatz: The physical trial wavefunction (e.g. SlaterJastrow)
+                whose local_energy is the actual quantity of interest for
+                the stability check.
+        walkers: Initial walker configurations.
+        params: Full [jastrow_params, linear_coeffs] for `full_ansatz`.
+        step_size: Initial MCMC proposal step size.
+        key: PRNG key.
+        move_type, max_vmap_batch_size, mesh: forwarded to burn_in.
+        chunk_size: Sweeps per chunk (one step-size adaptation and one
+                stability check per chunk).
+        max_steps: Hard cap on total sweeps; the stability criterion, not
+                the cap, should normally terminate.
+        acceptance_target: Pre-gate center, matching burn_in's step-size
+                adaptation target.
+        acceptance_tol: Pre-gate band around the target.
+        stability_window: Number of consecutive chunks required stable.
+        energy_stability_atol: Absolute energy tolerance (Ha) for the
+                window range; scale with system size (equilibrium
+                fluctuations grow with it).
+        variance_stability_rtol: Relative tolerance for Var's window
+                range, above the plateau noise floor and below the
+                pre-plateau transition.
+
+    Returns:
+        Tuple of (equilibrated_walkers, chunk_history, new_key, step_size,
+        total_steps_run). chunk_history is a list of per-chunk dicts with
+        keys: steps_so_far, acceptance, mean_energy, variance (the latter
+        two are None for chunks skipped by the acceptance pre-gate).
+    """
+    if key is None:
+        key = random.PRNGKey(int(time.time()))
+
+    vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
+    batch_local_energy = jax.jit(vmap_fn(
+        lambda w, p: full_ansatz.local_energy(w, p)[0],
+        in_axes=(0, None),
+        out_axes=0,
+    ))
+
+    chunk_history = []
+    e_window = []
+    var_window = []
+    total_steps = 0
+
+    while total_steps < max_steps:
+        this_chunk = min(chunk_size, max_steps - total_steps)
+        walkers, acc_hist, key, step_size = burn_in(
+            ref_det, walkers, this_chunk, step_size, key, params=params,
+            report_interval=chunk_size, move_type=move_type,
+            max_vmap_batch_size=max_vmap_batch_size, mesh=mesh,
+        )
+        total_steps += this_chunk
+        chunk_acceptance = float(np.mean(acc_hist)) if acc_hist else None
+
+        record = {"steps_so_far": total_steps, "acceptance": chunk_acceptance,
+                   "mean_energy": None, "variance": None}
+
+        if chunk_acceptance is not None and abs(chunk_acceptance - acceptance_target) <= acceptance_tol:
+            energies = np.asarray(jax.device_get(batch_local_energy(walkers, params))).reshape(-1)
+            e_mean = float(np.mean(energies))
+            var = float(np.mean((energies - e_mean) ** 2))
+            record["mean_energy"] = e_mean
+            record["variance"] = var
+
+            e_window.append(e_mean)
+            var_window.append(var)
+            e_window = e_window[-stability_window:]
+            var_window = var_window[-stability_window:]
+
+            if len(e_window) == stability_window:
+                e_range = max(e_window) - min(e_window)
+                var_range = max(var_window) - min(var_window)
+                var_scale = max(abs(np.mean(var_window)), 1e-12)
+                if e_range <= energy_stability_atol and var_range / var_scale <= variance_stability_rtol:
+                    chunk_history.append(record)
+                    logger.info(
+                        f"adaptive_burn_in converged after {total_steps} sweeps "
+                        f"(E window {e_window}, Var window {var_window})."
+                    )
+                    return walkers, chunk_history, key, step_size, total_steps
+        else:
+            # Pre-gate not yet passed -- acceptance still settling.
+            # Reset the stability window: a chunk that skipped the E/Var
+            # check contributes no evidence either way, and letting a
+            # stale window from before a pre-gate dip carry over risks
+            # false "stable" on a window that isn't contiguous.
+            e_window = []
+            var_window = []
+
+        chunk_history.append(record)
+
+    logger.info(
+        f"adaptive_burn_in hit max_steps={max_steps} without meeting the "
+        f"stability criterion -- returning current state; consider "
+        f"raising max_steps or loosening the stability tolerances."
+    )
+    return walkers, chunk_history, key, step_size, total_steps
+
+
 def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, report_interval=100, mesh=None):
     """Perform burn-in steps for MCMC sampling with importance sampling.
     

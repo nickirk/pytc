@@ -453,6 +453,7 @@ def optimize(
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "fisher" # Energy minimization uses Fisher
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
+        opt_kwargs["mesh"] = mesh
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         
         key, subkey = random.split(key)
@@ -624,6 +625,7 @@ def optimize_ref_var(
     save_path: Optional[str] = None,
     n_mcmc_per_opt: Optional[int] = None,
     n_opt_per_mcmc: Optional[int] = None,
+    initial_opt_state: Optional[int] = None,
 ):
     """Perform variational Monte Carlo optimization using MCMC sampling.
 
@@ -656,12 +658,30 @@ def optimize_ref_var(
                         optimization update.
         n_opt_per_mcmc: Optional explicit number of optimization steps before
                         each MCMC refresh.
+        initial_opt_state: Newton optimizer only. If provided, seeds the
+                        optimizer's internal step counter (which drives the
+                        learning-rate decay schedule, see create_optimizer's
+                        `schedule_lr`) at this value instead of 0 -- lets a
+                        warm-started run (`params` loaded from a prior run's
+                        history) continue that run's LR decay instead of
+                        silently restarting it at full `learning_rate` at
+                        each wall-clock chunk boundary.
 
     Returns:
-        Dictionary with optimization results and statistics
+        Dictionary with optimization results and statistics. Includes
+        "final_opt_state" (int, Newton only) -- the optimizer's step counter
+        after the last update, for chaining into a subsequent warm-started
+        run's `initial_opt_state`.
     """
     if key is None:
         key = random.PRNGKey(int(time.time()))
+
+    if initial_opt_state is not None and optimizer_type.lower() != "newton":
+        raise ValueError(
+            "`initial_opt_state` is only supported for optimizer_type='newton' "
+            f"(got {optimizer_type!r}) -- it seeds NewtonOptimizer's internal "
+            "step counter, which other optimizer types don't expose this way."
+        )
 
     if opt_kwargs is None:
         opt_kwargs = {}
@@ -756,16 +776,20 @@ def optimize_ref_var(
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
-        
+        opt_kwargs["mesh"] = mesh
+
         # Add jacobian_sample_size if provided
         if jacobian_sample_size is not None:
             opt_kwargs["jacobian_sample_size"] = jacobian_sample_size
         
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
-        
+
         key, subkey = random.split(key)
-        opt_state = optimizer.init(params, subkey, (walkers, ansatz))
-        
+        if initial_opt_state is not None:
+            opt_state = jnp.array(initial_opt_state, dtype=jnp.int32)
+        else:
+            opt_state = optimizer.init(params, subkey, (walkers, ansatz))
+
         training_step = make_second_order_training_step(
             mcmc_step,
             optimizer,
@@ -897,10 +921,164 @@ def optimize_ref_var(
     logger.info("Optimization complete!")
     
     
+    final_opt_state = (
+        int(jax.device_get(opt_state)) if optimizer_type.lower() == "newton" else None
+    )
+
     return {
         "cost": np.array(losses),
         "energies": np.array(energies),
         "stds": np.array(stds),
         "acceptance": np.array(acceptances),
-        "params": params_history
+        "params": params_history,
+        "final_opt_state": final_opt_state,
+        "final_walkers": jax.device_get(walkers),
+    }
+
+
+def evaluate_ref_var(
+    ansatz,
+    params,
+    n_walkers: int = 100,
+    step_size: float = 1.0,
+    burn_in_steps: int = 1000,
+    initial_walkers=None,
+    key=None,
+    move_type: str = "one",
+    max_vmap_batch_size: int = 0,
+    n_eval_batches: int = 1,
+    n_mcmc_per_eval: int = 1,
+    clip_multiplier: float = 5.0,
+):
+    """Evaluate reference-variance / local-energy statistics at FIXED params.
+
+    Unlike ``optimize_ref_var``, this never updates ``params`` -- it exists
+    for controlled experiments where the params must be held
+    bit-identical across runs to isolate a single variable (walker count,
+    burn-in, warm-start convention). It also surfaces the raw local-energy
+    tail (clipped fraction, max|E_L|) that the production loss function
+    discards after clipping, since that tail is the object of the W-scaling
+    hypothesis under test.
+
+    Args:
+        ansatz: Wavefunction object (SlaterJastrow).
+        params: Frozen [jastrow_params, linear_coeffs] -- never updated.
+        n_walkers: Number of parallel walkers.
+        step_size: MCMC proposal std dev.
+        burn_in_steps: Burn-in steps before the first eval batch. Pass 0
+                       when ``initial_walkers`` is an already-equilibrated
+                       checkpoint (the fresh-vs-continued-walkers experiment).
+        initial_walkers: Optional Walker state (e.g. from
+                       ``mcmc_utils.load_walkers``) or raw positions.
+        key: PRNG key.
+        move_type: "one" or "all" for MCMC electron moves.
+        max_vmap_batch_size: If >0, use folx.batched_vmap for memory efficiency.
+        n_eval_batches: Number of independent stat batches to record.
+        n_mcmc_per_eval: MCMC steps to decorrelate walkers between batches.
+        clip_multiplier: Same clipping window as the production loss
+                       (mean +/- multiplier * MAD); only used to report
+                       clipped_fraction/variance, never to modify walkers.
+
+    Returns:
+        Dictionary with:
+            "batches": list of per-batch dicts (cost, mean_energy,
+                energy_mad, clipped_fraction, max_abs_local_energy,
+                acceptance).
+            "final_walkers": Walker state after the last batch, host-local
+                (pass to ``mcmc_utils.save_walkers`` to checkpoint).
+    """
+    if key is None:
+        key = random.PRNGKey(int(time.time()))
+
+    if not isinstance(params, (list, tuple)) or len(params) != 2:
+        raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
+
+    from .sharding import (
+        create_mesh, replicate, initialize_walkers_sharded,
+        pad_n_walkers, n_devices as get_n_devices,
+        is_multi_gpu as check_multi_gpu, get_vmap_fn,
+    )
+
+    multi_gpu = check_multi_gpu()
+    mesh = None
+    if multi_gpu:
+        num_devices = get_n_devices()
+        mesh = create_mesh()
+        padded_n = pad_n_walkers(n_walkers, num_devices)
+        if padded_n != n_walkers:
+            logger.info(f"Padding n_walkers from {n_walkers} to {padded_n} "
+                  f"(divisible by {num_devices} devices)")
+            n_walkers = padded_n
+        params = replicate(params, mesh)
+
+    ref_det = ansatz.dets[0]
+    if multi_gpu and mesh is not None:
+        walkers = initialize_walkers_sharded(
+            ref_det, n_walkers, mesh, initial_walkers=initial_walkers, key=key
+        )
+    else:
+        walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
+
+    if burn_in_steps > 0:
+        logger.info("Performing burn-in...")
+        walkers, _, key, step_size = burn_in(
+            ref_det, walkers, burn_in_steps, step_size, key, params=params,
+            move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
+        logger.info(f"Burn-in complete. Final step size: {step_size:.4f}")
+    else:
+        logger.info("burn_in_steps=0: using walkers as-provided (continued-walkers mode).")
+
+    mcmc_step = make_mcmc_step(ref_det, step_size, move_type,
+                                max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
+
+    vmap_impl = get_vmap_fn(max_vmap_batch_size, mesh)
+    batch_local_energy = jax.jit(vmap_impl(
+        lambda w, p: ansatz.local_energy(w, p)[0],
+        in_axes=(0, None),
+        out_axes=0,
+    ))
+
+    batches = []
+    for b in range(n_eval_batches):
+        pmove_val = None
+        for _ in range(n_mcmc_per_eval):
+            key, subkey = random.split(key)
+            walkers, pmove = mcmc_step(ref_det, walkers, subkey, params)
+            pmove_val = float(jax.device_get(pmove))
+
+        energies = np.asarray(jax.device_get(batch_local_energy(walkers, params))).reshape(-1)
+        n = energies.shape[0]
+        e_mean = float(np.mean(energies))
+        e_mad = float(np.mean(np.abs(energies - e_mean)))
+
+        if clip_multiplier > 0 and e_mad > 0:
+            lo, hi = e_mean - clip_multiplier * e_mad, e_mean + clip_multiplier * e_mad
+            clipped_fraction = float(np.mean((energies < lo) | (energies > hi)))
+            clipped_energies = np.clip(energies, lo, hi)
+            clipped_mean = float(np.mean(clipped_energies))
+            variance = float(np.sum((clipped_energies - clipped_mean) ** 2) / (n - 1)) if n > 1 else 0.0
+        else:
+            clipped_fraction = 0.0
+            variance = float(np.sum((energies - e_mean) ** 2) / (n - 1)) if n > 1 else 0.0
+
+        batch_stats = {
+            "cost": variance,
+            "mean_energy": e_mean,
+            "energy_mad": e_mad,
+            "clipped_fraction": clipped_fraction,
+            "max_abs_local_energy": float(np.max(np.abs(energies))),
+            "acceptance": pmove_val,
+        }
+        batches.append(batch_stats)
+        accept_str = f"{pmove_val:.3f}" if pmove_val is not None else "n/a"
+        logger.info(
+            f"Eval batch {b:3d} | Var: {variance:.6f} | E: {e_mean:.6f} | "
+            f"clipped_frac: {clipped_fraction:.4f} | max|E_L|: {batch_stats['max_abs_local_energy']:.4f} | "
+            f"Accept: {accept_str}"
+        )
+
+    return {
+        "batches": batches,
+        "final_walkers": jax.device_get(walkers),
+        "n_walkers": n_walkers,
     }

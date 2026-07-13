@@ -405,5 +405,89 @@ class TestHamiltonianGrad(unittest.TestCase):
         self.assertLess(execution_time, 5.0, "Gradient computation took too long (>5s)")
         self.assertLess(mem_increase, 1000, "Gradient memory usage too high (>1GB)")
 
+
+class TestJastrowTermsPolymorphicDispatch(unittest.TestCase):
+    """BoysHandyAnalytical's get_pair_grid_grad_lap override (the fast
+    whole-electron-set path) must give bit-identical full-E_L results to
+    the Jastrow base class's default per-pair implementation (inherited
+    unchanged by generic BoysHandy), on multi-type systems with the same
+    CompositeJastrow (NuclearCusp + BH) structure production uses. There
+    is no flag -- class choice (BoysHandyAnalytical vs BoysHandy) is the
+    only dispatch. See pytc/jastrow/test/test_bha.py for
+    the lower-level, same-instance base-vs-override check.
+    """
+
+    def _build(self, mol, jastrow_cls):
+        mf = scf.RHF(mol).density_fit()
+        mf.kernel()
+        det = SlaterDet.create(mol, mf.mo_coeff)
+        bh = jastrow_cls.create(mol)
+        ncusp = NuclearCusp.create(mol, name="ncusp")
+        jastrow = CompositeJastrow.create([ncusp, bh])
+        params = jastrow.init_params()
+        ansatz = SlaterJastrow.create(mol, jastrow, [det])
+        return ansatz, params
+
+    def _check(self, mol, n_walkers=4, seed=11):
+        from pytc.jastrow.bha import BoysHandyAnalytical
+        ansatz_base, params_base = self._build(mol, BoysHandy)
+        ansatz_override, params_override = self._build(mol, BoysHandyAnalytical)
+        key = random.PRNGKey(seed)
+        walkers = initialize_walkers(ansatz_base, n_walkers, key=key)
+        for w in range(n_walkers):
+            walker_w = jax.tree_util.tree_map(lambda x: x[w], walkers)
+            e_base = compute_single_walker_energy(ansatz_base, walker_w, params_base)
+            e_override = compute_single_walker_energy(
+                ansatz_override, walker_w, params_override)
+            # Tight but not bit-exact: the two paths use different op
+            # orderings, which coincide only for special parameter values.
+            np.testing.assert_allclose(
+                float(e_override), float(e_base), rtol=1e-12, atol=1e-12,
+                err_msg=f"walker {w}: BoysHandyAnalytical E_L != generic BoysHandy E_L")
+
+    def test_lih(self):
+        mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)
+        self._check(mol)
+
+    def test_h2o(self):
+        mol = gto.M(atom="O 0 0 0; H 0 -1.4 1.1; H 0 1.4 1.1",
+                     basis="sto-3g", unit="Bohr", verbose=0)
+        self._check(mol)
+
+    def test_water_dimer(self):
+        mol = gto.M(atom="""
+O  0.000  0.000  0.000
+H  0.757  0.586  0.000
+H -0.757  0.586  0.000
+O  0.000  0.000  2.900
+H  0.757 -0.586  2.900
+H -0.757 -0.586  2.900
+""", basis="cc-pVDZ", unit="Angstrom", verbose=0)
+        self._check(mol)
+
+
+class TestJastrowTermsCompositeLengthMismatch(unittest.TestCase):
+    """A CompositeJastrow/params length mismatch must raise, not silently
+    truncate via zip() and return a wrong (partial) energy."""
+
+    def test_extra_component_raises(self):
+        mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)
+        from pytc.jastrow.bha import BoysHandyAnalytical
+        mf = scf.RHF(mol).density_fit()
+        mf.kernel()
+        det = SlaterDet.create(mol, mf.mo_coeff)
+        bha = BoysHandyAnalytical.create(mol)
+        ncusp = NuclearCusp.create(mol, name="ncusp")
+        jastrow = CompositeJastrow.create([ncusp, bha])
+        params = jastrow.init_params()
+        ansatz = SlaterJastrow.create(mol, jastrow, [det])
+        key = random.PRNGKey(17)
+        walkers = initialize_walkers(ansatz, 1, key=key)
+        walker_0 = jax.tree_util.tree_map(lambda x: x[0], walkers)
+        truncated_params = params[:1]  # drop the BHA entry
+        with self.assertRaises(ValueError):
+            compute_single_walker_energy(ansatz, walker_0, truncated_params)
+
+
 if __name__ == "__main__":
     unittest.main()

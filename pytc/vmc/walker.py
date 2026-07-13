@@ -101,14 +101,36 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None, log_in
     """
     if key is None:
         key = random.PRNGKey(int(time.time()))
-    
-    # If initial_walkers is already a Walker, return it
+
+    # If initial_walkers is already a Walker, return it -- but only if its
+    # walker count actually matches n_walkers. Silently returning a
+    # checkpoint's Walker with the WRONG count corrupts every downstream
+    # W-dependent computation (damping, batch shapes, statistics) with no
+    # error signal. Callers that want a different walker count than a
+    # saved checkpoint must resample explicitly first
+    # (see mcmc_utils.resample_walkers).
     if isinstance(initial_walkers, Walker):
+        actual_n = initial_walkers.positions.shape[0]
+        if actual_n != n_walkers:
+            raise ValueError(
+                f"initialize_walkers: initial_walkers is a Walker with "
+                f"{actual_n} walkers but n_walkers={n_walkers} was "
+                f"requested. Resample to the target size explicitly "
+                f"(mcmc_utils.resample_walkers) if you intend a different "
+                f"walker count than the checkpoint."
+            )
         return initial_walkers
-    
+
     # If initial_walkers are positions, use them
     if initial_walkers is not None:
         positions = initial_walkers
+        if positions.shape[0] != n_walkers:
+            raise ValueError(
+                f"initialize_walkers: initial_walkers positions have "
+                f"{positions.shape[0]} walkers but n_walkers={n_walkers} "
+                f"was requested -- same silent-mismatch class as the "
+                f"Walker-instance case above."
+            )
     else:
         # Get molecular information needed for initialization
         # ansatz here is a SlaterDet, which now has atom_coords and atom_charges as attributes

@@ -27,7 +27,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=0.0, max_delta_norm=None, mesh=None):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -38,6 +38,17 @@ class NewtonOptimizer:
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
         self.jacobian_sample_size = jacobian_sample_size
         self.clip_multiplier = clip_multiplier
+        # Opt-in hardening against huge-but-finite Jacobian rows from
+        # near-nodal walkers: jac_row_clip_multiplier rescales outlier rows;
+        # max_delta_norm is a trust-region radius RELATIVE to
+        # max(1, ||params||). Both OFF by default (0/None) to preserve the
+        # numerics of existing calculations; enable explicitly for runs that
+        # chain many sub-optimizations.
+        self.jac_row_clip_multiplier = jac_row_clip_multiplier
+        self.max_delta_norm = max_delta_norm
+        # Thread one Mesh instance through so _get_vmap uses the same mesh
+        # as walker init/MCMC instead of re-deriving one when mesh=None.
+        self.mesh = mesh
 
     def _get_vmap(self):
         """Return the appropriate vmap implementation.
@@ -45,12 +56,12 @@ class NewtonOptimizer:
         Automatically detects multi-GPU environments via get_vmap_fn.
         """
         from .sharding import get_vmap_fn
-        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size)
+        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size, mesh=self.mesh)
 
     def _get_unbatched_vmap(self):
         """Return a per-batch vmap without nested folx batching."""
         from .sharding import get_vmap_fn
-        return get_vmap_fn(max_vmap_batch_size=0)
+        return get_vmap_fn(max_vmap_batch_size=0, mesh=self.mesh)
 
     def _get_effective_batch_size(self, n_walkers: int) -> int:
         """Return a batch size compatible with the current execution mode."""
@@ -106,6 +117,47 @@ class NewtonOptimizer:
             axis=1,
         )
 
+    @staticmethod
+    def _clip_jacobian_rows(jac_mat, clip_multiplier, mask=None):
+        """Clip each walker's Jacobian row to at most
+        ``clip_multiplier * median(row_norm)`` (over the unmasked rows),
+        rescaling the whole row down (direction preserved) rather than
+        clamping individual entries -- same spirit as the existing
+        energy MAD-clipping, applied to row *scale* so a single
+        near-nodal walker's huge-but-finite row can't dominate
+        ``sum_jte``/``sum_jtj``. Median (not mean) since it is itself
+        robust to the exact walkers this is meant to guard against.
+        Statistics are computed within the same batch/set being clipped
+        (no extra Jacobian pass) -- cheap, at the cost of being a local
+        rather than a whole-walker-population estimate.
+        """
+        if clip_multiplier is None or clip_multiplier <= 0:
+            return jac_mat
+        # Defense-in-depth: callers are expected to have already excluded
+        # non-finite rows (finite-masking happens before this is called in
+        # NewtonOptimizer.step), but guard here too -- an Inf row gives
+        # row_norm=inf, and threshold/inf=0, so scale*row = 0*inf = NaN
+        # without this, silently manufacturing a NaN from the clip itself
+        # rather than the walker that was already broken.
+        finite_row = jnp.all(jnp.isfinite(jac_mat), axis=1)
+        jac_mat = jnp.where(finite_row[:, None], jac_mat, 0.0)
+        row_norm = jnp.linalg.norm(jac_mat, axis=1)
+        if mask is not None:
+            mask = mask & finite_row
+        else:
+            mask = finite_row
+        # Masked (padding/non-finite) rows are already zero; excluding
+        # them from the median keeps the threshold meaningful.
+        valid_norm = jnp.where(mask, row_norm, jnp.nan)
+        median_norm = jnp.nanmedian(valid_norm)
+        threshold = clip_multiplier * median_norm
+        # If every row is masked/non-finite, nanmedian is NaN and the clip
+        # would itself manufacture NaNs; fall back to "no clipping" and let
+        # the finite-masking above (rows already zeroed) carry the batch.
+        threshold = jnp.where(jnp.isfinite(threshold), threshold, jnp.inf)
+        scale = jnp.minimum(1.0, threshold / jnp.maximum(row_norm, 1e-300))
+        return jac_mat * scale[:, None]
+
     def init(self, params, rng, batch):
         return jnp.array(0, dtype=jnp.int32)  # step count
 
@@ -139,7 +191,10 @@ class NewtonOptimizer:
                 # S = 1/N * J.T @ J
                 n_walkers = walkers.shape[0]
                 curvature_mat = (jac_centered.T @ jac_centered) / n_walkers
-                
+                # Finite-masking/row-clipping (below) is gauss_newton-specific;
+                # no dropped-walker tracking on this path.
+                n_dropped = jnp.array(0, dtype=jnp.int32)
+
             elif self.curvature_type == "gauss_newton":
                 # GN: G = 2/M * J_centered.T @ J_centered
                 # J_i = d(E_L(w_i))/dp
@@ -204,20 +259,45 @@ class NewtonOptimizer:
                             single_local_energy,
                             in_axes=(0, None),
                         )(batch_walkers, params)
+                        # A walker can be genuinely non-finite (not just huge) --
+                        # e.g. a near-nodal walker whose updated params push some
+                        # Jastrow term into a mathematically undefined regime.
+                        # Clipping downstream can only rescale huge-but-finite
+                        # values; a NaN/inf must be excluded here instead, same
+                        # treatment as a padding row, or it silently poisons
+                        # every accumulated sum it touches regardless of clipping.
+                        batch_mask = batch_mask & jnp.isfinite(energies_batch)
                         return jnp.where(batch_mask, energies_batch, 0.0)
 
                     def masked_energy_jacobian_batch(batch_walkers, batch_mask, clip_lo, clip_hi):
+                        orig_mask = batch_mask
                         energies_batch, jac_batch = batch_vmap_fn(
                             single_local_energy_and_grad,
                             in_axes=(0, None),
                         )(batch_walkers, params)
+                        jac_mat_batch = self._flatten_jacobian(jac_batch, batch_size)
+                        # See masked_energy_batch: exclude genuinely non-finite
+                        # walkers (energy OR any jacobian component) before any
+                        # clipping runs, so nanmedian in _clip_jacobian_rows can't
+                        # confuse "real broken walker" with "intentional padding
+                        # sentinel", and NaN can't survive a finite rescale.
+                        batch_mask = (
+                            orig_mask
+                            & jnp.isfinite(energies_batch)
+                            & jnp.all(jnp.isfinite(jac_mat_batch), axis=1)
+                        )
                         energies_batch = jnp.where(batch_mask, energies_batch, 0.0)
                         if clip_lo is not None and clip_hi is not None:
                             clipped = jnp.clip(energies_batch, clip_lo, clip_hi)
                             energies_batch = jnp.where(batch_mask, clipped, 0.0)
-                        jac_mat_batch = self._flatten_jacobian(jac_batch, batch_size)
                         jac_mat_batch = jnp.where(batch_mask[:, None], jac_mat_batch, 0.0)
-                        return energies_batch, jac_mat_batch
+                        jac_mat_batch = self._clip_jacobian_rows(
+                            jac_mat_batch, self.jac_row_clip_multiplier, mask=batch_mask
+                        )
+                        # Walkers dropped for non-finiteness specifically, not
+                        # counting padding rows (which orig_mask already excludes).
+                        n_dropped_batch = jnp.sum((~batch_mask) & orig_mask).astype(jnp.int32)
+                        return energies_batch, jac_mat_batch, n_dropped_batch
 
                     clip_lo = None
                     clip_hi = None
@@ -260,12 +340,13 @@ class NewtonOptimizer:
                         jnp.zeros_like(params_vec),
                         jnp.zeros_like(params_vec),
                         jnp.zeros((params_vec.shape[0], params_vec.shape[0]), dtype=param_dtype),
+                        jnp.array(0, dtype=jnp.int32),
                     )
 
                     def stats_scan_body(carry, xs):
-                        sum_e, sum_e2, sum_j, sum_jte, sum_jtj = carry
+                        sum_e, sum_e2, sum_j, sum_jte, sum_jtj, n_dropped = carry
                         batch_walkers, batch_mask = xs
-                        energies_batch, jac_mat_batch = masked_energy_jacobian_batch(
+                        energies_batch, jac_mat_batch, n_dropped_batch = masked_energy_jacobian_batch(
                             batch_walkers,
                             batch_mask,
                             clip_lo,
@@ -276,24 +357,30 @@ class NewtonOptimizer:
                         sum_j = sum_j + jnp.sum(jac_mat_batch, axis=0)
                         sum_jte = sum_jte + jac_mat_batch.T @ energies_batch
                         sum_jtj = sum_jtj + jac_mat_batch.T @ jac_mat_batch
-                        return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), None
+                        n_dropped = n_dropped + n_dropped_batch
+                        return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj, n_dropped), None
 
-                    (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), _ = jax.lax.scan(
+                    (sum_e, sum_e2, sum_j, sum_jte, sum_jtj, n_dropped), _ = jax.lax.scan(
                         stats_scan_body,
                         init_carry,
                         (batched_walkers, batched_mask),
                     )
 
-                    e_mean = sum_e / n_walkers
-                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_walkers - e_mean**2, 0.0))
-                    mean_j = sum_j / n_walkers
-                    loss = (sum_e2 - n_walkers * e_mean**2) / (n_walkers - 1)
+                    # Dropped (non-finite) walkers contribute zeros to every
+                    # sum above; dividing by the full n_walkers would treat
+                    # them as real zero-energy/zero-Jacobian samples and bias
+                    # the step. Use the valid count (floored to avoid /0).
+                    n_valid = jnp.maximum(n_walkers - n_dropped, 2)
+                    e_mean = sum_e / n_valid
+                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_valid - e_mean**2, 0.0))
+                    mean_j = sum_j / n_valid
+                    loss = (sum_e2 - n_valid * e_mean**2) / (n_valid - 1)
                     aux_data = (e_mean, e_std)
-                    grads_vec = (2.0 / (n_walkers - 1)) * (
-                        sum_jte - n_walkers * mean_j * e_mean
+                    grads_vec = (2.0 / (n_valid - 1)) * (
+                        sum_jte - n_valid * mean_j * e_mean
                     )
-                    curvature_mat = (2.0 / n_walkers) * (
-                        sum_jtj - n_walkers * jnp.outer(mean_j, mean_j)
+                    curvature_mat = (2.0 / n_valid) * (
+                        sum_jtj - n_valid * jnp.outer(mean_j, mean_j)
                     )
                 else:
                     # Compute energies and Jacobian for (sub-sampled) walkers
@@ -303,34 +390,55 @@ class NewtonOptimizer:
                         in_axes=(0, None)
                     )(sub_walkers, params)
 
+                    jac_mat = self._flatten_jacobian(jac, n_walkers)
+                    # Exclude genuinely non-finite walkers (energy OR any
+                    # jacobian component) BEFORE computing any clip statistics --
+                    # a NaN/inf energy would otherwise poison e_mean_raw/
+                    # e_std_raw themselves, and clipping can only rescale
+                    # huge-but-finite values, not NaN/inf. Same treatment as a
+                    # padding row in the batched path (zero + excluded from
+                    # stats, n_walkers denominator unchanged).
+                    finite_mask = jnp.isfinite(energies) & jnp.all(jnp.isfinite(jac_mat), axis=1)
+                    n_dropped = jnp.sum(~finite_mask)
+                    if n_dropped.dtype != jnp.int32:
+                        n_dropped = n_dropped.astype(jnp.int32)
+                    energies = jnp.where(finite_mask, energies, 0.0)
+                    jac_mat = jnp.where(finite_mask[:, None], jac_mat, 0.0)
+
                     # Clip energies to suppress outliers.  The gradient is
                     # 2/(M-1) * J^T @ (E - mean(E)), so clipping energies
                     # naturally limits the influence of extreme walkers.
                     if self.clip_multiplier > 0:
-                        e_mean_raw = jnp.mean(energies)
-                        e_std_raw = jnp.mean(jnp.abs(energies - e_mean_raw))
-                        energies = jnp.clip(
+                        e_mean_raw = jnp.sum(energies) / jnp.maximum(jnp.sum(finite_mask), 1)
+                        e_std_raw = jnp.sum(jnp.where(finite_mask, jnp.abs(energies - e_mean_raw), 0.0)) / jnp.maximum(jnp.sum(finite_mask), 1)
+                        clipped = jnp.clip(
                             energies,
                             e_mean_raw - self.clip_multiplier * e_std_raw,
                             e_mean_raw + self.clip_multiplier * e_std_raw,
                         )
+                        energies = jnp.where(finite_mask, clipped, 0.0)
 
-                    jac_mat = self._flatten_jacobian(jac, n_walkers)
+                    jac_mat = self._clip_jacobian_rows(jac_mat, self.jac_row_clip_multiplier, mask=finite_mask)
 
-                    # Compute variance loss and auxiliary data analytically from energies
-                    e_mean = jnp.mean(energies)
-                    e_std = jnp.std(energies)
-                    energy_diff = energies - e_mean
-                    loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
+                    # Compute variance loss and auxiliary data analytically
+                    # from energies. Dropped walkers were zeroed above, so
+                    # denominators use the valid count and centered
+                    # quantities are re-masked to keep dropped rows at zero.
+                    n_valid = jnp.maximum(jnp.sum(finite_mask), 2)
+                    e_mean = jnp.sum(energies) / n_valid
+                    energy_diff = jnp.where(finite_mask, energies - e_mean, 0.0)
+                    e_std = jnp.sqrt(jnp.sum(energy_diff**2) / n_valid)
+                    loss = jnp.sum(energy_diff**2) / (n_valid - 1)
                     aux_data = (e_mean, e_std)
 
                     # Compute variance gradient analytically:
                     # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
-                    grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
+                    grads_vec = (2.0 / (n_valid - 1)) * (jac_mat.T @ energy_diff)
 
                     # Center the Jacobian for curvature matrix
-                    jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
-                    curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
+                    mean_jac = jnp.sum(jac_mat, axis=0, keepdims=True) / n_valid
+                    jac_centered = jnp.where(finite_mask[:, None], jac_mat - mean_jac, 0.0)
+                    curvature_mat = (2.0 / n_valid) * (jac_centered.T @ jac_centered)
             
             else:
                 raise ValueError(f"Unknown curvature type: {self.curvature_type}")
@@ -353,15 +461,26 @@ class NewtonOptimizer:
                 solve_kwargs["assume_a"] = "pos"
                 
             delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, **solve_kwargs)
-            
+
+            # Trust-region cap (opt-in): rescale the whole step (direction
+            # preserved) when a near-flat curvature direction yields a huge
+            # but finite step; the bound is relative to max(1, ||params||)
+            # so it tracks the parameter scale.
+            if self.max_delta_norm is not None and self.max_delta_norm > 0:
+                params_vec_for_scale, _ = jax.flatten_util.ravel_pytree(params)
+                trust_radius = self.max_delta_norm * jnp.maximum(1.0, jnp.linalg.norm(params_vec_for_scale))
+                delta_norm = jnp.linalg.norm(delta_vec)
+                delta_scale = jnp.minimum(1.0, trust_radius / jnp.maximum(delta_norm, 1e-300))
+                delta_vec = delta_vec * delta_scale
+
             # Unflatten delta to match params structure
             delta = unravel_fn(delta_vec)
-            
+
             # Update
             lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
             new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
-            
-            return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr}
+
+            return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr, "n_dropped_walkers": n_dropped}
 
         # CG Solver: need loss + grads from value_and_grad_func
         (loss, aux_data), grads = self.value_and_grad_func(params, batch)
@@ -525,6 +644,9 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             solve_kwargs=merged_kwargs.get("solve_kwargs", None),
             jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
             clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
+            jac_row_clip_multiplier=merged_kwargs.get("jac_row_clip_multiplier", 0.0),
+            max_delta_norm=merged_kwargs.get("max_delta_norm", None),
+            mesh=merged_kwargs.get("mesh", None),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
