@@ -19,7 +19,9 @@ class REXP(jastrow.Jastrow):
         r12 = r1-r2
         # Use custom norm to match NumPy behavior
         r12_norm = _safe_norm_np(r12, jnp.array(self.epsilon))
-        return 0.5*jnp.exp(-params['alpha'] * r12_norm) * r12_norm
+        # Squeeze to a scalar: alpha is stored shape-(1,), and the pair-value
+        # contract (e.g. the log-Jastrow scan carry) requires a scalar.
+        return jnp.squeeze(0.5*jnp.exp(-params['alpha'] * r12_norm) * r12_norm)
 
     def __call__(self, r1, r2, params):
         return super().__call__(r1, r2, params)

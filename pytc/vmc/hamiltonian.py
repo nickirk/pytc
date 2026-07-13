@@ -23,7 +23,13 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     # grad_k U = sum_{j!=k} grad_1(rk, rj)
     
     def compute_pair_grads(r_i, r_j):
-        g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j, jastrow_params)
+        # Displace exact-coincidence pairs (the i == j diagonal) before
+        # evaluating: the diagonal is masked out below, but a NaN produced
+        # at r_i == r_j (0/0 in autodiff'd pair norms) survives the
+        # multiplicative mask (NaN * 0 = NaN).
+        coincident = jnp.all(r_i == r_j)
+        r_j_safe = jnp.where(coincident, r_j + 1.0, r_j)
+        g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j_safe, jastrow_params)
         return g1, l1
         
     # vmap over j (inner), then i (outer)

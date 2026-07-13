@@ -82,7 +82,7 @@ def make_energy_loss(
             # Extract walkers from batch
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 walkers, ansatz_arg = batch_data
-                ansatz_dynamic = ansatz_arg
+                ansatz_dynamic = ansatz_arg if ansatz_arg is not None else ansatz
             else:
                 walkers = batch_data
                 ansatz_dynamic = ansatz
@@ -137,16 +137,18 @@ def make_energy_loss(
             clipped_energies = aux_data.clipped_energies
             diff = aux_data.diff
             
-            # Extract walkers from batch_data
-            if isinstance(batch_data, tuple):
-                walkers = batch_data[0]
+            # Extract walkers (and any dynamic ansatz) from batch_data,
+            # mirroring the forward pass -- ansatz_dynamic must be resolved
+            # here too, since this scope does not see loss_fn's locals.
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                walkers, ansatz_arg = batch_data
+                ansatz_dynamic = ansatz_arg if ansatz_arg is not None else ansatz
             else:
                 walkers = batch_data
-            
-         # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
-            # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
+                ansatz_dynamic = ansatz
+
+            # batch_network takes (walkers, params) but we only differentiate
+            # params, so curry it to a function of params alone.
             def log_psi_fn(p):
                 # Use standard vmap with checkpointing for correct global gradients
                 return vmap_impl(
