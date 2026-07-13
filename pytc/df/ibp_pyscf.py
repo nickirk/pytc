@@ -19,9 +19,9 @@ records the surface-probe parity observed on newer PySCF; support beyond
 """
 
 import dataclasses
-import hashlib
 
 import numpy as np
+import pyscf
 from pyscf.df.df import DF
 from pyscf.dft import numint
 
@@ -58,26 +58,59 @@ def _validate_positive_float(name, value):
     return value
 
 
+def _plain_python(obj):
+    """Recursively coerce a PySCF parsed-basis / ECP structure into plain
+    Python dict/list/str/int/float/bool/None so the canonical TLV encoder
+    (which rejects object-dtype arrays and unknown types) can hash it. Numpy
+    scalars become their Python items; numpy arrays become nested lists."""
+    if isinstance(obj, dict):
+        return {str(k): _plain_python(v) for k, v in obj.items()}
+    if isinstance(obj, np.ndarray):
+        return _plain_python(obj.tolist())
+    if isinstance(obj, (list, tuple)):
+        return [_plain_python(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, (bool, int, float, str, bytes)) or obj is None:
+        return obj
+    # Anything else (unexpected) is stringified rather than silently dropped.
+    return str(obj)
+
+
+def _normalized_basis(mol):
+    """The parsed numeric basis (``mol._basis``: per-element list of angular
+    momentum + primitive exponent/coefficient blocks), as plain Python. This
+    is the realized numeric basis, not a repr of the requested basis name, so
+    two molecules that resolve to different contractions are distinguished."""
+    return _plain_python(dict(getattr(mol, "_basis", {}) or {}))
+
+
+def _normalized_ecp(mol):
+    """The parsed ECP (``mol._ecp``), plain Python, or None if none is set."""
+    ecp = getattr(mol, "_ecp", None)
+    if not ecp:
+        return None
+    return _plain_python(dict(ecp))
+
+
 def _canonical_molecule_digest(mol):
-    """A reproducible identity digest for a molecule -- element charges,
-    coordinates (bohr), total charge, spin, and the basis specification --
-    built from canonical bytes rather than repr(), so a different molecule,
-    geometry, or basis is always distinguishable across processes."""
-    h = hashlib.sha256()
-    h.update(_canonical_sha256(np.asarray(mol.atom_charges())).encode())
-    h.update(_canonical_sha256(np.ascontiguousarray(mol.atom_coords())).encode())
-    h.update(str(int(mol.charge)).encode())
-    h.update(str(int(mol.spin)).encode())
-    # Basis: PySCF normalizes mol.basis to a per-element dict of contractions
-    # after build(); encode it deterministically.
-    basis = mol.basis
-    if isinstance(basis, dict):
-        for key in sorted(basis):
-            h.update(str(key).encode())
-            h.update(repr(basis[key]).encode())
-    else:
-        h.update(repr(basis).encode())
-    return h.hexdigest()
+    """A reproducible, canonical identity digest for a molecule, built from
+    normalized numeric/string fields via the closed TLV encoder (never
+    ``repr``): element charges, coordinates (bohr), total charge, spin, the
+    AO representation (``cart`` vs spherical -- it changes ``nao`` for the
+    same basis), the realized AO count, the parsed numeric basis, and any
+    ECP. A different molecule, geometry, basis, or AO representation always
+    yields a different digest, deterministically across processes."""
+    return _canonical_spec_sha256({
+        "atom_charges": np.ascontiguousarray(np.asarray(mol.atom_charges())),
+        "atom_coords_bohr": np.ascontiguousarray(mol.atom_coords()),
+        "charge": int(mol.charge),
+        "spin": int(mol.spin),
+        "cart": bool(mol.cart),
+        "nao": int(mol.nao),
+        "basis": _normalized_basis(mol),
+        "ecp": _normalized_ecp(mol),
+    })
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,8 +145,8 @@ class IBPISDFConfig:
         object.__setattr__(self, "packed_pair_tol",
                            _validate_positive_float("packed_pair_tol", self.packed_pair_tol))
         object.__setattr__(self, "pivot_effective_rank_rtol",
-                           _validate_positive_float("pivot_effective_rank_rtol",
-                                                    self.pivot_effective_rank_rtol))
+                           self._validate_open_unit_interval(
+                               "pivot_effective_rank_rtol", self.pivot_effective_rank_rtol))
         if self.pivot_on_over_rank not in _SUPPORTED_ON_OVER_RANK:
             raise ValueError(
                 f"pivot_on_over_rank must be one of {_SUPPORTED_ON_OVER_RANK}, got "
@@ -148,6 +181,17 @@ class IBPISDFConfig:
         if level < 0:
             raise ValueError(f"grid_level must be non-negative, got {level}.")
         return level
+
+    @staticmethod
+    def _validate_open_unit_interval(name, value):
+        """The selector's effective-rank rtol contract is 0 < rtol < 1; reject
+        anything outside the open unit interval so failure is early and closed."""
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+            raise ValueError(f"{name} must be a real number in (0, 1), got {value!r}.")
+        value = float(value)
+        if not np.isfinite(value) or not (0.0 < value < 1.0):
+            raise ValueError(f"{name} must satisfy 0 < {name} < 1, got {value!r}.")
+        return value
 
     @staticmethod
     def _nonneg_float(name, value):
@@ -192,6 +236,7 @@ class IBPISDF(DF):
     def _clear_custom_cache(self):
         self._ibp_built = False
         self._ibp_mol_digest = None
+        self._ibp_provenance = None
         self._ibp_grid = None
         self._ibp_sector = None
         self._ibp_plan = None
@@ -204,10 +249,25 @@ class IBPISDF(DF):
     def config(self):
         return self._config
 
+    @property
+    def provenance(self):
+        return self._ibp_provenance
+
     def build(self):
+        # Idempotent: a second build validates that the molecule identity has
+        # not changed under the built cache. An in-place mutation (set_geom_,
+        # basis change, cart flip) after the first build must not silently
+        # reuse stale factors -- it fails loudly and demands reset().
+        current = _canonical_molecule_digest(self.mol)
         if self._ibp_built:
+            if current != self._ibp_mol_digest:
+                raise RuntimeError(
+                    "IBPISDF: the molecule identity changed after build() (geometry, "
+                    "basis, or AO representation differs from the built artifact); call "
+                    "reset() before reusing this provider."
+                )
             return self
-        self._ibp_build()
+        self._ibp_build(current)
         return self
 
     def reset(self, mol=None):
@@ -220,27 +280,42 @@ class IBPISDF(DF):
 
     def copy(self):
         # An unbuilt copy with the same immutable configuration -- the simplest
-        # honest contract; it must not share this provider's mutable cache.
-        return IBPISDF(self.mol, config=self._config)
+        # honest contract; it must not share this provider's mutable build
+        # cache. PySCF runtime settings are preserved so the copy behaves like
+        # a fresh, unbuilt clone of this provider rather than a defaulted one.
+        new = IBPISDF(self.mol, config=self._config)
+        new.blockdim = self.blockdim
+        new.max_memory = self.max_memory
+        new.verbose = self.verbose
+        new.stdout = self.stdout
+        return new
 
-    def get_naoaux(self):
-        if not self._ibp_built:
-            self._ibp_build()
-        return self._ibp_naoaux
-
-    def loop(self, blksize=None):
-        if not self._ibp_built:
-            self._ibp_build()
-        naoaux = self._ibp_naoaux
-        if naoaux == 0:
-            return
+    def _resolve_blksize(self, blksize):
+        """Resolve and type-check the effective block size (including the
+        blockdim default) before any streaming so an invalid block size or a
+        corrupted blockdim can never be silently swallowed by an early
+        (e.g. zero-rank) return."""
         if blksize is None:
-            blksize = int(self.blockdim)
+            blksize = self.blockdim
         if isinstance(blksize, bool) or not isinstance(blksize, (int, np.integer)):
             raise ValueError(f"blksize must be a positive int or None, got {blksize!r}.")
         blksize = int(blksize)
         if blksize <= 0:
             raise ValueError(f"blksize must be positive, got {blksize}.")
+        return blksize
+
+    def get_naoaux(self):
+        self.build()
+        return self._ibp_naoaux
+
+    def loop(self, blksize=None):
+        self.build()
+        # Validate the block size first -- before the zero-rank short circuit --
+        # so an invalid blksize/blockdim is rejected regardless of rank.
+        blksize = self._resolve_blksize(blksize)
+        naoaux = self._ibp_naoaux
+        if naoaux == 0:
+            return
         W = self._ibp_factor
         P = self._ibp_pair
         for start in range(0, naoaux, blksize):
@@ -262,10 +337,23 @@ class IBPISDF(DF):
 
     # -- build pipeline ------------------------------------------------------
 
-    def _ibp_build(self):
+    def _provider_provenance(self, mol_digest):
+        """One closed provenance record identifying exactly which molecule,
+        configuration, adapter, and PySCF produced the artifacts. It is bound
+        into every downstream artifact so the identity travels with the data."""
+        return {
+            "provider": "IBPISDF",
+            "adapter_version": _IBPISDF_VERSION,
+            "metric": _IBPISDF_METRIC,
+            "mol_digest": mol_digest,
+            "config_spec_sha256": self._config.config_spec_sha256,
+            "pyscf_version": str(pyscf.__version__),
+        }
+
+    def _ibp_build(self, mol_digest):
         cfg = self._config
         mol = self.mol
-        mol_digest = _canonical_molecule_digest(mol)
+        provenance = self._provider_provenance(mol_digest)
 
         # Realized atom grid.
         from pyscf.dft import gen_grid
@@ -284,7 +372,10 @@ class IBPISDF(DF):
 
         grid = build_ibp_grid(
             coords, weights,
-            construction_metadata={"source": "pyscf_atom_grid", "grid_level": cfg.grid_level},
+            construction_metadata={
+                "source": "pyscf_atom_grid", "grid_level": cfg.grid_level,
+                "provider_provenance": provenance,
+            },
         )
 
         # Canonical pivot selection uses the WEIGHTED AO values; the sector is
@@ -303,10 +394,12 @@ class IBPISDF(DF):
             ao_values, ao_values, ao_gradients, ao_gradients, pivots, grid,
             pivot_provenance=record, same_factor=True,
             grid_batch_size=cfg.grid_batch_size,
+            upstream_provenance=provenance,
         )
         plan = build_ibp_operator_plan(
             grid, method="direct",
             eval_block_size=cfg.eval_block_size, source_block_size=cfg.source_block_size,
+            upstream_provenance=provenance,
         )
         # Same-sector, two-sided-averaged core. ibp_core hard-fails a materially
         # indefinite core; a within-band PSD factor is produced here.
@@ -314,6 +407,7 @@ class IBPISDF(DF):
             sector, operator=plan, symmetry_mode="two_sided_average",
             mu_block_size=cfg.core_mu_block_size, nu_block_size=cfg.core_nu_block_size,
             psd_rtol=cfg.psd_rtol,
+            upstream_provenance=provenance,
         )
 
         # Gates: the packed AO-pair metric must be Hermitian to tolerance and
@@ -339,5 +433,6 @@ class IBPISDF(DF):
         self._ibp_factor = core.psd_factor            # W
         self._ibp_pair = sector.P                      # P
         self._ibp_naoaux = int(core.psd_retained_rank)
+        self._ibp_provenance = provenance
         self._ibp_mol_digest = mol_digest
         self._ibp_built = True

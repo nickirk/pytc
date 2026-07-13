@@ -10,6 +10,7 @@ The shared prepared normal-equation solver is JAX-backed and refuses to
 downcast, so x64 must be enabled before any sector build.
 """
 
+import io
 import os
 import types
 import unittest
@@ -22,7 +23,11 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from pyscf import gto
 
-from pytc.df.ibp_pyscf import IBPISDF, IBPISDFConfig
+from pytc.df.ibp_pyscf import (
+    IBPISDF,
+    IBPISDFConfig,
+    _canonical_molecule_digest,
+)
 
 
 def _h2():
@@ -95,6 +100,13 @@ class TestIBPISDFConfig(unittest.TestCase):
         IBPISDFConfig(rank=4, psd_rtol=0.0, grid_batch_size=None,
                       core_mu_block_size=None, core_nu_block_size=None)
 
+    def test_pivot_effective_rank_rtol_open_unit_interval(self):
+        # The selector contract is 0 < rtol < 1; anything outside is rejected.
+        IBPISDFConfig(rank=4, pivot_effective_rank_rtol=0.5)
+        for bad in (0.0, 1.0, 2.0, -0.1, True):
+            with self.assertRaises(ValueError):
+                IBPISDFConfig(rank=4, pivot_effective_rank_rtol=bad)
+
 
 class TestIBPISDFConstruction(unittest.TestCase):
     def test_config_xor_direct_knobs(self):
@@ -128,6 +140,9 @@ class TestIBPISDFStreaming(unittest.TestCase):
         p._ibp_factor = W
         p._ibp_pair = P
         p._ibp_naoaux = int(W.shape[1])
+        # Match the current molecule identity so build()'s idempotent identity
+        # guard treats this injected cache as a valid built state.
+        p._ibp_mol_digest = _canonical_molecule_digest(p.mol)
         p._ibp_built = True
 
     def test_loop_yields_W_dagger_P_in_blocks(self):
@@ -165,6 +180,23 @@ class TestIBPISDFStreaming(unittest.TestCase):
         self.assertEqual(p.get_naoaux(), 0)
         self.assertEqual(list(p.loop()), [])
 
+    def test_zero_naoaux_still_validates_blksize(self):
+        # The block size must be validated BEFORE the zero-rank short circuit,
+        # so an invalid blksize is rejected even when there is nothing to yield.
+        p = IBPISDF(_h2(), rank=3)
+        self._inject(p, np.zeros((5, 0)), np.zeros((5, 4)))
+        for bad in (False, 0, -1, 2.5):
+            with self.assertRaises(ValueError):
+                list(p.loop(blksize=bad))
+
+    def test_corrupt_default_blockdim_is_rejected(self):
+        # An invalid default blockdim must not be silently coerced to int.
+        p = IBPISDF(_h2(), rank=3)
+        self._inject(p, np.zeros((5, 0)), np.zeros((5, 4)))
+        p.blockdim = True
+        with self.assertRaises(ValueError):
+            list(p.loop())
+
 
 class TestIBPISDFLifecycle(unittest.TestCase):
     def _mark_built(self, p):
@@ -182,6 +214,20 @@ class TestIBPISDFLifecycle(unittest.TestCase):
         self.assertEqual(q.config.config_spec_sha256, p.config.config_spec_sha256)
         # mutating the copy's cache does not touch the original
         self.assertTrue(p._ibp_built)
+
+    def test_copy_preserves_pyscf_runtime_settings(self):
+        p = IBPISDF(_h2(), rank=3, grid_level=1)
+        marker = io.StringIO()
+        p.blockdim = 7
+        p.max_memory = 123
+        p.verbose = 5
+        p.stdout = marker
+        q = p.copy()
+        self.assertEqual(q.blockdim, 7)
+        self.assertEqual(q.max_memory, 123)
+        self.assertEqual(q.verbose, 5)
+        self.assertIs(q.stdout, marker)
+        self.assertFalse(q._ibp_built)  # runtime preserved, build cache not
 
     def test_reset_clears_built_state(self):
         p = IBPISDF(_h2(), rank=3)
@@ -232,6 +278,78 @@ class TestIBPISDFBuildGates(unittest.TestCase):
                 p.build()
         self.assertFalse(p._ibp_built)
         self.assertIsNone(p._ibp_factor)
+
+
+class TestMoleculeDigest(unittest.TestCase):
+    """The molecule identity must be canonical (no repr) and complete."""
+
+    def test_cart_vs_spherical_distinguished(self):
+        # Alice's repro: C/cc-pVDZ spherical (14 AO) vs Cartesian (15 AO) must
+        # not share a digest even though the requested basis name is identical.
+        sph = gto.M(atom="C 0 0 0", basis="cc-pvdz", spin=2, verbose=0)
+        cart = gto.M(atom="C 0 0 0", basis="cc-pvdz", spin=2, cart=True, verbose=0)
+        self.assertNotEqual(sph.nao, cart.nao)
+        self.assertNotEqual(
+            _canonical_molecule_digest(sph), _canonical_molecule_digest(cart)
+        )
+
+    def test_geometry_basis_charge_spin_distinguished(self):
+        base = _canonical_molecule_digest(_h2())
+        moved = _canonical_molecule_digest(
+            gto.M(atom="H 0 0 0; H 0 0 0.90", basis="sto-3g", verbose=0)
+        )
+        rebased = _canonical_molecule_digest(
+            gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        )
+        self.assertNotEqual(base, moved)
+        self.assertNotEqual(base, rebased)
+
+    def test_digest_is_reproducible(self):
+        self.assertEqual(_canonical_molecule_digest(_h2()),
+                         _canonical_molecule_digest(_h2()))
+
+
+class TestIBPISDFProvenanceBinding(unittest.TestCase):
+    def test_provider_provenance_bound_in_every_artifact(self):
+        p = IBPISDF(_h2(), rank=3, grid_level=1)
+        p.build()
+        prov = p.provenance
+        self.assertEqual(
+            sorted(prov),
+            ["adapter_version", "config_spec_sha256", "metric", "mol_digest",
+             "provider", "pyscf_version"],
+        )
+        self.assertEqual(prov["mol_digest"], _canonical_molecule_digest(p.mol))
+        self.assertEqual(prov["config_spec_sha256"], p.config.config_spec_sha256)
+        # The same closed record travels through grid, sector, plan, and core.
+        self.assertEqual(
+            p._ibp_grid.construction_metadata["provider_provenance"]["mol_digest"],
+            prov["mol_digest"],
+        )
+        for artifact in (p._ibp_sector, p._ibp_plan, p._ibp_core):
+            bound = artifact.provenance["upstream_provenance"]
+            self.assertEqual(bound["mol_digest"], prov["mol_digest"])
+            self.assertEqual(bound["config_spec_sha256"], prov["config_spec_sha256"])
+            self.assertEqual(bound["adapter_version"], prov["adapter_version"])
+
+
+class TestIBPISDFStaleMolecule(unittest.TestCase):
+    def test_inplace_geometry_mutation_after_build_is_rejected(self):
+        p = IBPISDF(_h2(), rank=3, grid_level=1)
+        p.build()
+        p.mol.set_geom_("H 0 0 0; H 0 0 0.90")
+        for access in (p.build, p.get_naoaux, lambda: list(p.loop())):
+            with self.assertRaises(RuntimeError):
+                access()
+
+    def test_reset_then_rebuild_after_mutation_succeeds(self):
+        p = IBPISDF(_h2(), rank=3, grid_level=1)
+        p.build()
+        p.mol.set_geom_("H 0 0 0; H 0 0 0.90")
+        p.reset()
+        p.build()  # clean rebuild on the new geometry
+        self.assertTrue(p._ibp_built)
+        self.assertEqual(p.provenance["mol_digest"], _canonical_molecule_digest(p.mol))
 
 
 class TestIBPISDFPhysicalBuild(unittest.TestCase):
