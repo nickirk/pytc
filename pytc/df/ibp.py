@@ -25,6 +25,7 @@ import hashlib
 import math
 import time
 import types
+import typing
 
 import jax
 import jax.numpy as jnp
@@ -1511,6 +1512,98 @@ def build_ibp_interpolation_sector(
 
 _IBP_CORE_VERSION = "1"
 _SUPPORTED_IBP_CORE_SYMMETRY_MODES = ("two_sided_average", "one_sided")
+_SUPPORTED_PEAK_HOST_BYTES_STATUS = ("unmeasured_cpu_oracle",)
+_DEFAULT_PSD_RTOL = 1e-10
+
+
+def _normalized_frobenius_residual(a, b):
+    """||a - b||_F / ||a||_F with the 0/0 -> 0 convention, so a residual on
+    an all-zero reference reads as exact (0) rather than nan."""
+    denom = float(np.linalg.norm(a))
+    if denom == 0.0:
+        return 0.0
+    return float(np.linalg.norm(a - b)) / denom
+
+
+class PSDFactorization(typing.NamedTuple):
+    """Result of psd_factorize: the compact Hermitian PSD factor plus the
+    mandatory diagnostics. Immutable; task #8 (AO-pair provider) reuses this
+    same helper on Z_AO rather than re-deriving the gate."""
+    factor: object                    # W, shape (n, retained_rank), read-only
+    factor_sha256: str
+    rtol: float
+    raw_min_eigenvalue: float
+    spectral_scale: float
+    negative_mode_count: int
+    clipped_mode_count: int
+    clipped_absolute_weight: float
+    retained_rank: int
+    reconstruction_residual: float
+
+
+def psd_factorize(z_hermitian, *, rtol=_DEFAULT_PSD_RTOL):
+    """Factor a Hermitian core Z_H ~= W W^dagger within a roundoff band.
+
+    Diagonalizes Z_H, HARD-FAILS if any eigenvalue is below
+    ``-rtol * max|eig|`` (a material negative mode is a discretization
+    failure and must never be silently repaired), clips only the negative
+    modes that lie inside the roundoff band to zero, and forms the COMPACT
+    factor ``W = U[:, positive] sqrt(lambda_clipped[positive])`` with no
+    zero columns (so W.shape[1] is the retained rank task #8 streams).
+
+    Assumes Z_H is Hermitian (numpy.linalg.eigh reads the lower triangle);
+    the caller passes the two-sided-averaged same-sector core, which is
+    Hermitian by construction. Zero Z_H yields scale/tolerance/residual 0,
+    retained rank 0, and W.shape == (n, 0)."""
+    Z = np.asarray(z_hermitian)
+    if Z.ndim != 2 or Z.shape[0] != Z.shape[1]:
+        raise ValueError(f"psd_factorize requires a square 2-D array, got shape {Z.shape}.")
+    if not np.all(np.isfinite(Z)):
+        raise ValueError("psd_factorize: Z_H has non-finite entries.")
+    rtol = float(rtol)
+    if not math.isfinite(rtol) or rtol < 0.0:
+        raise ValueError(f"psd_factorize: rtol must be a finite non-negative float, got {rtol!r}.")
+
+    eigvals, eigvecs = np.linalg.eigh(Z)  # ascending real eigenvalues
+    spectral_scale = float(np.max(np.abs(eigvals))) if eigvals.size else 0.0
+    raw_min_eigenvalue = float(eigvals[0]) if eigvals.size else 0.0
+    threshold = -rtol * spectral_scale
+
+    if np.any(eigvals < threshold):
+        offending = float(eigvals[eigvals < threshold].min())
+        raise ValueError(
+            f"psd_factorize: material negative eigenvalue {offending!r} is below the "
+            f"roundoff band threshold {threshold!r} (rtol={rtol!r}, spectral_scale="
+            f"{spectral_scale!r}); a materially indefinite core is a hard compatibility "
+            f"failure and is never repaired by clipping."
+        )
+
+    negative = eigvals < 0.0
+    negative_mode_count = int(np.count_nonzero(negative))
+    clipped_absolute_weight = (
+        float(np.sum(np.abs(eigvals[negative]))) if negative_mode_count else 0.0
+    )
+    lambda_clipped = np.where(negative, 0.0, eigvals)
+    positive = lambda_clipped > 0.0
+    retained_rank = int(np.count_nonzero(positive))
+    W = eigvecs[:, positive] * np.sqrt(lambda_clipped[positive])[None, :]
+    W = _readonly_copy(W)
+
+    reconstruction = W @ W.conj().T
+    reconstruction_residual = _normalized_frobenius_residual(Z, reconstruction)
+
+    return PSDFactorization(
+        factor=W,
+        factor_sha256=_canonical_sha256(W),
+        rtol=rtol,
+        raw_min_eigenvalue=raw_min_eigenvalue,
+        spectral_scale=spectral_scale,
+        negative_mode_count=negative_mode_count,
+        clipped_mode_count=negative_mode_count,  # every negative here is within-band
+        clipped_absolute_weight=clipped_absolute_weight,
+        retained_rank=retained_rank,
+        reconstruction_residual=reconstruction_residual,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1555,10 +1648,28 @@ class IBPCoreArtifact:
     symmetry_mode: str
     z_forward_one_sided: object
     z_reverse_one_sided: object
+    z_sha256: str
+    z_forward_sha256: str
+    z_reverse_sha256: object
     raw_dagger_residual: float
+    raw_packed_pair_metric_dagger_residual: object
     coincident_pairs: int
     n_mu: int
     n_nu: int
+    # PSD factorization (task #7): populated only for a same-sector,
+    # two-sided-averaged (Hermitian) core; psd_status="not_applicable" with
+    # every psd_* field None for cross-sector or one-sided artifacts.
+    psd_status: str
+    psd_rtol: object
+    psd_factor: object
+    psd_factor_sha256: object
+    psd_raw_min_eigenvalue: object
+    psd_spectral_scale: object
+    psd_negative_mode_count: object
+    psd_clipped_mode_count: object
+    psd_clipped_absolute_weight: object
+    psd_retained_rank: object
+    psd_reconstruction_residual: object
     left_sector_spec_sha256: str
     right_sector_spec_sha256: str
     operator_spec_sha256: str
@@ -1569,6 +1680,7 @@ class IBPCoreArtifact:
     realized_dtype: str
     build_wall_time_seconds: float
     peak_host_bytes: object
+    peak_host_bytes_status: str
     solver_version: str
     provenance: object
     core_spec_sha256: str
@@ -1632,13 +1744,22 @@ class IBPCoreArtifact:
                 )
             dagger = self.z_reverse_one_sided.conj().T
 
-        recomputed_residual = float(np.max(np.abs(self.z_forward_one_sided - dagger)))
+        if not np.all(np.isfinite(self.z_forward_one_sided)):
+            raise ValueError("z_forward_one_sided has non-finite entries.")
+        if self.z_reverse_one_sided is not None and not np.all(
+            np.isfinite(self.z_reverse_one_sided)
+        ):
+            raise ValueError("z_reverse_one_sided has non-finite entries.")
+        if not np.all(np.isfinite(self.Z)):
+            raise ValueError("Z has non-finite entries.")
+
+        recomputed_residual = _normalized_frobenius_residual(self.z_forward_one_sided, dagger)
         if not math.isclose(self.raw_dagger_residual, recomputed_residual,
                             rel_tol=1e-9, abs_tol=1e-14):
             raise ValueError(
                 f"raw_dagger_residual={self.raw_dagger_residual!r} does not match the "
-                f"value recomputed from the artifact's own raw orientation(s) "
-                f"({recomputed_residual!r})."
+                f"normalized-Frobenius value recomputed from the artifact's own raw "
+                f"orientation(s) ({recomputed_residual!r})."
             )
 
         expected_Z = (
@@ -1650,6 +1771,51 @@ class IBPCoreArtifact:
                 "Z does not match the value recomputed from this artifact's own raw "
                 "orientation(s) and symmetry_mode."
             )
+
+        # Bind array CONTENT into the spec: recomputing Z from the raw
+        # orientation(s) keeps a coherent multi-array sign flip self-consistent,
+        # so a scalar-only digest cannot detect it -- only hashing the bytes can.
+        for name in ("z_sha256", "z_forward_sha256"):
+            _validate_sha256_hex(name, getattr(self, name))
+        recomputed_z_sha = _canonical_sha256(self.Z)
+        if self.z_sha256 != recomputed_z_sha:
+            raise ValueError("z_sha256 does not match the digest recomputed from Z's bytes.")
+        recomputed_zf_sha = _canonical_sha256(self.z_forward_one_sided)
+        if self.z_forward_sha256 != recomputed_zf_sha:
+            raise ValueError(
+                "z_forward_sha256 does not match the digest recomputed from "
+                "z_forward_one_sided's bytes."
+            )
+        if self.same_sector:
+            if self.z_reverse_sha256 is not None:
+                raise ValueError("z_reverse_sha256 must be None for same_sector=True.")
+        else:
+            _validate_sha256_hex("z_reverse_sha256", self.z_reverse_sha256)
+            recomputed_zr_sha = _canonical_sha256(self.z_reverse_one_sided)
+            if self.z_reverse_sha256 != recomputed_zr_sha:
+                raise ValueError(
+                    "z_reverse_sha256 does not match the digest recomputed from "
+                    "z_reverse_one_sided's bytes."
+                )
+
+        # Production-facing packed-pair metric dagger residual: same-sector
+        # only (cross cores are not square/Hermitian in pair space); recorded,
+        # not recomputed here, because the sector P is not carried on the core.
+        if self.same_sector:
+            if self.raw_packed_pair_metric_dagger_residual is None:
+                raise ValueError(
+                    "raw_packed_pair_metric_dagger_residual is required for same_sector=True."
+                )
+            _validate_nonnegative_finite(
+                "raw_packed_pair_metric_dagger_residual",
+                self.raw_packed_pair_metric_dagger_residual,
+            )
+        elif self.raw_packed_pair_metric_dagger_residual is not None:
+            raise ValueError(
+                "raw_packed_pair_metric_dagger_residual must be None for cross-sector cores."
+            )
+
+        self._validate_psd_fields()
 
         if isinstance(self.coincident_pairs, bool) or not isinstance(self.coincident_pairs, int):
             raise ValueError(f"coincident_pairs must be a non-negative int, got {self.coincident_pairs!r}.")
@@ -1687,6 +1853,16 @@ class IBPCoreArtifact:
                 raise ValueError(
                     f"peak_host_bytes must be non-negative, got {self.peak_host_bytes!r}."
                 )
+        if self.peak_host_bytes_status not in _SUPPORTED_PEAK_HOST_BYTES_STATUS:
+            raise ValueError(
+                f"peak_host_bytes_status={self.peak_host_bytes_status!r} must be one of "
+                f"{_SUPPORTED_PEAK_HOST_BYTES_STATUS}."
+            )
+        if self.peak_host_bytes_status == "unmeasured_cpu_oracle" and self.peak_host_bytes is not None:
+            raise ValueError(
+                "peak_host_bytes must be None when peak_host_bytes_status is "
+                "'unmeasured_cpu_oracle'."
+            )
 
         if self.solver_version != _IBP_CORE_VERSION:
             raise ValueError(f"solver_version={self.solver_version!r} != {_IBP_CORE_VERSION!r}.")
@@ -1697,8 +1873,20 @@ class IBPCoreArtifact:
 
         recomputed_spec = _canonical_spec_sha256({
             "same_sector": self.same_sector, "symmetry_mode": self.symmetry_mode,
+            "z_sha256": self.z_sha256, "z_forward_sha256": self.z_forward_sha256,
+            "z_reverse_sha256": self.z_reverse_sha256,
             "raw_dagger_residual": self.raw_dagger_residual,
+            "raw_packed_pair_metric_dagger_residual": self.raw_packed_pair_metric_dagger_residual,
             "coincident_pairs": self.coincident_pairs, "n_mu": n_mu, "n_nu": n_nu,
+            "psd_status": self.psd_status, "psd_rtol": self.psd_rtol,
+            "psd_factor_sha256": self.psd_factor_sha256,
+            "psd_raw_min_eigenvalue": self.psd_raw_min_eigenvalue,
+            "psd_spectral_scale": self.psd_spectral_scale,
+            "psd_negative_mode_count": self.psd_negative_mode_count,
+            "psd_clipped_mode_count": self.psd_clipped_mode_count,
+            "psd_clipped_absolute_weight": self.psd_clipped_absolute_weight,
+            "psd_retained_rank": self.psd_retained_rank,
+            "psd_reconstruction_residual": self.psd_reconstruction_residual,
             "left_sector_spec_sha256": self.left_sector_spec_sha256,
             "right_sector_spec_sha256": self.right_sector_spec_sha256,
             "operator_spec_sha256": self.operator_spec_sha256,
@@ -1707,6 +1895,7 @@ class IBPCoreArtifact:
             "realized_dtype": self.realized_dtype,
             "build_wall_time_seconds": build_wall_time_seconds,
             "peak_host_bytes": self.peak_host_bytes,
+            "peak_host_bytes_status": self.peak_host_bytes_status,
             "solver_version": self.solver_version, "provenance": self.provenance,
         })
         if recomputed_spec != self.core_spec_sha256:
@@ -1714,6 +1903,95 @@ class IBPCoreArtifact:
                 "core_spec_sha256 does not match the canonical digest recomputed from "
                 "this artifact's own declared fields."
             )
+
+    def _validate_psd_fields(self):
+        """Close the PSD factorization fields. For a factorized (same-sector,
+        two-sided) core, RECOMPUTE the whole factorization from this
+        artifact's own Z and require the stored factor/diagnostics to match
+        exactly -- so a tampered Z (or tampered PSD field) is rejected, and a
+        Z edited to be materially indefinite hard-fails here just as it would
+        in the builder. For every other core, enforce the all-None invariant."""
+        psd_scalar_fields = (
+            "psd_rtol", "psd_factor", "psd_factor_sha256", "psd_raw_min_eigenvalue",
+            "psd_spectral_scale", "psd_negative_mode_count", "psd_clipped_mode_count",
+            "psd_clipped_absolute_weight", "psd_retained_rank", "psd_reconstruction_residual",
+        )
+        applicable = self.same_sector and self.symmetry_mode == "two_sided_average"
+        if self.psd_status == "not_applicable":
+            if applicable:
+                raise ValueError(
+                    "psd_status='not_applicable' is invalid for a same-sector, "
+                    "two-sided-averaged core, which must be factorized."
+                )
+            for name in psd_scalar_fields:
+                if getattr(self, name) is not None:
+                    raise ValueError(
+                        f"{name} must be None when psd_status='not_applicable'."
+                    )
+            return
+        if self.psd_status != "factorized":
+            raise ValueError(
+                f"psd_status={self.psd_status!r} must be 'factorized' or 'not_applicable'."
+            )
+        if not applicable:
+            raise ValueError(
+                "psd_status='factorized' is only valid for a same-sector, "
+                "two-sided-averaged core."
+            )
+        if not isinstance(self.psd_factor, np.ndarray):
+            raise TypeError("psd_factor must be a numpy.ndarray for a factorized core.")
+        object.__setattr__(self, "psd_factor", _readonly_copy(self.psd_factor))
+        if not np.all(np.isfinite(self.psd_factor)):
+            raise ValueError("psd_factor has non-finite entries.")
+        _validate_sha256_hex("psd_factor_sha256", self.psd_factor_sha256)
+        if (isinstance(self.psd_rtol, bool) or not isinstance(self.psd_rtol, float)
+                or not math.isfinite(self.psd_rtol) or self.psd_rtol < 0.0):
+            raise ValueError(
+                f"psd_rtol must be a finite non-negative float for a factorized core, "
+                f"got {self.psd_rtol!r}."
+            )
+
+        recomputed = psd_factorize(self.Z, rtol=self.psd_rtol)
+        if recomputed.factor.shape != self.psd_factor.shape:
+            raise ValueError(
+                f"psd_factor.shape {self.psd_factor.shape} does not match the factor "
+                f"recomputed from Z ({recomputed.factor.shape})."
+            )
+        if self.psd_factor_sha256 != recomputed.factor_sha256:
+            raise ValueError(
+                "psd_factor_sha256 does not match the factor recomputed from this "
+                "artifact's own Z and psd_rtol."
+            )
+        checks = {
+            "psd_rtol": recomputed.rtol,
+            "psd_raw_min_eigenvalue": recomputed.raw_min_eigenvalue,
+            "psd_spectral_scale": recomputed.spectral_scale,
+            "psd_clipped_absolute_weight": recomputed.clipped_absolute_weight,
+            "psd_reconstruction_residual": recomputed.reconstruction_residual,
+        }
+        for name, expected in checks.items():
+            actual = getattr(self, name)
+            if not isinstance(actual, float) or not math.isfinite(actual):
+                raise ValueError(f"{name} must be a finite float, got {actual!r}.")
+            if not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-15):
+                raise ValueError(
+                    f"{name}={actual!r} does not match the value recomputed from Z "
+                    f"({expected!r})."
+                )
+        int_checks = {
+            "psd_negative_mode_count": recomputed.negative_mode_count,
+            "psd_clipped_mode_count": recomputed.clipped_mode_count,
+            "psd_retained_rank": recomputed.retained_rank,
+        }
+        for name, expected in int_checks.items():
+            actual = getattr(self, name)
+            if isinstance(actual, bool) or not isinstance(actual, int) or actual < 0:
+                raise ValueError(f"{name} must be a non-negative int, got {actual!r}.")
+            if actual != expected:
+                raise ValueError(
+                    f"{name}={actual!r} does not match the value recomputed from Z "
+                    f"({expected!r})."
+                )
 
 
 def _ibp_one_sided_block(grad_theta_source, theta_source, grid, *,
@@ -1748,7 +2026,8 @@ def _ibp_one_sided_block(grad_theta_source, theta_source, grid, *,
 
 
 def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
-             mu_block_size=None, nu_block_size=None, upstream_provenance=None):
+             mu_block_size=None, nu_block_size=None, psd_rtol=_DEFAULT_PSD_RTOL,
+             upstream_provenance=None):
     """Build an IBPCoreArtifact from one (same-sector) or two (cross-sector)
     IBPInterpolationSector artifacts, via this module's own kernel()
     primitive applied to sector Theta/grad_Theta arrays.
@@ -1813,12 +2092,15 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
 
     n_mu = left.selected_rank
     n_nu = right_sector.selected_rank
+    # Clamp the requested pivot block to the realized rank: a block larger
+    # than the rank produces exactly one rank-sized block, so recording the
+    # oversized request would misreport the realized tiling.
     mu_block = (
-        _validate_positive_int("mu_block_size", mu_block_size)
+        min(_validate_positive_int("mu_block_size", mu_block_size), n_mu)
         if mu_block_size is not None else n_mu
     )
     nu_block = (
-        _validate_positive_int("nu_block_size", nu_block_size)
+        min(_validate_positive_int("nu_block_size", nu_block_size), n_nu)
         if nu_block_size is not None else n_nu
     )
 
@@ -1846,14 +2128,69 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         dagger = z_reverse.conj().T
     build_wall_time_seconds = time.perf_counter() - start
 
-    raw_dagger_residual = float(np.max(np.abs(z_forward - dagger)))
+    # Reject non-finite raw orientations immediately after assembly, before any
+    # norm/eigendecomposition would otherwise propagate nan/inf silently.
+    if not np.all(np.isfinite(z_forward)):
+        raise ValueError("ibp_core: z_forward one-sided orientation has non-finite entries.")
+    if z_reverse is not None and not np.all(np.isfinite(z_reverse)):
+        raise ValueError("ibp_core: z_reverse one-sided orientation has non-finite entries.")
+
+    raw_dagger_residual = _normalized_frobenius_residual(z_forward, dagger)
     Z = z_forward if symmetry_mode == "one_sided" else (z_forward + dagger) / 2
 
-    try:
-        import resource
-        peak_host_bytes = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
-    except (ImportError, AttributeError):
-        peak_host_bytes = None
+    # Production-facing packed-pair metric dagger residual (same-sector only):
+    # project the raw one-sided core back to the packed AO-pair space through
+    # the sector's interpolation matrix P (shape (rank, packed_pair)) and
+    # measure that pair metric's departure from Hermiticity -- this is the
+    # quantity task #8's <=1e-3 gate is stated against.
+    if same_sector:
+        P = left.P
+        m_raw = P.conj().T @ z_forward @ P
+        raw_packed_pair_metric_dagger_residual = _normalized_frobenius_residual(
+            m_raw, m_raw.conj().T
+        )
+    else:
+        raw_packed_pair_metric_dagger_residual = None
+
+    # PSD factorization: only for a same-sector, two-sided-averaged (Hermitian)
+    # core. The corrective factor is the one task #8 will stream; material
+    # negative modes hard-fail here rather than being repaired.
+    if same_sector and symmetry_mode == "two_sided_average":
+        psd = psd_factorize(Z, rtol=psd_rtol)
+        psd_status = "factorized"
+        psd_rtol_value = psd.rtol
+        psd_factor = psd.factor
+        psd_factor_sha256 = psd.factor_sha256
+        psd_raw_min_eigenvalue = psd.raw_min_eigenvalue
+        psd_spectral_scale = psd.spectral_scale
+        psd_negative_mode_count = psd.negative_mode_count
+        psd_clipped_mode_count = psd.clipped_mode_count
+        psd_clipped_absolute_weight = psd.clipped_absolute_weight
+        psd_retained_rank = psd.retained_rank
+        psd_reconstruction_residual = psd.reconstruction_residual
+    else:
+        psd_status = "not_applicable"
+        psd_rtol_value = None
+        psd_factor = None
+        psd_factor_sha256 = None
+        psd_raw_min_eigenvalue = None
+        psd_spectral_scale = None
+        psd_negative_mode_count = None
+        psd_clipped_mode_count = None
+        psd_clipped_absolute_weight = None
+        psd_retained_rank = None
+        psd_reconstruction_residual = None
+
+    z_sha256 = _canonical_sha256(Z)
+    z_forward_sha256 = _canonical_sha256(z_forward)
+    z_reverse_sha256 = None if same_sector else _canonical_sha256(z_reverse)
+
+    # A truthful build-scoped host-memory peak is not available for this
+    # NumPy CPU oracle (ru_maxrss is process-lifetime and already-bytes on
+    # macOS; tracemalloc misses NumPy's C-level allocations). Record an
+    # explicit measured-absence rather than a misleading number.
+    peak_host_bytes = None
+    peak_host_bytes_status = "unmeasured_cpu_oracle"
 
     upstream = dict(upstream_provenance) if upstream_provenance else {}
     provenance = _deep_freeze({
@@ -1866,8 +2203,20 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     realized_dtype = str(Z.dtype)
     spec_fields = {
         "same_sector": same_sector, "symmetry_mode": symmetry_mode,
+        "z_sha256": z_sha256, "z_forward_sha256": z_forward_sha256,
+        "z_reverse_sha256": z_reverse_sha256,
         "raw_dagger_residual": raw_dagger_residual,
+        "raw_packed_pair_metric_dagger_residual": raw_packed_pair_metric_dagger_residual,
         "coincident_pairs": coincident_pairs, "n_mu": n_mu, "n_nu": n_nu,
+        "psd_status": psd_status, "psd_rtol": psd_rtol_value,
+        "psd_factor_sha256": psd_factor_sha256,
+        "psd_raw_min_eigenvalue": psd_raw_min_eigenvalue,
+        "psd_spectral_scale": psd_spectral_scale,
+        "psd_negative_mode_count": psd_negative_mode_count,
+        "psd_clipped_mode_count": psd_clipped_mode_count,
+        "psd_clipped_absolute_weight": psd_clipped_absolute_weight,
+        "psd_retained_rank": psd_retained_rank,
+        "psd_reconstruction_residual": psd_reconstruction_residual,
         "left_sector_spec_sha256": left.sector_spec_sha256,
         "right_sector_spec_sha256": right_sector.sector_spec_sha256,
         "operator_spec_sha256": operator.operator_spec_sha256,
@@ -1875,6 +2224,7 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         "backend": "numpy", "device": "cpu", "realized_dtype": realized_dtype,
         "build_wall_time_seconds": build_wall_time_seconds,
         "peak_host_bytes": peak_host_bytes,
+        "peak_host_bytes_status": peak_host_bytes_status,
         "solver_version": _IBP_CORE_VERSION, "provenance": provenance,
     }
     core_spec_sha256 = _canonical_spec_sha256(spec_fields)
@@ -1882,14 +2232,28 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     return IBPCoreArtifact(
         Z=Z, same_sector=same_sector, symmetry_mode=symmetry_mode,
         z_forward_one_sided=z_forward, z_reverse_one_sided=z_reverse,
-        raw_dagger_residual=raw_dagger_residual, coincident_pairs=coincident_pairs,
+        z_sha256=z_sha256, z_forward_sha256=z_forward_sha256,
+        z_reverse_sha256=z_reverse_sha256,
+        raw_dagger_residual=raw_dagger_residual,
+        raw_packed_pair_metric_dagger_residual=raw_packed_pair_metric_dagger_residual,
+        coincident_pairs=coincident_pairs,
         n_mu=n_mu, n_nu=n_nu,
+        psd_status=psd_status, psd_rtol=psd_rtol_value,
+        psd_factor=psd_factor, psd_factor_sha256=psd_factor_sha256,
+        psd_raw_min_eigenvalue=psd_raw_min_eigenvalue,
+        psd_spectral_scale=psd_spectral_scale,
+        psd_negative_mode_count=psd_negative_mode_count,
+        psd_clipped_mode_count=psd_clipped_mode_count,
+        psd_clipped_absolute_weight=psd_clipped_absolute_weight,
+        psd_retained_rank=psd_retained_rank,
+        psd_reconstruction_residual=psd_reconstruction_residual,
         left_sector_spec_sha256=left.sector_spec_sha256,
         right_sector_spec_sha256=right_sector.sector_spec_sha256,
         operator_spec_sha256=operator.operator_spec_sha256,
         mu_block_size=mu_block, nu_block_size=nu_block,
         backend="numpy", device="cpu", realized_dtype=realized_dtype,
         build_wall_time_seconds=build_wall_time_seconds, peak_host_bytes=peak_host_bytes,
+        peak_host_bytes_status=peak_host_bytes_status,
         solver_version=_IBP_CORE_VERSION, provenance=provenance,
         core_spec_sha256=core_spec_sha256,
     )

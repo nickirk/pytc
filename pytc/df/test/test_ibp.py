@@ -30,13 +30,23 @@ from pytc.df.ibp import (
     IBPGrid,
     IBPInterpolationSector,
     IBPOperatorPlan,
+    PSDFactorization,
     build_ibp_grid,
     build_ibp_interpolation_sector,
     build_ibp_operator_plan,
     ibp_core,
     naive_coulomb_kernel,
     kernel,
+    psd_factorize,
 )
+
+
+def _normalized_frobenius_residual_ref(a, b):
+    """Independent reference for ||a-b||_F/||a||_F (0/0 -> 0) so the tests do
+    not verify the module against its own helper."""
+    num = float(np.linalg.norm(np.asarray(a) - np.asarray(b)))
+    den = float(np.linalg.norm(np.asarray(a)))
+    return 0.0 if den == 0.0 else num / den
 
 
 class TestAtomCenteredSingleIBPCore(unittest.TestCase):
@@ -958,6 +968,77 @@ class TestIBPInterpolationSector(unittest.TestCase):
             )
 
 
+class TestPSDFactorize(unittest.TestCase):
+    """Direct unit tests for psd_factorize -- the reusable Hermitian PSD gate
+    (task #8 will call the same helper on Z_AO)."""
+
+    def test_positive_semidefinite_exact_reconstruction(self):
+        # Full-rank PSD (square generator, well-conditioned) so every mode is
+        # genuinely positive -- no numerically-ambiguous null space.
+        for dtype in (np.float64, np.complex128):
+            rng = np.random.default_rng(7)
+            a = rng.normal(size=(6, 6))
+            if np.issubdtype(np.dtype(dtype), np.complexfloating):
+                a = a + 1j * rng.normal(size=(6, 6))
+            z = a @ a.conj().T + 0.5 * np.eye(6)  # PSD, full rank, conditioned
+            result = psd_factorize(z.astype(dtype))
+            self.assertIsInstance(result, PSDFactorization)
+            self.assertEqual(result.negative_mode_count, 0)
+            self.assertEqual(result.clipped_mode_count, 0)
+            self.assertEqual(result.clipped_absolute_weight, 0.0)
+            self.assertEqual(result.retained_rank, 6)
+            self.assertEqual(result.factor.shape, (6, 6))
+            self.assertFalse(result.factor.flags.writeable)
+            recon = result.factor @ result.factor.conj().T
+            np.testing.assert_allclose(recon, z, rtol=1e-10, atol=1e-10)
+            self.assertLess(result.reconstruction_residual, 1e-10)
+
+    def test_roundoff_negative_modes_are_clipped(self):
+        rng = np.random.default_rng(11)
+        u, _ = np.linalg.qr(rng.normal(size=(5, 5)))
+        scale = 1.0
+        eigs = np.array([scale, 0.6 * scale, 0.3 * scale, -1e-13 * scale, -3e-13 * scale])
+        z = (u * eigs) @ u.conj().T
+        z = (z + z.conj().T) / 2
+        result = psd_factorize(z, rtol=1e-10)
+        self.assertEqual(result.negative_mode_count, 2)
+        self.assertEqual(result.clipped_mode_count, 2)
+        self.assertEqual(result.retained_rank, 3)
+        self.assertGreater(result.clipped_absolute_weight, 0.0)
+        self.assertLess(result.clipped_absolute_weight, 1e-12)
+        self.assertEqual(result.factor.shape, (5, 3))
+
+    def test_material_negative_mode_hard_fails(self):
+        rng = np.random.default_rng(13)
+        u, _ = np.linalg.qr(rng.normal(size=(4, 4)))
+        eigs = np.array([1.0, 0.5, 0.2, -1e-4])  # far beyond the roundoff band
+        z = (u * eigs) @ u.conj().T
+        z = (z + z.conj().T) / 2
+        with self.assertRaisesRegex(ValueError, "material negative"):
+            psd_factorize(z, rtol=1e-10)
+
+    def test_zero_core_normalizes_to_zero_rank(self):
+        z = np.zeros((4, 4))
+        result = psd_factorize(z)
+        self.assertEqual(result.spectral_scale, 0.0)
+        self.assertEqual(result.raw_min_eigenvalue, 0.0)
+        self.assertEqual(result.retained_rank, 0)
+        self.assertEqual(result.reconstruction_residual, 0.0)
+        self.assertEqual(result.factor.shape, (4, 0))
+
+    def test_rejects_nonsquare_and_nonfinite(self):
+        with self.assertRaises(ValueError):
+            psd_factorize(np.zeros((3, 4)))
+        z = np.eye(3)
+        z[0, 0] = np.nan
+        with self.assertRaises(ValueError):
+            psd_factorize(z)
+
+    def test_rejects_negative_rtol(self):
+        with self.assertRaises(ValueError):
+            psd_factorize(np.eye(3), rtol=-1e-10)
+
+
 class TestIBPCoreArtifact(unittest.TestCase):
     def _record(self, n_pivots, analytic_bound):
         return {
@@ -1004,21 +1085,25 @@ class TestIBPCoreArtifact(unittest.TestCase):
         return grid, plan, sector_a, sector_b
 
     def test_same_sector_matches_independent_kernel_call(self):
+        # one_sided: the raw quadrature is what this verifies against kernel().
+        # A random nonphysical same-sector core is materially indefinite, so
+        # the production two_sided PSD gate rejects it by design; that path is
+        # covered separately with an injected PSD/indefinite Z.
         for dtype in (np.float64, np.complex128):
             grid, plan, sector_a, _ = self._setup(dtype)
-            core = ibp_core(sector_a, operator=plan)
+            core = ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
             expected_forward, expected_coincident = kernel(
                 sector_a.grad_Theta, sector_a.Theta, grid.coords, grid.weights,
                 eval_block_size=plan.eval_block_size, source_block_size=plan.source_block_size,
             )
             np.testing.assert_allclose(core.z_forward_one_sided, expected_forward, atol=1e-12)
-            expected_Z = (expected_forward + expected_forward.conj().T) / 2
-            np.testing.assert_allclose(core.Z, expected_Z, atol=1e-12)
+            np.testing.assert_allclose(core.Z, expected_forward, atol=1e-12)
             self.assertEqual(core.coincident_pairs, expected_coincident)
             self.assertTrue(core.same_sector)
             self.assertIsNone(core.z_reverse_one_sided)
-            expected_residual = float(
-                np.max(np.abs(expected_forward - expected_forward.conj().T))
+            self.assertEqual(core.psd_status, "not_applicable")
+            expected_residual = _normalized_frobenius_residual_ref(
+                expected_forward, expected_forward.conj().T
             )
             self.assertAlmostEqual(core.raw_dagger_residual, expected_residual, places=10)
 
@@ -1114,23 +1199,124 @@ class TestIBPCoreArtifact(unittest.TestCase):
 
     def test_direct_construction_bypassing_builder_is_still_validated(self):
         _, plan, sector_a, _ = self._setup()
-        core = ibp_core(sector_a, operator=plan)
+        core = ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
         with self.assertRaises(ValueError):
             IBPCoreArtifact(
                 Z=core.Z, same_sector=core.same_sector, symmetry_mode=core.symmetry_mode,
                 z_forward_one_sided=core.z_forward_one_sided,
                 z_reverse_one_sided=core.z_reverse_one_sided,
+                z_sha256=core.z_sha256, z_forward_sha256=core.z_forward_sha256,
+                z_reverse_sha256=core.z_reverse_sha256,
                 raw_dagger_residual=core.raw_dagger_residual,
+                raw_packed_pair_metric_dagger_residual=core.raw_packed_pair_metric_dagger_residual,
                 coincident_pairs=core.coincident_pairs, n_mu=core.n_mu, n_nu=core.n_nu,
+                psd_status=core.psd_status, psd_rtol=core.psd_rtol,
+                psd_factor=core.psd_factor, psd_factor_sha256=core.psd_factor_sha256,
+                psd_raw_min_eigenvalue=core.psd_raw_min_eigenvalue,
+                psd_spectral_scale=core.psd_spectral_scale,
+                psd_negative_mode_count=core.psd_negative_mode_count,
+                psd_clipped_mode_count=core.psd_clipped_mode_count,
+                psd_clipped_absolute_weight=core.psd_clipped_absolute_weight,
+                psd_retained_rank=core.psd_retained_rank,
+                psd_reconstruction_residual=core.psd_reconstruction_residual,
                 left_sector_spec_sha256=core.left_sector_spec_sha256,
                 right_sector_spec_sha256=core.right_sector_spec_sha256,
                 operator_spec_sha256=core.operator_spec_sha256,
                 mu_block_size=core.mu_block_size, nu_block_size=core.nu_block_size,
                 backend=core.backend, device=core.device, realized_dtype=core.realized_dtype,
                 build_wall_time_seconds=core.build_wall_time_seconds,
-                peak_host_bytes=core.peak_host_bytes, solver_version=core.solver_version,
+                peak_host_bytes=core.peak_host_bytes,
+                peak_host_bytes_status=core.peak_host_bytes_status,
+                solver_version=core.solver_version,
                 provenance={}, core_spec_sha256="0" * 64,
             )
+
+    def _hermitian_psd(self, n, seed=3):
+        rng = np.random.default_rng(seed)
+        a = rng.normal(size=(n, n))
+        z = a @ a.conj().T + 0.5 * np.eye(n)  # Hermitian, PSD, full rank
+        return (z + z.conj().T) / 2
+
+    def test_same_sector_two_sided_psd_factorization_is_wired(self):
+        # Inject a known Hermitian PSD Z so the ibp_core two-sided path is
+        # exercised end to end without a full physical grid. Non-circular:
+        # psd_factorize has its own eigensystem tests and the raw-kernel path
+        # is checked in one-sided mode.
+        _, plan, sector_a, _ = self._setup()
+        n = sector_a.selected_rank
+        z_psd = self._hermitian_psd(n)
+        with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_psd, 2)):
+            core = ibp_core(sector_a, operator=plan)  # two_sided_average default
+        self.assertEqual(core.psd_status, "factorized")
+        self.assertEqual(core.psd_rtol, 1e-10)
+        self.assertEqual(core.psd_negative_mode_count, 0)
+        self.assertEqual(core.psd_retained_rank, n)
+        self.assertEqual(core.psd_factor.shape, (n, n))
+        self.assertFalse(core.psd_factor.flags.writeable)
+        recon = core.psd_factor @ core.psd_factor.conj().T
+        np.testing.assert_allclose(recon, core.Z, atol=1e-10)
+        self.assertLess(core.psd_reconstruction_residual, 1e-10)
+        self.assertIsNotNone(core.raw_packed_pair_metric_dagger_residual)
+        self.assertGreaterEqual(core.raw_packed_pair_metric_dagger_residual, 0.0)
+        self.assertIsNone(core.peak_host_bytes)
+        self.assertEqual(core.peak_host_bytes_status, "unmeasured_cpu_oracle")
+
+    def test_same_sector_material_indefinite_hard_fails_in_builder(self):
+        _, plan, sector_a, _ = self._setup()
+        n = sector_a.selected_rank
+        rng = np.random.default_rng(5)
+        u, _ = np.linalg.qr(rng.normal(size=(n, n)))
+        eigs = np.linspace(1.0, 0.2, n)
+        eigs[-1] = -1e-3  # far outside the roundoff band
+        z_bad = (u * eigs) @ u.conj().T
+        z_bad = (z_bad + z_bad.conj().T) / 2
+        with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_bad, 0)):
+            with self.assertRaisesRegex(ValueError, "material negative"):
+                ibp_core(sector_a, operator=plan)
+
+    def test_cross_and_one_sided_have_psd_not_applicable(self):
+        _, plan, sector_a, sector_b = self._setup()
+        cross = ibp_core(sector_a, sector_b, operator=plan)
+        self.assertEqual(cross.psd_status, "not_applicable")
+        self.assertIsNone(cross.psd_factor)
+        self.assertIsNone(cross.psd_rtol)
+        self.assertIsNone(cross.raw_packed_pair_metric_dagger_residual)
+        one_sided = ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
+        self.assertEqual(one_sided.psd_status, "not_applicable")
+        self.assertIsNone(one_sided.psd_factor)
+
+    def test_coherent_multi_array_tamper_is_rejected(self):
+        # The exact bypass the scalar-only spec allowed: coherently sign-flip
+        # Z and both raw orientations. Internally self-consistent (Z recomputes
+        # from the orientations; the normalized residual is flip-invariant) but
+        # the bound array content hashes reject it. Cross-sector so PSD is n/a
+        # and the content hash is the sole mechanism catching the tamper.
+        grid, plan, sector_a, sector_b = self._setup(np.complex128)
+        core = ibp_core(sector_a, sector_b, operator=plan)
+        with self.assertRaises(ValueError):
+            dataclasses.replace(
+                core, Z=-core.Z,
+                z_forward_one_sided=-core.z_forward_one_sided,
+                z_reverse_one_sided=-core.z_reverse_one_sided,
+            )
+
+    def test_overlarge_block_size_is_clamped_to_rank(self):
+        _, plan, sector_a, _ = self._setup()
+        n = sector_a.selected_rank
+        z_psd = self._hermitian_psd(n)
+        with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_psd, 0)):
+            core = ibp_core(sector_a, operator=plan, mu_block_size=999, nu_block_size=999)
+        self.assertEqual(core.mu_block_size, n)
+        self.assertEqual(core.nu_block_size, n)
+
+    def test_nonfinite_core_is_rejected(self):
+        _, plan, sector_a, _ = self._setup()
+        n = sector_a.selected_rank
+        z_bad = np.array(self._hermitian_psd(n))
+        z_bad[0, 0] = np.inf
+        with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_bad, 0)):
+            with self.assertRaises(ValueError):
+                ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
 
     def test_provenance_references_both_sectors_and_operator(self):
         _, plan, sector_a, sector_b = self._setup()
