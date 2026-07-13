@@ -1038,6 +1038,19 @@ class TestPSDFactorize(unittest.TestCase):
         with self.assertRaises(ValueError):
             psd_factorize(np.eye(3), rtol=-1e-10)
 
+    def test_rejects_non_hermitian_input(self):
+        # eigh reads one triangle, so a non-Hermitian input would otherwise be
+        # "factorized" against its Hermitian completion with a large residual.
+        z = np.array([[1.0, 100.0], [0.0, 1.0]])
+        with self.assertRaisesRegex(ValueError, "not Hermitian"):
+            psd_factorize(z)
+
+    def test_rejects_bool_and_nonfinite_rtol(self):
+        z = np.eye(3)
+        for bad in (True, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                psd_factorize(z, rtol=bad)
+
 
 class TestIBPCoreArtifact(unittest.TestCase):
     def _record(self, n_pivots, analytic_bound):
@@ -1299,6 +1312,28 @@ class TestIBPCoreArtifact(unittest.TestCase):
                 z_forward_one_sided=-core.z_forward_one_sided,
                 z_reverse_one_sided=-core.z_reverse_one_sided,
             )
+
+    def test_stored_psd_factor_tamper_is_rejected(self):
+        _, plan, sector_a, _ = self._setup()
+        n = sector_a.selected_rank
+        z_psd = self._hermitian_psd(n)
+        with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_psd, 0)):
+            core = ibp_core(sector_a, operator=plan)
+        # A pure sign flip leaves W Wᵈ (the reconstruction) unchanged, so only
+        # the stored factor's own content hash catches it.
+        with self.assertRaises(ValueError):
+            dataclasses.replace(core, psd_factor=-core.psd_factor)
+
+    def test_zero_forward_nonzero_reverse_residual_is_rejected(self):
+        _, plan, sector_a, sector_b = self._setup()
+        n_mu = sector_a.selected_rank
+        n_nu = sector_b.selected_rank
+        z_zero = np.zeros((n_mu, n_nu))
+        z_nonzero = np.ones((n_nu, n_mu))
+        with mock.patch("pytc.df.ibp._ibp_one_sided_block",
+                        side_effect=[(z_zero, 0), (z_nonzero, 0)]):
+            with self.assertRaises(ValueError):
+                ibp_core(sector_a, sector_b, operator=plan)
 
     def test_overlarge_block_size_is_clamped_to_rank(self):
         _, plan, sector_a, _ = self._setup()

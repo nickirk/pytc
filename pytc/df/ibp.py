@@ -1514,15 +1514,28 @@ _IBP_CORE_VERSION = "1"
 _SUPPORTED_IBP_CORE_SYMMETRY_MODES = ("two_sided_average", "one_sided")
 _SUPPORTED_PEAK_HOST_BYTES_STATUS = ("unmeasured_cpu_oracle",)
 _DEFAULT_PSD_RTOL = 1e-10
+_PSD_HERMITICITY_TOL = 1e-10
 
 
 def _normalized_frobenius_residual(a, b):
-    """||a - b||_F / ||a||_F with the 0/0 -> 0 convention, so a residual on
-    an all-zero reference reads as exact (0) rather than nan."""
+    """||a - b||_F / ||a||_F. Only 0/0 maps to 0 (an exact all-zero reference);
+    a nonzero difference against a zero-norm reference is undefined and raises
+    rather than being silently reported as exact."""
+    a = np.asarray(a)
+    b = np.asarray(b)
+    numerator = float(np.linalg.norm(a - b))
     denom = float(np.linalg.norm(a))
     if denom == 0.0:
-        return 0.0
-    return float(np.linalg.norm(a - b)) / denom
+        if numerator == 0.0:
+            return 0.0
+        raise ValueError(
+            "normalized Frobenius residual is undefined: nonzero difference against a "
+            "zero-norm reference."
+        )
+    result = numerator / denom
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"normalized Frobenius residual is not finite and non-negative: {result!r}.")
+    return result
 
 
 class PSDFactorization(typing.NamedTuple):
@@ -1560,9 +1573,23 @@ def psd_factorize(z_hermitian, *, rtol=_DEFAULT_PSD_RTOL):
         raise ValueError(f"psd_factorize requires a square 2-D array, got shape {Z.shape}.")
     if not np.all(np.isfinite(Z)):
         raise ValueError("psd_factorize: Z_H has non-finite entries.")
+    if isinstance(rtol, bool) or not isinstance(rtol, (int, float, np.integer, np.floating)):
+        raise ValueError(f"psd_factorize: rtol must be a real, non-bool number, got {rtol!r}.")
     rtol = float(rtol)
     if not math.isfinite(rtol) or rtol < 0.0:
         raise ValueError(f"psd_factorize: rtol must be a finite non-negative float, got {rtol!r}.")
+
+    # Hermiticity gate: eigh reads only one triangle, so a non-Hermitian input
+    # would be silently "factorized" against its Hermitian completion. An exact
+    # two-sided-averaged core is Hermitian to roundoff.
+    z_norm = float(np.linalg.norm(Z))
+    if z_norm > 0.0:
+        hermiticity_residual = float(np.linalg.norm(Z - Z.conj().T)) / z_norm
+        if hermiticity_residual > _PSD_HERMITICITY_TOL:
+            raise ValueError(
+                f"psd_factorize: input is not Hermitian (residual {hermiticity_residual!r} > "
+                f"{_PSD_HERMITICITY_TOL!r}); PSD factorization requires a Hermitian core."
+            )
 
     eigvals, eigvecs = np.linalg.eigh(Z)  # ascending real eigenvalues
     spectral_scale = float(np.max(np.abs(eigvals))) if eigvals.size else 0.0
@@ -1621,13 +1648,19 @@ class IBPCoreArtifact:
     contract, the raw one-sided orientation(s) and their dagger residual
     are ALWAYS retained regardless of symmetry_mode, so quadrature bias can
     never be silently hidden behind an averaged production Z:
+    raw_dagger_residual is the NORMALIZED Frobenius residual
+    ||z_forward - dagger||_F / ||z_forward||_F (0/0 -> 0):
     - same-sector: z_forward_one_sided is the sole raw computation;
       z_reverse_one_sided is None (the "reverse" orientation is just its
-      conjugate transpose, not a second kernel() evaluation); raw_dagger_
-      residual = max|z_forward_one_sided - z_forward_one_sided^dagger|.
+      conjugate transpose, not a second kernel() evaluation); the dagger is
+      z_forward_one_sided^dagger. Same-sector cores also record
+      raw_packed_pair_metric_dagger_residual, the normalized Frobenius
+      departure from Hermiticity of the packed AO-pair metric
+      P^dagger z_forward P (the quantity the AO-pair gate is stated against).
     - cross-sector: BOTH orientations are evaluated (z_forward_one_sided =
-      Z_AB, z_reverse_one_sided = Z_BA); raw_dagger_residual =
-      max|z_forward_one_sided - z_reverse_one_sided^dagger|.
+      Z_AB, z_reverse_one_sided = Z_BA); the dagger is
+      z_reverse_one_sided^dagger; raw_packed_pair_metric_dagger_residual is
+      None (a cross core is not a square Hermitian pair metric).
 
     symmetry_mode="two_sided_average" (production default) sets
     Z = (z_forward_one_sided + dagger(reverse-or-self))/2.
@@ -1951,25 +1984,45 @@ class IBPCoreArtifact:
                 f"got {self.psd_rtol!r}."
             )
 
-        recomputed = psd_factorize(self.Z, rtol=self.psd_rtol)
-        if recomputed.factor.shape != self.psd_factor.shape:
+        # Bind the STORED factor's own bytes -- a re-diagonalization gives a
+        # gauge-equivalent but generally different W (eigenvector sign/phase and
+        # degenerate-subspace freedom), so the factor is validated by its own
+        # content hash and by whether it actually reconstructs Z, while the
+        # gauge-INVARIANT eigenvalue diagnostics are recomputed from Z.
+        if _canonical_sha256(self.psd_factor) != self.psd_factor_sha256:
             raise ValueError(
-                f"psd_factor.shape {self.psd_factor.shape} does not match the factor "
-                f"recomputed from Z ({recomputed.factor.shape})."
+                "psd_factor_sha256 does not match the stored factor's own bytes."
             )
-        if self.psd_factor_sha256 != recomputed.factor_sha256:
+        if str(self.psd_factor.dtype) != self.realized_dtype:
             raise ValueError(
-                "psd_factor_sha256 does not match the factor recomputed from this "
-                "artifact's own Z and psd_rtol."
+                f"psd_factor.dtype {self.psd_factor.dtype} does not match the core dtype "
+                f"{self.realized_dtype}."
             )
-        checks = {
-            "psd_rtol": recomputed.rtol,
-            "psd_raw_min_eigenvalue": recomputed.raw_min_eigenvalue,
-            "psd_spectral_scale": recomputed.spectral_scale,
-            "psd_clipped_absolute_weight": recomputed.clipped_absolute_weight,
-            "psd_reconstruction_residual": recomputed.reconstruction_residual,
+
+        eigvals = np.linalg.eigvalsh(self.Z)  # gauge-invariant, ascending
+        spectral_scale = float(np.max(np.abs(eigvals))) if eigvals.size else 0.0
+        raw_min_eigenvalue = float(eigvals[0]) if eigvals.size else 0.0
+        threshold = -self.psd_rtol * spectral_scale
+        if np.any(eigvals < threshold):
+            offending = float(eigvals[eigvals < threshold].min())
+            raise ValueError(
+                f"Z is materially indefinite (eigenvalue {offending!r} below "
+                f"{threshold!r}); a factorized core must have no material negative mode."
+            )
+        negative = eigvals < 0.0
+        negative_mode_count = int(np.count_nonzero(negative))
+        clipped_absolute_weight = (
+            float(np.sum(np.abs(eigvals[negative]))) if negative_mode_count else 0.0
+        )
+        retained_rank = int(np.count_nonzero(np.where(negative, 0.0, eigvals) > 0.0))
+
+        float_checks = {
+            "psd_rtol": self.psd_rtol,  # identity: bound above and folded into the spec
+            "psd_raw_min_eigenvalue": raw_min_eigenvalue,
+            "psd_spectral_scale": spectral_scale,
+            "psd_clipped_absolute_weight": clipped_absolute_weight,
         }
-        for name, expected in checks.items():
+        for name, expected in float_checks.items():
             actual = getattr(self, name)
             if not isinstance(actual, float) or not math.isfinite(actual):
                 raise ValueError(f"{name} must be a finite float, got {actual!r}.")
@@ -1979,9 +2032,9 @@ class IBPCoreArtifact:
                     f"({expected!r})."
                 )
         int_checks = {
-            "psd_negative_mode_count": recomputed.negative_mode_count,
-            "psd_clipped_mode_count": recomputed.clipped_mode_count,
-            "psd_retained_rank": recomputed.retained_rank,
+            "psd_negative_mode_count": negative_mode_count,
+            "psd_clipped_mode_count": negative_mode_count,
+            "psd_retained_rank": retained_rank,
         }
         for name, expected in int_checks.items():
             actual = getattr(self, name)
@@ -1992,6 +2045,33 @@ class IBPCoreArtifact:
                     f"{name}={actual!r} does not match the value recomputed from Z "
                     f"({expected!r})."
                 )
+
+        # The stored factor must have the retained-rank width and must actually
+        # reconstruct Z to the recorded residual (catches a wrong-magnitude or
+        # otherwise non-reconstructing factor; a pure sign flip is already
+        # caught by the content-hash bind above).
+        if self.psd_factor.shape != (self.n_mu, retained_rank):
+            raise ValueError(
+                f"psd_factor.shape {self.psd_factor.shape} must be "
+                f"{(self.n_mu, retained_rank)} (n_mu, retained_rank)."
+            )
+        actual_reconstruction = _normalized_frobenius_residual(
+            self.Z, self.psd_factor @ self.psd_factor.conj().T
+        )
+        if not isinstance(self.psd_reconstruction_residual, float) or not math.isfinite(
+            self.psd_reconstruction_residual
+        ):
+            raise ValueError(
+                f"psd_reconstruction_residual must be a finite float, got "
+                f"{self.psd_reconstruction_residual!r}."
+            )
+        if not math.isclose(self.psd_reconstruction_residual, actual_reconstruction,
+                            rel_tol=1e-12, abs_tol=1e-15):
+            raise ValueError(
+                f"psd_reconstruction_residual={self.psd_reconstruction_residual!r} does not "
+                f"match the residual of the STORED factor's own reconstruction "
+                f"({actual_reconstruction!r})."
+            )
 
 
 def _ibp_one_sided_block(grad_theta_source, theta_source, grid, *,
