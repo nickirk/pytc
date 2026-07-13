@@ -65,6 +65,35 @@ def _build_normal_matrix(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray) -> jnp.
     return gram_p * gram_q
 
 
+_CHOLESKY_BACKWARD_ERROR_TOL = 1e-6  # relative Frobenius residual, regularized system
+
+
+def _cholesky_backward_error(chol, lower, mat_reg):
+    """Relative Frobenius residual of the Cholesky factor against the
+    REGULARIZED matrix it was asked to factor -- ||L L^dagger - mat_reg||
+    / ||mat_reg|| (or U^dagger U for upper). LAPACK's cho_factor is
+    backward-stable by construction whenever it returns without error,
+    so this is a modest additional safety net against a factor that is
+    finite but numerically garbage (e.g. under catastrophic cancellation
+    at extreme ill-conditioning), not a substitute for the isfinite
+    check -- gap 2's REGULARIZED-solve half (Alice's task #8 review,
+    2026-07-12): this gates jitter escalation; the separate UNREGULARIZED
+    bias check lives downstream in df/fit.py's _cholesky_jitter_sandwich,
+    since only that caller has the actual right-hand side M needed to
+    measure it, and it must NEVER be "fixed" by more jitter here (more
+    jitter only increases unregularized bias)."""
+    if lower:
+        tri = jnp.tril(chol)
+        recon = tri @ tri.conj().T
+    else:
+        tri = jnp.triu(chol)
+        recon = tri.conj().T @ tri
+    num = jnp.linalg.norm(recon - mat_reg)
+    den = jnp.linalg.norm(mat_reg)
+    den_f = float(den)
+    return float(num / den) if den_f > 0.0 else float(num)
+
+
 def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
                           max_jitter_tries: int = 8, jitter_growth: float = 10.0):
     """Adaptive-jitter Cholesky factorization for a symmetric/Hermitian
@@ -78,21 +107,27 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
     that motivated it).
 
     Starts from a small base jitter (max of a diag-mean*rcond estimate
-    and a machine-epsilon floor) and geometrically escalates it until
-    the Cholesky factor is finite -- handles matrices that are SPD in
-    exact arithmetic but numerically indefinite/near-singular (e.g. a
-    near-full-rank pivot-selection Gram matrix) without ever going
-    through an SVD, which is a non-starter at production core sizes on
-    GPU.
+    and a PURELY matrix-relative machine-epsilon floor) and
+    geometrically escalates it until the Cholesky factor is both finite
+    AND passes a regularized-solve backward-error check -- handles
+    matrices that are SPD in exact arithmetic but numerically
+    indefinite/near-singular (e.g. a near-full-rank pivot-selection
+    Gram matrix) without ever going through an SVD, which is a
+    non-starter at production core sizes on GPU.
 
-    STATUS (Alice's audit of commit b59c6ce, 2026-07-12, task #6/#3):
-    this is currently a DIAGNOSTIC CANDIDATE, not yet the declared
-    production default -- four implementation gaps found in review
-    (scale-relative jitter floor, the v1.2 two-check acceptance rule,
-    production-scalable residual estimation, cheap same-sector
-    detection) are tracked as this task's third commit. Production
-    default is declared only after the task-#3-mandated benchmark at
-    representative N_mu.
+    STATUS (Alice's audit of commit b59c6ce, task #8 commit 3,
+    2026-07-12): the diagnostic-candidate label from commit b59c6ce
+    still applies -- this fixes gap 1 (jitter floor) and half of gap 2
+    (regularized-solve backward-error gating jitter escalation, added
+    here) of Alice's 4-item review; the unregularized-bias check /
+    TSVD-fallback half of gap 2, plus gaps 3 (production-scalable
+    residual) and 4 (cheap same-sector detection), live in
+    df/fit.py's _cholesky_jitter_sandwich since they need the actual
+    fit context this generic primitive doesn't have. This solver's
+    provenance label is "unscaled_cholesky_jitter" (not "cholesky_jitter"
+    matching the doc rule exactly) until row equilibration exists.
+    Production default is declared only after the task-#3-mandated
+    benchmark at representative N_mu.
 
     Args:
         matrix: (n, n) symmetric/Hermitian PSD matrix.
@@ -108,29 +143,56 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
         n_tries is how many attempts it took (1 = no escalation needed)
         -- both are provenance fields for callers that need to record
         the solver's own diagnostics (Coulomb path's compute_Z).
+
+    Raises:
+        ValueError: matrix's diagonal mean is not finite.
+        numpy.linalg.LinAlgError: matrix's diagonal mean is
+            non-positive (not PSD -- previously masked by an absolute
+            eps*max(diag_mean, 1.0) floor that injected eps-scale
+            jitter regardless of the matrix's own scale, Alice's gap 1),
+            or the factor never passes both checks within
+            max_jitter_tries attempts.
     """
     mat = 0.5 * (matrix + matrix.conj().T)
     diag_mean = float(jnp.mean(jnp.real(jnp.diag(mat))))
-    eps_scale = float(jnp.finfo(mat.dtype).eps) * max(diag_mean, 1.0)
+    if not np.isfinite(diag_mean):
+        raise ValueError(
+            f"prepare_spd_cholesky: matrix diagonal mean is not finite ({diag_mean}); "
+            f"cannot form a scale-relative jitter."
+        )
+    if diag_mean <= 0.0:
+        raise np.linalg.LinAlgError(
+            f"prepare_spd_cholesky: matrix diagonal mean is non-positive ({diag_mean:.3e}); "
+            f"matrix is not PSD, cannot form a scale-relative jitter."
+        )
+    eps = float(jnp.finfo(mat.dtype).eps)
+    eps_scale = eps * diag_mean  # PURELY matrix-relative -- no absolute 1.0 floor (gap 1 fix)
     base_jitter = max(diag_mean * rcond, eps_scale)
     eye = jnp.eye(mat.shape[0], dtype=mat.dtype)
 
     last_chol = None
+    last_backward_error = None
     for attempt in range(max_jitter_tries):
         jitter = base_jitter * (jitter_growth ** attempt)
-        chol, lower = jsp_linalg.cho_factor(mat + jitter * eye, lower=True)
+        mat_reg = mat + jitter * eye
+        chol, lower = jsp_linalg.cho_factor(mat_reg, lower=True)
         if bool(jnp.all(jnp.isfinite(chol))):
-            if attempt > 0:
-                logger.warning(
-                    "Cholesky jitter escalated: base=%.3e final=%.3e tries=%d",
-                    base_jitter, jitter, attempt + 1
-                )
-            return chol, bool(lower), float(jitter), attempt + 1
+            backward_error = _cholesky_backward_error(chol, lower, mat_reg)
+            if backward_error <= _CHOLESKY_BACKWARD_ERROR_TOL:
+                if attempt > 0:
+                    logger.warning(
+                        "Cholesky jitter escalated: base=%.3e final=%.3e tries=%d "
+                        "backward_error=%.3e",
+                        base_jitter, jitter, attempt + 1, backward_error
+                    )
+                return chol, bool(lower), float(jitter), attempt + 1
+            last_backward_error = backward_error
         last_chol = chol
 
     raise np.linalg.LinAlgError(
         f"Adaptive Cholesky failed after {max_jitter_tries} tries; "
-        f"base_jitter={base_jitter:.3e}, last_nonfinite={bool(jnp.any(jnp.isnan(last_chol)))}"
+        f"base_jitter={base_jitter:.3e}, last_nonfinite={bool(jnp.any(jnp.isnan(last_chol)))}, "
+        f"last_backward_error={last_backward_error}"
     )
 
 

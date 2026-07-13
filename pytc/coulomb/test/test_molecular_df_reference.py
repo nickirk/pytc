@@ -230,7 +230,7 @@ class TestMolecularDFReference(unittest.TestCase):
         mode and must report a genuinely different field set (retained
         singular-value range instead of jitter)."""
         prov = self.Z_provenance
-        self.assertEqual(prov["solver"], "cholesky_jitter")
+        self.assertEqual(prov["solver"], "unscaled_cholesky_jitter")
         self.assertIsInstance(prov["jitter_used"], tuple)
         self.assertIsInstance(prov["n_tries"], tuple)
         self.assertIsNone(prov["retained_singular_value_range"])
