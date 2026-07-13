@@ -461,3 +461,155 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=Non
         "backend": "numpy",
     }
     return W, info
+
+
+@jax.jit
+def _hermitian_sandwich_solve_core(Pi, V, rtol):
+    """Fixed-shape, jitted, device-resident core of
+    hermitian_sandwich_solve_device (task #24, design v2.1 sections 5+6/7).
+    Reproduces hermitian_sandwich_solve's math exactly, restructured so
+    retained-rank truncation is a boolean MASK over the full n-dimensional
+    eigenbasis rather than a dynamic-size slice (eigvecs[:, :n_retained]),
+    which is required for a static-shape jax.jit graph -- masked-out modes
+    contribute exactly 0 to both the pseudo-inverse and the retained-space
+    projector, which is mathematically identical to slicing them away.
+    """
+    n = Pi.shape[0]
+    dtype = jnp.result_type(Pi.dtype, V.dtype, jnp.complex128)
+    tiny = jnp.finfo(dtype).tiny
+
+    Pi_herm = (Pi + Pi.conj().T) / 2
+    V_herm = (V + V.conj().T) / 2
+    pi_anti_hermitian_residual = jnp.linalg.norm(Pi - Pi.conj().T) / jnp.maximum(
+        jnp.linalg.norm(Pi), tiny
+    )
+    v_anti_hermitian_residual = jnp.linalg.norm(V - V.conj().T) / jnp.maximum(
+        jnp.linalg.norm(V), tiny
+    )
+
+    eigvals_asc, eigvecs_asc = jnp.linalg.eigh(Pi_herm)
+    order = jnp.argsort(eigvals_asc)[::-1]
+    eigvals = eigvals_asc[order]
+    eigvecs = eigvecs_asc[:, order]
+
+    s_max = eigvals[0]
+    threshold = rtol * s_max
+    mask = eigvals > threshold
+    n_retained = jnp.sum(mask)
+    has_retained = n_retained > 0
+
+    safe_eigvals = jnp.where(mask, eigvals, 1.0)
+    inv_eigvals = jnp.where(mask, 1.0 / safe_eigvals, 0.0)
+    Pi_pinv_r = (eigvecs * inv_eigvals[None, :]) @ eigvecs.conj().T
+    W_full = Pi_pinv_r @ V_herm @ Pi_pinv_r
+    W_full = (W_full + W_full.conj().T) / 2
+
+    mask_c = mask.astype(eigvecs.dtype)
+    proj_r = (eigvecs * mask_c[None, :]) @ eigvecs.conj().T
+    retained_target = proj_r @ V_herm @ proj_r
+    retained_solve = proj_r @ (Pi_herm @ W_full @ Pi_herm - V_herm) @ proj_r
+    v_norm = jnp.maximum(jnp.linalg.norm(V_herm), tiny)
+    retained_solve_residual_full = jnp.linalg.norm(retained_solve) / jnp.maximum(
+        jnp.linalg.norm(retained_target), tiny
+    )
+    truncation_residual_full = jnp.linalg.norm(V_herm - retained_target) / v_norm
+
+    W = jnp.where(has_retained, W_full, jnp.zeros_like(W_full))
+    retained_solve_residual = jnp.where(has_retained, retained_solve_residual_full, 0.0)
+    truncation_residual = jnp.where(has_retained, truncation_residual_full, 1.0)
+    s_min_retained = jnp.min(jnp.where(mask, eigvals, jnp.inf))
+
+    return (
+        W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
+        v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+    )
+
+
+def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-8):
+    """Device (JAX, fixed-shape, jitted) counterpart of
+    hermitian_sandwich_solve (task #24, design v2.1 sections 5+6/7): the
+    same two-sided Hermitian sandwich solve, restructured to avoid
+    dynamic-shape slicing so the whole computation is one fixed-shape
+    jax.jit graph, entirely device-resident -- see
+    _hermitian_sandwich_solve_core's docstring for the masking rewrite.
+
+    Two known simplifications vs the NumPy oracle, both deliberate scope
+    reductions for a first device implementation, not silent bugs:
+      - No hard PSD validation. Raising a Python ValueError from inside a
+        jax.jit graph on a TRACED value (s_max) is not a plain `if`/raise
+        the way host-side NumPy code can do it. A genuinely non-PSD or
+        zero Pi degrades to n_retained=0 (W=0), matching the NumPy
+        oracle's OWN n_retained==0 fallback branch, rather than raising
+        the oracle's separate "Pi not PSD" ValueError. Callers on the
+        device path are expected to have already validated Pi's
+        PSD-ness via the NumPy oracle during development/testing.
+      - No adaptive-retention mode (target_truncation_residual): that is
+        inherently a variable-iteration-count algorithm, which does not
+        fit a fixed-shape jitted graph. It remains a NumPy-host-only
+        diagnostic feature.
+
+    Args:
+        Pi: (n,n) array, Hermitian PSD expected (Hermitized internally).
+        V: (n,n) array, Hermitized internally.
+        rtol: relative spectral retention threshold (default 1e-8).
+
+    Returns:
+        (W, info): W is (n,n) complex128 jax array. info is a dict with
+        the same keys as hermitian_sandwich_solve's, plus
+        backend="jax"; adaptive_retention_used is always False and
+        target_truncation_residual is always None (see above).
+
+    Raises:
+        ValueError: Pi/V are not square/matching-shape 2-D arrays,
+            not finite, or rtol is not a finite positive number (all
+            host-side checks on the untraced inputs).
+    """
+    Pi_np = np.asarray(Pi)
+    V_np = np.asarray(V)
+    if Pi_np.ndim != 2 or Pi_np.shape[0] != Pi_np.shape[1]:
+        raise ValueError(f"Pi must be a square 2-D array, got shape {Pi_np.shape}.")
+    n = Pi_np.shape[0]
+    if n == 0:
+        raise ValueError("Pi must be nonempty.")
+    if V_np.shape != (n, n):
+        raise ValueError(f"V must have shape {(n, n)} matching Pi, got {V_np.shape}.")
+    if not np.all(np.isfinite(Pi_np)) or not np.all(np.isfinite(V_np)):
+        raise ValueError("Pi and V must be finite.")
+    if isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
+        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+    rtol = float(rtol)
+    if not np.isfinite(rtol) or rtol <= 0.0:
+        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+
+    Pi_jnp = jnp.asarray(Pi_np, dtype=jnp.complex128)
+    V_jnp = jnp.asarray(V_np, dtype=jnp.complex128)
+    if Pi_jnp.dtype != jnp.complex128:
+        logger.warning(
+            f"hermitian_sandwich_solve_device: resolved dtype is {Pi_jnp.dtype}, not "
+            f"complex128 -- verify jax.config.update('jax_enable_x64', True) is set "
+            f"before trusting production numbers from this path (design v2.1 section 1 "
+            f"fixes c128 as the only tier with defined 1e-6-class gates)."
+        )
+
+    (
+        W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
+        v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+    ) = _hermitian_sandwich_solve_core(Pi_jnp, V_jnp, rtol)
+
+    n_retained_i = int(n_retained)
+    info = {
+        "n_retained": n_retained_i,
+        "n_discarded": n - n_retained_i,
+        "s_max": float(s_max),
+        "s_min_retained": None if n_retained_i == 0 else float(s_min_retained),
+        "pi_anti_hermitian_residual": float(pi_anti_hermitian_residual),
+        "v_anti_hermitian_residual": float(v_anti_hermitian_residual),
+        "retained_solve_residual": float(retained_solve_residual),
+        "truncation_residual": float(truncation_residual),
+        "rtol": rtol,
+        "adaptive_retention_used": False,
+        "target_truncation_residual": None,
+        "dtype": str(W.dtype),
+        "backend": "jax",
+    }
+    return W, info

@@ -25,7 +25,15 @@ import -- see pivoted_cholesky_hermitian's docstring.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
+from functools import partial
+
+import jax
+import jax.numpy as jnp
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=1e-12):
@@ -365,4 +373,215 @@ def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_me
     # see the docstring's Eq. 10 factor-placement note; empirically
     # confirmed against a real fftisdf run (V2 reference-replay test).
     W_q = np.sqrt(n_grid) * W_q_unscaled
+    return W_q, kern_q, solve_info
+
+
+# ---------------------------------------------------------------------------
+# C1 (task #24, design v2.1 section 7): device path, KernelProvider protocol.
+#
+# Flinn's seam ruling (task #24 thread, msg 6916c47c) on top of the
+# apply_raw_kernel_and_solve oracle above: KernelProvider.apply(q_index, lq)
+# is a LINEAR q-momentum kernel operator applied to a PRE-PHASED (Nip, Ng)
+# slab, returning v_q BEFORE the final conjugate -- the Bloch-phase multiply
+# (eta_q -> lq) and the outer conjugate (v_q -> rq) are pipeline glue that
+# does not vary between providers, not part of the provider contract. The
+# vol/Ng normalization stays INSIDE the provider (it is part of "kernel on
+# the canonical mesh"); exxdiv stays OUTSIDE, unchanged, owned by a later
+# get_k post-processing step. "Raw" implements the operator in 3 Fourier
+# passes; the contract itself does not fix a step count (a future IBP
+# provider may need several FFT/IFFT passes for gradient/vector-valued
+# G-space components inside one apply() call).
+#
+# q<->-q dagger law AT THIS SEAM (derived here, not copied from the original
+# eta_q-based law in the design doc text, since that law was written for the
+# phase-included signature): given
+#     l_q[neg[q]] = conj(l_q[q])
+# (true because eta[neg[q]] = conj(eta[q]) from pair_convolve's own q<->-q
+# closure, and phase(neg[q]) = exp(-1j r.(-q)) = exp(+1j r.q) = conj(phase(q))
+# for phase(k) = exp(-1j r.k)), the raw kernel-apply operator satisfies
+#     apply(neg[q], conj(l_q)) == conj(apply(q, l_q))
+# Proof: (1) coulG(-q)[G] = coulG(q)[-G] -- both equal 4pi/|G+-q|^2, and this
+# value is REAL, so it equals its own conjugate; (2) the standard DFT
+# conjugate-reversal identity FFT(conj(f))[G] = conj(FFT(f)[-G]); composing
+# (1)+(2) through the coulG multiply, then one more IFFT (which turns a
+# G-reversal + conjugate back into a plain conjugate in real/grid space, by
+# the same identity applied in reverse), closes the law with no leftover
+# phase. Verified numerically in test_raw_kernel_apply_dagger_law.
+
+
+@partial(jax.jit, static_argnames=("grid_mesh",))
+def _raw_kernel_apply_core(lq, coulG_scaled, grid_mesh):
+    """Jitted, fixed-shape core of the "raw" KernelProvider: v_q =
+    IFFT(coulG(q)*vol/Ng * FFT(lq)), device-resident throughout. See
+    raw_kernel_apply's docstring for the full contract; this function
+    does no validation (that lives in the host-side wrapper, since
+    validation involves cell/pyscf calls that are not jittable) and
+    performs no phase multiply and no outer conjugate -- both are
+    pipeline glue applied by the caller, not this seam.
+    """
+    n_ip = lq.shape[0]
+    lq_mesh = lq.reshape((n_ip,) + grid_mesh)
+    wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
+    vq_mesh = jnp.asarray(coulG_scaled, dtype=lq.dtype).reshape(grid_mesh)
+    vq_mesh = wq_mesh * vq_mesh[None, :, :, :]
+    rq_mesh = jnp.fft.ifftn(vq_mesh, axes=(1, 2, 3))
+    return rq_mesh.reshape(n_ip, -1)
+
+
+def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
+    """Host-side wrapper: validate inputs, compute coulG(q)*vol/Ng on the
+    host via pyscf (not jittable -- cell.get_Gv/get_coulG are plain
+    Python/NumPy pyscf calls), then dispatch to the jitted device core.
+
+    Args:
+        lq: (Nip, Ng) complex128, ALREADY Bloch-phase-corrected (the
+            pipeline's job, not this function's -- see module-level
+            comment above).
+        cell: pyscf.pbc.gto.Cell.
+        q_kpt: (3,) absolute k-vector for this q.
+        grid_mesh: (3,) positive ints, the real-space integration mesh
+            (prod must equal Ng).
+
+    Returns:
+        v_q: (Nip, Ng) complex128 jax array, BEFORE the outer conjugate
+        (the pipeline applies conj(v_q) -> rq itself).
+
+    Raises:
+        ValueError: malformed shapes, or grid_mesh does not match Ng.
+    """
+    from pyscf.pbc import tools as pbctools
+
+    lq_np = np.asarray(lq)
+    if lq_np.ndim != 2:
+        raise ValueError(f"lq must be 2-D (Nip, Ng), got shape {lq_np.shape}.")
+    n_ip, n_grid = lq_np.shape
+
+    grid_mesh_t = tuple(int(x) for x in grid_mesh)
+    if len(grid_mesh_t) != 3 or any(m <= 0 for m in grid_mesh_t):
+        raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh_t}.")
+    if int(np.prod(grid_mesh_t)) != n_grid:
+        raise ValueError(f"prod(grid_mesh)={int(np.prod(grid_mesh_t))} != lq's grid size {n_grid}.")
+
+    q_kpt_np = np.asarray(q_kpt, dtype=np.float64)
+    if q_kpt_np.shape != (3,):
+        raise ValueError(f"q_kpt must have shape (3,), got {q_kpt_np.shape}.")
+
+    Gv = cell.get_Gv(list(grid_mesh_t))
+    coulG = pbctools.get_coulG(cell, k=q_kpt_np, exx=False, Gv=Gv, mesh=list(grid_mesh_t))
+    coulG_scaled = np.asarray(coulG, dtype=np.float64) * (cell.vol / n_grid)
+
+    lq_jnp = jnp.asarray(lq_np, dtype=jnp.complex128)
+    if lq_jnp.dtype != jnp.complex128:
+        logger.warning(
+            f"raw_kernel_apply: resolved dtype is {lq_jnp.dtype}, not complex128 -- JAX "
+            f"defaults to complex64 SILENTLY unless the caller has enabled "
+            f"jax.config.update('jax_enable_x64', True). This device path is defined only "
+            f"at the c128 parity tier (design v2.1 section 1); verify x64 is enabled "
+            f"before trusting production numbers from this path."
+        )
+    return _raw_kernel_apply_core(lq_jnp, jnp.asarray(coulG_scaled), grid_mesh_t)
+
+
+@dataclasses.dataclass(frozen=True)
+class RawKernelProvider:
+    """The "raw" (bare 4pi/G^2, exx=False) KernelProvider (design v2.1
+    section 7): wraps raw_kernel_apply behind the KernelProvider seam
+    (apply(q_index, lq) -> v_q) plus a provenance() accessor. A provider
+    is a per-(cell, canonical k-mesh, grid) object -- q_index looks up
+    the absolute k-vector from canonical_kpts internally, so callers
+    never pass raw k-vectors across the provider boundary.
+
+    Args:
+        cell: pyscf.pbc.gto.Cell.
+        canonical_kpts: (Nk, 3) float64, e.g. KptsMesh.canonical_kpts --
+            canonical_kpts[q_index] is the absolute k-vector for that q.
+        grid_mesh: (3,) positive ints, the real-space integration mesh.
+    """
+    cell: object
+    canonical_kpts: object
+    grid_mesh: tuple
+
+    def __post_init__(self):
+        canonical_kpts = np.asarray(self.canonical_kpts, dtype=np.float64)
+        if canonical_kpts.ndim != 2 or canonical_kpts.shape[1] != 3:
+            raise ValueError(
+                f"canonical_kpts must have shape (Nk,3), got {canonical_kpts.shape}."
+            )
+        grid_mesh = tuple(int(x) for x in self.grid_mesh)
+        if len(grid_mesh) != 3 or any(m <= 0 for m in grid_mesh):
+            raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh}.")
+        object.__setattr__(self, "canonical_kpts", canonical_kpts)
+        object.__setattr__(self, "grid_mesh", grid_mesh)
+
+    def apply(self, q_index, lq):
+        n_kpts = self.canonical_kpts.shape[0]
+        if not (0 <= q_index < n_kpts):
+            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+        return raw_kernel_apply(
+            lq, cell=self.cell, q_kpt=self.canonical_kpts[q_index], grid_mesh=self.grid_mesh
+        )
+
+    def provenance(self):
+        return {
+            "kernel_name": "raw",
+            "kernel_version": 1,
+            "g0_convention": "pyscf_get_coulG_exx_false",
+            "grid_mesh": self.grid_mesh,
+            "normalization": "vol_over_ng_inside_provider",
+            "exxdiv": "owned_by_get_k_postprocessing_not_this_provider",
+        }
+
+
+def apply_kernel_and_solve_device(provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-8):
+    """S4 pipeline glue (design v2.1 section 6), device-resident,
+    provider-agnostic: Bloch-phase multiply -> provider.apply(q_index,
+    lq) -> outer conjugate -> ZGEMM contract to (Nip,Nip) -> device
+    Hermitian sandwich solve. Reproduces apply_raw_kernel_and_solve's
+    exact math when provider is a RawKernelProvider (validated to
+    <=1e-12 in test_apply_kernel_and_solve_device_matches_numpy_oracle),
+    but is written against the provider SEAM so a future ibp provider
+    plugs in here unchanged.
+
+    Args:
+        provider: object exposing .apply(q_index, lq) -> v_q (Nip, Ng),
+            e.g. RawKernelProvider.
+        q_index: int, canonical index of this q (looked up by the
+            provider itself for any provider-internal k-vector needs).
+        Pi_q: (Nip, Nip) complex128, this q's metric.
+        eta_q: (Nip, Ng) complex128, this q's RHS, NOT yet phase-
+            corrected (the pipeline's job, matching build_pi_eta's raw
+            output).
+        grid_coords: (Ng, 3) real-space grid point coordinates, same
+            flattened order as eta_q's grid axis.
+        rtol: forwarded to the device sandwich solve.
+
+    Returns:
+        (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 jax
+        array (the solved kernel matrix); kern_q is the raw (Nip, Nip)
+        contracted kernel before the sandwich solve; solve_info is the
+        device sandwich solve's own info dict.
+    """
+    from pytc.df.solvers import hermitian_sandwich_solve_device
+
+    q_kpt = provider.canonical_kpts[q_index]
+    eta_q_np = np.asarray(eta_q)
+    n_ip, n_grid = eta_q_np.shape
+    grid_coords_np = np.asarray(grid_coords, dtype=np.float64)
+    if grid_coords_np.shape != (n_grid, 3):
+        raise ValueError(
+            f"grid_coords must have shape ({n_grid},3) matching eta_q's grid axis, "
+            f"got {grid_coords_np.shape}."
+        )
+
+    phase = jnp.exp(-1j * (jnp.asarray(grid_coords_np) @ jnp.asarray(q_kpt)))
+    lq = jnp.asarray(eta_q_np, dtype=jnp.complex128) * phase[None, :]
+
+    v_q = provider.apply(q_index, lq)
+    rq = jnp.conj(v_q)
+
+    kern_q = (lq @ rq.T) / jnp.sqrt(n_grid)
+
+    Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
+    W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
+    W_q = jnp.sqrt(n_grid) * W_q_unscaled
     return W_q, kern_q, solve_info
