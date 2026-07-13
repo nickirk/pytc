@@ -1,7 +1,8 @@
 """Periodic ISDF fit machinery (task #21, #proj-isdf-periodic, design
-v2.1 section 3): a generic, matrix-free Hermitian-PSD pivoted Cholesky
-selector. The Pi^q/eta^q builders and per-q kernel application land in
-a later commit (V2).
+v2.1 sections 3-5): a generic, matrix-free Hermitian-PSD pivoted
+Cholesky selector, and the Pi^q/eta^q metric/RHS builders. Per-q
+Coulomb kernel application (section 7's KernelProvider protocol) is
+Phase C's scope, not implemented here.
 
 Design decision (Alice's option (a), design v2.1 section 3): the
 existing pytc.df.pivots molecular pair core
@@ -137,3 +138,62 @@ def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=
         n_selected += 1
 
     return pivots[:n_selected], L[:, :n_selected], n_selected
+
+
+def build_pi_eta(X, ao_blocks, kmesh, *, imag_tol=1e-10):
+    """Build the per-q metric Pi^q and RHS eta^q (design v2.1 section 4/5):
+
+        Pi^q  = pair_convolve(X, X, kmesh)[q]         (Nip, Nip)
+        eta^q = pair_convolve(X, AO, kmesh)[q]         (Nip, Ng)
+
+    eta is accumulated over grid blocks by calling pair_convolve once
+    per block and concatenating along the grid axis -- this bounds the
+    memory of any single pair_convolve call to one block's worth of AO
+    data, at the cost of re-walking X's own per-q GEMM/FFT machinery
+    once per block (the same reference-first, optimize-later posture as
+    this module's other primitives; a genuinely fused/tiled device
+    pipeline is Phase C's job, not this CPU oracle's).
+
+    Args:
+        X: (Nk, Nip, Nao) complex128 -- the interpolation-point factor
+            (e.g. AO or MO values at the selected pivot points) across
+            the canonical k-mesh.
+        ao_blocks: a single (Nk, Ng, Nao) complex128 array, or an
+            iterable of (Nk, blk_i, Nao) complex128 arrays (AO values at
+            successive grid blocks) across the SAME canonical k-mesh.
+        kmesh: (3,) positive ints, the canonical k/q-mesh shape (see
+            pytc.pbc.df.kpts.KptsMesh.kmesh).
+        imag_tol: forwarded to pair_convolve's imaginary-part gate.
+
+    Returns:
+        (Pi, eta): Pi is (Nk, Nip, Nip) complex128; eta is
+        (Nk, Nip, Ng) complex128, Ng = sum of the ao_blocks' grid sizes.
+
+    Raises:
+        ValueError: forwarded from pair_convolve for malformed shapes,
+            or if X/ao_blocks are not a valid time-reversal-symmetric
+            pair (the imag_tol gate).
+    """
+    # Local import: pytc.pbc.df.isdf depends on pytc.pbc.df.kpts (both
+    # are pbc/df/ peers), never the reverse -- kpts.py stays a leaf.
+    from pytc.pbc.df.kpts import pair_convolve
+
+    X = np.asarray(X)
+    if X.ndim != 3:
+        raise ValueError(f"X must be 3-D (Nk, Nip, Nao), got shape {X.shape}.")
+
+    Pi = pair_convolve(X, X, kmesh, imag_tol=imag_tol)
+
+    if isinstance(ao_blocks, np.ndarray):
+        ao_blocks = [ao_blocks]
+    else:
+        ao_blocks = list(ao_blocks)
+    if not ao_blocks:
+        raise ValueError("ao_blocks must be nonempty.")
+
+    eta_chunks = [
+        pair_convolve(X, np.asarray(block), kmesh, imag_tol=imag_tol)
+        for block in ao_blocks
+    ]
+    eta = np.concatenate(eta_chunks, axis=2)
+    return Pi, eta
