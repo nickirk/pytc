@@ -253,11 +253,26 @@ class IBPISDF(DF):
     def provenance(self):
         return self._ibp_provenance
 
+    @staticmethod
+    def _require_supported_molecule(mol):
+        """v1 supports all-electron and ECP molecules. A pseudopotential
+        (GTH/pseudo) molecule changes the realized AO/operator artifacts and
+        has not been validated here, so it is rejected explicitly rather than
+        silently omitted from the identity digest (which would let a pseudo
+        change go unnoticed)."""
+        if getattr(mol, "_pseudo", None):
+            raise NotImplementedError(
+                "IBPISDF v1 does not support pseudopotential (pseudo/GTH) molecules; "
+                "only all-electron and ECP molecules are validated. Remove the "
+                "pseudopotential or use a supported provider."
+            )
+
     def build(self):
         # Idempotent: a second build validates that the molecule identity has
         # not changed under the built cache. An in-place mutation (set_geom_,
         # basis change, cart flip) after the first build must not silently
         # reuse stale factors -- it fails loudly and demands reset().
+        self._require_supported_molecule(self.mol)
         current = _canonical_molecule_digest(self.mol)
         if self._ibp_built:
             if current != self._ibp_mol_digest:

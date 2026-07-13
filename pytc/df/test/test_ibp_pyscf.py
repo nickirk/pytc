@@ -351,6 +351,16 @@ class TestIBPISDFStaleMolecule(unittest.TestCase):
         self.assertTrue(p._ibp_built)
         self.assertEqual(p.provenance["mol_digest"], _canonical_molecule_digest(p.mol))
 
+    def test_pseudopotential_molecule_is_rejected(self):
+        # v1 supports all-electron/ECP molecules only; a pseudopotential
+        # molecule must be rejected explicitly rather than silently omitted
+        # from the identity digest.
+        mol = _h2()
+        mol._pseudo = {"H": "gth-pade"}  # simulate a pseudo molecule
+        p = IBPISDF(mol, rank=3, grid_level=1)
+        with self.assertRaises(NotImplementedError):
+            p.build()
+
 
 class TestIBPISDFPhysicalBuild(unittest.TestCase):
     def test_h2_sto3g_level1_build_and_reconstruction(self):
