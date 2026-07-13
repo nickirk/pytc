@@ -19,8 +19,16 @@ Round-2 findings on the first fix (commit 7064a7b), all covered here:
 4b) same-sector identity inference ran AFTER np.asarray conversion,
     silently broken for JAX/CuPy inputs (device arrays get a NEW host
     object on every np.asarray call).
+
+Round-3 finding (commit ac04e3c): the sampled estimator's OWN internals
+were fixed to be on-device, but its caller (_cholesky_jitter_sandwich)
+still unconditionally converted S_A/S_B/M/Z to numpy before calling it,
+so sampled mode inherited a device->host->device round trip through the
+estimator's own jnp.asarray -- exactly the transfer the round-2 fix was
+supposed to remove.
 """
 import unittest
+from unittest.mock import patch
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -28,6 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pytc.df.solvers import prepare_spd_cholesky
+from pytc.df import fit
 from pytc.df.fit import compute_Z, compute_Z_cross
 
 
@@ -198,6 +207,33 @@ class TestResidualModes(unittest.TestCase):
     def test_unknown_residual_mode_rejected(self):
         with self.assertRaises(ValueError):
             compute_Z(self.P, self.C, residual_mode="not-a-real-mode")
+
+    def test_sampled_residual_receives_jax_arrays_not_numpy_roundtripped(self):
+        # Round-3 fix (Alice's second re-review, 2026-07-12): the
+        # estimator's own internals were on-device, but its caller
+        # (_cholesky_jitter_sandwich) unconditionally converted
+        # S_A/S_B/M/Z to numpy first, so sampled mode still paid a
+        # device->host->device round trip through the estimator's own
+        # jnp.asarray. Spy on the estimator to verify it now receives
+        # jax arrays directly, never np.ndarray.
+        captured = {}
+        original = fit._two_sided_residual_sampled
+
+        def spy(S_A, Z, S_B, M, **kwargs):
+            captured["args"] = (S_A, Z, S_B, M)
+            return original(S_A, Z, S_B, M, **kwargs)
+
+        with patch.object(fit, "_two_sided_residual_sampled", side_effect=spy):
+            compute_Z(self.P, self.C, residual_mode="sampled")
+
+        self.assertIn("args", captured)
+        for arg in captured["args"]:
+            self.assertNotIsInstance(arg, np.ndarray)
+            self.assertIsInstance(arg, jax.Array)
+
+    def test_zero_probes_rejected_not_silently_zero(self):
+        with self.assertRaises(ValueError):
+            compute_Z(self.P, self.C, residual_mode="sampled", residual_n_probes=0)
 
 
 class TestExplicitSameSector(unittest.TestCase):

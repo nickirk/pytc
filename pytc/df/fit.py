@@ -126,6 +126,11 @@ def _two_sided_residual_sampled(S_A, Z, S_B, M, n_probes=_DEFAULT_RESIDUAL_N_PRO
     validation exists. Use residual_mode="exact" for anything
     decision-grade.
     """
+    if n_probes < 1:
+        raise ValueError(
+            f"n_probes must be >= 1, got {n_probes} -- n_probes=0 would silently "
+            f"produce an empty probe matrix and a misleading zero residual."
+        )
     S_A = jnp.asarray(S_A)
     S_B = jnp.asarray(S_B)
     Z = jnp.asarray(Z)
@@ -259,9 +264,22 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     Z = jsp_linalg.cho_solve((chol_B, lower_B), X.conj().T).conj().T  # (S_A^-1 M) S_B^-1
     Z_np = np.asarray(Z)
 
-    fit_residual, residual_meta = _compute_residual(
-        np.asarray(S_A), Z_np, np.asarray(S_B), np.asarray(M),
-        residual_mode, residual_n_probes, residual_seed)
+    if residual_mode == "sampled":
+        # S_A/S_B/M are already jnp (converted at function entry) and Z
+        # is a fresh jnp array from cho_solve above -- pass them through
+        # UNCONVERTED so the sampled estimator's on-device batched
+        # matvecs never see a host round trip. An earlier version
+        # called np.asarray on all four here unconditionally, so sampled
+        # mode inherited a device->host->device round trip through
+        # _two_sided_residual_sampled's own jnp.asarray -- exactly the
+        # transfer the on-device rewrite was meant to remove (Alice's
+        # second re-review, 2026-07-12).
+        fit_residual, residual_meta = _compute_residual(
+            S_A, Z, S_B, M, residual_mode, residual_n_probes, residual_seed)
+    else:
+        fit_residual, residual_meta = _compute_residual(
+            np.asarray(S_A), Z_np, np.asarray(S_B), np.asarray(M),
+            residual_mode, residual_n_probes, residual_seed)
 
     provenance = {
         "solver": "unscaled_cholesky_jitter",
