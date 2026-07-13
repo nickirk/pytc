@@ -34,7 +34,7 @@ class TestDfPackageImportCompat(unittest.TestCase):
 
     def test_underscore_symbol_used_externally_stays_importable(self):
         # _pivoted_cholesky_phi is underscore-prefixed but imported
-        # directly by pytc/coulomb/test/test_pivot_selection.py -- an
+        # directly by pytc/test/test_pivot_selection.py -- an
         # explicit exception to the private-name convention (Alice's
         # migration spec: "except re-exporting a symbol if an existing
         # import requires it").
@@ -56,12 +56,12 @@ class TestDfPackageImportCompat(unittest.TestCase):
             import pytc.df.coulomb  # noqa: F401
 
     def test_coulomb_path_imports_from_new_df_package(self):
-        # pytc/coulomb/ imports shared primitives from the new df/
-        # package -- these must keep working unchanged (no relocation
-        # of Coulomb's own business logic in this task, per the ratified
-        # narrow scope).
-        from pytc.coulomb.pivot_selection import select_sector_pivots  # noqa: F401
-        from pytc.coulomb.molecular_df_reference import compute_Z  # noqa: F401
+        # pytc/integrals/coulomb.py imports shared primitives from the
+        # df/ package -- these must keep working unchanged (no
+        # relocation of Coulomb's own business logic in task #8, per
+        # its ratified narrow scope).
+        from pytc.integrals.coulomb import select_sector_pivots  # noqa: F401
+        from pytc.integrals.coulomb import compute_Z  # noqa: F401
 
     def test_module_attribute_access_pattern_from_tc_and_xtc_py(self):
         # pytc/tc.py AND pytc/xtc.py's actual production call sites both
@@ -81,6 +81,80 @@ class TestDfPackageImportCompat(unittest.TestCase):
         import pytc
         self.assertTrue(callable(pytc.df.isdf_decompose))
         self.assertTrue(callable(pytc.df.pivoted_cholesky_pair_pivots))
+
+
+class TestNoCoulombPackageRemains(unittest.TestCase):
+    """Gate for task #14's corrective reorganization (isdf-coulomb-cuda,
+    2026-07-13): pytc/coulomb/ was consolidated into pytc/integrals/
+    coulomb.py with no compatibility shim (Ke's explicit "no Coulomb
+    folder" ruling). Alice's acceptance criterion: "an rg gate showing
+    no production import still targets pytc.coulomb and no canonical
+    implementation remains in root tc/xtc" -- covers import statements
+    and module strings in tracked production/test Python sources,
+    deliberately excluding git history/build artifacts (this scans the
+    actual working tree via `git ls-files`, not disk globbing, so
+    untracked scratch files/other agents' worktree checkouts can never
+    produce a false failure here).
+    """
+
+    def test_pytc_coulomb_package_is_gone(self):
+        with self.assertRaises(ModuleNotFoundError):
+            import pytc.coulomb  # noqa: F401
+
+    def test_no_pytc_coulomb_references_in_tracked_python_sources(self):
+        import os
+        import subprocess
+
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True, cwd=this_dir,
+        ).stdout.strip()
+        tracked_py_files = subprocess.run(
+            ["git", "ls-files", "*.py"],
+            capture_output=True, text=True, check=True, cwd=repo_root,
+        ).stdout.splitlines()
+
+        offenders = []
+        for rel_path in tracked_py_files:
+            # This test file itself legitimately names the pattern it
+            # is searching for (in this docstring/these string
+            # literals) -- exclude it, not a real reference to the old
+            # package.
+            if rel_path == "pytc/test/test_df_package_compat.py":
+                continue
+            full_path = f"{repo_root}/{rel_path}"
+            with open(full_path, encoding="utf-8") as f:
+                for lineno, line in enumerate(f, start=1):
+                    if "pytc.coulomb" in line or "pytc/coulomb" in line:
+                        offenders.append(f"{rel_path}:{lineno}: {line.strip()}")
+
+        self.assertEqual(
+            offenders, [],
+            "Found stale pytc.coulomb/pytc/coulomb references in tracked "
+            "Python sources after task #14's package deletion:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_root_tc_xtc_are_shims_not_canonical_implementations(self):
+        # The root pytc/tc.py, pytc/xtc.py compatibility shims (task
+        # #14 commit A) must stay true sys.modules aliases -- neither
+        # should define its own TC/XTC class or grow back into a
+        # canonical implementation.
+        import pytc.tc
+        import pytc.xtc
+        import pytc.integrals.tc
+        import pytc.integrals.xtc
+        self.assertIs(pytc.tc, pytc.integrals.tc)
+        self.assertIs(pytc.xtc, pytc.integrals.xtc)
+
+        repo_root_tc = pytc.tc.__file__
+        repo_root_xtc = pytc.xtc.__file__
+        # Since pytc.tc IS pytc.integrals.tc (same module object), its
+        # own __file__ already points at pytc/integrals/tc.py -- confirm
+        # that directly rather than re-deriving a path.
+        self.assertTrue(repo_root_tc.endswith("pytc/integrals/tc.py"))
+        self.assertTrue(repo_root_xtc.endswith("pytc/integrals/xtc.py"))
 
 
 if __name__ == "__main__":

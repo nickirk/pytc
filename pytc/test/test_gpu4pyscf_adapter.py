@@ -1,4 +1,5 @@
-"""Tests for pytc.coulomb.gpu4pyscf_adapter (task #4, isdf-coulomb-cuda).
+"""Tests for pytc.integrals.coulomb's gpu4pyscf-adapter section (task #4,
+isdf-coulomb-cuda).
 
 Runs against plain pyscf RHF only -- no CUDA/gpu4pyscf available on this
 host. The adapter's gpu4pyscf code paths (cupy .get() conversion,
@@ -13,7 +14,7 @@ import unittest
 import numpy as np
 from pyscf import gto, scf, dft, df
 
-from pytc.coulomb.gpu4pyscf_adapter import (
+from pytc.integrals.coulomb import (
     get_mo_coeff,
     get_grid_ao_values_and_weights,
     get_naux,

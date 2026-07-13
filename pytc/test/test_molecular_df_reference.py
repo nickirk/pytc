@@ -1,4 +1,5 @@
-"""Tests for pytc.coulomb.molecular_df_reference (task #6, isdf-coulomb-cuda).
+"""Tests for pytc.integrals.coulomb's MolecularDFReference section (task #6,
+isdf-coulomb-cuda).
 
 Validation ladder steps 1-2 (decision 001):
   1. ERI-block errors vs exact DF blocks.
@@ -15,9 +16,11 @@ import unittest
 import numpy as np
 from pyscf import gto, scf, mp
 
-from pytc.coulomb.gpu4pyscf_adapter import get_mo_coeff, get_grid_ao_values_and_weights
-from pytc.coulomb.pivot_selection import weight_mo_values, select_sector_pivots
-from pytc.coulomb.molecular_df_reference import (
+from pytc.integrals.coulomb import (
+    get_mo_coeff,
+    get_grid_ao_values_and_weights,
+    weight_mo_values,
+    select_sector_pivots,
     pair_collocation_at_pivots,
     compute_C_streamed,
     compute_Z,

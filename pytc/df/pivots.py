@@ -2,7 +2,8 @@
 (pytc/df/ package reorganization, task #8, isdf-coulomb-cuda,
 2026-07-12). Both TC's own phi/gradient decomposition
 (pytc.df.isdf.isdf_decompose) and the Coulomb path's sector-aware pivot
-selection (pytc.coulomb.pivot_selection) share this module -- see
+selection (pytc.integrals.coulomb's pivot-selection section) share this
+module -- see
 pivoted_cholesky_pair_pivots's docstring for the algebraic identity that
 makes it matrix-free, and the extensive review-round history for how
 its correctness/scale-invariance guarantees were established.

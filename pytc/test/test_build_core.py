@@ -1,5 +1,5 @@
-"""Tests for pytc.coulomb.build_core (task #8 follow-up, isdf-coulomb-cuda,
-2026-07-12), TWO review rounds:
+"""Tests for pytc.integrals.coulomb's build_core orchestration section
+(task #8 follow-up, isdf-coulomb-cuda, 2026-07-12), TWO review rounds:
 
 Round 1: build_sector/build_core must reproduce exactly what the
 hand-rolled pivot-selection -> pair_collocation_at_pivots ->
@@ -49,11 +49,20 @@ import numpy as np
 from pyscf import df as pyscf_df
 from pyscf import gto, scf
 
-from pytc.coulomb.gpu4pyscf_adapter import get_mo_coeff, get_grid_ao_values_and_weights
-from pytc.coulomb.pivot_selection import weight_mo_values, select_sector_pivots
-from pytc.coulomb.molecular_df_reference import pair_collocation_at_pivots, compute_C_streamed
-from pytc.df.fit import compute_Z, compute_Z_cross
-from pytc.coulomb.build_core import build_sector, build_core, SectorFit, CoreArtifact
+from pytc.integrals.coulomb import (
+    get_mo_coeff,
+    get_grid_ao_values_and_weights,
+    weight_mo_values,
+    select_sector_pivots,
+    pair_collocation_at_pivots,
+    compute_C_streamed,
+    compute_Z,
+    compute_Z_cross,
+    build_sector,
+    build_core,
+    SectorFit,
+    CoreArtifact,
+)
 
 
 class TestBuildCore(unittest.TestCase):

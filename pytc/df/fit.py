@@ -5,8 +5,8 @@ compute_Z_cross, and reconstruct_eri_block all operate purely on (P, C)
 pair-collocation/DF-contraction matrices with zero Coulomb-specific
 content -- under the kernel-policy design (decision 001), the Poisson
 builder and any future TC channel consume this identically, which is
-precisely why it lives here rather than in pytc/coulomb/. What STAYS in
-pytc/coulomb/molecular_df_reference.py: compute_C_streamed (the
+precisely why it lives here rather than in pytc/integrals/coulomb.py.
+What STAYS in pytc/integrals/coulomb.py: compute_C_streamed (the
 DF-B-tensor route -- MolecularDFReference policy specifically) and the
 gpu4pyscf adapter.
 

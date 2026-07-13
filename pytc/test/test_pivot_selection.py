@@ -1,4 +1,5 @@
-"""Tests for pytc.coulomb.pivot_selection (task #5, isdf-coulomb-cuda).
+"""Tests for pytc.integrals.coulomb's pivot-selection section (task #5,
+isdf-coulomb-cuda).
 
 Covers: the sector-aware oo/ov/vv API on a real small system, the
 same-factor case matching pytc.df's original phi-decomposition pivot
@@ -15,8 +16,9 @@ import jax.numpy as jnp
 from pyscf import gto, scf, dft
 
 from pytc.df import pivoted_cholesky_pair_pivots, _pivoted_cholesky_phi
-from pytc.coulomb.gpu4pyscf_adapter import get_mo_coeff, get_grid_ao_values_and_weights
-from pytc.coulomb.pivot_selection import (
+from pytc.integrals.coulomb import (
+    get_mo_coeff,
+    get_grid_ao_values_and_weights,
     weight_mo_values,
     select_sector_pivots,
     select_pivots_oo_ov_vv,
