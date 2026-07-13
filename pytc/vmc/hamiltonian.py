@@ -22,17 +22,25 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     # And specifically for the total gradient on electron k:
     # grad_k U = sum_{j!=k} grad_1(rk, rj)
     
-    def compute_pair_grads(r_i, r_j):
-        g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j, jastrow_params)
+    def compute_pair_grads(i, r_i, j, r_j):
+        # Displace the i == j diagonal before evaluating: it is masked out
+        # below, but a NaN produced at r_i == r_j (0/0 in autodiff'd pair
+        # norms) survives the multiplicative mask (NaN * 0 = NaN). The
+        # displaced value is discarded by the mask, so its magnitude is
+        # irrelevant. Index-based so that genuinely coincident DISTINCT
+        # electrons still propagate their true (possibly divergent) value.
+        r_j_safe = jnp.where(i == j, r_j + 1.0, r_j)
+        g1, l1 = sj.jastrow.get_log_grads_r1(r_i, r_j_safe, jastrow_params)
         return g1, l1
         
-    # vmap over j (inner), then i (outer)
-    inner_vmap = jax.vmap(compute_pair_grads, in_axes=(None, 0))
-    outer_vmap = jax.vmap(inner_vmap, in_axes=(0, None))
+    # vmap over j (inner), then i (outer), carrying electron indices
+    inner_vmap = jax.vmap(compute_pair_grads, in_axes=(None, None, 0, 0))
+    outer_vmap = jax.vmap(inner_vmap, in_axes=(0, 0, None, None))
     
     # Compute for all pairs
     # g1s: (N, N, 3), l1s: (N, N)
-    g1s, l1s = outer_vmap(elec_coords, elec_coords)
+    idx = jnp.arange(n_electrons)
+    g1s, l1s = outer_vmap(idx, elec_coords, idx, elec_coords)
     
     # 3. Mask diagonal (i == j)
     mask = 1.0 - jnp.eye(n_electrons)

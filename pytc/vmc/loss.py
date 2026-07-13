@@ -79,13 +79,16 @@ def make_energy_loss(
                 aux: AuxData namedtuple with (mean_energy, energy_std, clipped_energies, diff)
                      Can be indexed as aux[0], aux[1] for backward compatibility
             """
-            # Extract walkers from batch
+            # Extract walkers from batch. The custom-JVP path always
+            # evaluates with the factory ansatz (primal AND tangent); a
+            # batch-carried ansatz in the (walkers, ansatz) convention is
+            # honored only by the non-JVP variant below. Mixing the two
+            # here would make the primal energies and the JVP tangent
+            # disagree.
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                walkers, ansatz_arg = batch_data
-                ansatz_dynamic = ansatz_arg
+                walkers = batch_data[0]
             else:
                 walkers = batch_data
-                ansatz_dynamic = ansatz
             
             # Compute all local energies using vmap (or batched_vmap)
             energies = batch_local_energy(walkers, params)
@@ -137,20 +140,20 @@ def make_energy_loss(
             clipped_energies = aux_data.clipped_energies
             diff = aux_data.diff
             
-            # Extract walkers from batch_data
-            if isinstance(batch_data, tuple):
+            # Extract walkers from batch_data, mirroring the forward pass.
+            # The tangent uses the factory ansatz, matching the primal
+            # energies above (see the forward-pass note).
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 walkers = batch_data[0]
             else:
                 walkers = batch_data
-            
-         # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
-            # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
+
+            # batch_network takes (walkers, params) but we only differentiate
+            # params, so curry it to a function of params alone.
             def log_psi_fn(p):
                 # Use standard vmap with checkpointing for correct global gradients
                 return vmap_impl(
-                    jax.checkpoint(lambda w, p: ansatz_dynamic(w, p)[0][1]),
+                    jax.checkpoint(lambda w, p: ansatz(w, p)[0][1]),
                     in_axes=(0, None),
                     out_axes=0
                     )(walkers, p)
