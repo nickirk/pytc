@@ -287,3 +287,177 @@ def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
     term_q = jnp.matmul(phi_piv_q.conj().T, phi_q_batch)
     atb = term_p * term_q
     return jsp_linalg.cho_solve((chol, lower), atb)
+
+
+def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=None):
+    """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V, via a
+    relative-spectral-threshold truncated pseudo-inverse of Pi (task #21,
+    #proj-isdf-periodic, design v2.1 section 5). NEW function, added
+    beside the existing SVD/eigh-based solvers above -- reuses NumPy's
+    eigh, not previously-existing code.
+
+    Both Pi and V are Hermitized on entry (their own anti-Hermitian
+    residuals are recorded, not silently discarded). Pi is eigendecomposed
+    (Hermitian, PSD expected); modes are retained by the RELATIVE
+    threshold s_i > rtol * s_max (scale-invariant -- rescaling Pi/V by a
+    constant does not change which modes are retained). Let U_r be the
+    retained eigenvectors and Sigma_r their eigenvalues; the truncated
+    pseudo-inverse is Pi^+_r = U_r Sigma_r^-1 U_r^dagger, and
+    W = Pi^+_r V Pi^+_r, Hermitized.
+
+    Because U_r consists of Pi's OWN eigenvectors, Pi @ Pi^+_r =
+    Pi^+_r @ Pi = Proj_r (the retained-subspace projector) EXACTLY (to
+    the precision of the eigendecomposition) -- so Pi W Pi = Proj_r V
+    Proj_r exactly on the retained subspace BY CONSTRUCTION, and the
+    total error against the full V is entirely the DISCARDED-space part
+    of V. Two residuals are reported SEPARATELY rather than one combined
+    number, so this cannot be hidden:
+        (i)  retained-space solve residual (machine-tier; should be ~0
+             regardless of rtol -- a numerical sanity check on the
+             eigendecomposition/solve arithmetic, not a scientific gate):
+             ||Proj_r (Pi W Pi - V) Proj_r||_F / ||Proj_r V Proj_r||_F
+        (ii) truncation residual (controlled by rtol/mode retention;
+             REPORTED, not gated here -- its physical consequence is
+             gated downstream at consumer parity):
+             ||V - Proj_r V Proj_r||_F / ||V||_F
+
+    Args:
+        Pi: (n,n) array, Hermitian PSD expected (Hermitized internally
+            regardless).
+        V: (n,n) array, Hermitized internally.
+        rtol: relative spectral retention threshold (default 1e-8).
+        target_truncation_residual: optional. If given, after the
+            rtol-based retention, ADDITIONAL modes (in decreasing
+            eigenvalue order) are retained one at a time until the
+            truncation residual meets this target or all n modes are
+            retained -- recorded via adaptive_retention_used=True and
+            the realized target. The default rtol makes NO promise
+            about the truncation residual; this is how a caller opts
+            into one.
+
+    Returns:
+        (W, info) where info is a dict with keys: n_retained,
+        n_discarded, s_max, s_min_retained (None if n_retained==0),
+        pi_anti_hermitian_residual, v_anti_hermitian_residual,
+        retained_solve_residual, truncation_residual, rtol,
+        adaptive_retention_used, target_truncation_residual (the
+        realized target, or None), dtype, backend ("numpy").
+
+    Raises:
+        ValueError: Pi/V are not square/matching-shape 2-D arrays, or
+            rtol/target_truncation_residual are not finite positive
+            numbers.
+    """
+    Pi = np.asarray(Pi)
+    V = np.asarray(V)
+    if Pi.ndim != 2 or Pi.shape[0] != Pi.shape[1]:
+        raise ValueError(f"Pi must be a square 2-D array, got shape {Pi.shape}.")
+    n = Pi.shape[0]
+    if n == 0:
+        raise ValueError("Pi must be nonempty.")
+    if V.shape != (n, n):
+        raise ValueError(f"V must have shape {(n, n)} matching Pi, got {V.shape}.")
+    if not np.all(np.isfinite(Pi)) or not np.all(np.isfinite(V)):
+        raise ValueError("Pi and V must be finite.")
+
+    if isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
+        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+    rtol = float(rtol)
+    if not np.isfinite(rtol) or rtol <= 0.0:
+        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+
+    if target_truncation_residual is not None:
+        if isinstance(target_truncation_residual, bool) or not isinstance(
+            target_truncation_residual, (int, float)
+        ):
+            raise ValueError(
+                f"target_truncation_residual must be None or a finite non-negative "
+                f"float, got {target_truncation_residual!r}."
+            )
+        target_truncation_residual = float(target_truncation_residual)
+        if not np.isfinite(target_truncation_residual) or target_truncation_residual < 0.0:
+            raise ValueError(
+                f"target_truncation_residual must be None or a finite non-negative "
+                f"float, got {target_truncation_residual!r}."
+            )
+
+    tiny = np.finfo(np.result_type(Pi.dtype, V.dtype, np.complex128)).tiny
+
+    Pi_herm = (Pi + Pi.conj().T) / 2
+    V_herm = (V + V.conj().T) / 2
+    pi_anti_hermitian_residual = float(np.linalg.norm(Pi - Pi.conj().T)) / max(
+        float(np.linalg.norm(Pi)), tiny
+    )
+    v_anti_hermitian_residual = float(np.linalg.norm(V - V.conj().T)) / max(
+        float(np.linalg.norm(V)), tiny
+    )
+
+    # eigh returns eigenvalues ASCENDING; reverse to descending so
+    # "the first n_retained" are the largest, and adaptive retention can
+    # grow n_retained by simply extending the slice.
+    eigvals_asc, eigvecs_asc = np.linalg.eigh(Pi_herm)
+    order = np.argsort(eigvals_asc)[::-1]
+    eigvals = eigvals_asc[order]
+    eigvecs = eigvecs_asc[:, order]
+
+    s_max = float(eigvals[0]) if n > 0 else 0.0
+    if s_max <= 0.0:
+        raise ValueError(
+            "Pi's largest eigenvalue is non-positive after Hermitization -- Pi does "
+            "not appear to be PSD (or is the zero matrix)."
+        )
+    threshold = rtol * s_max
+    n_retained = int(np.sum(eigvals > threshold))
+
+    v_norm = max(float(np.linalg.norm(V_herm)), tiny)
+    adaptive_retention_used = False
+
+    def _truncation_residual(k):
+        U_r = eigvecs[:, :k]
+        proj = U_r @ U_r.conj().T
+        return float(np.linalg.norm(V_herm - proj @ V_herm @ proj)) / v_norm
+
+    if target_truncation_residual is not None:
+        current = _truncation_residual(n_retained) if n_retained > 0 else 1.0
+        while current > target_truncation_residual and n_retained < n:
+            n_retained += 1
+            adaptive_retention_used = True
+            current = _truncation_residual(n_retained)
+
+    n_discarded = n - n_retained
+    U_r = eigvecs[:, :n_retained]
+    sigma_r = eigvals[:n_retained]
+    s_min_retained = float(np.min(sigma_r)) if n_retained > 0 else None
+
+    if n_retained > 0:
+        Pi_pinv_r = U_r @ np.diag(1.0 / sigma_r) @ U_r.conj().T
+        W = Pi_pinv_r @ V_herm @ Pi_pinv_r
+        W = (W + W.conj().T) / 2
+        proj_r = U_r @ U_r.conj().T
+        retained_target = proj_r @ V_herm @ proj_r
+        retained_solve = proj_r @ (Pi_herm @ W @ Pi_herm - V_herm) @ proj_r
+        retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
+            float(np.linalg.norm(retained_target)), tiny
+        )
+        truncation_residual = _truncation_residual(n_retained)
+    else:
+        W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
+        retained_solve_residual = 0.0
+        truncation_residual = 1.0
+
+    info = {
+        "n_retained": n_retained,
+        "n_discarded": n_discarded,
+        "s_max": s_max,
+        "s_min_retained": s_min_retained,
+        "pi_anti_hermitian_residual": pi_anti_hermitian_residual,
+        "v_anti_hermitian_residual": v_anti_hermitian_residual,
+        "retained_solve_residual": retained_solve_residual,
+        "truncation_residual": truncation_residual,
+        "rtol": rtol,
+        "adaptive_retention_used": adaptive_retention_used,
+        "target_truncation_residual": target_truncation_residual,
+        "dtype": str(W.dtype),
+        "backend": "numpy",
+    }
+    return W, info
