@@ -27,7 +27,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=5.0, max_delta_norm=0.5, mesh=None):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=0.0, max_delta_norm=None, mesh=None):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -38,33 +38,16 @@ class NewtonOptimizer:
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
         self.jacobian_sample_size = jacobian_sample_size
         self.clip_multiplier = clip_multiplier
-        # Hardening for the near-nodal walker population that is a
-        # permanent feature of |Det|^2 sampling (goal-1 VMC-scaling NaN
-        # hunt, #proj-pytc-efficiency-refactor): a walker whose Slater
-        # inverse is huge-but-finite (mid nodal-surface crossing) can
-        # still contribute a huge-but-finite Jacobian row, which can pull
-        # a near-flat GN curvature direction to near-zero and produce an
-        # enormous Newton step (observed empirically: |delta|~1770 at a
-        # 43-param (H2O)25/W=5000 production point, loss exploding 3600x
-        # in the very next chained sub-step). A single clip pass isn't
-        # enough on its own -- a walker can be genuinely non-finite (not
-        # just huge), which the gauss_newton path also excludes (zero +
-        # drop from stats, same treatment as a padding row) before any
-        # clipping runs. max_delta_norm is a RELATIVE trust-region radius
-        # (multiplied by max(1, ||params||) at use time, not a fixed
-        # constant -- a fixed value derived from already-diverged deltas
-        # stays enormous once params return to a normal ~O(1) scale).
-        # 0/None disables jac_row_clip_multiplier/max_delta_norm independently.
+        # Opt-in hardening against huge-but-finite Jacobian rows from
+        # near-nodal walkers: jac_row_clip_multiplier rescales outlier rows;
+        # max_delta_norm is a trust-region radius RELATIVE to
+        # max(1, ||params||). Both OFF by default (0/None) to preserve the
+        # numerics of existing calculations; enable explicitly for runs that
+        # chain many sub-optimizations.
         self.jac_row_clip_multiplier = jac_row_clip_multiplier
         self.max_delta_norm = max_delta_norm
-        # The Mesh optimize_ref_var/optimize build for sharded walkers
-        # (walker init, MCMC via make_mcmc_step) -- threaded through
-        # explicitly so _get_vmap/_get_unbatched_vmap use the SAME mesh
-        # instance instead of get_vmap_fn/shard_vmap silently re-deriving
-        # one via create_mesh() when mesh=None. Re-derivation was already
-        # correct on a stable single-node device topology (create_mesh()
-        # is deterministic over jax.devices()), so passing it explicitly
-        # closes a latent fragility rather than a live bug.
+        # Thread one Mesh instance through so _get_vmap uses the same mesh
+        # as walker init/MCMC instead of re-deriving one when mesh=None.
         self.mesh = mesh
 
     def _get_vmap(self):
@@ -479,18 +462,10 @@ class NewtonOptimizer:
                 
             delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, **solve_kwargs)
 
-            # Trust-region cap: a near-flat curvature direction (small
-            # eigenvalue relative to damping) can produce an enormous step
-            # even though the solve itself stays finite -- observed
-            # empirically at production scale (|delta|~1770 for a 43-param
-            # GN system, loss exploding 3600x the very next chained
-            # sub-step). Rescale the whole step (direction preserved)
-            # rather than clamp components. The bound is RELATIVE to the
-            # current param scale (0.5 * max(1, ||params||)), not a fixed
-            # constant -- an earlier fixed max_delta_norm=10 was derived
-            # from already-diverged post-explosion deltas, not the actual
-            # param landscape, and stayed enormous relative to
-            # params of magnitude ~1.
+            # Trust-region cap (opt-in): rescale the whole step (direction
+            # preserved) when a near-flat curvature direction yields a huge
+            # but finite step; the bound is relative to max(1, ||params||)
+            # so it tracks the parameter scale.
             if self.max_delta_norm is not None and self.max_delta_norm > 0:
                 params_vec_for_scale, _ = jax.flatten_util.ravel_pytree(params)
                 trust_radius = self.max_delta_norm * jnp.maximum(1.0, jnp.linalg.norm(params_vec_for_scale))
@@ -669,8 +644,8 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             solve_kwargs=merged_kwargs.get("solve_kwargs", None),
             jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
             clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
-            jac_row_clip_multiplier=merged_kwargs.get("jac_row_clip_multiplier", 5.0),
-            max_delta_norm=merged_kwargs.get("max_delta_norm", 0.5),
+            jac_row_clip_multiplier=merged_kwargs.get("jac_row_clip_multiplier", 0.0),
+            max_delta_norm=merged_kwargs.get("max_delta_norm", None),
             mesh=merged_kwargs.get("mesh", None),
         )
     else:

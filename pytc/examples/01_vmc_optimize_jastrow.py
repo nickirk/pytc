@@ -127,7 +127,7 @@ def main():
     phase_b_params = phase_a["params"][-1]
     # Seed phase B with phase A's final walkers: they are already
     # equilibrated and have tracked the slowly-moving parameters, so no
-    # second cold start (previously another 2000-sweep burn-in) is paid.
+    # second cold start is paid.
     # For a walker-count INCREASE between phases, use resample_walkers
     # (+ a short adaptive_burn_in on the resampled ensemble) instead.
     phase_b = optimize_ref_var(

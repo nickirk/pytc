@@ -1070,10 +1070,11 @@ def evaluate_ref_var(
             "acceptance": pmove_val,
         }
         batches.append(batch_stats)
+        accept_str = f"{pmove_val:.3f}" if pmove_val is not None else "n/a"
         logger.info(
             f"Eval batch {b:3d} | Var: {variance:.6f} | E: {e_mean:.6f} | "
             f"clipped_frac: {clipped_fraction:.4f} | max|E_L|: {batch_stats['max_abs_local_energy']:.4f} | "
-            f"Accept: {pmove_val:.3f}"
+            f"Accept: {accept_str}"
         )
 
     return {

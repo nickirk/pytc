@@ -353,6 +353,10 @@ def save_optimization_history(data: Dict[str, Any], filepath: str) -> str:
                 # Now save the single stacked PyTree structure
                 _save_element(f, 'params', stacked_params)
             elif key not in _skip_keys:
+                if value is None:
+                    # h5py cannot store None (e.g. 'final_opt_state' from
+                    # non-Newton optimizers).
+                    continue
                 # Top level metrics (cost, energies, stds, acceptance,
                 # final_opt_state) are arrays/scalars.
                 f.create_dataset(key, data=value)

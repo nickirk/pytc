@@ -317,22 +317,11 @@ class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
 
 
 class TestBoysHandyAnalyticalNearCoalescence(unittest.TestCase):
-    """Regression suite for the epsilon-default bug:
-    ``BoysHandyAnalytical.create()``
-    defaulted ``epsilon=1e-8`` while ``BoysHandy.create()`` defaults to
-    ``1e-16``. ``_safe_norm``'s epsilon floors the e-e distance at
-    ``sqrt(epsilon)`` -- with the mismatched default, BHA's Laplacian
-    (which has an explicit ``2*f_d1/dist`` term) incorrectly PLATEAUED
-    instead of diverging as two electrons approach coalescence, while BH's
-    reference kept the correct ``1/r`` cusp growth. Diverged to a
-    completely different value (including sign flips) from BH by
-    separations as mild as 1e-4 bohr, with the tighter epsilon default
-    now fixed. This suite locks BH-vs-BHA agreement across the whole
-    near-coalescence regime, in both VALUES and PARAMETER GRADIENTS --
-    the original validation gap: the pre-existing pair-grid test only
-    checked forward values at random (not near-degenerate) configurations,
-    and no test differentiated w.r.t. Jastrow params at all, so this
-    exact bug shipped undetected.
+    """Locks BH-vs-BHA agreement across the near-coalescence regime, in
+    values, spatial derivatives, AND parameter gradients: both classes must
+    share the same ``epsilon`` default, since ``_safe_norm`` floors the e-e
+    distance at ``sqrt(epsilon)`` and any mismatch splits the two Laplacians
+    near coalescence.
     """
 
     EPS_SERIES = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]

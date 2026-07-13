@@ -439,8 +439,10 @@ class TestJastrowTermsPolymorphicDispatch(unittest.TestCase):
             e_base = compute_single_walker_energy(ansatz_base, walker_w, params_base)
             e_override = compute_single_walker_energy(
                 ansatz_override, walker_w, params_override)
+            # Tight but not bit-exact: the two paths use different op
+            # orderings, which coincide only for special parameter values.
             np.testing.assert_allclose(
-                float(e_override), float(e_base), rtol=0, atol=0,
+                float(e_override), float(e_base), rtol=1e-12, atol=1e-12,
                 err_msg=f"walker {w}: BoysHandyAnalytical E_L != generic BoysHandy E_L")
 
     def test_lih(self):
@@ -466,8 +468,7 @@ H -0.757 -0.586  2.900
 
 class TestJastrowTermsCompositeLengthMismatch(unittest.TestCase):
     """A CompositeJastrow/params length mismatch must raise, not silently
-    truncate via zip() and return a wrong (partial) energy (GitHub review,
-    whole-electron-set contraction)."""
+    truncate via zip() and return a wrong (partial) energy."""
 
     def test_extra_component_raises(self):
         mol = gto.M(atom="Li 0 0 0; H 0 0 1.6", basis="sto-3g", unit="Bohr", verbose=0)

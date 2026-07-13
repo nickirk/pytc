@@ -117,8 +117,7 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None, log_in
                 f"{actual_n} walkers but n_walkers={n_walkers} was "
                 f"requested. Resample to the target size explicitly "
                 f"(mcmc_utils.resample_walkers) if you intend a different "
-                f"walker count than the checkpoint -- this used to be a "
-                f"silent no-op that returned the wrong walker count."
+                f"walker count than the checkpoint."
             )
         return initial_walkers
 
