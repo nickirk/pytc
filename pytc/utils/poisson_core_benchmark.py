@@ -28,6 +28,9 @@ Examples::
     python -m pytc.utils.poisson_core_benchmark --emit-matrix --backend jax \
         --output p2c_matrix.json
 
+    python -m pytc.utils.poisson_core_benchmark --matrix-index 0 --backend jax \
+        --output p2c_case_0.json
+
 Task #16, #proj-isdf-coulomb-cuda, 2026-07-13.
 """
 
@@ -511,9 +514,22 @@ def recommended_matrix(backend: str = "jax") -> list[dict[str, Any]]:
     return [asdict(c) for c in cases]
 
 
+def matrix_case(index: int, backend: str = "jax") -> BenchmarkCase:
+    """Resolve one recommended sweep case for a cluster job-array index."""
+    matrix = recommended_matrix(backend)
+    if isinstance(index, bool) or index < 0 or index >= len(matrix):
+        raise ValueError(f"matrix index must be in [0, {len(matrix)}), got {index!r}")
+    return BenchmarkCase(**matrix[index])
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--emit-matrix", action="store_true")
+    selection = p.add_mutually_exclusive_group()
+    selection.add_argument("--emit-matrix", action="store_true")
+    selection.add_argument(
+        "--matrix-index", type=int,
+        help="run this zero-based case from the recommended matrix; other case flags are ignored",
+    )
     p.add_argument("--system", choices=sorted(SYSTEMS), default="H2O_ccpVDZ")
     p.add_argument("--spacing", type=float, default=0.35)
     p.add_argument("--margin", type=float, default=6.0)
@@ -541,14 +557,17 @@ def main(argv: list[str] | None = None) -> int:
                 handle.write(payload + "\n")
         print(payload)
         return 0
-    case = BenchmarkCase(
-        system=args.system, spacing=args.spacing, margin=args.margin,
-        pad_factor=args.pad_factor, rank_factor=args.rank_factor,
-        backend=args.backend, auxbasis=args.auxbasis,
-        ao_batch_size=args.ao_batch_size, grid_batch_size=args.grid_batch_size,
-        mu_block_size=args.mu_block_size, nu_block_size=args.nu_block_size,
-        rcond=args.rcond, repeats=args.repeats, num_threads=args.num_threads,
-    )
+    if args.matrix_index is not None:
+        case = matrix_case(args.matrix_index, args.backend)
+    else:
+        case = BenchmarkCase(
+            system=args.system, spacing=args.spacing, margin=args.margin,
+            pad_factor=args.pad_factor, rank_factor=args.rank_factor,
+            backend=args.backend, auxbasis=args.auxbasis,
+            ao_batch_size=args.ao_batch_size, grid_batch_size=args.grid_batch_size,
+            mu_block_size=args.mu_block_size, nu_block_size=args.nu_block_size,
+            rcond=args.rcond, repeats=args.repeats, num_threads=args.num_threads,
+        )
     result = run_case(case)
     payload = json.dumps(result, indent=2, sort_keys=True)
     if args.output:

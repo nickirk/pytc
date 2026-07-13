@@ -8,6 +8,7 @@ from pyscf import gto
 from pytc.utils.poisson_core_benchmark import (
     BenchmarkCase,
     centered_uniform_mesh,
+    matrix_case,
     mp2_energy_from_ovov,
     recommended_matrix,
 )
@@ -51,6 +52,15 @@ class TestPoissonCoreBenchmarkProtocol(unittest.TestCase):
         self.assertIn(3, {case["pad_factor"] for case in matrix})
         self.assertIn(0.25, {case["spacing"] for case in matrix if case["system"] == "H2O_ccpVDZ"})
         self.assertIn(6.0, {case["rank_factor"] for case in matrix if case["system"] == "benzene_ccpVDZ"})
+
+    def test_matrix_case_resolves_and_bounds_checks_job_array_index(self):
+        matrix = recommended_matrix("jax")
+        self.assertEqual(matrix_case(0, "jax"), BenchmarkCase(**matrix[0]))
+        self.assertEqual(matrix_case(len(matrix) - 1, "jax"), BenchmarkCase(**matrix[-1]))
+        with self.assertRaises(ValueError):
+            matrix_case(-1, "jax")
+        with self.assertRaises(ValueError):
+            matrix_case(len(matrix), "jax")
 
 
 if __name__ == "__main__":
