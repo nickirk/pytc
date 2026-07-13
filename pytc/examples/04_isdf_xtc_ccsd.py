@@ -16,7 +16,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 from pyscf import gto, scf
 
-from pytc import xtc
+from pytc.integrals import xtc
 from pytc.jastrow import REXP
 from pytc.solver import jax_xtc_ccsd
 

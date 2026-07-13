@@ -3,8 +3,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
-from pytc.tc import TC, ISDFTC
-from pytc.xtc import XTC, ISDFXTC
+from pytc.integrals.tc import TC, ISDFTC
+from pytc.integrals.xtc import XTC, ISDFXTC
 from pytc.jastrow.rexp import REXP
 
 jax.config.update("jax_enable_x64", True)

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 from pytc.df import isdf_decompose
-from pytc.tc import TC
+from pytc.integrals.tc import TC
 
 jax.config.update("jax_enable_x64", True)
 

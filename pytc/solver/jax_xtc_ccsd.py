@@ -9,7 +9,7 @@ from pyscf import lib
 from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
-from pytc import xtc as xtc_mod
+from pytc.integrals import xtc as xtc_mod
 from pytc.utils.gpu_memory import resolve_vvvv_panel_block_sizes
 from pytc.utils.gpu_memory import estimate_blksize
 
@@ -933,7 +933,7 @@ def _update_amps(cc, t1, t2, eris):
     t2new_host /= eijab_np
     
     # Release the X slice cache at the end of each iteration.
-    from pytc.xtc import invalidate_X_cache
+    from pytc.integrals.xtc import invalidate_X_cache
     invalidate_X_cache()
 
     logger.debug("_update_amps finished in %.3f s", time.perf_counter()-t_start)

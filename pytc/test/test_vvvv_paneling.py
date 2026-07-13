@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from pyscf import lib
 
-from pytc import xtc as xtc_mod
+from pytc.integrals import xtc as xtc_mod
 from pytc.solver import jax_xtc_ccsd, xtc_ccsd
 from pytc.utils import gpu_memory
 from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize
@@ -180,7 +180,7 @@ class TestTileMemory(unittest.TestCase):
 
     def test_isdf_tile_peak_bytes_formula(self):
         """Verify the individual term breakdown matches _estimate_delta_u_direct_tile_bytes."""
-        from pytc.xtc import _estimate_delta_u_direct_tile_bytes
+        from pytc.integrals.xtc import _estimate_delta_u_direct_tile_bytes
         for Np, Nq, Nr, Ns, Nf in [(5, 10, 5, 10, 200), (21, 21, 21, 1179, 500)]:
             ref = _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, Nf)
             got = isdf_tile_peak_bytes(Np, Nq, Nr, Ns, Nf, include_d=True)
@@ -418,7 +418,7 @@ class TestSolverRoundRobin(unittest.TestCase):
             from types import SimpleNamespace
 
             from pytc.solver import jax_xtc_ccsd, xtc_ccsd
-            from pytc import xtc as xtc_mod
+            from pytc.integrals import xtc as xtc_mod
 
             calls = []
 
@@ -591,7 +591,7 @@ class TestComputeMediumBlocksTiled(unittest.TestCase):
 
         def _assemble_2b_tile(self, jastrow_params, kernels, ranges,
                                device=None, panel_size=None, panel_layout="pr"):
-            from pytc.tc import _normalize_panel_layout
+            from pytc.integrals.tc import _normalize_panel_layout
             layout = _normalize_panel_layout(panel_layout)
             sp, sq, sr, ss = ranges
             block = self._tc[sp, sq, sr, ss].copy()
