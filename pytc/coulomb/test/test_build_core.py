@@ -404,6 +404,53 @@ class TestBuildCore(unittest.TestCase):
                 self.coords, self.weights, self.n_rank_ov,
                 upstream_provenance={"box": Box()})
 
+    # ---- Round 5, findings 1-3: closing the remaining schema edges ----
+
+    def test_deep_freeze_rejects_non_str_mapping_key(self):
+        # Alice's round-5 repro: a mutable-but-hashable custom key
+        # object stays aliased if only VALUES are frozen -- provenance
+        # keys must be str.
+        class Key:
+            def __init__(self):
+                self.value = 1
+
+        with self.assertRaises(TypeError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov,
+                upstream_provenance={"nested": {Key(): 1}})
+
+    def test_deep_freeze_rejects_object_dtype_array(self):
+        # Alice's round-5 repro: setflags(write=False) only blocks
+        # reassigning array ELEMENTS, not mutating the arbitrary Python
+        # objects an object-dtype array's elements reference.
+        class Box:
+            def __init__(self):
+                self.value = 1
+
+        obj_array = np.array([Box(), Box()], dtype=object)
+        with self.assertRaises(TypeError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov,
+                upstream_provenance={"boxes": obj_array})
+
+    def test_deep_freeze_recurses_through_numpy_scalar_item(self):
+        # np.generic.item() must be fed back through _deep_freeze, not
+        # returned directly -- a structured/object numpy scalar can
+        # .item() into something that itself still needs validation.
+        # Plain numeric scalars are the common case and must still work
+        # (a regression on this would break e.g. numerical_rank fields
+        # derived from numpy computations upstream).
+        sector = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov,
+            upstream_provenance={"numpy_float": np.float64(3.5), "numpy_int": np.int64(7)})
+        self.assertEqual(sector.provenance["upstream_provenance"]["numpy_float"], 3.5)
+        self.assertIsInstance(sector.provenance["upstream_provenance"]["numpy_float"], float)
+        self.assertEqual(sector.provenance["upstream_provenance"]["numpy_int"], 7)
+        self.assertIsInstance(sector.provenance["upstream_provenance"]["numpy_int"], int)
+
     def test_mutating_caller_upstream_dict_after_build_does_not_alter_artifact(self):
         # build_sector must not alias the caller's own dict either --
         # mutating the ORIGINAL dict passed in after the call must not

@@ -155,30 +155,71 @@ def _deep_freeze(obj, _path="<root>"):
     it. Callers must normalize custom objects (e.g. pathlib.Path,
     version objects) to strings before passing them in
     upstream_provenance.
+
+    3 more closures (Alice's 5th round, 2026-07-13 -- the schema was
+    still open at edges the container-level checks didn't reach):
+    - Mapping KEYS were copied unchanged, only values were frozen -- a
+      mutable-but-hashable custom key object stayed aliased (and could
+      even corrupt dict lookup if its hash changed after the fact).
+      All provenance keys are our own string literals internally, so
+      keys are now required to be str (raises TypeError otherwise) --
+      free to enforce, closes the hole.
+    - np.ndarray with dtype.hasobject (an object-dtype array) was made
+      read-only only at the CONTAINER level -- setflags(write=False)
+      blocks reassigning array ELEMENTS, but each element is itself a
+      reference to an arbitrary Python object, and mutating THAT
+      object's own state (Alice's repro: a Box stored in an object
+      array) still leaked through despite the array being "read-only".
+      Rejected outright (TypeError) rather than attempting to
+      recursively normalize each element -- rejection is safer for a
+      provenance schema than a partial/best-effort per-element freeze.
+    - np.generic (numpy scalar) fed its .item() result straight back to
+      the caller without re-validating it -- for plain numeric scalars
+      .item() gives an already-immutable Python float/int/bool, but for
+      STRUCTURED numpy scalars .item() can return a tuple or an object
+      that itself needs recursive validation. Now recurses through
+      _deep_freeze(obj.item(), _path) instead of returning it directly.
     """
     if isinstance(obj, types.MappingProxyType):
         obj = dict(obj)
     if isinstance(obj, dict):
-        return types.MappingProxyType({
-            k: _deep_freeze(v, f"{_path}[{k!r}]") for k, v in obj.items()
-        })
+        frozen = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise TypeError(
+                    f"_deep_freeze: unsupported mapping key at {_path}: "
+                    f"{type(k).__name__} ({k!r}) -- provenance mapping keys must "
+                    f"be str (all internal provenance keys already are; a "
+                    f"non-str/mutable key would stay aliased to the caller)."
+                )
+            frozen[k] = _deep_freeze(v, f"{_path}[{k!r}]")
+        return types.MappingProxyType(frozen)
     if isinstance(obj, (list, tuple)):
         return tuple(_deep_freeze(v, f"{_path}[{i}]") for i, v in enumerate(obj))
     if isinstance(obj, (set, frozenset)):
         return frozenset(_deep_freeze(v, _path) for v in obj)
     if isinstance(obj, np.ndarray):
+        if obj.dtype.hasobject:
+            raise TypeError(
+                f"_deep_freeze: unsupported object-dtype array at {_path} "
+                f"(dtype={obj.dtype}) -- setflags(write=False) only blocks "
+                f"reassigning array elements, not mutating the arbitrary Python "
+                f"objects those elements reference. Normalize to a non-object "
+                f"dtype or a plain list/tuple of already-immutable values before "
+                f"passing it in upstream_provenance."
+            )
         return _readonly_copy(obj)
     if isinstance(obj, np.generic):
-        return obj.item()
+        return _deep_freeze(obj.item(), _path)
     if isinstance(obj, _DEEP_FREEZE_IMMUTABLE_SCALAR_TYPES):
         return obj
     raise TypeError(
         f"_deep_freeze: unsupported object at {_path}: {type(obj).__name__} "
-        f"({obj!r}) -- provenance values must be a Mapping/list/tuple/set/"
-        f"frozenset/np.ndarray/np.generic, or an immutable scalar (None, bool, "
-        f"int, float, complex, str, bytes). Normalize custom objects (e.g. "
-        f"pathlib.Path, version objects) to strings before passing them in "
-        f"upstream_provenance."
+        f"({obj!r}) -- provenance values must be a Mapping (str keys)/list/"
+        f"tuple/set/frozenset/np.ndarray (non-object dtype)/np.generic, or an "
+        f"immutable scalar (None, bool, int, float, complex, str, bytes). "
+        f"Normalize custom objects (e.g. pathlib.Path, version objects) to "
+        f"strings before passing them in upstream_provenance."
     )
 
 
