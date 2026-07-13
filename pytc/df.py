@@ -283,6 +283,26 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     further raw-track precision is scientifically needed; above that
     threshold, the raw pivot is ALWAYS genuinely deflated regardless of
     how small it looks in absolute terms.
+
+    Round-5 fix (Alice's 4th re-review, 2026-07-12): Round 4's
+    ``small_eps = 100 * eps(dtype) * max_diag`` can EXCEED the
+    scientific ``eff_tol = effective_rank_rtol * max_diag`` in float32
+    (100*eps ~= 1.2e-5, larger than the default rtol=1e-6) -- a pivot
+    can be scientifically effective (raw residual >= eff_tol) while the
+    OFFICIAL L update still calls it "small" and skips deflation. The
+    test module's module-level x64 config hides this in float64 (where
+    100*eps ~= 2.2e-14, always far below any reasonable rtol), so this
+    needs an explicit float32 regression to stay caught.
+    INVARIANT: the numerical threshold must never exceed the scientific
+    one, else effective pivots skip deflation and the prefix breaks in
+    low precision. Fixed with ``small_eps = min(100*eps(dtype),
+    0.1*effective_rank_rtol) * max_diag`` -- the min() with a c=0.1
+    factor guarantees small_eps < eff_tol always, regardless of dtype
+    or rtol choice. Also fixed a related dtype-propagation gap exposed
+    while reproducing this in float32: ``L``/``L_raw`` were allocated
+    via bare ``jnp.zeros(...)`` (no explicit dtype), silently following
+    JAX's ambient x64-flag default rather than the actual input dtype --
+    now explicitly ``dtype=diag_err.dtype``.
     """
     n_grid = factor_p_weighted.shape[1]
     if n_rank > n_grid:
@@ -333,7 +353,18 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         # 3rd re-review, 2026-07-12: one-feature rank-1 factors with two
         # identical nonzero columns, rescaled by 1e-4, wrongly reported
         # effective_rank=2 for an analytically rank-1 problem).
-        small_eps = 100.0 * jnp.finfo(diag_err.dtype).eps * max_diag
+        # INVARIANT: the numerical threshold must never exceed the
+        # scientific one, else a pivot judged effective by eff_tol gets
+        # skipped by the official L update and never deflated -- its
+        # duplicate/correlated twin then looks like fresh signal, and
+        # the prefix latch closes too early, silently dropping later
+        # genuinely-independent signal (Alice's 4th re-review,
+        # 2026-07-12: 100*eps is ~1.2e-5 in float32, LARGER than the
+        # default effective_rank_rtol=1e-6 -- the x64-enabled test
+        # module hid this path entirely). min() with c=0.1 guarantees
+        # small_eps < eff_tol always, regardless of dtype or rtol.
+        small_eps = jnp.minimum(100.0 * jnp.finfo(diag_err.dtype).eps,
+                                 0.1 * effective_rank_rtol) * max_diag
         # Tie-break ramp span normalized to stay ~1e-12*max_diag
         # REGARDLESS of n_grid (divide by n_grid-1) -- the previous
         # unnormalized ``1e-12 * arange(n_grid)`` had a span growing with
@@ -348,7 +379,11 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         small_eps = 0.0
         diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * max_diag
 
-    L = jnp.zeros((n_grid, n_rank))
+    # Explicit dtype (not JAX's ambient x64-flag default) so mixed-
+    # precision callers (e.g. float32 inputs under a process that has
+    # jax_enable_x64 on for other code) get a float32 L/L_raw trajectory
+    # matching diag_err's own dtype, not a silently-upcast float64 one.
+    L = jnp.zeros((n_grid, n_rank), dtype=diag_err.dtype)
     pivots = jnp.zeros(n_rank, dtype=int)
     selected_mask = jnp.zeros(n_grid, dtype=bool)
 
@@ -358,7 +393,7 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         # diagnostic -- only allocated on this opt-in path (Felix's
         # architect ranking, 2026-07-12: legacy TC callers pay nothing).
         raw_diag_err0 = raw_diag
-        L_raw0 = jnp.zeros((n_grid, n_rank))
+        L_raw0 = jnp.zeros((n_grid, n_rank), dtype=diag_err.dtype)
         n_effective0 = jnp.array(0, dtype=int)
         still_effective0 = jnp.array(True)
 

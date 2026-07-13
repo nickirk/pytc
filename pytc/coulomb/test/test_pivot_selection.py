@@ -284,6 +284,64 @@ class TestPivotSelection(unittest.TestCase):
         # Same prefix (up to the effective_rank=1 point) regardless of scale.
         self.assertEqual(results[1.0][0][0], results[1e-4][0][0])
 
+    def test_effective_rank_guard_ordering_invariant_float32(self):
+        """Regression for Alice's 4th re-review catch (2026-07-12, task
+        #6 blocker item 3, round 5): the numerical smallness cutoff
+        (small_eps, guarding rsqrt) must NEVER exceed the scientific
+        significance cutoff (eff_tol = effective_rank_rtol * max_diag),
+        or a pivot judged scientifically effective gets SKIPPED by the
+        official L update (never deflated) -- its duplicate/correlated
+        twin then looks like fresh signal, and the prefix latch closes
+        too early, silently dropping later genuinely-independent signal.
+
+        In float32, ``100 * eps`` is ~1.2e-5 -- LARGER than the default
+        ``effective_rank_rtol=1e-6`` -- so this failure mode is real at
+        the library's own default, not just at some exotic rtol choice.
+        The test module's module-level ``jax_enable_x64`` does NOT hide
+        this (unlike the earlier float64-only bugs): explicit
+        ``dtype=jnp.float32`` factor/shift arrays force float32
+        computation regardless of the ambient x64 flag.
+
+        Construction: three orthogonal features on 4 grid points -- a
+        strong signal (index 0, raw diag 1), a DUPLICATED correlated
+        signal split across two indices sharing the SAME feature row
+        with the SAME coefficient (indices 1 and 2, raw diag 5e-6 each
+        -- genuinely redundant, not independent), and an independent
+        weak signal (index 3, raw diag 2e-6). True effective rank is 3
+        (strong + one 5e-6 direction + the independent 2e-6 direction);
+        the pre-round-5 primitive gave 2, having skipped deflating the
+        first 5e-6 pivot (its raw residual sits below the too-loose
+        float32 small_eps), so its duplicate looked like fresh signal
+        and the independent 2e-6 point was never reached before the
+        (prematurely closed) prefix latch shut.
+        """
+        a = 1.0 ** 0.25
+        b = (5e-6) ** 0.25
+        c = (2e-6) ** 0.25
+        factor_p = jnp.array([
+            [a, 0.0, 0.0, 0.0],
+            [0.0, b, b, 0.0],
+            [0.0, 0.0, 0.0, c],
+        ], dtype=jnp.float32)
+        factor_q = factor_p
+
+        diag_err = jnp.sum(factor_p**2, axis=0) * jnp.sum(factor_q**2, axis=0)
+        self.assertEqual(diag_err.dtype, jnp.float32)
+        shift = jnp.array(0.0, dtype=jnp.float32)
+        pivots, effective_rank = pivoted_cholesky_pair_pivots(
+            factor_p, factor_q, 4, shift, track_effective_rank=True, effective_rank_rtol=1e-6)
+        pivots_np = np.asarray(pivots)
+
+        self.assertEqual(effective_rank, 3)
+        # Prefix must contain the strong signal (0), the independent
+        # weak signal (3), and exactly one of the duplicated pair (1 or
+        # 2) -- never both (that would mean deflation still failed to
+        # recognize the duplicate as redundant).
+        prefix = set(pivots_np[:3].tolist())
+        self.assertIn(0, prefix)
+        self.assertIn(3, prefix)
+        self.assertEqual(len(prefix & {1, 2}), 1)
+
     def test_select_sector_pivots_truncates_over_rank_request(self):
         """select_sector_pivots must not silently return residual-
         exhausted, numerically-arbitrary pivots as if they were
