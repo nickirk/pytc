@@ -65,7 +65,7 @@ class TestMolecularDFReference(unittest.TestCase):
         vir_at_piv = np.asarray(cls.vir_raw)[:, pivots]
         cls.P = pair_collocation_at_pivots(occ_at_piv, vir_at_piv)
         cls.C = compute_C_streamed(cls.mf, cls.P, cls.mo_occ, cls.mo_vir, auxbasis="weigend")
-        cls.Z = compute_Z(cls.P, cls.C)
+        cls.Z, cls.Z_provenance = compute_Z(cls.P, cls.C)
 
         cls.eri_ovov_exact = cls.mf.with_df.ao2mo(
             (cls.mo_occ, cls.mo_vir, cls.mo_occ, cls.mo_vir), compact=False
@@ -152,7 +152,7 @@ class TestMolecularDFReference(unittest.TestCase):
         """compute_Z_cross must reconstruct the oo|vv ERI block -- a
         cross-sector block MP2's ov|ov-only validation never exercises,
         but CCSD needs (Alice's task #6 review, blocker item 2)."""
-        Z_oovv = compute_Z_cross(self.P_oo, self.C_oo, self.P_vv, self.C_vv)
+        Z_oovv, _prov = compute_Z_cross(self.P_oo, self.C_oo, self.P_vv, self.C_vv)
         eri_isdf = reconstruct_eri_block(self.P_oo, Z_oovv, self.P_vv).reshape(
             self.n_occ, self.n_occ, self.n_vir, self.n_vir)
         rel_err = (np.linalg.norm(eri_isdf - self.eri_oovv_exact)
@@ -163,7 +163,7 @@ class TestMolecularDFReference(unittest.TestCase):
         """compute_Z_cross must reconstruct the ov|vv ERI block -- the
         other cross-sector block CCSD needs (Alice's task #6 review,
         blocker item 2)."""
-        Z_ovvv = compute_Z_cross(self.P, self.C, self.P_vv, self.C_vv)
+        Z_ovvv, _prov = compute_Z_cross(self.P, self.C, self.P_vv, self.C_vv)
         eri_isdf = reconstruct_eri_block(self.P, Z_ovvv, self.P_vv).reshape(
             self.n_occ, self.n_vir, self.n_vir, self.n_vir)
         rel_err = (np.linalg.norm(eri_isdf - self.eri_ovvv_exact)
@@ -200,7 +200,7 @@ class TestMolecularDFReference(unittest.TestCase):
             np.asarray(self.vir_raw)[:, pivots_vv], np.asarray(self.vir_raw)[:, pivots_vv])
         C_vv = compute_C_streamed(self.mf, P_vv, self.mo_vir, self.mo_vir, auxbasis="weigend")
 
-        Z_ovvv = compute_Z_cross(P_ov, C_ov, P_vv, C_vv)
+        Z_ovvv, _prov = compute_Z_cross(P_ov, C_ov, P_vv, C_vv)
         eri_isdf = reconstruct_eri_block(P_ov, Z_ovvv, P_vv).reshape(
             self.n_occ, self.n_vir, self.n_vir, self.n_vir)
         rel_err = (np.linalg.norm(eri_isdf - self.eri_ovvv_exact)
@@ -214,9 +214,51 @@ class TestMolecularDFReference(unittest.TestCase):
         """compute_Z_cross(P, C, P, C) must equal compute_Z(P, C) exactly
         -- compute_Z is documented as compute_Z_cross's same-sector
         special case, so this identity must hold bit-for-bit (same
-        pinv calls, same inputs), not just approximately."""
-        Z_cross_same = compute_Z_cross(self.P, self.C, self.P, self.C)
+        solver calls, same inputs), not just approximately."""
+        Z_cross_same, prov_cross = compute_Z_cross(self.P, self.C, self.P, self.C)
         np.testing.assert_allclose(Z_cross_same, self.Z, atol=1e-12)
+        self.assertEqual(prov_cross["solver"], self.Z_provenance["solver"])
+        self.assertEqual(prov_cross["jitter_used"], self.Z_provenance["jitter_used"])
+
+    def test_compute_Z_provenance_fields(self):
+        """compute_Z's provenance dict must carry the design doc §4
+        solver-level fields it can actually observe (2026-07-12):
+        solver, jitter/retries, dtype, two-sided fit residual + its
+        norm convention + acceptance threshold, row-scaling. Default
+        solver is cholesky_jitter (production, per the doc's measured
+        decision); tsvd remains available as the diagnostic/fallback
+        mode and must report a genuinely different field set (retained
+        singular-value range instead of jitter)."""
+        prov = self.Z_provenance
+        self.assertEqual(prov["solver"], "cholesky_jitter")
+        self.assertIsInstance(prov["jitter_used"], tuple)
+        self.assertIsInstance(prov["n_tries"], tuple)
+        self.assertIsNone(prov["retained_singular_value_range"])
+        self.assertIn("float", prov["dtype"])
+        self.assertGreaterEqual(prov["fit_residual"], 0.0)
+        # Two-sided residual on the actual returned Z must be tiny and
+        # well within the design doc's acceptance threshold for this
+        # well-conditioned (analytically pre-capped, near-full-rank) test.
+        self.assertLess(prov["fit_residual"], prov["residual_warn_threshold"])
+        self.assertEqual(prov["row_scaling"], "identity")
+
+        Z_tsvd, prov_tsvd = compute_Z(self.P, self.C, solver="tsvd")
+        self.assertEqual(prov_tsvd["solver"], "tsvd")
+        self.assertIsNotNone(prov_tsvd["retained_singular_value_range"])
+        self.assertIn("n_retained", prov_tsvd)
+        # Both solvers must agree on the actual ERI reconstruction to
+        # within a small tolerance -- different regularization, same
+        # underlying physics.
+        eri_chol = reconstruct_eri_block(self.P, self.Z, self.P)
+        eri_tsvd = reconstruct_eri_block(self.P, Z_tsvd, self.P)
+        rel_diff = np.linalg.norm(eri_chol - eri_tsvd) / np.linalg.norm(eri_chol)
+        self.assertLess(rel_diff, 0.05)
+
+    def test_compute_Z_rejects_unknown_solver(self):
+        with self.assertRaises(ValueError):
+            compute_Z(self.P, self.C, solver="not-a-real-solver")
+        with self.assertRaises(ValueError):
+            compute_Z_cross(self.P, self.C, self.P, self.C, solver="not-a-real-solver")
 
     def test_P_independent_of_weight_scale(self):
         """Rescaling the integration weights by a positive constant must

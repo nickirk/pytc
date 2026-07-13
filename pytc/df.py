@@ -68,38 +68,82 @@ def _build_normal_matrix(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray) -> jnp.
     return gram_p * gram_q
 
 
-def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
-                                    rcond: float = 1e-14,
-                                    max_jitter_tries: int = 8,
-                                    jitter_growth: float = 10.0):
-    """Prepare robust Cholesky factor for repeated batched solves.
+def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
+                          max_jitter_tries: int = 8, jitter_growth: float = 10.0):
+    """Adaptive-jitter Cholesky factorization for a symmetric/Hermitian
+    positive-SEMIdefinite matrix -- the shared "Cholesky + adaptive
+    diagonal jitter" primitive both TC's own fitting (via
+    prepare_normal_equations_solver, now a thin wrapper around this) and
+    the Coulomb path's S-solve use (isdf-coulomb-cuda design doc §4,
+    2026-07-12: "Cholesky with adaptive diagonal jitter is the
+    production solver for S⁻¹-type applications" -- decided on measured
+    evidence, not a default; see the doc for the rcond-sweep history
+    that motivated it).
 
-    Uses adaptive jitter escalation to guarantee numerically SPD matrices.
+    Starts from a small base jitter (max of a diag-mean*rcond estimate
+    and a machine-epsilon floor) and geometrically escalates it until
+    the Cholesky factor is finite -- handles matrices that are SPD in
+    exact arithmetic but numerically indefinite/near-singular (e.g. a
+    near-full-rank pivot-selection Gram matrix) without ever going
+    through an SVD, which is a non-starter at production core sizes on
+    GPU.
+
+    Args:
+        matrix: (n, n) symmetric/Hermitian PSD matrix.
+        rcond: Relative jitter scale (fraction of the matrix's own
+            diagonal mean) used as the STARTING jitter before escalation.
+        max_jitter_tries: Escalation attempts before giving up.
+        jitter_growth: Geometric growth factor per escalation attempt.
+
+    Returns:
+        (chol, lower, jitter_used, n_tries): chol/lower are cho_factor's
+        own outputs (pass to jsp_linalg.cho_solve); jitter_used is the
+        final (possibly escalated) jitter value actually applied;
+        n_tries is how many attempts it took (1 = no escalation needed)
+        -- both are provenance fields for callers that need to record
+        the solver's own diagnostics (Coulomb path's compute_Z).
     """
-    ata = _build_normal_matrix(phi_piv_p, phi_piv_q)
-    ata = 0.5 * (ata + ata.T)
-    diag_mean = float(jnp.mean(jnp.diag(ata)))
-    eps_scale = float(jnp.finfo(ata.dtype).eps) * max(diag_mean, 1.0)
+    mat = 0.5 * (matrix + matrix.conj().T)
+    diag_mean = float(jnp.mean(jnp.real(jnp.diag(mat))))
+    eps_scale = float(jnp.finfo(mat.dtype).eps) * max(diag_mean, 1.0)
     base_jitter = max(diag_mean * rcond, eps_scale)
-    eye = jnp.eye(ata.shape[0], dtype=ata.dtype)
+    eye = jnp.eye(mat.shape[0], dtype=mat.dtype)
 
     last_chol = None
     for attempt in range(max_jitter_tries):
         jitter = base_jitter * (jitter_growth ** attempt)
-        chol, lower = jsp_linalg.cho_factor(ata + jitter * eye, lower=True)
+        chol, lower = jsp_linalg.cho_factor(mat + jitter * eye, lower=True)
         if bool(jnp.all(jnp.isfinite(chol))):
             if attempt > 0:
                 logger.warning(
                     "Cholesky jitter escalated: base=%.3e final=%.3e tries=%d",
                     base_jitter, jitter, attempt + 1
                 )
-            return chol, bool(lower)
+            return chol, bool(lower), float(jitter), attempt + 1
         last_chol = chol
 
     raise np.linalg.LinAlgError(
         f"Adaptive Cholesky failed after {max_jitter_tries} tries; "
         f"base_jitter={base_jitter:.3e}, last_nonfinite={bool(jnp.any(jnp.isnan(last_chol)))}"
     )
+
+
+def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
+                                    rcond: float = 1e-14,
+                                    max_jitter_tries: int = 8,
+                                    jitter_growth: float = 10.0):
+    """Prepare robust Cholesky factor for repeated batched solves.
+
+    Thin wrapper around prepare_spd_cholesky (TC's original entry point,
+    preserved with its existing (chol, lower)-only return contract --
+    see prepare_spd_cholesky's docstring for the shared jitter-escalation
+    algorithm and its own 4-tuple return, used by callers that need the
+    extra provenance fields).
+    """
+    ata = _build_normal_matrix(phi_piv_p, phi_piv_q)
+    chol, lower, _jitter_used, _n_tries = prepare_spd_cholesky(
+        ata, rcond=rcond, max_jitter_tries=max_jitter_tries, jitter_growth=jitter_growth)
+    return chol, lower
 
 
 @partial(jax.jit, static_argnames=('lower',))

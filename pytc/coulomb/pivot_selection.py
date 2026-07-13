@@ -99,6 +99,14 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
     """
     if on_over_rank not in ("truncate", "raise"):
         raise ValueError(f"on_over_rank must be 'truncate' or 'raise', got {on_over_rank!r}")
+    if not (0.0 < effective_rank_rtol < 1.0):
+        raise ValueError(
+            f"effective_rank_rtol must satisfy 0 < rtol < 1, got {effective_rank_rtol!r} "
+            f"-- it is a fraction of the raw diagonal's own max (see "
+            f"pytc.df.pivoted_cholesky_pair_pivots's docstring), so 0 admits pure noise "
+            f"as 'effective' and >=1 rejects all real signal (Alice's task #6 re-review, "
+            f"2026-07-12, non-blocking hardening item)."
+        )
     factor_p_weighted = jnp.asarray(factor_p_weighted)
     factor_q_weighted = jnp.asarray(factor_q_weighted)
 

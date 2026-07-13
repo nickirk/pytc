@@ -15,10 +15,17 @@ dense object is the (n_pivots, n_pivots) Z core, never the full
 (n_pair, n_pair) or (n_aux, n_pair) tensors.
 """
 
+import logging
+
 import numpy as np
+import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 from pyscf import lib
 
 from pytc.coulomb.gpu4pyscf_adapter import stream_df_cderi_blocks
+from pytc.df import prepare_spd_cholesky
+
+logger = logging.getLogger(__name__)
 
 
 def pair_collocation_at_pivots(factor_p_at_pivots, factor_q_at_pivots):
@@ -105,16 +112,160 @@ def compute_C_streamed(mf, P, mo_coeff_p, mo_coeff_q, auxbasis="weigend", blksiz
     return np.concatenate(c_chunks, axis=1)
 
 
-def compute_Z(P, C, rcond=None):
+_RESIDUAL_WARN_THRESHOLD = 1e-10  # design doc v1.1 §4: acceptance = 1e-10 fit residual
+_RESIDUAL_NORM_CONVENTION_SAME = "||S Z S - C C^dagger|| / ||C C^dagger||"
+_RESIDUAL_NORM_CONVENTION_CROSS = "||S_A Z_AB S_B - C_A C_B^dagger|| / ||C_A C_B^dagger||"
+_CHOLESKY_JITTER_MAX_TRIES = 7  # design doc v1.1 §4: up to 6 retries (1 initial + 6)
+
+
+def _two_sided_residual(S_A, Z, S_B, M):
+    """Alice's solver-residual convention (task #6/#3 review, 2026-07-12):
+    the FULL two-sided residual on the actual returned Z, not a
+    one-sided check of only the first S^-1 solve -- ``||S_A Z S_B -
+    M|| / ||M||`` (same-sector: S_A=S_B=S, matches ``||S Z S -
+    C C^dagger||/||C C^dagger||`` exactly)."""
+    residual_num = float(np.linalg.norm(S_A @ Z @ S_B - M))
+    residual_den = float(np.linalg.norm(M))
+    return residual_num / residual_den if residual_den > 0.0 else 0.0
+
+
+def _warn_if_residual_large(fit_residual, solver_label, extra=""):
+    if fit_residual > _RESIDUAL_WARN_THRESHOLD:
+        logger.warning(
+            f"compute_Z ({solver_label}): two-sided fit residual {fit_residual:.3e} "
+            f"exceeds the design-doc acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e}"
+            f"{extra} -- this is a WARNING, not a hard rejection (full acceptance also "
+            f"requires the downstream ERI/energy spot-check, which this function cannot "
+            f"see); downstream results should be treated with extra suspicion."
+        )
+
+
+def _cholesky_jitter_sandwich(S_A, S_B, M, rcond):
+    """S_A^-1 M S_B^-1 via pytc.df.prepare_spd_cholesky (design doc §4,
+    isdf-coulomb-cuda, 2026-07-12: "Cholesky with adaptive diagonal
+    jitter is the production solver for S^-1-type applications" -- the
+    same idiom TC's own orbital fitting uses, not a parallel
+    implementation). S_A is S_B (same object) for the same-sector case
+    (compute_Z); different for cross-sector (compute_Z_cross). Jitter
+    schedule matches the doc's adaptive rule exactly: lambda_0 =
+    rcond * trace(S)/N_mu (rcond default 1e-14), x10 growth, up to 6
+    retries (7 total attempts).
+
+    Returns (Z, provenance) -- provenance carries exactly the
+    solver-level fields compute_Z/compute_Z_cross can actually observe
+    (solver, jitter/retries, dtype, two-sided fit residual + its norm
+    convention + acceptance threshold, row-scaling); fields that need
+    caller-side context (kernel policy, upstream SCF/grid provenance)
+    are NOT compute_Z's to fabricate -- a higher-level build_core
+    wrapper assembles those (Alice/Felix, 2026-07-12, part of phase 1's
+    core-build contract, not deferred to CCSD step 3).
+    """
+    S_A = jnp.asarray(S_A)
+    S_B = jnp.asarray(S_B)
+    M = jnp.asarray(M)
+    if S_A.dtype in (jnp.float32, jnp.complex64):
+        logger.warning(
+            f"compute_Z (cholesky_jitter): resolved dtype is {S_A.dtype} -- JAX defaults "
+            f"to float32 SILENTLY unless the caller has enabled "
+            f"jax.config.update('jax_enable_x64', True), downcasting float64 numpy inputs "
+            f"without any error. Measured impact on the H2O/cc-pVDZ ov-sector checkpoint: "
+            f"ERI relative error 0.51% (float32) vs 2.0e-4 (float64), a ~25x precision "
+            f"loss -- verify x64 is enabled before trusting production numbers from this path."
+        )
+    same_sector = S_B is S_A or (S_A.shape == S_B.shape and bool(jnp.array_equal(S_A, S_B)))
+
+    chol_A, lower_A, jitter_A, tries_A = prepare_spd_cholesky(
+        S_A, rcond=rcond, max_jitter_tries=_CHOLESKY_JITTER_MAX_TRIES)
+    if same_sector:
+        chol_B, lower_B, jitter_B, tries_B = chol_A, lower_A, jitter_A, tries_A
+    else:
+        chol_B, lower_B, jitter_B, tries_B = prepare_spd_cholesky(
+            S_B, rcond=rcond, max_jitter_tries=_CHOLESKY_JITTER_MAX_TRIES)
+
+    X = jsp_linalg.cho_solve((chol_A, lower_A), M)  # S_A^-1 M
+    Z = jsp_linalg.cho_solve((chol_B, lower_B), X.conj().T).conj().T  # (S_A^-1 M) S_B^-1
+    Z_np = np.asarray(Z)
+
+    fit_residual = _two_sided_residual(np.asarray(S_A), Z_np, np.asarray(S_B), np.asarray(M))
+    _warn_if_residual_large(
+        fit_residual, "cholesky_jitter",
+        extra=f" (jitter_A={jitter_A:.3e}, tries_A={tries_A})")
+
+    provenance = {
+        "solver": "cholesky_jitter",
+        "cutoff": rcond,
+        "jitter_used": (jitter_A, jitter_A) if same_sector else (jitter_A, jitter_B),
+        "n_tries": (tries_A, tries_A) if same_sector else (tries_A, tries_B),
+        "retained_singular_value_range": None,  # not applicable to this solver
+        "dtype": str(Z_np.dtype),
+        "fit_residual": fit_residual,
+        "residual_norm_convention": _RESIDUAL_NORM_CONVENTION_SAME if same_sector else _RESIDUAL_NORM_CONVENTION_CROSS,
+        "residual_warn_threshold": _RESIDUAL_WARN_THRESHOLD,
+        "row_scaling": "identity",
+    }
+    return Z_np, provenance
+
+
+def _tsvd_sandwich(S_A, S_B, M, rcond):
+    """S_A^+ M S_B^+ via an EXPLICIT truncated-SVD pseudoinverse (not
+    np.linalg.pinv's black box) so the retained singular-value range can
+    be reported in provenance -- the diagnostics/fallback solver mode
+    per design doc §4 (production default is cholesky_jitter).
+    """
+    S_A = np.asarray(S_A)
+    S_B = np.asarray(S_B)
+    M = np.asarray(M)
+    same_sector = S_B is S_A or (S_A.shape == S_B.shape and np.array_equal(S_A, S_B))
+
+    def _tsvd_pinv_and_range(S):
+        s_vals, U = np.linalg.eigh(0.5 * (S + S.conj().T))  # Hermitian PSD: eigh == SVD up to sign
+        s_vals = np.clip(s_vals, 0.0, None)
+        cutoff = (rcond if rcond is not None else np.finfo(S.dtype).eps * max(S.shape)) * s_vals.max()
+        keep = s_vals > cutoff
+        inv_vals = np.where(keep, 1.0 / np.where(keep, s_vals, 1.0), 0.0)
+        S_inv = (U * inv_vals) @ U.conj().T
+        retained = s_vals[keep]
+        sv_range = (float(retained.min()), float(retained.max())) if retained.size else (0.0, 0.0)
+        return S_inv, sv_range, int(keep.sum())
+
+    S_A_inv, sv_range_A, n_retained_A = _tsvd_pinv_and_range(S_A)
+    if same_sector:
+        S_B_inv, sv_range_B, n_retained_B = S_A_inv, sv_range_A, n_retained_A
+    else:
+        S_B_inv, sv_range_B, n_retained_B = _tsvd_pinv_and_range(S_B)
+
+    Z = S_A_inv @ M @ S_B_inv
+    fit_residual = _two_sided_residual(S_A, Z, S_B, M)
+    _warn_if_residual_large(fit_residual, "tsvd")
+
+    provenance = {
+        "solver": "tsvd",
+        "cutoff": rcond,
+        "retained_singular_value_range": (sv_range_A, sv_range_A) if same_sector else (sv_range_A, sv_range_B),
+        "n_retained": (n_retained_A, n_retained_A) if same_sector else (n_retained_A, n_retained_B),
+        "dtype": str(Z.dtype),
+        "fit_residual": fit_residual,
+        "residual_norm_convention": _RESIDUAL_NORM_CONVENTION_SAME if same_sector else _RESIDUAL_NORM_CONVENTION_CROSS,
+        "residual_warn_threshold": _RESIDUAL_WARN_THRESHOLD,
+        "row_scaling": "identity",
+    }
+    return Z, provenance
+
+
+def compute_Z(P, C, rcond=None, solver="cholesky_jitter"):
     """Z = S^-1 C C^dagger S^-1, S = P P^dagger.
 
-    Uses the Moore-Penrose pseudoinverse (not a direct solve) since S
-    can be singular/ill-conditioned -- decision 001 itself calls this
-    the "least-squares core," and pytc.coulomb.pivot_selection's own
-    reconstruction-error tests measured real rank-deficiency and large
-    condition numbers on Gram matrices of this same algebraic form
-    (task #5, 2026-07-12), so treating S as exactly invertible would be
-    the wrong default here.
+    Production solver is Cholesky with adaptive diagonal jitter
+    (isdf-coulomb-cuda design doc §4, 2026-07-12) -- decided on measured
+    evidence, not assumed: at production core sizes an SVD is a
+    GPU non-starter, pivot budgets are analytically pre-capped so S
+    enters the solve at (near-)full rank by construction, and the
+    apparent earlier need for delicate pinv-cutoff tuning was itself an
+    artifact of a since-fixed bug (weighted, not raw, values in P --
+    see pair_collocation_at_pivots's docstring). solver="tsvd" is kept
+    as the small/medium-system diagnostic oracle and fallback -- an
+    EXPLICIT truncated-SVD pseudoinverse (not np.linalg.pinv's black
+    box) so the retained singular-value range can be reported.
 
     History: this function originally took WEIGHTED (sqrt(w_g)-scaled)
     values into pair_collocation_at_pivots's P, and needed a hand-tuned,
@@ -124,38 +275,49 @@ def compute_Z(P, C, rcond=None):
     (n_pivots=300, n_pair=95, cond(S)~2e24), and rcond tightened much
     past ~3e-7 made it WORSE again (readmitted noise). Alice's task #6
     review (2026-07-12, blocker item 1) identified the root cause: P
-    should be built from RAW (unweighted) values (see
-    pair_collocation_at_pivots's docstring) -- weighting is a pivot-
-    SELECTION device, not part of the actual interpolation formula.
-    With that fix, S on the same test has rank EXACTLY equal to
-    n_pair=95 (no numerical rank inflation from the weight scaling) and
-    the rcond sweep becomes well-behaved: error falls MONOTONICALLY as
-    rcond shrinks from 1e-4 (23%) through 1e-6 (2.5%) down to a
-    ~1e-6-relative-error plateau at rcond<=3e-10 (no readmitted-noise
-    regime observed down to 1e-15) -- numpy's own default rcond
-    (~6.7e-14 for this matrix size) already sits on that plateau,
-    measured 1.2e-6 relative ERI error. So the numpy default is now the
-    right default; rcond is still exposed for callers who need to
-    re-tune per system (e.g. much larger/differently-conditioned S).
+    should be built from RAW (unweighted) values -- weighting is a
+    pivot-SELECTION device, not part of the actual interpolation
+    formula. With that fix, S on the same test has rank EXACTLY equal
+    to n_pair=95 (no numerical rank inflation from the weight scaling)
+    and the rcond sweep becomes well-behaved.
 
     Args:
         P: (n_pivots, n_pair) pair-collocation matrix at the pivots
             (RAW/unweighted values -- see pair_collocation_at_pivots).
         C: (n_pivots, n_aux) from compute_C_streamed.
-        rcond: Relative singular-value cutoff for S's pseudoinverse.
-            None (default) uses numpy's own pinv default.
+        rcond: Solver-specific meaning -- for "cholesky_jitter", the
+            STARTING relative jitter scale (forwarded to
+            prepare_spd_cholesky, default 1e-14, auto-escalated if
+            needed); for "tsvd", the relative singular-value cutoff
+            (None uses a machine-epsilon-scaled default, matching
+            numpy's own pinv convention).
+        solver: "cholesky_jitter" (default, production) or "tsvd"
+            (diagnostic/fallback).
 
     Returns:
-        Z: (n_pivots, n_pivots).
+        (Z, provenance): Z is (n_pivots, n_pivots); provenance is a
+        dict with the solver-level fields from design doc §4 this
+        function can observe directly (solver, jitter/cutoff + retry
+        history or retained singular-value range, fit residual,
+        row-scaling). Fields needing caller-side context (kernel
+        policy, upstream SCF/grid provenance, pivot-index hashes) are
+        NOT fabricated here -- assemble those at the call site that
+        actually has them.
     """
     P = np.asarray(P)
     C = np.asarray(C)
     S = P @ P.conj().T
-    S_inv = np.linalg.pinv(S, rcond=rcond)
-    return S_inv @ (C @ C.conj().T) @ S_inv
+    M = C @ C.conj().T
+    if solver == "cholesky_jitter":
+        rcond_eff = 1e-14 if rcond is None else rcond
+        return _cholesky_jitter_sandwich(S, S, M, rcond_eff)
+    elif solver == "tsvd":
+        return _tsvd_sandwich(S, S, M, rcond)
+    else:
+        raise ValueError(f"solver must be 'cholesky_jitter' or 'tsvd', got {solver!r}")
 
 
-def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None):
+def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None, solver="cholesky_jitter"):
     """Z_AB = S_A^-1 C_A C_B^dagger S_B^-1, S_A = P_A P_A^dagger, S_B = P_B
     P_B^dagger -- the cross-sector generalization of compute_Z, needed
     when the ERI block's bra and ket pair indices come from DIFFERENT
@@ -165,11 +327,12 @@ def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None):
     pivot_selection.select_pivots_oo_ov_vv, which selects oo/ov/vv
     pivots independently).
 
-    compute_Z(P, C, rcond) is exactly this function's same-sector
-    special case (P_A=P_B=P, C_A=C_B=C); kept as a separate simpler
-    entry point since same-sector Z is CCSD's most common need (oo|oo,
-    ov|ov, vv|vv) and callers there shouldn't have to pass every
-    argument twice.
+    compute_Z(P, C, rcond, solver) is exactly this function's
+    same-sector special case (P_A=P_B=P, C_A=C_B=C); kept as a separate
+    simpler entry point since same-sector Z is CCSD's most common need
+    (oo|oo, ov|ov, vv|vv) and callers there shouldn't have to pass every
+    argument twice. See compute_Z's docstring for the solver choice and
+    provenance fields -- identical here.
 
     Derivation: with V_AB the exact (n_pair_A, n_pair_B) ERI block
     between sectors A and B, and B_A/B_B the DF Cholesky factors
@@ -191,13 +354,12 @@ def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None):
         C_B: (n_pivots_B, n_aux) from compute_C_streamed for sector B
             -- must share the SAME n_aux axis as C_A (same mf, same
             auxbasis).
-        rcond: Relative singular-value cutoff for S_A's and S_B's
-            pseudoinverses. None (default) uses numpy's own pinv
-            default (see compute_Z's docstring on why this is now the
-            right default, once P is built from raw/unweighted values).
+        rcond, solver: see compute_Z's docstring.
 
     Returns:
-        Z_AB: (n_pivots_A, n_pivots_B).
+        (Z_AB, provenance): Z_AB is (n_pivots_A, n_pivots_B); provenance
+        as in compute_Z, with jitter/retained-range/n_retained fields
+        as (A, B) pairs when sectors A and B are genuinely different.
     """
     P_A = np.asarray(P_A)
     C_A = np.asarray(C_A)
@@ -205,9 +367,14 @@ def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None):
     C_B = np.asarray(C_B)
     S_A = P_A @ P_A.conj().T
     S_B = P_B @ P_B.conj().T
-    S_A_inv = np.linalg.pinv(S_A, rcond=rcond)
-    S_B_inv = np.linalg.pinv(S_B, rcond=rcond)
-    return S_A_inv @ (C_A @ C_B.conj().T) @ S_B_inv
+    M = C_A @ C_B.conj().T
+    if solver == "cholesky_jitter":
+        rcond_eff = 1e-14 if rcond is None else rcond
+        return _cholesky_jitter_sandwich(S_A, S_B, M, rcond_eff)
+    elif solver == "tsvd":
+        return _tsvd_sandwich(S_A, S_B, M, rcond)
+    else:
+        raise ValueError(f"solver must be 'cholesky_jitter' or 'tsvd', got {solver!r}")
 
 
 def reconstruct_eri_block(P_row, Z, P_col):
