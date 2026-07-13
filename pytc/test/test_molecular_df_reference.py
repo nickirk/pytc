@@ -9,11 +9,20 @@ Validation ladder steps 1-2 (decision 001):
 Runs on H2O/cc-pVDZ (CPU, no CUDA available here) -- gpu4pyscf-backend
 validation is later work once GPU hardware is available (Grace, per
 Ke's sequencing).
+
+Enables jax_enable_x64 explicitly at module level (Alice's review,
+task #14 commit B corrective, 2026-07-13): this module's own float64
+acceptance thresholds require it, and it must not depend on another
+test module (e.g. test_pivot_selection.py) enabling it first via
+JAX's process-global config -- every scientific test module declares
+the precision it requires and must pass when run alone.
 """
 
 import unittest
 
 import numpy as np
+import jax
+jax.config.update("jax_enable_x64", True)
 from pyscf import gto, scf, mp
 
 from pytc.integrals.coulomb import (

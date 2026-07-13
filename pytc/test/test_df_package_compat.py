@@ -87,51 +87,55 @@ class TestNoCoulombPackageRemains(unittest.TestCase):
     """Gate for task #14's corrective reorganization (isdf-coulomb-cuda,
     2026-07-13): pytc/coulomb/ was consolidated into pytc/integrals/
     coulomb.py with no compatibility shim (Ke's explicit "no Coulomb
-    folder" ruling). Alice's acceptance criterion: "an rg gate showing
-    no production import still targets pytc.coulomb and no canonical
-    implementation remains in root tc/xtc" -- covers import statements
-    and module strings in tracked production/test Python sources,
-    deliberately excluding git history/build artifacts (this scans the
-    actual working tree via `git ls-files`, not disk globbing, so
-    untracked scratch files/other agents' worktree checkouts can never
-    produce a false failure here).
+    folder" ruling). Alice's acceptance criterion: "no production import
+    still targets pytc.coulomb and no canonical implementation remains
+    in root tc/xtc." Scans the installed pytc package tree directly via
+    pathlib (rooted at the actually-imported ``pytc.__file__``'s
+    directory), not `git`/`rg` -- repository-independent, so this passes
+    identically for a plain source checkout, an installed wheel/sdist,
+    or any tree with no `.git` metadata at all (Alice's review,
+    2026-07-13: the earlier git-ls-files-based version would fail for
+    exactly those cases). Limited to production Python sources --
+    test/examples/legacy subtrees are excluded, both because they are
+    not what "no production import" is about and to avoid this test
+    module's own pattern-matching strings producing a false positive.
     """
 
     def test_pytc_coulomb_package_is_gone(self):
         with self.assertRaises(ModuleNotFoundError):
             import pytc.coulomb  # noqa: F401
 
-    def test_no_pytc_coulomb_references_in_tracked_python_sources(self):
-        import os
-        import subprocess
+    def test_root_pytc_coulomb_path_does_not_exist(self):
+        import pytc
+        from pathlib import Path
 
-        this_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True, cwd=this_dir,
-        ).stdout.strip()
-        tracked_py_files = subprocess.run(
-            ["git", "ls-files", "*.py"],
-            capture_output=True, text=True, check=True, cwd=repo_root,
-        ).stdout.splitlines()
+        pytc_root = Path(pytc.__file__).resolve().parent
+        self.assertFalse(
+            (pytc_root / "coulomb").exists(),
+            f"{pytc_root / 'coulomb'} must not exist -- pytc/coulomb/ was "
+            f"deleted entirely in task #14's commit B, no compatibility shim.",
+        )
+
+    def test_no_pytc_coulomb_references_in_production_python_sources(self):
+        import pytc
+        from pathlib import Path
+
+        pytc_root = Path(pytc.__file__).resolve().parent
+        excluded_dir_names = {"test", "tests", "examples", "legacy", "__pycache__"}
 
         offenders = []
-        for rel_path in tracked_py_files:
-            # This test file itself legitimately names the pattern it
-            # is searching for (in this docstring/these string
-            # literals) -- exclude it, not a real reference to the old
-            # package.
-            if rel_path == "pytc/test/test_df_package_compat.py":
+        for py_file in pytc_root.rglob("*.py"):
+            rel_parts = py_file.relative_to(pytc_root).parts
+            if excluded_dir_names & set(rel_parts[:-1]):
                 continue
-            full_path = f"{repo_root}/{rel_path}"
-            with open(full_path, encoding="utf-8") as f:
+            with open(py_file, encoding="utf-8") as f:
                 for lineno, line in enumerate(f, start=1):
                     if "pytc.coulomb" in line or "pytc/coulomb" in line:
-                        offenders.append(f"{rel_path}:{lineno}: {line.strip()}")
+                        offenders.append(f"{py_file.relative_to(pytc_root)}:{lineno}: {line.strip()}")
 
         self.assertEqual(
             offenders, [],
-            "Found stale pytc.coulomb/pytc/coulomb references in tracked "
+            "Found stale pytc.coulomb/pytc/coulomb references in production "
             "Python sources after task #14's package deletion:\n"
             + "\n".join(offenders),
         )
