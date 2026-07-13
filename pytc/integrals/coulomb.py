@@ -2374,6 +2374,7 @@ class PoissonCoreArtifact:
             "kernel_spec_sha256": self.kernel_spec_sha256,
             "mu_block_size": mu_block_size, "nu_block_size": nu_block_size,
             "normalization": self.normalization, "backend": self.backend,
+            "device": self.device,
             "realized_dtype": self.realized_dtype, "solver_version": self.solver_version,
         })
         _validate_sha256_hex("core_spec_sha256", self.core_spec_sha256)
@@ -2677,7 +2678,7 @@ def poisson_core(left, right=None, *, kernel, mu_block_size=None, nu_block_size=
         "left_n_fused": n_mu_left, "right_n_fused": n_mu_right,
         "kernel_spec_sha256": kernel.kernel_spec_sha256,
         "mu_block_size": mu_block_size_realized, "nu_block_size": nu_block_size_realized,
-        "normalization": "dV", "backend": kernel.backend,
+        "normalization": "dV", "backend": kernel.backend, "device": device,
         "realized_dtype": realized_dtype, "solver_version": _POISSON_INTERPOLATION_SOLVER_VERSION,
     })
 

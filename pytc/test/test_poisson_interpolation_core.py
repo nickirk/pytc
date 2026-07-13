@@ -702,6 +702,26 @@ class TestPoissonCoreArtifactValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             PoissonCoreArtifact(**kwargs)
 
+    def test_core_spec_sha256_is_sensitive_to_device(self):
+        # core_spec_sha256 is documented to cover EVERY typed core field,
+        # explicitly including device -- confirm the canonical digest
+        # actually changes for otherwise-identical field dictionaries
+        # that differ only in device (Alice's review, task #15,
+        # 2026-07-13: the builder hash and __post_init__ recomputation
+        # had both silently omitted device from the hashed fields
+        # despite the documented schema and handoff claiming it was
+        # covered).
+        from pytc.integrals.coulomb import _kernel_spec_sha256
+        base_fields = {
+            "left_sector_spec_sha256": "11" * 32, "right_sector_spec_sha256": "22" * 32,
+            "left_n_fused": 5, "right_n_fused": 5, "kernel_spec_sha256": "33" * 32,
+            "mu_block_size": 5, "nu_block_size": 5, "normalization": "dV",
+            "backend": "numpy", "realized_dtype": "float64", "solver_version": "1",
+        }
+        digest_cpu = _kernel_spec_sha256({**base_fields, "device": "cpu"})
+        digest_gpu = _kernel_spec_sha256({**base_fields, "device": "gpu:0"})
+        self.assertNotEqual(digest_cpu, digest_gpu)
+
     def test_rejects_bad_block_size(self):
         kwargs = self._valid_kwargs()
         kwargs["mu_block_size"] = 0
