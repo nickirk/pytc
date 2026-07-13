@@ -45,7 +45,8 @@ def weight_mo_values(mo_values, weights):
 
 
 def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=None,
-                          on_over_rank="truncate", same_factor=False, effective_rank_rtol=1e-6):
+                          on_over_rank="truncate", same_factor=False, effective_rank_rtol=1e-6,
+                          return_provenance=False):
     """Select interpolation points for one MO-pair sector, at most n_rank
     of them.
 
@@ -92,10 +93,22 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
             docstring for the empirical calibration); expose here so
             callers can re-tune per system without reaching past this
             wrapper.
+        return_provenance: False (default, unchanged return type) or
+            True to additionally return a provenance dict distinguishing
+            requested_rank, analytic_rank_bound, n_rank_capped,
+            numerical_rank (pivoted_cholesky_pair_pivots's own measured
+            effective_rank), and n_pivots (len of the final, possibly
+            truncated, pivots array) -- these are DISTINCT concepts a
+            caller assembling a full provenance record (e.g.
+            pytc.coulomb.build_core) must not conflate; in particular
+            n_pivots must never be presented as "effective/numerical
+            rank" on its own (Alice's task #8 build_core API review,
+            2026-07-12).
 
     Returns:
         pivots: (k,) selected grid-point indices, k <= n_rank (bounded
-        by both the analytic pair-rank cap and effective_rank).
+        by both the analytic pair-rank cap and effective_rank). If
+        return_provenance=True, returns (pivots, provenance) instead.
     """
     if on_over_rank not in ("truncate", "raise"):
         raise ValueError(f"on_over_rank must be 'truncate' or 'raise', got {on_over_rank!r}")
@@ -150,7 +163,16 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
             f"upper bound ({analytic_rank_bound}) -- request a smaller n_rank "
             f"or pass on_over_rank='truncate'."
         )
-    return pivots
+    if not return_provenance:
+        return pivots
+    provenance = {
+        "requested_rank": int(n_rank),
+        "analytic_rank_bound": int(analytic_rank_bound),
+        "n_rank_capped": int(n_rank_capped),
+        "numerical_rank": int(effective_rank),
+        "n_pivots": int(len(pivots)),
+    }
+    return pivots, provenance
 
 
 def select_pivots_oo_ov_vv(mo_values, n_occ, weights, n_rank_oo, n_rank_ov, n_rank_vv, shift=None):
