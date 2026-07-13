@@ -291,101 +291,99 @@ def _deep_freeze(obj, _path="<root>"):
     )
 
 
-def _canonical_encode(obj, buf):
-    """Append a deterministic, type-tagged canonical byte encoding of obj
-    (already routed through _deep_freeze, or a plain scalar) to buf, a
-    list of bytes fragments -- for provenance hashing.
+def _tlv(tag, payload):
+    """Tag-length-value: a 1-byte type tag, an 8-byte big-endian payload
+    length, then the payload itself. Self-delimiting -- concatenating
+    any sequence of TLV-encoded nodes is unambiguous/injective
+    regardless of what bytes appear inside a payload (Alice's review,
+    task #5, 2026-07-13, round 2: the prior delimiter-separated encoder
+    let a string CONTAINING a literal delimiter collide with an
+    unrelated sibling structure -- construction_metadata={"seq":
+    ("a,str:b",)} hashed identically to {"seq": ("a", "b")}, since both
+    serialized to the same delimiter-joined bytes. A length-prefixed
+    payload makes that impossible: the reader always knows exactly how
+    many bytes belong to this node, so it never needs to interpret
+    bytes inside the payload as structure.)"""
+    return tag + len(payload).to_bytes(8, "big") + payload
+
+
+def _canonical_encode_node(obj):
+    """Return the complete, self-delimiting TLV bytes for obj (already
+    routed through _deep_freeze, or a plain scalar) -- for provenance
+    hashing.
 
     Deliberately NOT repr()-based (Alice's review, task #5,
-    2026-07-13): repr(frozenset(...)) iterates in the set's internal
-    hash-table order, which depends on PYTHONHASHSEED for str elements
-    (randomized per process by default) -- the same logical
+    2026-07-13, round 1): repr(frozenset(...)) iterates in the set's
+    internal hash-table order, which depends on PYTHONHASHSEED for str
+    elements (randomized per process by default) -- the same logical
     construction_metadata could hash differently across runs, and
     Alice's repro even showed builder vs __post_init__ disagreeing
     WITHIN one construction (re-freezing a frozenset rebuilds its
     internal table). repr() on a large ndarray also silently truncates
-    (numpy's summarized repr), so two arrays differing only in their
-    untruncated middle content could hash identically. This encoder
-    instead: sorts dict keys (str, per _deep_freeze's closed schema);
-    preserves tuple/list element order; for frozenset/set, encodes each
-    element independently and sorts the resulting BYTE strings (well-
-    defined regardless of hash-seed-dependent iteration order); and
-    hashes an ndarray's FULL raw bytes (never a summarized repr)."""
+    (numpy's summarized repr). This encoder instead: sorts dict keys
+    (str, per _deep_freeze's closed schema); preserves tuple/list
+    element order; for frozenset/set, encodes each element
+    independently (each already self-delimiting) and sorts the
+    resulting byte strings (well-defined regardless of hash-seed-
+    dependent iteration order); and hashes an ndarray's FULL raw bytes
+    (never a summarized repr) -- each as its own length-prefixed field
+    so dtype/shape/bytes can never bleed into one another either."""
     if isinstance(obj, types.MappingProxyType):
         obj = dict(obj)
     if isinstance(obj, dict):
-        buf.append(b"dict{")
+        parts = []
         for k in sorted(obj):
             if not isinstance(k, str):
-                raise TypeError(f"_canonical_encode: mapping key must be str, got {k!r}.")
-            buf.append(b"k:")
-            _canonical_encode(k, buf)
-            buf.append(b"=")
-            _canonical_encode(obj[k], buf)
-            buf.append(b";")
-        buf.append(b"}")
-        return
+                raise TypeError(f"_canonical_encode_node: mapping key must be str, got {k!r}.")
+            parts.append(_canonical_encode_node(k))
+            parts.append(_canonical_encode_node(obj[k]))
+        return _tlv(b"D", b"".join(parts))
     if isinstance(obj, (list, tuple)):
-        buf.append(b"seq[")
-        for v in obj:
-            _canonical_encode(v, buf)
-            buf.append(b",")
-        buf.append(b"]")
-        return
+        return _tlv(b"L", b"".join(_canonical_encode_node(v) for v in obj))
     if isinstance(obj, (set, frozenset)):
-        encoded_elements = []
-        for v in obj:
-            sub = []
-            _canonical_encode(v, sub)
-            encoded_elements.append(b"".join(sub))
-        encoded_elements.sort()
-        buf.append(b"set{")
-        for e in encoded_elements:
-            buf.append(e)
-            buf.append(b",")
-        buf.append(b"}")
-        return
+        encoded_elements = sorted(_canonical_encode_node(v) for v in obj)
+        return _tlv(b"S", b"".join(encoded_elements))
     if isinstance(obj, np.ndarray):
         if obj.dtype.hasobject:
-            raise TypeError(f"_canonical_encode: unsupported object-dtype array {obj.dtype}.")
+            raise TypeError(f"_canonical_encode_node: unsupported object-dtype array {obj.dtype}.")
         a = np.ascontiguousarray(obj)
-        buf.append(b"ndarray(" + str(a.dtype).encode() + b"," + repr(a.shape).encode() + b")")
-        buf.append(a.tobytes())
-        return
+        payload = (
+            _tlv(b"t", str(a.dtype).encode())
+            + _tlv(b"h", repr(a.shape).encode())
+            + _tlv(b"b", a.tobytes())
+        )
+        return _tlv(b"A", payload)
     if isinstance(obj, np.generic):
-        _canonical_encode(obj.item(), buf)
-        return
+        return _canonical_encode_node(obj.item())
     if obj is None:
-        buf.append(b"none")
-        return
+        return _tlv(b"n", b"")
     if isinstance(obj, bool):
-        buf.append(b"bool:" + (b"1" if obj else b"0"))
-        return
-    if isinstance(obj, (int, float, complex)):
-        buf.append(type(obj).__name__.encode() + b":" + repr(obj).encode())
-        return
+        return _tlv(b"b", b"1" if obj else b"0")
+    if isinstance(obj, int):
+        return _tlv(b"i", repr(obj).encode())
+    if isinstance(obj, float):
+        return _tlv(b"f", repr(obj).encode())
+    if isinstance(obj, complex):
+        return _tlv(b"c", repr(obj).encode())
     if isinstance(obj, str):
-        buf.append(b"str:" + obj.encode("utf-8", errors="surrogatepass"))
-        return
+        return _tlv(b"s", obj.encode("utf-8", errors="surrogatepass"))
     if isinstance(obj, bytes):
-        buf.append(b"bytes:" + obj)
-        return
+        return _tlv(b"y", obj)
     raise TypeError(
-        f"_canonical_encode: unsupported type {type(obj).__name__} for provenance hashing "
-        f"({obj!r})."
+        f"_canonical_encode_node: unsupported type {type(obj).__name__} for provenance "
+        f"hashing ({obj!r})."
     )
 
 
 def _canonical_spec_sha256(fields):
-    """SHA-256 over a canonical, type-tagged encoding of specification
-    fields (see _canonical_encode) -- deterministic across processes/
-    hash seeds and never truncates large array data."""
+    """SHA-256 over a canonical, self-delimiting TLV encoding of
+    specification fields (see _canonical_encode_node) -- deterministic
+    across processes/hash seeds, never truncates large array data, and
+    is injective (no delimiter-collision between distinct structures)."""
     h = hashlib.sha256()
     for key in sorted(fields):
-        h.update(key.encode())
-        buf = []
-        _canonical_encode(fields[key], buf)
-        h.update(b"".join(buf))
+        h.update(_canonical_encode_node(key))
+        h.update(_canonical_encode_node(fields[key]))
     return h.hexdigest()
 
 

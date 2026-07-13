@@ -519,6 +519,23 @@ class TestIBPProvenanceCanonicalEncoding(unittest.TestCase):
         grid_b = self._grid_with_metadata({"seq": (3, 2, 1)})
         self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
 
+    def test_delimiter_collision_in_string_content_is_rejected(self):
+        """Alice's round-2 finding: a delimiter-separated (non-length-
+        prefixed) encoder let a string CONTAINING a literal delimiter
+        collide with an unrelated sibling tuple -- ("a,str:b",) and
+        ("a", "b") serialized to identical bytes. The TLV encoder must
+        distinguish them since they are genuinely different structures."""
+        grid_a = self._grid_with_metadata({"seq": ("a,str:b",)})
+        grid_b = self._grid_with_metadata({"seq": ("a", "b")})
+        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
+    def test_delimiter_collision_in_raw_bytes_content_is_rejected(self):
+        # Analogous case with raw bytes instead of str -- exercises the
+        # "y" (bytes) TLV branch rather than "s" (str).
+        grid_a = self._grid_with_metadata({"seq": (b"a,bytes:b",)})
+        grid_b = self._grid_with_metadata({"seq": (b"a", b"bytes:b")})
+        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
 
 if __name__ == "__main__":
     unittest.main()
