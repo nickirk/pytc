@@ -1,8 +1,12 @@
 """Periodic ISDF fit machinery (task #21, #proj-isdf-periodic, design
 v2.1 sections 3-5): a generic, matrix-free Hermitian-PSD pivoted
-Cholesky selector, and the Pi^q/eta^q metric/RHS builders. Per-q
-Coulomb kernel application (section 7's KernelProvider protocol) is
-Phase C's scope, not implemented here.
+Cholesky selector, the Pi^q/eta^q metric/RHS builders, and a minimal
+plain-NumPy raw-kernel-apply-and-solve function needed to close the V2
+reference-replay gate at the CPU/NumPy oracle level (Flinn's ruling,
+task #21 thread, 2026-07-13: correctness oracles must close before
+device work starts, so B1 owns this; the formal KernelProvider class
+protocol -- device/jit path, pluggable ibp slot, provenance dict -- is
+Phase C's job and will formalize/wrap this function, not replace it).
 
 Design decision (Alice's option (a), design v2.1 section 3): the
 existing pytc.df.pivots molecular pair core
@@ -197,3 +201,168 @@ def build_pi_eta(X, ao_blocks, kmesh, *, imag_tol=1e-10):
     ]
     eta = np.concatenate(eta_chunks, axis=2)
     return Pi, eta
+
+
+def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-8):
+    """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel
+    to eta^q over the SPATIAL grid, contract back into a Nip x Nip
+    kernel matrix, and solve the Hermitian sandwich for W^q (design
+    v2.1 sections 5+7). Plain NumPy, single q at a time -- a minimal
+    function proving the V0-V6 "raw" provider semantics at the CPU/
+    NumPy oracle level; the formal KernelProvider class/device path is
+    Phase C's job (see module docstring).
+
+        lq   = eta_q * exp(-1j * grid_coords @ q_kpt)   # Bloch-phase
+                                                          # correction:
+            eta^q as built by pair_convolve carries only the k-INDEX
+            Alg-1 phase machinery, not the grid-coordinate-dependent
+            Bloch phase a per-q spatial-grid FFT needs -- this factor
+            supplies it.
+        wq   = FFT(lq, grid_mesh)                        # spatial FFT,
+                                                          # one row per
+                                                          # interpolation
+                                                          # point.
+        vq   = cell.get_coulG(q_kpt, exx=False, mesh=grid_mesh)
+               * cell.vol / Ng                            # bare kernel,
+                                                          # G=0 handled
+                                                          # by pyscf's
+                                                          # own exx=False
+                                                          # convention.
+        rq   = conj(IFFT(wq * vq, grid_mesh))             # spatial
+                                                          # IFFT, then
+                                                          # conjugate
+                                                          # (matches the
+                                                          # bare-kernel
+                                                          # convention
+                                                          # verified
+                                                          # against a
+                                                          # real
+                                                          # reference
+                                                          # dump -- see
+                                                          # the V2
+                                                          # reference-
+                                                          # replay
+                                                          # test).
+        kern_q = lq @ rq.T / sqrt(Ng)                     # (Nip, Nip).
+        W_q  = sqrt(Ng) * hermitian_sandwich_solve(Pi_q, kern_q)[0]
+                                                          # the final
+                                                          # sqrt(Ng)
+                                                          # rescale
+                                                          # exactly
+                                                          # cancels
+                                                          # kern_q's own
+                                                          # 1/sqrt(Ng),
+                                                          # per the
+                                                          # paper's Eq.
+                                                          # 10 factor
+                                                          # list
+                                                          # (section 4:
+                                                          # "vol/Ng,
+                                                          # 1/sqrt(Ng),
+                                                          # sqrt(Ng)
+                                                          # factor
+                                                          # placements")
+                                                          # -- empirically
+                                                          # confirmed
+                                                          # against a
+                                                          # real fftisdf
+                                                          # run on he2
+                                                          # [1,1,3]: this
+                                                          # exact
+                                                          # rescale
+                                                          # closes W_q to
+                                                          # ~1e-9
+                                                          # relative
+                                                          # error (see
+                                                          # the V2
+                                                          # reference-
+                                                          # replay
+                                                          # test).
+
+    exxdiv is NEVER applied here (per section 4/7: exxdiv ownership
+    belongs to a later get_k post-processing step, never inside a
+    kernel provider) -- this function only ever produces the bare
+    kernel.
+
+    Args:
+        Pi_q: (Nip, Nip) complex128, this q's metric (e.g. from
+            build_pi_eta).
+        eta_q: (Nip, Ng) complex128, this q's RHS (e.g. from
+            build_pi_eta), Ng matching grid_coords/grid_mesh.
+        cell: pyscf.pbc.gto.Cell (needed for cell.vol and
+            cell.get_coulG).
+        q_kpt: (3,) absolute k-vector for this q (e.g.
+            KptsMesh.canonical_kpts[q]).
+        grid_coords: (Ng, 3) real-space grid point coordinates, in the
+            SAME flattened order as eta_q's grid axis.
+        grid_mesh: (3,) positive ints, the REAL-SPACE integration mesh
+            shape (a DIFFERENT mesh from the k-point mesh) -- prod
+            must equal Ng.
+        rtol: forwarded to hermitian_sandwich_solve.
+
+    Returns:
+        (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 (the
+        solved kernel matrix); kern_q is the raw (Nip, Nip) contracted
+        kernel before the sandwich solve; solve_info is
+        hermitian_sandwich_solve's own info dict.
+
+    Raises:
+        ValueError: malformed shapes, or grid_mesh does not match Ng.
+    """
+    # Local imports: pytc.pbc.df.isdf depends on pytc.df.solvers (a
+    # pytc/df/ peer, per the design's dependency direction) and pyscf's
+    # own reciprocal-lattice tool, never the reverse.
+    from pyscf.pbc import tools as pbctools
+
+    from pytc.df.solvers import hermitian_sandwich_solve
+
+    Pi_q = np.asarray(Pi_q)
+    eta_q = np.asarray(eta_q)
+    n_ip = Pi_q.shape[0]
+    if Pi_q.shape != (n_ip, n_ip):
+        raise ValueError(f"Pi_q must be square, got shape {Pi_q.shape}.")
+    if eta_q.ndim != 2 or eta_q.shape[0] != n_ip:
+        raise ValueError(f"eta_q must have shape ({n_ip},Ng), got {eta_q.shape}.")
+    n_grid = eta_q.shape[1]
+
+    grid_coords = np.asarray(grid_coords, dtype=np.float64)
+    if grid_coords.shape != (n_grid, 3):
+        raise ValueError(
+            f"grid_coords must have shape ({n_grid},3) matching eta_q's grid axis, "
+            f"got {grid_coords.shape}."
+        )
+    grid_mesh_t = tuple(int(x) for x in grid_mesh)
+    if len(grid_mesh_t) != 3 or any(m <= 0 for m in grid_mesh_t):
+        raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh_t}.")
+    if int(np.prod(grid_mesh_t)) != n_grid:
+        raise ValueError(
+            f"prod(grid_mesh)={int(np.prod(grid_mesh_t))} != eta_q's grid size {n_grid}."
+        )
+
+    q_kpt = np.asarray(q_kpt, dtype=np.float64)
+    if q_kpt.shape != (3,):
+        raise ValueError(f"q_kpt must have shape (3,), got {q_kpt.shape}.")
+
+    phase = np.exp(-1j * (grid_coords @ q_kpt))
+    lq = eta_q * phase[None, :]
+
+    lq_mesh = lq.reshape((n_ip,) + grid_mesh_t)
+    wq_mesh = np.fft.fftn(lq_mesh, axes=(1, 2, 3), norm="backward")
+
+    Gv = cell.get_Gv(list(grid_mesh_t))
+    vq = pbctools.get_coulG(cell, k=q_kpt, exx=False, Gv=Gv, mesh=list(grid_mesh_t))
+    vq = vq * (cell.vol / n_grid)
+    vq_mesh = vq.reshape(grid_mesh_t)
+
+    rq_mesh = np.fft.ifftn(wq_mesh * vq_mesh[None, :, :, :], axes=(1, 2, 3), norm="backward")
+    rq = rq_mesh.reshape(n_ip, n_grid).conj()
+
+    kern_q = (lq @ rq.T) / np.sqrt(n_grid)
+    kern_q = np.asarray(kern_q, dtype=np.complex128)
+
+    W_q_unscaled, solve_info = hermitian_sandwich_solve(Pi_q, kern_q, rtol=rtol)
+    # Final sqrt(Ng) rescale, exactly cancelling kern_q's own 1/sqrt(Ng) --
+    # see the docstring's Eq. 10 factor-placement note; empirically
+    # confirmed against a real fftisdf run (V2 reference-replay test).
+    W_q = np.sqrt(n_grid) * W_q_unscaled
+    return W_q, kern_q, solve_info
