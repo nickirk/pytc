@@ -23,6 +23,22 @@ findings, all covered here):
    MappingProxyType, mutable arrays) -- mutating a SectorFit's
    provenance or arrays after build_core already used it retroactively
    altered the built CoreArtifact.
+
+Round 3 (Alice's re-review of round-2's compatibility_key/_deep_freeze
+fixes, 2 more real findings):
+4. compatibility_key fingerprinted the REQUESTED auxbasis via
+   pyscf.df.addons.make_auxmol -- but stream_df_cderi_blocks silently
+   REUSES mf.with_df whenever present, ignoring the requested auxbasis
+   entirely in that case. Independently reproduced: an mf with a
+   pre-existing with_df streamed bit-identical blocks under two
+   different (both-ignored) requested auxbasis strings, yet got
+   DIFFERENT keys -- a false rejection. Fixed by hashing the ACTUAL
+   streamed DF block bytes (compute_C_streamed's df_factor_sha256)
+   instead of an auxmol fingerprint of the requested label.
+5. _deep_freeze never actually froze numpy arrays nested inside e.g.
+   upstream_provenance (only top-level P/C/pivots went through
+   _readonly_copy) -- mutating a caller's array nested in
+   upstream_provenance after build leaked into the built artifact.
 """
 
 import copy
@@ -205,13 +221,55 @@ class TestBuildCore(unittest.TestCase):
 
     def test_cross_join_rejects_mismatched_system(self):
         sector_ov = self._build_ov_sector()
-        # A SectorFit built from a totally different molecule/basis.
+        # A SectorFit built from a totally different molecule/basis,
+        # requesting the SAME nominal auxbasis string -- proving the
+        # rejection is driven by the actually-streamed factor, not a
+        # trivial string mismatch (round-3 finding).
         sector_other = build_sector(
             self.mf2, self.factor2_raw, self.factor2_raw, self.mo2, self.mo2,
-            self.coords2, self.weights2, requested_rank=1, same_factor=True)
+            self.coords2, self.weights2, requested_rank=1, same_factor=True,
+            auxbasis="weigend")
         self.assertNotEqual(sector_ov.compatibility_key, sector_other.compatibility_key)
         with self.assertRaises(ValueError):
             build_core(sector_ov, sector_other)
+
+    # ---- Round 3, finding 4: compatibility_key tracks the ACTUAL
+    # streamed factor, not the (possibly-ignored) requested auxbasis ----
+
+    def test_compatibility_key_invariant_to_ignored_auxbasis_when_with_df_reused(self):
+        # self.mf already has with_df set (from .density_fit() in
+        # setUpClass), so stream_df_cderi_blocks silently IGNORES
+        # whatever auxbasis is requested here -- both calls must
+        # stream the identical actual factor and therefore get the
+        # SAME compatibility_key/df_factor_sha256, despite different
+        # (both-ignored) requested auxbasis strings.
+        self.assertIsNotNone(self.mf.with_df)
+        sector_a = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, auxbasis="weigend")
+        sector_b = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, auxbasis="def2-svp-jkfit")
+        self.assertEqual(sector_a.provenance["df_factor_sha256"],
+                          sector_b.provenance["df_factor_sha256"])
+        self.assertEqual(sector_a.compatibility_key, sector_b.compatibility_key)
+        self.assertTrue(sector_a.provenance["reused_existing_with_df"])
+        self.assertEqual(sector_a.provenance["requested_auxbasis"], "weigend")
+        self.assertEqual(sector_b.provenance["requested_auxbasis"], "def2-svp-jkfit")
+        self.assertEqual(sector_a.provenance["effective_auxbasis"],
+                          sector_b.provenance["effective_auxbasis"])
+
+    def test_compatibility_key_invariant_to_blksize(self):
+        sector_a = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, blksize=None)
+        sector_b = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, blksize=8)
+        self.assertEqual(sector_a.provenance["df_factor_sha256"],
+                          sector_b.provenance["df_factor_sha256"])
+        self.assertEqual(sector_a.compatibility_key, sector_b.compatibility_key)
+        np.testing.assert_allclose(sector_a.C, sector_b.C)
 
     def test_cross_join_accepts_matching_system(self):
         sector_oo = self._build_oo_sector()
@@ -252,6 +310,35 @@ class TestBuildCore(unittest.TestCase):
         self.assertIsInstance(nested, types.MappingProxyType)
         with self.assertRaises(TypeError):
             nested["auxbasis"] = "mutated"
+
+    # ---- Round 3, finding 5: arrays nested inside provenance are frozen ----
+
+    def test_nested_array_in_upstream_provenance_is_read_only(self):
+        x = np.array([1.0, 2.0, 3.0])
+        sector = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov,
+            upstream_provenance={"some_array": x})
+        frozen_array = sector.provenance["upstream_provenance"]["some_array"]
+        self.assertIsInstance(frozen_array, np.ndarray)
+        self.assertFalse(frozen_array.flags.writeable)
+        with self.assertRaises(ValueError):
+            frozen_array[0] = 0.0
+
+    def test_mutating_callers_nested_array_after_build_does_not_alter_artifact(self):
+        # Alice's exact repro: x = np.array([1.0]); frozen = _deep_freeze
+        # ({'nested_array': x}); x[0] = 9.0 must NOT change
+        # frozen['nested_array'][0] -- the frozen copy must be
+        # independent of the caller's original array, not merely a
+        # read-only VIEW of the same underlying buffer.
+        x = np.array([1.0])
+        sector = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov,
+            upstream_provenance={"nested_array": x})
+        x[0] = 9.0
+        np.testing.assert_array_equal(
+            sector.provenance["upstream_provenance"]["nested_array"], [1.0])
 
     def test_mutating_caller_upstream_dict_after_build_does_not_alter_artifact(self):
         # build_sector must not alias the caller's own dict either --
@@ -322,6 +409,33 @@ class TestBuildCore(unittest.TestCase):
             build_sector(
                 self.mf, self.occ_raw, self.vir_raw, self.mo_occ[:, :-1], self.mo_vir,
                 self.coords, self.weights, self.n_rank_ov)
+
+    def test_malformed_1d_grid_coords_raises_value_error_not_index_error(self):
+        # A flattened grid_coords (missing the (n_grid, 3) axis) must
+        # raise the documented ValueError, not an incidental IndexError
+        # from .shape[1] indexing (Alice's build_core review, round 3).
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords.ravel(), self.weights, self.n_rank_ov)
+
+    def test_malformed_1d_factor_raises_value_error_not_index_error(self):
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw.ravel(), self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov)
+
+    def test_malformed_1d_mo_coeff_raises_value_error_not_index_error(self):
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ[:, 0], self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov)
+
+    def test_malformed_2d_grid_weights_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights[:, None], self.n_rank_ov)
 
 
 def _thaw(obj):

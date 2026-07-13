@@ -40,13 +40,7 @@ Round 2 (re-review of round-1 implementation -> 3 more fixes):
    numerical_rank=2 while the TRUE rank was 9). numerical_rank=None +
    numerical_rank_lower_bound otherwise.
 4. Cross-sector joins now require a matching compatibility_key --
-   fingerprints molecule identity, the REALIZED auxiliary basis
-   (parsed function/exponent data, not just the auxbasis label string
-   -- two different custom auxbasis objects or pyscf versions can
-   realize different functions under the same label), kernel policy,
-   and pyscf version. build_core raises ValueError on a mismatched
-   cross join rather than silently joining two SectorFits built from
-   different molecules/kernels that happen to share an n_aux.
+   see round 3 below for its final (corrected) definition.
 5. SectorFit/CoreArtifact are genuinely immutable, not just
    shallow-frozen dataclasses: P/C/pivots are DEFENSIVE COPIES with
    the numpy write flag cleared (never the caller's own array object,
@@ -57,14 +51,34 @@ Round 2 (re-review of round-1 implementation -> 3 more fixes):
    lets nested keys like provenance['upstream_provenance']['x'] = ...
    mutate an already-built artifact.
 
-Also (round 2): strict construction validation (grid/factor/mo_coeff
-shape consistency; same_factor=True requires factor_p_raw/factor_q_raw
-and mo_coeff_p/mo_coeff_q to actually be equal, not just same-shaped,
-since the n*(n+1)/2 triangular analytic rank cap assumes phi_p*phi_q ==
-phi_q*phi_p as functions); factor_p_raw_sha256/factor_q_raw_sha256
-added to provenance (the actual MO-value arrays used were not hashed
-before, only the claimed grid/mo_coeff); public exports added to
-pytc.coulomb.__init__.
+Round 3 (re-review of round-2 implementation -> 2 more fixes):
+6. compatibility_key originally fingerprinted the REQUESTED auxbasis
+   argument via pyscf.df.addons.make_auxmol -- but
+   stream_df_cderi_blocks silently REUSES mf.with_df whenever already
+   present, in which case the requested auxbasis is IGNORED entirely.
+   Independently reproduced: an mf with a pre-existing with_df
+   (auxbasis "cc-pvdz-jkfit") streamed BIT-IDENTICAL blocks when called
+   with two different, both-ignored, requested auxbasis strings, yet
+   the two calls' make_auxmol-based keys DIFFERED -- a false rejection
+   of a physically identical join. Fixed at the source: compute_C_streamed
+   now optionally returns df_factor_sha256, an incremental SHA-256 over
+   the ACTUAL packed DF block bytes AS THEY STREAM (blksize-invariant --
+   see its docstring) -- the definitive proof two builds consumed the
+   same ordered auxiliary factor. compatibility_key now incorporates
+   this actual-factor hash instead of an independently-derived auxmol
+   fingerprint of the (possibly-ignored) requested auxbasis.
+7. _deep_freeze claimed to leave numpy arrays "handled separately" but
+   never actually froze arrays nested inside e.g. upstream_provenance
+   (only the top-level P/C/pivots went through _readonly_copy) --
+   mutating a caller-supplied array nested in upstream_provenance after
+   build silently leaked into the already-built artifact. Fixed: an
+   explicit np.ndarray branch in _deep_freeze routes through the same
+   _readonly_copy used for P/C/pivots.
+
+Also (round 3): explicit ndim/shape validation before any .shape[1]
+indexing (grid_coords must be (n_grid, 3); grid_weights (n_grid,);
+factors and MO coefficients 2-D) so malformed inputs raise the
+documented ValueError rather than an incidental IndexError.
 """
 
 import dataclasses
@@ -74,7 +88,6 @@ import types
 
 import numpy as np
 import pyscf
-from pyscf.df.addons import make_auxmol
 
 from pytc.coulomb.pivot_selection import select_sector_pivots, weight_mo_values
 from pytc.coulomb.molecular_df_reference import compute_C_streamed
@@ -113,12 +126,14 @@ def _readonly_copy(a):
 
 def _deep_freeze(obj):
     """Recursively convert dict -> types.MappingProxyType, list/tuple ->
-    tuple, set -> frozenset, at every nesting level -- a shallow
-    top-level MappingProxyType still lets nested keys (e.g.
-    provenance['upstream_provenance']['x'] = ...) mutate an
-    already-built artifact (Alice's build_core review, 2026-07-12).
-    Leaves scalars, strings, and numpy arrays (handled separately via
-    _readonly_copy) unchanged."""
+    tuple, set -> frozenset, and numpy arrays -> read-only copies, at
+    every nesting level -- a shallow top-level MappingProxyType still
+    lets nested keys (e.g. provenance['upstream_provenance']['x'] = ...)
+    mutate an already-built artifact, and arrays nested inside e.g.
+    upstream_provenance were previously left untouched entirely,
+    silently mutable via any alias the caller kept (Alice's build_core
+    review, 2026-07-12, two rounds: shallow top-level freeze, then
+    missing array handling). Leaves scalars/strings unchanged."""
     if isinstance(obj, types.MappingProxyType):
         obj = dict(obj)
     if isinstance(obj, dict):
@@ -127,29 +142,33 @@ def _deep_freeze(obj):
         return tuple(_deep_freeze(v) for v in obj)
     if isinstance(obj, set):
         return frozenset(_deep_freeze(v) for v in obj)
+    if isinstance(obj, np.ndarray):
+        return _readonly_copy(obj)
     return obj
 
 
-def _kernel_compatibility_key(mf, kernel_policy, auxbasis):
+def _kernel_compatibility_key(mf, kernel_policy, df_factor_sha256):
     """Fingerprint of everything that must match for two SectorFits' C
     columns to represent the SAME ordered DF factor/kernel instance:
-    molecule identity (geometry/AO basis/charge/spin), the REALIZED
-    auxiliary basis (parsed exponent/coefficient data via
-    pyscf.df.addons.make_auxmol, not just the `auxbasis` label string --
-    two different custom auxbasis objects, or the same label realized
-    under different pyscf versions, can differ), kernel policy, and the
-    pyscf version itself (Alice's build_core review, 2026-07-12: "same
-    equal strings [for auxbasis] are not enough")."""
+    molecule identity (geometry/AO basis/charge/spin) as human-legible
+    supporting metadata, PLUS df_factor_sha256 -- an incremental hash of
+    the ACTUAL packed DF block bytes streamed for this build
+    (compute_C_streamed's return_provenance option) -- which is the
+    DEFINITIVE proof of factor identity, since stream_df_cderi_blocks
+    silently reuses mf.with_df whenever present and ignores any
+    requested `auxbasis` argument in that case (Alice's build_core
+    review, 2026-07-13: a key built only from the REQUESTED auxbasis
+    label -- even via a realized-auxmol fingerprint -- can diverge from
+    what was actually streamed, in either direction). Also folds in
+    kernel_policy and the pyscf version."""
     mol = mf.mol
-    auxmol = make_auxmol(mol, auxbasis)
     h = hashlib.sha256()
     h.update(repr(mol.atom).encode())
     h.update(repr(mol.basis).encode())
     h.update(str(mol.charge).encode())
     h.update(str(mol.spin).encode())
     h.update(_canonical_sha256(mol.atom_coords()).encode())
-    h.update(repr(auxmol._basis).encode())
-    h.update(str(auxmol.nao).encode())
+    h.update(df_factor_sha256.encode())
     h.update(kernel_policy.encode())
     h.update(pyscf.__version__.encode())
     return h.hexdigest()
@@ -221,9 +240,14 @@ def build_sector(mf, factor_p_raw, factor_q_raw, mo_coeff_p, mo_coeff_q,
         kernel_policy: Recorded in provenance and fingerprinted into
             compatibility_key; only "MolecularDFReference" is
             implemented so far (compute_C_streamed's DF-B-tensor route).
-        auxbasis, blksize: forwarded to compute_C_streamed; auxbasis is
-            also fingerprinted (its REALIZED parsed basis, not just the
-            label) into compatibility_key.
+        auxbasis, blksize: forwarded to compute_C_streamed. NOTE:
+            auxbasis is silently IGNORED by compute_C_streamed whenever
+            mf.with_df already exists -- see the requested_auxbasis/
+            effective_auxbasis/reused_existing_with_df provenance
+            fields, which record what was actually used. Not
+            fingerprinted into compatibility_key directly; the ACTUAL
+            streamed DF factor bytes (df_factor_sha256) are, which is
+            correct regardless of whether auxbasis was honored.
         upstream_provenance: Caller-supplied dict of facts this function
             cannot infer safely from `mf` alone -- gpu4pyscf version,
             the ACTUAL grid settings used to build grid_coords/
@@ -255,6 +279,19 @@ def build_sector(mf, factor_p_raw, factor_q_raw, mo_coeff_p, mo_coeff_q,
     mo_coeff_q = np.asarray(mo_coeff_q)
     grid_coords = np.asarray(grid_coords)
     grid_weights = np.asarray(grid_weights)
+
+    if grid_coords.ndim != 2 or grid_coords.shape[1] != 3:
+        raise ValueError(f"grid_coords must be (n_grid, 3), got shape {grid_coords.shape}.")
+    if grid_weights.ndim != 1:
+        raise ValueError(f"grid_weights must be 1-D (n_grid,), got shape {grid_weights.shape}.")
+    if factor_p_raw.ndim != 2:
+        raise ValueError(f"factor_p_raw must be 2-D (n_p, n_grid), got shape {factor_p_raw.shape}.")
+    if factor_q_raw.ndim != 2:
+        raise ValueError(f"factor_q_raw must be 2-D (n_q, n_grid), got shape {factor_q_raw.shape}.")
+    if mo_coeff_p.ndim != 2:
+        raise ValueError(f"mo_coeff_p must be 2-D (n_ao, n_p), got shape {mo_coeff_p.shape}.")
+    if mo_coeff_q.ndim != 2:
+        raise ValueError(f"mo_coeff_q must be 2-D (n_ao, n_q), got shape {mo_coeff_q.shape}.")
 
     n_grid = grid_coords.shape[0]
     if grid_weights.shape[0] != n_grid:
@@ -306,9 +343,12 @@ def build_sector(mf, factor_p_raw, factor_q_raw, mo_coeff_p, mo_coeff_q,
     pivots = np.asarray(pivots)
 
     P = pair_collocation_at_pivots(factor_p_raw[:, pivots], factor_q_raw[:, pivots])
-    C = compute_C_streamed(mf, P, mo_coeff_p, mo_coeff_q, auxbasis=auxbasis, blksize=blksize)
+    C, c_provenance = compute_C_streamed(
+        mf, P, mo_coeff_p, mo_coeff_q, auxbasis=auxbasis, blksize=blksize,
+        return_provenance=True)
 
-    compatibility_key = _kernel_compatibility_key(mf, kernel_policy, auxbasis)
+    compatibility_key = _kernel_compatibility_key(
+        mf, kernel_policy, c_provenance["df_factor_sha256"])
 
     provenance = {
         "kernel_policy": kernel_policy,
@@ -317,6 +357,8 @@ def build_sector(mf, factor_p_raw, factor_q_raw, mo_coeff_p, mo_coeff_q,
         "effective_rank_rtol": effective_rank_rtol,
         **pivot_provenance,  # requested_rank, analytic_rank_bound, n_rank_capped,
                               # rank_exhausted, numerical_rank, numerical_rank_lower_bound, n_pivots
+        **c_provenance,  # df_factor_sha256, requested_auxbasis, effective_auxbasis,
+                          # reused_existing_with_df
         "pivot_indices_sha256": _canonical_sha256(pivots),
         "grid_sha256": _canonical_sha256(grid_coords, grid_weights),
         "mo_coeff_p_sha256": _canonical_sha256(mo_coeff_p),
