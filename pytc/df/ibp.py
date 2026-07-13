@@ -29,6 +29,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .solvers import (
+    prepare_normal_equations_solver,
+    solve_normal_equations_batch_prepared,
+)
+
 
 def _validate_grid_inputs(density, coords, weights, name):
     density = np.asarray(density)
@@ -828,4 +833,672 @@ def build_ibp_operator_plan(grid, *, method="direct", tolerance=None,
         backend=grid.backend, device=grid.device, dtype=grid.dtype,
         method_version=_IBP_OPERATOR_PLAN_VERSION,
         provenance=frozen_provenance, operator_spec_sha256=operator_spec_sha256,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fixed-pivot interpolation sectors (task #6).
+# ---------------------------------------------------------------------------
+
+_IBP_INTERPOLATION_SOLVER_VERSION = "1"
+_SUPPORTED_IBP_STORAGE_MODES = ("incore_full_theta_gradient",)
+_IBP_FACTOR_IDENTITY_KEYS = (
+    "factor_p_sha256",
+    "factor_q_sha256",
+    "gradient_p_sha256",
+    "gradient_q_sha256",
+)
+_IBP_PIVOT_PROVENANCE_KEYS = frozenset({
+    "requested_rank",
+    "analytic_rank_bound",
+    "n_rank_capped",
+    "rank_exhausted",
+    "numerical_rank",
+    "numerical_rank_lower_bound",
+    "n_pivots",
+})
+
+
+def _validate_nonnegative_finite(name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        raise ValueError(f"{name} must be a finite non-negative number, got {value!r}.")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be a finite non-negative number, got {value!r}.")
+    return value
+
+
+def _validate_pivot_provenance(record, *, n_p, n_q, same_factor, selected_rank):
+    """Validate the exact record returned by select_sector_pivots(...,
+    return_provenance=True), without importing the higher integrals layer.
+
+    pytc.df.ibp is intentionally below pytc.integrals.coulomb in the package
+    graph.  Consuming and checking the selector's closed record preserves that
+    layering while preventing requested, selected, and numerical ranks from
+    being silently conflated.
+    """
+    if record is None:
+        raise ValueError(
+            "pivot_provenance is required and must be the record returned by "
+            "select_sector_pivots(..., return_provenance=True)."
+        )
+    try:
+        record = dict(record)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("pivot_provenance must be a mapping.") from exc
+    keys = frozenset(record)
+    if keys != _IBP_PIVOT_PROVENANCE_KEYS:
+        missing = sorted(_IBP_PIVOT_PROVENANCE_KEYS - keys)
+        extra = sorted(keys - _IBP_PIVOT_PROVENANCE_KEYS)
+        raise ValueError(
+            f"pivot_provenance has a non-closed schema; missing={missing}, extra={extra}."
+        )
+
+    requested_rank = _validate_positive_int("requested_rank", record["requested_rank"])
+    analytic_rank_bound = (
+        n_p * (n_p + 1) // 2 if same_factor else n_p * n_q
+    )
+    if record["analytic_rank_bound"] != analytic_rank_bound:
+        raise ValueError(
+            f"pivot_provenance analytic_rank_bound={record['analytic_rank_bound']!r} "
+            f"does not match the factor shapes ({analytic_rank_bound})."
+        )
+    n_rank_capped = min(requested_rank, analytic_rank_bound)
+    if record["n_rank_capped"] != n_rank_capped:
+        raise ValueError(
+            f"pivot_provenance n_rank_capped={record['n_rank_capped']!r} != "
+            f"min(requested_rank, analytic_rank_bound)={n_rank_capped}."
+        )
+    if record["n_pivots"] != selected_rank:
+        raise ValueError(
+            f"pivot_provenance n_pivots={record['n_pivots']!r} != actual pivot count "
+            f"{selected_rank}."
+        )
+    if not isinstance(record["rank_exhausted"], bool):
+        raise TypeError("pivot_provenance rank_exhausted must be bool.")
+    rank_exhausted = record["rank_exhausted"]
+    numerical_rank_lower_bound = _validate_positive_int(
+        "numerical_rank_lower_bound", record["numerical_rank_lower_bound"]
+    )
+    if numerical_rank_lower_bound != selected_rank:
+        raise ValueError(
+            "pivot_provenance numerical_rank_lower_bound must equal the selected pivot "
+            f"count ({selected_rank}), got {numerical_rank_lower_bound}."
+        )
+    numerical_rank = record["numerical_rank"]
+    if rank_exhausted:
+        numerical_rank = _validate_positive_int("numerical_rank", numerical_rank)
+        if numerical_rank != selected_rank or selected_rank >= n_rank_capped:
+            raise ValueError(
+                "rank_exhausted=True requires numerical_rank == selected_rank < "
+                "n_rank_capped."
+            )
+    else:
+        if numerical_rank is not None or selected_rank != n_rank_capped:
+            raise ValueError(
+                "rank_exhausted=False requires numerical_rank=None and "
+                "selected_rank == n_rank_capped."
+            )
+
+    return {
+        "requested_rank": requested_rank,
+        "analytic_rank_bound": analytic_rank_bound,
+        "n_rank_capped": n_rank_capped,
+        "rank_exhausted": rank_exhausted,
+        "numerical_rank": numerical_rank,
+        "numerical_rank_lower_bound": numerical_rank_lower_bound,
+        "n_pivots": selected_rank,
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class IBPInterpolationSector:
+    """One fixed-pivot orbital-pair interpolation sector on an IBPGrid.
+
+    ``P`` is the raw pair collocation at the selected points.  Same-factor
+    sectors use packed-lower pair order (the layout required by the later
+    PySCF ``loop()`` bridge); mixed sectors use full row-major ``(p,q)``
+    order. ``Theta[mu,g]`` and ``grad_Theta[mu,3,g]`` are built with one
+    prepared normal-equation factorization.  Gradient construction applies
+    the product rule using those exact pivots/factorization; it never runs a
+    second pivot selection.
+
+    NumPy outputs are defensive read-only copies. JAX outputs remain on the
+    realized device. Large JAX inputs are identified by caller-attested
+    SHA-256 strings; only the small pivot vector is transferred to the host
+    for canonical validation/hashing.
+    """
+    P: object
+    Theta: object
+    grad_Theta: object
+    pivots: object
+    grid: object
+    n_orbital_p: int
+    n_orbital_q: int
+    n_pair: int
+    n_grid: int
+    same_factor: bool
+    pair_layout: str
+    requested_rank: int
+    analytic_rank_bound: int
+    n_rank_capped: int
+    selected_rank: int
+    rank_exhausted: bool
+    numerical_rank: object
+    numerical_rank_lower_bound: int
+    storage_mode: str
+    backend: str
+    device: str
+    realized_dtype: str
+    grid_batch_size: int
+    rcond: float
+    jitter_used: float
+    n_tries: int
+    factor_identity_source: str
+    factor_p_sha256: str
+    factor_q_sha256: str
+    gradient_p_sha256: str
+    gradient_q_sha256: str
+    pivots_sha256: str
+    output_identity_source: str
+    p_sha256: object
+    theta_sha256: object
+    grad_theta_sha256: object
+    solver_version: str
+    provenance: object
+    sector_spec_sha256: str
+
+    def __post_init__(self):
+        if not isinstance(self.grid, IBPGrid):
+            raise TypeError(f"grid must be an IBPGrid, got {type(self.grid).__name__}.")
+        if not isinstance(self.same_factor, bool):
+            raise TypeError("same_factor must be bool.")
+        if self.backend not in _SUPPORTED_IBP_BACKENDS:
+            raise ValueError(f"Unsupported backend={self.backend!r}.")
+        if self.backend != self.grid.backend:
+            raise ValueError("sector backend must match the bound IBPGrid backend.")
+        if self.storage_mode not in _SUPPORTED_IBP_STORAGE_MODES:
+            raise ValueError(f"Unsupported storage_mode={self.storage_mode!r}.")
+
+        arrays = (self.P, self.Theta, self.grad_Theta, self.pivots)
+        if self.backend == "numpy":
+            if not all(isinstance(a, np.ndarray) for a in arrays):
+                raise TypeError("backend='numpy' requires P/Theta/grad_Theta/pivots as ndarray.")
+            for name in ("P", "Theta", "grad_Theta", "pivots"):
+                object.__setattr__(self, name, _readonly_copy(getattr(self, name)))
+            if self.device != "cpu" or self.grid.device != "cpu":
+                raise ValueError("NumPy sectors and their grid must use device='cpu'.")
+        else:
+            if not all(isinstance(a, jax.Array) for a in arrays):
+                raise TypeError("backend='jax' requires P/Theta/grad_Theta/pivots as jax.Array.")
+            devices = {str(a.device) for a in arrays}
+            if devices != {self.device} or self.device != self.grid.device:
+                raise ValueError(
+                    f"JAX sector arrays and grid must share device={self.device!r}, got {devices}."
+                )
+
+        n_p = _validate_positive_int("n_orbital_p", self.n_orbital_p)
+        n_q = _validate_positive_int("n_orbital_q", self.n_orbital_q)
+        n_grid = _validate_positive_int("n_grid", self.n_grid)
+        selected_rank = _validate_positive_int("selected_rank", self.selected_rank)
+        if n_grid != self.grid.n_grid:
+            raise ValueError(f"n_grid={n_grid} != bound grid.n_grid={self.grid.n_grid}.")
+        expected_layout = "packed_lower" if self.same_factor else "full_row_major"
+        expected_n_pair = n_p * (n_p + 1) // 2 if self.same_factor else n_p * n_q
+        if self.same_factor and n_p != n_q:
+            raise ValueError("same_factor=True requires n_orbital_p == n_orbital_q.")
+        if self.pair_layout != expected_layout or self.n_pair != expected_n_pair:
+            raise ValueError(
+                f"pair layout/count must be {expected_layout!r}/{expected_n_pair}, got "
+                f"{self.pair_layout!r}/{self.n_pair}."
+            )
+        if self.P.shape != (selected_rank, expected_n_pair):
+            raise ValueError(
+                f"P must have shape {(selected_rank, expected_n_pair)}, got {self.P.shape}."
+            )
+        if self.Theta.shape != (selected_rank, n_grid):
+            raise ValueError(
+                f"Theta must have shape {(selected_rank, n_grid)}, got {self.Theta.shape}."
+            )
+        if self.grad_Theta.shape != (selected_rank, 3, n_grid):
+            raise ValueError(
+                f"grad_Theta must have shape {(selected_rank, 3, n_grid)}, "
+                f"got {self.grad_Theta.shape}."
+            )
+        if self.pivots.shape != (selected_rank,) or not np.issubdtype(
+            np.dtype(self.pivots.dtype), np.integer
+        ):
+            raise ValueError("pivots must be a 1-D integer array of selected_rank entries.")
+
+        data_dtypes = {str(a.dtype) for a in (self.P, self.Theta, self.grad_Theta)}
+        if data_dtypes != {self.realized_dtype}:
+            raise ValueError(
+                f"P/Theta/grad_Theta dtype must equal realized_dtype={self.realized_dtype!r}, "
+                f"got {data_dtypes}."
+            )
+        data_dtype = np.dtype(self.realized_dtype)
+        if not np.issubdtype(data_dtype, np.inexact):
+            raise ValueError("sector data must use a floating or complex dtype.")
+        real_dtype = np.empty((), dtype=data_dtype).real.dtype
+        if str(real_dtype) != self.grid.dtype:
+            raise ValueError(
+                f"sector real precision {real_dtype} does not match grid dtype {self.grid.dtype}."
+            )
+        if self.backend == "numpy":
+            finite = all(np.all(np.isfinite(a)) for a in (self.P, self.Theta, self.grad_Theta))
+        else:
+            finite = all(bool(jnp.all(jnp.isfinite(a))) for a in (self.P, self.Theta, self.grad_Theta))
+        if not finite:
+            raise ValueError("P, Theta, and grad_Theta must be finite.")
+
+        pivots_np = np.asarray(self.pivots, dtype=np.int64)
+        if np.unique(pivots_np).size != selected_rank:
+            raise ValueError("pivots must be unique.")
+        if pivots_np.min() < 0 or pivots_np.max() >= n_grid:
+            raise ValueError(f"pivots must lie in [0, {n_grid}).")
+        recomputed_pivots_sha256 = _canonical_sha256(pivots_np)
+        if self.pivots_sha256 != recomputed_pivots_sha256:
+            raise ValueError("pivots_sha256 does not match the canonical pivot indices.")
+
+        rank_record = _validate_pivot_provenance(
+            {
+                "requested_rank": self.requested_rank,
+                "analytic_rank_bound": self.analytic_rank_bound,
+                "n_rank_capped": self.n_rank_capped,
+                "rank_exhausted": self.rank_exhausted,
+                "numerical_rank": self.numerical_rank,
+                "numerical_rank_lower_bound": self.numerical_rank_lower_bound,
+                "n_pivots": selected_rank,
+            },
+            n_p=n_p, n_q=n_q, same_factor=self.same_factor,
+            selected_rank=selected_rank,
+        )
+        for key, value in rank_record.items():
+            if key != "n_pivots":
+                object.__setattr__(self, key, value)
+
+        grid_batch_size = _validate_positive_int("grid_batch_size", self.grid_batch_size)
+        if grid_batch_size > n_grid:
+            raise ValueError("grid_batch_size must be the realized value and cannot exceed n_grid.")
+        object.__setattr__(self, "grid_batch_size", grid_batch_size)
+        if (
+            isinstance(self.rcond, bool)
+            or not isinstance(self.rcond, (int, float, np.number))
+            or not math.isfinite(self.rcond)
+            or self.rcond <= 0.0
+        ):
+            raise ValueError(f"rcond must be finite and positive, got {self.rcond!r}.")
+        jitter_used = _validate_nonnegative_finite("jitter_used", self.jitter_used)
+        object.__setattr__(self, "jitter_used", jitter_used)
+        n_tries = _validate_positive_int("n_tries", self.n_tries)
+        object.__setattr__(self, "n_tries", n_tries)
+        if self.solver_version != _IBP_INTERPOLATION_SOLVER_VERSION:
+            raise ValueError(
+                f"solver_version={self.solver_version!r} != "
+                f"{_IBP_INTERPOLATION_SOLVER_VERSION!r}."
+            )
+
+        expected_identity_source = (
+            "computed_content_hash" if self.backend == "numpy" else "caller_attested"
+        )
+        if self.factor_identity_source != expected_identity_source:
+            raise ValueError(
+                f"factor_identity_source must be {expected_identity_source!r} for "
+                f"backend={self.backend!r}."
+            )
+        for name in _IBP_FACTOR_IDENTITY_KEYS + ("pivots_sha256",):
+            _validate_sha256_hex(name, getattr(self, name))
+        if self.same_factor and (
+            self.factor_p_sha256 != self.factor_q_sha256
+            or self.gradient_p_sha256 != self.gradient_q_sha256
+        ):
+            raise ValueError("same_factor=True requires identical factor and gradient identities.")
+
+        expected_output_source = (
+            "computed_content_hash"
+            if self.backend == "numpy"
+            else "derived_from_attested_inputs_unverified"
+        )
+        if self.output_identity_source != expected_output_source:
+            raise ValueError(
+                f"output_identity_source must be {expected_output_source!r} for "
+                f"backend={self.backend!r}."
+            )
+        if self.backend == "numpy":
+            output_hashes = {
+                "p_sha256": _canonical_sha256(self.P),
+                "theta_sha256": _canonical_sha256(self.Theta),
+                "grad_theta_sha256": _canonical_sha256(self.grad_Theta),
+            }
+            for name, recomputed in output_hashes.items():
+                _validate_sha256_hex(name, getattr(self, name))
+                if getattr(self, name) != recomputed:
+                    raise ValueError(f"{name} does not match the realized NumPy output.")
+        elif any(
+            value is not None
+            for value in (self.p_sha256, self.theta_sha256, self.grad_theta_sha256)
+        ):
+            raise ValueError(
+                "JAX output content hashes must be None: the builder does not copy large "
+                "derived arrays to the host merely to hash them; their trust boundary is "
+                "recorded by output_identity_source."
+            )
+
+        object.__setattr__(
+            self, "provenance", _deep_freeze(dict(self.provenance) if self.provenance else {})
+        )
+        recomputed_spec = _canonical_spec_sha256({
+            "grid_spec_sha256": self.grid.grid_spec_sha256,
+            "n_orbital_p": n_p, "n_orbital_q": n_q, "n_pair": expected_n_pair,
+            "n_grid": n_grid, "same_factor": self.same_factor,
+            "pair_layout": self.pair_layout,
+            "requested_rank": self.requested_rank,
+            "analytic_rank_bound": self.analytic_rank_bound,
+            "n_rank_capped": self.n_rank_capped,
+            "selected_rank": selected_rank,
+            "rank_exhausted": self.rank_exhausted,
+            "numerical_rank": self.numerical_rank,
+            "numerical_rank_lower_bound": self.numerical_rank_lower_bound,
+            "storage_mode": self.storage_mode, "backend": self.backend,
+            "device": self.device, "realized_dtype": self.realized_dtype,
+            "grid_batch_size": grid_batch_size, "rcond": float(self.rcond),
+            "jitter_used": jitter_used, "n_tries": n_tries,
+            "factor_identity_source": self.factor_identity_source,
+            "factor_p_sha256": self.factor_p_sha256,
+            "factor_q_sha256": self.factor_q_sha256,
+            "gradient_p_sha256": self.gradient_p_sha256,
+            "gradient_q_sha256": self.gradient_q_sha256,
+            "pivots_sha256": self.pivots_sha256,
+            "output_identity_source": self.output_identity_source,
+            "p_sha256": self.p_sha256, "theta_sha256": self.theta_sha256,
+            "grad_theta_sha256": self.grad_theta_sha256,
+            "solver_version": self.solver_version,
+            "provenance": self.provenance,
+        })
+        if recomputed_spec != self.sector_spec_sha256:
+            raise ValueError(
+                "sector_spec_sha256 does not match the canonical digest recomputed from "
+                "this artifact's own declared fields."
+            )
+
+
+def build_ibp_interpolation_sector(
+    factor_p_raw,
+    factor_q_raw,
+    gradient_p_raw,
+    gradient_q_raw,
+    pivots,
+    grid,
+    *,
+    pivot_provenance,
+    same_factor=False,
+    grid_batch_size=None,
+    rcond=1e-14,
+    upstream_provenance=None,
+):
+    """Build raw fixed-pivot pair interpolation vectors and derivatives.
+
+    ``pivot_provenance`` must be the exact closed record returned by the
+    canonical higher-layer selector's ``return_provenance=True`` mode. The
+    builder validates it but deliberately does not select or reorder pivots:
+    the undifferentiated selection is a separate step, and gradients must
+    never trigger a second selection.
+    """
+    if not isinstance(grid, IBPGrid):
+        raise TypeError(f"grid must be an IBPGrid, got {type(grid).__name__}.")
+    if not isinstance(same_factor, bool):
+        raise TypeError("same_factor must be bool.")
+
+    inputs = (factor_p_raw, factor_q_raw, gradient_p_raw, gradient_q_raw)
+    all_numpy = all(isinstance(a, np.ndarray) for a in inputs)
+    all_jax = all(isinstance(a, jax.Array) for a in inputs)
+    if not (all_numpy or all_jax):
+        raise ValueError(
+            "factor and gradient inputs must all be numpy.ndarray or all be jax.Array."
+        )
+    backend = "jax" if all_jax else "numpy"
+    if backend != grid.backend:
+        raise ValueError("factor/gradient backend must match the bound IBPGrid backend.")
+    xp = jnp if backend == "jax" else np
+    factor_p_raw, factor_q_raw, gradient_p_raw, gradient_q_raw = (
+        xp.asarray(a) for a in inputs
+    )
+    if factor_p_raw.ndim != 2 or factor_q_raw.ndim != 2:
+        raise ValueError("factor_p_raw/factor_q_raw must be 2-D (n_orbital,n_grid).")
+    if gradient_p_raw.shape != (3,) + factor_p_raw.shape:
+        raise ValueError("gradient_p_raw must have shape (3,) + factor_p_raw.shape.")
+    if gradient_q_raw.shape != (3,) + factor_q_raw.shape:
+        raise ValueError("gradient_q_raw must have shape (3,) + factor_q_raw.shape.")
+    if factor_p_raw.shape[0] == 0 or factor_q_raw.shape[0] == 0:
+        raise ValueError("factor arrays must contain at least one orbital.")
+    if factor_p_raw.shape[1] != grid.n_grid or factor_q_raw.shape[1] != grid.n_grid:
+        raise ValueError(
+            f"factor grid axes must match grid.n_grid={grid.n_grid}, got "
+            f"{factor_p_raw.shape[1]}/{factor_q_raw.shape[1]}."
+        )
+    dtypes = {str(a.dtype) for a in (factor_p_raw, factor_q_raw, gradient_p_raw, gradient_q_raw)}
+    if len(dtypes) != 1:
+        raise ValueError(f"all factors and gradients must share one dtype, got {dtypes}.")
+    realized_dtype = dtypes.pop()
+    dtype = np.dtype(realized_dtype)
+    if not np.issubdtype(dtype, np.inexact):
+        raise ValueError("factor and gradient inputs must use a floating or complex dtype.")
+    if dtype in (np.dtype(np.float64), np.dtype(np.complex128)) and not jax.config.jax_enable_x64:
+        raise ValueError(
+            f"Requested sector dtype {dtype} requires jax_enable_x64 because the shared "
+            "prepared normal-equation solver is JAX-backed. Call "
+            "jax.config.update('jax_enable_x64', True) before building, or supply explicit "
+            "float32/complex64 inputs; silent solver downcasting is not allowed."
+        )
+    if str(np.empty((), dtype=dtype).real.dtype) != grid.dtype:
+        raise ValueError(
+            f"factor real precision does not match bound grid dtype {grid.dtype!r}."
+        )
+    if backend == "numpy":
+        finite = all(np.all(np.isfinite(a)) for a in inputs)
+        device = "cpu"
+    else:
+        finite = all(bool(jnp.all(jnp.isfinite(a))) for a in inputs)
+        devices = {str(a.device) for a in inputs}
+        if devices != {grid.device}:
+            raise ValueError(
+                f"all JAX factors/gradients must share grid device {grid.device!r}, got {devices}."
+            )
+        device = grid.device
+    if not finite:
+        raise ValueError("factor and gradient inputs must be finite.")
+    if same_factor:
+        array_equal = jnp.array_equal if backend == "jax" else np.array_equal
+        if not bool(array_equal(factor_p_raw, factor_q_raw)):
+            raise ValueError("same_factor=True requires factor_p_raw == factor_q_raw.")
+        if not bool(array_equal(gradient_p_raw, gradient_q_raw)):
+            raise ValueError("same_factor=True requires gradient_p_raw == gradient_q_raw.")
+
+    pivots_np_raw = np.asarray(pivots)
+    if pivots_np_raw.ndim != 1 or not np.issubdtype(pivots_np_raw.dtype, np.integer):
+        raise ValueError("pivots must be a 1-D integer array.")
+    pivots_np = np.asarray(pivots_np_raw, dtype=np.int64)
+    selected_rank = int(pivots_np.size)
+    if selected_rank == 0 or np.unique(pivots_np).size != selected_rank:
+        raise ValueError("pivots must be nonempty and unique.")
+    if pivots_np.min() < 0 or pivots_np.max() >= grid.n_grid:
+        raise ValueError(f"pivots must lie in [0, {grid.n_grid}).")
+    rank_record = _validate_pivot_provenance(
+        pivot_provenance,
+        n_p=factor_p_raw.shape[0], n_q=factor_q_raw.shape[0],
+        same_factor=same_factor, selected_rank=selected_rank,
+    )
+    if backend == "jax":
+        pivot_dtype = jnp.int64 if jax.config.x64_enabled else jnp.int32
+        pivots_backend = jnp.asarray(pivots_np, dtype=pivot_dtype)
+    else:
+        pivots_backend = pivots_np
+
+    batch = (
+        _validate_positive_int("grid_batch_size", grid_batch_size)
+        if grid_batch_size is not None else grid.n_grid
+    )
+    batch = min(batch, grid.n_grid)
+    if isinstance(rcond, bool) or not isinstance(rcond, (int, float, np.number)):
+        raise ValueError(f"rcond must be finite and positive, got {rcond!r}.")
+    rcond = float(rcond)
+    if not math.isfinite(rcond) or rcond <= 0.0:
+        raise ValueError(f"rcond must be finite and positive, got {rcond!r}.")
+
+    factor_p_piv = factor_p_raw[:, pivots_backend]
+    factor_q_piv = factor_q_raw[:, pivots_backend]
+    chol, lower, jitter_used, n_tries = prepare_normal_equations_solver(
+        factor_p_piv, factor_q_piv, rcond=rcond, return_info=True
+    )
+
+    theta_chunks = []
+    gradient_chunks = [[] for _ in range(3)]
+    for start in range(0, grid.n_grid, batch):
+        stop = min(start + batch, grid.n_grid)
+        fp = factor_p_raw[:, start:stop]
+        fq = factor_q_raw[:, start:stop]
+        theta_batch = solve_normal_equations_batch_prepared(
+            chol, lower, factor_p_piv, factor_q_piv, fp, fq
+        )
+        if backend == "numpy":
+            theta_batch = np.asarray(theta_batch)
+        theta_chunks.append(theta_batch)
+        for axis in range(3):
+            left = solve_normal_equations_batch_prepared(
+                chol, lower, factor_p_piv, factor_q_piv,
+                gradient_p_raw[axis, :, start:stop], fq,
+            )
+            right = solve_normal_equations_batch_prepared(
+                chol, lower, factor_p_piv, factor_q_piv,
+                fp, gradient_q_raw[axis, :, start:stop],
+            )
+            value = left + right
+            if backend == "numpy":
+                value = np.asarray(value)
+            gradient_chunks[axis].append(value)
+    concatenate = jnp.concatenate if backend == "jax" else np.concatenate
+    stack = jnp.stack if backend == "jax" else np.stack
+    Theta = concatenate(theta_chunks, axis=1)
+    grad_Theta = stack(
+        [concatenate(component, axis=1) for component in gradient_chunks], axis=1
+    )
+
+    if same_factor:
+        pair_p_np, pair_q_np = np.tril_indices(factor_p_raw.shape[0])
+        if backend == "jax":
+            pair_p = jnp.asarray(pair_p_np, dtype=pivots_backend.dtype)
+            pair_q = jnp.asarray(pair_q_np, dtype=pivots_backend.dtype)
+        else:
+            pair_p, pair_q = pair_p_np, pair_q_np
+        P = (
+            factor_p_piv[pair_p, :] * factor_q_piv[pair_q, :]
+        ).T
+        pair_layout = "packed_lower"
+    else:
+        P = xp.einsum("pu,qu->upq", factor_p_piv, factor_q_piv).reshape(
+            selected_rank, factor_p_raw.shape[0] * factor_q_raw.shape[0]
+        )
+        pair_layout = "full_row_major"
+    if backend == "numpy":
+        P = np.asarray(P)
+
+    upstream = dict(upstream_provenance) if upstream_provenance else {}
+    if backend == "numpy":
+        reserved = sorted(set(upstream).intersection(_IBP_FACTOR_IDENTITY_KEYS))
+        if reserved:
+            raise ValueError(
+                f"NumPy identities are computed from content; remove reserved upstream keys {reserved}."
+            )
+        identities = {
+            "factor_p_sha256": _canonical_sha256(factor_p_raw),
+            "factor_q_sha256": _canonical_sha256(factor_q_raw),
+            "gradient_p_sha256": _canonical_sha256(gradient_p_raw),
+            "gradient_q_sha256": _canonical_sha256(gradient_q_raw),
+        }
+        identity_source = "computed_content_hash"
+    else:
+        missing = [key for key in _IBP_FACTOR_IDENTITY_KEYS if key not in upstream]
+        if missing:
+            raise ValueError(
+                "JAX sectors require caller-attested input identities in upstream_provenance; "
+                f"missing {missing}."
+            )
+        identities = {key: upstream.pop(key) for key in _IBP_FACTOR_IDENTITY_KEYS}
+        for key, value in identities.items():
+            _validate_sha256_hex(f"upstream_provenance[{key!r}]", value)
+        identity_source = "caller_attested"
+    if same_factor and (
+        identities["factor_p_sha256"] != identities["factor_q_sha256"]
+        or identities["gradient_p_sha256"] != identities["gradient_q_sha256"]
+    ):
+        raise ValueError("same_factor=True requires identical factor and gradient identities.")
+
+    provenance = _deep_freeze({
+        "pivot_provenance": rank_record,
+        "upstream_provenance": upstream,
+    })
+    pivots_sha256 = _canonical_sha256(pivots_np)
+    n_pair = (
+        factor_p_raw.shape[0] * (factor_p_raw.shape[0] + 1) // 2
+        if same_factor else factor_p_raw.shape[0] * factor_q_raw.shape[0]
+    )
+    if backend == "numpy":
+        output_identity_source = "computed_content_hash"
+        p_sha256 = _canonical_sha256(P)
+        theta_sha256 = _canonical_sha256(Theta)
+        grad_theta_sha256 = _canonical_sha256(grad_Theta)
+    else:
+        output_identity_source = "derived_from_attested_inputs_unverified"
+        p_sha256 = theta_sha256 = grad_theta_sha256 = None
+    spec_fields = {
+        "grid_spec_sha256": grid.grid_spec_sha256,
+        "n_orbital_p": int(factor_p_raw.shape[0]),
+        "n_orbital_q": int(factor_q_raw.shape[0]),
+        "n_pair": int(n_pair), "n_grid": int(grid.n_grid),
+        "same_factor": same_factor, "pair_layout": pair_layout,
+        "requested_rank": rank_record["requested_rank"],
+        "analytic_rank_bound": rank_record["analytic_rank_bound"],
+        "n_rank_capped": rank_record["n_rank_capped"],
+        "selected_rank": selected_rank,
+        "rank_exhausted": rank_record["rank_exhausted"],
+        "numerical_rank": rank_record["numerical_rank"],
+        "numerical_rank_lower_bound": rank_record["numerical_rank_lower_bound"],
+        "storage_mode": "incore_full_theta_gradient", "backend": backend,
+        "device": device, "realized_dtype": str(Theta.dtype),
+        "grid_batch_size": batch, "rcond": rcond,
+        "jitter_used": float(jitter_used), "n_tries": int(n_tries),
+        "factor_identity_source": identity_source,
+        **identities, "pivots_sha256": pivots_sha256,
+        "output_identity_source": output_identity_source,
+        "p_sha256": p_sha256, "theta_sha256": theta_sha256,
+        "grad_theta_sha256": grad_theta_sha256,
+        "solver_version": _IBP_INTERPOLATION_SOLVER_VERSION,
+        "provenance": provenance,
+    }
+    sector_spec_sha256 = _canonical_spec_sha256(spec_fields)
+    return IBPInterpolationSector(
+        P=P, Theta=Theta, grad_Theta=grad_Theta, pivots=pivots_backend, grid=grid,
+        n_orbital_p=int(factor_p_raw.shape[0]),
+        n_orbital_q=int(factor_q_raw.shape[0]), n_pair=int(n_pair),
+        n_grid=int(grid.n_grid), same_factor=same_factor, pair_layout=pair_layout,
+        requested_rank=rank_record["requested_rank"],
+        analytic_rank_bound=rank_record["analytic_rank_bound"],
+        n_rank_capped=rank_record["n_rank_capped"], selected_rank=selected_rank,
+        rank_exhausted=rank_record["rank_exhausted"],
+        numerical_rank=rank_record["numerical_rank"],
+        numerical_rank_lower_bound=rank_record["numerical_rank_lower_bound"],
+        storage_mode="incore_full_theta_gradient", backend=backend, device=device,
+        realized_dtype=str(Theta.dtype), grid_batch_size=batch, rcond=rcond,
+        jitter_used=float(jitter_used), n_tries=int(n_tries),
+        factor_identity_source=identity_source,
+        factor_p_sha256=identities["factor_p_sha256"],
+        factor_q_sha256=identities["factor_q_sha256"],
+        gradient_p_sha256=identities["gradient_p_sha256"],
+        gradient_q_sha256=identities["gradient_q_sha256"],
+        pivots_sha256=pivots_sha256,
+        output_identity_source=output_identity_source,
+        p_sha256=p_sha256, theta_sha256=theta_sha256,
+        grad_theta_sha256=grad_theta_sha256,
+        solver_version=_IBP_INTERPOLATION_SOLVER_VERSION,
+        provenance=provenance, sector_spec_sha256=sector_spec_sha256,
     )

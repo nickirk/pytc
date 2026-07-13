@@ -17,15 +17,20 @@ import subprocess
 import sys
 import types
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+jax.config.update("jax_enable_x64", True)
+
 from pytc.df.ibp import (
     IBPGrid,
+    IBPInterpolationSector,
     IBPOperatorPlan,
     build_ibp_grid,
+    build_ibp_interpolation_sector,
     build_ibp_operator_plan,
     naive_coulomb_kernel,
     kernel,
@@ -535,6 +540,420 @@ class TestIBPProvenanceCanonicalEncoding(unittest.TestCase):
         grid_a = self._grid_with_metadata({"seq": (b"a,bytes:b",)})
         grid_b = self._grid_with_metadata({"seq": (b"a", b"bytes:b")})
         self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
+
+
+class TestIBPInterpolationSector(unittest.TestCase):
+    def _case(self, dtype=np.float64, *, same_factor=False, seed=30):
+        rng = np.random.default_rng(seed)
+        n_grid = 13
+        n_p = 3 if same_factor else 2
+        n_q = n_p if same_factor else 3
+        factor_p = rng.normal(size=(n_p, n_grid))
+        factor_q = factor_p.copy() if same_factor else rng.normal(size=(n_q, n_grid))
+        gradient_p = rng.normal(size=(3, n_p, n_grid))
+        gradient_q = gradient_p.copy() if same_factor else rng.normal(size=(3, n_q, n_grid))
+        if np.issubdtype(np.dtype(dtype), np.complexfloating):
+            factor_p = factor_p + 1j * rng.normal(size=factor_p.shape)
+            factor_q = (
+                factor_p.copy()
+                if same_factor
+                else factor_q + 1j * rng.normal(size=factor_q.shape)
+            )
+            gradient_p = gradient_p + 1j * rng.normal(size=gradient_p.shape)
+            gradient_q = (
+                gradient_p.copy()
+                if same_factor
+                else gradient_q + 1j * rng.normal(size=gradient_q.shape)
+            )
+        factor_p = factor_p.astype(dtype)
+        factor_q = factor_q.astype(dtype)
+        gradient_p = gradient_p.astype(dtype)
+        gradient_q = gradient_q.astype(dtype)
+        real_dtype = np.empty((), dtype=dtype).real.dtype
+        coords = rng.normal(size=(n_grid, 3)).astype(real_dtype)
+        weights = rng.random(n_grid).astype(real_dtype)
+        grid = build_ibp_grid(coords, weights, construction_metadata={"case": "unit"})
+        return grid, factor_p, factor_q, gradient_p, gradient_q
+
+    def _rank_record(self, n_p, n_q, n_pivots, *, same_factor=False,
+                     requested_rank=None, exhausted=False):
+        analytic = n_p * (n_p + 1) // 2 if same_factor else n_p * n_q
+        requested = n_pivots if requested_rank is None else requested_rank
+        capped = min(requested, analytic)
+        return {
+            "requested_rank": requested,
+            "analytic_rank_bound": analytic,
+            "n_rank_capped": capped,
+            "rank_exhausted": exhausted,
+            "numerical_rank": n_pivots if exhausted else None,
+            "numerical_rank_lower_bound": n_pivots,
+            "n_pivots": n_pivots,
+        }
+
+    def _build(self, dtype=np.float64, *, same_factor=False, batch=4, seed=30):
+        case = self._case(dtype, same_factor=same_factor, seed=seed)
+        grid, factor_p, factor_q, gradient_p, gradient_q = case
+        n_pivots = min(5, factor_p.shape[0] * factor_q.shape[0])
+        pivots = np.array([0, 2, 5, 8, 11][:n_pivots])
+        record = self._rank_record(
+            factor_p.shape[0], factor_q.shape[0], n_pivots,
+            same_factor=same_factor,
+        )
+        sector = build_ibp_interpolation_sector(
+            factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
+            pivot_provenance=record, same_factor=same_factor,
+            grid_batch_size=batch, rcond=1e-14,
+            upstream_provenance={"caller": {"name": "unit"}},
+        )
+        return sector, case, pivots, record
+
+    def test_real_and_complex_match_independent_dense_lstsq(self):
+        for dtype in (np.float64, np.complex128):
+            sector, case, pivots, _ = self._build(dtype)
+            _, factor_p, factor_q, gradient_p, gradient_q = case
+            collocation = np.einsum(
+                "pu,qu->pqu", factor_p[:, pivots], factor_q[:, pivots]
+            ).reshape(factor_p.shape[0] * factor_q.shape[0], len(pivots))
+            pair_grid = np.einsum("pg,qg->pqg", factor_p, factor_q).reshape(
+                factor_p.shape[0] * factor_q.shape[0], factor_p.shape[1]
+            )
+            theta_expected = np.linalg.lstsq(collocation, pair_grid, rcond=None)[0]
+            gradients_expected = []
+            for axis in range(3):
+                derivative = (
+                    np.einsum("pg,qg->pqg", gradient_p[axis], factor_q)
+                    + np.einsum("pg,qg->pqg", factor_p, gradient_q[axis])
+                ).reshape(factor_p.shape[0] * factor_q.shape[0], factor_p.shape[1])
+                gradients_expected.append(
+                    np.linalg.lstsq(collocation, derivative, rcond=None)[0]
+                )
+            gradient_expected = np.stack(gradients_expected, axis=1)
+            np.testing.assert_allclose(sector.P, collocation.T, atol=3e-11, rtol=3e-11)
+            np.testing.assert_allclose(
+                sector.Theta, theta_expected, atol=3e-11, rtol=3e-11
+            )
+            np.testing.assert_allclose(
+                sector.grad_Theta, gradient_expected, atol=5e-11, rtol=5e-11
+            )
+            self.assertEqual(sector.pair_layout, "full_row_major")
+
+    def test_float32_and_complex64_are_explicitly_gated_against_dense_lstsq(self):
+        for dtype in (np.float32, np.complex64):
+            sector, case, pivots, _ = self._build(dtype, seed=35)
+            _, factor_p, factor_q, gradient_p, gradient_q = case
+            collocation = np.einsum(
+                "pu,qu->pqu", factor_p[:, pivots], factor_q[:, pivots]
+            ).reshape(factor_p.shape[0] * factor_q.shape[0], len(pivots))
+            pair_grid = np.einsum("pg,qg->pqg", factor_p, factor_q).reshape(
+                factor_p.shape[0] * factor_q.shape[0], factor_p.shape[1]
+            )
+            theta_expected = np.linalg.lstsq(collocation, pair_grid, rcond=None)[0]
+            gradients_expected = []
+            for axis in range(3):
+                derivative = (
+                    np.einsum("pg,qg->pqg", gradient_p[axis], factor_q)
+                    + np.einsum("pg,qg->pqg", factor_p, gradient_q[axis])
+                ).reshape(factor_p.shape[0] * factor_q.shape[0], factor_p.shape[1])
+                gradients_expected.append(
+                    np.linalg.lstsq(collocation, derivative, rcond=None)[0]
+                )
+            gradient_expected = np.stack(gradients_expected, axis=1)
+            self.assertEqual(sector.realized_dtype, np.dtype(dtype).name)
+            np.testing.assert_allclose(
+                sector.Theta, theta_expected, atol=3e-4, rtol=3e-4
+            )
+            np.testing.assert_allclose(
+                sector.grad_Theta, gradient_expected, atol=5e-4, rtol=5e-4
+            )
+
+    def test_numpy_float64_rejects_cleanly_when_jax_x64_is_disabled(self):
+        code = "\n".join((
+            "import jax",
+            "jax.config.update('jax_enable_x64', False)",
+            "import numpy as np",
+            "from pytc.df.ibp import build_ibp_grid, build_ibp_interpolation_sector",
+            "coords = np.arange(18, dtype=np.float64).reshape(6, 3)",
+            "weights = np.ones(6, dtype=np.float64)",
+            "grid = build_ibp_grid(coords, weights)",
+            "fp = np.arange(12, dtype=np.float64).reshape(2, 6) + 1",
+            "fq = np.arange(18, dtype=np.float64).reshape(3, 6) + 2",
+            "gp = np.ones((3, 2, 6), dtype=np.float64)",
+            "gq = np.ones((3, 3, 6), dtype=np.float64)",
+            "record = {'requested_rank': 3, 'analytic_rank_bound': 6, "
+            "'n_rank_capped': 3, 'rank_exhausted': False, "
+            "'numerical_rank': None, 'numerical_rank_lower_bound': 3, "
+            "'n_pivots': 3}",
+            "try:",
+            "    build_ibp_interpolation_sector(fp, fq, gp, gq, "
+            "np.array([0, 2, 4]), grid, pivot_provenance=record)",
+            "except ValueError as exc:",
+            "    assert 'jax_enable_x64' in str(exc)",
+            "    print('EXPECTED')",
+            "else:",
+            "    raise AssertionError('float64 sector silently downcast')",
+        ))
+        result = subprocess.run(
+            [sys.executable, "-W", "error", "-c", code],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "EXPECTED")
+
+    def test_accepts_exact_canonical_selector_provenance(self):
+        from pytc.integrals.coulomb import select_sector_pivots, weight_mo_values
+
+        grid, factor_p, factor_q, gradient_p, gradient_q = self._case(seed=36)
+        weighted_p = weight_mo_values(factor_p, grid.weights)
+        weighted_q = weight_mo_values(factor_q, grid.weights)
+        pivots, record = select_sector_pivots(
+            weighted_p, weighted_q, 5, return_provenance=True
+        )
+        sector = build_ibp_interpolation_sector(
+            factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
+            pivot_provenance=record,
+        )
+        self.assertEqual(sector.requested_rank, record["requested_rank"])
+        self.assertEqual(sector.selected_rank, record["n_pivots"])
+        self.assertEqual(
+            dict(sector.provenance["pivot_provenance"]), record
+        )
+
+    def test_same_factor_uses_packed_lower_pair_layout(self):
+        sector, case, pivots, _ = self._build(np.float64, same_factor=True)
+        _, factor, _, _, _ = case
+        pair_p, pair_q = np.tril_indices(factor.shape[0])
+        expected = (
+            factor[pair_p[:, None], pivots[None, :]]
+            * factor[pair_q[:, None], pivots[None, :]]
+        ).T
+        np.testing.assert_allclose(sector.P, expected)
+        self.assertEqual(sector.pair_layout, "packed_lower")
+        self.assertEqual(sector.n_pair, factor.shape[0] * (factor.shape[0] + 1) // 2)
+
+    def test_grid_batching_is_numerically_invariant(self):
+        small, _, _, _ = self._build(np.complex128, batch=2, seed=31)
+        full, _, _, _ = self._build(np.complex128, batch=1000, seed=31)
+        np.testing.assert_allclose(small.Theta, full.Theta, atol=3e-12, rtol=3e-12)
+        np.testing.assert_allclose(
+            small.grad_Theta, full.grad_Theta, atol=3e-12, rtol=3e-12
+        )
+        self.assertNotEqual(small.sector_spec_sha256, full.sector_spec_sha256)
+        self.assertEqual(full.grid_batch_size, full.n_grid)
+
+    def test_prepared_solver_is_built_once_and_reused_for_all_gradients(self):
+        case = self._case()
+        grid, factor_p, factor_q, gradient_p, gradient_q = case
+        pivots = np.array([0, 2, 5, 8, 11])
+        record = self._rank_record(2, 3, len(pivots))
+        import pytc.df.ibp as ibp_module
+        original_prepare = ibp_module.prepare_normal_equations_solver
+        original_solve = ibp_module.solve_normal_equations_batch_prepared
+        with (
+            mock.patch.object(
+                ibp_module, "prepare_normal_equations_solver", wraps=original_prepare
+            ) as prepare_spy,
+            mock.patch.object(
+                ibp_module, "solve_normal_equations_batch_prepared", wraps=original_solve
+            ) as solve_spy,
+        ):
+            build_ibp_interpolation_sector(
+                factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
+                pivot_provenance=record, grid_batch_size=4,
+            )
+        self.assertEqual(prepare_spy.call_count, 1)
+        n_batches = 4
+        self.assertEqual(solve_spy.call_count, n_batches * 7)
+
+    def test_rank_exhaustion_record_is_preserved_without_conflation(self):
+        case = self._case(seed=32)
+        grid, factor_p, factor_q, gradient_p, gradient_q = case
+        pivots = np.array([0, 2, 5])
+        record = self._rank_record(2, 3, 3, requested_rank=5, exhausted=True)
+        sector = build_ibp_interpolation_sector(
+            factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
+            pivot_provenance=record,
+        )
+        self.assertEqual(sector.requested_rank, 5)
+        self.assertEqual(sector.selected_rank, 3)
+        self.assertEqual(sector.numerical_rank, 3)
+        self.assertEqual(sector.numerical_rank_lower_bound, 3)
+        self.assertTrue(sector.rank_exhausted)
+
+    def test_rejects_inconsistent_rank_records(self):
+        case = self._case()
+        grid, factor_p, factor_q, gradient_p, gradient_q = case
+        pivots = np.array([0, 2, 5, 8, 11])
+        good = self._rank_record(2, 3, len(pivots))
+        for update in (
+            {"n_pivots": 4},
+            {"analytic_rank_bound": 99},
+            {"numerical_rank": 5},
+            {"rank_exhausted": True, "numerical_rank": 5},
+        ):
+            bad = {**good, **update}
+            with self.assertRaises((TypeError, ValueError)):
+                build_ibp_interpolation_sector(
+                    factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
+                    pivot_provenance=bad,
+                )
+        with self.assertRaises(ValueError):
+            build_ibp_interpolation_sector(
+                factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
+                pivot_provenance={**good, "extra": 1},
+            )
+
+    def test_numpy_outputs_and_provenance_are_immutable_and_tamper_checked(self):
+        sector, _, _, _ = self._build()
+        other_grid, *_ = self._case(seed=99)
+        self.assertIsInstance(sector, IBPInterpolationSector)
+        for array in (sector.P, sector.Theta, sector.grad_Theta, sector.pivots):
+            self.assertFalse(array.flags.writeable)
+        self.assertIsInstance(sector.provenance, types.MappingProxyType)
+        self.assertIsInstance(
+            sector.provenance["upstream_provenance"]["caller"],
+            types.MappingProxyType,
+        )
+        with self.assertRaises(TypeError):
+            sector.provenance["x"] = 1
+        altered = np.array(sector.Theta, copy=True)
+        altered[0, 0] += 1.0
+        for kwargs in (
+            {"sector_spec_sha256": "0" * 64},
+            {"selected_rank": sector.selected_rank + 1},
+            {"rcond": True},
+            {"Theta": altered},
+            {"factor_p_sha256": "0" * 64},
+            {"grid": other_grid},
+            {"backend": "jax"},
+            {"device": "gpu"},
+            {"realized_dtype": "float32"},
+            {"solver_version": "999"},
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                dataclasses.replace(sector, **kwargs)
+
+    def test_rejects_malformed_inputs_and_same_factor_lies(self):
+        case = self._case()
+        grid, factor_p, factor_q, gradient_p, gradient_q = case
+        pivots = np.array([0, 2, 5, 8, 11])
+        record = self._rank_record(2, 3, len(pivots))
+        bad_gradient = gradient_p.copy()
+        bad_gradient[0, 0, 0] = np.nan
+        for args in (
+            (factor_p[:, :-1], factor_q, gradient_p[:, :, :-1], gradient_q),
+            (factor_p, factor_q, bad_gradient, gradient_q),
+            (factor_p.astype(np.float32), factor_q, gradient_p, gradient_q),
+        ):
+            with self.assertRaises(ValueError):
+                build_ibp_interpolation_sector(
+                    *args, pivots, grid, pivot_provenance=record,
+                )
+        same_grid, fp, fq, gp, gq = self._case(same_factor=True)
+        fq = fq.copy()
+        fq[0, 0] += 1.0
+        same_record = self._rank_record(3, 3, 5, same_factor=True)
+        with self.assertRaises(ValueError):
+            build_ibp_interpolation_sector(
+                fp, fq, gp, gq, pivots, same_grid,
+                pivot_provenance=same_record, same_factor=True,
+            )
+
+    def test_jax_backend_preserves_device_and_uses_attested_large_input_hashes(self):
+        numpy_case = self._case(np.float64, seed=33)
+        np_grid, fp_np, fq_np, gp_np, gq_np = numpy_case
+        ids = {
+            key: hashlib.sha256(key.encode()).hexdigest()
+            for key in (
+                "factor_p_sha256", "factor_q_sha256",
+                "gradient_p_sha256", "gradient_q_sha256",
+            )
+        }
+        coords = jnp.asarray(np_grid.coords)
+        weights = jnp.asarray(np_grid.weights)
+        grid = build_ibp_grid(
+            coords, weights, backend="jax",
+            coords_identity=hashlib.sha256(b"coords").hexdigest(),
+            weights_identity=hashlib.sha256(b"weights").hexdigest(),
+        )
+        inputs = tuple(jnp.asarray(a) for a in (fp_np, fq_np, gp_np, gq_np))
+        pivots = np.array([0, 2, 5, 8, 11])
+        record = self._rank_record(2, 3, len(pivots))
+        import pytc.df.ibp as ibp_module
+        original_hash = ibp_module._canonical_sha256
+        with mock.patch.object(
+            ibp_module, "_canonical_sha256", wraps=original_hash
+        ) as hash_spy:
+            sector = build_ibp_interpolation_sector(
+                *inputs, pivots, grid, pivot_provenance=record,
+                upstream_provenance={**ids, "caller": "jax-test"},
+            )
+        self.assertEqual(sector.backend, "jax")
+        self.assertEqual(sector.device, grid.device)
+        for array in (sector.P, sector.Theta, sector.grad_Theta, sector.pivots):
+            self.assertIsInstance(array, jax.Array)
+            self.assertEqual(str(array.device), grid.device)
+        self.assertEqual(
+            sector.output_identity_source, "derived_from_attested_inputs_unverified"
+        )
+        self.assertIsNone(sector.theta_sha256)
+        for call in hash_spy.call_args_list:
+            argument = np.asarray(call.args[0])
+            self.assertEqual(argument.ndim, 1)
+            self.assertTrue(np.issubdtype(argument.dtype, np.integer))
+            self.assertEqual(argument.size, len(pivots))
+
+    def test_numpy_and_jax_agree_for_all_supported_precisions(self):
+        for dtype in (np.float32, np.complex64, np.float64, np.complex128):
+            case = self._case(dtype, seed=37)
+            np_grid, fp, fq, gp, gq = case
+            pivots = np.array([0, 2, 5, 8, 11])
+            record = self._rank_record(2, 3, len(pivots))
+            numpy_sector = build_ibp_interpolation_sector(
+                fp, fq, gp, gq, pivots, np_grid,
+                pivot_provenance=record, grid_batch_size=3,
+            )
+            jax_grid = build_ibp_grid(
+                jnp.asarray(np_grid.coords), jnp.asarray(np_grid.weights), backend="jax",
+                coords_identity=hashlib.sha256(b"coords-agreement").hexdigest(),
+                weights_identity=hashlib.sha256(b"weights-agreement").hexdigest(),
+            )
+            identities = {
+                key: hashlib.sha256(f"{key}-{np.dtype(dtype).name}".encode()).hexdigest()
+                for key in (
+                    "factor_p_sha256", "factor_q_sha256",
+                    "gradient_p_sha256", "gradient_q_sha256",
+                )
+            }
+            jax_sector = build_ibp_interpolation_sector(
+                *(jnp.asarray(a) for a in (fp, fq, gp, gq)),
+                pivots, jax_grid, pivot_provenance=record, grid_batch_size=3,
+                upstream_provenance=identities,
+            )
+            real_itemsize = np.empty((), dtype=dtype).real.dtype.itemsize
+            tolerance = 5e-4 if real_itemsize == 4 else 5e-11
+            for numpy_value, jax_value in (
+                (numpy_sector.P, jax_sector.P),
+                (numpy_sector.Theta, jax_sector.Theta),
+                (numpy_sector.grad_Theta, jax_sector.grad_Theta),
+            ):
+                np.testing.assert_allclose(
+                    numpy_value, np.asarray(jax_value), atol=tolerance, rtol=tolerance
+                )
+
+    def test_jax_backend_requires_all_four_attested_identities(self):
+        np_grid, fp, fq, gp, gq = self._case(seed=34)
+        grid = build_ibp_grid(
+            jnp.asarray(np_grid.coords), jnp.asarray(np_grid.weights), backend="jax",
+            coords_identity=hashlib.sha256(b"coords").hexdigest(),
+            weights_identity=hashlib.sha256(b"weights").hexdigest(),
+        )
+        inputs = tuple(jnp.asarray(a) for a in (fp, fq, gp, gq))
+        pivots = np.array([0, 2, 5, 8, 11])
+        record = self._rank_record(2, 3, len(pivots))
+        with self.assertRaises(ValueError):
+            build_ibp_interpolation_sector(
+                *inputs, pivots, grid, pivot_provenance=record,
+                upstream_provenance={"factor_p_sha256": "0" * 64},
+            )
 
 
 if __name__ == "__main__":
