@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import math
+import time
 import types
 
 import jax
@@ -1501,4 +1502,394 @@ def build_ibp_interpolation_sector(
         grad_theta_sha256=grad_theta_sha256,
         solver_version=_IBP_INTERPOLATION_SOLVER_VERSION,
         provenance=provenance, sector_spec_sha256=sector_spec_sha256,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Same/cross-sector Z cores (task #7).
+# ---------------------------------------------------------------------------
+
+_IBP_CORE_VERSION = "1"
+_SUPPORTED_IBP_CORE_SYMMETRY_MODES = ("two_sided_average", "one_sided")
+
+
+@dataclasses.dataclass(frozen=True)
+class IBPCoreArtifact:
+    """A completed Z core for one sector (same-sector) or one sector pair
+    (cross-sector), built via ibp_core using this module's own kernel()
+    primitive (task #2) applied to sector Theta/grad_Theta arrays instead
+    of raw AO factors -- Z_AB[mu,nu] = -1/2 sum_g w_g grad(Theta_A[mu,g])^*
+    . sum_h w_h rhat(r_g-r_h) Theta_B[nu,h] is exactly kernel()'s formula.
+
+    The blocked real-space IBP kernel is NOT manifestly Hermitian the way
+    the free-space Poisson kernel is (that one is an exact FFT convolution;
+    this one is a one-sided discrete quadrature evaluated with an explicit
+    coincident-point convention) -- so, per the architecture's mathematical
+    contract, the raw one-sided orientation(s) and their dagger residual
+    are ALWAYS retained regardless of symmetry_mode, so quadrature bias can
+    never be silently hidden behind an averaged production Z:
+    - same-sector: z_forward_one_sided is the sole raw computation;
+      z_reverse_one_sided is None (the "reverse" orientation is just its
+      conjugate transpose, not a second kernel() evaluation); raw_dagger_
+      residual = max|z_forward_one_sided - z_forward_one_sided^dagger|.
+    - cross-sector: BOTH orientations are evaluated (z_forward_one_sided =
+      Z_AB, z_reverse_one_sided = Z_BA); raw_dagger_residual =
+      max|z_forward_one_sided - z_reverse_one_sided^dagger|.
+
+    symmetry_mode="two_sided_average" (production default) sets
+    Z = (z_forward_one_sided + dagger(reverse-or-self))/2.
+    symmetry_mode="one_sided" (diagnostic only) sets Z = z_forward_one_sided
+    unaveraged.
+
+    Backend scope: only backend="numpy" is implemented here. kernel() is a
+    NumPy-only primitive (task #2) -- routing a JAX-backend sector/operator
+    through it would silently force a host transfer via np.asarray(),
+    exactly the hazard IBPGrid/IBPOperatorPlan's own JAX paths were built to
+    avoid. A tiled, device-resident JAX execution path is task #10's
+    explicit scope, not this one; ibp_core rejects backend="jax" plans
+    with a clear NotImplementedError rather than silently doing the wrong
+    thing.
+    """
+    Z: object
+    same_sector: bool
+    symmetry_mode: str
+    z_forward_one_sided: object
+    z_reverse_one_sided: object
+    raw_dagger_residual: float
+    coincident_pairs: int
+    n_mu: int
+    n_nu: int
+    left_sector_spec_sha256: str
+    right_sector_spec_sha256: str
+    operator_spec_sha256: str
+    mu_block_size: int
+    nu_block_size: int
+    backend: str
+    device: str
+    realized_dtype: str
+    build_wall_time_seconds: float
+    peak_host_bytes: object
+    solver_version: str
+    provenance: object
+    core_spec_sha256: str
+
+    def __post_init__(self):
+        if self.backend != "numpy":
+            raise ValueError(
+                f"Unsupported backend={self.backend!r} -- only 'numpy' is implemented "
+                f"(JAX tiled execution is task #10's scope)."
+            )
+        if self.device != "cpu":
+            raise ValueError(f"device must be 'cpu' for backend='numpy', got {self.device!r}.")
+        if not isinstance(self.same_sector, bool):
+            raise TypeError("same_sector must be bool.")
+        if self.symmetry_mode not in _SUPPORTED_IBP_CORE_SYMMETRY_MODES:
+            raise ValueError(
+                f"Unsupported symmetry_mode={self.symmetry_mode!r}, must be one of "
+                f"{_SUPPORTED_IBP_CORE_SYMMETRY_MODES}."
+            )
+
+        n_mu = _validate_positive_int("n_mu", self.n_mu)
+        n_nu = _validate_positive_int("n_nu", self.n_nu)
+
+        if not isinstance(self.Z, np.ndarray):
+            raise TypeError("Z must be a numpy.ndarray for backend='numpy'.")
+        if not isinstance(self.z_forward_one_sided, np.ndarray):
+            raise TypeError("z_forward_one_sided must be a numpy.ndarray.")
+        object.__setattr__(self, "Z", _readonly_copy(self.Z))
+        object.__setattr__(self, "z_forward_one_sided", _readonly_copy(self.z_forward_one_sided))
+        if self.Z.shape != (n_mu, n_nu):
+            raise ValueError(f"Z.shape must be {(n_mu, n_nu)}, got {self.Z.shape}.")
+        if self.z_forward_one_sided.shape != (n_mu, n_nu):
+            raise ValueError(
+                f"z_forward_one_sided.shape must be {(n_mu, n_nu)}, got "
+                f"{self.z_forward_one_sided.shape}."
+            )
+
+        if self.same_sector:
+            if self.z_reverse_one_sided is not None:
+                raise ValueError("z_reverse_one_sided must be None for same_sector=True.")
+            if self.left_sector_spec_sha256 != self.right_sector_spec_sha256:
+                raise ValueError(
+                    "same_sector=True requires left_sector_spec_sha256 == "
+                    "right_sector_spec_sha256."
+                )
+            if n_mu != n_nu:
+                raise ValueError("same_sector=True requires n_mu == n_nu.")
+            dagger = self.z_forward_one_sided.conj().T
+        else:
+            if not isinstance(self.z_reverse_one_sided, np.ndarray):
+                raise TypeError(
+                    "z_reverse_one_sided must be a numpy.ndarray for same_sector=False."
+                )
+            object.__setattr__(
+                self, "z_reverse_one_sided", _readonly_copy(self.z_reverse_one_sided)
+            )
+            if self.z_reverse_one_sided.shape != (n_nu, n_mu):
+                raise ValueError(
+                    f"z_reverse_one_sided.shape must be {(n_nu, n_mu)}, got "
+                    f"{self.z_reverse_one_sided.shape}."
+                )
+            dagger = self.z_reverse_one_sided.conj().T
+
+        recomputed_residual = float(np.max(np.abs(self.z_forward_one_sided - dagger)))
+        if not math.isclose(self.raw_dagger_residual, recomputed_residual,
+                            rel_tol=1e-9, abs_tol=1e-14):
+            raise ValueError(
+                f"raw_dagger_residual={self.raw_dagger_residual!r} does not match the "
+                f"value recomputed from the artifact's own raw orientation(s) "
+                f"({recomputed_residual!r})."
+            )
+
+        expected_Z = (
+            self.z_forward_one_sided if self.symmetry_mode == "one_sided"
+            else (self.z_forward_one_sided + dagger) / 2
+        )
+        if not np.array_equal(self.Z, expected_Z):
+            raise ValueError(
+                "Z does not match the value recomputed from this artifact's own raw "
+                "orientation(s) and symmetry_mode."
+            )
+
+        if isinstance(self.coincident_pairs, bool) or not isinstance(self.coincident_pairs, int):
+            raise ValueError(f"coincident_pairs must be a non-negative int, got {self.coincident_pairs!r}.")
+        if self.coincident_pairs < 0:
+            raise ValueError(f"coincident_pairs must be non-negative, got {self.coincident_pairs!r}.")
+
+        data_dtype = np.dtype(self.realized_dtype)
+        if not np.issubdtype(data_dtype, np.inexact):
+            raise ValueError("core data must use a floating or complex dtype.")
+        if str(self.Z.dtype) != self.realized_dtype:
+            raise ValueError(
+                f"realized_dtype={self.realized_dtype!r} does not match Z.dtype "
+                f"{self.Z.dtype}."
+            )
+
+        mu_block_size = _validate_positive_int("mu_block_size", self.mu_block_size)
+        nu_block_size = _validate_positive_int("nu_block_size", self.nu_block_size)
+        object.__setattr__(self, "mu_block_size", mu_block_size)
+        object.__setattr__(self, "nu_block_size", nu_block_size)
+
+        for name in ("left_sector_spec_sha256", "right_sector_spec_sha256", "operator_spec_sha256"):
+            _validate_sha256_hex(name, getattr(self, name))
+
+        build_wall_time_seconds = _validate_nonnegative_finite(
+            "build_wall_time_seconds", self.build_wall_time_seconds
+        )
+        object.__setattr__(self, "build_wall_time_seconds", build_wall_time_seconds)
+        if self.peak_host_bytes is not None:
+            if isinstance(self.peak_host_bytes, bool) or not isinstance(self.peak_host_bytes, int):
+                raise ValueError(
+                    f"peak_host_bytes must be None or a non-negative int, got "
+                    f"{self.peak_host_bytes!r}."
+                )
+            if self.peak_host_bytes < 0:
+                raise ValueError(
+                    f"peak_host_bytes must be non-negative, got {self.peak_host_bytes!r}."
+                )
+
+        if self.solver_version != _IBP_CORE_VERSION:
+            raise ValueError(f"solver_version={self.solver_version!r} != {_IBP_CORE_VERSION!r}.")
+
+        object.__setattr__(
+            self, "provenance", _deep_freeze(dict(self.provenance) if self.provenance else {})
+        )
+
+        recomputed_spec = _canonical_spec_sha256({
+            "same_sector": self.same_sector, "symmetry_mode": self.symmetry_mode,
+            "raw_dagger_residual": self.raw_dagger_residual,
+            "coincident_pairs": self.coincident_pairs, "n_mu": n_mu, "n_nu": n_nu,
+            "left_sector_spec_sha256": self.left_sector_spec_sha256,
+            "right_sector_spec_sha256": self.right_sector_spec_sha256,
+            "operator_spec_sha256": self.operator_spec_sha256,
+            "mu_block_size": mu_block_size, "nu_block_size": nu_block_size,
+            "backend": self.backend, "device": self.device,
+            "realized_dtype": self.realized_dtype,
+            "build_wall_time_seconds": build_wall_time_seconds,
+            "peak_host_bytes": self.peak_host_bytes,
+            "solver_version": self.solver_version, "provenance": self.provenance,
+        })
+        if recomputed_spec != self.core_spec_sha256:
+            raise ValueError(
+                "core_spec_sha256 does not match the canonical digest recomputed from "
+                "this artifact's own declared fields."
+            )
+
+
+def _ibp_one_sided_block(grad_theta_source, theta_source, grid, *,
+                         mu_block, nu_block, eval_block_size, source_block_size):
+    """Assemble the full (n_mu, n_nu) one-sided Z via kernel(), tiled over
+    the pivot (mu/nu) axes at this level -- kernel() itself only tiles over
+    the GRID axis (eval_block_size/source_block_size), never the orbital/
+    pivot axis, so a large pivot count needs this outer blocking to bound
+    the size of kernel()'s internal (n_nu, 3, n_eval)-shaped intermediate.
+    Not yet memory-optimal (each (mu,nu) block pair re-walks the grid
+    quadrature independently) -- task #10's tiled JAX backend is where
+    genuine shared-intermediate reuse belongs; this NumPy oracle path
+    favors correctness and a simple, auditable loop structure."""
+    n_mu_total = grad_theta_source.shape[0]
+    n_nu_total = theta_source.shape[0]
+    row_blocks = []
+    coincident_pairs = None
+    for mu_start in range(0, n_mu_total, mu_block):
+        mu_end = min(mu_start + mu_block, n_mu_total)
+        col_blocks = []
+        for nu_start in range(0, n_nu_total, nu_block):
+            nu_end = min(nu_start + nu_block, n_nu_total)
+            z_block, block_coincident = kernel(
+                grad_theta_source[mu_start:mu_end], theta_source[nu_start:nu_end],
+                grid.coords, grid.weights,
+                eval_block_size=eval_block_size, source_block_size=source_block_size,
+            )
+            col_blocks.append(z_block)
+            coincident_pairs = block_coincident
+        row_blocks.append(np.concatenate(col_blocks, axis=1))
+    return np.concatenate(row_blocks, axis=0), coincident_pairs
+
+
+def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
+             mu_block_size=None, nu_block_size=None, upstream_provenance=None):
+    """Build an IBPCoreArtifact from one (same-sector) or two (cross-sector)
+    IBPInterpolationSector artifacts, via this module's own kernel()
+    primitive applied to sector Theta/grad_Theta arrays.
+
+    Args:
+        left: IBPInterpolationSector for the sector (same-sector) or
+            sector A (cross-sector).
+        right: None (same-sector: right_sector = left, the literal same
+            Theta/grad_Theta arrays, no duplicated computation) or an
+            IBPInterpolationSector for sector B (cross-sector).
+        operator: IBPOperatorPlan, REQUIRED. Its bound grid must match
+            both sectors' bound grid exactly (grid_spec_sha256 equality);
+            only method="direct" is implemented (matching this module's
+            only implemented method); backend must be "numpy".
+        symmetry_mode: "two_sided_average" (default, production) or
+            "one_sided" (diagnostic only, unaveraged raw Z).
+        mu_block_size/nu_block_size: bound the pivot-axis blocking of the
+            left/right sectors respectively. None resolves to each
+            sector's full selected_rank (single block); the realized
+            value is recorded.
+        upstream_provenance: optional caller-supplied dict of extra facts,
+            deep-frozen into the returned artifact's provenance.
+
+    Returns:
+        IBPCoreArtifact.
+    """
+    if not isinstance(left, IBPInterpolationSector):
+        raise TypeError(f"left must be an IBPInterpolationSector, got {type(left).__name__}.")
+    if right is not None and not isinstance(right, IBPInterpolationSector):
+        raise TypeError(f"right must be an IBPInterpolationSector or None, got {type(right).__name__}.")
+    if not isinstance(operator, IBPOperatorPlan):
+        raise TypeError(f"operator must be an IBPOperatorPlan, got {type(operator).__name__}.")
+    if symmetry_mode not in _SUPPORTED_IBP_CORE_SYMMETRY_MODES:
+        raise ValueError(
+            f"Unsupported symmetry_mode={symmetry_mode!r}, must be one of "
+            f"{_SUPPORTED_IBP_CORE_SYMMETRY_MODES}."
+        )
+    if operator.method != "direct":
+        raise ValueError(f"Unsupported operator.method={operator.method!r} for ibp_core.")
+    if operator.backend != "numpy":
+        raise NotImplementedError(
+            f"ibp_core only implements backend='numpy' (got operator.backend="
+            f"{operator.backend!r}) -- JAX tiled direct execution is task #10's scope, "
+            f"not yet implemented here."
+        )
+
+    same_sector = right is None
+    right_sector = left if same_sector else right
+
+    for sector, label in ((left, "left"), (right_sector, "right")):
+        if sector.backend != "numpy":
+            raise NotImplementedError(
+                f"ibp_core only implements backend='numpy' (got {label} sector.backend="
+                f"{sector.backend!r})."
+            )
+        if sector.grid.grid_spec_sha256 != operator.grid.grid_spec_sha256:
+            raise ValueError(
+                f"{label} sector's bound grid does not match operator.grid "
+                f"(grid_spec_sha256 mismatch) -- a core cannot join sectors/operators "
+                f"built on different grids."
+            )
+
+    n_mu = left.selected_rank
+    n_nu = right_sector.selected_rank
+    mu_block = (
+        _validate_positive_int("mu_block_size", mu_block_size)
+        if mu_block_size is not None else n_mu
+    )
+    nu_block = (
+        _validate_positive_int("nu_block_size", nu_block_size)
+        if nu_block_size is not None else n_nu
+    )
+
+    start = time.perf_counter()
+    z_forward, coincident_pairs = _ibp_one_sided_block(
+        left.grad_Theta, right_sector.Theta, operator.grid,
+        mu_block=mu_block, nu_block=nu_block,
+        eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
+    )
+    if same_sector:
+        z_reverse = None
+        dagger = z_forward.conj().T
+    else:
+        z_reverse, reverse_coincident = _ibp_one_sided_block(
+            right_sector.grad_Theta, left.Theta, operator.grid,
+            mu_block=nu_block, nu_block=mu_block,
+            eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
+        )
+        if reverse_coincident != coincident_pairs:
+            raise ValueError(
+                "forward/reverse orientation coincident-pair counts disagree "
+                f"({coincident_pairs} vs {reverse_coincident}) -- both orientations use "
+                "the identical bound grid, so this indicates a structural inconsistency."
+            )
+        dagger = z_reverse.conj().T
+    build_wall_time_seconds = time.perf_counter() - start
+
+    raw_dagger_residual = float(np.max(np.abs(z_forward - dagger)))
+    Z = z_forward if symmetry_mode == "one_sided" else (z_forward + dagger) / 2
+
+    try:
+        import resource
+        peak_host_bytes = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+    except (ImportError, AttributeError):
+        peak_host_bytes = None
+
+    upstream = dict(upstream_provenance) if upstream_provenance else {}
+    provenance = _deep_freeze({
+        "left_sector_provenance": dict(left.provenance),
+        "right_sector_provenance": dict(right_sector.provenance),
+        "operator_provenance": dict(operator.provenance),
+        "upstream_provenance": upstream,
+    })
+
+    realized_dtype = str(Z.dtype)
+    spec_fields = {
+        "same_sector": same_sector, "symmetry_mode": symmetry_mode,
+        "raw_dagger_residual": raw_dagger_residual,
+        "coincident_pairs": coincident_pairs, "n_mu": n_mu, "n_nu": n_nu,
+        "left_sector_spec_sha256": left.sector_spec_sha256,
+        "right_sector_spec_sha256": right_sector.sector_spec_sha256,
+        "operator_spec_sha256": operator.operator_spec_sha256,
+        "mu_block_size": mu_block, "nu_block_size": nu_block,
+        "backend": "numpy", "device": "cpu", "realized_dtype": realized_dtype,
+        "build_wall_time_seconds": build_wall_time_seconds,
+        "peak_host_bytes": peak_host_bytes,
+        "solver_version": _IBP_CORE_VERSION, "provenance": provenance,
+    }
+    core_spec_sha256 = _canonical_spec_sha256(spec_fields)
+
+    return IBPCoreArtifact(
+        Z=Z, same_sector=same_sector, symmetry_mode=symmetry_mode,
+        z_forward_one_sided=z_forward, z_reverse_one_sided=z_reverse,
+        raw_dagger_residual=raw_dagger_residual, coincident_pairs=coincident_pairs,
+        n_mu=n_mu, n_nu=n_nu,
+        left_sector_spec_sha256=left.sector_spec_sha256,
+        right_sector_spec_sha256=right_sector.sector_spec_sha256,
+        operator_spec_sha256=operator.operator_spec_sha256,
+        mu_block_size=mu_block, nu_block_size=nu_block,
+        backend="numpy", device="cpu", realized_dtype=realized_dtype,
+        build_wall_time_seconds=build_wall_time_seconds, peak_host_bytes=peak_host_bytes,
+        solver_version=_IBP_CORE_VERSION, provenance=provenance,
+        core_spec_sha256=core_spec_sha256,
     )

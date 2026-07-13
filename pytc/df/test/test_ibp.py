@@ -26,12 +26,14 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 
 from pytc.df.ibp import (
+    IBPCoreArtifact,
     IBPGrid,
     IBPInterpolationSector,
     IBPOperatorPlan,
     build_ibp_grid,
     build_ibp_interpolation_sector,
     build_ibp_operator_plan,
+    ibp_core,
     naive_coulomb_kernel,
     kernel,
 )
@@ -954,6 +956,196 @@ class TestIBPInterpolationSector(unittest.TestCase):
                 *inputs, pivots, grid, pivot_provenance=record,
                 upstream_provenance={"factor_p_sha256": "0" * 64},
             )
+
+
+class TestIBPCoreArtifact(unittest.TestCase):
+    def _record(self, n_pivots, analytic_bound):
+        return {
+            "requested_rank": n_pivots, "analytic_rank_bound": analytic_bound,
+            "n_rank_capped": min(n_pivots, analytic_bound), "rank_exhausted": False,
+            "numerical_rank": None, "numerical_rank_lower_bound": n_pivots,
+            "n_pivots": n_pivots,
+        }
+
+    def _setup(self, dtype=np.float64, seed=40, n_grid=14, eval_block_size=5,
+              source_block_size=6):
+        rng = np.random.default_rng(seed)
+        coords = rng.normal(size=(n_grid, 3))
+        weights = rng.random(n_grid)
+        grid = build_ibp_grid(coords, weights)
+        plan = build_ibp_operator_plan(
+            grid, eval_block_size=eval_block_size, source_block_size=source_block_size
+        )
+
+        n_a, n_b = 2, 3
+        factor_a = rng.normal(size=(n_a, n_grid))
+        factor_b = rng.normal(size=(n_b, n_grid))
+        grad_a = rng.normal(size=(3, n_a, n_grid))
+        grad_b = rng.normal(size=(3, n_b, n_grid))
+        if np.issubdtype(np.dtype(dtype), np.complexfloating):
+            factor_a = factor_a + 1j * rng.normal(size=factor_a.shape)
+            factor_b = factor_b + 1j * rng.normal(size=factor_b.shape)
+            grad_a = grad_a + 1j * rng.normal(size=grad_a.shape)
+            grad_b = grad_b + 1j * rng.normal(size=grad_b.shape)
+        factor_a, factor_b = factor_a.astype(dtype), factor_b.astype(dtype)
+        grad_a, grad_b = grad_a.astype(dtype), grad_b.astype(dtype)
+
+        n_same = n_a * (n_a + 1) // 2
+        pivots_same = np.arange(n_grid)[:n_same]
+        sector_a = build_ibp_interpolation_sector(
+            factor_a, factor_a, grad_a, grad_a, pivots_same, grid,
+            pivot_provenance=self._record(n_same, n_same), same_factor=True,
+        )
+        pivots_cross = np.arange(n_grid)[:5]
+        sector_b = build_ibp_interpolation_sector(
+            factor_a, factor_b, grad_a, grad_b, pivots_cross, grid,
+            pivot_provenance=self._record(5, n_a * n_b),
+        )
+        return grid, plan, sector_a, sector_b
+
+    def test_same_sector_matches_independent_kernel_call(self):
+        for dtype in (np.float64, np.complex128):
+            grid, plan, sector_a, _ = self._setup(dtype)
+            core = ibp_core(sector_a, operator=plan)
+            expected_forward, expected_coincident = kernel(
+                sector_a.grad_Theta, sector_a.Theta, grid.coords, grid.weights,
+                eval_block_size=plan.eval_block_size, source_block_size=plan.source_block_size,
+            )
+            np.testing.assert_allclose(core.z_forward_one_sided, expected_forward, atol=1e-12)
+            expected_Z = (expected_forward + expected_forward.conj().T) / 2
+            np.testing.assert_allclose(core.Z, expected_Z, atol=1e-12)
+            self.assertEqual(core.coincident_pairs, expected_coincident)
+            self.assertTrue(core.same_sector)
+            self.assertIsNone(core.z_reverse_one_sided)
+            expected_residual = float(
+                np.max(np.abs(expected_forward - expected_forward.conj().T))
+            )
+            self.assertAlmostEqual(core.raw_dagger_residual, expected_residual, places=10)
+
+    def test_cross_sector_matches_independent_kernel_calls_both_orientations(self):
+        grid, plan, sector_a, sector_b = self._setup(np.complex128)
+        core = ibp_core(sector_a, sector_b, operator=plan)
+        expected_forward, _ = kernel(
+            sector_a.grad_Theta, sector_b.Theta, grid.coords, grid.weights,
+            eval_block_size=plan.eval_block_size, source_block_size=plan.source_block_size,
+        )
+        expected_reverse, _ = kernel(
+            sector_b.grad_Theta, sector_a.Theta, grid.coords, grid.weights,
+            eval_block_size=plan.eval_block_size, source_block_size=plan.source_block_size,
+        )
+        np.testing.assert_allclose(core.z_forward_one_sided, expected_forward, atol=1e-12)
+        np.testing.assert_allclose(core.z_reverse_one_sided, expected_reverse, atol=1e-12)
+        expected_Z = (expected_forward + expected_reverse.conj().T) / 2
+        np.testing.assert_allclose(core.Z, expected_Z, atol=1e-12)
+        self.assertFalse(core.same_sector)
+        self.assertEqual(core.Z.shape, (sector_a.selected_rank, sector_b.selected_rank))
+
+    def test_one_sided_mode_is_unaveraged(self):
+        grid, plan, sector_a, sector_b = self._setup(np.float64)
+        core = ibp_core(sector_a, sector_b, operator=plan, symmetry_mode="one_sided")
+        np.testing.assert_array_equal(core.Z, core.z_forward_one_sided)
+        # The raw residual is still computed and retained even in diagnostic mode --
+        # quadrature bias is never hidden regardless of which Z ships as production.
+        self.assertGreater(core.raw_dagger_residual, 0.0)
+
+    def test_rejects_unsupported_symmetry_mode(self):
+        _, plan, sector_a, _ = self._setup()
+        with self.assertRaises(ValueError):
+            ibp_core(sector_a, operator=plan, symmetry_mode="nonsense")
+
+    def test_rejects_non_sector_left_and_non_plan_operator(self):
+        _, plan, sector_a, _ = self._setup()
+        with self.assertRaises(TypeError):
+            ibp_core("not-a-sector", operator=plan)
+        with self.assertRaises(TypeError):
+            ibp_core(sector_a, operator="not-a-plan")
+        with self.assertRaises(TypeError):
+            ibp_core(sector_a, "not-a-sector", operator=plan)
+
+    def test_rejects_sector_operator_grid_mismatch(self):
+        _, plan, sector_a, _ = self._setup()
+        other_rng = np.random.default_rng(999)
+        other_grid = build_ibp_grid(
+            other_rng.normal(size=(14, 3)), other_rng.random(14)
+        )
+        other_plan = build_ibp_operator_plan(other_grid)
+        with self.assertRaises(ValueError):
+            ibp_core(sector_a, operator=other_plan)
+
+    def test_mu_nu_block_size_does_not_change_result(self):
+        _, plan, sector_a, sector_b = self._setup(np.complex128)
+        full = ibp_core(sector_a, sector_b, operator=plan)
+        blocked = ibp_core(sector_a, sector_b, operator=plan, mu_block_size=1, nu_block_size=2)
+        np.testing.assert_allclose(blocked.Z, full.Z, atol=1e-12)
+        np.testing.assert_allclose(
+            blocked.z_forward_one_sided, full.z_forward_one_sided, atol=1e-12
+        )
+        self.assertEqual(blocked.mu_block_size, 1)
+        self.assertEqual(blocked.nu_block_size, 2)
+        self.assertEqual(full.mu_block_size, sector_a.selected_rank)
+        self.assertEqual(full.nu_block_size, sector_b.selected_rank)
+
+    def test_jax_backend_operator_is_explicitly_rejected(self):
+        rng = np.random.default_rng(41)
+        coords = jnp.asarray(rng.normal(size=(6, 3)))
+        weights = jnp.asarray(rng.random(6))
+        grid = build_ibp_grid(
+            coords, weights, backend="jax",
+            coords_identity=hashlib.sha256(b"c").hexdigest(),
+            weights_identity=hashlib.sha256(b"w").hexdigest(),
+        )
+        plan = build_ibp_operator_plan(grid)
+        _, _, sector_a, _ = self._setup()
+        with self.assertRaises(NotImplementedError):
+            ibp_core(sector_a, operator=plan)
+
+    def test_tampering_via_dataclasses_replace_is_rejected(self):
+        _, plan, sector_a, sector_b = self._setup()
+        core = ibp_core(sector_a, sector_b, operator=plan)
+        for kwargs in (
+            {"core_spec_sha256": "0" * 64},
+            {"Z": core.Z + 1.0},
+            {"raw_dagger_residual": core.raw_dagger_residual + 1.0},
+            {"symmetry_mode": "one_sided"},
+            {"same_sector": True, "z_reverse_one_sided": None},
+        ):
+            with self.assertRaises(ValueError):
+                dataclasses.replace(core, **kwargs)
+
+    def test_direct_construction_bypassing_builder_is_still_validated(self):
+        _, plan, sector_a, _ = self._setup()
+        core = ibp_core(sector_a, operator=plan)
+        with self.assertRaises(ValueError):
+            IBPCoreArtifact(
+                Z=core.Z, same_sector=core.same_sector, symmetry_mode=core.symmetry_mode,
+                z_forward_one_sided=core.z_forward_one_sided,
+                z_reverse_one_sided=core.z_reverse_one_sided,
+                raw_dagger_residual=core.raw_dagger_residual,
+                coincident_pairs=core.coincident_pairs, n_mu=core.n_mu, n_nu=core.n_nu,
+                left_sector_spec_sha256=core.left_sector_spec_sha256,
+                right_sector_spec_sha256=core.right_sector_spec_sha256,
+                operator_spec_sha256=core.operator_spec_sha256,
+                mu_block_size=core.mu_block_size, nu_block_size=core.nu_block_size,
+                backend=core.backend, device=core.device, realized_dtype=core.realized_dtype,
+                build_wall_time_seconds=core.build_wall_time_seconds,
+                peak_host_bytes=core.peak_host_bytes, solver_version=core.solver_version,
+                provenance={}, core_spec_sha256="0" * 64,
+            )
+
+    def test_provenance_references_both_sectors_and_operator(self):
+        _, plan, sector_a, sector_b = self._setup()
+        core = ibp_core(
+            sector_a, sector_b, operator=plan, upstream_provenance={"note": "unit"}
+        )
+        self.assertEqual(
+            dict(core.provenance["left_sector_provenance"]), dict(sector_a.provenance)
+        )
+        self.assertEqual(
+            dict(core.provenance["right_sector_provenance"]), dict(sector_b.provenance)
+        )
+        self.assertEqual(core.provenance["upstream_provenance"]["note"], "unit")
+        with self.assertRaises(TypeError):
+            core.provenance["note"] = "cannot-assign"
 
 
 if __name__ == "__main__":
