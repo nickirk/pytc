@@ -31,6 +31,10 @@ Examples::
     python -m pytc.utils.poisson_core_benchmark --matrix-index 0 --backend jax \
         --output p2c_case_0.json
 
+    python -m pytc.utils.poisson_core_benchmark --system H2O_ccpVDZ \
+        --spacing 0.12 --rank-factor 4 --grid-shift-fraction 0.5 0.5 0.5 \
+        --backend jax --output p2c_h2o_shifted.json
+
 Task #16, #proj-isdf-coulomb-cuda, 2026-07-13.
 """
 
@@ -110,6 +114,7 @@ class BenchmarkCase:
     rcond: float = 1e-12
     repeats: int = 2
     num_threads: int = 1
+    grid_shift_fraction: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         if self.system not in SYSTEMS:
@@ -129,15 +134,31 @@ class BenchmarkCase:
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        try:
+            shift = tuple(float(x) for x in self.grid_shift_fraction)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("grid_shift_fraction must contain three finite floats") from exc
+        if len(shift) != 3 or any(not math.isfinite(x) or abs(x) > 0.5 for x in shift):
+            raise ValueError(
+                "grid_shift_fraction must contain three finite values in [-0.5, 0.5], "
+                f"got {self.grid_shift_fraction!r}"
+            )
+        object.__setattr__(self, "grid_shift_fraction", shift)
 
 
-def centered_uniform_mesh(mol: gto.Mole, spacing: float, margin: float):
+def centered_uniform_mesh(mol: gto.Mole, spacing: float, margin: float,
+                          shift_fraction=(0.0, 0.0, 0.0)):
     """Return an odd, molecule-centered Cartesian mesh in Bohr.
 
     ``margin`` is added beyond the outermost nucleus independently along
     each axis.  Odd shapes put the molecular box center on a grid point and
     make spacing/domain sweeps deterministic.
     """
+    shift_fraction = tuple(float(x) for x in shift_fraction)
+    if len(shift_fraction) != 3 or any(
+        not math.isfinite(x) or abs(x) > 0.5 for x in shift_fraction
+    ):
+        raise ValueError("shift_fraction must contain three finite values in [-0.5, 0.5]")
     atom_coords = np.asarray(mol.atom_coords(unit="Bohr"), dtype=np.float64)
     lo = atom_coords.min(axis=0)
     hi = atom_coords.max(axis=0)
@@ -150,7 +171,10 @@ def centered_uniform_mesh(mol: gto.Mole, spacing: float, margin: float):
             n += 1
         shape.append(n)
     shape_t = tuple(shape)
-    origin = tuple(center - 0.5 * (np.asarray(shape_t) - 1) * spacing)
+    origin = tuple(
+        center - 0.5 * (np.asarray(shape_t) - 1) * spacing
+        + np.asarray(shift_fraction) * spacing
+    )
 
     axes = [origin[i] + np.arange(shape_t[i]) * spacing for i in range(3)]
     xyz = np.meshgrid(*axes, indexing="ij")
@@ -281,7 +305,9 @@ def run_case(case: BenchmarkCase) -> dict[str, Any]:
         mo_occ = mo_coeff[:, :n_occ]
         mo_vir = mo_coeff[:, n_occ:]
 
-        shape, origin, coords = centered_uniform_mesh(mol, case.spacing, case.margin)
+        shape, origin, coords = centered_uniform_mesh(
+            mol, case.spacing, case.margin, case.grid_shift_fraction,
+        )
         n_grid = int(np.prod(shape))
         dV = case.spacing ** 3
 
@@ -388,7 +414,7 @@ def run_case(case: BenchmarkCase) -> dict[str, Any]:
     poisson_total_warm = kernel_warm_seconds + theta_warm_seconds + core_warm_seconds
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case": asdict(case),
         "status": "ok",
         "environment": {
@@ -453,6 +479,10 @@ def run_case(case: BenchmarkCase) -> dict[str, Any]:
         },
         "provenance": {
             "pivot": pivot_provenance,
+            "mo_coeff_sha256": _array_sha256(mo_coeff),
+            "grid_coords_sha256": _array_sha256(coords),
+            "pivots_sha256": _array_sha256(pivots),
+            "pair_collocation_P_sha256": _array_sha256(P),
             "df_factor_sha256": c_provenance["df_factor_sha256"],
             "df_solver": z_df_provenance,
             "poisson_sector_spec_sha256": poisson_sector.sector_spec_sha256,
@@ -544,6 +574,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--rcond", type=float, default=1e-12)
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--num-threads", type=int, default=1)
+    p.add_argument(
+        "--grid-shift-fraction", type=float, nargs=3, metavar=("SX", "SY", "SZ"),
+        default=(0.0, 0.0, 0.0),
+        help="translate the grid by these fractions of one cell per axis (diagnostic)",
+    )
     p.add_argument("--output", help="optional JSON output path; stdout is always emitted")
     return p
 
@@ -567,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             ao_batch_size=args.ao_batch_size, grid_batch_size=args.grid_batch_size,
             mu_block_size=args.mu_block_size, nu_block_size=args.nu_block_size,
             rcond=args.rcond, repeats=args.repeats, num_threads=args.num_threads,
+            grid_shift_fraction=tuple(args.grid_shift_fraction),
         )
     result = run_case(case)
     payload = json.dumps(result, indent=2, sort_keys=True)

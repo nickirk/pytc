@@ -30,6 +30,20 @@ class TestPoissonCoreBenchmarkProtocol(unittest.TestCase):
         np.testing.assert_array_equal(origin, origin2)
         np.testing.assert_array_equal(coords, coords2)
 
+    def test_centered_mesh_shift_is_exact_fraction_of_spacing(self):
+        mol = gto.M(atom="H 0 0 -0.5; H 0 0 0.5", basis="sto-3g", verbose=0)
+        shape0, origin0, coords0 = centered_uniform_mesh(mol, 0.4, 2.0)
+        shape1, origin1, coords1 = centered_uniform_mesh(
+            mol, 0.4, 2.0, shift_fraction=(0.5, -0.25, 0.0),
+        )
+        self.assertEqual(shape0, shape1)
+        np.testing.assert_allclose(np.asarray(origin1) - origin0, (0.2, -0.1, 0.0))
+        np.testing.assert_allclose(
+            coords1 - coords0, np.broadcast_to((0.2, -0.1, 0.0), coords0.shape),
+        )
+        with self.assertRaises(ValueError):
+            centered_uniform_mesh(mol, 0.4, 2.0, shift_fraction=(0.6, 0.0, 0.0))
+
     def test_mp2_formula_zero_eri_is_zero(self):
         eri = np.zeros((1, 2, 1, 2))
         mo_energy = np.array([-1.0, 0.2, 0.4])
@@ -42,6 +56,8 @@ class TestPoissonCoreBenchmarkProtocol(unittest.TestCase):
             BenchmarkCase(pad_factor=1)
         with self.assertRaises(ValueError):
             BenchmarkCase(backend="cuda")
+        with self.assertRaises(ValueError):
+            BenchmarkCase(grid_shift_fraction=(0.0, 0.0, 0.6))
 
     def test_recommended_matrix_is_unique_and_has_all_sweep_axes(self):
         matrix = recommended_matrix("jax")
