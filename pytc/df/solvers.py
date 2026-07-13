@@ -23,7 +23,19 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
       B[pq, g] = phi_p_batch[p, g] * phi_q_batch[q, g]
 
     This exploits the separable structure to avoid O(N^2) intermediates:
-    (C^T B)[m, g] = (sum_p phi_piv_p[p,m]*phi_p_batch[p,g]) * (sum_q phi_piv_q[q,m]*phi_q_batch[q,g])
+    (C^dagger B)[m, g] = (sum_p conj(phi_piv_p[p,m])*phi_p_batch[p,g])
+                        * (sum_q conj(phi_piv_q[q,m])*phi_q_batch[q,g])
+
+    Complex-correct: least squares needs the CONJUGATE transpose C^dagger,
+    not the plain transpose C^T -- an earlier version of this function used
+    `.T` throughout, which is only correct for real inputs and silently
+    gives a wrong (non-Hermitian, not-necessarily-PSD normal-equation
+    matrix) answer for complex ones (Alice's review, task #15 design,
+    2026-07-13: independently reproduced via an explicit dense
+    C[(p,q),mu]/B[(p,q),g] + np.linalg.lstsq oracle -- relative error ~2.0
+    with plain `.T`, 6.4e-10 with `.conj().T`). For real inputs `.conj()`
+    is a no-op, so every existing real-valued caller (TC/xTC's own ISDF
+    fitting) is bit-identically unaffected by this fix.
 
     Args:
         phi_piv_p: (n_orb, n_fused) first factor of pivots
@@ -35,18 +47,21 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
     Returns:
         X: (n_fused, batch_size) solutions
     """
-    # Compute A^T A efficiently using the Kronecker-like structure
-    gram_p = phi_piv_p.T @ phi_piv_p  # (n_fused, n_fused)
-    gram_q = phi_piv_q.T @ phi_piv_q  # (n_fused, n_fused)
-    ATA = gram_p * gram_q  # Element-wise product
+    # Compute C^dagger C efficiently using the Kronecker-like structure
+    gram_p = phi_piv_p.conj().T @ phi_piv_p  # (n_fused, n_fused)
+    gram_q = phi_piv_q.conj().T @ phi_piv_q  # (n_fused, n_fused)
+    ATA = gram_p * gram_q  # Element-wise product -- Hermitian PSD (Hadamard product of two Hermitian PSD matrices)
 
-    # Compute A^T B efficiently using separable structure
-    term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)  # (n_fused, batch_size)
-    term_q = jnp.matmul(phi_piv_q.T, phi_q_batch)  # (n_fused, batch_size)
+    # Compute C^dagger B efficiently using separable structure
+    term_p = jnp.matmul(phi_piv_p.conj().T, phi_p_batch)  # (n_fused, batch_size)
+    term_q = jnp.matmul(phi_piv_q.conj().T, phi_q_batch)  # (n_fused, batch_size)
     ATB = term_p * term_q  # (n_fused, batch_size)
 
-    # Use LU solve (jnp.linalg.solve) with Tikhonov regularization
-    diag_mean = jnp.mean(jnp.diag(ATA))
+    # Use LU solve (jnp.linalg.solve) with Tikhonov regularization.
+    # ATA's diagonal is exactly real in exact arithmetic (Hermitian PSD);
+    # .real guards against a spurious ~1e-16-scale imaginary rounding
+    # residual feeding into the (real-valued-by-construction) jitter scale.
+    diag_mean = jnp.mean(jnp.diag(ATA)).real
     jitter = diag_mean * rcond
     ATA_reg = ATA + jitter * jnp.eye(ATA.shape[0])
     X = jnp.linalg.solve(ATA_reg, ATB)
@@ -59,9 +74,12 @@ solve_normal_equations_batch = jax.jit(solve_normal_equations_batch, static_argn
 
 @jax.jit
 def _build_normal_matrix(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray) -> jnp.ndarray:
-    """Build unregularized normal-equation matrix for structured LS."""
-    gram_p = phi_piv_p.T @ phi_piv_p
-    gram_q = phi_piv_q.T @ phi_piv_q
+    """Build unregularized normal-equation matrix C^dagger C for structured
+    LS -- conjugate transpose, not plain transpose (see
+    solve_normal_equations_batch's docstring for the complex-correctness
+    fix this is part of; real inputs are unaffected, .conj() is a no-op)."""
+    gram_p = phi_piv_p.conj().T @ phi_piv_p
+    gram_q = phi_piv_q.conj().T @ phi_piv_q
     return gram_p * gram_q
 
 
@@ -228,7 +246,8 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
 def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
                                     rcond: float = 1e-14,
                                     max_jitter_tries: int = 8,
-                                    jitter_growth: float = 10.0):
+                                    jitter_growth: float = 10.0,
+                                    return_info: bool = False):
     """Prepare robust Cholesky factor for repeated batched solves.
 
     Thin wrapper around prepare_spd_cholesky (TC's original entry point,
@@ -236,10 +255,21 @@ def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarr
     see prepare_spd_cholesky's docstring for the shared jitter-escalation
     algorithm and its own 4-tuple return, used by callers that need the
     extra provenance fields).
+
+    Args:
+        return_info: False (default) -- backward-compatible (chol, lower)
+            2-tuple, unchanged. True -- returns the full
+            (chol, lower, jitter_used, n_tries) 4-tuple prepare_spd_cholesky
+            itself produces, instead of discarding the last two (added for
+            task #15's provenance requirements -- a caller building a
+            provenance-carrying artifact needs the ACTUAL jitter/retry
+            facts, not just the usable factor).
     """
     ata = _build_normal_matrix(phi_piv_p, phi_piv_q)
-    chol, lower, _jitter_used, _n_tries = prepare_spd_cholesky(
+    chol, lower, jitter_used, n_tries = prepare_spd_cholesky(
         ata, rcond=rcond, max_jitter_tries=max_jitter_tries, jitter_growth=jitter_growth)
+    if return_info:
+        return chol, lower, jitter_used, n_tries
     return chol, lower
 
 
@@ -247,8 +277,13 @@ def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarr
 def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
                                           phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
                                           phi_p_batch: jnp.ndarray, phi_q_batch: jnp.ndarray) -> jnp.ndarray:
-    """Solve batched normal equations using precomputed Cholesky factor."""
-    term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)
-    term_q = jnp.matmul(phi_piv_q.T, phi_q_batch)
+    """Solve batched normal equations using precomputed Cholesky factor.
+
+    Conjugate transpose (`.conj().T`), not plain transpose -- see
+    solve_normal_equations_batch's docstring for the complex-correctness
+    fix this is part of; real inputs are unaffected (.conj() is a no-op).
+    """
+    term_p = jnp.matmul(phi_piv_p.conj().T, phi_p_batch)
+    term_q = jnp.matmul(phi_piv_q.conj().T, phi_q_batch)
     atb = term_p * term_q
     return jsp_linalg.cho_solve((chol, lower), atb)
