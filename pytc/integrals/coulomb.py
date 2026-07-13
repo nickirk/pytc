@@ -2211,6 +2211,16 @@ class PoissonInterpolationSector:
 
         if self.factor_identity_source not in ("computed_content_hash", "caller_attested"):
             raise ValueError(f"Unsupported factor_identity_source={self.factor_identity_source!r}.")
+        # Backend/trust-boundary pairing is a hard invariant, not just a
+        # supported-value check -- a manually constructed artifact must
+        # not be able to claim NumPy content-hash trust for JAX-sourced
+        # factors or vice versa (Alice's review, task #15, 2026-07-13).
+        expected_source = "computed_content_hash" if self.backend == "numpy" else "caller_attested"
+        if self.factor_identity_source != expected_source:
+            raise ValueError(
+                f"factor_identity_source={self.factor_identity_source!r} is inconsistent with "
+                f"backend={self.backend!r} -- expected {expected_source!r}."
+            )
 
         for name, value in [
             ("pivots_sha256", self.pivots_sha256),
@@ -2218,6 +2228,30 @@ class PoissonInterpolationSector:
             ("factor_q_sha256", self.factor_q_sha256),
         ]:
             _validate_sha256_hex(name, value)
+
+        # same_factor=True asserts factor_p_raw and factor_q_raw were the
+        # SAME array -- their recorded identity digests must agree,
+        # regardless of trust boundary (reproduced: JAX same_factor=True
+        # accepted contradictory caller-attested factor_p_sha256 !=
+        # factor_q_sha256 -- Alice's review, task #15, 2026-07-13).
+        if self.same_factor and self.factor_p_sha256 != self.factor_q_sha256:
+            raise ValueError(
+                "same_factor=True requires factor_p_sha256 == factor_q_sha256 "
+                f"(got {self.factor_p_sha256!r} != {self.factor_q_sha256!r})."
+            )
+
+        # Pivot identity must be bound to the ACTUAL pivot array, not
+        # merely a syntactically-valid digest string -- recompute and
+        # require equality (reproduced: dataclasses.replace with a
+        # reordered pivots array kept the stale digest -- Alice's
+        # review, task #15, 2026-07-13).
+        recomputed_pivots_sha256 = _canonical_sha256(pivots_np)
+        if recomputed_pivots_sha256 != self.pivots_sha256:
+            raise ValueError(
+                "pivots_sha256 does not match the digest recomputed from the actual "
+                "pivots array -- pivots may have been reordered or replaced without "
+                "updating the digest."
+            )
 
         if self.solver_version != _POISSON_INTERPOLATION_SOLVER_VERSION:
             raise ValueError(
@@ -2269,6 +2303,7 @@ class PoissonCoreArtifact:
     device: str
     realized_dtype: str
     solver_version: str
+    core_spec_sha256: str
 
     def __post_init__(self):
         if self.backend not in ("numpy", "jax"):
@@ -2324,6 +2359,28 @@ class PoissonCoreArtifact:
             raise ValueError(
                 f"solver_version={self.solver_version!r} != "
                 f"{_POISSON_INTERPOLATION_SOLVER_VERSION!r}."
+            )
+
+        # Close the core's own digest, not just the kernel/sector digests
+        # it references -- otherwise ANY single typed field (kernel_spec_
+        # sha256 included) can be tampered with independently and still
+        # look internally consistent (reproduced: dataclasses.replace
+        # with kernel_spec_sha256="0"*64 was accepted -- Alice's review,
+        # task #15, 2026-07-13).
+        recomputed_core_hash = _kernel_spec_sha256({
+            "left_sector_spec_sha256": self.left_sector_spec_sha256,
+            "right_sector_spec_sha256": self.right_sector_spec_sha256,
+            "left_n_fused": left_n_fused, "right_n_fused": right_n_fused,
+            "kernel_spec_sha256": self.kernel_spec_sha256,
+            "mu_block_size": mu_block_size, "nu_block_size": nu_block_size,
+            "normalization": self.normalization, "backend": self.backend,
+            "realized_dtype": self.realized_dtype, "solver_version": self.solver_version,
+        })
+        _validate_sha256_hex("core_spec_sha256", self.core_spec_sha256)
+        if recomputed_core_hash != self.core_spec_sha256:
+            raise ValueError(
+                "core_spec_sha256 does not match the canonical digest recomputed from "
+                "this artifact's own declared fields."
             )
 
 
@@ -2473,6 +2530,15 @@ def build_poisson_interpolation_sector(factor_p_raw, factor_q_raw, pivots, mesh,
         _validate_sha256_hex("upstream_provenance['factor_q_sha256']", factor_q_sha256)
         factor_identity_source = "caller_attested"
 
+    if same_factor and factor_p_sha256 != factor_q_sha256:
+        raise ValueError(
+            "same_factor=True requires factor_p_sha256 == factor_q_sha256 -- got "
+            f"{factor_p_sha256!r} != {factor_q_sha256!r} (on the JAX path this is a "
+            "caller-attested identity, but a contradictory pair is still rejected: "
+            "same_factor already asserts factor_p_raw and factor_q_raw are the SAME "
+            "array, verified by actual equality above)."
+        )
+
     sector_spec_sha256 = _kernel_spec_sha256({
         "mesh_shape": mesh.shape, "mesh_spacing": mesh.spacing, "mesh_origin": mesh.origin,
         "same_factor": same_factor, "storage_mode": "incore_full_theta",
@@ -2605,6 +2671,16 @@ def poisson_core(left, right=None, *, kernel, mu_block_size=None, nu_block_size=
     device = "cpu" if kernel.backend == "numpy" else str(Z.device)
     realized_dtype = str(Z.dtype)
 
+    core_spec_sha256 = _kernel_spec_sha256({
+        "left_sector_spec_sha256": left.sector_spec_sha256,
+        "right_sector_spec_sha256": right_sector.sector_spec_sha256,
+        "left_n_fused": n_mu_left, "right_n_fused": n_mu_right,
+        "kernel_spec_sha256": kernel.kernel_spec_sha256,
+        "mu_block_size": mu_block_size_realized, "nu_block_size": nu_block_size_realized,
+        "normalization": "dV", "backend": kernel.backend,
+        "realized_dtype": realized_dtype, "solver_version": _POISSON_INTERPOLATION_SOLVER_VERSION,
+    })
+
     return PoissonCoreArtifact(
         Z=Z,
         left_sector_spec_sha256=left.sector_spec_sha256,
@@ -2614,4 +2690,5 @@ def poisson_core(left, right=None, *, kernel, mu_block_size=None, nu_block_size=
         mu_block_size=mu_block_size_realized, nu_block_size=nu_block_size_realized,
         normalization="dV", backend=kernel.backend, device=device, realized_dtype=realized_dtype,
         solver_version=_POISSON_INTERPOLATION_SOLVER_VERSION,
+        core_spec_sha256=core_spec_sha256,
     )

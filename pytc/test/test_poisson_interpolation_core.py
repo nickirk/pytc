@@ -27,9 +27,11 @@ float64 tolerances require it; must not depend on another test module
 enabling it first).
 """
 import dataclasses
+import math
 import time
 import tracemalloc
 import unittest
+from unittest.mock import patch
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -180,6 +182,34 @@ class TestPoissonInterpolationTilingEquality(unittest.TestCase):
         core_tiled = poisson_core(sector, kernel=kernel, mu_block_size=2, nu_block_size=3)
         np.testing.assert_allclose(core_tiled.Z, core_untiled.Z, atol=1e-9, rtol=1e-9)
 
+    def test_poisson_solve_call_count_matches_nu_blocks_not_mu_blocks(self):
+        # solve_free_space_poisson must be called exactly
+        # ceil(n_right/nu_block_size) times -- once per nu-block, NEVER
+        # recomputed inside the mu-loop (Alice's review, task #15,
+        # 2026-07-13: "add a call-count spy proving solve_free_space_
+        # poisson is called exactly ceil(n_right/nu_block_size) times and
+        # does not grow with the number of mu blocks").
+        kernel, sector = self._build((4, 4, 4), (0.25, 0.25, 0.25), "rfft", np.float64, False, 9)
+        n_right = sector.Theta.shape[0]
+        nu_block_size = 4
+        expected_calls = math.ceil(n_right / nu_block_size)
+
+        import pytc.integrals.coulomb as coulomb_module
+        real_solve = coulomb_module.solve_free_space_poisson
+        with patch.object(coulomb_module, "solve_free_space_poisson",
+                           side_effect=real_solve) as spy:
+            poisson_core(sector, kernel=kernel, mu_block_size=1, nu_block_size=nu_block_size)
+            calls_with_many_mu_blocks = spy.call_count
+
+        with patch.object(coulomb_module, "solve_free_space_poisson",
+                           side_effect=real_solve) as spy:
+            poisson_core(sector, kernel=kernel, mu_block_size=n_right, nu_block_size=nu_block_size)
+            calls_with_one_mu_block = spy.call_count
+
+        self.assertEqual(calls_with_many_mu_blocks, expected_calls)
+        self.assertEqual(calls_with_one_mu_block, expected_calls)
+        self.assertEqual(calls_with_many_mu_blocks, calls_with_one_mu_block)
+
 
 class TestPoissonCoreHermiticityAndRejection(unittest.TestCase):
     """Acceptance test 3."""
@@ -272,7 +302,7 @@ class TestPoissonBackendAgreement(unittest.TestCase):
 
         np.testing.assert_allclose(core_np.Z, np.asarray(core_jax.Z), atol=1e-8, rtol=1e-8)
 
-    def test_pinned_float32_complex64(self):
+    def test_pinned_float32(self):
         shape = (4, 4, 4)
         spacing = (0.25, 0.25, 0.25)
         rng = np.random.default_rng(4)
@@ -285,6 +315,58 @@ class TestPoissonBackendAgreement(unittest.TestCase):
         self.assertEqual(sector.realized_dtype, str(np.dtype(np.float32)))
         core = poisson_core(sector, kernel=kernel)
         self.assertEqual(core.realized_dtype, str(np.dtype(np.float32)))
+
+    def test_pinned_complex64_full_sector_and_fft_core(self):
+        # A REAL complex64 path -- fft_kind='fft', complex factors, and a
+        # dense-oracle cross-check, not just a dtype-label assertion
+        # (Alice's review, task #15, 2026-07-13: "add a real complex64
+        # full sector+FFT-core test").
+        shape = (4, 4, 4)
+        spacing = (0.25, 0.25, 0.25)
+        rng = np.random.default_rng(9)
+        N_g = 64
+        factor_p = (rng.standard_normal((3, N_g)) + 1j * rng.standard_normal((3, N_g))).astype(np.complex64)
+        factor_q = (rng.standard_normal((3, N_g)) + 1j * rng.standard_normal((3, N_g))).astype(np.complex64)
+        pivots = rng.choice(N_g, size=5, replace=False)
+        kernel = build_free_space_poisson_kernel(
+            shape, spacing, backend="numpy", fft_kind="fft", dtype=np.complex64)
+        sector = build_poisson_interpolation_sector(factor_p, factor_q, pivots, kernel.mesh, rcond=1e-5)
+        self.assertEqual(sector.realized_dtype, str(np.dtype(np.complex64)))
+        core = poisson_core(sector, kernel=kernel)
+        self.assertEqual(core.realized_dtype, str(np.dtype(np.complex64)))
+
+        Theta_ref = _dense_theta_reference(
+            factor_p.astype(np.complex128), factor_q.astype(np.complex128), pivots)
+        np.testing.assert_allclose(sector.Theta.astype(np.complex128), Theta_ref, atol=2e-3, rtol=2e-3)
+
+    def test_jax_complex_path_vs_numpy_dense_oracle(self):
+        # A formal JAX complex path (Theta and Z), not just real float64
+        # (Alice's review, task #15, 2026-07-13).
+        shape = (4, 4, 4)
+        spacing = (0.3, 0.3, 0.3)
+        rng = np.random.default_rng(10)
+        N_g = 64
+        factor_p = rng.standard_normal((3, N_g)) + 1j * rng.standard_normal((3, N_g))
+        factor_q = rng.standard_normal((3, N_g)) + 1j * rng.standard_normal((3, N_g))
+        pivots = rng.choice(N_g, size=6, replace=False)
+
+        kernel_jax = build_free_space_poisson_kernel(
+            shape, spacing, backend="jax", fft_kind="fft", dtype=np.complex128)
+        sector_jax = build_poisson_interpolation_sector(
+            jnp.asarray(factor_p), jnp.asarray(factor_q), pivots, kernel_jax.mesh, rcond=1e-12,
+            upstream_provenance={"factor_p_sha256": "a" * 64, "factor_q_sha256": "b" * 64})
+        core_jax = poisson_core(sector_jax, kernel=kernel_jax)
+
+        Theta_ref = _dense_theta_reference(factor_p, factor_q, pivots)
+        np.testing.assert_allclose(np.asarray(sector_jax.Theta), Theta_ref, atol=1e-8, rtol=1e-8)
+
+        kernel_np = build_free_space_poisson_kernel(
+            shape, spacing, backend="numpy", fft_kind="fft", dtype=np.complex128)
+        sector_np = build_poisson_interpolation_sector(
+            factor_p, factor_q, pivots, kernel_np.mesh, rcond=1e-12)
+        core_np = poisson_core(sector_np, kernel=kernel_np)
+
+        np.testing.assert_allclose(np.asarray(core_jax.Z), core_np.Z, atol=1e-8, rtol=1e-8)
 
 
 class TestPoissonSyntheticExactFit(unittest.TestCase):
@@ -476,6 +558,73 @@ class TestPoissonInterpolationSectorValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             PoissonInterpolationSector(**kwargs)
 
+    def test_rejects_valid_but_wrong_pivots_sha256(self):
+        # A syntactically valid 64-hex digest that simply does not match
+        # the actual pivots array -- not just malformed syntax (Alice's
+        # review, task #15, 2026-07-13: pivot identity must be bound to
+        # the actual array, not merely a plausible-looking string).
+        kwargs = self._valid_kwargs()
+        kwargs["pivots_sha256"] = "ab" * 32
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
+    def test_rejects_reordered_pivots_with_stale_digest(self):
+        kwargs = self._valid_kwargs()
+        kwargs["pivots"] = np.array(kwargs["pivots"])[::-1].copy()
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
+    def test_rejects_valid_but_wrong_factor_p_sha256(self):
+        kwargs = self._valid_kwargs()
+        kwargs["factor_p_sha256"] = "cd" * 32
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
+    def test_rejects_valid_but_wrong_factor_q_sha256(self):
+        kwargs = self._valid_kwargs()
+        kwargs["factor_q_sha256"] = "ef" * 32
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
+    def test_rejects_backend_factor_identity_source_mismatch(self):
+        # NumPy backend claiming a JAX-style caller_attested trust
+        # boundary (or vice versa) must be rejected -- a manually
+        # constructed artifact must not be able to claim the wrong trust
+        # boundary (Alice's review, task #15, 2026-07-13).
+        kwargs = self._valid_kwargs()
+        self.assertEqual(kwargs["backend"], "numpy")
+        kwargs["factor_identity_source"] = "caller_attested"
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
+    def test_rejects_same_factor_true_with_differing_factor_digests(self):
+        kwargs = self._valid_kwargs()
+        kwargs["same_factor"] = True
+        kwargs["factor_p_sha256"] = "11" * 32
+        kwargs["factor_q_sha256"] = "22" * 32
+        # Recompute a self-consistent sector_spec_sha256 for THIS
+        # perturbed field set so the earlier hash-recomputation check
+        # doesn't mask the same_factor-specific check being tested here.
+        from pytc.integrals.coulomb import _kernel_spec_sha256
+        kwargs["sector_spec_sha256"] = _kernel_spec_sha256({
+            "mesh_shape": kwargs["mesh_shape"], "mesh_spacing": kwargs["mesh_spacing"],
+            "mesh_origin": kwargs["mesh_origin"], "same_factor": kwargs["same_factor"],
+            "storage_mode": kwargs["storage_mode"], "backend": kwargs["backend"],
+            "realized_dtype": kwargs["realized_dtype"], "grid_batch_size": kwargs["grid_batch_size"],
+            "rcond": kwargs["rcond"], "jitter_used": kwargs["jitter_used"],
+            "n_tries": kwargs["n_tries"], "factor_identity_source": kwargs["factor_identity_source"],
+            "pivots_sha256": kwargs["pivots_sha256"], "factor_p_sha256": kwargs["factor_p_sha256"],
+            "factor_q_sha256": kwargs["factor_q_sha256"], "solver_version": kwargs["solver_version"],
+        })
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
+    def test_rejects_valid_but_wrong_device(self):
+        kwargs = self._valid_kwargs()
+        kwargs["device"] = "gpu:0"
+        with self.assertRaises(ValueError):
+            PoissonInterpolationSector(**kwargs)
+
 
 class TestPoissonCoreArtifactValidation(unittest.TestCase):
     """Acceptance test 7 (core half)."""
@@ -520,6 +669,36 @@ class TestPoissonCoreArtifactValidation(unittest.TestCase):
     def test_rejects_non_hex_kernel_digest(self):
         kwargs = self._valid_kwargs()
         kwargs["kernel_spec_sha256"] = "short"
+        with self.assertRaises(ValueError):
+            PoissonCoreArtifact(**kwargs)
+
+    def test_rejects_valid_but_wrong_kernel_digest(self):
+        # A syntactically valid 64-hex digest that doesn't match what
+        # core_spec_sha256 was actually computed from -- not just
+        # malformed syntax (Alice's review, task #15, 2026-07-13:
+        # "ANY single typed field... can be tampered with independently
+        # and still look internally consistent" without a recomputed
+        # core_spec_sha256).
+        kwargs = self._valid_kwargs()
+        kwargs["kernel_spec_sha256"] = "ab" * 32
+        with self.assertRaises(ValueError):
+            PoissonCoreArtifact(**kwargs)
+
+    def test_rejects_valid_but_wrong_left_sector_digest(self):
+        kwargs = self._valid_kwargs()
+        kwargs["left_sector_spec_sha256"] = "cd" * 32
+        with self.assertRaises(ValueError):
+            PoissonCoreArtifact(**kwargs)
+
+    def test_rejects_valid_but_wrong_right_sector_digest(self):
+        kwargs = self._valid_kwargs()
+        kwargs["right_sector_spec_sha256"] = "ef" * 32
+        with self.assertRaises(ValueError):
+            PoissonCoreArtifact(**kwargs)
+
+    def test_rejects_valid_but_wrong_device(self):
+        kwargs = self._valid_kwargs()
+        kwargs["device"] = "gpu:0"
         with self.assertRaises(ValueError):
             PoissonCoreArtifact(**kwargs)
 
