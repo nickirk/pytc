@@ -124,27 +124,62 @@ def _readonly_copy(a):
     return a
 
 
-def _deep_freeze(obj):
+_DEEP_FREEZE_IMMUTABLE_SCALAR_TYPES = (type(None), bool, int, float, complex, str, bytes)
+
+
+def _deep_freeze(obj, _path="<root>"):
     """Recursively convert dict -> types.MappingProxyType, list/tuple ->
-    tuple, set -> frozenset, and numpy arrays -> read-only copies, at
-    every nesting level -- a shallow top-level MappingProxyType still
-    lets nested keys (e.g. provenance['upstream_provenance']['x'] = ...)
-    mutate an already-built artifact, and arrays nested inside e.g.
+    tuple, set/frozenset -> frozenset, and numpy arrays/scalars ->
+    read-only copies / .item(), at every nesting level -- a shallow
+    top-level MappingProxyType still lets nested keys (e.g.
+    provenance['upstream_provenance']['x'] = ...) mutate an
+    already-built artifact, and arrays nested inside e.g.
     upstream_provenance were previously left untouched entirely,
     silently mutable via any alias the caller kept (Alice's build_core
-    review, 2026-07-12, two rounds: shallow top-level freeze, then
-    missing array handling). Leaves scalars/strings unchanged."""
+    review, 2026-07-12, three rounds: shallow top-level freeze, then
+    missing array handling).
+
+    CLOSED schema (Alice's 4th round, 2026-07-13): any object that
+    isn't one of the above containers, an immutable scalar (None, bool,
+    int, float, complex, str, bytes), or a numpy array/scalar raises
+    TypeError -- an earlier version silently returned unknown objects
+    unchanged, so an arbitrary mutable object (e.g. a caller's own
+    class instance) passed via upstream_provenance stayed aliased and
+    mutable despite the "genuinely immutable" contract (repro: a plain
+    Box object with a mutable .value attribute, passed through
+    unchanged, `frozen['box'] is box` and later mutation leaked
+    through). Deep-copying unknown objects instead was considered and
+    rejected: a copy still would not guarantee immutability (the copy
+    itself could contain further-nested mutable state) and would
+    silently conceal non-serializable provenance rather than surfacing
+    it. Callers must normalize custom objects (e.g. pathlib.Path,
+    version objects) to strings before passing them in
+    upstream_provenance.
+    """
     if isinstance(obj, types.MappingProxyType):
         obj = dict(obj)
     if isinstance(obj, dict):
-        return types.MappingProxyType({k: _deep_freeze(v) for k, v in obj.items()})
+        return types.MappingProxyType({
+            k: _deep_freeze(v, f"{_path}[{k!r}]") for k, v in obj.items()
+        })
     if isinstance(obj, (list, tuple)):
-        return tuple(_deep_freeze(v) for v in obj)
-    if isinstance(obj, set):
-        return frozenset(_deep_freeze(v) for v in obj)
+        return tuple(_deep_freeze(v, f"{_path}[{i}]") for i, v in enumerate(obj))
+    if isinstance(obj, (set, frozenset)):
+        return frozenset(_deep_freeze(v, _path) for v in obj)
     if isinstance(obj, np.ndarray):
         return _readonly_copy(obj)
-    return obj
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, _DEEP_FREEZE_IMMUTABLE_SCALAR_TYPES):
+        return obj
+    raise TypeError(
+        f"_deep_freeze: unsupported object at {_path}: {type(obj).__name__} "
+        f"({obj!r}) -- provenance values must be a Mapping/list/tuple/set/"
+        f"frozenset/np.ndarray/np.generic, or an immutable scalar (None, bool, "
+        f"int, float, complex, str, bytes). Normalize custom objects (e.g. "
+        f"pathlib.Path, version objects) to strings before passing them in "
+        f"upstream_provenance."
+    )
 
 
 def _kernel_compatibility_key(mf, kernel_policy, df_factor_sha256):

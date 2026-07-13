@@ -46,6 +46,7 @@ import types
 import unittest
 
 import numpy as np
+from pyscf import df as pyscf_df
 from pyscf import gto, scf
 
 from pytc.coulomb.gpu4pyscf_adapter import get_mo_coeff, get_grid_ao_values_and_weights
@@ -88,6 +89,19 @@ class TestBuildCore(unittest.TestCase):
         cls.factor2_raw = mo_values2
         cls.coords2 = coords2
         cls.weights2 = weights2
+
+        # A THIRD mf, same molecule/basis as mf2 but NOT density-fit up
+        # front (no with_df yet) -- used to isolate "same molecule, same
+        # nominal auxbasis argument, different ACTUAL with_df" from
+        # "different molecule entirely" (Alice's round-4 coverage ask).
+        cls.mf3 = scf.RHF(cls.mol2).run()
+        ao_values3, weights3, coords3 = get_grid_ao_values_and_weights(cls.mf3, grid_lvl=2)
+        mo_coeff3 = get_mo_coeff(cls.mf3)
+        mo_values3 = (ao_values3 @ mo_coeff3).T
+        cls.mo3 = mo_coeff3
+        cls.factor3_raw = mo_values3
+        cls.coords3 = coords3
+        cls.weights3 = weights3
 
     def _reference_ov_pipeline(self):
         pivots = np.asarray(select_sector_pivots(
@@ -271,6 +285,40 @@ class TestBuildCore(unittest.TestCase):
         self.assertEqual(sector_a.compatibility_key, sector_b.compatibility_key)
         np.testing.assert_allclose(sector_a.C, sector_b.C)
 
+    def test_compatibility_key_isolates_same_molecule_different_actual_factor(self):
+        # Alice's round-4 coverage ask: test_cross_join_rejects_mismatched_
+        # system (above) conflates "different molecule" with the narrower
+        # claim this module actually makes. Isolate it: SAME molecule
+        # (self.mol2/self.mf3), SAME nominal (ignored) auxbasis argument
+        # passed to build_sector both times, but two genuinely DIFFERENT
+        # pre-built with_df objects swapped onto mf3.with_df between
+        # calls -- must still produce different keys and a rejected join.
+        with_df_a = pyscf_df.df.DF(self.mol2, auxbasis="weigend")
+        with_df_a.build()
+        self.mf3.with_df = with_df_a
+        sector_a = build_sector(
+            self.mf3, self.factor3_raw, self.factor3_raw, self.mo3, self.mo3,
+            self.coords3, self.weights3, requested_rank=1, same_factor=True,
+            auxbasis="def2-svp-jkfit")  # ignored -- with_df_a already set
+
+        with_df_b = pyscf_df.df.DF(self.mol2, auxbasis="def2-svp-jkfit")
+        with_df_b.build()
+        self.mf3.with_df = with_df_b
+        sector_b = build_sector(
+            self.mf3, self.factor3_raw, self.factor3_raw, self.mo3, self.mo3,
+            self.coords3, self.weights3, requested_rank=1, same_factor=True,
+            auxbasis="def2-svp-jkfit")  # same nominal argument as sector_a, still ignored
+
+        self.assertTrue(sector_a.provenance["reused_existing_with_df"])
+        self.assertTrue(sector_b.provenance["reused_existing_with_df"])
+        self.assertEqual(sector_a.provenance["requested_auxbasis"],
+                          sector_b.provenance["requested_auxbasis"])
+        self.assertNotEqual(sector_a.provenance["df_factor_sha256"],
+                             sector_b.provenance["df_factor_sha256"])
+        self.assertNotEqual(sector_a.compatibility_key, sector_b.compatibility_key)
+        with self.assertRaises(ValueError):
+            build_core(sector_a, sector_b)
+
     def test_cross_join_accepts_matching_system(self):
         sector_oo = self._build_oo_sector()
         sector_ov = self._build_ov_sector()
@@ -339,6 +387,22 @@ class TestBuildCore(unittest.TestCase):
         x[0] = 9.0
         np.testing.assert_array_equal(
             sector.provenance["upstream_provenance"]["nested_array"], [1.0])
+
+    def test_deep_freeze_rejects_unknown_mutable_object(self):
+        # Alice's round-4 repro: a plain custom object with mutable
+        # state must NOT be silently passed through unchanged -- the
+        # provenance schema is CLOSED (Mapping/list/tuple/set/frozenset/
+        # ndarray/immutable scalars only); anything else raises
+        # TypeError rather than staying aliased and mutable.
+        class Box:
+            def __init__(self):
+                self.value = 1
+
+        with self.assertRaises(TypeError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov,
+                upstream_provenance={"box": Box()})
 
     def test_mutating_caller_upstream_dict_after_build_does_not_alter_artifact(self):
         # build_sector must not alias the caller's own dict either --
