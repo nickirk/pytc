@@ -2,6 +2,8 @@
 grids), moved here from ``pytc/utils/atom_centered_single_ibp_benchmark.py``
 so the canonical implementation lives in ``pytc/df/`` alongside the other
 model-agnostic DF/ISDF machinery (task #2, #proj-isdf-ibp-coulomb).
+``kernel`` is the main-entrance single-IBP primitive (PySCF-style naming,
+per Ke); ``naive_coulomb_kernel`` is the diagnostic comparison quadrature.
 
 Unlike a uniform grid, a PySCF/TC atom-centered Becke grid is not
 translationally invariant, so the ``rhat`` action here is evaluated by
@@ -40,7 +42,7 @@ def _validate_grid_inputs(density, coords, weights, name):
     return density, coords, weights
 
 
-def atom_centered_single_ibp_core(
+def kernel(
     gradient_density_left,
     density_right,
     coords_left,
@@ -105,7 +107,7 @@ def atom_centered_single_ibp_core(
     return result, coincident_pairs
 
 
-def atom_centered_direct_coulomb_core_offdiagonal(
+def naive_coulomb_kernel(
     density_left,
     density_right,
     coords_left,
@@ -150,10 +152,10 @@ def atom_centered_direct_coulomb_core_offdiagonal(
             diff = coords_left[i0:i1, None, :] - coords_right[None, j0:j1, :]
             radius = np.linalg.norm(diff, axis=-1)
             coincident_pairs += int(np.count_nonzero(radius == 0.0))
-            kernel = np.divide(
+            inv_r = np.divide(
                 1.0, radius, out=np.zeros_like(radius), where=radius != 0.0
             )
             weighted_density = density_right[:, j0:j1] * weights_right[j0:j1]
-            potential += weighted_density @ kernel.T
+            potential += weighted_density @ inv_r.T
         result += (density_left[:, i0:i1].conj() * weights_left[i0:i1]) @ potential.T
     return result, coincident_pairs

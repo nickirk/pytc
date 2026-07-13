@@ -15,8 +15,8 @@ an atom-centered quadrature weight is not a geometric cell volume, may be zero
 or negative after molecular partitioning, and therefore does not define a
 controlled scalar Coulomb self-cell correction.
 
-The canonical direct-grid primitives (``atom_centered_single_ibp_core``,
-``atom_centered_direct_coulomb_core_offdiagonal``) live in ``pytc/df/ibp.py``;
+The canonical direct-grid primitives (``kernel``,
+``naive_coulomb_kernel``) live in ``pytc/df/ibp.py``;
 this module re-exports them for backward-compatible imports and provides the
 benchmark orchestration (molecular case setup, reference comparisons, CLI).
 
@@ -38,8 +38,8 @@ import numpy as np
 from pyscf import ao2mo, dft, gto, mp, scf
 
 from pytc.df.ibp import (
-    atom_centered_direct_coulomb_core_offdiagonal,
-    atom_centered_single_ibp_core,
+    naive_coulomb_kernel,
+    kernel,
 )
 from pytc.df.solvers import (
     prepare_normal_equations_solver,
@@ -124,7 +124,7 @@ def run_atom_centered_case(case: AtomCenteredSingleIBPCase) -> dict[str, Any]:
     ).reshape(n_occ * n_vir, 3, -1)
 
     t0 = time.perf_counter()
-    eri_ibp, ibp_coincident = atom_centered_single_ibp_core(
+    eri_ibp, ibp_coincident = kernel(
         pair_gradient, pair, coords, weights,
         eval_block_size=case.eval_block_size,
         source_block_size=case.source_block_size,
@@ -137,7 +137,7 @@ def run_atom_centered_case(case: AtomCenteredSingleIBPCase) -> dict[str, Any]:
     direct_coincident = None
     if case.include_direct_offdiagonal:
         t0 = time.perf_counter()
-        eri_direct, direct_coincident = atom_centered_direct_coulomb_core_offdiagonal(
+        eri_direct, direct_coincident = naive_coulomb_kernel(
             pair, pair, coords, weights,
             eval_block_size=case.eval_block_size,
             source_block_size=case.source_block_size,
@@ -240,7 +240,7 @@ def run_atom_centered_case(case: AtomCenteredSingleIBPCase) -> dict[str, Any]:
             grid_batch_size=4096,
         )
         t0 = time.perf_counter()
-        z_isdf, isdf_coincident = atom_centered_single_ibp_core(
+        z_isdf, isdf_coincident = kernel(
             gradient_theta, theta, coords, weights,
             eval_block_size=case.eval_block_size,
             source_block_size=case.source_block_size,

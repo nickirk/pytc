@@ -6,8 +6,8 @@ import numpy as np
 
 from pytc.utils.atom_centered_single_ibp_benchmark import (
     AtomCenteredSingleIBPCase,
-    atom_centered_direct_coulomb_core_offdiagonal,
-    atom_centered_single_ibp_core,
+    naive_coulomb_kernel,
+    kernel,
     run_atom_centered_case,
 )
 
@@ -39,7 +39,7 @@ class TestAtomCenteredSingleIBPBlockedOracles(unittest.TestCase):
             expected = -0.5 * np.einsum(
                 "mci,nci,i->mn", gradient.conj(), vector, weights
             )
-            actual, coincident = atom_centered_single_ibp_core(
+            actual, coincident = kernel(
                 gradient, density, coords, weights,
                 eval_block_size=4, source_block_size=3,
             )
@@ -54,7 +54,7 @@ class TestAtomCenteredSingleIBPBlockedOracles(unittest.TestCase):
         expected = np.einsum(
             "mi,i,ij,nj,j->mn", density.conj(), weights, kernel, density, weights
         )
-        actual, coincident = atom_centered_direct_coulomb_core_offdiagonal(
+        actual, coincident = naive_coulomb_kernel(
             density, density, coords, weights,
             eval_block_size=4, source_block_size=3,
         )
@@ -73,7 +73,7 @@ class TestAtomCenteredSingleIBPBlockedOracles(unittest.TestCase):
         rhat = diff / radius[..., None]
         vector = np.einsum("nj,j,ijc->nci", rho, wy, rhat)
         expected = -0.5 * np.einsum("mci,nci,i->mn", grad, vector, wx)
-        actual, coincident = atom_centered_single_ibp_core(
+        actual, coincident = kernel(
             grad, rho, x, wx, coords_right=y, weights_right=wy,
             eval_block_size=3, source_block_size=5,
         )
@@ -82,11 +82,11 @@ class TestAtomCenteredSingleIBPBlockedOracles(unittest.TestCase):
 
     def test_block_sizes_do_not_change_result(self):
         coords, weights, density, gradient = self._case(np.float64)
-        small, _ = atom_centered_single_ibp_core(
+        small, _ = kernel(
             gradient, density, coords, weights,
             eval_block_size=2, source_block_size=2,
         )
-        full, _ = atom_centered_single_ibp_core(
+        full, _ = kernel(
             gradient, density, coords, weights,
             eval_block_size=100, source_block_size=100,
         )
@@ -95,13 +95,13 @@ class TestAtomCenteredSingleIBPBlockedOracles(unittest.TestCase):
     def test_rejects_malformed_inputs(self):
         coords, weights, density, gradient = self._case(np.float64)
         with self.assertRaises(ValueError):
-            atom_centered_single_ibp_core(gradient[:, :2], density, coords, weights)
+            kernel(gradient[:, :2], density, coords, weights)
         with self.assertRaises(ValueError):
-            atom_centered_single_ibp_core(
+            kernel(
                 gradient.astype(np.float32), density, coords, weights
             )
         with self.assertRaises(ValueError):
-            atom_centered_direct_coulomb_core_offdiagonal(
+            naive_coulomb_kernel(
                 density, density, coords, weights, eval_block_size=0
             )
 

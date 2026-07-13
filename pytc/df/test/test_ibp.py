@@ -15,8 +15,8 @@ import unittest
 import numpy as np
 
 from pytc.df.ibp import (
-    atom_centered_direct_coulomb_core_offdiagonal,
-    atom_centered_single_ibp_core,
+    naive_coulomb_kernel,
+    kernel,
 )
 
 
@@ -47,7 +47,7 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
             expected = -0.5 * np.einsum(
                 "mci,nci,i->mn", gradient.conj(), vector, weights
             )
-            actual, coincident = atom_centered_single_ibp_core(
+            actual, coincident = kernel(
                 gradient, density, coords, weights,
                 eval_block_size=4, source_block_size=3,
             )
@@ -62,7 +62,7 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
         expected = np.einsum(
             "mi,i,ij,nj,j->mn", density.conj(), weights, kernel, density, weights
         )
-        actual, coincident = atom_centered_direct_coulomb_core_offdiagonal(
+        actual, coincident = naive_coulomb_kernel(
             density, density, coords, weights,
             eval_block_size=4, source_block_size=3,
         )
@@ -81,7 +81,7 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
         rhat = diff / radius[..., None]
         vector = np.einsum("nj,j,ijc->nci", rho, wy, rhat)
         expected = -0.5 * np.einsum("mci,nci,i->mn", grad, vector, wx)
-        actual, coincident = atom_centered_single_ibp_core(
+        actual, coincident = kernel(
             grad, rho, x, wx, coords_right=y, weights_right=wy,
             eval_block_size=3, source_block_size=5,
         )
@@ -90,11 +90,11 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
 
     def test_block_sizes_do_not_change_result(self):
         coords, weights, density, gradient = self._case(np.float64)
-        small, _ = atom_centered_single_ibp_core(
+        small, _ = kernel(
             gradient, density, coords, weights,
             eval_block_size=2, source_block_size=2,
         )
-        full, _ = atom_centered_single_ibp_core(
+        full, _ = kernel(
             gradient, density, coords, weights,
             eval_block_size=100, source_block_size=100,
         )
@@ -102,11 +102,11 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
 
     def test_block_sizes_do_not_change_result_offdiagonal(self):
         coords, weights, density, _ = self._case(np.complex128)
-        small, _ = atom_centered_direct_coulomb_core_offdiagonal(
+        small, _ = naive_coulomb_kernel(
             density, density, coords, weights,
             eval_block_size=2, source_block_size=2,
         )
-        full, _ = atom_centered_direct_coulomb_core_offdiagonal(
+        full, _ = naive_coulomb_kernel(
             density, density, coords, weights,
             eval_block_size=100, source_block_size=100,
         )
@@ -115,28 +115,28 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
     def test_rejects_malformed_inputs(self):
         coords, weights, density, gradient = self._case(np.float64)
         with self.assertRaises(ValueError):
-            atom_centered_single_ibp_core(gradient[:, :2], density, coords, weights)
+            kernel(gradient[:, :2], density, coords, weights)
         with self.assertRaises(ValueError):
-            atom_centered_single_ibp_core(
+            kernel(
                 gradient.astype(np.float32), density, coords, weights
             )
         with self.assertRaises(ValueError):
-            atom_centered_direct_coulomb_core_offdiagonal(
+            naive_coulomb_kernel(
                 density, density, coords, weights, eval_block_size=0
             )
         with self.assertRaises(ValueError):
             # coords shape mismatch: wrong number of grid points
-            atom_centered_single_ibp_core(
+            kernel(
                 gradient, density, coords[:-1], weights
             )
         with self.assertRaises(ValueError):
             # non-finite coordinates
             bad_coords = coords.copy()
             bad_coords[0, 0] = np.nan
-            atom_centered_single_ibp_core(gradient, density, bad_coords, weights)
+            kernel(gradient, density, bad_coords, weights)
         with self.assertRaises(ValueError):
             # dtype mismatch between gradient and density_right
-            atom_centered_single_ibp_core(
+            kernel(
                 gradient.astype(np.complex128), density, coords, weights
             )
 
@@ -147,7 +147,7 @@ class TestAtomCenteredSingleIBPCore(unittest.TestCase):
         weights = np.ones(1)
         density = np.ones((1, 1))
         gradient = np.ones((1, 3, 1))
-        result, coincident = atom_centered_single_ibp_core(
+        result, coincident = kernel(
             gradient, density, coords, weights,
         )
         self.assertTrue(np.all(np.isfinite(result)))
