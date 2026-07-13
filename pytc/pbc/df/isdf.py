@@ -715,3 +715,109 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-8
             done[nq] = True
 
     return jnp.stack(coul_kpt, axis=0), jnp.stack(kern_kpt, axis=0), infos, n_pipeline_calls
+
+
+# ---------------------------------------------------------------------------
+# S1/S2 streaming (design v2.1 section 6): AO evaluation and the periodic
+# pivot-selection metric oracle, both grid-block-streamed so host memory for
+# either stays bounded by one block regardless of the full grid size Ng.
+
+
+def stream_ao_blocks(cell, kpts, grid_coords, block_size):
+    """S1: stream AO values at kpts over grid_coords in blocks of
+    block_size grid points, evaluating cell.pbc_eval_gto once per block --
+    bounds host memory to one block's worth of AO data regardless of Ng.
+    Blocks compose directly with build_pi_eta's own ao_blocks iterable
+    support (pass a generator expression dropping the (g0,g1) bounds).
+
+    Args:
+        cell: pyscf.pbc.gto.Cell.
+        kpts: (Nk,3) absolute k-points.
+        grid_coords: (Ng,3) real-space grid point coordinates.
+        block_size: positive int, grid points per block.
+
+    Yields:
+        (g0, g1, ao_block): g0/g1 are the grid-index bounds [g0,g1) this
+        block covers; ao_block is (Nk, g1-g0, Nao) complex128.
+
+    Raises:
+        ValueError: malformed grid_coords or non-positive block_size.
+    """
+    grid_coords = np.asarray(grid_coords, dtype=np.float64)
+    if grid_coords.ndim != 2 or grid_coords.shape[1] != 3:
+        raise ValueError(f"grid_coords must have shape (Ng,3), got {grid_coords.shape}.")
+    n_grid = grid_coords.shape[0]
+    if n_grid == 0:
+        raise ValueError("grid_coords must be nonempty.")
+
+    if isinstance(block_size, bool) or not isinstance(block_size, (int, np.integer)):
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}.")
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+
+    kpts_list = list(np.asarray(kpts, dtype=np.float64))
+
+    for g0 in range(0, n_grid, block_size):
+        g1 = min(g0 + block_size, n_grid)
+        ao_block = np.asarray(
+            cell.pbc_eval_gto("GTOval", grid_coords[g0:g1], kpts=kpts_list), dtype=np.complex128,
+        )
+        yield g0, g1, ao_block
+
+
+def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
+    """S2 periodic pivot-selection metric oracle (design v2.1 section 3):
+    a (diag, col_eval) pair for the reference-cell (R=0 supercell image)
+    pair-density Gram matrix
+
+        M[r,r'] = | sum_{k,mu} conj(AO_k(r,mu)) AO_k(r',mu) |^2 / Nk
+
+    fed to pivoted_cholesky_hermitian for interpolation-point selection.
+    M is never materialized. diag(M) costs ONE streamed AO-grid sweep
+    (a single pass suffices since M[r,r] only needs AO at r itself); each
+    col_eval(j) call costs its OWN full streamed AO-grid sweep (a single
+    extra point evaluation at r_j, then re-sweeping the whole grid against
+    it) -- selecting `rank` pivots therefore costs `rank` full AO-grid
+    sweeps, matching the design's own "measured cost honesty" accounting
+    (this traffic is NOT a cheap column fetch and should be recorded by
+    the caller, not hidden).
+
+    Args:
+        cell: pyscf.pbc.gto.Cell.
+        kpts: (Nk,3) absolute k-points.
+        grid_coords: (Ng,3) real-space grid point coordinates.
+        block_size: forwarded to stream_ao_blocks.
+
+    Returns:
+        (diag, col_eval): diag is (Ng,) float64; col_eval(j) -> (Ng,)
+        complex128 (M's j-th column; M is real-valued, complex128 dtype
+        only to match pivoted_cholesky_hermitian's contract).
+
+    Raises:
+        ValueError: forwarded from stream_ao_blocks for malformed inputs.
+    """
+    grid_coords = np.asarray(grid_coords, dtype=np.float64)
+    n_grid = grid_coords.shape[0]
+    kpts_np = np.asarray(kpts, dtype=np.float64)
+    n_kpts = kpts_np.shape[0]
+
+    diag = np.empty(n_grid, dtype=np.float64)
+    for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size):
+        pooled = np.sum(np.abs(ao_block) ** 2, axis=(0, 2))  # (blk,), sum_{k,mu} |AO_k(r,mu)|^2
+        diag[g0:g1] = pooled ** 2 / n_kpts
+
+    def col_eval(j):
+        ao_j_block = np.asarray(
+            cell.pbc_eval_gto("GTOval", grid_coords[j:j + 1], kpts=list(kpts_np)),
+            dtype=np.complex128,
+        )
+        ao_j = ao_j_block[:, 0, :]  # (Nk, Nao)
+
+        col = np.empty(n_grid, dtype=np.complex128)
+        for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size):
+            gram = np.einsum("km,krm->r", ao_j.conj(), ao_block, optimize=True)
+            col[g0:g1] = (np.abs(gram) ** 2 / n_kpts).astype(np.complex128)
+        return col
+
+    return diag, col_eval
