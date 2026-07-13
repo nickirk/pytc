@@ -1,0 +1,34 @@
+"""Generic density-fitting/ISDF numerical machinery -- model-agnostic,
+shared by TC/xTC and the Coulomb path (pytc/df/ package reorganization,
+task #8, isdf-coulomb-cuda, 2026-07-12; see docs/design-phase1.md).
+
+This __init__ provides ONLY compatibility re-exports (Alice's migration
+spec): every name previously importable as ``pytc.df.X`` when this was
+a single module stays importable the same way. No substantive
+implementation lives here -- see pivots.py, solvers.py, isdf.py.
+"""
+from .pivots import (
+    pivoted_cholesky_pair_pivots,
+    _pivoted_cholesky_pair_pivots_core,
+)
+from .solvers import (
+    solve_normal_equations_batch,
+    _build_normal_matrix,
+    prepare_spd_cholesky,
+    prepare_normal_equations_solver,
+    solve_normal_equations_batch_prepared,
+)
+from .isdf import (
+    isdf_decompose,
+    _pivoted_cholesky_phi,
+    _pivoted_cholesky_grad,
+)
+
+__all__ = [
+    "pivoted_cholesky_pair_pivots",
+    "solve_normal_equations_batch",
+    "prepare_spd_cholesky",
+    "prepare_normal_equations_solver",
+    "solve_normal_equations_batch_prepared",
+    "isdf_decompose",
+]
