@@ -1439,10 +1439,23 @@ def _validate_positive_int(name, value):
     return ivalue
 
 
-def _validate_positive_int_tuple(name, values, length=3):
-    values = tuple(values)
+def _as_length_tuple(name, values, length=3):
+    """Coerce to a tuple of the given length, converting a bare
+    TypeError from a non-iterable/scalar input (e.g. spacing=1.0) into
+    the documented ValueError instead of letting it leak (Alice's
+    review, task #13, 2026-07-13: directly reproduced scalar
+    spacing=1.0/origin=0.0 raising 'float object is not iterable')."""
+    try:
+        values = tuple(values)
+    except TypeError:
+        raise ValueError(f"{name} must be an iterable of {length} values, got scalar {values!r}.")
     if len(values) != length:
         raise ValueError(f"{name} must have length {length}, got {values!r}.")
+    return values
+
+
+def _validate_positive_int_tuple(name, values, length=3):
+    values = _as_length_tuple(name, values, length)
     return tuple(_validate_positive_int(f"{name}[{i}]", v) for i, v in enumerate(values))
 
 
@@ -1480,16 +1493,12 @@ class FreeSpacePoissonMesh:
         shape = _validate_positive_int_tuple("shape", self.shape)
         padded_shape = _validate_positive_int_tuple("padded_shape", self.padded_shape)
 
-        spacing = tuple(self.spacing)
-        if len(spacing) != 3:
-            raise ValueError(f"spacing must have length 3, got {spacing!r}.")
+        spacing = _as_length_tuple("spacing", self.spacing)
         spacing = tuple(float(s) for s in spacing)
         if any((not math.isfinite(d)) or d <= 0.0 for d in spacing):
             raise ValueError(f"spacing must be 3 finite positive floats, got {spacing}.")
 
-        origin = tuple(self.origin)
-        if len(origin) != 3:
-            raise ValueError(f"origin must have length 3, got {origin!r}.")
+        origin = _as_length_tuple("origin", self.origin)
         origin = tuple(float(o) for o in origin)
         if any(not math.isfinite(o) for o in origin):
             raise ValueError(f"origin must be 3 finite floats, got {origin}.")
@@ -1597,30 +1606,103 @@ class FreeSpacePoissonKernel:
             )
 
         input_dtype = np.dtype(self.input_dtype)
+        if input_dtype not in _REAL_COMPUTE_DTYPE_FOR_INPUT:
+            raise ValueError(
+                f"input_dtype must be one of float32/float64/complex64/complex128, "
+                f"got {input_dtype}."
+            )
         if self.fft_kind == "rfft" and not np.issubdtype(input_dtype, np.floating):
             raise ValueError(f"fft_kind='rfft' requires a real input_dtype, got {input_dtype}.")
         if self.fft_kind == "fft" and not np.issubdtype(input_dtype, np.complexfloating):
             raise ValueError(f"fft_kind='fft' requires a complex input_dtype, got {input_dtype}.")
 
-        if not math.isfinite(self.self_cell_integral):
-            raise ValueError(f"self_cell_integral must be finite, got {self.self_cell_integral!r}.")
-        if not math.isfinite(self.K_self):
-            raise ValueError(f"K_self must be finite, got {self.K_self!r}.")
-
-        if self.mesh.self_cell_scheme == "rectangular_cell":
+        # Provenance closure (Alice's review, task #13, 2026-07-13):
+        # `dataclasses.replace` on a genuine builder-produced kernel can
+        # still construct a nominally-typed but internally INCONSISTENT
+        # artifact (self_cell_integral/K_self disagreeing with each
+        # other and with mesh geometry; device="gpu999"; a stale/
+        # mismatched numpy_version/jax_version/solver_version; a
+        # kernel_spec_sha256 that doesn't match its own declared
+        # fields) -- all independently reproduced. Recompute every one
+        # of these from first principles (the mesh, the realized
+        # spectrum/backend, and library __version__ strings) and
+        # require exact/tight-tolerance agreement, rather than trusting
+        # any of them as passed in.
+        I_expected, K_self_expected, R_expected = _self_cell_values(
+            self.mesh.self_cell_scheme, *self.mesh.spacing)
+        if not math.isclose(self.self_cell_integral, I_expected, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                f"self_cell_integral={self.self_cell_integral!r} does not match the "
+                f"value recomputed from mesh.self_cell_scheme/spacing ({I_expected!r})."
+            )
+        if not math.isclose(self.K_self, K_self_expected, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                f"K_self={self.K_self!r} does not match the value recomputed from "
+                f"mesh.self_cell_scheme/spacing ({K_self_expected!r})."
+            )
+        if R_expected is None:
             if self.equivalent_sphere_radius is not None:
                 raise ValueError(
                     "equivalent_sphere_radius must be None for self_cell_scheme="
                     "'rectangular_cell' (that scheme has no such radius -- never a "
                     "fabricated/foreign value)."
                 )
-        else:  # "equivalent_sphere" -- mesh.__post_init__ already rejects any other value
+        else:
             r = self.equivalent_sphere_radius
-            if r is None or not math.isfinite(r) or r <= 0.0:
+            if (r is None or not math.isfinite(r) or r <= 0.0
+                    or not math.isclose(r, R_expected, rel_tol=1e-9, abs_tol=1e-12)):
                 raise ValueError(
-                    f"equivalent_sphere_radius must be a finite positive float for "
-                    f"self_cell_scheme='equivalent_sphere', got {r!r}."
+                    f"equivalent_sphere_radius={r!r} does not match the value "
+                    f"recomputed from mesh.spacing ({R_expected!r})."
                 )
+
+        if self.backend == "numpy":
+            if self.device != "cpu":
+                raise ValueError(f"device must be 'cpu' for backend='numpy', got {self.device!r}.")
+            if self.jax_version is not None:
+                raise ValueError(
+                    f"jax_version must be None for backend='numpy', got {self.jax_version!r}."
+                )
+        else:
+            realized_device = str(self.spectrum.device)
+            if self.device != realized_device:
+                raise ValueError(
+                    f"device={self.device!r} != the realized spectrum's actual device "
+                    f"{realized_device!r}."
+                )
+            if self.jax_version != jax.__version__:
+                raise ValueError(
+                    f"jax_version={self.jax_version!r} != the running jax.__version__ "
+                    f"{jax.__version__!r}."
+                )
+        if self.numpy_version != np.__version__:
+            raise ValueError(
+                f"numpy_version={self.numpy_version!r} != the running numpy.__version__ "
+                f"{np.__version__!r}."
+            )
+        if self.solver_version != _FREE_SPACE_POISSON_SOLVER_VERSION:
+            raise ValueError(
+                f"solver_version={self.solver_version!r} != "
+                f"{_FREE_SPACE_POISSON_SOLVER_VERSION!r}."
+            )
+
+        recomputed_hash = _kernel_spec_sha256({
+            "shape": self.mesh.shape, "spacing": self.mesh.spacing, "origin": self.mesh.origin,
+            "padded_shape": self.mesh.padded_shape,
+            "self_cell_scheme": self.mesh.self_cell_scheme,
+            "fft_normalization": self.mesh.fft_normalization,
+            "self_cell_integral": self.self_cell_integral, "K_self": self.K_self,
+            "equivalent_sphere_radius": self.equivalent_sphere_radius,
+            "fft_kind": self.fft_kind, "backend": self.backend,
+            "input_dtype": self.input_dtype, "spectrum_dtype": self.spectrum_dtype,
+            "numpy_version": self.numpy_version, "jax_version": self.jax_version,
+            "solver_version": self.solver_version,
+        })
+        if recomputed_hash != self.kernel_spec_sha256:
+            raise ValueError(
+                "kernel_spec_sha256 does not match the canonical digest recomputed from "
+                "this artifact's own declared fields (never hashes spectrum bytes/JAX data)."
+            )
 
 
 def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,

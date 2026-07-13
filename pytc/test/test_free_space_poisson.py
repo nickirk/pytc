@@ -23,6 +23,7 @@ float64 acceptance thresholds require it; must not depend on another
 test module enabling it first) -- see test_molecular_df_reference.py's
 docstring for the same standing lesson.
 """
+import dataclasses
 import math
 import time
 import tracemalloc
@@ -144,26 +145,84 @@ class TestFreeSpacePoissonMeshValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_free_space_poisson_kernel((4, 4, 4), (0, 1, 1), backend="numpy")
 
+    def test_rejects_scalar_spacing_with_valueerror_not_typeerror(self):
+        # Alice's review, task #13, 2026-07-13: directly reproduced
+        # spacing=1.0 leaking a bare "float object is not iterable"
+        # TypeError instead of the documented ValueError.
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonMesh(shape=(4, 4, 4), spacing=1.0, origin=(0, 0, 0),
+                                  padded_shape=(8, 8, 8), self_cell_scheme="rectangular_cell",
+                                  fft_normalization="backward")
+
+    def test_rejects_scalar_origin_with_valueerror_not_typeerror(self):
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonMesh(shape=(4, 4, 4), spacing=(0.1, 0.1, 0.1), origin=0.0,
+                                  padded_shape=(8, 8, 8), self_cell_scheme="rectangular_cell",
+                                  fft_normalization="backward")
+
+    def test_rejects_wrong_length_spacing(self):
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonMesh(shape=(4, 4, 4), spacing=(0.1, 0.1), origin=(0, 0, 0),
+                                  padded_shape=(8, 8, 8), self_cell_scheme="rectangular_cell",
+                                  fft_normalization="backward")
+
+    def test_builder_rejects_scalar_spacing(self):
+        with self.assertRaises(ValueError):
+            build_free_space_poisson_kernel((4, 4, 4), 0.2, backend="numpy")
+
+    def test_builder_rejects_scalar_origin(self):
+        with self.assertRaises(ValueError):
+            build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), origin=0.0, backend="numpy")
+
+    def test_builder_rejects_scalar_shape(self):
+        with self.assertRaises(ValueError):
+            build_free_space_poisson_kernel(4, (0.2, 0.2, 0.2), backend="numpy")
+
 
 class TestFreeSpacePoissonKernelValidationAndImmutability(unittest.TestCase):
     """FreeSpacePoissonKernel is public (in __all__) and directly
     constructible -- it must actually enforce its own invariants, not
-    merely document a contract the builder happens to satisfy (Alice's
-    review, task #13, 2026-07-13: directly constructed a nominal NumPy
-    kernel with a mutable spectrum and mutated it successfully; it also
-    accepted the wrong spectrum backend, a non-mesh mesh, and arbitrary
-    self/device/version/hash metadata)."""
+    merely document a contract the builder happens to satisfy.
 
-    def _valid_kwargs(self):
-        kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="numpy")
-        spectrum = np.array(kernel.spectrum)  # a fresh, still-writable copy
-        spectrum.setflags(write=True)
-        return dict(
-            mesh=kernel.mesh, spectrum=spectrum, fft_kind="rfft", backend="numpy",
-            input_dtype="float64", spectrum_dtype="complex128", device="cpu",
-            numpy_version="x", jax_version=None, self_cell_integral=1.0, K_self=1.0,
-            equivalent_sphere_radius=None, kernel_spec_sha256="bogus", solver_version="1",
-        )
+    Round 1 (Alice's review, task #13, 2026-07-13): directly constructed
+    a nominal NumPy kernel with a mutable spectrum and mutated it
+    successfully; it also accepted the wrong spectrum backend and a
+    non-mesh mesh.
+
+    Round 2 (same review thread): the round-1 "valid kwargs" baseline
+    itself encoded the remaining hole -- numpy_version="x",
+    kernel_spec_sha256="bogus", self_cell_integral=1.0/K_self=1.0
+    (inconsistent with each other and mesh geometry) were all accepted.
+    Directly reproduced via dataclasses.replace on a genuine builder
+    artifact: self_cell_integral=-1.0/K_self=123.0, device="gpu999",
+    kernel_spec_sha256="bogus", numpy_version="bogus"/solver_version=
+    "bogus", input_dtype="float16" -- all silently accepted. Fixed by
+    recomputing every one of these from first principles in
+    __post_init__ and requiring exact/tight-tolerance agreement.
+    Every test below now seeds from a REAL builder artifact's actual
+    field values (via dataclasses.fields), then perturbs exactly ONE
+    field away from that self-consistent baseline -- never a
+    hand-rolled dict of placeholder values that could itself mask a
+    validation hole.
+    """
+
+    def _valid_kwargs(self, kernel=None):
+        if kernel is None:
+            kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="numpy")
+        kwargs = {f.name: getattr(kernel, f.name) for f in dataclasses.fields(kernel)}
+        if kernel.backend == "numpy":
+            # A fresh, still-writable copy -- the kernel's OWN spectrum
+            # is already read-only, so mutation tests need their own
+            # writable array to start from.
+            spectrum = np.array(kernel.spectrum)
+            spectrum.setflags(write=True)
+            kwargs["spectrum"] = spectrum
+        return kwargs
+
+    def test_valid_kwargs_baseline_actually_constructs(self):
+        # The baseline itself must be genuinely valid -- every
+        # perturbation test below depends on this.
+        FreeSpacePoissonKernel(**self._valid_kwargs())
 
     def test_numpy_spectrum_is_defensively_copied_and_readonly(self):
         kwargs = self._valid_kwargs()
@@ -209,9 +268,30 @@ class TestFreeSpacePoissonKernelValidationAndImmutability(unittest.TestCase):
         with self.assertRaises(ValueError):
             FreeSpacePoissonKernel(**kwargs)
 
+    def test_rejects_unsupported_input_dtype(self):
+        kwargs = self._valid_kwargs()
+        kwargs["input_dtype"] = "float16"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
     def test_rejects_input_dtype_fft_kind_mismatch(self):
         kwargs = self._valid_kwargs()
         kwargs["input_dtype"] = "complex128"  # fft_kind is "rfft" (real)
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_inconsistent_self_cell_values(self):
+        # Alice's exact repro: self_cell_integral/K_self disagreeing
+        # with each other AND with mesh geometry.
+        kwargs = self._valid_kwargs()
+        kwargs["self_cell_integral"] = -1.0
+        kwargs["K_self"] = 123.0
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_self_cell_integral_alone_perturbed(self):
+        kwargs = self._valid_kwargs()
+        kwargs["self_cell_integral"] = kwargs["self_cell_integral"] * 1.01
         with self.assertRaises(ValueError):
             FreeSpacePoissonKernel(**kwargs)
 
@@ -224,30 +304,70 @@ class TestFreeSpacePoissonKernelValidationAndImmutability(unittest.TestCase):
     def test_rejects_missing_equivalent_sphere_radius_on_equivalent_sphere_mesh(self):
         kernel_sph = build_free_space_poisson_kernel(
             (4, 4, 4), (0.2, 0.2, 0.2), self_cell_scheme="equivalent_sphere", backend="numpy")
-        spectrum = np.array(kernel_sph.spectrum)
-        spectrum.setflags(write=True)
-        kwargs = dict(
-            mesh=kernel_sph.mesh, spectrum=spectrum, fft_kind="rfft", backend="numpy",
-            input_dtype="float64", spectrum_dtype="complex128", device="cpu",
-            numpy_version="x", jax_version=None, self_cell_integral=1.0, K_self=1.0,
-            equivalent_sphere_radius=None,  # must be a real radius for this scheme
-            kernel_spec_sha256="bogus", solver_version="1",
-        )
+        kwargs = self._valid_kwargs(kernel_sph)
+        kwargs["equivalent_sphere_radius"] = None  # must be a real radius for this scheme
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_wrong_equivalent_sphere_radius(self):
+        kernel_sph = build_free_space_poisson_kernel(
+            (4, 4, 4), (0.2, 0.2, 0.2), self_cell_scheme="equivalent_sphere", backend="numpy")
+        kwargs = self._valid_kwargs(kernel_sph)
+        kwargs["equivalent_sphere_radius"] = kwargs["equivalent_sphere_radius"] * 2.0
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_bad_device_numpy(self):
+        kwargs = self._valid_kwargs()
+        kwargs["device"] = "gpu999"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_bad_device_jax(self):
+        kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="jax")
+        kwargs = self._valid_kwargs(kernel)
+        kwargs["device"] = "gpu999"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_jax_version_set_on_numpy_backend(self):
+        kwargs = self._valid_kwargs()
+        kwargs["jax_version"] = "9.9.9"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_wrong_jax_version_on_jax_backend(self):
+        kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="jax")
+        kwargs = self._valid_kwargs(kernel)
+        kwargs["jax_version"] = "bogus"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_wrong_numpy_version(self):
+        kwargs = self._valid_kwargs()
+        kwargs["numpy_version"] = "bogus"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_wrong_solver_version(self):
+        kwargs = self._valid_kwargs()
+        kwargs["solver_version"] = "bogus"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_tampered_hash(self):
+        kwargs = self._valid_kwargs()
+        kwargs["kernel_spec_sha256"] = "bogus"
         with self.assertRaises(ValueError):
             FreeSpacePoissonKernel(**kwargs)
 
     def test_jax_spectrum_stays_untouched_no_copy(self):
         kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="jax")
-        spectrum = kernel.spectrum
-        k2 = FreeSpacePoissonKernel(
-            mesh=kernel.mesh, spectrum=spectrum, fft_kind="rfft", backend="jax",
-            input_dtype="float64", spectrum_dtype=str(spectrum.dtype), device=str(spectrum.device),
-            numpy_version="x", jax_version="y", self_cell_integral=1.0, K_self=1.0,
-            equivalent_sphere_radius=None, kernel_spec_sha256="bogus", solver_version="1",
-        )
+        kwargs = self._valid_kwargs(kernel)
+        k2 = FreeSpacePoissonKernel(**kwargs)
         # Literally the same array object -- JAX arrays are already
         # immutable, no defensive copy needed or performed.
-        self.assertIs(k2.spectrum, spectrum)
+        self.assertIs(k2.spectrum, kernel.spectrum)
 
 
 class TestFreeSpacePoissonKernelSpecHash(unittest.TestCase):
