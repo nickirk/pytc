@@ -27,6 +27,7 @@ from pytc.df.ibp_pyscf import (
     IBPISDF,
     IBPISDFConfig,
     _canonical_molecule_digest,
+    _plain_python,
 )
 
 
@@ -308,6 +309,20 @@ class TestMoleculeDigest(unittest.TestCase):
         self.assertEqual(_canonical_molecule_digest(_h2()),
                          _canonical_molecule_digest(_h2()))
 
+    def test_unknown_basis_object_is_rejected_not_stringified(self):
+        # An arbitrary object must never be str()'d into an address-bearing,
+        # non-deterministic identity -- it is a hard TypeError.
+        class Odd:
+            pass
+        with self.assertRaises(TypeError):
+            _plain_python(Odd())
+        with self.assertRaises(TypeError):
+            _plain_python({"H": [Odd()]})
+        mol = _h2()
+        mol._basis = {"H": [Odd()]}
+        with self.assertRaises(TypeError):
+            _canonical_molecule_digest(mol)
+
 
 class TestIBPISDFProvenanceBinding(unittest.TestCase):
     def test_provider_provenance_bound_in_every_artifact(self):
@@ -331,6 +346,19 @@ class TestIBPISDFProvenanceBinding(unittest.TestCase):
             self.assertEqual(bound["mol_digest"], prov["mol_digest"])
             self.assertEqual(bound["config_spec_sha256"], prov["config_spec_sha256"])
             self.assertEqual(bound["adapter_version"], prov["adapter_version"])
+
+    def test_public_provenance_is_frozen_and_cannot_diverge(self):
+        # The provider's public provenance must be immutable so it cannot be
+        # mutated to disagree with the frozen artifact copies.
+        p = IBPISDF(_h2(), rank=3, grid_level=1)
+        p.build()
+        with self.assertRaises(TypeError):
+            p.provenance["mol_digest"] = "0" * 64
+        # still consistent with the frozen grid copy
+        self.assertEqual(
+            p.provenance["mol_digest"],
+            p._ibp_grid.construction_metadata["provider_provenance"]["mol_digest"],
+        )
 
 
 class TestIBPISDFStaleMolecule(unittest.TestCase):

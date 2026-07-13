@@ -26,8 +26,8 @@ from pyscf.df.df import DF
 from pyscf.dft import numint
 
 from pytc.df.ibp import (
-    _canonical_sha256,
     _canonical_spec_sha256,
+    _deep_freeze,
     build_ibp_grid,
     build_ibp_interpolation_sector,
     build_ibp_operator_plan,
@@ -62,7 +62,12 @@ def _plain_python(obj):
     """Recursively coerce a PySCF parsed-basis / ECP structure into plain
     Python dict/list/str/int/float/bool/None so the canonical TLV encoder
     (which rejects object-dtype arrays and unknown types) can hash it. Numpy
-    scalars become their Python items; numpy arrays become nested lists."""
+    scalars become their Python items; numpy arrays become nested lists.
+
+    An unknown type is a hard error, never stringified: ``str(obj)`` on an
+    arbitrary object yields an address-bearing, non-deterministic identity
+    (``<... at 0x...>``) -- precisely the representation-based defect the
+    canonical encoder exists to reject."""
     if isinstance(obj, dict):
         return {str(k): _plain_python(v) for k, v in obj.items()}
     if isinstance(obj, np.ndarray):
@@ -73,8 +78,11 @@ def _plain_python(obj):
         return obj.item()
     if isinstance(obj, (bool, int, float, str, bytes)) or obj is None:
         return obj
-    # Anything else (unexpected) is stringified rather than silently dropped.
-    return str(obj)
+    raise TypeError(
+        f"_plain_python: unsupported type {type(obj).__name__} in a molecule "
+        f"basis/ECP structure; refusing to stringify an unknown object into a "
+        f"non-deterministic identity."
+    )
 
 
 def _normalized_basis(mol):
@@ -448,6 +456,8 @@ class IBPISDF(DF):
         self._ibp_factor = core.psd_factor            # W
         self._ibp_pair = sector.P                      # P
         self._ibp_naoaux = int(core.psd_retained_rank)
-        self._ibp_provenance = provenance
+        # Publish the deep-frozen record so the provider's public provenance
+        # cannot be mutated to diverge from the (frozen) artifact copies.
+        self._ibp_provenance = _deep_freeze(provenance)
         self._ibp_mol_digest = mol_digest
         self._ibp_built = True
