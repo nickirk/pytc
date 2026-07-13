@@ -32,7 +32,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
-from scipy import integrate, special
+from scipy import special
 
 from pytc.integrals.coulomb import (
     FreeSpacePoissonMesh,
@@ -91,6 +91,201 @@ class TestFreeSpacePoissonMeshValidation(unittest.TestCase):
                                   origin=(0, 0, 0), padded_shape=(8, 10, 12),
                                   self_cell_scheme="rectangular_cell", fft_normalization="forward")
 
+    def test_rejects_fractional_shape_instead_of_truncating(self):
+        # Alice's review, task #13, 2026-07-13: directly reproduced
+        # shape=(3.7,4,5) silently becoming (3,4,5) via int() truncation.
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonMesh(shape=(3.7, 4, 5), spacing=(0.1, 0.1, 0.1),
+                                  origin=(0, 0, 0), padded_shape=(8, 8, 10),
+                                  self_cell_scheme="rectangular_cell", fft_normalization="backward")
+
+    def test_rejects_bool_shape_instead_of_coercing(self):
+        # isinstance(True, int) is True in Python -- int(True)==1 would
+        # otherwise silently accept a bool as a plausible-looking shape
+        # entry (Alice's review, task #13, 2026-07-13).
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonMesh(shape=(True, 4, 5), spacing=(0.1, 0.1, 0.1),
+                                  origin=(0, 0, 0), padded_shape=(8, 8, 10),
+                                  self_cell_scheme="rectangular_cell", fft_normalization="backward")
+
+    def test_rejects_fractional_padded_shape(self):
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonMesh(shape=(4, 5, 6), spacing=(0.1, 0.1, 0.1),
+                                  origin=(0, 0, 0), padded_shape=(8.5, 10, 12),
+                                  self_cell_scheme="rectangular_cell", fft_normalization="backward")
+
+    def test_integral_valued_float_shape_is_accepted(self):
+        # 4.0 is genuinely integral -- must NOT be rejected (only
+        # non-integral floats and bool are rejected).
+        mesh = FreeSpacePoissonMesh(
+            shape=(4.0, 5, 6), spacing=(0.1, 0.1, 0.1), origin=(0, 0, 0),
+            padded_shape=(8, 10, 12), self_cell_scheme="rectangular_cell",
+            fft_normalization="backward")
+        self.assertEqual(mesh.shape, (4, 5, 6))
+        self.assertIsInstance(mesh.shape[0], int)
+
+    def test_builder_rejects_fractional_pad_factor(self):
+        with self.assertRaises(ValueError):
+            build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2),
+                                              pad_factor=2.7, backend="numpy")
+
+    def test_builder_rejects_bool_pad_factor(self):
+        with self.assertRaises(ValueError):
+            build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2),
+                                              pad_factor=True, backend="numpy")
+
+    def test_builder_validates_geometry_before_self_cell_computation(self):
+        # Must raise the documented ValueError, not an incidental
+        # ZeroDivisionError from inside the self-cell formula (Alice's
+        # review, task #13, 2026-07-13: directly reproduced
+        # spacing=(0,1,1) raising ZeroDivisionError because the self
+        # term was computed before the mesh -- and thus spacing -- was
+        # ever validated).
+        with self.assertRaises(ValueError):
+            build_free_space_poisson_kernel((4, 4, 4), (0, 1, 1), backend="numpy")
+
+
+class TestFreeSpacePoissonKernelValidationAndImmutability(unittest.TestCase):
+    """FreeSpacePoissonKernel is public (in __all__) and directly
+    constructible -- it must actually enforce its own invariants, not
+    merely document a contract the builder happens to satisfy (Alice's
+    review, task #13, 2026-07-13: directly constructed a nominal NumPy
+    kernel with a mutable spectrum and mutated it successfully; it also
+    accepted the wrong spectrum backend, a non-mesh mesh, and arbitrary
+    self/device/version/hash metadata)."""
+
+    def _valid_kwargs(self):
+        kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="numpy")
+        spectrum = np.array(kernel.spectrum)  # a fresh, still-writable copy
+        spectrum.setflags(write=True)
+        return dict(
+            mesh=kernel.mesh, spectrum=spectrum, fft_kind="rfft", backend="numpy",
+            input_dtype="float64", spectrum_dtype="complex128", device="cpu",
+            numpy_version="x", jax_version=None, self_cell_integral=1.0, K_self=1.0,
+            equivalent_sphere_radius=None, kernel_spec_sha256="bogus", solver_version="1",
+        )
+
+    def test_numpy_spectrum_is_defensively_copied_and_readonly(self):
+        kwargs = self._valid_kwargs()
+        self.assertTrue(kwargs["spectrum"].flags.writeable)
+        k = FreeSpacePoissonKernel(**kwargs)
+        self.assertFalse(k.spectrum.flags.writeable)
+        with self.assertRaises(ValueError):
+            k.spectrum[0, 0, 0] = 12345
+        # The kernel's own copy is independent of the caller's array --
+        # mutating the caller's original array must not leak through.
+        kwargs["spectrum"][0, 0, 0] = 999
+        self.assertNotEqual(k.spectrum[0, 0, 0], 999)
+
+    def test_rejects_non_mesh_mesh(self):
+        kwargs = self._valid_kwargs()
+        kwargs["mesh"] = object()
+        with self.assertRaises(TypeError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_numpy_backend_with_jax_spectrum(self):
+        kwargs = self._valid_kwargs()
+        kwargs["spectrum"] = jnp.asarray(kwargs["spectrum"])
+        with self.assertRaises(TypeError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_jax_backend_with_numpy_spectrum(self):
+        kwargs = self._valid_kwargs()
+        kwargs["backend"] = "jax"
+        with self.assertRaises(TypeError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_spectrum_dtype_mismatch(self):
+        kwargs = self._valid_kwargs()
+        kwargs["spectrum_dtype"] = "complex64"  # actual spectrum is complex128
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_non_complex_spectrum_dtype(self):
+        kwargs = self._valid_kwargs()
+        kwargs["spectrum"] = kwargs["spectrum"].real.copy()
+        kwargs["spectrum"].setflags(write=True)
+        kwargs["spectrum_dtype"] = "float64"
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_input_dtype_fft_kind_mismatch(self):
+        kwargs = self._valid_kwargs()
+        kwargs["input_dtype"] = "complex128"  # fft_kind is "rfft" (real)
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_equivalent_sphere_radius_on_rectangular_cell_mesh(self):
+        kwargs = self._valid_kwargs()
+        kwargs["equivalent_sphere_radius"] = 999.0  # mesh scheme is rectangular_cell
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_rejects_missing_equivalent_sphere_radius_on_equivalent_sphere_mesh(self):
+        kernel_sph = build_free_space_poisson_kernel(
+            (4, 4, 4), (0.2, 0.2, 0.2), self_cell_scheme="equivalent_sphere", backend="numpy")
+        spectrum = np.array(kernel_sph.spectrum)
+        spectrum.setflags(write=True)
+        kwargs = dict(
+            mesh=kernel_sph.mesh, spectrum=spectrum, fft_kind="rfft", backend="numpy",
+            input_dtype="float64", spectrum_dtype="complex128", device="cpu",
+            numpy_version="x", jax_version=None, self_cell_integral=1.0, K_self=1.0,
+            equivalent_sphere_radius=None,  # must be a real radius for this scheme
+            kernel_spec_sha256="bogus", solver_version="1",
+        )
+        with self.assertRaises(ValueError):
+            FreeSpacePoissonKernel(**kwargs)
+
+    def test_jax_spectrum_stays_untouched_no_copy(self):
+        kernel = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), backend="jax")
+        spectrum = kernel.spectrum
+        k2 = FreeSpacePoissonKernel(
+            mesh=kernel.mesh, spectrum=spectrum, fft_kind="rfft", backend="jax",
+            input_dtype="float64", spectrum_dtype=str(spectrum.dtype), device=str(spectrum.device),
+            numpy_version="x", jax_version="y", self_cell_integral=1.0, K_self=1.0,
+            equivalent_sphere_radius=None, kernel_spec_sha256="bogus", solver_version="1",
+        )
+        # Literally the same array object -- JAX arrays are already
+        # immutable, no defensive copy needed or performed.
+        self.assertIs(k2.spectrum, spectrum)
+
+
+class TestFreeSpacePoissonKernelSpecHash(unittest.TestCase):
+    def test_origin_perturbs_hash(self):
+        k1 = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), origin=(0, 0, 0), backend="numpy")
+        k2 = build_free_space_poisson_kernel((4, 4, 4), (0.2, 0.2, 0.2), origin=(9, 8, 7), backend="numpy")
+        self.assertNotEqual(k1.kernel_spec_sha256, k2.kernel_spec_sha256)
+
+    def test_every_provenance_relevant_field_perturbs_hash(self):
+        base_kwargs = dict(shape=(4, 4, 4), spacing=(0.2, 0.2, 0.2), origin=(0.0, 0.0, 0.0), backend="numpy")
+        base = build_free_space_poisson_kernel(**base_kwargs)
+        variants = [
+            {**base_kwargs, "origin": (1.0, 0.0, 0.0)},
+            {**base_kwargs, "spacing": (0.25, 0.2, 0.2)},
+            {**base_kwargs, "shape": (5, 4, 4)},
+            {**base_kwargs, "pad_factor": 3},
+            {**base_kwargs, "self_cell_scheme": "equivalent_sphere"},
+            {**base_kwargs, "dtype": np.float32},
+        ]
+        digests = {base.kernel_spec_sha256}
+        for kwargs in variants:
+            k = build_free_space_poisson_kernel(**kwargs)
+            self.assertNotIn(
+                k.kernel_spec_sha256, digests,
+                msg=f"kwargs delta {kwargs} did not perturb kernel_spec_sha256")
+            digests.add(k.kernel_spec_sha256)
+
+    def test_hash_does_not_require_reading_full_spectrum_bytes(self):
+        # Structural check: two kernels for the SAME spec but built
+        # independently (fresh FFT each time, potentially tiny FP
+        # rounding differences between runs on some platforms) must
+        # still hash identically -- confirms the hash is over the small
+        # scalar spec fields, not the spectrum array contents.
+        kwargs = dict(shape=(4, 4, 4), spacing=(0.2, 0.2, 0.2), backend="numpy")
+        k1 = build_free_space_poisson_kernel(**kwargs)
+        k2 = build_free_space_poisson_kernel(**kwargs)
+        self.assertEqual(k1.kernel_spec_sha256, k2.kernel_spec_sha256)
+
 
 class TestWrappedIntegerOffsets(unittest.TestCase):
     def test_matches_fftfreq_even_and_odd(self):
@@ -107,36 +302,40 @@ class TestWrappedIntegerOffsets(unittest.TestCase):
 
 class TestSelfCellSchemes(unittest.TestCase):
     """rectangular_cell (exact closed form) vs equivalent_sphere
-    (documented approximation) -- quantified against an INDEPENDENT
-    scipy quadrature reference, not the production formula re-run
-    against itself."""
+    (documented approximation) -- quantified against independently-
+    derived HIGH-ACCURACY REFERENCE CONSTANTS, not a live scipy
+    quadrature. A live scipy.integrate.tplquad over the singular 1/r
+    integrand (even with the singularity excluded as a small ball)
+    produced unstable max-subdivisions/roundoff IntegrationWarnings in
+    CI (Alice's review, task #13, 2026-07-13: "make the focused suite
+    warning-clean"). These constants were derived TWICE independently
+    during design review -- once via that same scipy adaptive
+    quadrature, once via a fully separate sympy symbolic evaluation of
+    the closed-form antiderivative F(x,y,z) at its degenerate box
+    corners (proper limits, not epsilon substitution) -- both methods
+    agreed to full float64 precision, so hardcoding them here is not
+    "trust the formula," it is recording an independently cross-checked
+    fact.
+    """
 
-    @staticmethod
-    def _quadrature_reference_integral(dx, dy, dz, eps_frac=1e-4):
-        eps = eps_frac * min(dx, dy, dz)
-        ball_contrib = 2 * np.pi * eps**2
+    # self_cell_integral I for a UNIT-DENSITY box (dx,dy,dz), derived
+    # independently two ways during task #13's design review (scipy
+    # adaptive quadrature with the singularity handled analytically, and
+    # a separate sympy symbolic corner-limit evaluation) -- both agree
+    # to full float64 precision.
+    _INDEPENDENT_REFERENCE_I = {
+        (1.0, 1.0, 1.0): 2.380077363979554,    # isotropic cube
+        (1.0, 1.0, 4.0): 4.915333788705233,    # anisotropic 1:1:4
+        (1.0, 1.0, 10.0): 6.730842777277461,   # anisotropic 1:1:10
+    }
 
-        def f(z, y, x):
-            r2 = x * x + y * y + z * z
-            if r2 <= eps * eps:
-                return 0.0
-            return 1.0 / np.sqrt(r2)
-
-        val, _ = integrate.tplquad(f, -dx / 2, dx / 2, -dy / 2, dy / 2, -dz / 2, dz / 2,
-                                    epsabs=1e-8, epsrel=1e-8)
-        return val + ball_contrib
-
-    def test_rectangular_cell_matches_independent_quadrature(self):
-        for dx, dy, dz, label in [
-            (1.0, 1.0, 1.0, "cube"),
-            (1.0, 1.0, 4.0, "aniso 1:1:4"),
-            (1.0, 1.0, 10.0, "aniso 1:1:10"),
-        ]:
-            I_ref = self._quadrature_reference_integral(dx, dy, dz)
+    def test_rectangular_cell_matches_independent_reference(self):
+        for (dx, dy, dz), I_ref in self._INDEPENDENT_REFERENCE_I.items():
             I, K_self = _rectangular_cell_self_potential(dx, dy, dz)
             dV = dx * dy * dz
-            self.assertAlmostEqual(I, I_ref, delta=1e-3 * abs(I_ref),
-                                    msg=f"{label}: closed-form I disagrees with independent quadrature")
+            self.assertAlmostEqual(
+                I, I_ref, places=9,
+                msg=f"({dx},{dy},{dz}): closed-form I disagrees with independent reference")
             self.assertAlmostEqual(K_self * dV, I, places=10)
 
     def test_rectangular_cell_scale_homogeneity(self):
@@ -223,6 +422,29 @@ class TestFreeSpacePoissonGaussianConvergence(unittest.TestCase):
             err = np.abs(v[interior, interior, interior] - v_analytic[interior, interior, interior])
             errs.append(err.max())
         # Strictly decreasing as h shrinks.
+        self.assertLess(errs[1], errs[0])
+        self.assertLess(errs[2], errs[1])
+
+    def test_box_size_convergence_fixed_h(self):
+        # Genuine box-size (fixed h, growing physical box) convergence --
+        # DISTINCT from test_h_convergence (which scales N*h together)
+        # and from the padding-invariance test (structural, not physical)
+        # -- Alice's review, task #13, 2026-07-13: the original gate
+        # explicitly asked for h/box/padding convergence as three
+        # separate sweeps. A too-small box truncates the Gaussian's tail
+        # (rho outside the sampled box is implicitly zero, when the true
+        # density extends beyond it), a real, distinct error source from
+        # grid discretization.
+        alpha = 2.0
+        h = 0.15
+        errs = []
+        for N in (12, 20, 32):
+            v, v_analytic, N_ = self._gaussian_case(h=h, N=N, alpha=alpha)
+            c = N_ // 2
+            win = 4  # fixed physical window near the center, same for every N
+            sl = slice(c - win, c + win)
+            err = np.abs(v[sl, sl, sl] - v_analytic[sl, sl, sl])
+            errs.append(err.max())
         self.assertLess(errs[1], errs[0])
         self.assertLess(errs[2], errs[1])
 
@@ -326,7 +548,11 @@ class TestFreeSpacePoissonBatching(unittest.TestCase):
         rho_batch = rng.standard_normal((3,) + shape)
         v_batch = solve_free_space_poisson(rho_batch, kernel)
         v_single = np.stack([solve_free_space_poisson(rho_batch[i], kernel) for i in range(3)])
-        np.testing.assert_array_equal(v_batch, v_single)
+        # Tight assert_allclose, not assert_array_equal -- exact bitwise
+        # FFT equality between a batched and per-item call is stronger
+        # than the documented contract and can be FFT-library/version-
+        # sensitive (Alice's review, task #13, 2026-07-13).
+        np.testing.assert_allclose(v_batch, v_single, atol=1e-12, rtol=1e-12)
 
     def test_multi_axis_batch(self):
         shape = (4, 4, 4)
@@ -435,11 +661,21 @@ class TestFreeSpacePoissonBackendAgreement(unittest.TestCase):
         v_c = solve_free_space_poisson(rho_c, kernel_c)
         self.assertEqual(v_c.dtype, np.complex64)
 
-    def test_jax_x64_truncation_raises(self):
+    def test_jax_x64_truncation_raises_without_jax_warning(self):
+        # Checked proactively via jax.config.jax_enable_x64 -- NOT by
+        # probing with jnp.zeros(dtype=...) and observing the downgrade,
+        # which would fire JAX's own UserWarning before this function's
+        # ValueError (Alice's review, task #13, 2026-07-13: "make the
+        # focused suite warning-clean"). warnings.simplefilter("error")
+        # turns any stray warning into an exception of ITS OWN type, so
+        # assertRaises(ValueError) here only passes if no warning fired.
+        import warnings
         with jax.enable_x64(False):
-            with self.assertRaises(ValueError):
-                build_free_space_poisson_kernel(
-                    (4, 4, 4), (0.2, 0.2, 0.2), backend="jax", dtype=np.float64)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                with self.assertRaises(ValueError):
+                    build_free_space_poisson_kernel(
+                        (4, 4, 4), (0.2, 0.2, 0.2), backend="jax", dtype=np.float64)
 
     def test_jax_backend_preserves_device_no_host_copy_marker(self):
         # Confirms the kernel's device field is read from the REALIZED

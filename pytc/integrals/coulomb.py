@@ -1417,6 +1417,35 @@ def _self_cell_values(self_cell_scheme, dx, dy, dz):
     raise ValueError(f"Unsupported self_cell_scheme={self_cell_scheme!r}.")
 
 
+def _validate_positive_int(name, value):
+    """Reject bool (isinstance(True, int) is True in Python -- an
+    explicit exclusion, not an oversight) and non-integral floats
+    rather than silently truncating them -- int(3.7)==3 and
+    int(True)==1 would otherwise coerce malformed input into a
+    plausible-looking but wrong value instead of rejecting it (Alice's
+    review, task #13, 2026-07-13: directly reproduced shape=(3.7,4,5)
+    -> (3,4,5) and pad_factor=2.7 -> 2 silently accepted)."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got bool {value!r}.")
+    if isinstance(value, (int, np.integer)):
+        ivalue = int(value)
+    elif (isinstance(value, (float, np.floating)) and math.isfinite(value)
+          and float(value).is_integer()):
+        ivalue = int(value)
+    else:
+        raise ValueError(f"{name} must be an integer (or integral-valued float), got {value!r}.")
+    if ivalue <= 0:
+        raise ValueError(f"{name} must be positive, got {ivalue}.")
+    return ivalue
+
+
+def _validate_positive_int_tuple(name, values, length=3):
+    values = tuple(values)
+    if len(values) != length:
+        raise ValueError(f"{name} must have length {length}, got {values!r}.")
+    return tuple(_validate_positive_int(f"{name}[{i}]", v) for i, v in enumerate(values))
+
+
 def _kernel_spec_sha256(fields):
     """SHA-256 over a canonical repr of small scalar/string kernel-
     specification fields only (mesh geometry, scheme, resolved
@@ -1448,23 +1477,28 @@ class FreeSpacePoissonMesh:
     fft_normalization: str
 
     def __post_init__(self):
-        shape = tuple(int(s) for s in self.shape)
-        spacing = tuple(float(s) for s in self.spacing)
-        origin = tuple(float(o) for o in self.origin)
-        padded_shape = tuple(int(s) for s in self.padded_shape)
+        shape = _validate_positive_int_tuple("shape", self.shape)
+        padded_shape = _validate_positive_int_tuple("padded_shape", self.padded_shape)
+
+        spacing = tuple(self.spacing)
+        if len(spacing) != 3:
+            raise ValueError(f"spacing must have length 3, got {spacing!r}.")
+        spacing = tuple(float(s) for s in spacing)
+        if any((not math.isfinite(d)) or d <= 0.0 for d in spacing):
+            raise ValueError(f"spacing must be 3 finite positive floats, got {spacing}.")
+
+        origin = tuple(self.origin)
+        if len(origin) != 3:
+            raise ValueError(f"origin must have length 3, got {origin!r}.")
+        origin = tuple(float(o) for o in origin)
+        if any(not math.isfinite(o) for o in origin):
+            raise ValueError(f"origin must be 3 finite floats, got {origin}.")
+
         object.__setattr__(self, "shape", shape)
         object.__setattr__(self, "spacing", spacing)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "padded_shape", padded_shape)
 
-        if len(shape) != 3 or any(s <= 0 for s in shape):
-            raise ValueError(f"shape must be 3 positive integers, got {shape}.")
-        if len(spacing) != 3 or any((not math.isfinite(d)) or d <= 0.0 for d in spacing):
-            raise ValueError(f"spacing must be 3 finite positive floats, got {spacing}.")
-        if len(origin) != 3 or any(not math.isfinite(o) for o in origin):
-            raise ValueError(f"origin must be 3 finite floats, got {origin}.")
-        if len(padded_shape) != 3:
-            raise ValueError(f"padded_shape must have length 3, got {padded_shape}.")
         for p, n in zip(padded_shape, shape):
             if p < 2 * n - 1:
                 raise ValueError(
@@ -1513,10 +1547,32 @@ class FreeSpacePoissonKernel:
     solver_version: str
 
     def __post_init__(self):
+        if not isinstance(self.mesh, FreeSpacePoissonMesh):
+            raise TypeError(f"mesh must be a FreeSpacePoissonMesh, got {type(self.mesh).__name__}.")
         if self.fft_kind not in ("rfft", "fft"):
             raise ValueError(f"Unsupported fft_kind={self.fft_kind!r}.")
         if self.backend not in ("numpy", "jax"):
             raise ValueError(f"Unsupported backend={self.backend!r}.")
+
+        # Backend/spectrum-type consistency, then make the artifact
+        # ACTUALLY immutable here (not merely by builder convention) --
+        # Alice's review, task #13, 2026-07-13: directly constructed a
+        # nominal kernel with a mutable NumPy spectrum and mutated it
+        # successfully through the public dataclass.
+        if self.backend == "numpy":
+            if not isinstance(self.spectrum, np.ndarray):
+                raise TypeError(
+                    f"backend='numpy' requires spectrum to be a numpy.ndarray, got "
+                    f"{type(self.spectrum).__name__}."
+                )
+            object.__setattr__(self, "spectrum", _readonly_copy(self.spectrum))
+        else:
+            if not isinstance(self.spectrum, jax.Array):
+                raise TypeError(
+                    f"backend='jax' requires spectrum to be a jax.Array, got "
+                    f"{type(self.spectrum).__name__}."
+                )
+
         expected_shape = (
             (*self.mesh.padded_shape[:-1], self.mesh.padded_shape[-1] // 2 + 1)
             if self.fft_kind == "rfft" else self.mesh.padded_shape
@@ -1527,6 +1583,44 @@ class FreeSpacePoissonKernel:
                 f"expected {self.fft_kind} shape {expected_shape} for padded_shape "
                 f"{self.mesh.padded_shape}."
             )
+
+        declared_spectrum_dtype = np.dtype(self.spectrum_dtype)
+        if np.dtype(self.spectrum.dtype) != declared_spectrum_dtype:
+            raise ValueError(
+                f"spectrum.dtype={self.spectrum.dtype} != declared spectrum_dtype="
+                f"{declared_spectrum_dtype}."
+            )
+        if not np.issubdtype(declared_spectrum_dtype, np.complexfloating):
+            raise ValueError(
+                f"spectrum_dtype must be complex (rfftn/fftn spectra are always "
+                f"complex-valued), got {declared_spectrum_dtype}."
+            )
+
+        input_dtype = np.dtype(self.input_dtype)
+        if self.fft_kind == "rfft" and not np.issubdtype(input_dtype, np.floating):
+            raise ValueError(f"fft_kind='rfft' requires a real input_dtype, got {input_dtype}.")
+        if self.fft_kind == "fft" and not np.issubdtype(input_dtype, np.complexfloating):
+            raise ValueError(f"fft_kind='fft' requires a complex input_dtype, got {input_dtype}.")
+
+        if not math.isfinite(self.self_cell_integral):
+            raise ValueError(f"self_cell_integral must be finite, got {self.self_cell_integral!r}.")
+        if not math.isfinite(self.K_self):
+            raise ValueError(f"K_self must be finite, got {self.K_self!r}.")
+
+        if self.mesh.self_cell_scheme == "rectangular_cell":
+            if self.equivalent_sphere_radius is not None:
+                raise ValueError(
+                    "equivalent_sphere_radius must be None for self_cell_scheme="
+                    "'rectangular_cell' (that scheme has no such radius -- never a "
+                    "fabricated/foreign value)."
+                )
+        else:  # "equivalent_sphere" -- mesh.__post_init__ already rejects any other value
+            r = self.equivalent_sphere_radius
+            if r is None or not math.isfinite(r) or r <= 0.0:
+                raise ValueError(
+                    f"equivalent_sphere_radius must be a finite positive float for "
+                    f"self_cell_scheme='equivalent_sphere', got {r!r}."
+                )
 
 
 def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,
@@ -1541,7 +1635,11 @@ def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,
         spacing: (dx, dy, dz), finite positive floats -- anisotropic
             supported, no isotropy assumption anywhere in the math.
         origin: (x0, y0, z0), physical coordinates of grid index
-            (0,0,0) -- provenance only, does not affect the kernel.
+            (0,0,0) -- does not affect the kernel VALUES (the kernel
+            is translation-invariant), but is included in
+            kernel_spec_sha256 since two kernels built for different
+            physical placements are distinct provenance records even
+            when numerically identical.
         pad_factor: padded_shape = pad_factor * shape per axis. Must be
             >= 2 (zero-padding sufficient for a correct linear, non-
             wrapping convolution).
@@ -1567,16 +1665,28 @@ def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,
         raise ValueError(f"Unsupported backend={backend!r}, must be 'numpy' or 'jax'.")
     if fft_kind not in ("rfft", "fft"):
         raise ValueError(f"Unsupported fft_kind={fft_kind!r}, must be 'rfft' or 'fft'.")
+
+    pad_factor = _validate_positive_int("pad_factor", pad_factor)
     if pad_factor < 2:
         raise ValueError(
             f"pad_factor={pad_factor} must be >= 2 -- zero-padding sufficient for a "
             f"correct linear (non-wrapping) convolution."
         )
+    shape = _validate_positive_int_tuple("shape", shape)
+    padded_shape = tuple(pad_factor * s for s in shape)
 
-    shape = tuple(int(s) for s in shape)
-    if len(shape) != 3 or any(s <= 0 for s in shape):
-        raise ValueError(f"shape must be 3 positive integers, got {shape}.")
-    padded_shape = tuple(int(pad_factor) * s for s in shape)
+    # Construct+validate geometry FIRST -- before computing the self-cell
+    # term or anything else that could raise an incidental, uncontracted
+    # exception on malformed spacing/origin (Alice's review, task #13,
+    # 2026-07-13: directly reproduced spacing=(0,1,1) raising a bare
+    # ZeroDivisionError from inside the self-cell formula instead of the
+    # documented ValueError, because the self term was computed before
+    # the mesh -- and thus the spacing -- was ever validated).
+    mesh = FreeSpacePoissonMesh(
+        shape=shape, spacing=spacing, origin=origin, padded_shape=padded_shape,
+        self_cell_scheme=self_cell_scheme, fft_normalization="backward",
+    )
+    dx, dy, dz = mesh.spacing
 
     dtype = (np.dtype(dtype) if dtype is not None
               else (np.dtype(np.float64) if fft_kind == "rfft" else np.dtype(np.complex128)))
@@ -1592,24 +1702,23 @@ def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,
     real_compute_dtype = _REAL_COMPUTE_DTYPE_FOR_INPUT[dtype]
 
     if backend == "jax":
-        probe = jnp.zeros((), dtype=dtype)
-        if probe.dtype != dtype:
+        needs_64bit = dtype in (np.dtype(np.float64), np.dtype(np.complex128))
+        if needs_64bit and not jax.config.jax_enable_x64:
+            # Checked proactively via jax.config.jax_enable_x64 -- NOT by
+            # probing with jnp.zeros(dtype=...) and observing whether it
+            # got silently downgraded, which fires JAX's own UserWarning
+            # even though this function raises immediately afterward
+            # (Alice's review, task #13, 2026-07-13: a clean ValueError
+            # is preferable to a warning-then-exception).
             raise ValueError(
-                f"Requested dtype {dtype} was silently downgraded to {probe.dtype} by "
-                f"JAX (jax_enable_x64 is disabled) -- call "
-                f"jax.config.update('jax_enable_x64', True) before requesting a "
-                f"float64/complex128 kernel, or request a 32-bit dtype explicitly."
+                f"Requested dtype {dtype} requires jax_enable_x64, which is "
+                f"currently disabled -- call jax.config.update('jax_enable_x64', "
+                f"True) before requesting a float64/complex128 kernel, or request "
+                f"a 32-bit dtype explicitly."
             )
 
-    dx, dy, dz = (float(s) for s in spacing)
     self_cell_integral, K_self, equivalent_sphere_radius = _self_cell_values(
         self_cell_scheme, dx, dy, dz)
-
-    mesh = FreeSpacePoissonMesh(
-        shape=shape, spacing=(dx, dy, dz), origin=tuple(float(o) for o in origin),
-        padded_shape=padded_shape, self_cell_scheme=self_cell_scheme,
-        fft_normalization="backward",
-    )
 
     Px, Py, Pz = mesh.padded_shape
     ix = _wrapped_integer_offsets(Px)
@@ -1633,17 +1742,19 @@ def build_free_space_poisson_kernel(shape, spacing, origin=(0.0, 0.0, 0.0), *,
         K_padded_b = K_padded_b.astype(dtype)
         spectrum = fft_ns.fftn(K_padded_b, s=mesh.padded_shape, axes=(0, 1, 2), norm="backward")
 
-    if backend == "numpy":
-        spectrum = _readonly_copy(spectrum)
-        device = "cpu"
-    else:
-        device = str(spectrum.device)
+    # NOTE: the spectrum is NOT defensively copied here -- FreeSpacePoissonKernel's
+    # own __post_init__ now does that unconditionally for backend="numpy" (Alice's
+    # review, task #13, 2026-07-13: the builder must not be the SOLE guard of
+    # immutability for a publicly-constructible type), so copying here too would
+    # just double the allocation for no benefit.
+    device = "cpu" if backend == "numpy" else str(spectrum.device)
 
     spectrum_dtype = str(spectrum.dtype)
     jax_version_str = jax.__version__ if backend == "jax" else None
 
     kernel_spec_sha256 = _kernel_spec_sha256({
-        "shape": mesh.shape, "spacing": mesh.spacing, "padded_shape": mesh.padded_shape,
+        "shape": mesh.shape, "spacing": mesh.spacing, "origin": mesh.origin,
+        "padded_shape": mesh.padded_shape,
         "self_cell_scheme": self_cell_scheme, "fft_normalization": mesh.fft_normalization,
         "self_cell_integral": self_cell_integral, "K_self": K_self,
         "equivalent_sphere_radius": equivalent_sphere_radius,
