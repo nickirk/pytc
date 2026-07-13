@@ -33,6 +33,18 @@ sections above it):
      the DFT quadrature grid used in section 1 -- both are "grids" in
      this file but serve unrelated purposes (irregular pruned
      quadrature vs. a uniform Cartesian FFT mesh).
+  6. Poisson interpolation-vector Z-core assembly (task #15,
+     isdf-coulomb-cuda, P2b) -- builds raw physical interpolation
+     vectors Theta on section 5's mesh (reusing pytc/df/solvers.py's
+     structured normal-equations solver, the SAME primitive
+     pytc/df/isdf.py:isdf_decompose already uses for TC's own ISDF
+     fitting -- no duplicated selection/solver logic) and assembles
+     Z = dV * Theta^dagger V via section 5's approved Poisson backend.
+     A genuinely different, more direct kernel-policy route to the
+     same Z-core object build_core's MolecularDFReference policy
+     (section 4) produces via DF blocks -- no S^-1 regularization step
+     needed here, since the free-space Poisson operator gives the
+     Coulomb kernel's action directly.
 """
 
 import dataclasses
@@ -53,6 +65,10 @@ from pytc.df.fit import (
     compute_Z,
     compute_Z_cross,
     reconstruct_eri_block,
+)
+from pytc.df.solvers import (
+    prepare_normal_equations_solver,
+    solve_normal_equations_batch_prepared,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +97,10 @@ __all__ = [
     "build_free_space_poisson_kernel",
     "solve_free_space_poisson",
     "free_space_poisson_direct_sum_oracle",
+    "PoissonInterpolationSector",
+    "PoissonCoreArtifact",
+    "build_poisson_interpolation_sector",
+    "poisson_core",
 ]
 
 
@@ -1983,3 +2003,615 @@ def free_space_poisson_direct_sum_oracle(rho, mesh):
     rho_flat = rho.reshape(batch_shape + (Ng,))
     v_flat = dV * np.einsum("...j,ij->...i", rho_flat, K)
     return v_flat.reshape(rho.shape)
+
+
+# ===========================================================================
+# 6. Poisson interpolation-vector Z-core assembly
+# ===========================================================================
+"""Builds raw physical interpolation vectors Theta on a FreeSpacePoissonMesh
+and assembles the Coulomb Z-core Z = dV * Theta^dagger V via section 5's
+approved Poisson backend (task #15, isdf-coulomb-cuda, P2b, 2026-07-13 --
+2 review rounds with Alice before implementation).
+
+Theta[mu,g] construction reuses pytc/df/solvers.py's structured normal-
+equations solver directly -- the SAME primitive pytc/df/isdf.py:
+isdf_decompose already uses for TC's own single-orbital ISDF fitting
+(xi_phi/xi_grad), applied here with the Coulomb path's own pair factors.
+No new solver logic: prepare_normal_equations_solver + repeated
+solve_normal_equations_batch_prepared calls, batched over the grid axis.
+
+RAW (unweighted) factor values throughout -- factor_p_raw/factor_q_raw at
+BOTH the pivots and the grid batch, matching pair_collocation_at_pivots's
+already-established convention (section 4), NOT the isdf-coulomb-cuda
+decision doc's original Theta=A P^dagger S^-1 formula (which uses
+WEIGHTED A=sqrt(w)*phi_p*phi_q). That weighted formula is exactly what
+Alice's own task #6 review moved the codebase away from ("passing
+weighted values here... made compute_Z's rcond silently depend on the
+grid quadrature's weight scale, a portability bug") -- the decision doc
+was never updated after that fix. Selection-weighted collocation
+(weight_mo_values) is used ONLY by select_sector_pivots to choose pivots
+in the first place, never touches the Theta fit itself.
+
+Z assembly is a DIRECT bilinear contraction, not a compute_Z-style S^-1
+regularized solve: Z_mu,nu = <Theta_mu|1/r12|Theta_nu> = integral
+Theta_mu(r) V_nu(r) dr, discretized as dV * sum_g conj(Theta_mu(r_g)) *
+V_nu(r_g), where V_nu = K Theta_nu (section 5's solve_free_space_poisson).
+TWO separate dV factors legitimately appear here -- one already inside
+solve_free_space_poisson's own internal step (section 5, unchanged), one
+in this section's own outer sum -- these are two DISTINCT nested-integral
+discretizations, not a double-count of the same quantity. W = dV*I is
+trivial on this uniform mesh (every cell has the same volume, unlike the
+irregular DFT grid in section 1) -- no separate weight array is stored.
+
+Mesh-geometry identity (what Theta depends on: mesh.shape/spacing/origin)
+is kept SEPARATE from kernel identity (padded_shape/self_cell_scheme/
+fft_kind -- a Poisson-SOLVE-only concern Theta never touches):
+PoissonInterpolationSector records only geometry, no kernel reference at
+all, so one Theta sector legitimately serves multiple kernel choices
+(rfft vs fft, differing self_cell_scheme/padding) without rebuilding.
+PoissonCoreArtifact records the specific kernel_spec_sha256 used for ITS
+Poisson solves.
+
+Explicit incore baseline (storage_mode="incore_full_theta", stated as
+such, not implied away): the coupled normal-equations solve returns ALL
+n_fused rows for any given grid batch (the dense (n_fused,n_fused) normal
+matrix couples every interpolation point), so a sector's Theta cannot be
+built in mu-blocks without either recomputing the full solve per block or
+an out-of-core store (future work, not this task). grid_batch_size only
+bounds the TRANSIENT least-squares output width during construction.
+poisson_core's mu_block_size/nu_block_size instead bound the GEMM
+contraction slice widths and the Poisson-solve batch width respectively,
+tiling the O(N_g*N_mu^2) core-assembly contraction and the
+O(N_g*N_mu*log(N_g)) Poisson-solve cost for peak memory, not total FLOPs.
+"""
+
+_SUPPORTED_POISSON_STORAGE_MODES = ("incore_full_theta",)
+_POISSON_INTERPOLATION_SOLVER_VERSION = "1"
+
+
+def _validate_sha256_hex(name, value):
+    """Closed syntax validation for a caller-supplied or locally-computed
+    SHA-256 hex digest -- exactly 64 lowercase hex characters, nothing
+    else. Used both for locally-computed digests (sanity check) and for
+    caller-attested upstream digests on the JAX path, where this is the
+    ONLY validation performed -- syntax, not content (Alice's review,
+    task #15, 2026-07-13: "validate closed key names/type/64-hex syntax
+    and record that trust boundary... do not claim the JAX digest was
+    verified from device bytes")."""
+    if (not isinstance(value, str) or len(value) != 64
+            or any(c not in "0123456789abcdef" for c in value)):
+        raise ValueError(
+            f"{name} must be a 64-character lowercase hex SHA-256 string, got {value!r}."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PoissonInterpolationSector:
+    """One MO-pair sector's raw physical interpolation vectors Theta,
+    built once via build_poisson_interpolation_sector and reusable across
+    multiple poisson_core calls (same-sector AND cross-sector, against
+    any kernel sharing this sector's mesh geometry) without rebuilding.
+
+    Theta: (n_pivots, N_g), the natural solver-output orientation
+    (matching pytc.df.isdf.isdf_decompose's xi_phi convention exactly)
+    -- backend-preserving: NumPy gets a defensive read-only copy; JAX
+    stays an untouched (already-immutable) jax.Array on its actual
+    device.
+    mesh_shape/spacing/origin: GEOMETRY ONLY (no padded_shape/
+    self_cell_scheme/fft_normalization -- those are FreeSpacePoissonKernel
+    concerns Theta never touches).
+    storage_mode: "incore_full_theta" (only supported value -- an
+    honest, explicit label, not an implied-away detail).
+    factor_identity_source: "computed_content_hash" (NumPy -- this
+    function independently hashed factor_p_raw/factor_q_raw's actual
+    bytes) or "caller_attested" (JAX -- the caller supplied
+    upstream_provenance['factor_p_sha256'/'factor_q_sha256'], validated
+    only for syntax, never independently verified against device bytes).
+    """
+    Theta: object
+    pivots: object
+    mesh_shape: tuple
+    mesh_spacing: tuple
+    mesh_origin: tuple
+    same_factor: bool
+    storage_mode: str
+    backend: str
+    device: str
+    realized_dtype: str
+    grid_batch_size: int
+    rcond: float
+    jitter_used: float
+    n_tries: int
+    factor_identity_source: str
+    pivots_sha256: str
+    factor_p_sha256: str
+    factor_q_sha256: str
+    sector_spec_sha256: str
+    solver_version: str
+    provenance: object
+
+    def __post_init__(self):
+        mesh_shape = _validate_positive_int_tuple("mesh_shape", self.mesh_shape)
+        mesh_spacing = _as_length_tuple("mesh_spacing", self.mesh_spacing)
+        mesh_spacing = tuple(float(s) for s in mesh_spacing)
+        if any((not math.isfinite(d)) or d <= 0.0 for d in mesh_spacing):
+            raise ValueError(f"mesh_spacing must be 3 finite positive floats, got {mesh_spacing}.")
+        mesh_origin = _as_length_tuple("mesh_origin", self.mesh_origin)
+        mesh_origin = tuple(float(o) for o in mesh_origin)
+        if any(not math.isfinite(o) for o in mesh_origin):
+            raise ValueError(f"mesh_origin must be 3 finite floats, got {mesh_origin}.")
+        object.__setattr__(self, "mesh_shape", mesh_shape)
+        object.__setattr__(self, "mesh_spacing", mesh_spacing)
+        object.__setattr__(self, "mesh_origin", mesh_origin)
+
+        if not isinstance(self.same_factor, bool):
+            raise TypeError(f"same_factor must be bool, got {type(self.same_factor).__name__}.")
+        if self.storage_mode not in _SUPPORTED_POISSON_STORAGE_MODES:
+            raise ValueError(f"Unsupported storage_mode={self.storage_mode!r}.")
+        if self.backend not in ("numpy", "jax"):
+            raise ValueError(f"Unsupported backend={self.backend!r}.")
+
+        if self.backend == "numpy":
+            if not isinstance(self.Theta, np.ndarray):
+                raise TypeError("backend='numpy' requires Theta to be a numpy.ndarray.")
+            object.__setattr__(self, "Theta", _readonly_copy(self.Theta))
+            if self.device != "cpu":
+                raise ValueError(f"device must be 'cpu' for backend='numpy', got {self.device!r}.")
+        else:
+            if not isinstance(self.Theta, jax.Array):
+                raise TypeError("backend='jax' requires Theta to be a jax.Array.")
+            realized_device = str(self.Theta.device)
+            if self.device != realized_device:
+                raise ValueError(
+                    f"device={self.device!r} != the realized Theta array's actual device "
+                    f"{realized_device!r}."
+                )
+
+        n_g = 1
+        for s in mesh_shape:
+            n_g *= s
+
+        pivots_np = np.asarray(self.pivots)
+        if pivots_np.ndim != 1 or not np.issubdtype(pivots_np.dtype, np.integer):
+            raise ValueError("pivots must be a 1-D integer array.")
+        if np.unique(pivots_np).shape[0] != pivots_np.shape[0]:
+            raise ValueError("pivots must contain unique indices.")
+        if pivots_np.size == 0 or pivots_np.min() < 0 or pivots_np.max() >= n_g:
+            raise ValueError(f"pivots out of range [0, {n_g}).")
+        n_fused = int(pivots_np.shape[0])
+        object.__setattr__(
+            self, "pivots",
+            _readonly_copy(pivots_np) if self.backend == "numpy" else jnp.asarray(pivots_np)
+        )
+
+        expected_theta_shape = (n_fused, n_g)
+        if tuple(self.Theta.shape) != expected_theta_shape:
+            raise ValueError(
+                f"Theta.shape {tuple(self.Theta.shape)} != expected (n_pivots, prod(mesh_shape)) "
+                f"{expected_theta_shape}."
+            )
+
+        declared_dtype = np.dtype(self.realized_dtype)
+        if np.dtype(self.Theta.dtype) != declared_dtype:
+            raise ValueError(
+                f"Theta.dtype={self.Theta.dtype} != declared realized_dtype={declared_dtype}."
+            )
+
+        grid_batch_size = _validate_positive_int("grid_batch_size", self.grid_batch_size)
+        object.__setattr__(self, "grid_batch_size", grid_batch_size)
+
+        if not (math.isfinite(self.rcond) and self.rcond > 0.0):
+            raise ValueError(f"rcond must be a finite positive float, got {self.rcond!r}.")
+        if not math.isfinite(self.jitter_used) or self.jitter_used < 0.0:
+            raise ValueError(
+                f"jitter_used must be a finite non-negative float, got {self.jitter_used!r}."
+            )
+        n_tries = _validate_positive_int("n_tries", self.n_tries)
+        object.__setattr__(self, "n_tries", n_tries)
+
+        if self.factor_identity_source not in ("computed_content_hash", "caller_attested"):
+            raise ValueError(f"Unsupported factor_identity_source={self.factor_identity_source!r}.")
+
+        for name, value in [
+            ("pivots_sha256", self.pivots_sha256),
+            ("factor_p_sha256", self.factor_p_sha256),
+            ("factor_q_sha256", self.factor_q_sha256),
+        ]:
+            _validate_sha256_hex(name, value)
+
+        if self.solver_version != _POISSON_INTERPOLATION_SOLVER_VERSION:
+            raise ValueError(
+                f"solver_version={self.solver_version!r} != "
+                f"{_POISSON_INTERPOLATION_SOLVER_VERSION!r}."
+            )
+
+        recomputed_hash = _kernel_spec_sha256({
+            "mesh_shape": mesh_shape, "mesh_spacing": mesh_spacing, "mesh_origin": mesh_origin,
+            "same_factor": self.same_factor, "storage_mode": self.storage_mode,
+            "backend": self.backend, "realized_dtype": self.realized_dtype,
+            "grid_batch_size": grid_batch_size, "rcond": self.rcond,
+            "jitter_used": self.jitter_used, "n_tries": n_tries,
+            "factor_identity_source": self.factor_identity_source,
+            "pivots_sha256": self.pivots_sha256, "factor_p_sha256": self.factor_p_sha256,
+            "factor_q_sha256": self.factor_q_sha256, "solver_version": self.solver_version,
+        })
+        _validate_sha256_hex("sector_spec_sha256", self.sector_spec_sha256)
+        if recomputed_hash != self.sector_spec_sha256:
+            raise ValueError(
+                "sector_spec_sha256 does not match the canonical digest recomputed from "
+                "this artifact's own declared fields."
+            )
+
+        object.__setattr__(
+            self, "provenance",
+            _deep_freeze(dict(self.provenance) if self.provenance else {})
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PoissonCoreArtifact:
+    """A completed Z core for one sector (same-sector) or one sector pair
+    (cross-sector), assembled via poisson_core. Explicit typed fields
+    (not a nested provenance dict) so __post_init__ can recompute/
+    validate every one of them directly against the actual Z array and
+    the sectors/kernel that produced it -- mirroring
+    FreeSpacePoissonKernel's provenance-closure pattern (section 5)."""
+    Z: object
+    left_sector_spec_sha256: str
+    right_sector_spec_sha256: str
+    left_n_fused: int
+    right_n_fused: int
+    kernel_spec_sha256: str
+    mu_block_size: int
+    nu_block_size: int
+    normalization: str
+    backend: str
+    device: str
+    realized_dtype: str
+    solver_version: str
+
+    def __post_init__(self):
+        if self.backend not in ("numpy", "jax"):
+            raise ValueError(f"Unsupported backend={self.backend!r}.")
+
+        if self.backend == "numpy":
+            if not isinstance(self.Z, np.ndarray):
+                raise TypeError("backend='numpy' requires Z to be a numpy.ndarray.")
+            object.__setattr__(self, "Z", _readonly_copy(self.Z))
+            if self.device != "cpu":
+                raise ValueError(f"device must be 'cpu' for backend='numpy', got {self.device!r}.")
+        else:
+            if not isinstance(self.Z, jax.Array):
+                raise TypeError("backend='jax' requires Z to be a jax.Array.")
+            realized_device = str(self.Z.device)
+            if self.device != realized_device:
+                raise ValueError(
+                    f"device={self.device!r} != the realized Z array's actual device "
+                    f"{realized_device!r}."
+                )
+
+        left_n_fused = _validate_positive_int("left_n_fused", self.left_n_fused)
+        right_n_fused = _validate_positive_int("right_n_fused", self.right_n_fused)
+        object.__setattr__(self, "left_n_fused", left_n_fused)
+        object.__setattr__(self, "right_n_fused", right_n_fused)
+        expected_shape = (left_n_fused, right_n_fused)
+        if tuple(self.Z.shape) != expected_shape:
+            raise ValueError(
+                f"Z.shape {tuple(self.Z.shape)} != expected (left_n_fused, right_n_fused) "
+                f"{expected_shape}."
+            )
+
+        declared_dtype = np.dtype(self.realized_dtype)
+        if np.dtype(self.Z.dtype) != declared_dtype:
+            raise ValueError(f"Z.dtype={self.Z.dtype} != declared realized_dtype={declared_dtype}.")
+
+        mu_block_size = _validate_positive_int("mu_block_size", self.mu_block_size)
+        nu_block_size = _validate_positive_int("nu_block_size", self.nu_block_size)
+        object.__setattr__(self, "mu_block_size", mu_block_size)
+        object.__setattr__(self, "nu_block_size", nu_block_size)
+
+        if self.normalization != "dV":
+            raise ValueError(f"Only normalization='dV' is supported, got {self.normalization!r}.")
+
+        for name, value in [
+            ("left_sector_spec_sha256", self.left_sector_spec_sha256),
+            ("right_sector_spec_sha256", self.right_sector_spec_sha256),
+            ("kernel_spec_sha256", self.kernel_spec_sha256),
+        ]:
+            _validate_sha256_hex(name, value)
+
+        if self.solver_version != _POISSON_INTERPOLATION_SOLVER_VERSION:
+            raise ValueError(
+                f"solver_version={self.solver_version!r} != "
+                f"{_POISSON_INTERPOLATION_SOLVER_VERSION!r}."
+            )
+
+
+def build_poisson_interpolation_sector(factor_p_raw, factor_q_raw, pivots, mesh, *,
+                                        same_factor=False, grid_batch_size=None,
+                                        rcond=1e-14, upstream_provenance=None):
+    """Build the raw physical interpolation vectors Theta for one MO-pair
+    sector on a FreeSpacePoissonMesh, via pytc/df/solvers.py's structured
+    normal-equations solver (the same primitive
+    pytc.df.isdf.isdf_decompose already uses for TC's own ISDF fitting).
+
+    Args:
+        factor_p_raw, factor_q_raw: (n_p/n_q, N_g) RAW (unweighted) MO
+            values sampled at mesh's physical grid points, in mesh's
+            flattened row-major order. Must share dtype and backend
+            (both numpy.ndarray or both jax.Array). No hidden
+            conjugation is applied to either channel here -- whatever
+            conjugation convention a caller's pair-product formula needs
+            must already be baked into these arrays.
+        pivots: (n_fused,) 1-D integer grid-point indices into
+            [0, prod(mesh.shape)), unique, order preserved exactly as
+            given (never resorted/deduplicated by this function).
+        mesh: FreeSpacePoissonMesh -- only shape/spacing/origin
+            (geometry) are used; padded_shape/self_cell_scheme/
+            fft_normalization are kernel-construction concerns this
+            function never touches.
+        same_factor: True for a symmetric sector (oo, vv) -- validated
+            by ACTUAL equality (jnp.array_equal on JAX, transferring
+            only the resulting scalar to host; np.array_equal on NumPy),
+            never merely trusted as a flag.
+        grid_batch_size: bounds the TRANSIENT least-squares solve output
+            width during construction only (Theta itself is always
+            fully retained incore -- see storage_mode="incore_full_theta"
+            in the class docstring for why mu-blocking isn't possible
+            here). None resolves to N_g (single batch); the realized
+            value is recorded.
+        rcond: forwarded to prepare_normal_equations_solver.
+        upstream_provenance: for backend="numpy", optional extra caller
+            metadata (frozen and stored, does not affect
+            sector_spec_sha256). For backend="jax", MUST additionally
+            contain 'factor_p_sha256'/'factor_q_sha256' string digests
+            (caller-attested identity for factor_p_raw/factor_q_raw --
+            this function never runs NumPy content hashing over full
+            device arrays) -- raises if missing.
+
+    Returns:
+        PoissonInterpolationSector.
+    """
+    if not isinstance(mesh, FreeSpacePoissonMesh):
+        raise TypeError("mesh must be a FreeSpacePoissonMesh.")
+
+    is_p_jax = isinstance(factor_p_raw, jax.Array)
+    is_q_jax = isinstance(factor_q_raw, jax.Array)
+    is_p_numpy = isinstance(factor_p_raw, np.ndarray)
+    is_q_numpy = isinstance(factor_q_raw, np.ndarray)
+    if not ((is_p_jax and is_q_jax) or (is_p_numpy and is_q_numpy)):
+        raise ValueError(
+            "factor_p_raw and factor_q_raw must both be numpy.ndarray or both be jax.Array."
+        )
+    backend = "jax" if is_p_jax else "numpy"
+    xp = jnp if backend == "jax" else np
+
+    factor_p_raw = xp.asarray(factor_p_raw)
+    factor_q_raw = xp.asarray(factor_q_raw)
+    if factor_p_raw.ndim != 2 or factor_q_raw.ndim != 2:
+        raise ValueError("factor_p_raw/factor_q_raw must be 2-D (n_orb, N_g).")
+    if factor_p_raw.dtype != factor_q_raw.dtype:
+        raise ValueError(
+            f"factor_p_raw.dtype={factor_p_raw.dtype} != factor_q_raw.dtype={factor_q_raw.dtype}."
+        )
+
+    n_g = 1
+    for s in mesh.shape:
+        n_g *= s
+    if factor_p_raw.shape[1] != n_g or factor_q_raw.shape[1] != n_g:
+        raise ValueError(
+            f"factor_p_raw/factor_q_raw grid axis must equal prod(mesh.shape)={n_g}, "
+            f"got {factor_p_raw.shape[1]}/{factor_q_raw.shape[1]}."
+        )
+
+    pivots_np = np.asarray(pivots)
+    if pivots_np.ndim != 1 or not np.issubdtype(pivots_np.dtype, np.integer):
+        raise ValueError("pivots must be a 1-D integer array.")
+    if np.unique(pivots_np).shape[0] != pivots_np.shape[0]:
+        raise ValueError("pivots must contain unique indices.")
+    if pivots_np.size == 0 or pivots_np.min() < 0 or pivots_np.max() >= n_g:
+        raise ValueError(f"pivots out of range [0, {n_g}).")
+    pivots_backend = xp.asarray(pivots_np)
+
+    if same_factor:
+        if backend == "jax":
+            equal = bool(jnp.array_equal(factor_p_raw, factor_q_raw))
+        else:
+            equal = bool(np.array_equal(factor_p_raw, factor_q_raw))
+        if not equal:
+            raise ValueError(
+                "same_factor=True requires factor_p_raw and factor_q_raw to be the SAME "
+                "array (validated by actual equality, not merely trusted)."
+            )
+
+    if not (math.isfinite(rcond) and rcond > 0.0):
+        raise ValueError(f"rcond must be a finite positive float, got {rcond!r}.")
+
+    grid_batch_size_realized = (
+        _validate_positive_int("grid_batch_size", grid_batch_size)
+        if grid_batch_size is not None else n_g
+    )
+
+    factor_p_piv = factor_p_raw[:, pivots_backend]
+    factor_q_piv = factor_q_raw[:, pivots_backend]
+    n_fused = int(pivots_np.shape[0])
+
+    chol, lower, jitter_used, n_tries = prepare_normal_equations_solver(
+        factor_p_piv, factor_q_piv, rcond=rcond, return_info=True)
+
+    theta_chunks = []
+    for g_start in range(0, n_g, grid_batch_size_realized):
+        g_end = min(g_start + grid_batch_size_realized, n_g)
+        theta_batch = solve_normal_equations_batch_prepared(
+            chol, lower, factor_p_piv, factor_q_piv,
+            factor_p_raw[:, g_start:g_end], factor_q_raw[:, g_start:g_end])
+        theta_chunks.append(theta_batch)
+    Theta = (jnp.concatenate if backend == "jax" else np.concatenate)(theta_chunks, axis=1)
+
+    device = "cpu" if backend == "numpy" else str(Theta.device)
+    realized_dtype = str(Theta.dtype)
+
+    pivots_sha256 = _canonical_sha256(pivots_np)
+
+    upstream_provenance = dict(upstream_provenance) if upstream_provenance else {}
+    if backend == "numpy":
+        factor_p_sha256 = _canonical_sha256(np.asarray(factor_p_raw))
+        factor_q_sha256 = _canonical_sha256(np.asarray(factor_q_raw))
+        factor_identity_source = "computed_content_hash"
+    else:
+        if "factor_p_sha256" not in upstream_provenance or "factor_q_sha256" not in upstream_provenance:
+            raise ValueError(
+                "backend='jax': upstream_provenance must supply 'factor_p_sha256' and "
+                "'factor_q_sha256' -- this function never runs NumPy content hashing over "
+                "full device arrays (would force an unwanted host transfer). These are "
+                "CALLER-ATTESTED identities, validated only for syntax, never independently "
+                "verified against device bytes."
+            )
+        factor_p_sha256 = upstream_provenance.pop("factor_p_sha256")
+        factor_q_sha256 = upstream_provenance.pop("factor_q_sha256")
+        _validate_sha256_hex("upstream_provenance['factor_p_sha256']", factor_p_sha256)
+        _validate_sha256_hex("upstream_provenance['factor_q_sha256']", factor_q_sha256)
+        factor_identity_source = "caller_attested"
+
+    sector_spec_sha256 = _kernel_spec_sha256({
+        "mesh_shape": mesh.shape, "mesh_spacing": mesh.spacing, "mesh_origin": mesh.origin,
+        "same_factor": same_factor, "storage_mode": "incore_full_theta",
+        "backend": backend, "realized_dtype": realized_dtype,
+        "grid_batch_size": grid_batch_size_realized, "rcond": rcond,
+        "jitter_used": float(jitter_used), "n_tries": int(n_tries),
+        "factor_identity_source": factor_identity_source,
+        "pivots_sha256": pivots_sha256, "factor_p_sha256": factor_p_sha256,
+        "factor_q_sha256": factor_q_sha256,
+        "solver_version": _POISSON_INTERPOLATION_SOLVER_VERSION,
+    })
+
+    return PoissonInterpolationSector(
+        Theta=Theta, pivots=pivots_backend,
+        mesh_shape=mesh.shape, mesh_spacing=mesh.spacing, mesh_origin=mesh.origin,
+        same_factor=same_factor, storage_mode="incore_full_theta",
+        backend=backend, device=device, realized_dtype=realized_dtype,
+        grid_batch_size=grid_batch_size_realized, rcond=rcond,
+        jitter_used=float(jitter_used), n_tries=int(n_tries),
+        factor_identity_source=factor_identity_source,
+        pivots_sha256=pivots_sha256, factor_p_sha256=factor_p_sha256,
+        factor_q_sha256=factor_q_sha256, sector_spec_sha256=sector_spec_sha256,
+        solver_version=_POISSON_INTERPOLATION_SOLVER_VERSION,
+        provenance=_deep_freeze(upstream_provenance),
+    )
+
+
+def poisson_core(left, right=None, *, kernel, mu_block_size=None, nu_block_size=None):
+    """Assemble a Z core from one (same-sector) or two (cross-sector)
+    PoissonInterpolationSector artifacts, via Z = dV * Theta_L^dagger V_R
+    where V_R = K Theta_R (section 5's solve_free_space_poisson, batched
+    over nu-blocks). Right-nu-outer/left-mu-inner loop: V is solved
+    EXACTLY ONCE per nu-block, never recomputed inside the mu-loop.
+
+    Args:
+        left: PoissonInterpolationSector for the sector (same-sector) or
+            sector A (cross-sector).
+        right: None (same-sector: right_sector = left, literally the
+            same Theta object, no duplication) or a PoissonInterpolationSector
+            for sector B (cross-sector).
+        kernel: FreeSpacePoissonKernel, REQUIRED. Its mesh geometry
+            (shape/spacing/origin) must match BOTH sectors' recorded
+            geometry exactly; its input_dtype must exactly match both
+            sectors' realized Theta dtype (no implicit promotion).
+        mu_block_size: bounds the left-side GEMM contraction slice width.
+            None resolves to left's full n_fused (single block); the
+            realized value is recorded.
+        nu_block_size: bounds the right-side Poisson-solve batch width
+            (and the resulting GEMM slice width). None resolves to the
+            right sector's full n_fused; the realized value is recorded.
+
+    Returns:
+        PoissonCoreArtifact.
+
+    Raises:
+        TypeError: left/right not a PoissonInterpolationSector, or
+            kernel not a FreeSpacePoissonKernel.
+        ValueError: mesh-geometry mismatch, backend mismatch, dtype
+            mismatch, or invalid block sizes.
+    """
+    if not isinstance(left, PoissonInterpolationSector):
+        raise TypeError("left must be a PoissonInterpolationSector.")
+    if right is not None and not isinstance(right, PoissonInterpolationSector):
+        raise TypeError("right must be a PoissonInterpolationSector or None.")
+    if not isinstance(kernel, FreeSpacePoissonKernel):
+        raise TypeError("kernel must be a FreeSpacePoissonKernel.")
+
+    right_sector = left if right is None else right
+
+    kernel_geometry = (kernel.mesh.shape, kernel.mesh.spacing, kernel.mesh.origin)
+    for sector, label in ((left, "left"), (right_sector, "right")):
+        sector_geometry = (sector.mesh_shape, sector.mesh_spacing, sector.mesh_origin)
+        if sector_geometry != kernel_geometry:
+            raise ValueError(
+                f"{label} sector's mesh geometry {sector_geometry} does not match "
+                f"kernel.mesh's geometry {kernel_geometry}."
+            )
+
+    if left.backend != right_sector.backend:
+        raise ValueError(
+            f"left.backend={left.backend!r} != right.backend={right_sector.backend!r}."
+        )
+    if left.backend != kernel.backend:
+        raise ValueError(
+            f"sector backend={left.backend!r} != kernel.backend={kernel.backend!r}."
+        )
+
+    input_dtype = np.dtype(kernel.input_dtype)
+    for sector, label in ((left, "left"), (right_sector, "right")):
+        if np.dtype(sector.realized_dtype) != input_dtype:
+            raise ValueError(
+                f"{label} sector's Theta dtype {sector.realized_dtype} != "
+                f"kernel.input_dtype {input_dtype} -- no implicit promotion; build the "
+                f"sector's factors at the exact dtype the kernel expects."
+            )
+
+    n_mu_left = left.Theta.shape[0]
+    n_mu_right = right_sector.Theta.shape[0]
+    mu_block_size_realized = (
+        _validate_positive_int("mu_block_size", mu_block_size)
+        if mu_block_size is not None else n_mu_left
+    )
+    nu_block_size_realized = (
+        _validate_positive_int("nu_block_size", nu_block_size)
+        if nu_block_size is not None else n_mu_right
+    )
+
+    xp = jnp if kernel.backend == "jax" else np
+    mesh_shape = kernel.mesh.shape
+    dV = kernel.mesh.spacing[0] * kernel.mesh.spacing[1] * kernel.mesh.spacing[2]
+
+    z_row_blocks = []
+    for nu_start in range(0, n_mu_right, nu_block_size_realized):
+        nu_end = min(nu_start + nu_block_size_realized, n_mu_right)
+        b_nu = nu_end - nu_start
+        theta_nu_block = right_sector.Theta[nu_start:nu_end, :]
+        rho_batch = theta_nu_block.reshape((b_nu,) + mesh_shape)
+        v_batch = solve_free_space_poisson(rho_batch, kernel)
+        v_flat = v_batch.reshape(b_nu, -1)
+
+        mu_blocks = []
+        for mu_start in range(0, n_mu_left, mu_block_size_realized):
+            mu_end = min(mu_start + mu_block_size_realized, n_mu_left)
+            theta_mu_block = left.Theta[mu_start:mu_end, :]
+            mu_blocks.append(dV * (theta_mu_block.conj() @ v_flat.T))  # (b_mu, b_nu)
+        z_row_blocks.append(xp.concatenate(mu_blocks, axis=0))  # (n_mu_left, b_nu)
+
+    Z = xp.concatenate(z_row_blocks, axis=1)  # (n_mu_left, n_mu_right)
+
+    device = "cpu" if kernel.backend == "numpy" else str(Z.device)
+    realized_dtype = str(Z.dtype)
+
+    return PoissonCoreArtifact(
+        Z=Z,
+        left_sector_spec_sha256=left.sector_spec_sha256,
+        right_sector_spec_sha256=right_sector.sector_spec_sha256,
+        left_n_fused=n_mu_left, right_n_fused=n_mu_right,
+        kernel_spec_sha256=kernel.kernel_spec_sha256,
+        mu_block_size=mu_block_size_realized, nu_block_size=nu_block_size_realized,
+        normalization="dV", backend=kernel.backend, device=device, realized_dtype=realized_dtype,
+        solver_version=_POISSON_INTERPOLATION_SOLVER_VERSION,
+    )
