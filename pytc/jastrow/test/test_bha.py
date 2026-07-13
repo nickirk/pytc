@@ -301,8 +301,13 @@ class TestBoysHandyAnalyticalPairGrid(unittest.TestCase):
         g_ref, l_ref = Jastrow.get_pair_grid_grad_lap(bha, elec_coords, params)
         g_new, l_new = bha.get_pair_grid_grad_lap(elec_coords, params)
 
-        np.testing.assert_allclose(np.array(g_new), np.array(g_ref), rtol=1e-10, atol=1e-10)
-        np.testing.assert_allclose(np.array(l_new), np.array(l_ref), rtol=1e-10, atol=1e-10)
+        # Compare off-diagonal entries only: the diagonal is meaningless
+        # by contract (masked out by every caller), and the base
+        # implementation deliberately displaces it to keep NaN-prone
+        # coincidence evaluations out of autodiff'd pair norms.
+        off = ~np.eye(n_elec, dtype=bool)
+        np.testing.assert_allclose(np.array(g_new)[off], np.array(g_ref)[off], rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(np.array(l_new)[off], np.array(l_ref)[off], rtol=1e-10, atol=1e-10)
 
     def test_pair_grid_matches_reference_lih(self):
         self._check(get_lih_molecule(), n_elec=4, key_seed=5)

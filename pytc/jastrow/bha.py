@@ -238,14 +238,9 @@ class BoysHandyAnalytical(BoysHandy):
             ``compute_jastrow_terms``'s vmap grid produces (BEFORE the
             diagonal mask and the sum-over-j reduction it applies next).
 
-        Note: at very small N (measured on A100: N~20, e.g. H20), the
-        fixed per-atom scan overhead here can be marginally slower on the
-        Jacobian phase than the base class's plain per-pair vmap grid
-        (H20: 0.044s pairwise vs 0.18s here -- both trivial in absolute
-        terms). The crossover is between N=20 and N=40; users targeting
-        small systems who care about that margin can construct generic
-        ``BoysHandy`` instead. No implicit switching between the two --
-        class choice is the only dispatch.
+        Note: at very small N the fixed per-atom scan overhead can be
+        marginally slower than the base per-pair grid; construct generic
+        ``BoysHandy`` for that case -- class choice is the only dispatch.
         """
         b = nn.softplus(params['b_raw'])
         d = nn.softplus(params['d_raw'])

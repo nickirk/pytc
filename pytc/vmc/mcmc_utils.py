@@ -433,41 +433,24 @@ def load_walkers(filepath: str):
 
 def resample_walkers(ansatz, walkers, target_n_walkers, step_size, jitter_scale=1.0, key=None):
     """Bootstrap-resample a smaller (already-equilibrated) walker ensemble
-    up to a larger target size.
-
-    Initializing a large ensemble by replicating a smaller, already
-    equilibrated one inherits most of its equilibration instead of paying
-    the full cold-start diffusion cost (cold-start burn-in at H300/W=30000
-    is ~12h at 2.2s/sweep, vs minutes of decorrelation after resampling).
+    up to a larger target size, inheriting its equilibration instead of
+    paying a full cold-start burn-in.
 
     Args:
-        ansatz: Wavefunction object with molecular info (drives
-                initialize_walker_state's zero-filled cache shapes).
+        ansatz: Wavefunction object with molecular info.
         walkers: Source Walker (any size), typically already equilibrated.
-        target_n_walkers: Desired walker count -- need not be an exact
-                multiple of the source count (sampled with replacement).
-        step_size: The SOURCE ensemble's adapted MCMC step size. Jitter
-                sigma is tied to this because
-                resampled positions are exact duplicates until jittered,
-                and the chain's own adapted step size is what's already
-                known to move a walker within its typical set over a few
-                sweeps -- an arbitrary constant could either barely
-                perturb duplicates (leaving them correlated) or kick them
-                out of the typical set entirely.
+        target_n_walkers: Desired walker count (sampled with replacement).
+        step_size: The SOURCE ensemble's adapted MCMC step size; jitter
+                sigma is tied to it so duplicates separate on the chain's
+                own scale rather than an arbitrary constant.
         jitter_scale: Multiplier on step_size for the jitter std dev.
-                Default 1.0 (same scale as one MCMC proposal).
         key: PRNG key.
 
     Returns:
-        A fresh Walker at target_n_walkers with cached fields zeroed and
-        move_mask all-True (same convention as a cold nucleus-centered
-        init, via initialize_walker_state) -- NOT a burn-in-complete
-        state on its own. The duplicate positions are not independent
-        samples until MCMC has had a chance to separate them, so callers
-        must still run a short decorrelation pass afterward. Track that
-        as sweeps-SINCE-resample when applying any stability criterion on
-        top of this -- checking raw step/batch count instead risks reading
-        "stable" off still-correlated duplicates.
+        A fresh Walker at target_n_walkers (cached fields zeroed,
+        move_mask all-True). Duplicates are not independent samples:
+        run a short decorrelation pass afterward, counting sweeps since
+        the resample when applying any stability criterion.
     """
     from .walker import initialize_walker_state
 

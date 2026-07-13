@@ -183,9 +183,17 @@ class Jastrow:
             u(r_i, r_j) wrt r_i. Diagonal (i == j) entries are meaningless
             and are masked out by the caller.
         """
-        def compute_pair(r_i, r_j):
-            return self.get_log_grads_r1(r_i, r_j, params)
+        def compute_pair(i, r_i, j, r_j):
+            # Displace the i == j diagonal before evaluating: the caller
+            # masks it out, but a NaN produced at r_i == r_j (0/0 in
+            # autodiff'd pair norms) survives a multiplicative mask
+            # (NaN * 0 = NaN). The displaced value is discarded, so its
+            # magnitude is irrelevant; index-based so genuinely coincident
+            # DISTINCT electrons still propagate their true value.
+            r_j_safe = jnp.where(i == j, r_j + 1.0, r_j)
+            return self.get_log_grads_r1(r_i, r_j_safe, params)
 
-        inner = jax.vmap(compute_pair, in_axes=(None, 0))
-        outer = jax.vmap(inner, in_axes=(0, None))
-        return outer(elec_coords, elec_coords)
+        idx = jnp.arange(elec_coords.shape[0])
+        inner = jax.vmap(compute_pair, in_axes=(None, None, 0, 0))
+        outer = jax.vmap(inner, in_axes=(0, 0, None, None))
+        return outer(idx, elec_coords, idx, elec_coords)

@@ -152,32 +152,23 @@ def adaptive_burn_in(
     variance_stability_rtol=0.02,
 ):
     """Burn in until the ensemble's E_L/Var estimates stabilize, instead of
-    a fixed step count.
+    a fixed step count (a count tuned for one system size under-provisions
+    a larger one, since equilibration time grows with system size).
 
-    A fixed burn-in count tuned for one system size silently
-    under-provisions a larger one (equilibration time grows with system
-    size; measured at H40/W=30000, the true plateau is ~15,000-20,000
-    sweeps where the old default provided 500). This replaces the guess
-    with a termination criterion: run in chunks of `chunk_size` sweeps
-    (orchestrating repeated unmodified burn_in() calls), and after each
-    chunk:
+    Runs in chunks of `chunk_size` sweeps; after each chunk:
 
     1. PRE-GATE on acceptance within `acceptance_tol` of
-       `acceptance_target`. Acceptance only reflects the step-size
-       adaptation reaching its target, not global |Psi|^2 mixing
-       (measured: acceptance locks to ~0.50 thousands of sweeps before E
-       stops drifting), so it is a necessary cheap pre-check, not the
-       stopping decision.
+       `acceptance_target`. Acceptance reflects only step-size
+       adaptation, not global |Psi|^2 mixing -- a cheap pre-check, not
+       the stopping decision.
     2. Once the pre-gate passes, compute batch-mean E_L and Var via
        `full_ansatz` (the physical trial wavefunction -- NOT `ref_det`,
        which only defines the sampling distribution) over a sliding
-       window of the last `stability_window` chunks. Terminate once E has
-       stayed within `energy_stability_atol` (absolute: E crosses zero
-       during equilibration, so a relative tolerance degenerates near the
-       crossing) and Var within `variance_stability_rtol` (relative: Var
-       is strictly positive) across the window.
-    3. Hard-capped at `max_steps` total sweeps so a system that never
-       stabilizes (or a badly-set tolerance) can't hang.
+       window of the last `stability_window` chunks. Terminate once E is
+       within `energy_stability_atol` (absolute: E crosses zero during
+       equilibration) and Var within `variance_stability_rtol`
+       (relative: Var is strictly positive) across the window.
+    3. Hard-capped at `max_steps` total sweeps.
 
     If `walkers` came from `mcmc_utils.resample_walkers`, this function's
     sweep counter is "sweeps since resample" by construction, so the
@@ -197,29 +188,19 @@ def adaptive_burn_in(
         key: PRNG key.
         move_type, max_vmap_batch_size, mesh: forwarded to burn_in.
         chunk_size: Sweeps per chunk (one step-size adaptation and one
-                stability check per chunk). Default 500 trades some
-                termination-point precision for ~5x fewer E_L-batch
-                evaluations at the measured 15,000-20,000-sweep
-                equilibration timescale.
-        max_steps: Hard cap on total sweeps. Default 50000 sits
-                comfortably above the measured H40/W=30000 plateau so the
-                stability criterion, not the cap, normally terminates;
-                slower systems may need it raised.
-        acceptance_target: Pre-gate center. Default 0.5, matching
-                burn_in's own step-size adaptation target.
-        acceptance_tol: Pre-gate band. Default 0.02 covers the measured
-                equilibrated spread (0.499-0.513) with margin while
-                staying far below unequilibrated readings (~0.67).
+                stability check per chunk).
+        max_steps: Hard cap on total sweeps; the stability criterion, not
+                the cap, should normally terminate.
+        acceptance_target: Pre-gate center, matching burn_in's step-size
+                adaptation target.
+        acceptance_tol: Pre-gate band around the target.
         stability_window: Number of consecutive chunks required stable.
         energy_stability_atol: Absolute energy tolerance (Ha) for the
-                window range. Default 0.05 Ha from the measured H40
-                plateau residual; callers on larger systems should scale
-                it (e.g. tolerance-per-atom * n_atoms) since equilibrium
-                fluctuations grow with system size.
+                window range; scale with system size (equilibrium
+                fluctuations grow with it).
         variance_stability_rtol: Relative tolerance for Var's window
-                range. Default 0.02: measured pre-plateau relative
-                changes are 20-130% vs 0.83% on the plateau, so 2% sits
-                above the plateau noise floor and below the transition.
+                range, above the plateau noise floor and below the
+                pre-plateau transition.
 
     Returns:
         Tuple of (equilibrated_walkers, chunk_history, new_key, step_size,

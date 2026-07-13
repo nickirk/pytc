@@ -45,8 +45,10 @@ def test_energy_loss():
     # Create energy loss
     loss_fn = make_energy_loss(ansatz, optimizer_type="adam")
     
-    # Compute loss
-    loss, (mean_e, std_e) = loss_fn(params, walkers)
+    # Compute loss (aux is an AuxData namedtuple; first two fields are
+    # mean energy and energy std)
+    loss, aux = loss_fn(params, walkers)
+    mean_e, std_e = aux[0], aux[1]
     
     print(f"Energy loss test:")
     print(f"  Loss: {loss:.6f}")
