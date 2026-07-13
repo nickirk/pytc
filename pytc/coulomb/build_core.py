@@ -11,44 +11,72 @@ Location: pytc/coulomb/, NOT pytc/df/ -- this module CHOOSES the
 MolecularDFReference kernel policy (calls compute_C_streamed), while
 pytc/df/fit.py stays kernel-agnostic (Alice, 2026-07-12).
 
-API (Alice's amendment to the initial proposal, 2026-07-12):
-1. Both RAW and selection-WEIGHTED MO-value factors must be passed
-   explicitly -- pivot SELECTION uses weighted values, P construction
-   uses RAW values (task #6's original bug: reusing weighted values for
-   P made compute_Z's rcond default silently depend on the grid
-   quadrature's weight scale).
+API, per two rounds of Alice's review (2026-07-12):
+
+Round 1 (initial proposal -> approved amendments):
+1. Weighted MO-value factors are now DERIVED INTERNALLY from raw
+   values + grid_weights (via pivot_selection.weight_mo_values), not
+   taken as a separate explicit parameter -- Alice's simplification
+   over her own original "pass both explicitly" ask: since grid_weights
+   is already a required parameter (for hashing), deriving removes the
+   raw/weighted consistency-mismatch class entirely rather than
+   requiring validation of it.
 2. Two-stage, typed API: build_sector(...) -> SectorFit(P, C, pivots,
-   provenance) is a reusable artifact; build_core(left, right=None)
-   -> CoreArtifact(Z, provenance) -- right=None is same-sector
-   (compute_Z), right=<SectorFit> is cross-sector (compute_Z_cross).
-   Cross-sector is NOT deferred: conventional CCSD's already-approved
-   contract needs oo/ov/vv same-sector cores AND their cross cores
-   (oo|vv, ov|vv) from the start.
-3. requested_rank, n_pivots (selected count), and numerical_rank
-   (pivoted_cholesky_pair_pivots's own Gram-spectrum-measured
-   effective_rank) are recorded as THREE DISTINCT provenance fields --
-   n_pivots is never presented as "effective rank" on its own.
-4. TWO separate canonical SHA-256 hashes: pivot_indices_sha256 (exact
-   integer index array) and grid_sha256 (canonicalized coords AND
-   weights together) -- grid_lvl + basis + geometry alone does not pin
-   the realized grid (pruning, atom-grid overrides, radii scheme, pyscf
-   version, and point ordering can all vary it). MO coefficients are
-   canonicalized (contiguous array + dtype/shape) before hashing too.
-   hashlib.sha256 throughout, never Python's built-in hash() (unstable
-   across processes/runs). upstream_provenance (pyscf/gpu4pyscf
-   versions, the actual realized grid settings) is caller-supplied
-   explicitly, never inferred via `mf` type inspection -- for the same
-   reason grid_sha256 exists: inference cannot see pruning/version/
-   ordering effects.
+   compatibility_key, provenance) is a reusable artifact; build_core
+   (left, right=None) -> CoreArtifact(Z, provenance) -- right=None is
+   same-sector (compute_Z), right=<SectorFit> is cross-sector
+   (compute_Z_cross). Cross-sector is NOT deferred: conventional CCSD's
+   approved contract needs oo/ov/vv same-sector cores AND their cross
+   cores (oo|vv, ov|vv) from the start.
+
+Round 2 (re-review of round-1 implementation -> 3 more fixes):
+3. numerical_rank is only reported as an EXACT value when
+   pivoted_cholesky_pair_pivots actually exhausted the effective prefix
+   within the analytically-capped candidate pool (rank_exhausted=True)
+   -- if every candidate pivot in a capped selection remained
+   "effective", that only proves rank >= n_rank_capped, NOT that
+   n_rank_capped IS the true rank (Alice's independent repro: random
+   3x12/3x12 factors, requested_rank=2 -> a capped run reported
+   numerical_rank=2 while the TRUE rank was 9). numerical_rank=None +
+   numerical_rank_lower_bound otherwise.
+4. Cross-sector joins now require a matching compatibility_key --
+   fingerprints molecule identity, the REALIZED auxiliary basis
+   (parsed function/exponent data, not just the auxbasis label string
+   -- two different custom auxbasis objects or pyscf versions can
+   realize different functions under the same label), kernel policy,
+   and pyscf version. build_core raises ValueError on a mismatched
+   cross join rather than silently joining two SectorFits built from
+   different molecules/kernels that happen to share an n_aux.
+5. SectorFit/CoreArtifact are genuinely immutable, not just
+   shallow-frozen dataclasses: P/C/pivots are DEFENSIVE COPIES with
+   the numpy write flag cleared (never the caller's own array object,
+   so construction never side-effects the caller's arrays), and
+   provenance dicts are recursively frozen (dict -> MappingProxyType,
+   list/tuple -> tuple, set -> frozenset) at every nesting level, not
+   just the top level -- a shallow top-level MappingProxyType still
+   lets nested keys like provenance['upstream_provenance']['x'] = ...
+   mutate an already-built artifact.
+
+Also (round 2): strict construction validation (grid/factor/mo_coeff
+shape consistency; same_factor=True requires factor_p_raw/factor_q_raw
+and mo_coeff_p/mo_coeff_q to actually be equal, not just same-shaped,
+since the n*(n+1)/2 triangular analytic rank cap assumes phi_p*phi_q ==
+phi_q*phi_p as functions); factor_p_raw_sha256/factor_q_raw_sha256
+added to provenance (the actual MO-value arrays used were not hashed
+before, only the claimed grid/mo_coeff); public exports added to
+pytc.coulomb.__init__.
 """
 
 import dataclasses
 import hashlib
 import logging
+import types
 
 import numpy as np
+import pyscf
+from pyscf.df.addons import make_auxmol
 
-from pytc.coulomb.pivot_selection import select_sector_pivots
+from pytc.coulomb.pivot_selection import select_sector_pivots, weight_mo_values
 from pytc.coulomb.molecular_df_reference import compute_C_streamed
 from pytc.df.fit import pair_collocation_at_pivots, compute_Z, compute_Z_cross
 
@@ -71,29 +99,88 @@ def _canonical_sha256(*arrays):
     return h.hexdigest()
 
 
+def _readonly_copy(a):
+    """Defensive COPY (never the caller's own array object) with the
+    numpy write flag cleared. np.asarray on an input that is already an
+    ndarray of matching dtype can return the SAME object with no copy --
+    calling setflags(write=False) on that result would silently mark
+    the CALLER's own array read-only as a side effect. Copy first,
+    always (Alice's build_core review, 2026-07-12)."""
+    a = np.array(a, copy=True)
+    a.setflags(write=False)
+    return a
+
+
+def _deep_freeze(obj):
+    """Recursively convert dict -> types.MappingProxyType, list/tuple ->
+    tuple, set -> frozenset, at every nesting level -- a shallow
+    top-level MappingProxyType still lets nested keys (e.g.
+    provenance['upstream_provenance']['x'] = ...) mutate an
+    already-built artifact (Alice's build_core review, 2026-07-12).
+    Leaves scalars, strings, and numpy arrays (handled separately via
+    _readonly_copy) unchanged."""
+    if isinstance(obj, types.MappingProxyType):
+        obj = dict(obj)
+    if isinstance(obj, dict):
+        return types.MappingProxyType({k: _deep_freeze(v) for k, v in obj.items()})
+    if isinstance(obj, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in obj)
+    if isinstance(obj, set):
+        return frozenset(_deep_freeze(v) for v in obj)
+    return obj
+
+
+def _kernel_compatibility_key(mf, kernel_policy, auxbasis):
+    """Fingerprint of everything that must match for two SectorFits' C
+    columns to represent the SAME ordered DF factor/kernel instance:
+    molecule identity (geometry/AO basis/charge/spin), the REALIZED
+    auxiliary basis (parsed exponent/coefficient data via
+    pyscf.df.addons.make_auxmol, not just the `auxbasis` label string --
+    two different custom auxbasis objects, or the same label realized
+    under different pyscf versions, can differ), kernel policy, and the
+    pyscf version itself (Alice's build_core review, 2026-07-12: "same
+    equal strings [for auxbasis] are not enough")."""
+    mol = mf.mol
+    auxmol = make_auxmol(mol, auxbasis)
+    h = hashlib.sha256()
+    h.update(repr(mol.atom).encode())
+    h.update(repr(mol.basis).encode())
+    h.update(str(mol.charge).encode())
+    h.update(str(mol.spin).encode())
+    h.update(_canonical_sha256(mol.atom_coords()).encode())
+    h.update(repr(auxmol._basis).encode())
+    h.update(str(auxmol.nao).encode())
+    h.update(kernel_policy.encode())
+    h.update(pyscf.__version__.encode())
+    return h.hexdigest()
+
+
 @dataclasses.dataclass(frozen=True)
 class SectorFit:
-    """One MO-pair sector's reusable ISDF/LS-THC fit artifact: pivots
-    selected, P and C constructed. Reusable across multiple build_core
-    joins (e.g. the same "vv" SectorFit feeds both the vv|vv same-sector
-    core and the oo|vv / ov|vv cross-sector cores) without recomputing
-    pivot selection or re-streaming the DF integrals."""
+    """One MO-pair sector's reusable, IMMUTABLE ISDF/LS-THC fit
+    artifact: pivots selected, P and C constructed. Reusable across
+    multiple build_core joins (e.g. the same "vv" SectorFit feeds both
+    the vv|vv same-sector core and the oo|vv / ov|vv cross-sector
+    cores) without recomputing pivot selection or re-streaming the DF
+    integrals. P/C/pivots are read-only array copies; provenance is
+    recursively frozen -- see _readonly_copy/_deep_freeze."""
     P: np.ndarray
     C: np.ndarray
     pivots: np.ndarray
-    provenance: dict
+    compatibility_key: str
+    provenance: types.MappingProxyType
 
 
 @dataclasses.dataclass(frozen=True)
 class CoreArtifact:
     """A completed Z core for one sector (same-sector) or one sector
-    pair (cross-sector), with full provenance."""
+    pair (cross-sector), with full, IMMUTABLE provenance."""
     Z: np.ndarray
-    provenance: dict
+    provenance: types.MappingProxyType
 
 
-def build_sector(mf, factor_p_raw, factor_q_raw, factor_p_weighted, factor_q_weighted,
-                  mo_coeff_p, mo_coeff_q, grid_coords, grid_weights, requested_rank,
+def build_sector(mf, factor_p_raw, factor_q_raw, mo_coeff_p, mo_coeff_q,
+                  grid_coords, grid_weights, requested_rank,
                   *, same_factor=False, effective_rank_rtol=1e-6, shift=None,
                   on_over_rank="truncate", kernel_policy="MolecularDFReference",
                   auxbasis="weigend", blksize=None, upstream_provenance=None):
@@ -102,46 +189,59 @@ def build_sector(mf, factor_p_raw, factor_q_raw, factor_p_weighted, factor_q_wei
 
     Args:
         mf: Converged mean-field object -- forwarded to compute_C_streamed
-            (kernel_policy="MolecularDFReference"'s DF-B-tensor route).
+            (kernel_policy="MolecularDFReference"'s DF-B-tensor route)
+            and fingerprinted into compatibility_key.
         factor_p_raw, factor_q_raw: (n_p/n_q, n_grid) RAW (unweighted)
             MO values -- used for P construction via
-            pair_collocation_at_pivots, NEVER for pivot selection.
-        factor_p_weighted, factor_q_weighted: (n_p/n_q, n_grid)
-            sqrt(weight)-scaled MO values (pytc.coulomb.pivot_selection.
-            weight_mo_values's convention) -- used for pivot SELECTION
-            only. Passing weighted values into P construction instead
-            was task #6's original bug (see pair_collocation_at_pivots's
-            docstring) -- both factor kinds are required explicitly here
-            so that mistake cannot recur inside this wrapper.
+            pair_collocation_at_pivots AND as the source for pivot-
+            selection weighting (weight_mo_values(factor, grid_weights)
+            is applied internally; passing an independently-supplied
+            "weighted" array was removed as an explicit parameter since
+            it could drift from raw*sqrt(|weights|) with nothing to
+            catch the mismatch).
         mo_coeff_p, mo_coeff_q: (n_ao, n_p/n_q) MO coefficients for this
             sector's two pair indices -- forwarded to compute_C_streamed
-            and hashed into provenance.
+            and hashed into provenance. Column count must match
+            factor_p_raw/factor_q_raw's row count.
         grid_coords: (n_grid, 3) grid point coordinates -- hashed into
-            provenance (grid_sha256) together with grid_weights; not
-            otherwise used numerically here (the factor_* arrays already
-            encode the grid's effect on the MO values).
-        grid_weights: (n_grid,) integration weights -- hashed alongside
-            grid_coords.
+            provenance (grid_sha256) together with grid_weights.
+        grid_weights: (n_grid,) integration weights -- used both to
+            derive the internal weighted factors and hashed into
+            provenance alongside grid_coords.
         requested_rank: Requested pivot-selection rank for this sector.
         same_factor: True for a symmetric sector (oo, vv) -- forwarded
-            to select_sector_pivots.
+            to select_sector_pivots. Requires factor_p_raw ==
+            factor_q_raw and mo_coeff_p == mo_coeff_q (validated,
+            raises ValueError otherwise): the n*(n+1)/2 triangular
+            analytic rank cap assumes phi_p*phi_q == phi_q*phi_p as
+            functions on the grid, which only holds when p and q are
+            literally the same orbital set.
         effective_rank_rtol, shift, on_over_rank: forwarded to
             select_sector_pivots.
-        kernel_policy: Recorded in provenance; only "MolecularDFReference"
-            is implemented so far (compute_C_streamed's DF-B-tensor route).
-        auxbasis, blksize: forwarded to compute_C_streamed.
+        kernel_policy: Recorded in provenance and fingerprinted into
+            compatibility_key; only "MolecularDFReference" is
+            implemented so far (compute_C_streamed's DF-B-tensor route).
+        auxbasis, blksize: forwarded to compute_C_streamed; auxbasis is
+            also fingerprinted (its REALIZED parsed basis, not just the
+            label) into compatibility_key.
         upstream_provenance: Caller-supplied dict of facts this function
-            cannot infer safely from `mf` alone -- pyscf/gpu4pyscf
-            versions, the ACTUAL grid settings used to build grid_coords/
+            cannot infer safely from `mf` alone -- gpu4pyscf version,
+            the ACTUAL grid settings used to build grid_coords/
             grid_weights/factor_* (level, pruning, atom-grid overrides,
-            radii scheme), basis name. Alice's ruling, 2026-07-12:
-            type-inspecting `mf` for this is unreliable, since none of
-            those realized-grid details are visible from `mf`'s type
-            alone. None becomes an empty dict, recorded as-is (not
-            validated -- this function trusts the caller's own record).
+            radii scheme). None becomes an empty dict, recorded as-is
+            (not validated -- this function trusts the caller's own
+            record; it does NOT participate in compatibility_key, which
+            only covers facts this function can independently verify).
 
     Returns:
-        SectorFit(P, C, pivots, provenance).
+        SectorFit(P, C, pivots, compatibility_key, provenance) -- P, C,
+        pivots are read-only array copies; provenance is a recursively
+        frozen (nested MappingProxyType) dict.
+
+    Raises:
+        ValueError: unsupported kernel_policy; grid/factor/mo_coeff
+            shape mismatch; same_factor=True with unequal
+            factor_p_raw/factor_q_raw or mo_coeff_p/mo_coeff_q.
     """
     if kernel_policy not in _SUPPORTED_KERNEL_POLICIES:
         raise ValueError(
@@ -151,12 +251,53 @@ def build_sector(mf, factor_p_raw, factor_q_raw, factor_p_weighted, factor_q_wei
         )
     factor_p_raw = np.asarray(factor_p_raw)
     factor_q_raw = np.asarray(factor_q_raw)
-    factor_p_weighted = np.asarray(factor_p_weighted)
-    factor_q_weighted = np.asarray(factor_q_weighted)
     mo_coeff_p = np.asarray(mo_coeff_p)
     mo_coeff_q = np.asarray(mo_coeff_q)
     grid_coords = np.asarray(grid_coords)
     grid_weights = np.asarray(grid_weights)
+
+    n_grid = grid_coords.shape[0]
+    if grid_weights.shape[0] != n_grid:
+        raise ValueError(
+            f"grid_weights length ({grid_weights.shape[0]}) != grid_coords length "
+            f"({n_grid})."
+        )
+    if factor_p_raw.shape[1] != n_grid:
+        raise ValueError(
+            f"factor_p_raw grid axis ({factor_p_raw.shape[1]}) != grid_coords length "
+            f"({n_grid})."
+        )
+    if factor_q_raw.shape[1] != n_grid:
+        raise ValueError(
+            f"factor_q_raw grid axis ({factor_q_raw.shape[1]}) != grid_coords length "
+            f"({n_grid})."
+        )
+    if mo_coeff_p.shape[1] != factor_p_raw.shape[0]:
+        raise ValueError(
+            f"mo_coeff_p has {mo_coeff_p.shape[1]} MO columns but factor_p_raw has "
+            f"{factor_p_raw.shape[0]} rows -- these must describe the same orbital set."
+        )
+    if mo_coeff_q.shape[1] != factor_q_raw.shape[0]:
+        raise ValueError(
+            f"mo_coeff_q has {mo_coeff_q.shape[1]} MO columns but factor_q_raw has "
+            f"{factor_q_raw.shape[0]} rows -- these must describe the same orbital set."
+        )
+    if same_factor:
+        if factor_p_raw.shape != factor_q_raw.shape or not np.array_equal(factor_p_raw, factor_q_raw):
+            raise ValueError(
+                "same_factor=True requires factor_p_raw and factor_q_raw to be the "
+                "SAME orbital set (phi_p*phi_q == phi_q*phi_p as functions on the grid "
+                "-- the assumption behind the n*(n+1)/2 triangular analytic rank cap) "
+                "-- got numerically different arrays."
+            )
+        if mo_coeff_p.shape != mo_coeff_q.shape or not np.array_equal(mo_coeff_p, mo_coeff_q):
+            raise ValueError(
+                "same_factor=True requires mo_coeff_p and mo_coeff_q to be the SAME "
+                "MO coefficients, consistent with factor_p_raw/factor_q_raw."
+            )
+
+    factor_p_weighted = weight_mo_values(factor_p_raw, grid_weights)
+    factor_q_weighted = weight_mo_values(factor_q_raw, grid_weights)
 
     pivots, pivot_provenance = select_sector_pivots(
         factor_p_weighted, factor_q_weighted, requested_rank, shift=shift,
@@ -167,19 +308,32 @@ def build_sector(mf, factor_p_raw, factor_q_raw, factor_p_weighted, factor_q_wei
     P = pair_collocation_at_pivots(factor_p_raw[:, pivots], factor_q_raw[:, pivots])
     C = compute_C_streamed(mf, P, mo_coeff_p, mo_coeff_q, auxbasis=auxbasis, blksize=blksize)
 
+    compatibility_key = _kernel_compatibility_key(mf, kernel_policy, auxbasis)
+
     provenance = {
         "kernel_policy": kernel_policy,
         "kernel_policy_params": {"auxbasis": auxbasis, "blksize": blksize},
         "same_factor": same_factor,
         "effective_rank_rtol": effective_rank_rtol,
-        **pivot_provenance,  # requested_rank, analytic_rank_bound, n_rank_capped, numerical_rank, n_pivots
+        **pivot_provenance,  # requested_rank, analytic_rank_bound, n_rank_capped,
+                              # rank_exhausted, numerical_rank, numerical_rank_lower_bound, n_pivots
         "pivot_indices_sha256": _canonical_sha256(pivots),
         "grid_sha256": _canonical_sha256(grid_coords, grid_weights),
         "mo_coeff_p_sha256": _canonical_sha256(mo_coeff_p),
         "mo_coeff_q_sha256": _canonical_sha256(mo_coeff_q),
+        "factor_p_raw_sha256": _canonical_sha256(factor_p_raw),
+        "factor_q_raw_sha256": _canonical_sha256(factor_q_raw),
+        "compatibility_key": compatibility_key,
         "upstream_provenance": dict(upstream_provenance) if upstream_provenance else {},
     }
-    return SectorFit(P=P, C=C, pivots=pivots, provenance=provenance)
+
+    return SectorFit(
+        P=_readonly_copy(P),
+        C=_readonly_copy(C),
+        pivots=_readonly_copy(pivots),
+        compatibility_key=compatibility_key,
+        provenance=_deep_freeze(provenance),
+    )
 
 
 def build_core(left, right=None, rcond=None, solver="cholesky_jitter", **solver_kwargs):
@@ -196,7 +350,12 @@ def build_core(left, right=None, rcond=None, solver="cholesky_jitter", **solver_
             artifacts are never the literal same sector by construction
             of this API, so same_sector=False is always correct here.
             Use build_core(sf) (right=None), not build_core(sf, sf),
-            for the same-sector case.
+            for the same-sector case). Rejected with ValueError unless
+            right.compatibility_key == left.compatibility_key -- same
+            n_aux is NOT sufficient evidence that C_left C_right^dagger
+            is physically meaningful (they could come from different
+            molecules/auxbases/kernel policies that happen to realize
+            the same auxiliary dimension).
         rcond, solver, **solver_kwargs: forwarded to compute_Z/
             compute_Z_cross (tsvd_rcond, backward_error_mode,
             backward_error_tol, residual_mode, residual_n_probes,
@@ -206,13 +365,28 @@ def build_core(left, right=None, rcond=None, solver="cholesky_jitter", **solver_
         CoreArtifact(Z, provenance) -- provenance merges compute_Z's/
         compute_Z_cross's own solver-level dict with each side's
         SectorFit provenance (key "sector" when same-sector, keys
-        "left_sector"/"right_sector" when cross-sector).
+        "left_sector"/"right_sector" when cross-sector), recursively
+        frozen.
+
+    Raises:
+        ValueError: right is not None and
+            right.compatibility_key != left.compatibility_key.
     """
     if right is None:
         Z, solver_provenance = compute_Z(
             left.P, left.C, rcond=rcond, solver=solver, **solver_kwargs)
         provenance = {**solver_provenance, "sector": left.provenance}
     else:
+        if left.compatibility_key != right.compatibility_key:
+            raise ValueError(
+                f"Cross-sector join rejected: left.compatibility_key "
+                f"({left.compatibility_key[:12]}...) != right.compatibility_key "
+                f"({right.compatibility_key[:12]}...) -- these SectorFits do not "
+                f"share the same molecule/basis/auxbasis/kernel-policy/pyscf-version "
+                f"identity, so C_left C_right^dagger would not represent a physically "
+                f"meaningful cross-sector ERI block even if their auxiliary "
+                f"dimensions happen to match."
+            )
         Z, solver_provenance = compute_Z_cross(
             left.P, left.C, right.P, right.C, rcond=rcond, solver=solver,
             same_sector=False, **solver_kwargs)
@@ -221,4 +395,4 @@ def build_core(left, right=None, rcond=None, solver="cholesky_jitter", **solver_
             "left_sector": left.provenance,
             "right_sector": right.provenance,
         }
-    return CoreArtifact(Z=Z, provenance=provenance)
+    return CoreArtifact(Z=_readonly_copy(Z), provenance=_deep_freeze(provenance))

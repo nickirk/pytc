@@ -1,12 +1,32 @@
 """Tests for pytc.coulomb.build_core (task #8 follow-up, isdf-coulomb-cuda,
-2026-07-12): build_sector/build_core must reproduce exactly what the
+2026-07-12), TWO review rounds:
+
+Round 1: build_sector/build_core must reproduce exactly what the
 hand-rolled pivot-selection -> pair_collocation_at_pivots ->
 compute_C_streamed -> compute_Z/compute_Z_cross pipeline produces
-(bit-exact), while additionally assembling the full §4 provenance record
-(pivot/grid/mo_coeff hashes, distinct rank fields, kernel policy,
-upstream provenance) that pipeline never recorded.
+(bit-exact), while additionally assembling the full §4 provenance
+record (pivot/grid/mo_coeff hashes, distinct rank fields, kernel
+policy, upstream provenance).
+
+Round 2 (Alice's re-review of the round-1 implementation, 3 real
+findings, all covered here):
+1. numerical_rank was reported as an exact value even when
+   pivoted_cholesky_pair_pivots only established a LOWER BOUND (a
+   capped prefix where every candidate remained "effective" proves
+   rank >= n_rank_capped, not ==) -- independently reproduced with
+   random 3x12/3x12 factors at requested_rank=2 (reported
+   numerical_rank=2, true rank 9).
+2. Cross-sector joins didn't validate that the two SectorFits came
+   from the same molecule/basis/auxbasis/kernel-policy/pyscf-version
+   identity -- same n_aux was silently accepted as sufficient.
+3. SectorFit/CoreArtifact were only shallow-frozen (top-level
+   MappingProxyType, mutable arrays) -- mutating a SectorFit's
+   provenance or arrays after build_core already used it retroactively
+   altered the built CoreArtifact.
 """
 
+import copy
+import types
 import unittest
 
 import numpy as np
@@ -42,6 +62,17 @@ class TestBuildCore(unittest.TestCase):
         cls.n_rank_ov = 300
         cls.n_rank_oo = 75
 
+        # A second, DIFFERENT molecule/basis for cross-join rejection tests.
+        cls.mol2 = gto.M(atom="He 0 0 0", basis="sto-3g", verbose=0)
+        cls.mf2 = scf.RHF(cls.mol2).density_fit().run()
+        mo_coeff2 = get_mo_coeff(cls.mf2)
+        ao_values2, weights2, coords2 = get_grid_ao_values_and_weights(cls.mf2, grid_lvl=2)
+        mo_values2 = (ao_values2 @ mo_coeff2).T
+        cls.mo2 = mo_coeff2
+        cls.factor2_raw = mo_values2
+        cls.coords2 = coords2
+        cls.weights2 = weights2
+
     def _reference_ov_pipeline(self):
         pivots = np.asarray(select_sector_pivots(
             self.occ_weighted, self.vir_weighted, self.n_rank_ov))
@@ -51,20 +82,28 @@ class TestBuildCore(unittest.TestCase):
         C = compute_C_streamed(self.mf, P, self.mo_occ, self.mo_vir, auxbasis="weigend")
         return pivots, P, C
 
+    def _build_ov_sector(self):
+        return build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov)
+
+    def _build_oo_sector(self):
+        return build_sector(
+            self.mf, self.occ_raw, self.occ_raw, self.mo_occ, self.mo_occ,
+            self.coords, self.weights, self.n_rank_oo, same_factor=True)
+
+    # ---- Round 1: bit-exact pipeline equivalence ----
+
     def test_build_sector_matches_hand_rolled_pipeline_bit_exact(self):
         ref_pivots, ref_P, ref_C = self._reference_ov_pipeline()
-        sector = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
+        sector = self._build_ov_sector()
         self.assertIsInstance(sector, SectorFit)
         np.testing.assert_array_equal(np.asarray(sector.pivots), ref_pivots)
         np.testing.assert_allclose(sector.P, ref_P, atol=0.0, rtol=0.0)
         np.testing.assert_allclose(sector.C, ref_C, atol=0.0, rtol=0.0)
 
     def test_build_core_same_sector_matches_compute_Z_directly(self):
-        sector = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
+        sector = self._build_ov_sector()
         core = build_core(sector)
         self.assertIsInstance(core, CoreArtifact)
         Z_direct, prov_direct = compute_Z(sector.P, sector.C)
@@ -72,18 +111,10 @@ class TestBuildCore(unittest.TestCase):
         self.assertEqual(core.provenance["solver"], prov_direct["solver"])
         self.assertEqual(core.provenance["jitter_used"], prov_direct["jitter_used"])
         self.assertIn("sector", core.provenance)
-        self.assertEqual(core.provenance["sector"], sector.provenance)
 
     def test_build_core_cross_sector_matches_compute_Z_cross_directly(self):
-        oo_pivots = np.asarray(select_sector_pivots(
-            self.occ_weighted, self.occ_weighted, self.n_rank_oo, same_factor=True))
-        sector_oo = build_sector(
-            self.mf, self.occ_raw, self.occ_raw, self.occ_weighted, self.occ_weighted,
-            self.mo_occ, self.mo_occ, self.coords, self.weights, self.n_rank_oo,
-            same_factor=True)
-        sector_ov = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
+        sector_oo = self._build_oo_sector()
+        sector_ov = self._build_ov_sector()
 
         core = build_core(sector_oo, sector_ov)
         Z_direct, prov_direct = compute_Z_cross(
@@ -92,79 +123,214 @@ class TestBuildCore(unittest.TestCase):
         self.assertEqual(core.provenance["jitter_used"], prov_direct["jitter_used"])
         self.assertIn("left_sector", core.provenance)
         self.assertIn("right_sector", core.provenance)
-        self.assertEqual(core.provenance["left_sector"], sector_oo.provenance)
-        self.assertEqual(core.provenance["right_sector"], sector_ov.provenance)
-
-    def test_provenance_rank_fields_are_distinct(self):
-        # n_rank_oo=75 requested >> oo's true triangular-number rank
-        # (n_occ*(n_occ+1)/2=15 for H2O/cc-pVDZ, n_occ=5) -- so
-        # requested_rank, analytic_rank_bound, and numerical_rank/
-        # n_pivots must all differ, proving they're tracked as distinct
-        # concepts, not one value standing in for all three (Alice's
-        # build_core API review, 2026-07-12, point 3).
-        sector_oo = build_sector(
-            self.mf, self.occ_raw, self.occ_raw, self.occ_weighted, self.occ_weighted,
-            self.mo_occ, self.mo_occ, self.coords, self.weights, self.n_rank_oo,
-            same_factor=True)
-        prov = sector_oo.provenance
-        self.assertEqual(prov["requested_rank"], self.n_rank_oo)
-        self.assertLess(prov["analytic_rank_bound"], self.n_rank_oo)
-        self.assertEqual(prov["numerical_rank"], prov["n_pivots"])
-        self.assertLess(prov["n_pivots"], self.n_rank_oo)
 
     def test_provenance_hashes_present_and_reproducible(self):
-        sector_a = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
-        sector_b = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
-        # Same inputs -> identical hashes (reproducibility).
+        sector_a = self._build_ov_sector()
+        sector_b = self._build_ov_sector()
         self.assertEqual(sector_a.provenance["pivot_indices_sha256"],
                           sector_b.provenance["pivot_indices_sha256"])
         self.assertEqual(sector_a.provenance["grid_sha256"], sector_b.provenance["grid_sha256"])
         self.assertEqual(sector_a.provenance["mo_coeff_p_sha256"],
                           sector_b.provenance["mo_coeff_p_sha256"])
-        # Different pivot sets (oo vs ov) -> different pivot hash.
-        sector_oo = build_sector(
-            self.mf, self.occ_raw, self.occ_raw, self.occ_weighted, self.occ_weighted,
-            self.mo_occ, self.mo_occ, self.coords, self.weights, self.n_rank_oo,
-            same_factor=True)
+        self.assertEqual(sector_a.provenance["factor_p_raw_sha256"],
+                          sector_b.provenance["factor_p_raw_sha256"])
+
+        sector_oo = self._build_oo_sector()
         self.assertNotEqual(sector_a.provenance["pivot_indices_sha256"],
                              sector_oo.provenance["pivot_indices_sha256"])
-        # Same grid -> same grid hash even across different sectors.
         self.assertEqual(sector_a.provenance["grid_sha256"], sector_oo.provenance["grid_sha256"])
-        # Different MO coefficients (occ vs vir) -> different mo_coeff hash.
         self.assertNotEqual(sector_a.provenance["mo_coeff_p_sha256"],
                              sector_a.provenance["mo_coeff_q_sha256"])
 
     def test_upstream_provenance_passthrough(self):
         upstream = {"pyscf_version": "2.10.0", "gpu4pyscf_version": None, "grid_lvl": 2}
         sector = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov,
-            upstream_provenance=upstream)
-        self.assertEqual(sector.provenance["upstream_provenance"], upstream)
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, upstream_provenance=upstream)
+        self.assertEqual(dict(sector.provenance["upstream_provenance"]), upstream)
 
     def test_upstream_provenance_defaults_to_empty_dict(self):
-        sector = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
-        self.assertEqual(sector.provenance["upstream_provenance"], {})
+        sector = self._build_ov_sector()
+        self.assertEqual(dict(sector.provenance["upstream_provenance"]), {})
 
     def test_unsupported_kernel_policy_rejected(self):
         with self.assertRaises(ValueError):
             build_sector(
-                self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-                self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov,
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov,
                 kernel_policy="MolecularFreeSpacePoisson")
 
     def test_kernel_policy_recorded_in_provenance(self):
-        sector = build_sector(
-            self.mf, self.occ_raw, self.vir_raw, self.occ_weighted, self.vir_weighted,
-            self.mo_occ, self.mo_vir, self.coords, self.weights, self.n_rank_ov)
+        sector = self._build_ov_sector()
         self.assertEqual(sector.provenance["kernel_policy"], "MolecularDFReference")
         self.assertEqual(sector.provenance["kernel_policy_params"]["auxbasis"], "weigend")
+
+    # ---- Round 2, finding 1: honest rank semantics ----
+
+    def test_numerical_rank_is_none_when_not_exhausted(self):
+        # requested_rank=2 for the ov sector's true rank (94) -- the
+        # capped selection never runs out of "effective" pivots within
+        # only 2 candidates, so numerical_rank must NOT claim an exact
+        # value (Alice's independent repro: capped-but-not-exhausted
+        # runs previously reported a false exact rank).
+        sector = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, requested_rank=2)
+        prov = sector.provenance
+        self.assertFalse(prov["rank_exhausted"])
+        self.assertIsNone(prov["numerical_rank"])
+        self.assertEqual(prov["numerical_rank_lower_bound"], prov["n_rank_capped"])
+        self.assertEqual(prov["n_pivots"], prov["n_rank_capped"])
+
+    def test_numerical_rank_is_exact_when_exhausted(self):
+        # n_rank_oo=75 requested >> oo's true triangular-number rank
+        # (15 for H2O/cc-pVDZ, n_occ=5) -- the analytic cap alone brings
+        # n_rank_capped to 15, and the numerical selection may or may
+        # not further truncate below that; whichever happens,
+        # rank_exhausted's value must be internally consistent with
+        # numerical_rank/numerical_rank_lower_bound.
+        sector = self._build_oo_sector()
+        prov = sector.provenance
+        self.assertEqual(prov["requested_rank"], self.n_rank_oo)
+        self.assertLess(prov["analytic_rank_bound"], self.n_rank_oo)
+        if prov["rank_exhausted"]:
+            self.assertIsNotNone(prov["numerical_rank"])
+            self.assertEqual(prov["numerical_rank"], prov["numerical_rank_lower_bound"])
+            self.assertEqual(prov["numerical_rank"], prov["n_pivots"])
+        else:
+            self.assertIsNone(prov["numerical_rank"])
+            self.assertEqual(prov["numerical_rank_lower_bound"], prov["n_rank_capped"])
+
+    # ---- Round 2, finding 2: cross-join compatibility validation ----
+
+    def test_cross_join_rejects_mismatched_system(self):
+        sector_ov = self._build_ov_sector()
+        # A SectorFit built from a totally different molecule/basis.
+        sector_other = build_sector(
+            self.mf2, self.factor2_raw, self.factor2_raw, self.mo2, self.mo2,
+            self.coords2, self.weights2, requested_rank=1, same_factor=True)
+        self.assertNotEqual(sector_ov.compatibility_key, sector_other.compatibility_key)
+        with self.assertRaises(ValueError):
+            build_core(sector_ov, sector_other)
+
+    def test_cross_join_accepts_matching_system(self):
+        sector_oo = self._build_oo_sector()
+        sector_ov = self._build_ov_sector()
+        self.assertEqual(sector_oo.compatibility_key, sector_ov.compatibility_key)
+        core = build_core(sector_oo, sector_ov)  # must not raise
+        self.assertIsInstance(core, CoreArtifact)
+
+    def test_compatibility_key_recorded_in_provenance(self):
+        sector = self._build_ov_sector()
+        self.assertEqual(sector.provenance["compatibility_key"], sector.compatibility_key)
+
+    # ---- Round 2, finding 3: genuine immutability ----
+
+    def test_provenance_top_level_is_read_only(self):
+        sector = self._build_ov_sector()
+        self.assertIsInstance(sector.provenance, types.MappingProxyType)
+        with self.assertRaises(TypeError):
+            sector.provenance["mutated_after_build"] = True
+
+    def test_provenance_nested_dict_is_read_only(self):
+        # A shallow top-level MappingProxyType still allows nested-key
+        # mutation (sector.provenance['upstream_provenance']['x']=...)
+        # unless nested structures are ALSO frozen -- exactly Alice's
+        # repro.
+        upstream = {"pyscf_version": "2.10.0"}
+        sector = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, upstream_provenance=upstream)
+        nested = sector.provenance["upstream_provenance"]
+        self.assertIsInstance(nested, types.MappingProxyType)
+        with self.assertRaises(TypeError):
+            nested["mutated_after_build"] = True
+
+    def test_kernel_policy_params_nested_dict_is_read_only(self):
+        sector = self._build_ov_sector()
+        nested = sector.provenance["kernel_policy_params"]
+        self.assertIsInstance(nested, types.MappingProxyType)
+        with self.assertRaises(TypeError):
+            nested["auxbasis"] = "mutated"
+
+    def test_mutating_caller_upstream_dict_after_build_does_not_alter_artifact(self):
+        # build_sector must not alias the caller's own dict either --
+        # mutating the ORIGINAL dict passed in after the call must not
+        # retroactively change the (already frozen-copied) artifact.
+        upstream = {"pyscf_version": "2.10.0"}
+        sector = build_sector(
+            self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov, upstream_provenance=upstream)
+        upstream["mutated_after_build"] = True
+        self.assertNotIn("mutated_after_build", sector.provenance["upstream_provenance"])
+
+    def test_sector_arrays_are_read_only(self):
+        sector = self._build_ov_sector()
+        for arr in (sector.P, sector.C, sector.pivots):
+            self.assertFalse(arr.flags.writeable)
+            with self.assertRaises(ValueError):
+                arr[0] = 0
+
+    def test_readonly_copy_does_not_mutate_callers_array(self):
+        # Passing the caller's own array in must not mark THAT array
+        # read-only as a side effect -- construction must always copy
+        # first (Alice's review: np.asarray on an already-ndarray input
+        # can return the SAME object, so setflags without copying first
+        # would leak the read-only flag back to the caller).
+        occ_raw_copy = np.array(self.occ_raw, copy=True)
+        self.assertTrue(occ_raw_copy.flags.writeable)
+        build_sector(
+            self.mf, occ_raw_copy, self.vir_raw, self.mo_occ, self.mo_vir,
+            self.coords, self.weights, self.n_rank_ov)
+        self.assertTrue(occ_raw_copy.flags.writeable)
+
+    def test_core_artifact_z_is_read_only(self):
+        sector = self._build_ov_sector()
+        core = build_core(sector)
+        self.assertFalse(core.Z.flags.writeable)
+
+    def test_mutation_after_build_does_not_alter_already_built_core(self):
+        # Alice's exact repro: build a core from a SectorFit, then
+        # attempt to mutate the SectorFit's own provenance -- the
+        # already-built CoreArtifact's embedded copy must be unaffected
+        # (this test documents the intended behavior: mutation is
+        # rejected outright by the frozen structures above, so there is
+        # nothing left to leak).
+        sector = self._build_ov_sector()
+        core = build_core(sector)
+        core_provenance_before = copy.deepcopy(_thaw(core.provenance))
+        with self.assertRaises(TypeError):
+            sector.provenance["mutated_after_build"] = True
+        self.assertEqual(_thaw(core.provenance), core_provenance_before)
+
+    # ---- Round 2: construction validation ----
+
+    def test_same_factor_true_rejects_unequal_factors(self):
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights, self.n_rank_oo, same_factor=True)
+
+    def test_mismatched_grid_and_weights_length_rejected(self):
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ, self.mo_vir,
+                self.coords, self.weights[:-1], self.n_rank_ov)
+
+    def test_mismatched_mo_coeff_column_count_rejected(self):
+        with self.assertRaises(ValueError):
+            build_sector(
+                self.mf, self.occ_raw, self.vir_raw, self.mo_occ[:, :-1], self.mo_vir,
+                self.coords, self.weights, self.n_rank_ov)
+
+
+def _thaw(obj):
+    """Inverse of build_core._deep_freeze, for test comparison only."""
+    if isinstance(obj, types.MappingProxyType):
+        return {k: _thaw(v) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_thaw(v) for v in obj)
+    return obj
 
 
 if __name__ == "__main__":

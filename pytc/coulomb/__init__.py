@@ -26,6 +26,12 @@ from .molecular_df_reference import (
     compute_Z_cross,
     reconstruct_eri_block,
 )
+from .build_core import (
+    SectorFit,
+    CoreArtifact,
+    build_sector,
+    build_core,
+)
 
 __all__ = [
     "get_mo_coeff",
@@ -42,4 +48,8 @@ __all__ = [
     "compute_Z",
     "compute_Z_cross",
     "reconstruct_eri_block",
+    "SectorFit",
+    "CoreArtifact",
+    "build_sector",
+    "build_core",
 ]

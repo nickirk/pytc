@@ -96,14 +96,28 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
         return_provenance: False (default, unchanged return type) or
             True to additionally return a provenance dict distinguishing
             requested_rank, analytic_rank_bound, n_rank_capped,
-            numerical_rank (pivoted_cholesky_pair_pivots's own measured
-            effective_rank), and n_pivots (len of the final, possibly
-            truncated, pivots array) -- these are DISTINCT concepts a
-            caller assembling a full provenance record (e.g.
-            pytc.coulomb.build_core) must not conflate; in particular
-            n_pivots must never be presented as "effective/numerical
-            rank" on its own (Alice's task #8 build_core API review,
-            2026-07-12).
+            rank_exhausted, numerical_rank, numerical_rank_lower_bound,
+            and n_pivots (len of the final, possibly truncated, pivots
+            array) -- these are DISTINCT concepts a caller assembling a
+            full provenance record (e.g. pytc.coulomb.build_core) must
+            not conflate; in particular n_pivots must never be presented
+            as "effective/numerical rank" on its own (Alice's task #8
+            build_core API review, 2026-07-12).
+
+            numerical_rank semantics (Alice's SECOND build_core review,
+            2026-07-12): pivoted_cholesky_pair_pivots only ever observes
+            a PREFIX of length n_rank_capped. If every candidate pivot
+            in that capped prefix remains "effective" (no truncation),
+            that proves only rank >= n_rank_capped -- NOT that
+            n_rank_capped is the true rank (independent repro: random
+            3x12/3x12 factors, requested_rank=2 gave a capped run
+            reporting "numerical_rank=2" while the array's TRUE rank
+            was 9). So numerical_rank is the EXACT measured rank
+            (=effective_rank) ONLY when rank_exhausted is True
+            (effective_rank < n_rank_capped, i.e. the algorithm actually
+            ran out of real signal within the capped pool); otherwise
+            numerical_rank is None and only numerical_rank_lower_bound
+            (=effective_rank, which then equals n_rank_capped) is known.
 
     Returns:
         pivots: (k,) selected grid-point indices, k <= n_rank (bounded
@@ -165,11 +179,14 @@ def select_sector_pivots(factor_p_weighted, factor_q_weighted, n_rank, shift=Non
         )
     if not return_provenance:
         return pivots
+    rank_exhausted = bool(effective_rank < n_rank_capped)
     provenance = {
         "requested_rank": int(n_rank),
         "analytic_rank_bound": int(analytic_rank_bound),
         "n_rank_capped": int(n_rank_capped),
-        "numerical_rank": int(effective_rank),
+        "rank_exhausted": rank_exhausted,
+        "numerical_rank": int(effective_rank) if rank_exhausted else None,
+        "numerical_rank_lower_bound": int(effective_rank),
         "n_pivots": int(len(pivots)),
     }
     return pivots, provenance
