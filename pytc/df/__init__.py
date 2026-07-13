@@ -23,6 +23,12 @@ from .isdf import (
     _pivoted_cholesky_phi,
     _pivoted_cholesky_grad,
 )
+from .fit import (
+    pair_collocation_at_pivots,
+    compute_Z,
+    compute_Z_cross,
+    reconstruct_eri_block,
+)
 
 __all__ = [
     "pivoted_cholesky_pair_pivots",
@@ -31,4 +37,8 @@ __all__ = [
     "prepare_normal_equations_solver",
     "solve_normal_equations_batch_prepared",
     "isdf_decompose",
+    "pair_collocation_at_pivots",
+    "compute_Z",
+    "compute_Z_cross",
+    "reconstruct_eri_block",
 ]
