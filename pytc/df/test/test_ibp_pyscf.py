@@ -311,6 +311,36 @@ class TestIBPISDFStaleMolecule(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 access()
 
+    def test_inplace_basis_mutation_same_nao_after_build_is_rejected(self):
+        # A basis exponent change at FIXED nao must still be caught (the
+        # fingerprint binds the realized _atm/_bas/_env, not just nao/coords).
+        from pyscf import gto
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74",
+                    basis={"H": gto.basis.parse("H S\n1.0 1.0")}, verbose=0)
+        p = IBPISDF(mol, rank=3, grid_level=1)
+        p.build()
+        nao_before = p.mol.nao
+        p.mol.basis = {"H": gto.basis.parse("H S\n2.0 1.0")}  # same nao, new exponent
+        p.mol.build()
+        self.assertEqual(p.mol.nao, nao_before)
+        for access in (p.build, p.get_naoaux, lambda: list(p.loop())):
+            with self.assertRaises(RuntimeError):
+                access()
+
+    def test_mol_fingerprint_discriminates_basis_ecp_and_flags(self):
+        from pyscf import gto
+        base = gto.M(atom="H 0 0 0; H 0 0 0.74",
+                     basis={"H": gto.basis.parse("H S\n1.0 1.0")}, verbose=0)
+        other_exp = gto.M(atom="H 0 0 0; H 0 0 0.74",
+                          basis={"H": gto.basis.parse("H S\n2.0 1.0")}, verbose=0)
+        self.assertEqual(base.nao, other_exp.nao)
+        self.assertNotEqual(_mol_fingerprint(base), _mol_fingerprint(other_exp))
+        # _ecpbas is bound: a (simulated) ECP table changes the fingerprint.
+        ecp_mol = gto.M(atom="H 0 0 0; H 0 0 0.74",
+                        basis={"H": gto.basis.parse("H S\n1.0 1.0")}, verbose=0)
+        ecp_mol._ecpbas = np.array([[0, 0, 1, 0, 0, 0, 0, 0]], dtype=np.int32)
+        self.assertNotEqual(_mol_fingerprint(base), _mol_fingerprint(ecp_mol))
+
     def test_reset_then_rebuild_after_mutation_succeeds(self):
         p = IBPISDF(_h2(), rank=3, grid_level=1)
         p.build()

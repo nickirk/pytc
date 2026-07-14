@@ -54,17 +54,24 @@ def _validate_positive_float(name, value):
 
 
 def _mol_fingerprint(mol):
-    """A lightweight geometry+basis identity for the stale-molecule guard: an
-    in-place mutation (set_geom_, basis change, cart flip) after build() must
-    not silently reuse stale factors. Compares realized AO count, AO
-    representation, charge/spin, atom charges, and coordinates (bohr)."""
+    """A lightweight identity for the stale-molecule guard: an in-place
+    mutation (set_geom_, basis exponent/coefficient change, ECP change, cart
+    flip) after build() must not silently reuse stale factors. Binds PySCF's
+    realized numeric molecule state -- the internal integral tables _atm/_bas/
+    _env (which encode the actual basis exponents and contraction coefficients,
+    so a same-nao basis change is caught) and _ecpbas -- plus charge/spin/cart.
+    No hashing: the raw bytes/tuples are compared directly."""
+    def _tobytes(name):
+        arr = getattr(mol, name, None)
+        return np.ascontiguousarray(arr).tobytes() if arr is not None else b""
     return (
-        int(mol.nao),
         bool(mol.cart),
         int(mol.charge),
         int(mol.spin),
-        tuple(int(z) for z in mol.atom_charges()),
-        np.ascontiguousarray(mol.atom_coords()).tobytes(),
+        _tobytes("_atm"),
+        _tobytes("_bas"),
+        _tobytes("_env"),
+        _tobytes("_ecpbas"),
     )
 
 

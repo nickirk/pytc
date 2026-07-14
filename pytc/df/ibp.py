@@ -1389,6 +1389,29 @@ def _ibp_one_sided_block(grad_theta_source, theta_source, grid, *,
     return np.concatenate(row_blocks, axis=0), coincident_pairs
 
 
+def _grids_equal(g1, g2):
+    """Numerical grid equality (no hashes): same backend/device/dtype/n_grid/
+    coincident-point policy and array-equal coords/weights, so independently
+    built grids with identical numerical data are compatible while a
+    one-element mismatch is not. JAX arrays reduce equality on device to a
+    single rank-0 bool through the scalar-sync boundary."""
+    if g1 is g2:
+        return True
+    for attr in ("backend", "device", "dtype", "n_grid", "coincident_point_policy"):
+        if getattr(g1, attr) != getattr(g2, attr):
+            return False
+    if g1.backend == "numpy":
+        return (np.array_equal(g1.coords, g2.coords)
+                and np.array_equal(g1.weights, g2.weights))
+    if g1.coords.shape != g2.coords.shape or g1.weights.shape != g2.weights.shape:
+        return False
+    eq = _ibp_sync_scalars(
+        c=jnp.all(g1.coords == g2.coords),
+        w=jnp.all(g1.weights == g2.weights),
+    )
+    return eq["c"] and eq["w"]
+
+
 def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
              mu_block_size=None, nu_block_size=None, psd_rtol=_DEFAULT_PSD_RTOL):
     """Build an IBPCoreArtifact from one (same-sector) or two (cross-sector)
@@ -1431,10 +1454,10 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
                 f"{label} sector.backend={sector.backend!r} must match "
                 f"operator.backend={backend!r} -- a core cannot mix backends."
             )
-        if sector.grid is not operator.grid:
+        if not _grids_equal(sector.grid, operator.grid):
             raise ValueError(
-                f"{label} sector's bound grid is not the operator's grid -- a core cannot "
-                f"join sectors/operators built on different grids."
+                f"{label} sector's bound grid does not match the operator's grid -- a core "
+                f"cannot join sectors/operators built on different grids."
             )
 
     n_mu = left.selected_rank

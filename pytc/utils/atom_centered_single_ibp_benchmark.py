@@ -15,13 +15,10 @@ an atom-centered quadrature weight is not a geometric cell volume, may be zero
 or negative after molecular partitioning, and therefore does not define a
 controlled scalar Coulomb self-cell correction.
 
-The canonical direct-grid primitives (``kernel``,
-``naive_coulomb_kernel``) live in ``pytc/df/ibp.py``;
-this module re-exports them for backward-compatible imports and provides the
+The canonical single-IBP primitive ``kernel`` lives in ``pytc/df/ibp.py``;
+the ``naive_coulomb_kernel`` diagnostic oracle is defined locally here (it is
+a benchmark/test-only oracle, not production code). This module provides the
 benchmark orchestration (molecular case setup, reference comparisons, CLI).
-
-Task #18, #proj-isdf-coulomb-cuda, 2026-07-13. Moved to pytc/df/ibp.py:
-task #2, #proj-isdf-ibp-coulomb.
 """
 
 from __future__ import annotations

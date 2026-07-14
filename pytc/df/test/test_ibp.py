@@ -925,6 +925,32 @@ class TestIBPCoreArtifact(unittest.TestCase):
         with self.assertRaises(ValueError):
             ibp_core(sector_a, operator=other_plan)
 
+    def test_accepts_independently_built_numerically_identical_grid(self):
+        # Grid compatibility is NUMERICAL (no hashes/object-identity): a plan
+        # built on a separate but byte-identical grid is accepted; a
+        # one-element coord/weight mismatch is rejected.
+        _, _, sector_a, sector_b = self._setup()
+        rng = np.random.default_rng(40)               # reproduce _setup's grid data
+        coords = rng.normal(size=(14, 3))
+        weights = rng.random(14)
+        twin_plan = build_ibp_operator_plan(
+            build_ibp_grid(coords.copy(), weights.copy()),
+            eval_block_size=5, source_block_size=6,
+        )
+        self.assertIsNot(twin_plan.grid, sector_a.grid)
+        core = ibp_core(sector_a, sector_b, operator=twin_plan)  # succeeds
+        self.assertEqual(core.n_mu, sector_a.selected_rank)
+        for bad_coords, bad_weights in (
+            (coords.copy() + np.eye(14, 3) * 1e-9, weights.copy()),  # 1 coord off
+            (coords.copy(), weights.copy() + np.eye(1, 14)[0] * 1e-9),  # 1 weight off
+        ):
+            bad_plan = build_ibp_operator_plan(
+                build_ibp_grid(bad_coords, bad_weights),
+                eval_block_size=5, source_block_size=6,
+            )
+            with self.assertRaises(ValueError):
+                ibp_core(sector_a, sector_b, operator=bad_plan)
+
     def test_mu_nu_block_size_does_not_change_result(self):
         _, plan, sector_a, sector_b = self._setup(np.complex128)
         full = ibp_core(sector_a, sector_b, operator=plan)
