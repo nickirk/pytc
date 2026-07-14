@@ -1699,14 +1699,18 @@ class IBPCoreArtifact:
     symmetry_mode="one_sided" (diagnostic only) sets Z = z_forward_one_sided
     unaveraged.
 
-    Backend scope: only backend="numpy" is implemented here. kernel() is a
-    NumPy-only primitive (task #2) -- routing a JAX-backend sector/operator
-    through it would silently force a host transfer via np.asarray(),
-    exactly the hazard IBPGrid/IBPOperatorPlan's own JAX paths were built to
-    avoid. A tiled, device-resident JAX execution path is task #10's
-    explicit scope, not this one; ibp_core rejects backend="jax" plans
-    with a clear NotImplementedError rather than silently doing the wrong
-    thing.
+    Backend scope: backend="numpy" (kernel() CPU oracle) and backend="jax"
+    (task #10's tiled, device-resident direct backend) are both implemented.
+    A NumPy core validates and content-hashes its host arrays
+    (output_identity_source="computed_content_hash"). A JAX core keeps Z, the
+    raw orientation(s), and the PSD factor as device jax.Array on the bound
+    device; its z_*/psd_factor content hashes are None
+    (output_identity_source="derived_from_attested_inputs_unverified", per the
+    caller-attested-input trust boundary), and validation reduces on device,
+    syncing only rank-0 scalars. ibp_core rejects a MIXED-backend
+    operator/sector combination. Timing/memory (build_wall_time_seconds,
+    peak_host_bytes) are execution metadata and are excluded from the
+    deterministic v2 core_spec_sha256.
     """
     Z: object
     same_sector: bool
@@ -1745,6 +1749,8 @@ class IBPCoreArtifact:
     operator_spec_sha256: str
     mu_block_size: int
     nu_block_size: int
+    eval_block_size: int
+    source_block_size: int
     backend: str
     device: str
     realized_dtype: str
@@ -1914,10 +1920,14 @@ class IBPCoreArtifact:
                 f"{self.Z.dtype}."
             )
 
-        mu_block_size = _validate_positive_int("mu_block_size", self.mu_block_size)
-        nu_block_size = _validate_positive_int("nu_block_size", self.nu_block_size)
-        object.__setattr__(self, "mu_block_size", mu_block_size)
-        object.__setattr__(self, "nu_block_size", nu_block_size)
+        object.__setattr__(self, "mu_block_size",
+                           _validate_positive_int("mu_block_size", self.mu_block_size))
+        object.__setattr__(self, "nu_block_size",
+                           _validate_positive_int("nu_block_size", self.nu_block_size))
+        object.__setattr__(self, "eval_block_size",
+                           _validate_positive_int("eval_block_size", self.eval_block_size))
+        object.__setattr__(self, "source_block_size",
+                           _validate_positive_int("source_block_size", self.source_block_size))
 
         for name in ("left_sector_spec_sha256", "right_sector_spec_sha256", "operator_spec_sha256"):
             _validate_sha256_hex(name, getattr(self, name))
@@ -1988,6 +1998,8 @@ class IBPCoreArtifact:
             "right_sector_spec_sha256": self.right_sector_spec_sha256,
             "operator_spec_sha256": self.operator_spec_sha256,
             "mu_block_size": self.mu_block_size, "nu_block_size": self.nu_block_size,
+            "eval_block_size": self.eval_block_size,
+            "source_block_size": self.source_block_size,
             "backend": self.backend, "device": self.device,
             "realized_dtype": self.realized_dtype,
             "solver_version": self.solver_version, "provenance": self.provenance,
@@ -2248,10 +2260,14 @@ class IBPCoreArtifact:
                 f"realized_dtype={self.realized_dtype!r} does not match Z.dtype {self.Z.dtype}."
             )
 
-        mu_block_size = _validate_positive_int("mu_block_size", self.mu_block_size)
-        nu_block_size = _validate_positive_int("nu_block_size", self.nu_block_size)
-        object.__setattr__(self, "mu_block_size", mu_block_size)
-        object.__setattr__(self, "nu_block_size", nu_block_size)
+        object.__setattr__(self, "mu_block_size",
+                           _validate_positive_int("mu_block_size", self.mu_block_size))
+        object.__setattr__(self, "nu_block_size",
+                           _validate_positive_int("nu_block_size", self.nu_block_size))
+        object.__setattr__(self, "eval_block_size",
+                           _validate_positive_int("eval_block_size", self.eval_block_size))
+        object.__setattr__(self, "source_block_size",
+                           _validate_positive_int("source_block_size", self.source_block_size))
 
         for name in ("left_sector_spec_sha256", "right_sector_spec_sha256", "operator_spec_sha256"):
             _validate_sha256_hex(name, getattr(self, name))
@@ -2306,6 +2322,13 @@ class IBPCoreArtifact:
             raise ValueError(
                 f"psd_status={self.psd_status!r} must be 'factorized' or 'not_applicable'."
             )
+        if not applicable:
+            raise ValueError(
+                "psd_status='factorized' is only valid for a same-sector, "
+                "two-sided-averaged core."
+            )
+        if not isinstance(self.psd_rtol, float) or not math.isfinite(self.psd_rtol) or self.psd_rtol < 0.0:
+            raise ValueError(f"psd_rtol must be a finite non-negative float, got {self.psd_rtol!r}.")
         if self.psd_factor_sha256 is not None:
             raise ValueError("psd_factor_sha256 must be None for backend='jax'.")
         if not isinstance(self.psd_factor, jax.Array):
@@ -2448,17 +2471,16 @@ def _ibp_orientation_jax(grad, theta, coords, weights, valid,
         i0 = et * E
         coords_e = lax.dynamic_slice(coords, (i0, 0), (E, 3))
         we = lax.dynamic_slice(w_eff, (i0,), (E,))
-        grad_e = lax.dynamic_slice(grad, (0, 0, i0), (n_mu_pad, 3, E))
 
         def nu_body(nt, Z):
             n0 = nt * Nn
-            theta_n = lax.dynamic_slice(theta, (n0, 0), (Nn, ng_pad))
 
             def src_body(st, V):
                 j0 = st * S
                 coords_s = lax.dynamic_slice(coords, (j0, 0), (S, 3))
                 we_s = lax.dynamic_slice(w_eff, (j0,), (S,))
-                theta_ns = lax.dynamic_slice(theta_n, (0, j0), (Nn, S))
+                # Slice theta DIRECTLY to (Nn,S) -- never materialize (Nn,ng_pad).
+                theta_ns = lax.dynamic_slice(theta, (n0, j0), (Nn, S))
                 diff = coords_e[:, None, :] - coords_s[None, :, :]   # (E,S,3)
                 rad2 = jnp.sum(diff * diff, axis=-1)                 # (E,S)
                 nz = rad2 > 0
@@ -2471,7 +2493,8 @@ def _ibp_orientation_jax(grad, theta, coords, weights, valid,
 
             def mu_body(mt, Z):
                 m0 = mt * Nm
-                grad_mt = lax.dynamic_slice(grad_e, (m0, 0, 0), (Nm, 3, E))
+                # Slice grad DIRECTLY to (Nm,3,E) -- never materialize (n_mu_pad,3,E).
+                grad_mt = lax.dynamic_slice(grad, (m0, 0, i0), (Nm, 3, E))
                 block = -0.5 * jnp.einsum("mci,nci,i->mn", grad_mt.conj(), V, we)
                 cur = lax.dynamic_slice(Z, (m0, n0), (Nm, Nn))
                 return lax.dynamic_update_slice(Z, cur + block, (m0, n0))
@@ -2679,8 +2702,9 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
             IBPInterpolationSector for sector B (cross-sector).
         operator: IBPOperatorPlan, REQUIRED. Its bound grid must match
             both sectors' bound grid exactly (grid_spec_sha256 equality);
-            only method="direct" is implemented (matching this module's
-            only implemented method); backend must be "numpy".
+            only method="direct" is implemented. backend is "numpy" (CPU
+            kernel oracle) or "jax" (tiled device-resident direct backend);
+            the operator and both sectors must share one backend.
         symmetry_mode: "two_sided_average" (default, production) or
             "one_sided" (diagnostic only, unaveraged raw Z).
         mu_block_size/nu_block_size: bound the pivot-axis blocking of the
@@ -2919,6 +2943,8 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         "right_sector_spec_sha256": right_sector.sector_spec_sha256,
         "operator_spec_sha256": operator.operator_spec_sha256,
         "mu_block_size": mu_block, "nu_block_size": nu_block,
+        "eval_block_size": operator.eval_block_size,
+        "source_block_size": operator.source_block_size,
         "backend": backend, "device": device, "realized_dtype": realized_dtype,
         "solver_version": _IBP_CORE_VERSION, "provenance": provenance,
     }
@@ -2947,6 +2973,8 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         right_sector_spec_sha256=right_sector.sector_spec_sha256,
         operator_spec_sha256=operator.operator_spec_sha256,
         mu_block_size=mu_block, nu_block_size=nu_block,
+        eval_block_size=operator.eval_block_size,
+        source_block_size=operator.source_block_size,
         backend=backend, device=device, realized_dtype=realized_dtype,
         build_wall_time_seconds=build_wall_time_seconds, peak_host_bytes=peak_host_bytes,
         peak_host_bytes_status=peak_host_bytes_status,

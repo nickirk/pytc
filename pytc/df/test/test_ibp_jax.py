@@ -80,6 +80,48 @@ def _jax_core(coords, weights, fp, gp, pivots, record, *, symmetry_mode, blocks)
                     mu_block_size=mu, nu_block_size=nu)
 
 
+def _sector(grid, fp, gp, backend, ids=None):
+    xp_fp = fp if backend == "numpy" else jnp.asarray(fp)
+    xp_gp = gp if backend == "numpy" else jnp.asarray(gp)
+    weighted = weight_mo_values(np.abs(fp),
+                                grid.weights if backend == "numpy" else np.asarray(grid.weights))
+    pivots, record = select_sector_pivots(weighted, weighted, fp.shape[0],
+                                          same_factor=True, return_provenance=True)
+    kw = {} if backend == "numpy" else {"upstream_provenance": ids}
+    return build_ibp_interpolation_sector(xp_fp, xp_fp, xp_gp, xp_gp, pivots, grid,
+                                          pivot_provenance=record, same_factor=True, **kw)
+
+
+def _cross_cores(dtype, blocks, seed=11):
+    e, s, mu, nu = blocks
+    ca, wa, fpa, gpa = _data(dtype, seed=seed)
+    _, _, fpb, gpb = _data(dtype, seed=seed + 100)
+    ng_grid = build_ibp_grid(ca, wa)
+    np_a = _sector(ng_grid, fpa, gpa, "numpy")
+    np_b = _sector(ng_grid, fpb, gpb, "numpy")
+    np_plan = build_ibp_operator_plan(ng_grid, eval_block_size=e, source_block_size=s)
+    np_core = ibp_core(np_a, np_b, operator=np_plan, symmetry_mode="two_sided_average",
+                       mu_block_size=mu, nu_block_size=nu)
+    jgrid = build_ibp_grid(
+        jnp.asarray(ca), jnp.asarray(wa), backend="jax",
+        coords_identity=hashlib.sha256(b"c").hexdigest(),
+        weights_identity=hashlib.sha256(b"w").hexdigest(),
+    )
+    ids_a = {k: hashlib.sha256(f"a{k}".encode()).hexdigest() for k in
+             ("factor_p_sha256", "factor_q_sha256", "gradient_p_sha256", "gradient_q_sha256")}
+    ids_a["factor_q_sha256"] = ids_a["factor_p_sha256"]
+    ids_a["gradient_q_sha256"] = ids_a["gradient_p_sha256"]
+    ids_b = {k: hashlib.sha256(f"b{k}".encode()).hexdigest() for k in ids_a}
+    ids_b["factor_q_sha256"] = ids_b["factor_p_sha256"]
+    ids_b["gradient_q_sha256"] = ids_b["gradient_p_sha256"]
+    j_a = _sector(jgrid, fpa, gpa, "jax", ids_a)
+    j_b = _sector(jgrid, fpb, gpb, "jax", ids_b)
+    j_plan = build_ibp_operator_plan(jgrid, eval_block_size=e, source_block_size=s)
+    j_core = ibp_core(j_a, j_b, operator=j_plan, symmetry_mode="two_sided_average",
+                      mu_block_size=mu, nu_block_size=nu)
+    return np_core, j_core
+
+
 class TestJaxNumpyParity(unittest.TestCase):
     def _check(self, dtype, symmetry_mode, blocks, coincident=True, seed=5):
         coords, weights, fp, gp = _data(dtype, seed=seed, coincident=coincident)
@@ -102,6 +144,19 @@ class TestJaxNumpyParity(unittest.TestCase):
         # exercise both a grid with a duplicate coordinate and one without
         self._check(np.float64, "one_sided", (8, 16, 2, 3), coincident=True)
         self._check(np.float64, "one_sided", (8, 16, 2, 3), coincident=False)
+
+    def test_cross_sector_real_and_complex(self):
+        for dtype in (np.float64, np.complex128):
+            np_core, jax_core = _cross_cores(dtype, (8, 16, 2, 3))
+            self.assertFalse(np_core.same_sector)
+            self.assertEqual(np_core.coincident_pairs, jax_core.coincident_pairs)
+            # both orientations + averaged Z
+            np.testing.assert_allclose(np.asarray(jax_core.z_forward_one_sided),
+                                       np_core.z_forward_one_sided, atol=1e-10, rtol=1e-8)
+            np.testing.assert_allclose(np.asarray(jax_core.z_reverse_one_sided),
+                                       np_core.z_reverse_one_sided, atol=1e-10, rtol=1e-8)
+            np.testing.assert_allclose(np.asarray(jax_core.Z), np_core.Z, atol=1e-10, rtol=1e-8)
+            self.assertEqual(jax_core.psd_status, "not_applicable")
 
     def test_all_block_choices_including_short_final(self):
         coords, weights, fp, gp = _data(np.float64)
@@ -177,17 +232,24 @@ class TestJaxPlacement(unittest.TestCase):
 
 
 class TestJaxAllocationAudit(unittest.TestCase):
+    def _padded(self, E, S, Nm, Nn, n_mu, n_nu):
+        # Reproduce the wrapper's padding exactly: ng padded to a multiple of
+        # lcm(E,S), orbital axes to Nm/Nn -- the real production shapes the
+        # jitted builder is compiled for.
+        import math
+        ng_pad = ibp._pad_to_multiple(200, math.lcm(E, S))
+        nm_pad = ibp._pad_to_multiple(n_mu, Nm)
+        nn_pad = ibp._pad_to_multiple(n_nu, Nn)
+        return (jnp.zeros((nm_pad, 3, ng_pad)), jnp.zeros((nn_pad, ng_pad)),
+                jnp.zeros((ng_pad, 3)), jnp.ones((ng_pad,)), jnp.ones((ng_pad,)), ng_pad)
+
     def test_whole_builder_jaxpr_has_no_full_grid_pair_axis(self):
-        # The compiled whole-orientation builder must never materialize a full
-        # grid-pair axis; every intermediate is bounded by the fixed tile sizes.
-        ng, n_mu, n_nu = 40, 6, 6
-        E, S, Nm, Nn = 8, 16, 2, 3
-        dt = jnp.float64
-        grad = jnp.zeros((n_mu, 3, ng), dt)
-        theta = jnp.zeros((n_nu, ng), dt)
-        coords = jnp.zeros((ng, 3))
-        weights = jnp.ones((ng,))
-        valid = jnp.ones((ng,))
+        # Audit the PRODUCTION-shape whole-orientation builder (the jitted
+        # function the wrapper actually runs), with inputs padded to a valid
+        # ng_pad = multiple of lcm(E,S). No computed intermediate may carry a
+        # grid-scale (O(ng^2) pair or untiled nu*3*ng field) allocation.
+        E, S, Nm, Nn, n_mu, n_nu = 8, 16, 2, 3, 6, 6
+        grad, theta, coords, weights, valid, ng = self._padded(E, S, Nm, Nn, n_mu, n_nu)
         jaxpr = jax.make_jaxpr(
             lambda g, t, c, w, v: ibp._ibp_orientation_jax(g, t, c, w, v, E, S, Nm, Nn, n_mu, n_nu)
         )(grad, theta, coords, weights, valid)
@@ -230,14 +292,41 @@ class TestJaxAllocationAudit(unittest.TestCase):
         self.assertTrue(seen_tile["rhat_ES3"],
                         "expected the bounded (E,S,3) rhat tile inside the loop body")
 
-    def test_symbolic_byte_bound_is_dtype_aware(self):
-        # The conservative per-block bound scales with itemsize (f64=8, c128=16).
-        def bound(itemsize, E, S, Nm, Nn, n_mu, n_nu):
-            workspace = E * S * 3 + E * S + Nn * 3 * E + Nm * 3 * E
-            output = n_mu * n_nu
-            return itemsize * (workspace + output)
-        self.assertEqual(bound(16, 8, 16, 2, 3, 6, 6),
-                         2 * bound(8, 8, 16, 2, 3, 6, 6))
+    def test_symbolic_byte_bound_is_dtype_aware_and_complete(self):
+        # A genuinely conservative bound: per-block tile workspace + the output
+        # + the RETAINED padded inputs (grad/theta/coords/weights/valid) with
+        # the ng_pad = lcm(E,S) amplification, all itemsize-scaled.
+        import math
+
+        def bound(itemsize, E, S, Nm, Nn, n_mu, n_nu, ng):
+            ng_pad = ibp._pad_to_multiple(ng, math.lcm(E, S))
+            nm_pad = ibp._pad_to_multiple(n_mu, Nm)
+            nn_pad = ibp._pad_to_multiple(n_nu, Nn)
+            tile = E * S * 3 + E * S + Nn * 3 * E    # rhat + rad + field V
+            output = nm_pad * nn_pad
+            padded_inputs = nm_pad * 3 * ng_pad + nn_pad * ng_pad + ng_pad * 3 + 2 * ng_pad
+            return itemsize * (tile + output + padded_inputs)
+        f64 = bound(8, 8, 16, 2, 3, 6, 6, 200)
+        c128 = bound(16, 8, 16, 2, 3, 6, 6, 200)
+        self.assertEqual(c128, 2 * f64)
+        # ng_pad amplification is real: 200 -> lcm(8,16)=16 -> ceil(200/16)*16=208
+        self.assertEqual(ibp._pad_to_multiple(200, math.lcm(8, 16)), 208)
+
+    def test_compiled_hlo_temp_memory_is_tile_bounded_not_grid_squared(self):
+        # Gate the COMPILED allocation contract: the XLA temp memory of the
+        # whole builder must be far below an (ng x ng) grid-pair allocation.
+        E, S, Nm, Nn, n_mu, n_nu = 8, 16, 2, 3, 6, 6
+        grad, theta, coords, weights, valid, ng = self._padded(E, S, Nm, Nn, n_mu, n_nu)
+        lowered = jax.jit(
+            ibp._ibp_orientation_jax, static_argnums=(5, 6, 7, 8, 9, 10)
+        ).lower(grad, theta, coords, weights, valid, E, S, Nm, Nn, n_mu, n_nu)
+        compiled = lowered.compile()
+        analysis = compiled.memory_analysis()
+        temp = getattr(analysis, "temp_size_in_bytes", None)
+        self.assertIsNotNone(temp)
+        grid_pair_bytes = 8 * ng * ng      # an (ng,ng) f64 pair allocation
+        self.assertLess(temp, grid_pair_bytes,
+                        f"compiled temp {temp} not below grid-pair {grid_pair_bytes}")
 
 
 class TestJaxTiming(unittest.TestCase):
@@ -316,6 +405,64 @@ class TestJaxPsdPath(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._psd_core(z)
 
+    @staticmethod
+    def _from_spectrum(evals, seed):
+        q, _ = np.linalg.qr(np.random.default_rng(seed).normal(size=(len(evals), len(evals))))
+        z = (q * np.asarray(evals)) @ q.T
+        return (z + z.T) / 2
+
+    def test_psd_zero_core(self):
+        core = self._psd_core(np.zeros((5, 5)))
+        self.assertEqual(core.psd_status, "factorized")
+        self.assertEqual(core.psd_retained_rank, 0)
+        self.assertEqual(core.psd_factor.shape, (5, 0))
+        self.assertEqual(core.psd_reconstruction_residual, 0.0)
+
+    def test_psd_within_band_clipping(self):
+        # one tiny negative eigenvalue inside the roundoff band (|neg| <
+        # rtol*scale, rtol=1e-10, scale=5) is clipped, not hard-failed.
+        z = self._from_spectrum([5.0, 3.0, 2.0, 1.0, -1e-12], seed=3)
+        core = self._psd_core(z)
+        self.assertEqual(core.psd_status, "factorized")
+        self.assertEqual(core.psd_negative_mode_count, 1)
+        self.assertEqual(core.psd_clipped_mode_count, 1)
+        self.assertEqual(core.psd_retained_rank, 4)
+
+    def test_psd_degenerate_spectrum_reconstructs(self):
+        z = self._from_spectrum([2.0, 2.0, 2.0, 1.0, 1.0], seed=4)
+        core = self._psd_core(z)
+        self.assertEqual(core.psd_retained_rank, 5)
+        recon = np.asarray(core.psd_factor) @ np.asarray(core.psd_factor).conj().T
+        np.testing.assert_allclose(recon, np.asarray(core.Z), atol=1e-10)
+
+    def test_factorized_status_invalid_on_one_sided_rejected(self):
+        # tamper: a one_sided same-sector core cannot declare factorized -- the
+        # applicable guard fires on the status alone, before any PSD field.
+        import dataclasses
+        coords, weights, fp, gp = _data(np.float64)
+        grid = build_ibp_grid(
+            jnp.asarray(coords), jnp.asarray(weights), backend="jax",
+            coords_identity=hashlib.sha256(b"c").hexdigest(),
+            weights_identity=hashlib.sha256(b"w").hexdigest())
+        w = weight_mo_values(np.abs(fp), np.asarray(weights))
+        piv, rec = select_sector_pivots(w, w, fp.shape[0], same_factor=True, return_provenance=True)
+        sector = build_ibp_interpolation_sector(
+            jnp.asarray(fp), jnp.asarray(fp), jnp.asarray(gp), jnp.asarray(gp),
+            piv, grid, pivot_provenance=rec, same_factor=True, upstream_provenance=_IDS)
+        plan = build_ibp_operator_plan(grid, eval_block_size=8, source_block_size=16)
+        one_sided = ibp_core(sector, operator=plan, symmetry_mode="one_sided")
+        with self.assertRaises(ValueError):
+            dataclasses.replace(one_sided, psd_status="factorized")
+
+    def test_negative_psd_rtol_rejected(self):
+        # A factorized JAX core with a negative psd_rtol must be rejected.
+        import dataclasses
+        rng = np.random.default_rng(9)
+        a = rng.normal(size=(5, 5))
+        core = self._psd_core((a @ a.T + 0.5 * np.eye(5) + (a @ a.T + 0.5 * np.eye(5)).T) / 2)
+        with self.assertRaises(ValueError):
+            dataclasses.replace(core, psd_rtol=-1.0)
+
 
 class TestJaxArtifactFields(unittest.TestCase):
     def test_jax_core_identity_and_device_fields(self):
@@ -349,7 +496,12 @@ class TestJaxFloat32Subprocess(unittest.TestCase):
             "for dt in (np.float32, np.complex64):\n"
             "  rng=np.random.default_rng(5); ng,n=24,5\n"
             "  coords=rng.normal(size=(ng,3)); coords[3]=coords[9]; weights=rng.uniform(.5,1.5,ng)\n"
-            "  fp=rng.normal(size=(n,ng)).astype(dt); gp=rng.normal(size=(3,n,ng)).astype(dt)\n"
+            "  fp=rng.normal(size=(n,ng)); gp=rng.normal(size=(3,n,ng))\n"
+            "  if np.iscomplexobj(np.empty((),dt)):\n"
+            "    fp=(fp+1j*rng.normal(size=(n,ng))).astype(dt); gp=(gp+1j*rng.normal(size=(3,n,ng))).astype(dt)\n"
+            "  else:\n"
+            "    fp=fp.astype(dt); gp=gp.astype(dt)\n"
+            "  assert np.iscomplexobj(fp)==np.iscomplexobj(np.empty((),dt)) and (not np.iscomplexobj(fp) or np.any(fp.imag!=0))\n"
             "  g=build_ibp_grid(coords.astype('float32'),weights.astype('float32'))\n"
             "  w=weight_mo_values(np.abs(fp).astype('float32'),g.weights); piv,rec=select_sector_pivots(w,w,n,same_factor=True,return_provenance=True)\n"
             "  sec=build_ibp_interpolation_sector(fp,fp,gp,gp,piv,g,pivot_provenance=rec,same_factor=True)\n"
@@ -366,6 +518,8 @@ class TestJaxFloat32Subprocess(unittest.TestCase):
             "print('X32_OK' if ok else 'X32_FAIL')\n"
         )
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0,
+                         msg=f"stdout={result.stdout}\nstderr={result.stderr[-2000:]}")
         self.assertIn("X32_OK", result.stdout,
                       msg=f"stdout={result.stdout}\nstderr={result.stderr[-2000:]}")
 

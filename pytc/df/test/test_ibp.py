@@ -1240,6 +1240,7 @@ class TestIBPCoreArtifact(unittest.TestCase):
                 right_sector_spec_sha256=core.right_sector_spec_sha256,
                 operator_spec_sha256=core.operator_spec_sha256,
                 mu_block_size=core.mu_block_size, nu_block_size=core.nu_block_size,
+                eval_block_size=core.eval_block_size, source_block_size=core.source_block_size,
                 backend=core.backend, device=core.device, realized_dtype=core.realized_dtype,
                 build_wall_time_seconds=core.build_wall_time_seconds,
                 peak_host_bytes=core.peak_host_bytes,
