@@ -208,14 +208,27 @@ class TestStageEtaRecomputeTile(unittest.TestCase):
 
 
 class TestJitMemoryAnalysisSmoke(unittest.TestCase):
-    def test_returns_labeled_cpu_structural_stats(self):
+    def test_returns_labeled_stats_matching_the_actual_running_backend(self):
+        # Deliberately backend-agnostic: this suite runs on whatever
+        # jax.default_backend() reports on the machine executing it
+        # (CPU dev box, or a real GPU node) -- hardcoding "cpu" here
+        # would fail on a genuine GPU run for the RIGHT reason (the
+        # label fix works), which is exactly what happened on a real
+        # V100 validation run. Assert internal consistency against the
+        # actual backend instead of assuming which one is present.
         @jax.jit
         def f(x):
             return x @ x
 
         result = jit_memory_analysis_smoke(f, jnp.ones((4, 4), dtype=jnp.complex128))
-        self.assertEqual(result["backend"], "cpu")
-        self.assertEqual(result["label"], "cpu_backend_structural_smoke_not_hbm")
+        backend = jax.default_backend()
+        expected_label = (
+            "cpu_backend_structural_smoke_not_hbm"
+            if backend == "cpu"
+            else "gpu_backend_compiled_memory_stats"
+        )
+        self.assertEqual(result["backend"], backend)
+        self.assertEqual(result["label"], expected_label)
         self.assertIn("temp_size_in_bytes", result)
         self.assertIsInstance(result["temp_size_in_bytes"], int)
 
