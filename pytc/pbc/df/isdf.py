@@ -479,7 +479,7 @@ def apply_kernel_and_solve_device(
         (W_q, kern_q, solve_info): W_q (Nip, Nip) complex128 jax array;
         kern_q the raw contracted kernel; solve_info the solve info dict.
     """
-    from pytc.df.solvers import _check_retention_marginal, hermitian_sandwich_solve_device
+    from pytc.df.solvers import _solve_info_from_core_output, hermitian_sandwich_solve_device
 
     n_ip, n_grid = eta_q.shape
 
@@ -515,31 +515,11 @@ def apply_kernel_and_solve_device(
             retained_solve_residual, truncation_residual,
         ) = fused(q_index, Pi_q_jnp, eta_q_jnp, phase, rtol, self_paired)
 
-        n_retained_i = int(n_retained)
-        s_max_f = float(s_max)
-        s_min_retained_f = None if n_retained_i == 0 else float(s_min_retained)
-        threshold = rtol * s_max_f
-        retention_marginal, cond_pi = _check_retention_marginal(
-            s_max_f, s_min_retained_f, threshold, rtol,
-            caller="apply_kernel_and_solve_device[fused]",
+        solve_info = _solve_info_from_core_output(
+            n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
+            v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+            n_ip, W_q_unscaled.dtype, rtol, caller="apply_kernel_and_solve_device[fused]",
         )
-        solve_info = {
-            "n_retained": n_retained_i,
-            "n_discarded": n_ip - n_retained_i,
-            "s_max": s_max_f,
-            "s_min_retained": s_min_retained_f,
-            "pi_anti_hermitian_residual": float(pi_anti_hermitian_residual),
-            "v_anti_hermitian_residual": float(v_anti_hermitian_residual),
-            "retained_solve_residual": float(retained_solve_residual),
-            "truncation_residual": float(truncation_residual),
-            "rtol": rtol,
-            "adaptive_retention_used": False,
-            "target_truncation_residual": None,
-            "retention_marginal": retention_marginal,
-            "cond_pi_retained": cond_pi,
-            "dtype": str(W_q_unscaled.dtype),
-            "backend": "jax",
-        }
     else:
         lq = eta_q_jnp * phase[None, :]
 

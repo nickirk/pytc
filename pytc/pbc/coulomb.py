@@ -16,7 +16,7 @@ from pytc.pbc.df.isdf import (
     pivoted_cholesky_hermitian,
     stream_ao_blocks,
 )
-from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts, kpt_to_spc, spc_to_kpt
+from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
 
 def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProvider):
@@ -47,6 +47,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProv
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
         dtype=np.complex128,
     )
+    ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
 
     ao_blocks_for_eta = (
         blk for _, _, blk in stream_ao_blocks(
@@ -70,6 +71,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProv
         "n_selected": n_selected,
         "n_pipeline_calls": n_pipeline_calls,
         "solve_infos": solve_infos,
+        "ao_tr_residual": ao_tr_residual,
     }
 
 
@@ -315,7 +317,9 @@ class ISDFDF:
         vj = None
         vk = None
         if with_j:
-            vj = get_j(self.cell, dm_kpts, kpts)
+            from pyscf.pbc.df.fft_jk import get_j_kpts
+
+            vj = get_j_kpts(self._core_df, dm_kpts, kpts=kpts)
         if with_k:
             built = self.build()
             vk = get_k(

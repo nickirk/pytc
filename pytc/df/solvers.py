@@ -321,6 +321,40 @@ def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller)
     return marginal, cond_pi
 
 
+def _solve_info_from_core_output(
+    n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
+    v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+    n, dtype, rtol, *, caller,
+):
+    """Build the device-solve info dict from _hermitian_sandwich_solve_core's
+    raw (traced) return values. Shared by hermitian_sandwich_solve_device and
+    apply_kernel_and_solve_device's fused path -- both wrap the same core."""
+    n_retained_i = int(n_retained)
+    s_max_f = float(s_max)
+    s_min_retained_f = None if n_retained_i == 0 else float(s_min_retained)
+    threshold = rtol * s_max_f
+    retention_marginal, cond_pi = _check_retention_marginal(
+        s_max_f, s_min_retained_f, threshold, rtol, caller=caller
+    )
+    return {
+        "n_retained": n_retained_i,
+        "n_discarded": n - n_retained_i,
+        "s_max": s_max_f,
+        "s_min_retained": s_min_retained_f,
+        "pi_anti_hermitian_residual": float(pi_anti_hermitian_residual),
+        "v_anti_hermitian_residual": float(v_anti_hermitian_residual),
+        "retained_solve_residual": float(retained_solve_residual),
+        "truncation_residual": float(truncation_residual),
+        "rtol": rtol,
+        "adaptive_retention_used": False,
+        "target_truncation_residual": None,
+        "retention_marginal": retention_marginal,
+        "cond_pi_retained": cond_pi,
+        "dtype": str(dtype),
+        "backend": "jax",
+    }
+
+
 def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=None):
     """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V via a
     relative-spectral-threshold truncated pseudo-inverse of Pi:
@@ -580,29 +614,9 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4):
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
     ) = _hermitian_sandwich_solve_core(Pi_jnp, V_jnp, rtol)
 
-    n_retained_i = int(n_retained)
-    s_max_f = float(s_max)
-    s_min_retained_f = None if n_retained_i == 0 else float(s_min_retained)
-    threshold = rtol * s_max_f
-    retention_marginal, cond_pi = _check_retention_marginal(
-        s_max_f, s_min_retained_f, threshold, rtol, caller="hermitian_sandwich_solve_device"
+    info = _solve_info_from_core_output(
+        n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
+        v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+        n, W.dtype, rtol, caller="hermitian_sandwich_solve_device",
     )
-
-    info = {
-        "n_retained": n_retained_i,
-        "n_discarded": n - n_retained_i,
-        "s_max": s_max_f,
-        "s_min_retained": s_min_retained_f,
-        "pi_anti_hermitian_residual": float(pi_anti_hermitian_residual),
-        "v_anti_hermitian_residual": float(v_anti_hermitian_residual),
-        "retained_solve_residual": float(retained_solve_residual),
-        "truncation_residual": float(truncation_residual),
-        "rtol": rtol,
-        "adaptive_retention_used": False,
-        "target_truncation_residual": None,
-        "retention_marginal": retention_marginal,
-        "cond_pi_retained": cond_pi,
-        "dtype": str(W.dtype),
-        "backend": "jax",
-    }
     return W, info
