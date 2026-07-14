@@ -256,6 +256,63 @@ class TestGetKVsRealFftdf(unittest.TestCase):
         self.assertLess(rel, 2.5)
 
 
+class TestGenuinePairMeshRegression(unittest.TestCase):
+    """Permanent regression guard for the Pi/eta q<->-q convention bug
+    (design doc section 4 audit trail, task #25/C2 item 2b): every mesh
+    used elsewhere in this file before this fix had a self-paired-only
+    subset that never exercised it. kmesh=[1,1,4] has neg=[0,3,2,1] --
+    q=0,2 self-paired, q=1,3 a genuine pair -- the smallest mesh that
+    does both. Bounds mirror TestGetKVsRealFftdf's [1,1,3] style
+    (ballpark sanity, not accuracy); the point is that a reintroduced
+    labeling bug blows this up by 6+ orders of magnitude (observed
+    rel=2.7e6 mid-investigation), not that these particular bounds are
+    tight."""
+
+    def _build_and_dm(self, rank, seed):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 4], wrap_around=False)
+        result = coulomb.build(cell, kpts, rank=rank, block_size=100, rtol=1e-8)
+        mesh_obj = result["mesh_obj"]
+        rng = np.random.default_rng(seed)
+        dm_kpts = _tr_symmetric_hermitian_fixture(
+            rng, mesh_obj.n_kpts, mesh_obj.neg, (cell.nao, cell.nao)
+        )
+        return cell, kpts, result, mesh_obj, dm_kpts
+
+    def test_rank_matched_parity_exxdiv_none(self):
+        cell, kpts, result, mesh_obj, dm_kpts = self._build_and_dm(rank=8, seed=42)
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+
+        vk_mine = np.asarray(coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase))
+
+        from pyscf.pbc.df import FFTDF
+        from pyscf.pbc.df.fft_jk import get_k_kpts
+
+        vk_ref = get_k_kpts(FFTDF(cell), dm_kpts, kpts=kpts, exxdiv=None)
+        rel = np.linalg.norm(vk_mine - vk_ref) / np.linalg.norm(vk_ref)
+        self.assertLess(rel, 1.5)
+
+    def test_rank_matched_parity_exxdiv_ewald(self):
+        cell, kpts, result, mesh_obj, dm_kpts = self._build_and_dm(rank=8, seed=42)
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+
+        vk_mine = np.asarray(
+            coulomb.get_k(
+                dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase,
+                exxdiv="ewald", cell=cell, kpts=mesh_obj.canonical_kpts,
+            )
+        )
+
+        from pyscf.pbc.df import FFTDF
+        from pyscf.pbc.df.fft_jk import get_k_kpts
+
+        vk_ref = get_k_kpts(FFTDF(cell), dm_kpts, kpts=kpts, exxdiv="ewald")
+        rel = np.linalg.norm(vk_mine - vk_ref) / np.linalg.norm(vk_ref)
+        self.assertLess(rel, 1.5)
+
+
 class TestRetentionPolicyDefaultAvoidsBlowup(unittest.TestCase):
     """Regression test for the retention-policy fix (design v2.1 section
     5): the old rtol=1e-8 default silently retained near-singular Pi
