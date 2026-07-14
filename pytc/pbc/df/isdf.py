@@ -979,14 +979,17 @@ def query_host_resources(scratch_dir="."):
 
 
 def jit_memory_analysis_smoke(jitted_fn, *args):
-    """Optional CPU-backend structural smoke recording (design v2.1
-    section 6's "XLA temporaries bounded by the jitted-program's compiled
-    memory report" note): compiles jitted_fn against args and returns its
-    jax CompiledMemoryStats, labeled explicitly as CPU-backend structural
-    data -- NOT an HBM/GPU measurement. Exercises the recording path end
-    to end on this machine so nobody mistakes the structure for real GPU
-    numbers later; a genuine device-memory reading is a calibration-gate
-    deliverable, not this layer's job.
+    """Compiled-program memory recording (design v2.1 section 6's "XLA
+    temporaries bounded by the jitted-program's compiled memory report"
+    note): compiles jitted_fn against args and returns its jax
+    CompiledMemoryStats. The label reflects the ACTUAL backend this ran
+    on -- "cpu_backend_structural_smoke_not_hbm" only when
+    jax.default_backend() is "cpu" (this machine, today); on a real GPU
+    backend the label instead reads "gpu_backend_compiled_memory_stats"
+    since compiled memory stats on an actual GPU ARE genuine device
+    memory data, not a smoke test -- mislabeling a real GPU run as
+    "not_hbm" would be exactly the false/omitted-observed-number failure
+    this layer's provenance schema is designed to avoid.
 
     Args:
         jitted_fn: a jax.jit-wrapped function.
@@ -994,16 +997,22 @@ def jit_memory_analysis_smoke(jitted_fn, *args):
             shapes (values are only used for shape/dtype; not executed).
 
     Returns:
-        dict: backend (jax.default_backend()), label
-        "cpu_backend_structural_smoke_not_hbm", and every field of
-        jax's CompiledMemoryStats (generated_code_size_in_bytes,
-        argument_size_in_bytes, output_size_in_bytes, alias_size_in_bytes,
-        temp_size_in_bytes, plus the host_* counterparts).
+        dict: backend (jax.default_backend()), label (see above), and
+        every field of jax's CompiledMemoryStats
+        (generated_code_size_in_bytes, argument_size_in_bytes,
+        output_size_in_bytes, alias_size_in_bytes, temp_size_in_bytes,
+        plus the host_* counterparts).
     """
+    backend = jax.default_backend()
+    label = (
+        "cpu_backend_structural_smoke_not_hbm"
+        if backend == "cpu"
+        else "gpu_backend_compiled_memory_stats"
+    )
     stats = jitted_fn.lower(*args).compile().memory_analysis()
     return {
-        "backend": jax.default_backend(),
-        "label": "cpu_backend_structural_smoke_not_hbm",
+        "backend": backend,
+        "label": label,
         "generated_code_size_in_bytes": stats.generated_code_size_in_bytes,
         "argument_size_in_bytes": stats.argument_size_in_bytes,
         "output_size_in_bytes": stats.output_size_in_bytes,

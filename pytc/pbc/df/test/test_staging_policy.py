@@ -214,10 +214,27 @@ class TestJitMemoryAnalysisSmoke(unittest.TestCase):
             return x @ x
 
         result = jit_memory_analysis_smoke(f, jnp.ones((4, 4), dtype=jnp.complex128))
+        self.assertEqual(result["backend"], "cpu")
         self.assertEqual(result["label"], "cpu_backend_structural_smoke_not_hbm")
-        self.assertIn("backend", result)
         self.assertIn("temp_size_in_bytes", result)
         self.assertIsInstance(result["temp_size_in_bytes"], int)
+
+    def test_label_reflects_actual_backend_not_hardcoded(self):
+        # A non-cpu backend must NOT be mislabeled "not_hbm" -- simulate
+        # by monkeypatching jax.default_backend rather than requiring a
+        # real GPU in this test environment.
+        import unittest.mock as mock
+
+        from pytc.pbc.df import isdf as isdf_module
+
+        @jax.jit
+        def f(x):
+            return x @ x
+
+        with mock.patch.object(isdf_module.jax, "default_backend", return_value="gpu"):
+            result = jit_memory_analysis_smoke(f, jnp.ones((4, 4), dtype=jnp.complex128))
+        self.assertEqual(result["backend"], "gpu")
+        self.assertEqual(result["label"], "gpu_backend_compiled_memory_stats")
 
 
 if __name__ == "__main__":
