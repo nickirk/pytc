@@ -20,6 +20,7 @@ from pytc.pbc.df.isdf import (
     apply_raw_kernel_and_solve,
     build_coul_kpt_device,
     build_pi_eta,
+    precompute_phase_all_q,
     raw_kernel_apply,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts
@@ -139,6 +140,31 @@ class TestRawKernelProvider(unittest.TestCase):
             provider.apply(mesh_obj.n_kpts, np.zeros((1, int(np.prod(cell.mesh)))))
 
 
+class TestPrecomputePhaseAllQ(unittest.TestCase):
+    """design v2.1 section 6 glue-fix (task #25/C2 item 1):
+    precompute_phase_all_q batches the per-q Bloch phase computation
+    that apply_kernel_and_solve_device used to redo from scratch (with
+    a fresh grid_coords upload) on every call."""
+
+    def test_matches_per_q_internal_computation(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_coords = cell.get_uniform_grids(cell.mesh)
+
+        phase_all = precompute_phase_all_q(grid_coords, mesh_obj.canonical_kpts)
+        self.assertEqual(phase_all.shape, (mesh_obj.n_kpts, grid_coords.shape[0]))
+        for q in range(mesh_obj.n_kpts):
+            expected = np.exp(-1j * (grid_coords @ mesh_obj.canonical_kpts[q]))
+            np.testing.assert_allclose(np.asarray(phase_all[q]), expected, atol=1e-12)
+
+    def test_rejects_malformed_shapes(self):
+        with self.assertRaises(ValueError):
+            precompute_phase_all_q(np.zeros((5, 2)), np.zeros((3, 3)))
+        with self.assertRaises(ValueError):
+            precompute_phase_all_q(np.zeros((5, 3)), np.zeros((3, 2)))
+
+
 class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
     def _setup(self, kmesh, seed=83, n_ip=3):
         cell = _make_cell()
@@ -167,6 +193,43 @@ class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(kern_dev), kern_np, atol=1e-12, err_msg=f"kern_q q={q}")
             np.testing.assert_allclose(np.asarray(W_dev), W_np, atol=1e-10, err_msg=f"W_q q={q}")
             self.assertEqual(info_dev["n_retained"], info_np["n_retained"])
+
+    def test_phase_q_gives_bit_identical_result_to_grid_coords_path(self):
+        # design v2.1 section 6 glue-fix (task #25/C2 item 1): passing a
+        # precomputed phase_q must reproduce EXACTLY (not just closely)
+        # the same computation the internal grid_coords-based path did.
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        phase_all = precompute_phase_all_q(grids, mesh_obj.canonical_kpts)
+        for q in range(mesh_obj.n_kpts):
+            W_grid, kern_grid, _ = apply_kernel_and_solve_device(
+                provider, q, Pi[q], eta[q], grid_coords=grids, rtol=1e-8,
+            )
+            W_phase, kern_phase, _ = apply_kernel_and_solve_device(
+                provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=1e-8,
+            )
+            np.testing.assert_array_equal(np.asarray(kern_phase), np.asarray(kern_grid))
+            np.testing.assert_array_equal(np.asarray(W_phase), np.asarray(W_grid))
+
+    def test_rejects_neither_grid_coords_nor_phase_q(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        with self.assertRaises(ValueError):
+            apply_kernel_and_solve_device(provider, 0, Pi[0], eta[0], rtol=1e-8)
+
+    def test_rejects_malformed_phase_q_shape(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        with self.assertRaises(ValueError):
+            apply_kernel_and_solve_device(
+                provider, 0, Pi[0], eta[0], phase_q=np.zeros(3), rtol=1e-8
+            )
 
     def test_self_paired_matches_numpy_oracle_and_is_exactly_real(self):
         cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])

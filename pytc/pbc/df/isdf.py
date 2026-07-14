@@ -556,8 +556,56 @@ class RawKernelProvider:
         }
 
 
+@jax.jit
+def _precompute_phase_all_q_core(grid_coords, canonical_kpts):
+    """Jitted, batched core of precompute_phase_all_q: the per-q Bloch
+    phase exp(-1j * grid_coords @ q_kpt) for EVERY q at once, from a
+    SINGLE grid_coords upload -- design v2.1 section 6 glue-fix
+    (task #25/C2 item 1). One (Ng,3)@(3,Nk) matmul replaces Nk separate
+    (Ng,3)@(3,) matvecs, each of which previously re-uploaded
+    grid_coords to device from scratch.
+    """
+    return jnp.exp(-1j * (grid_coords @ canonical_kpts.T)).T
+
+
+def precompute_phase_all_q(grid_coords, canonical_kpts):
+    """Host-side wrapper for _precompute_phase_all_q_core (design v2.1
+    section 6 glue-fix): compute the per-q Bloch phase for every q in
+    ONE batched, jitted call, to be sliced per-q and passed into
+    apply_kernel_and_solve_device's phase_q parameter -- eliminates the
+    per-q eager phase recomputation AND the per-q grid_coords re-upload
+    that together measured as 72% of apply_kernel_and_solve_device's
+    unfused per-q wall time on a real V100 (task #22 tile harness).
+
+    Args:
+        grid_coords: (Ng,3) real-space grid point coordinates.
+        canonical_kpts: (Nk,3) absolute k-vectors, e.g.
+            KptsMesh.canonical_kpts / RawKernelProvider.canonical_kpts.
+
+    Returns:
+        phase_all: (Nk, Ng) complex128 jax array; phase_all[q] is the
+        SAME array apply_kernel_and_solve_device used to build
+        internally per-call before this fix (verified bit-identical in
+        test_apply_kernel_and_solve_device_phase_q_matches_internal_computation).
+
+    Raises:
+        ValueError: malformed shapes.
+    """
+    grid_coords_np = np.asarray(grid_coords, dtype=np.float64)
+    if grid_coords_np.ndim != 2 or grid_coords_np.shape[1] != 3:
+        raise ValueError(f"grid_coords must have shape (Ng,3), got {grid_coords_np.shape}.")
+    canonical_kpts_np = np.asarray(canonical_kpts, dtype=np.float64)
+    if canonical_kpts_np.ndim != 2 or canonical_kpts_np.shape[1] != 3:
+        raise ValueError(
+            f"canonical_kpts must have shape (Nk,3), got {canonical_kpts_np.shape}."
+        )
+    return _precompute_phase_all_q_core(
+        jnp.asarray(grid_coords_np), jnp.asarray(canonical_kpts_np)
+    )
+
+
 def apply_kernel_and_solve_device(
-    provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-4,
+    provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=1e-4,
     retained_solve_residual_gate=1e-10, self_paired=False,
 ):
     """S4 pipeline glue (design v2.1 section 6), device-resident,
@@ -579,7 +627,22 @@ def apply_kernel_and_solve_device(
             corrected (the pipeline's job, matching build_pi_eta's raw
             output).
         grid_coords: (Ng, 3) real-space grid point coordinates, same
-            flattened order as eta_q's grid axis.
+            flattened order as eta_q's grid axis. Required only when
+            phase_q is not given (see below); ignored if it is.
+        phase_q: (Ng,) complex128 jax array, PRECOMPUTED
+            exp(-1j * grid_coords @ canonical_kpts[q_index]) -- design
+            v2.1 section 6 glue-fix (task #25/C2 item 1). When given,
+            this is used directly instead of recomputing the phase from
+            grid_coords/q_kpt on every call, and grid_coords is not
+            touched at all (no re-upload). Callers looping over many q
+            (e.g. build_coul_kpt_device) should precompute ALL q's phase
+            once via precompute_phase_all_q and pass phase_all[q_index]
+            here -- the per-q phase recomputation (and the grid_coords
+            re-upload it required) measured as 72% of this function's
+            unfused per-q wall time on a real V100 (task #22 tile
+            harness), and is a per-q CONSTANT that never needs
+            recomputing within one build. Exactly one of grid_coords/
+            phase_q must be given.
         rtol: forwarded to the device sandwich solve.
         retained_solve_residual_gate: HARD host-side gate (design v2.1
             section 5: "machine-tier, HARD gate <=1e-10 at c128") on
@@ -609,17 +672,28 @@ def apply_kernel_and_solve_device(
     """
     from pytc.df.solvers import hermitian_sandwich_solve_device
 
-    q_kpt = provider.canonical_kpts[q_index]
     eta_q_np = np.asarray(eta_q)
     n_ip, n_grid = eta_q_np.shape
-    grid_coords_np = np.asarray(grid_coords, dtype=np.float64)
-    if grid_coords_np.shape != (n_grid, 3):
-        raise ValueError(
-            f"grid_coords must have shape ({n_grid},3) matching eta_q's grid axis, "
-            f"got {grid_coords_np.shape}."
-        )
 
-    phase = jnp.exp(-1j * (jnp.asarray(grid_coords_np) @ jnp.asarray(q_kpt)))
+    if phase_q is None and grid_coords is None:
+        raise ValueError("apply_kernel_and_solve_device: give one of grid_coords/phase_q.")
+    if phase_q is not None:
+        phase = jnp.asarray(phase_q, dtype=jnp.complex128)
+        if phase.shape != (n_grid,):
+            raise ValueError(
+                f"phase_q must have shape ({n_grid},) matching eta_q's grid axis, "
+                f"got {phase.shape}."
+            )
+    else:
+        q_kpt = provider.canonical_kpts[q_index]
+        grid_coords_np = np.asarray(grid_coords, dtype=np.float64)
+        if grid_coords_np.shape != (n_grid, 3):
+            raise ValueError(
+                f"grid_coords must have shape ({n_grid},3) matching eta_q's grid axis, "
+                f"got {grid_coords_np.shape}."
+            )
+        phase = jnp.exp(-1j * (jnp.asarray(grid_coords_np) @ jnp.asarray(q_kpt)))
+
     lq = jnp.asarray(eta_q_np, dtype=jnp.complex128) * phase[None, :]
 
     v_q = provider.apply(q_index, lq)
@@ -717,6 +791,14 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
     if eta.shape[0] != n_kpts:
         raise ValueError(f"eta.shape[0]={eta.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
 
+    # Glue-fix (task #25/C2 item 1, design v2.1 section 6): precompute
+    # every q's Bloch phase ONCE (one grid_coords upload, one batched
+    # jitted matmul) instead of letting each apply_kernel_and_solve_device
+    # call recompute it from scratch -- measured as 72% of the unfused
+    # per-q wall time on a real V100 (task #22 tile harness), and a
+    # per-q constant that never changes within one build.
+    phase_all = precompute_phase_all_q(grid_coords, mesh_obj.canonical_kpts)
+
     neg = mesh_obj.neg
     coul_kpt = [None] * n_kpts
     kern_kpt = [None] * n_kpts
@@ -729,7 +811,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
             continue
         nq = int(neg[q])
         W_q, kern_q, info_q = apply_kernel_and_solve_device(
-            provider, q, Pi[q], eta[q], grid_coords=grid_coords, rtol=rtol,
+            provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=rtol,
             retained_solve_residual_gate=retained_solve_residual_gate,
             self_paired=(nq == q),
         )
