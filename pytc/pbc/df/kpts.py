@@ -250,6 +250,33 @@ def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
     )
 
 
+def build_kconserv(cell, canonical_kpts):
+    """Momentum-conservation table on the canonical mesh: kconserv[k1,k2,k3]
+    = k4 such that (canonical_kpts[k1] - canonical_kpts[k2] +
+    canonical_kpts[k3] - canonical_kpts[k4]) . a = 2*pi*n for integer n
+    (equivalently, k1-k2+k3-k4 is a reciprocal lattice vector) -- pyscf's
+    own convention (pyscf.pbc.lib.kpts_helper.get_kconserv docstring),
+    needed for THC-ERI blocks with 3 independent k-indices (the 4th is
+    fixed by conservation). Delegates to pyscf's own implementation
+    (reuse per the design doc's "no reimplementing existing modules"
+    principle) rather than re-deriving the reciprocal-lattice matching
+    here; canonical_kpts is exactly the uniform-mesh array
+    (cell.get_kpts(kmesh, wrap_around=False)) pyscf's fast path expects,
+    so this is never routed through pyscf's slower general-kpts fallback.
+
+    Args:
+        cell: pyscf.pbc.gto.Cell.
+        canonical_kpts: (n_kpts,3) absolute k-points, e.g. KptsMesh.canonical_kpts.
+
+    Returns:
+        kconserv: (n_kpts, n_kpts, n_kpts) int64 array.
+    """
+    from pyscf.pbc.lib.kpts_helper import get_kconserv
+
+    canonical_kpts = np.asarray(canonical_kpts, dtype=np.float64)
+    return np.asarray(get_kconserv(cell, canonical_kpts), dtype=np.int64)
+
+
 def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
     """Gate max_k ||AO[neg[k]] - conj(AO[k])|| / ||AO[k]|| <= tol,
     BEFORE any downstream .real is taken on quantities built from these
