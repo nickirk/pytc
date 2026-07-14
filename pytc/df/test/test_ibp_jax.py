@@ -243,90 +243,101 @@ class TestJaxAllocationAudit(unittest.TestCase):
         return (jnp.zeros((nm_pad, 3, ng_pad)), jnp.zeros((nn_pad, ng_pad)),
                 jnp.zeros((ng_pad, 3)), jnp.ones((ng_pad,)), jnp.ones((ng_pad,)), ng_pad)
 
-    def test_whole_builder_jaxpr_has_no_full_grid_pair_axis(self):
+    @staticmethod
+    def _live_byte_bound(itemsize, E, S, Nm, Nn, n_mu, n_nu, ng):
+        """A genuinely conservative upper bound (overcounting allowed) on the
+        COMPILED orientation's live bytes: retained padded arguments + output +
+        every potentially-simultaneously-live tile / full-grid temporary,
+        itemsize-scaled, with the ng_pad = lcm(E,S) amplification. Scope note:
+        this is the jitted-orientation live scope; a whole-wrapper peak would
+        additionally hold the original unpadded sector/grid arrays while the
+        padded copies exist (not included here)."""
+        import math
+        ng_pad = ibp._pad_to_multiple(ng, math.lcm(E, S))
+        nm_pad = ibp._pad_to_multiple(n_mu, Nm)
+        nn_pad = ibp._pad_to_multiple(n_nu, Nn)
+        # retained padded arguments (grad, theta, coords, weights, valid)
+        args = nm_pad * 3 * ng_pad + nn_pad * ng_pad + ng_pad * 3 + 2 * ng_pad
+        output = n_mu * n_nu
+        # every potentially-live temporary, conservatively summed:
+        temp = (
+            2 * E * S * 3            # diff + rhat  (E,S,3)
+            + 3 * E * S              # rad + nz + safe  (E,S)
+            + 2 * Nn * S             # theta_ns + wd  (Nn,S)
+            + Nn * 3 * E             # field V  (Nn,3,E)
+            + Nm * 3 * E             # grad_mt  (Nm,3,E)
+            + E * 3 + S * 3          # coords_e + coords_s
+            + E + S                  # we + we_s
+            + ng_pad                 # the one computed full-grid vector w_eff
+            + 2 * Nm * Nn            # block + cur
+            + nm_pad * nn_pad        # Z carry
+        )
+        return itemsize * (args + output + temp)
+
+    def test_whole_builder_jaxpr_permits_only_the_known_full_grid_vector(self):
         # Audit the PRODUCTION-shape whole-orientation builder (the jitted
-        # function the wrapper actually runs), with inputs padded to a valid
-        # ng_pad = multiple of lcm(E,S). No computed intermediate may carry a
-        # grid-scale (O(ng^2) pair or untiled nu*3*ng field) allocation.
+        # function the wrapper actually runs), inputs padded to a valid
+        # ng_pad = multiple of lcm(E,S). The ONLY computed intermediate allowed
+        # to carry the grid axis is the (ng_pad,) w_eff vector; any other
+        # computed shape containing ng_pad (a pair or an untiled field) is
+        # forbidden. (A size>3*ng rule would let a future (3,ng) slip.)
         E, S, Nm, Nn, n_mu, n_nu = 8, 16, 2, 3, 6, 6
         grad, theta, coords, weights, valid, ng = self._padded(E, S, Nm, Nn, n_mu, n_nu)
         jaxpr = jax.make_jaxpr(
             lambda g, t, c, w, v: ibp._ibp_orientation_jax(g, t, c, w, v, E, S, Nm, Nn, n_mu, n_nu)
         )(grad, theta, coords, weights, valid)
         forbidden = []
-        seen_tile = {"rhat_ES3": False}
-
-        def _size(shape):
-            n = 1
-            for d in shape:
-                n *= d
-            return n
+        seen = {"rhat_ES3": False, "w_eff_ng": False}
 
         def _walk(jpr):
             for eqn in jpr.eqns:
-                # Only COMPUTED intermediates (outvars) count as allocations; the
-                # padded inputs legitimately carry the ng axis as loop invars.
-                # A grid axis is acceptable only in an O(ng) or O(3*ng) array (the
-                # weight vector / a coord slice); a grid-PAIR (ng x ng, E x ng) or
-                # an untiled field (nu x 3 x ng) is forbidden -- caught by size.
                 for var in eqn.outvars:
                     shape = tuple(getattr(getattr(var, "aval", None), "shape", ()) or ())
-                    if any(dim == ng for dim in shape) and _size(shape) > 3 * ng:
-                        forbidden.append((str(eqn.primitive), shape))
+                    if ng in shape:
+                        if shape == (ng,):
+                            seen["w_eff_ng"] = True   # the sole permitted full-grid vector
+                        else:
+                            forbidden.append((str(eqn.primitive), shape))
                     if shape == (E, S, 3):
-                        seen_tile["rhat_ES3"] = True
-                # recurse into control-flow sub-jaxprs (the fori_loop bodies)
+                        seen["rhat_ES3"] = True
                 for param in eqn.params.values():
-                    sub = getattr(param, "jaxpr", param)
-                    if hasattr(sub, "eqns"):
-                        _walk(sub)
-                    elif isinstance(param, (tuple, list)):
-                        for p in param:
-                            s = getattr(p, "jaxpr", p)
-                            if hasattr(s, "eqns"):
-                                _walk(s)
+                    subs = param if isinstance(param, (tuple, list)) else [param]
+                    for p in subs:
+                        s = getattr(p, "jaxpr", p)
+                        if hasattr(s, "eqns"):
+                            _walk(s)
 
         _walk(jaxpr.jaxpr)
-        self.assertEqual(forbidden, [], f"full-grid allocation(s) found: {forbidden}")
-        # positive control: the bounded (E,S,3) rhat tile IS present in the body
-        self.assertTrue(seen_tile["rhat_ES3"],
-                        "expected the bounded (E,S,3) rhat tile inside the loop body")
+        self.assertEqual(forbidden, [], f"forbidden full-grid allocation(s): {forbidden}")
+        self.assertTrue(seen["rhat_ES3"], "expected the bounded (E,S,3) rhat tile")
+        self.assertTrue(seen["w_eff_ng"], "expected the (ng,) w_eff vector")
 
-    def test_symbolic_byte_bound_is_dtype_aware_and_complete(self):
-        # A genuinely conservative bound: per-block tile workspace + the output
-        # + the RETAINED padded inputs (grad/theta/coords/weights/valid) with
-        # the ng_pad = lcm(E,S) amplification, all itemsize-scaled.
-        import math
-
-        def bound(itemsize, E, S, Nm, Nn, n_mu, n_nu, ng):
-            ng_pad = ibp._pad_to_multiple(ng, math.lcm(E, S))
-            nm_pad = ibp._pad_to_multiple(n_mu, Nm)
-            nn_pad = ibp._pad_to_multiple(n_nu, Nn)
-            tile = E * S * 3 + E * S + Nn * 3 * E    # rhat + rad + field V
-            output = nm_pad * nn_pad
-            padded_inputs = nm_pad * 3 * ng_pad + nn_pad * ng_pad + ng_pad * 3 + 2 * ng_pad
-            return itemsize * (tile + output + padded_inputs)
-        f64 = bound(8, 8, 16, 2, 3, 6, 6, 200)
-        c128 = bound(16, 8, 16, 2, 3, 6, 6, 200)
+    def test_byte_bound_is_dtype_aware(self):
+        f64 = self._live_byte_bound(8, 8, 16, 2, 3, 6, 6, 200)
+        c128 = self._live_byte_bound(16, 8, 16, 2, 3, 6, 6, 200)
         self.assertEqual(c128, 2 * f64)
-        # ng_pad amplification is real: 200 -> lcm(8,16)=16 -> ceil(200/16)*16=208
-        self.assertEqual(ibp._pad_to_multiple(200, math.lcm(8, 16)), 208)
+        import math
+        self.assertEqual(ibp._pad_to_multiple(200, math.lcm(8, 16)), 208)  # amplification
 
-    def test_compiled_hlo_temp_memory_is_tile_bounded_not_grid_squared(self):
-        # Gate the COMPILED allocation contract: the XLA temp memory of the
-        # whole builder must be far below an (ng x ng) grid-pair allocation.
+    def test_compiled_live_bytes_within_symbolic_bound(self):
+        # Gate the COMPILED allocation contract against the conservative bound:
+        # argument + output + temp - alias <= bound, on the padded production
+        # shapes. Also far below an (ng x ng) grid-pair.
         E, S, Nm, Nn, n_mu, n_nu = 8, 16, 2, 3, 6, 6
         grad, theta, coords, weights, valid, ng = self._padded(E, S, Nm, Nn, n_mu, n_nu)
-        lowered = jax.jit(
+        compiled = jax.jit(
             ibp._ibp_orientation_jax, static_argnums=(5, 6, 7, 8, 9, 10)
-        ).lower(grad, theta, coords, weights, valid, E, S, Nm, Nn, n_mu, n_nu)
-        compiled = lowered.compile()
-        analysis = compiled.memory_analysis()
-        temp = getattr(analysis, "temp_size_in_bytes", None)
-        self.assertIsNotNone(temp)
-        grid_pair_bytes = 8 * ng * ng      # an (ng,ng) f64 pair allocation
-        self.assertLess(temp, grid_pair_bytes,
-                        f"compiled temp {temp} not below grid-pair {grid_pair_bytes}")
+        ).lower(grad, theta, coords, weights, valid, E, S, Nm, Nn, n_mu, n_nu).compile()
+        a = compiled.memory_analysis()
+        arg = a.argument_size_in_bytes
+        out = a.output_size_in_bytes
+        temp = a.temp_size_in_bytes
+        alias = getattr(a, "alias_size_in_bytes", 0)
+        live = arg + out + temp - alias
+        bound = self._live_byte_bound(8, E, S, Nm, Nn, n_mu, n_nu, 200)
+        self.assertLessEqual(live, bound, f"compiled live {live} exceeds bound {bound} "
+                             f"(arg={arg} out={out} temp={temp} alias={alias})")
+        self.assertLess(temp, 8 * ng * ng)  # far below an (ng,ng) grid-pair
 
 
 class TestJaxTiming(unittest.TestCase):
