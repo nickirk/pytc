@@ -324,7 +324,7 @@ def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller)
 def _solve_info_from_core_output(
     n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
     v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-    n, dtype, rtol, *, caller,
+    n, dtype, rtol, *, caller, retention_mode="single",
 ):
     """Build the device-solve info dict from _hermitian_sandwich_solve_core's
     raw (traced) return values. Shared by hermitian_sandwich_solve_device and
@@ -346,6 +346,7 @@ def _solve_info_from_core_output(
         "retained_solve_residual": float(retained_solve_residual),
         "truncation_residual": float(truncation_residual),
         "rtol": rtol,
+        "retention_mode": retention_mode,
         "adaptive_retention_used": False,
         "target_truncation_residual": None,
         "retention_marginal": retention_marginal,
@@ -355,12 +356,37 @@ def _solve_info_from_core_output(
     }
 
 
-def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=None):
+def hermitian_sandwich_solve(
+    Pi, V, *, rtol=1e-4, retention_mode="single", target_truncation_residual=None
+):
     """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V via a
-    relative-spectral-threshold truncated pseudo-inverse of Pi:
-    W = Pi^+_r V Pi^+_r with modes retained by s_i > rtol * s_max
-    (scale-invariant). Pi and V are Hermitized on entry; their
-    anti-Hermitian residuals are recorded. See design doc §5.
+    truncated pseudo-inverse of Pi. Pi and V are Hermitized on entry;
+    their anti-Hermitian residuals are recorded. See design doc §5.
+
+    Three retention modes:
+      "single" (default): threshold = rtol * s_max (scale-invariant).
+        Mode i retained iff s_i > threshold; W's (i,j) term is nonzero
+        only when BOTH i and j pass -- equivalent to Pi^+_r V Pi^+_r
+        with Pi^+_r's single-mode truncated pseudo-inverse.
+      "pairwise": threshold = rtol * s_max (scale-invariant). Pair
+        (i,j) retained iff s_i*s_j > threshold**2 -- strictly more
+        permissive than "single" (keeps weak-strong couplings a
+        single-mode AND excludes). Uses eigh (Pi is Hermitian PSD).
+      "svd_lstsq": fftisdf's OWN formula (fft/isdf.py's lstsq),
+        transplanted structurally, not just its mask shape -- SVD (not
+        eigh) of Pi: Pi = U diag(s) Vh; T = U^H V_herm U; T[i,j] /=
+        s_i*s_j where s_i*s_j > rtol**2, else 0; W = V T Vh (V=Vh^H).
+        U and V are NOT assumed equal even though Pi is Hermitian (the
+        reference never assumes this either). rtol is used as an
+        ABSOLUTE threshold here (fftisdf's own tol, default 1e-8), NOT
+        scaled by s_max -- this mode does not claim scale-invariance,
+        it claims to BE fftisdf's formula. Task #25/C2 item 2b: with
+        eta's q-labeling fixed (see build_pi_eta), Pi and kern now match
+        fftisdf's own arrays to machine precision, and feeding them
+        through fftisdf's own lstsq exactly reproduces fftisdf's own W
+        (relerr ~1e-11) -- this mode ports that same computation so
+        pytc's own pipeline reaches the same accuracy without depending
+        on the external reference at runtime.
 
     Two residuals are reported SEPARATELY: retained_solve_residual
     (machine-tier arithmetic sanity check, ~0 regardless of rtol) and
@@ -371,15 +397,16 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=Non
         V: (n,n).
         rtol: relative spectral retention threshold (default 1e-4;
             design doc §5 -- 1e-8 was far too loose at over-complete rank).
-        target_truncation_residual: optional; if given, additional modes
-            are retained (decreasing eigenvalue order) until the
-            truncation residual meets this target or all n modes are
-            retained (adaptive_retention_used=True).
+        retention_mode: "single" or "pairwise".
+        target_truncation_residual: optional, "single" mode only; if
+            given, additional modes are retained (decreasing eigenvalue
+            order) until the truncation residual meets this target or
+            all n modes are retained (adaptive_retention_used=True).
 
     Returns:
         (W, info): info keys are n_retained, n_discarded, s_max,
         s_min_retained (None if n_retained==0), pi/v_anti_hermitian_residual,
-        retained_solve_residual, truncation_residual, rtol,
+        retained_solve_residual, truncation_residual, rtol, retention_mode,
         adaptive_retention_used, target_truncation_residual,
         retention_marginal, cond_pi_retained, dtype, backend ("numpy").
     """
@@ -400,6 +427,13 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=Non
     rtol = float(rtol)
     if not np.isfinite(rtol) or rtol <= 0.0:
         raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+
+    if retention_mode not in ("single", "pairwise", "svd_lstsq"):
+        raise ValueError(
+            f"retention_mode must be 'single', 'pairwise', or 'svd_lstsq', got {retention_mode!r}."
+        )
+    if retention_mode != "single" and target_truncation_residual is not None:
+        raise ValueError("target_truncation_residual is only supported for retention_mode='single'.")
 
     if target_truncation_residual is not None:
         if isinstance(target_truncation_residual, bool) or not isinstance(
@@ -442,43 +476,110 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=Non
             "not appear to be PSD (or is the zero matrix)."
         )
     threshold = rtol * s_max
-    n_retained = int(np.sum(eigvals > threshold))
-
     v_norm = max(float(np.linalg.norm(V_herm)), tiny)
     adaptive_retention_used = False
 
-    def _truncation_residual(k):
-        U_r = eigvecs[:, :k]
-        proj = U_r @ U_r.conj().T
-        return float(np.linalg.norm(V_herm - proj @ V_herm @ proj)) / v_norm
+    if retention_mode == "svd_lstsq":
+        # fftisdf's literal lstsq formula: SVD (not eigh), rtol used as an
+        # ABSOLUTE threshold (not scaled by s_max -- this mode does not
+        # claim scale-invariance, it claims to BE fftisdf's formula).
+        threshold = rtol
+        u, s_svd, vh = np.linalg.svd(Pi_herm)
+        v = vh.conj().T
+        s_max = float(s_svd[0]) if n > 0 else 0.0
+        s_outer = s_svd[:, None] * s_svd[None, :]
+        pair_mask = np.abs(s_outer) > threshold**2
+        n_retained = int(np.sum(s_svd > threshold))
+        n_discarded = n - n_retained
+        s_min_retained = float(np.min(s_svd[s_svd > threshold])) if n_retained > 0 else None
 
-    if target_truncation_residual is not None:
-        current = _truncation_residual(n_retained) if n_retained > 0 else 1.0
-        while current > target_truncation_residual and n_retained < n:
-            n_retained += 1
-            adaptive_retention_used = True
-            current = _truncation_residual(n_retained)
+        if n_retained > 0:
+            M = u.conj().T @ V_herm @ u
+            safe_s_outer = np.where(pair_mask, s_outer, 1.0)
+            T = np.where(pair_mask, M / safe_s_outer, 0.0)
+            W = v @ T @ vh
+            W = (W + W.conj().T) / 2
+            diff_uv = u.conj().T @ (Pi_herm @ W @ Pi_herm - V_herm) @ v
+            retained_solve = np.where(pair_mask, diff_uv, 0.0)
+            retained_target = np.where(pair_mask, M, 0.0)
+            retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
+                float(np.linalg.norm(retained_target)), tiny
+            )
+            truncation_mass = np.where(pair_mask, 0.0, M)
+            truncation_residual = float(np.linalg.norm(truncation_mass)) / v_norm
+        else:
+            W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
+            retained_solve_residual = 0.0
+            truncation_residual = 1.0
+    elif retention_mode == "pairwise":
+        s_outer = eigvals[:, None] * eigvals[None, :]
+        pair_mask = s_outer > threshold**2
+        touched_mask = np.any(pair_mask, axis=1)
+        n_retained = int(np.sum(touched_mask))
+        n_discarded = n - n_retained
+        s_min_retained = float(np.min(eigvals[touched_mask])) if n_retained > 0 else None
 
-    n_discarded = n - n_retained
-    U_r = eigvecs[:, :n_retained]
-    sigma_r = eigvals[:n_retained]
-    s_min_retained = float(np.min(sigma_r)) if n_retained > 0 else None
-
-    if n_retained > 0:
-        Pi_pinv_r = U_r @ np.diag(1.0 / sigma_r) @ U_r.conj().T
-        W = Pi_pinv_r @ V_herm @ Pi_pinv_r
-        W = (W + W.conj().T) / 2
-        proj_r = U_r @ U_r.conj().T
-        retained_target = proj_r @ V_herm @ proj_r
-        retained_solve = proj_r @ (Pi_herm @ W @ Pi_herm - V_herm) @ proj_r
-        retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
-            float(np.linalg.norm(retained_target)), tiny
-        )
-        truncation_residual = _truncation_residual(n_retained)
+        if n_retained > 0:
+            M = eigvecs.conj().T @ V_herm @ eigvecs
+            safe_s_outer = np.where(pair_mask, s_outer, 1.0)
+            T = np.where(pair_mask, M / safe_s_outer, 0.0)
+            W = eigvecs @ T @ eigvecs.conj().T
+            W = (W + W.conj().T) / 2
+            # Pairwise retention has no retained SUBSPACE (no projector) --
+            # only a retained PAIR SET. Diagnostics must be ELEMENTWISE in
+            # Pi's eigenbasis: Pi W Pi equals V exactly on retained pairs
+            # (a pure arithmetic identity, T=M/s_outer there), so the
+            # solve-residual check is a sanity check on that identity, not
+            # a subspace-projected accuracy measure -- a union-of-touched-
+            # modes projector wrongly counts deliberately-zeroed pairs as
+            # error.
+            diff_eigenbasis = eigvecs.conj().T @ (Pi_herm @ W @ Pi_herm - V_herm) @ eigvecs
+            retained_solve = np.where(pair_mask, diff_eigenbasis, 0.0)
+            retained_target = np.where(pair_mask, M, 0.0)
+            retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
+                float(np.linalg.norm(retained_target)), tiny
+            )
+            truncation_mass = np.where(pair_mask, 0.0, M)
+            truncation_residual = float(np.linalg.norm(truncation_mass)) / v_norm
+        else:
+            W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
+            retained_solve_residual = 0.0
+            truncation_residual = 1.0
     else:
-        W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
-        retained_solve_residual = 0.0
-        truncation_residual = 1.0
+        n_retained = int(np.sum(eigvals > threshold))
+
+        def _truncation_residual(k):
+            U_r = eigvecs[:, :k]
+            proj = U_r @ U_r.conj().T
+            return float(np.linalg.norm(V_herm - proj @ V_herm @ proj)) / v_norm
+
+        if target_truncation_residual is not None:
+            current = _truncation_residual(n_retained) if n_retained > 0 else 1.0
+            while current > target_truncation_residual and n_retained < n:
+                n_retained += 1
+                adaptive_retention_used = True
+                current = _truncation_residual(n_retained)
+
+        n_discarded = n - n_retained
+        U_r = eigvecs[:, :n_retained]
+        sigma_r = eigvals[:n_retained]
+        s_min_retained = float(np.min(sigma_r)) if n_retained > 0 else None
+
+        if n_retained > 0:
+            Pi_pinv_r = U_r @ np.diag(1.0 / sigma_r) @ U_r.conj().T
+            W = Pi_pinv_r @ V_herm @ Pi_pinv_r
+            W = (W + W.conj().T) / 2
+            proj_r = U_r @ U_r.conj().T
+            retained_target = proj_r @ V_herm @ proj_r
+            retained_solve = proj_r @ (Pi_herm @ W @ Pi_herm - V_herm) @ proj_r
+            retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
+                float(np.linalg.norm(retained_target)), tiny
+            )
+            truncation_residual = _truncation_residual(n_retained)
+        else:
+            W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
+            retained_solve_residual = 0.0
+            truncation_residual = 1.0
 
     retention_marginal, cond_pi = _check_retention_marginal(
         s_max, s_min_retained, threshold, rtol, caller="hermitian_sandwich_solve"
@@ -494,6 +595,7 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=Non
         "retained_solve_residual": retained_solve_residual,
         "truncation_residual": truncation_residual,
         "rtol": rtol,
+        "retention_mode": retention_mode,
         "adaptive_retention_used": adaptive_retention_used,
         "target_truncation_residual": target_truncation_residual,
         "retention_marginal": retention_marginal,
@@ -504,16 +606,16 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=Non
     return W, info
 
 
-@jax.jit
-def _hermitian_sandwich_solve_core(Pi, V, rtol):
+@partial(jax.jit, static_argnames=("retention_mode",))
+def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single"):
     """Fixed-shape, jitted, device-resident core of
     hermitian_sandwich_solve_device (design v2.1 sections 5+6/7).
-    Reproduces hermitian_sandwich_solve's math exactly, restructured so
+    Reproduces hermitian_sandwich_solve's math exactly (both retention
+    modes -- see hermitian_sandwich_solve's docstring), restructured so
     retained-rank truncation is a boolean MASK over the full n-dimensional
-    eigenbasis rather than a dynamic-size slice (eigvecs[:, :n_retained]),
-    which is required for a static-shape jax.jit graph -- masked-out modes
-    contribute exactly 0 to both the pseudo-inverse and the retained-space
-    projector, which is mathematically identical to slicing them away.
+    eigenbasis rather than a dynamic-size slice, which is required for a
+    static-shape jax.jit graph -- masked-out modes/pairs contribute
+    exactly 0, which is mathematically identical to slicing them away.
     """
     n = Pi.shape[0]
     dtype = jnp.result_type(Pi.dtype, V.dtype, jnp.complex128)
@@ -535,30 +637,92 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol):
 
     s_max = eigvals[0]
     threshold = rtol * s_max
-    mask = eigvals > threshold
-    n_retained = jnp.sum(mask)
-    has_retained = n_retained > 0
-
-    safe_eigvals = jnp.where(mask, eigvals, 1.0)
-    inv_eigvals = jnp.where(mask, 1.0 / safe_eigvals, 0.0)
-    Pi_pinv_r = (eigvecs * inv_eigvals[None, :]) @ eigvecs.conj().T
-    W_full = Pi_pinv_r @ V_herm @ Pi_pinv_r
-    W_full = (W_full + W_full.conj().T) / 2
-
-    mask_c = mask.astype(eigvecs.dtype)
-    proj_r = (eigvecs * mask_c[None, :]) @ eigvecs.conj().T
-    retained_target = proj_r @ V_herm @ proj_r
-    retained_solve = proj_r @ (Pi_herm @ W_full @ Pi_herm - V_herm) @ proj_r
     v_norm = jnp.maximum(jnp.linalg.norm(V_herm), tiny)
-    retained_solve_residual_full = jnp.linalg.norm(retained_solve) / jnp.maximum(
-        jnp.linalg.norm(retained_target), tiny
-    )
-    truncation_residual_full = jnp.linalg.norm(V_herm - retained_target) / v_norm
+
+    if retention_mode == "svd_lstsq":
+        # fftisdf's literal lstsq formula: SVD (not eigh), rtol used as an
+        # ABSOLUTE threshold (not scaled by s_max -- see hermitian_
+        # sandwich_solve's docstring).
+        threshold = rtol
+        u, s_svd, vh = jnp.linalg.svd(Pi_herm)
+        v = vh.conj().T
+        s_max = s_svd[0]
+        s_outer = s_svd[:, None] * s_svd[None, :]
+        pair_mask = jnp.abs(s_outer) > threshold**2
+        n_retained = jnp.sum(s_svd > threshold)
+        has_retained = n_retained > 0
+
+        M = u.conj().T @ V_herm @ u
+        safe_s_outer = jnp.where(pair_mask, s_outer, 1.0)
+        T = jnp.where(pair_mask, M / safe_s_outer, 0.0)
+        W_full = v @ T @ vh
+        W_full = (W_full + W_full.conj().T) / 2
+
+        s_min_retained = jnp.min(jnp.where(s_svd > threshold, s_svd, jnp.inf))
+
+        diff_uv = u.conj().T @ (Pi_herm @ W_full @ Pi_herm - V_herm) @ v
+        retained_solve = jnp.where(pair_mask, diff_uv, 0.0)
+        retained_target = jnp.where(pair_mask, M, 0.0)
+        retained_solve_residual_full = jnp.linalg.norm(retained_solve) / jnp.maximum(
+            jnp.linalg.norm(retained_target), tiny
+        )
+        truncation_mass = jnp.where(pair_mask, 0.0, M)
+        truncation_residual_full = jnp.linalg.norm(truncation_mass) / v_norm
+    elif retention_mode == "pairwise":
+        s_outer = eigvals[:, None] * eigvals[None, :]
+        pair_mask = s_outer > threshold**2
+        touched_mask = jnp.any(pair_mask, axis=1)
+        n_retained = jnp.sum(touched_mask)
+        has_retained = n_retained > 0
+
+        M = eigvecs.conj().T @ V_herm @ eigvecs
+        safe_s_outer = jnp.where(pair_mask, s_outer, 1.0)
+        T = jnp.where(pair_mask, M / safe_s_outer, 0.0)
+        W_full = eigvecs @ T @ eigvecs.conj().T
+        W_full = (W_full + W_full.conj().T) / 2
+
+        s_min_retained = jnp.min(jnp.where(touched_mask, eigvals, jnp.inf))
+
+        # Pairwise retention has no retained SUBSPACE (no projector) --
+        # only a retained PAIR SET. Diagnostics must be ELEMENTWISE in
+        # Pi's eigenbasis: Pi W Pi equals V exactly on retained pairs (a
+        # pure arithmetic identity, T=M/s_outer there), so the solve-
+        # residual check is a sanity check on that identity, not a
+        # subspace-projected accuracy measure -- a union-of-touched-modes
+        # projector wrongly counts deliberately-zeroed pairs as error.
+        diff_eigenbasis = eigvecs.conj().T @ (Pi_herm @ W_full @ Pi_herm - V_herm) @ eigvecs
+        retained_solve = jnp.where(pair_mask, diff_eigenbasis, 0.0)
+        retained_target = jnp.where(pair_mask, M, 0.0)
+        retained_solve_residual_full = jnp.linalg.norm(retained_solve) / jnp.maximum(
+            jnp.linalg.norm(retained_target), tiny
+        )
+        truncation_mass = jnp.where(pair_mask, 0.0, M)
+        truncation_residual_full = jnp.linalg.norm(truncation_mass) / v_norm
+    else:
+        mask = eigvals > threshold
+        n_retained = jnp.sum(mask)
+        has_retained = n_retained > 0
+
+        safe_eigvals = jnp.where(mask, eigvals, 1.0)
+        inv_eigvals = jnp.where(mask, 1.0 / safe_eigvals, 0.0)
+        Pi_pinv_r = (eigvecs * inv_eigvals[None, :]) @ eigvecs.conj().T
+        W_full = Pi_pinv_r @ V_herm @ Pi_pinv_r
+        W_full = (W_full + W_full.conj().T) / 2
+
+        mask_c = mask.astype(eigvecs.dtype)
+        s_min_retained = jnp.min(jnp.where(mask, eigvals, jnp.inf))
+
+        proj_r = (eigvecs * mask_c[None, :]) @ eigvecs.conj().T
+        retained_target = proj_r @ V_herm @ proj_r
+        retained_solve = proj_r @ (Pi_herm @ W_full @ Pi_herm - V_herm) @ proj_r
+        retained_solve_residual_full = jnp.linalg.norm(retained_solve) / jnp.maximum(
+            jnp.linalg.norm(retained_target), tiny
+        )
+        truncation_residual_full = jnp.linalg.norm(V_herm - retained_target) / v_norm
 
     W = jnp.where(has_retained, W_full, jnp.zeros_like(W_full))
     retained_solve_residual = jnp.where(has_retained, retained_solve_residual_full, 0.0)
     truncation_residual = jnp.where(has_retained, truncation_residual_full, 1.0)
-    s_min_retained = jnp.min(jnp.where(mask, eigvals, jnp.inf))
 
     return (
         W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
@@ -566,7 +730,7 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol):
     )
 
 
-def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4):
+def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4, retention_mode="single"):
     """Device (JAX, fixed-shape, jitted) counterpart of
     hermitian_sandwich_solve. See design doc §5-§7.
 
@@ -598,6 +762,10 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4):
     rtol = float(rtol)
     if not np.isfinite(rtol) or rtol <= 0.0:
         raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+    if retention_mode not in ("single", "pairwise", "svd_lstsq"):
+        raise ValueError(
+            f"retention_mode must be 'single', 'pairwise', or 'svd_lstsq', got {retention_mode!r}."
+        )
 
     Pi_jnp = jnp.asarray(Pi_np, dtype=jnp.complex128)
     V_jnp = jnp.asarray(V_np, dtype=jnp.complex128)
@@ -612,11 +780,12 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4):
     (
         W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-    ) = _hermitian_sandwich_solve_core(Pi_jnp, V_jnp, rtol)
+    ) = _hermitian_sandwich_solve_core(Pi_jnp, V_jnp, rtol, retention_mode)
 
     info = _solve_info_from_core_output(
         n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
         n, W.dtype, rtol, caller="hermitian_sandwich_solve_device",
+        retention_mode=retention_mode,
     )
     return W, info

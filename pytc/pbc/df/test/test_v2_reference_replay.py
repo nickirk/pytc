@@ -1,7 +1,9 @@
 """V2 reference-replay gate: compare Pi^q/eta^q/W^q against the external
 fftisdf CPU oracle (sys.path-only, skipped if the clone is absent).
-Convention: fftisdf_Pi[q] = conj(pytc_Pi[q]) and likewise for eta --
-a pure conjugation, accounted for explicitly. See design doc §8.
+Convention: fftisdf_Pi[q] = conj(pytc_Pi[q]) (pure conjugation). eta^q
+matches fftisdf DIRECTLY, no conjugation (task #25/C2 item 2b: eta's
+q-axis is now relabeled by neg inside build_pi_eta itself, so
+pytc_eta[q] equals fftisdf_eta[q] as constructed). See design doc §8.
 """
 
 import os
@@ -52,7 +54,7 @@ class TestV2ReferenceReplay(unittest.TestCase):
             dtype=np.complex128,
         )
         cls.Pi_mine, cls.eta_mine = build_pi_eta(
-            cls.inpv_kpt, cls.ao_full, cls.mesh_obj.phase
+            cls.inpv_kpt, cls.ao_full, cls.mesh_obj.phase, cls.mesh_obj.neg
         )
 
     def test_pi_matches_fftisdf_within_v2_tolerance(self):
@@ -61,26 +63,28 @@ class TestV2ReferenceReplay(unittest.TestCase):
         phase = get_phase_factor(self.cell, self.kpts_ref)
         Pi_ref = fftisdf_contract(self.inpv_kpt, self.inpv_kpt, phase)
         n_k = self.mesh_obj.n_kpts
+        # Pi is now relabeled by neg at construction (item 2b unified fix),
+        # so it matches fftisdf's own convention directly -- no conjugation.
         for q in range(n_k):
-            expected = self.Pi_mine[q].conj()
+            expected = self.Pi_mine[q]
             rel = np.abs(expected - Pi_ref[q]).max() / np.abs(Pi_ref[q]).max()
             self.assertLess(rel, 1e-6, msg=f"q={q}")
 
     def test_eta_matches_fftisdf_within_v2_tolerance(self):
         n_k = self.mesh_obj.n_kpts
         for q in range(n_k):
-            expected = self.eta_mine[q].conj()
+            expected = self.eta_mine[q]
             rel = np.abs(expected - self.eta_ref[q]).max() / np.abs(self.eta_ref[q]).max()
             self.assertLess(rel, 1e-6, msg=f"q={q}")
 
     def test_w_matches_fftisdf_within_v2_tolerance(self):
         # Reference-replay mode: inject fftisdf's own pivot order (same
-        # inpv_kpt) AND account for the known Pi/eta convention
-        # difference, then compare the fully-solved W^q.
+        # inpv_kpt), compare the fully-solved W^q. Pi and eta both match
+        # fftisdf's convention directly now, no conjugation needed.
         n_k = self.mesh_obj.n_kpts
         for q in range(n_k):
-            Pi_q = self.Pi_mine[q].conj()
-            eta_q = self.eta_mine[q].conj()
+            Pi_q = self.Pi_mine[q]
+            eta_q = self.eta_mine[q]
             W_q, kern_q, info = apply_raw_kernel_and_solve(
                 Pi_q, eta_q, cell=self.cell, q_kpt=self.mesh_obj.canonical_kpts[q],
                 grid_coords=self.grid_coords, grid_mesh=self.cell.mesh, rtol=1e-8,

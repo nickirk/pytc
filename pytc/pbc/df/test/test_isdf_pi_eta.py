@@ -50,9 +50,11 @@ class TestBuildPiEta(unittest.TestCase):
         X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_ip, n_ao))
         ao = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_g, n_ao))
 
-        Pi, eta = build_pi_eta(X, ao, mesh.phase)
-        Pi_expected = pair_convolve(X, X, mesh.phase)
-        eta_expected = pair_convolve(X, ao, mesh.phase)
+        Pi, eta = build_pi_eta(X, ao, mesh.phase, mesh.neg)
+        # both Pi and eta are relabeled by neg relative to the raw
+        # pair_convolve output (unified q<->-q convention fix, C2 item 2b).
+        Pi_expected = pair_convolve(X, X, mesh.phase)[mesh.neg]
+        eta_expected = pair_convolve(X, ao, mesh.phase)[mesh.neg]
         np.testing.assert_allclose(Pi, Pi_expected, atol=1e-12)
         np.testing.assert_allclose(eta, eta_expected, atol=1e-12)
 
@@ -64,7 +66,7 @@ class TestBuildPiEta(unittest.TestCase):
         n_ip, n_ao = 4, 6
         X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_ip, n_ao))
         ao = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (5, n_ao))
-        Pi, _ = build_pi_eta(X, ao, mesh.phase)
+        Pi, _ = build_pi_eta(X, ao, mesh.phase, mesh.neg)
         for q in range(mesh.n_kpts):
             np.testing.assert_allclose(Pi[q], Pi[q].conj().T, atol=1e-10, err_msg=f"q={q}")
 
@@ -76,7 +78,7 @@ class TestBuildPiEta(unittest.TestCase):
         n_ip, n_ao = 3, 4
         X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_ip, n_ao))
         ao = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (5, n_ao))
-        Pi, eta = build_pi_eta(X, ao, mesh.phase)
+        Pi, eta = build_pi_eta(X, ao, mesh.phase, mesh.neg)
         np.testing.assert_allclose(Pi[mesh.neg], Pi.conj(), atol=1e-10)
         np.testing.assert_allclose(eta[mesh.neg], eta.conj(), atol=1e-10)
 
@@ -89,9 +91,9 @@ class TestBuildPiEta(unittest.TestCase):
         X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_ip, n_ao))
         ao = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_g, n_ao))
 
-        Pi_single, eta_single = build_pi_eta(X, ao, mesh.phase)
+        Pi_single, eta_single = build_pi_eta(X, ao, mesh.phase, mesh.neg)
         blocks = [ao[:, :4, :], ao[:, 4:7, :], ao[:, 7:, :]]
-        Pi_blocked, eta_blocked = build_pi_eta(X, blocks, mesh.phase)
+        Pi_blocked, eta_blocked = build_pi_eta(X, blocks, mesh.phase, mesh.neg)
 
         np.testing.assert_allclose(Pi_blocked, Pi_single, atol=1e-12)
         np.testing.assert_allclose(eta_blocked, eta_single, atol=1e-12)
@@ -104,7 +106,7 @@ class TestBuildPiEta(unittest.TestCase):
         X_bad = rng.normal(size=(mesh.n_kpts, 3)).astype(np.complex128)
         ao = rng.normal(size=(mesh.n_kpts, 5, 4)).astype(np.complex128)
         with self.assertRaises(ValueError):
-            build_pi_eta(X_bad, ao, mesh.phase)
+            build_pi_eta(X_bad, ao, mesh.phase, mesh.neg)
 
     def test_rejects_empty_ao_blocks(self):
         cell = _make_cell()
@@ -113,7 +115,7 @@ class TestBuildPiEta(unittest.TestCase):
         mesh = canonicalize_kpts(cell, kpts)
         X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (3, 4))
         with self.assertRaises(ValueError):
-            build_pi_eta(X, [], mesh.phase)
+            build_pi_eta(X, [], mesh.phase, mesh.neg)
 
 
 if __name__ == "__main__":

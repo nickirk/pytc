@@ -19,7 +19,8 @@ from pytc.pbc.df.isdf import (
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
 
-def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProvider):
+def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
+          provider_cls=RawKernelProvider):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -27,6 +28,9 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProv
         kpts: (Nk,3) absolute k-points (canonicalized internally).
         rank: requested interpolation-point rank.
         block_size: grid points per streamed AO block.
+        retention_mode: "single" or "pairwise" -- forwarded to the S4
+            Hermitian sandwich solve. See hermitian_sandwich_solve's
+            docstring (pytc/df/solvers.py) for the two modes.
         provider_cls: KernelProvider for S4 (default RawKernelProvider).
 
     Returns:
@@ -54,13 +58,13 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProv
             cell, mesh_obj.canonical_kpts, grid_coords, block_size
         )
     )
-    Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.phase)
+    Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg)
 
     provider = provider_cls(
         cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
     )
     coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
-        provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol
+        provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol, retention_mode=retention_mode
     )
 
     return {
@@ -262,15 +266,16 @@ class ISDFDF:
 
     Args:
         kpts: (Nk,3) absolute k-points, e.g. cell.make_kpts(kmesh).
-        rank, block_size, rtol: forwarded to build().
+        rank, block_size, rtol, retention_mode: forwarded to build().
     """
 
-    def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4):
+    def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single"):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
         self.block_size = block_size
         self.rtol = rtol
+        self.retention_mode = retention_mode
         self._built = None
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
         # factorization) delegate to a real FFTDF instance.
@@ -290,7 +295,7 @@ class ISDFDF:
         if self._built is None:
             self._built = build(
                 self.cell, self.kpts, rank=self.rank, block_size=self.block_size,
-                rtol=self.rtol,
+                rtol=self.rtol, retention_mode=self.retention_mode,
             )
         return self._built
 

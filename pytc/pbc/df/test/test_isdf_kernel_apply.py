@@ -53,7 +53,7 @@ class TestApplyRawKernelAndSolve(unittest.TestCase):
         grids = cell.get_uniform_grids(cell.mesh)
         X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
         ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (grids.shape[0], cell.nao))
-        Pi, eta = build_pi_eta(X, ao, mesh_obj.phase)
+        Pi, eta = build_pi_eta(X, ao, mesh_obj.phase, mesh_obj.neg)
         return cell, mesh_obj, grids, Pi, eta
 
     def test_kern_q_and_w_q_are_hermitian(self):

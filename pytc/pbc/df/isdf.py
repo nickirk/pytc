@@ -97,16 +97,42 @@ def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=
     return pivots[:n_selected], L[:, :n_selected], n_selected
 
 
-def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
+def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     """Build Pi^q = pair_convolve(X, X)[q] and eta^q = pair_convolve(X, AO)[q].
     eta is accumulated block-by-block so one pair_convolve call holds only
     one block of AO data. See design doc §4-§5.
+
+    q-labeling fix (task #25/C2 item 2b, 2026-07-14): Alg. 1's convolution
+    (which pair_convolve implements) and Eq. 4/5's own defining equations
+    for Pi/eta agree only up to a q<->-q relabeling (derived by dummy-
+    relabeling Alg. 1's expansion with m=-k). This is INVISIBLE at
+    self-paired q (q=neg[q]: real-valued/trivially-conjugate either way)
+    and was invisible in Pi's specific case for a second reason -- Pi's
+    symmetric X=X call makes pair_convolve's raw output satisfy
+    Pi_raw[neg[q]]=conj(Pi_raw[q]) regardless of labeling, so a plain
+    transpose relation to an external oracle (task #25/C2's Test D) LOOKED
+    clean while still carrying the SAME offset one level down: feeding
+    Pi_raw[q] into the Hermitian sandwich solve reproduces the WRONG
+    physical W at genuine-pair q (confirmed empirically: relative error
+    ~1e4 vs an external oracle, collapsing to ~1e-11 when Pi_raw[neg[q]]
+    is used instead) even though Pi_raw[q] itself "matched" the oracle's
+    own (equally offset) metric up to transpose. One bug, two faces --
+    both eta and Pi carry the identical offset; only eta's showed up as
+    an obvious VALUE mismatch, Pi's hid inside a transpose that looked
+    like a clean convention difference rather than a shared bug. Fixed
+    identically for both (not inside pair_convolve, which stays correct/
+    shared/untouched) by relabeling BOTH outputs' q-axis with neg once,
+    after construction -- every consumer (solve modes, the device
+    pipeline, apply_kernel_and_solve_device) receives the physical Pi^q/
+    eta^q and needs no compensating convention logic of its own.
 
     Args:
         X: (Nk, Nip, Nao) complex128 across the canonical k-mesh.
         ao_blocks: (Nk, Ng, Nao) complex128 array, or iterable of
             (Nk, blk_i, Nao) blocks on the SAME canonical k-mesh.
         phase: (Nk, Nk) unitary matrix (KptsMesh.phase).
+        neg: (Nk,) int array (KptsMesh.neg), used to relabel both
+            outputs' q-axis.
 
     Returns:
         (Pi, eta): (Nk, Nip, Nip) and (Nk, Nip, Ng) complex128.
@@ -117,8 +143,11 @@ def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
     X = np.asarray(X)
     if X.ndim != 3:
         raise ValueError(f"X must be 3-D (Nk, Nip, Nao), got shape {X.shape}.")
+    neg = np.asarray(neg)
+    if neg.shape != (X.shape[0],):
+        raise ValueError(f"neg must have shape ({X.shape[0]},), got {neg.shape}.")
 
-    Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)
+    Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
 
     if isinstance(ao_blocks, np.ndarray):
         ao_blocks = [ao_blocks]
@@ -131,7 +160,7 @@ def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
         pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)
         for block in ao_blocks
     ]
-    eta = np.concatenate(eta_chunks, axis=2)
+    eta = np.concatenate(eta_chunks, axis=2)[neg]
     return Pi, eta
 
 
@@ -163,11 +192,12 @@ def apply_raw_kernel_and_solve(
         grid_mesh: (3,) positive ints, real-space integration mesh
             (distinct from the k-point mesh); prod must equal Ng.
         rtol: forwarded to hermitian_sandwich_solve.
-        self_paired: True when neg[q]==q. Physics requires kern_q real for
-            such q, but the complex intermediates leave floating-point
-            imaginary noise that the near-singular solve amplifies; when
-            True, kern_q.real is taken BEFORE the solve (noise projection,
-            not a loosened gate). See design doc §5.
+        self_paired: True when neg[q]==q. Physics requires both Pi_q and
+            kern_q real for such q, but the complex intermediates leave
+            floating-point imaginary noise that the near-singular solve
+            amplifies; when True, Pi_q.real and kern_q.real are taken
+            BEFORE the solve (noise projection, not a loosened gate). See
+            design doc §5.
 
     Returns:
         (W_q, kern_q, solve_info): W_q (Nip, Nip) complex128; kern_q is
@@ -186,6 +216,8 @@ def apply_raw_kernel_and_solve(
     if eta_q.ndim != 2 or eta_q.shape[0] != n_ip:
         raise ValueError(f"eta_q must have shape ({n_ip},Ng), got {eta_q.shape}.")
     n_grid = eta_q.shape[1]
+    if self_paired:
+        Pi_q = Pi_q.real.astype(np.complex128)
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     if grid_coords.shape != (n_grid, 3):
@@ -332,9 +364,9 @@ def precompute_coulG_all_q(cell, canonical_kpts, grid_mesh):
     return jnp.asarray(coulG_all)
 
 
-@partial(jax.jit, static_argnames=("grid_mesh", "self_paired"))
+@partial(jax.jit, static_argnames=("grid_mesh", "self_paired", "retention_mode"))
 def _fused_apply_kernel_and_solve_core(
-    Pi_q, eta_q, phase_q, coulG_scaled_q, grid_mesh, rtol, self_paired
+    Pi_q, eta_q, phase_q, coulG_scaled_q, grid_mesh, rtol, self_paired, retention_mode="single"
 ):
     """Fully fused single-jax.jit per-q hot path: phase-multiply -> raw
     kernel apply -> conjugate -> ZGEMM -> Hermitian sandwich solve, one XLA
@@ -353,7 +385,7 @@ def _fused_apply_kernel_and_solve_core(
     (
         W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-    ) = _hermitian_sandwich_solve_core(Pi_q, kern_q, rtol)
+    ) = _hermitian_sandwich_solve_core(Pi_q, kern_q, rtol, retention_mode)
 
     return (
         W, kern_q, n_retained, s_max, s_min_retained,
@@ -403,12 +435,15 @@ class RawKernelProvider:
             lq, cell=self.cell, q_kpt=self.canonical_kpts[q_index], grid_mesh=self.grid_mesh
         )
 
-    def fused_apply_and_solve(self, q_index, Pi_q, eta_q, phase_q, rtol, self_paired):
+    def fused_apply_and_solve(
+        self, q_index, Pi_q, eta_q, phase_q, rtol, self_paired, retention_mode="single"
+    ):
         n_kpts = self.canonical_kpts.shape[0]
         if not (0 <= q_index < n_kpts):
             raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         return _fused_apply_kernel_and_solve_core(
-            Pi_q, eta_q, phase_q, self.coulG_all[q_index], self.grid_mesh, rtol, self_paired
+            Pi_q, eta_q, phase_q, self.coulG_all[q_index], self.grid_mesh, rtol, self_paired,
+            retention_mode,
         )
 
     def provenance(self):
@@ -451,7 +486,7 @@ def precompute_phase_all_q(grid_coords, canonical_kpts):
 
 def apply_kernel_and_solve_device(
     provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=1e-4,
-    retained_solve_residual_gate=1e-10, self_paired=False,
+    retained_solve_residual_gate=1e-10, self_paired=False, retention_mode="single",
 ):
     """S4 pipeline glue, device-resident, provider-agnostic: phase multiply
     -> provider.apply -> conjugate -> ZGEMM -> device Hermitian sandwich
@@ -472,8 +507,11 @@ def apply_kernel_and_solve_device(
             solve_info["retained_solve_residual"]; also hard-fails on
             n_retained == 0 (the jitted solve cannot raise on traced
             values, so degradation is turned into an error here).
-        self_paired: True when neg[q]==q; kern_q.real is taken before the
-            solve (see apply_raw_kernel_and_solve).
+        self_paired: True when neg[q]==q; Pi_q.real and kern_q.real are
+            taken before the solve (see apply_raw_kernel_and_solve).
+        retention_mode: "single" (default) or "pairwise" -- forwarded to
+            hermitian_sandwich_solve_device / the fused core. See
+            hermitian_sandwich_solve's docstring for the two modes.
 
     Returns:
         (W_q, kern_q, solve_info): W_q (Nip, Nip) complex128 jax array;
@@ -504,6 +542,8 @@ def apply_kernel_and_solve_device(
 
     eta_q_jnp = jnp.asarray(eta_q, dtype=jnp.complex128)
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
+    if self_paired:
+        Pi_q_jnp = Pi_q_jnp.real.astype(jnp.complex128)
 
     # Providers with a fused fast path run the whole chain as one jax.jit
     # graph; others fall back to the eager per-stage path below.
@@ -513,12 +553,13 @@ def apply_kernel_and_solve_device(
             W_q_unscaled, kern_q, n_retained, s_max, s_min_retained,
             pi_anti_hermitian_residual, v_anti_hermitian_residual,
             retained_solve_residual, truncation_residual,
-        ) = fused(q_index, Pi_q_jnp, eta_q_jnp, phase, rtol, self_paired)
+        ) = fused(q_index, Pi_q_jnp, eta_q_jnp, phase, rtol, self_paired, retention_mode)
 
         solve_info = _solve_info_from_core_output(
             n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
             v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
             n_ip, W_q_unscaled.dtype, rtol, caller="apply_kernel_and_solve_device[fused]",
+            retention_mode=retention_mode,
         )
     else:
         lq = eta_q_jnp * phase[None, :]
@@ -530,7 +571,9 @@ def apply_kernel_and_solve_device(
         if self_paired:
             kern_q = kern_q.real.astype(jnp.complex128)
 
-        W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
+        W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
+            Pi_q_jnp, kern_q, rtol=rtol, retention_mode=retention_mode
+        )
 
     # Host-side gate: the jitted solve cannot raise on a traced value, so
     # degeneracy becomes a precise, q-indexed error here (not a silent W_q=0).
@@ -557,7 +600,7 @@ def apply_kernel_and_solve_device(
 
 
 def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4,
-                           retained_solve_residual_gate=1e-10):
+                           retained_solve_residual_gate=1e-10, retention_mode="single"):
     """S4 orchestration: build coul_kpt (Nk, Nip, Nip) with one
     apply_kernel_and_solve_device call per unique {q, neg[q]} pair; the
     partner is set by exact conjugation (W[neg[q]] = conj(W[q]),
@@ -602,7 +645,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
         W_q, kern_q, info_q = apply_kernel_and_solve_device(
             provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=rtol,
             retained_solve_residual_gate=retained_solve_residual_gate,
-            self_paired=(nq == q),
+            self_paired=(nq == q), retention_mode=retention_mode,
         )
         coul_kpt[q] = W_q
         kern_kpt[q] = kern_q
@@ -856,7 +899,7 @@ def stage_eta_memmap(eta_chunks_iter, shape, memmap_path):
     return mm
 
 
-def stage_eta_recompute_tile(X, ao_block_source, phase, q_slice=None):
+def stage_eta_recompute_tile(X, ao_block_source, phase, neg, q_slice=None):
     """recompute staging (policy 3): rebuild eta on demand via build_pi_eta,
     with ao_block_source() returning a FRESH iterable of (Nk,blk,Nao)
     blocks on every call. q_slice is applied to the leading (Nk) axis
@@ -865,7 +908,7 @@ def stage_eta_recompute_tile(X, ao_block_source, phase, q_slice=None):
     Returns:
         (Pi, eta): same as build_pi_eta, optionally sliced by q_slice.
     """
-    Pi, eta = build_pi_eta(X, ao_block_source(), phase)
+    Pi, eta = build_pi_eta(X, ao_block_source(), phase, neg)
     if q_slice is not None:
         return Pi[q_slice], eta[q_slice]
     return Pi, eta
