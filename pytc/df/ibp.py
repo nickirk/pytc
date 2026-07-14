@@ -21,6 +21,7 @@ silently forget which diagonal convention was used.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import math
 import time
@@ -30,6 +31,7 @@ import typing
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
 from .solvers import (
     prepare_normal_equations_solver,
@@ -1510,21 +1512,21 @@ def build_ibp_interpolation_sector(
 # Same/cross-sector Z cores (task #7).
 # ---------------------------------------------------------------------------
 
-_IBP_CORE_VERSION = "1"
+_IBP_CORE_VERSION = "2"  # v2: JAX backend + deterministic spec (timing/memory excluded)
+_SUPPORTED_IBP_CORE_OUTPUT_IDENTITY_SOURCES = (
+    "computed_content_hash", "derived_from_attested_inputs_unverified",
+)
 _SUPPORTED_IBP_CORE_SYMMETRY_MODES = ("two_sided_average", "one_sided")
-_SUPPORTED_PEAK_HOST_BYTES_STATUS = ("unmeasured_cpu_oracle",)
+_SUPPORTED_PEAK_HOST_BYTES_STATUS = ("unmeasured_cpu_oracle", "unmeasured_jax_device")
 _DEFAULT_PSD_RTOL = 1e-10
 _PSD_HERMITICITY_TOL = 1e-10
 
 
-def _normalized_frobenius_residual(a, b):
-    """||a - b||_F / ||a||_F. Only 0/0 maps to 0 (an exact all-zero reference);
-    a nonzero difference against a zero-norm reference is undefined and raises
-    rather than being silently reported as exact."""
-    a = np.asarray(a)
-    b = np.asarray(b)
-    numerator = float(np.linalg.norm(a - b))
-    denom = float(np.linalg.norm(a))
+def _residual_from_norms(numerator, denom):
+    """Shared 0/0->0, nonzero/0->raise, finite/non-negative logic for a
+    normalized residual given already-computed (host scalar) norms."""
+    numerator = float(numerator)
+    denom = float(denom)
     if denom == 0.0:
         if numerator == 0.0:
             return 0.0
@@ -1536,6 +1538,36 @@ def _normalized_frobenius_residual(a, b):
     if not math.isfinite(result) or result < 0.0:
         raise ValueError(f"normalized Frobenius residual is not finite and non-negative: {result!r}.")
     return result
+
+
+def _normalized_frobenius_residual(a, b):
+    """||a - b||_F / ||a||_F. Only 0/0 maps to 0 (an exact all-zero reference);
+    a nonzero difference against a zero-norm reference is undefined and raises
+    rather than being silently reported as exact."""
+    a = np.asarray(a)
+    b = np.asarray(b)
+    return _residual_from_norms(np.linalg.norm(a - b), np.linalg.norm(a))
+
+
+def _normalized_frobenius_residual_jax(a, b):
+    """Device ||a-b||_F / ||a||_F: norms reduce on device and only the two
+    rank-0 scalars cross to the host (through _ibp_sync_scalars) before the
+    shared 0/0 / nonzero-0 / finite logic; no large array is transferred."""
+    s = _ibp_sync_scalars(num=jnp.linalg.norm(a - b), den=jnp.linalg.norm(a))
+    return _residual_from_norms(s["num"], s["den"])
+
+
+def _packed_pair_residual_rank_space_jax(z_forward, p):
+    """Same-sector packed-pair Hermiticity residual computed in rank space,
+    never forming P^dagger z P (n_pair x n_pair). With G = P P^dagger,
+    ||P^dagger A P||_F^2 = Re tr(A^dagger G A G); numerator uses A = z - z^H,
+    denominator A = z. Only the two rank-0 norms cross to the host."""
+    g = p @ p.conj().T                                  # (rank, rank)
+    diff = z_forward - z_forward.conj().T
+    num_sq = _frob_sq_in_rank_space(diff, g)
+    den_sq = _frob_sq_in_rank_space(z_forward, g)
+    s = _ibp_sync_scalars(num_sq=jnp.maximum(num_sq, 0.0), den_sq=jnp.maximum(den_sq, 0.0))
+    return _residual_from_norms(math.sqrt(s["num_sq"]), math.sqrt(s["den_sq"]))
 
 
 class PSDFactorization(typing.NamedTuple):
@@ -1684,6 +1716,11 @@ class IBPCoreArtifact:
     z_sha256: str
     z_forward_sha256: str
     z_reverse_sha256: object
+    # "computed_content_hash" (numpy: z_*/psd hashes are verified device-free
+    # content hashes) or "derived_from_attested_inputs_unverified" (jax: those
+    # hashes are None; identity is inherited from attested sector/operator
+    # inputs, never a device content hash).
+    output_identity_source: str
     raw_dagger_residual: float
     raw_packed_pair_metric_dagger_residual: object
     coincident_pairs: int
@@ -1719,10 +1756,23 @@ class IBPCoreArtifact:
     core_spec_sha256: str
 
     def __post_init__(self):
-        if self.backend != "numpy":
+        if self.backend not in _SUPPORTED_IBP_BACKENDS:
             raise ValueError(
-                f"Unsupported backend={self.backend!r} -- only 'numpy' is implemented "
-                f"(JAX tiled execution is task #10's scope)."
+                f"Unsupported backend={self.backend!r} -- must be one of "
+                f"{_SUPPORTED_IBP_BACKENDS}."
+            )
+        if self.output_identity_source not in _SUPPORTED_IBP_CORE_OUTPUT_IDENTITY_SOURCES:
+            raise ValueError(
+                f"Unsupported output_identity_source={self.output_identity_source!r}, must "
+                f"be one of {_SUPPORTED_IBP_CORE_OUTPUT_IDENTITY_SOURCES}."
+            )
+        if self.backend == "jax":
+            self._post_init_jax()
+            return
+        # ---- NumPy path (numerically and structurally unchanged) ----
+        if self.output_identity_source != "computed_content_hash":
+            raise ValueError(
+                "backend='numpy' requires output_identity_source='computed_content_hash'."
             )
         if self.device != "cpu":
             raise ValueError(f"device must be 'cpu' for backend='numpy', got {self.device!r}.")
@@ -1904,10 +1954,24 @@ class IBPCoreArtifact:
             self, "provenance", _deep_freeze(dict(self.provenance) if self.provenance else {})
         )
 
-        recomputed_spec = _canonical_spec_sha256({
+        recomputed_spec = _canonical_spec_sha256(self._core_spec_fields(n_mu, n_nu))
+        if recomputed_spec != self.core_spec_sha256:
+            raise ValueError(
+                "core_spec_sha256 does not match the canonical digest recomputed from "
+                "this artifact's own declared fields."
+            )
+
+    def _core_spec_fields(self, n_mu, n_nu):
+        """The v2 deterministic identity fields -- excludes the nondeterministic
+        build_wall_time_seconds / peak_host_bytes execution metadata so the same
+        inputs always digest identically. The builder digests the identical
+        field set (kept in lock-step; any drift fails the __post_init__ recompute
+        immediately)."""
+        return {
             "same_sector": self.same_sector, "symmetry_mode": self.symmetry_mode,
             "z_sha256": self.z_sha256, "z_forward_sha256": self.z_forward_sha256,
             "z_reverse_sha256": self.z_reverse_sha256,
+            "output_identity_source": self.output_identity_source,
             "raw_dagger_residual": self.raw_dagger_residual,
             "raw_packed_pair_metric_dagger_residual": self.raw_packed_pair_metric_dagger_residual,
             "coincident_pairs": self.coincident_pairs, "n_mu": n_mu, "n_nu": n_nu,
@@ -1923,19 +1987,11 @@ class IBPCoreArtifact:
             "left_sector_spec_sha256": self.left_sector_spec_sha256,
             "right_sector_spec_sha256": self.right_sector_spec_sha256,
             "operator_spec_sha256": self.operator_spec_sha256,
-            "mu_block_size": mu_block_size, "nu_block_size": nu_block_size,
+            "mu_block_size": self.mu_block_size, "nu_block_size": self.nu_block_size,
             "backend": self.backend, "device": self.device,
             "realized_dtype": self.realized_dtype,
-            "build_wall_time_seconds": build_wall_time_seconds,
-            "peak_host_bytes": self.peak_host_bytes,
-            "peak_host_bytes_status": self.peak_host_bytes_status,
             "solver_version": self.solver_version, "provenance": self.provenance,
-        })
-        if recomputed_spec != self.core_spec_sha256:
-            raise ValueError(
-                "core_spec_sha256 does not match the canonical digest recomputed from "
-                "this artifact's own declared fields."
-            )
+        }
 
     def _validate_psd_fields(self):
         """Close the PSD factorization fields. For a factorized (same-sector,
@@ -2073,6 +2129,509 @@ class IBPCoreArtifact:
                 f"({actual_reconstruction!r})."
             )
 
+    def _post_init_jax(self):
+        """Validate a device-resident JAX core. Mirrors the NumPy validation
+        but every large array stays a device jax.Array on self.device; only
+        rank-0 reduced scalars cross to the host (through _ibp_sync_scalars).
+        The z_*/psd_factor content hashes are None (caller-attested-input trust
+        boundary); identity is bound through the recomputed spec digest and the
+        gauge-invariant scalar diagnostics + W W^dagger reconstruction residual,
+        never an exact eigenvector-matrix comparison."""
+        if self.output_identity_source != "derived_from_attested_inputs_unverified":
+            raise ValueError(
+                "backend='jax' requires output_identity_source="
+                "'derived_from_attested_inputs_unverified'."
+            )
+        if not isinstance(self.same_sector, bool):
+            raise TypeError("same_sector must be bool.")
+        if self.symmetry_mode not in _SUPPORTED_IBP_CORE_SYMMETRY_MODES:
+            raise ValueError(
+                f"Unsupported symmetry_mode={self.symmetry_mode!r}, must be one of "
+                f"{_SUPPORTED_IBP_CORE_SYMMETRY_MODES}."
+            )
+        n_mu = _validate_positive_int("n_mu", self.n_mu)
+        n_nu = _validate_positive_int("n_nu", self.n_nu)
+
+        def _require_device_array(name, arr, shape):
+            if not isinstance(arr, jax.Array):
+                raise TypeError(f"{name} must be a jax.Array for backend='jax'.")
+            if str(arr.device) != self.device:
+                raise ValueError(
+                    f"{name} device {str(arr.device)!r} does not match core device "
+                    f"{self.device!r}."
+                )
+            if arr.shape != shape:
+                raise ValueError(f"{name}.shape must be {shape}, got {arr.shape}.")
+
+        _require_device_array("Z", self.Z, (n_mu, n_nu))
+        _require_device_array("z_forward_one_sided", self.z_forward_one_sided, (n_mu, n_nu))
+
+        if self.same_sector:
+            if self.z_reverse_one_sided is not None:
+                raise ValueError("z_reverse_one_sided must be None for same_sector=True.")
+            if self.left_sector_spec_sha256 != self.right_sector_spec_sha256:
+                raise ValueError(
+                    "same_sector=True requires left_sector_spec_sha256 == "
+                    "right_sector_spec_sha256."
+                )
+            if n_mu != n_nu:
+                raise ValueError("same_sector=True requires n_mu == n_nu.")
+            dagger = self.z_forward_one_sided.conj().T
+        else:
+            _require_device_array("z_reverse_one_sided", self.z_reverse_one_sided, (n_nu, n_mu))
+            dagger = self.z_reverse_one_sided.conj().T
+
+        checks = _ibp_sync_scalars(
+            zf=jnp.all(jnp.isfinite(self.z_forward_one_sided)),
+            z=jnp.all(jnp.isfinite(self.Z)),
+            zr=(jnp.all(jnp.isfinite(self.z_reverse_one_sided))
+                if self.z_reverse_one_sided is not None else jnp.asarray(True)),
+        )
+        if not checks["zf"]:
+            raise ValueError("z_forward_one_sided has non-finite entries.")
+        if not checks["z"]:
+            raise ValueError("Z has non-finite entries.")
+        if self.z_reverse_one_sided is not None and not checks["zr"]:
+            raise ValueError("z_reverse_one_sided has non-finite entries.")
+
+        recomputed_residual = _normalized_frobenius_residual_jax(self.z_forward_one_sided, dagger)
+        if not math.isclose(self.raw_dagger_residual, recomputed_residual,
+                            rel_tol=1e-9, abs_tol=1e-14):
+            raise ValueError(
+                f"raw_dagger_residual={self.raw_dagger_residual!r} does not match the value "
+                f"recomputed from the artifact's own raw orientation(s) "
+                f"({recomputed_residual!r})."
+            )
+        expected_Z = (
+            self.z_forward_one_sided if self.symmetry_mode == "one_sided"
+            else (self.z_forward_one_sided + dagger) / 2
+        )
+        if not _ibp_sync_scalars(m=jnp.all(self.Z == expected_Z))["m"]:
+            raise ValueError(
+                "Z does not match the value recomputed from this artifact's own raw "
+                "orientation(s) and symmetry_mode."
+            )
+
+        for name in ("z_sha256", "z_forward_sha256", "z_reverse_sha256"):
+            if getattr(self, name) is not None:
+                raise ValueError(
+                    f"{name} must be None for backend='jax': device bytes are never hashed "
+                    f"on the fly; identity is inherited from the attested inputs."
+                )
+
+        if self.same_sector:
+            if self.raw_packed_pair_metric_dagger_residual is None:
+                raise ValueError(
+                    "raw_packed_pair_metric_dagger_residual is required for same_sector=True."
+                )
+            _validate_nonnegative_finite(
+                "raw_packed_pair_metric_dagger_residual",
+                self.raw_packed_pair_metric_dagger_residual,
+            )
+        elif self.raw_packed_pair_metric_dagger_residual is not None:
+            raise ValueError(
+                "raw_packed_pair_metric_dagger_residual must be None for cross-sector cores."
+            )
+
+        self._validate_psd_fields_jax()
+
+        if isinstance(self.coincident_pairs, bool) or not isinstance(self.coincident_pairs, int):
+            raise ValueError(f"coincident_pairs must be a non-negative int, got {self.coincident_pairs!r}.")
+        if self.coincident_pairs < 0:
+            raise ValueError(f"coincident_pairs must be non-negative, got {self.coincident_pairs!r}.")
+
+        data_dtype = np.dtype(self.realized_dtype)
+        if not np.issubdtype(data_dtype, np.inexact):
+            raise ValueError("core data must use a floating or complex dtype.")
+        if str(self.Z.dtype) != self.realized_dtype:
+            raise ValueError(
+                f"realized_dtype={self.realized_dtype!r} does not match Z.dtype {self.Z.dtype}."
+            )
+
+        mu_block_size = _validate_positive_int("mu_block_size", self.mu_block_size)
+        nu_block_size = _validate_positive_int("nu_block_size", self.nu_block_size)
+        object.__setattr__(self, "mu_block_size", mu_block_size)
+        object.__setattr__(self, "nu_block_size", nu_block_size)
+
+        for name in ("left_sector_spec_sha256", "right_sector_spec_sha256", "operator_spec_sha256"):
+            _validate_sha256_hex(name, getattr(self, name))
+
+        build_wall_time_seconds = _validate_nonnegative_finite(
+            "build_wall_time_seconds", self.build_wall_time_seconds
+        )
+        object.__setattr__(self, "build_wall_time_seconds", build_wall_time_seconds)
+        if self.peak_host_bytes is not None:
+            raise ValueError("peak_host_bytes must be None for the JAX device backend.")
+        if self.peak_host_bytes_status != "unmeasured_jax_device":
+            raise ValueError(
+                f"peak_host_bytes_status={self.peak_host_bytes_status!r} must be "
+                f"'unmeasured_jax_device' for backend='jax'."
+            )
+        if self.solver_version != _IBP_CORE_VERSION:
+            raise ValueError(f"solver_version={self.solver_version!r} != {_IBP_CORE_VERSION!r}.")
+
+        object.__setattr__(
+            self, "provenance", _deep_freeze(dict(self.provenance) if self.provenance else {})
+        )
+        if _canonical_spec_sha256(self._core_spec_fields(n_mu, n_nu)) != self.core_spec_sha256:
+            raise ValueError(
+                "core_spec_sha256 does not match the canonical digest recomputed from this "
+                "artifact's own declared fields."
+            )
+
+    def _validate_psd_fields_jax(self):
+        """Device-resident PSD validation mirroring _validate_psd_fields, but
+        gauge-robust: validate the stored device factor's shape/device/dtype,
+        the gauge-invariant scalar diagnostics recomputed from Z on device, and
+        the W W^dagger reconstruction residual -- never an exact eigenvector
+        comparison (phase/degenerate-subspace ambiguity), and never a device
+        content hash (psd_factor_sha256 stays None)."""
+        psd_scalar_fields = (
+            "psd_rtol", "psd_factor", "psd_factor_sha256", "psd_raw_min_eigenvalue",
+            "psd_spectral_scale", "psd_negative_mode_count", "psd_clipped_mode_count",
+            "psd_clipped_absolute_weight", "psd_retained_rank", "psd_reconstruction_residual",
+        )
+        applicable = self.same_sector and self.symmetry_mode == "two_sided_average"
+        if self.psd_status == "not_applicable":
+            if applicable:
+                raise ValueError(
+                    "psd_status='not_applicable' is invalid for a same-sector, "
+                    "two-sided-averaged core, which must be factorized."
+                )
+            for name in psd_scalar_fields:
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{name} must be None when psd_status='not_applicable'.")
+            return
+        if self.psd_status != "factorized":
+            raise ValueError(
+                f"psd_status={self.psd_status!r} must be 'factorized' or 'not_applicable'."
+            )
+        if self.psd_factor_sha256 is not None:
+            raise ValueError("psd_factor_sha256 must be None for backend='jax'.")
+        if not isinstance(self.psd_factor, jax.Array):
+            raise TypeError("psd_factor must be a jax.Array for backend='jax'.")
+        if str(self.psd_factor.device) != self.device:
+            raise ValueError(
+                f"psd_factor device {str(self.psd_factor.device)!r} does not match core "
+                f"device {self.device!r}."
+            )
+        if str(self.psd_factor.dtype) != self.realized_dtype:
+            raise ValueError(
+                f"psd_factor.dtype {self.psd_factor.dtype} does not match the core dtype "
+                f"{self.realized_dtype}."
+            )
+
+        eigvals = jnp.linalg.eigvalsh(self.Z)  # gauge-invariant, ascending, device
+        threshold = -self.psd_rtol * jnp.max(jnp.abs(eigvals))
+        negative = eigvals < 0.0
+        diag = _ibp_sync_scalars(
+            spectral_scale=jnp.max(jnp.abs(eigvals)),
+            raw_min=eigvals[0],
+            material_negative=jnp.any(eigvals < threshold),
+            offending=jnp.min(jnp.where(eigvals < threshold, eigvals, jnp.inf)),
+            negative_mode_count=jnp.sum(negative),
+            clipped_absolute_weight=jnp.sum(jnp.where(negative, jnp.abs(eigvals), 0.0)),
+            retained=jnp.sum(eigvals > 0.0),
+        )
+        if diag["material_negative"]:
+            raise ValueError(
+                f"Z is materially indefinite (eigenvalue {diag['offending']!r} below the "
+                f"roundoff band); a factorized core must have no material negative mode."
+            )
+        float_checks = {
+            "psd_raw_min_eigenvalue": diag["raw_min"],
+            "psd_spectral_scale": diag["spectral_scale"],
+            "psd_clipped_absolute_weight": diag["clipped_absolute_weight"],
+        }
+        for name, expected in float_checks.items():
+            actual = getattr(self, name)
+            if not isinstance(actual, float) or not math.isfinite(actual):
+                raise ValueError(f"{name} must be a finite float, got {actual!r}.")
+            if not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-15):
+                raise ValueError(
+                    f"{name}={actual!r} does not match the value recomputed from Z ({expected!r})."
+                )
+        if not isinstance(self.psd_rtol, float) or not math.isfinite(self.psd_rtol):
+            raise ValueError(f"psd_rtol must be a finite float, got {self.psd_rtol!r}.")
+        int_checks = {
+            "psd_negative_mode_count": int(diag["negative_mode_count"]),
+            "psd_clipped_mode_count": int(diag["negative_mode_count"]),
+            "psd_retained_rank": int(diag["retained"]),
+        }
+        for name, expected in int_checks.items():
+            actual = getattr(self, name)
+            if isinstance(actual, bool) or not isinstance(actual, int) or actual < 0:
+                raise ValueError(f"{name} must be a non-negative int, got {actual!r}.")
+            if actual != expected:
+                raise ValueError(
+                    f"{name}={actual!r} does not match the value recomputed from Z ({expected!r})."
+                )
+        retained_rank = int(diag["retained"])
+        if self.psd_factor.shape != (self.n_mu, retained_rank):
+            raise ValueError(
+                f"psd_factor.shape {self.psd_factor.shape} must be "
+                f"{(self.n_mu, retained_rank)} (n_mu, retained_rank)."
+            )
+        actual_reconstruction = _normalized_frobenius_residual_jax(
+            self.Z, self.psd_factor @ self.psd_factor.conj().T
+        )
+        if not isinstance(self.psd_reconstruction_residual, float) or not math.isfinite(
+            self.psd_reconstruction_residual
+        ):
+            raise ValueError(
+                f"psd_reconstruction_residual must be a finite float, got "
+                f"{self.psd_reconstruction_residual!r}."
+            )
+        if not math.isclose(self.psd_reconstruction_residual, actual_reconstruction,
+                            rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                f"psd_reconstruction_residual={self.psd_reconstruction_residual!r} does not "
+                f"match the STORED factor's own reconstruction ({actual_reconstruction!r})."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tiled, device-resident JAX direct backend (task #10). The whole orientation
+# is built inside ONE jax.jit via lax.fori_loop over eval/nu/source/mu tiles,
+# so short/padded blocks never trigger shape-dependent recompiles and the
+# jaxpr/HLO allocation audit sees the complete builder. Only bounded tiles
+# (rhat (E,S,3), field V (Nn,3,E)) are formed -- never an (Ng,Ng), (3,Ng,Ng),
+# or full V(nu,3,Ng) array. The field tile V is mu-independent and reused
+# across mu tiles. Every large array stays a device jax.Array; only rank-0
+# reduced scalars ever cross to the host, through _ibp_sync_scalars.
+# ---------------------------------------------------------------------------
+
+
+def _ibp_sync_scalars(**device_values):
+    """The single auditable device->host synchronization boundary for the JAX
+    backend. Each value must already be a rank-0 (scalar) device array -- a
+    reduced diagnostic, never a large array. Returns a dict of Python scalars.
+    Transferring a non-scalar here is a programming error and is rejected."""
+    out = {}
+    for name, value in device_values.items():
+        arr = jnp.asarray(value)
+        if arr.ndim != 0:
+            raise ValueError(
+                f"_ibp_sync_scalars: {name!r} must be a rank-0 scalar to cross to host, "
+                f"got shape {arr.shape} -- large arrays must stay device-resident."
+            )
+        if jnp.issubdtype(arr.dtype, jnp.bool_):
+            out[name] = bool(arr)
+        elif jnp.issubdtype(arr.dtype, jnp.integer):
+            out[name] = int(arr)
+        else:
+            out[name] = float(arr)
+    return out
+
+
+def _pad_to_multiple(n, block):
+    return ((n + block - 1) // block) * block
+
+
+@functools.partial(jax.jit, static_argnums=(5, 6, 7, 8, 9, 10))
+def _ibp_orientation_jax(grad, theta, coords, weights, valid,
+                         E, S, Nm, Nn, n_mu, n_nu):
+    """Whole-orientation one-sided Z built inside one jit. grad
+    (n_mu_pad,3,Ng_pad); theta (n_nu_pad,Ng_pad); coords (Ng_pad,3);
+    weights/valid (Ng_pad,). Padded grid points carry valid=0 (so weight 0),
+    padded orbital rows are zero; the (n_mu,n_nu) slice is returned."""
+    ng_pad = coords.shape[0]
+    n_mu_pad = grad.shape[0]
+    n_nu_pad = theta.shape[0]
+    n_eval = ng_pad // E
+    n_src = ng_pad // S
+    n_mut = n_mu_pad // Nm
+    n_nut = n_nu_pad // Nn
+    w_eff = weights * valid                      # zero weight on padded grid points
+
+    def eval_body(et, Z):
+        i0 = et * E
+        coords_e = lax.dynamic_slice(coords, (i0, 0), (E, 3))
+        we = lax.dynamic_slice(w_eff, (i0,), (E,))
+        grad_e = lax.dynamic_slice(grad, (0, 0, i0), (n_mu_pad, 3, E))
+
+        def nu_body(nt, Z):
+            n0 = nt * Nn
+            theta_n = lax.dynamic_slice(theta, (n0, 0), (Nn, ng_pad))
+
+            def src_body(st, V):
+                j0 = st * S
+                coords_s = lax.dynamic_slice(coords, (j0, 0), (S, 3))
+                we_s = lax.dynamic_slice(w_eff, (j0,), (S,))
+                theta_ns = lax.dynamic_slice(theta_n, (0, j0), (Nn, S))
+                diff = coords_e[:, None, :] - coords_s[None, :, :]   # (E,S,3)
+                rad2 = jnp.sum(diff * diff, axis=-1)                 # (E,S)
+                nz = rad2 > 0
+                safe = jnp.where(nz, jnp.sqrt(rad2), 1.0)            # safe denominator
+                rhat = jnp.where(nz[..., None], diff / safe[..., None], 0.0)
+                wd = theta_ns * we_s[None, :]                        # (Nn,S)
+                return V + jnp.einsum("nj,ijc->nci", wd, rhat)       # (Nn,3,E)
+
+            V = lax.fori_loop(0, n_src, src_body, jnp.zeros((Nn, 3, E), grad.dtype))
+
+            def mu_body(mt, Z):
+                m0 = mt * Nm
+                grad_mt = lax.dynamic_slice(grad_e, (m0, 0, 0), (Nm, 3, E))
+                block = -0.5 * jnp.einsum("mci,nci,i->mn", grad_mt.conj(), V, we)
+                cur = lax.dynamic_slice(Z, (m0, n0), (Nm, Nn))
+                return lax.dynamic_update_slice(Z, cur + block, (m0, n0))
+
+            return lax.fori_loop(0, n_mut, mu_body, Z)
+
+        return lax.fori_loop(0, n_nut, nu_body, Z)
+
+    Z = lax.fori_loop(0, n_eval, eval_body,
+                      jnp.zeros((n_mu_pad, n_nu_pad), grad.dtype))
+    return lax.dynamic_slice(Z, (0, 0), (n_mu, n_nu))
+
+
+@functools.partial(jax.jit, static_argnums=(2, 3))
+def _ibp_coincident_jax(coords, valid, E, S):
+    """Total ordered coincident grid-pair count (matching NumPy's per-pass
+    count), reduced to a rank-0 device scalar over valid eval/source pairs --
+    no (Ng,Ng) array is retained (each tile reduces to a scalar)."""
+    ng_pad = coords.shape[0]
+    n_eval = ng_pad // E
+    n_src = ng_pad // S
+
+    def eval_body(et, acc):
+        i0 = et * E
+        coords_e = lax.dynamic_slice(coords, (i0, 0), (E, 3))
+        valid_e = lax.dynamic_slice(valid, (i0,), (E,))
+
+        def src_body(st, acc):
+            j0 = st * S
+            coords_s = lax.dynamic_slice(coords, (j0, 0), (S, 3))
+            valid_s = lax.dynamic_slice(valid, (j0,), (S,))
+            diff = coords_e[:, None, :] - coords_s[None, :, :]
+            rad2 = jnp.sum(diff * diff, axis=-1)
+            vp = (valid_e[:, None] > 0) & (valid_s[None, :] > 0)
+            return acc + jnp.sum(jnp.where((rad2 == 0) & vp, 1, 0))
+
+        return lax.fori_loop(0, n_src, src_body, acc)
+
+    return lax.fori_loop(0, n_eval, eval_body, jnp.array(0, jnp.int64))
+
+
+def _ibp_one_sided_block_jax(grad_theta_source, theta_source, grid, *,
+                             eval_block_size, source_block_size,
+                             mu_block, nu_block):
+    """Device-resident one-sided Z for the JAX backend. grad_theta_source/
+    theta_source/grid.coords/grid.weights are jax.Array on grid.device. Tile
+    sizes E/S/mu/nu are the realized (clamped) block sizes. Returns the device
+    Z (jax.Array) and a rank-0 device coincident-count scalar."""
+    dtype = grad_theta_source.dtype
+    if dtype in (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128)) and not jax.config.jax_enable_x64:
+        raise ValueError(
+            "JAX float64/complex128 ibp_core requires jax_enable_x64=True; call "
+            "jax.config.update('jax_enable_x64', True) before building, or supply "
+            "float32/complex64 inputs."
+        )
+    n_mu = grad_theta_source.shape[0]
+    n_nu = theta_source.shape[0]
+    ng = grid.coords.shape[0]
+    g = math.lcm(int(eval_block_size), int(source_block_size))
+    ng_pad = _pad_to_multiple(ng, g)
+    nm_pad = _pad_to_multiple(n_mu, mu_block)
+    nn_pad = _pad_to_multiple(n_nu, nu_block)
+    # Grid weights are real; they multiply complex theta/grad inside the einsums
+    # (JAX promotes). The validity mask matches the weights' real dtype.
+    weight_dtype = grid.weights.dtype
+
+    grad = jnp.zeros((nm_pad, 3, ng_pad), dtype).at[:n_mu, :, :ng].set(grad_theta_source)
+    theta = jnp.zeros((nn_pad, ng_pad), dtype).at[:n_nu, :ng].set(theta_source)
+    coords = jnp.zeros((ng_pad, 3), grid.coords.dtype).at[:ng].set(grid.coords)
+    weights = jnp.zeros((ng_pad,), weight_dtype).at[:ng].set(grid.weights)
+    valid = jnp.zeros((ng_pad,), weight_dtype).at[:ng].set(jnp.asarray(1, weight_dtype))
+
+    Z = _ibp_orientation_jax(
+        grad, theta, coords, weights, valid,
+        int(eval_block_size), int(source_block_size),
+        int(mu_block), int(nu_block), n_mu, n_nu,
+    )
+    coincident = _ibp_coincident_jax(coords, valid, int(eval_block_size), int(source_block_size))
+    return Z, coincident
+
+
+def _frob_sq_in_rank_space(a, g):
+    """Re tr(a^dagger g a g) == ||P^dagger a P||_F^2 when g = P P^dagger --
+    the rank-space Frobenius norm-squared of the packed-pair projection,
+    never forming the (n_pair, n_pair) matrix. Backend-agnostic (a/g are
+    jax.Array or ndarray)."""
+    xp = jnp if isinstance(a, jax.Array) else np
+    m = a.conj().T @ g @ a @ g
+    return xp.real(xp.trace(m))
+
+
+def psd_factorize_jax(z_hermitian, *, rtol=_DEFAULT_PSD_RTOL):
+    """Device-resident Hermitian PSD factorization mirroring psd_factorize:
+    device eigh, Hermiticity gate, material-negative hard-fail, roundoff
+    clip, compact device W, zero-core -> rank 0. Only rank-0 reduced scalars
+    cross to the host (through _ibp_sync_scalars); the eigenvalue vector and
+    W stay device-resident."""
+    Z = z_hermitian
+    if Z.ndim != 2 or Z.shape[0] != Z.shape[1]:
+        raise ValueError(f"psd_factorize_jax requires a square 2-D array, got shape {Z.shape}.")
+    if isinstance(rtol, bool) or not isinstance(rtol, (int, float, np.integer, np.floating)):
+        raise ValueError(f"psd_factorize_jax: rtol must be a real, non-bool number, got {rtol!r}.")
+    rtol = float(rtol)
+    if not math.isfinite(rtol) or rtol < 0.0:
+        raise ValueError(f"psd_factorize_jax: rtol must be a finite non-negative float, got {rtol!r}.")
+    n = Z.shape[0]
+    z_norm = jnp.linalg.norm(Z)
+    herm = jnp.where(z_norm > 0, jnp.linalg.norm(Z - Z.conj().T) / jnp.where(z_norm > 0, z_norm, 1.0), 0.0)
+    finite = jnp.all(jnp.isfinite(Z))
+    eigvals, eigvecs = jnp.linalg.eigh(Z)            # ascending real eigenvalues, device
+    spectral_scale = jnp.max(jnp.abs(eigvals)) if n else jnp.asarray(0.0, eigvals.dtype)
+    raw_min = eigvals[0] if n else jnp.asarray(0.0, eigvals.dtype)
+    threshold = -rtol * spectral_scale
+    material_negative = jnp.any(eigvals < threshold)
+    offending = jnp.min(jnp.where(eigvals < threshold, eigvals, jnp.inf))
+    negative = eigvals < 0.0
+    negative_mode_count = jnp.sum(negative)
+    clipped_absolute_weight = jnp.sum(jnp.where(negative, jnp.abs(eigvals), 0.0))
+    retained = jnp.sum(eigvals > 0.0)
+    diag = _ibp_sync_scalars(
+        finite=finite, hermiticity=herm, spectral_scale=spectral_scale,
+        raw_min=raw_min, material_negative=material_negative, offending=offending,
+        negative_mode_count=negative_mode_count,
+        clipped_absolute_weight=clipped_absolute_weight, retained=retained,
+    )
+    if not diag["finite"]:
+        raise ValueError("psd_factorize_jax: Z_H has non-finite entries.")
+    if diag["hermiticity"] > _PSD_HERMITICITY_TOL:
+        raise ValueError(
+            f"psd_factorize_jax: input is not Hermitian (residual {diag['hermiticity']!r} > "
+            f"{_PSD_HERMITICITY_TOL!r}); PSD factorization requires a Hermitian core."
+        )
+    if diag["material_negative"]:
+        raise ValueError(
+            f"psd_factorize_jax: material negative eigenvalue {diag['offending']!r} is below "
+            f"the roundoff band threshold {(-rtol * diag['spectral_scale'])!r} (rtol={rtol!r}, "
+            f"spectral_scale={diag['spectral_scale']!r}); a materially indefinite core is a "
+            f"hard compatibility failure and is never repaired by clipping."
+        )
+    retained_rank = int(diag["retained"])
+    # eigh is ascending: the strictly-positive eigenvalues are the last
+    # retained_rank; clipped negatives contribute nothing. W stays device-side.
+    if retained_rank:
+        pos_vals = eigvals[n - retained_rank:]
+        W = eigvecs[:, n - retained_rank:] * jnp.sqrt(pos_vals)[None, :]
+    else:
+        W = eigvecs[:, n:]  # (n, 0)
+    recon = W @ W.conj().T
+    z_norm_h = jnp.linalg.norm(Z)
+    recon_residual = jnp.where(z_norm_h > 0, jnp.linalg.norm(Z - recon) / jnp.where(z_norm_h > 0, z_norm_h, 1.0), 0.0)
+    recon_residual = _ibp_sync_scalars(v=recon_residual)["v"]
+    return PSDFactorization(
+        factor=W, factor_sha256=None, rtol=rtol,
+        raw_min_eigenvalue=diag["raw_min"], spectral_scale=diag["spectral_scale"],
+        negative_mode_count=int(diag["negative_mode_count"]),
+        clipped_mode_count=int(diag["negative_mode_count"]),
+        clipped_absolute_weight=diag["clipped_absolute_weight"],
+        retained_rank=retained_rank, reconstruction_residual=recon_residual,
+    )
+
 
 def _ibp_one_sided_block(grad_theta_source, theta_source, grid, *,
                          mu_block, nu_block, eval_block_size, source_block_size):
@@ -2147,21 +2706,21 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         )
     if operator.method != "direct":
         raise ValueError(f"Unsupported operator.method={operator.method!r} for ibp_core.")
-    if operator.backend != "numpy":
+    backend = operator.backend
+    if backend not in _SUPPORTED_IBP_BACKENDS:
         raise NotImplementedError(
-            f"ibp_core only implements backend='numpy' (got operator.backend="
-            f"{operator.backend!r}) -- JAX tiled direct execution is task #10's scope, "
-            f"not yet implemented here."
+            f"ibp_core supports backend in {_SUPPORTED_IBP_BACKENDS}, got "
+            f"operator.backend={backend!r}."
         )
 
     same_sector = right is None
     right_sector = left if same_sector else right
 
     for sector, label in ((left, "left"), (right_sector, "right")):
-        if sector.backend != "numpy":
-            raise NotImplementedError(
-                f"ibp_core only implements backend='numpy' (got {label} sector.backend="
-                f"{sector.backend!r})."
+        if sector.backend != backend:
+            raise ValueError(
+                f"{label} sector.backend={sector.backend!r} must match "
+                f"operator.backend={backend!r} -- a core cannot mix backends."
             )
         if sector.grid.grid_spec_sha256 != operator.grid.grid_spec_sha256:
             raise ValueError(
@@ -2185,20 +2744,36 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     )
 
     start = time.perf_counter()
-    z_forward, coincident_pairs = _ibp_one_sided_block(
-        left.grad_Theta, right_sector.Theta, operator.grid,
-        mu_block=mu_block, nu_block=nu_block,
-        eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
-    )
+    if backend == "numpy":
+        z_forward, coincident_pairs = _ibp_one_sided_block(
+            left.grad_Theta, right_sector.Theta, operator.grid,
+            mu_block=mu_block, nu_block=nu_block,
+            eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
+        )
+    else:
+        z_forward, coincident_dev = _ibp_one_sided_block_jax(
+            left.grad_Theta, right_sector.Theta, operator.grid,
+            eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
+            mu_block=mu_block, nu_block=nu_block,
+        )
+        coincident_pairs = _ibp_sync_scalars(c=coincident_dev)["c"]
     if same_sector:
         z_reverse = None
         dagger = z_forward.conj().T
     else:
-        z_reverse, reverse_coincident = _ibp_one_sided_block(
-            right_sector.grad_Theta, left.Theta, operator.grid,
-            mu_block=nu_block, nu_block=mu_block,
-            eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
-        )
+        if backend == "numpy":
+            z_reverse, reverse_coincident = _ibp_one_sided_block(
+                right_sector.grad_Theta, left.Theta, operator.grid,
+                mu_block=nu_block, nu_block=mu_block,
+                eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
+            )
+        else:
+            z_reverse, reverse_dev = _ibp_one_sided_block_jax(
+                right_sector.grad_Theta, left.Theta, operator.grid,
+                eval_block_size=operator.eval_block_size, source_block_size=operator.source_block_size,
+                mu_block=nu_block, nu_block=mu_block,
+            )
+            reverse_coincident = _ibp_sync_scalars(c=reverse_dev)["c"]
         if reverse_coincident != coincident_pairs:
             raise ValueError(
                 "forward/reverse orientation coincident-pair counts disagree "
@@ -2209,13 +2784,27 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     build_wall_time_seconds = time.perf_counter() - start
 
     # Reject non-finite raw orientations immediately after assembly, before any
-    # norm/eigendecomposition would otherwise propagate nan/inf silently.
-    if not np.all(np.isfinite(z_forward)):
+    # norm/eigendecomposition would otherwise propagate nan/inf silently. For
+    # JAX the finiteness reduces on device; only the rank-0 bool crosses.
+    if backend == "numpy":
+        forward_finite = bool(np.all(np.isfinite(z_forward)))
+        reverse_finite = z_reverse is None or bool(np.all(np.isfinite(z_reverse)))
+    else:
+        checks = _ibp_sync_scalars(
+            f=jnp.all(jnp.isfinite(z_forward)),
+            r=jnp.all(jnp.isfinite(z_reverse)) if z_reverse is not None else jnp.asarray(True),
+        )
+        forward_finite = checks["f"]
+        reverse_finite = z_reverse is None or checks["r"]
+    if not forward_finite:
         raise ValueError("ibp_core: z_forward one-sided orientation has non-finite entries.")
-    if z_reverse is not None and not np.all(np.isfinite(z_reverse)):
+    if not reverse_finite:
         raise ValueError("ibp_core: z_reverse one-sided orientation has non-finite entries.")
 
-    raw_dagger_residual = _normalized_frobenius_residual(z_forward, dagger)
+    if backend == "numpy":
+        raw_dagger_residual = _normalized_frobenius_residual(z_forward, dagger)
+    else:
+        raw_dagger_residual = _normalized_frobenius_residual_jax(z_forward, dagger)
     Z = z_forward if symmetry_mode == "one_sided" else (z_forward + dagger) / 2
 
     # Production-facing packed-pair metric dagger residual (same-sector only):
@@ -2225,10 +2814,16 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     # quantity task #8's <=1e-3 gate is stated against.
     if same_sector:
         P = left.P
-        m_raw = P.conj().T @ z_forward @ P
-        raw_packed_pair_metric_dagger_residual = _normalized_frobenius_residual(
-            m_raw, m_raw.conj().T
-        )
+        if backend == "numpy":
+            m_raw = P.conj().T @ z_forward @ P
+            raw_packed_pair_metric_dagger_residual = _normalized_frobenius_residual(
+                m_raw, m_raw.conj().T
+            )
+        else:
+            # Rank-space diagnostic: never form the (n_pair, n_pair) matrix.
+            raw_packed_pair_metric_dagger_residual = (
+                _packed_pair_residual_rank_space_jax(z_forward, P)
+            )
     else:
         raw_packed_pair_metric_dagger_residual = None
 
@@ -2236,7 +2831,7 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     # core. The corrective factor is the one task #8 will stream; material
     # negative modes hard-fail here rather than being repaired.
     if same_sector and symmetry_mode == "two_sided_average":
-        psd = psd_factorize(Z, rtol=psd_rtol)
+        psd = psd_factorize(Z, rtol=psd_rtol) if backend == "numpy" else psd_factorize_jax(Z, rtol=psd_rtol)
         psd_status = "factorized"
         psd_rtol_value = psd.rtol
         psd_factor = psd.factor
@@ -2261,16 +2856,34 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         psd_retained_rank = None
         psd_reconstruction_residual = None
 
-    z_sha256 = _canonical_sha256(Z)
-    z_forward_sha256 = _canonical_sha256(z_forward)
-    z_reverse_sha256 = None if same_sector else _canonical_sha256(z_reverse)
+    if backend == "numpy":
+        # NumPy: computed content hashes over the realized host arrays.
+        output_identity_source = "computed_content_hash"
+        z_sha256 = _canonical_sha256(Z)
+        z_forward_sha256 = _canonical_sha256(z_forward)
+        z_reverse_sha256 = None if same_sector else _canonical_sha256(z_reverse)
+        device = "cpu"
+    else:
+        # JAX: the arrays are device-resident and derived from caller-attested
+        # sector/operator inputs (task #6 trust boundary); their identity is
+        # inherited from those attested upstream identities, not a device
+        # content hash. Never hash device bytes on the fly.
+        output_identity_source = "derived_from_attested_inputs_unverified"
+        z_sha256 = None
+        z_forward_sha256 = None
+        z_reverse_sha256 = None
+        device = str(Z.device)
+        if str(operator.grid.device) != device:
+            raise ValueError(
+                f"JAX core output device {device!r} does not match the bound grid device "
+                f"{operator.grid.device!r}."
+            )
 
     # A truthful build-scoped host-memory peak is not available for this
-    # NumPy CPU oracle (ru_maxrss is process-lifetime and already-bytes on
-    # macOS; tracemalloc misses NumPy's C-level allocations). Record an
-    # explicit measured-absence rather than a misleading number.
+    # oracle (ru_maxrss is process-lifetime; tracemalloc misses NumPy C-level
+    # and device allocations). Record an explicit measured-absence.
     peak_host_bytes = None
-    peak_host_bytes_status = "unmeasured_cpu_oracle"
+    peak_host_bytes_status = "unmeasured_cpu_oracle" if backend == "numpy" else "unmeasured_jax_device"
 
     upstream = dict(upstream_provenance) if upstream_provenance else {}
     provenance = _deep_freeze({
@@ -2281,10 +2894,15 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
     })
 
     realized_dtype = str(Z.dtype)
+    # Core spec v2: the identity digest is DETERMINISTIC -- nondeterministic
+    # execution measurements (build_wall_time_seconds, peak_host_bytes) are
+    # excluded and carried only as execution metadata, so the same inputs
+    # always yield the same core_spec_sha256 regardless of timing/host memory.
     spec_fields = {
         "same_sector": same_sector, "symmetry_mode": symmetry_mode,
         "z_sha256": z_sha256, "z_forward_sha256": z_forward_sha256,
         "z_reverse_sha256": z_reverse_sha256,
+        "output_identity_source": output_identity_source,
         "raw_dagger_residual": raw_dagger_residual,
         "raw_packed_pair_metric_dagger_residual": raw_packed_pair_metric_dagger_residual,
         "coincident_pairs": coincident_pairs, "n_mu": n_mu, "n_nu": n_nu,
@@ -2301,10 +2919,7 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         "right_sector_spec_sha256": right_sector.sector_spec_sha256,
         "operator_spec_sha256": operator.operator_spec_sha256,
         "mu_block_size": mu_block, "nu_block_size": nu_block,
-        "backend": "numpy", "device": "cpu", "realized_dtype": realized_dtype,
-        "build_wall_time_seconds": build_wall_time_seconds,
-        "peak_host_bytes": peak_host_bytes,
-        "peak_host_bytes_status": peak_host_bytes_status,
+        "backend": backend, "device": device, "realized_dtype": realized_dtype,
         "solver_version": _IBP_CORE_VERSION, "provenance": provenance,
     }
     core_spec_sha256 = _canonical_spec_sha256(spec_fields)
@@ -2314,6 +2929,7 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         z_forward_one_sided=z_forward, z_reverse_one_sided=z_reverse,
         z_sha256=z_sha256, z_forward_sha256=z_forward_sha256,
         z_reverse_sha256=z_reverse_sha256,
+        output_identity_source=output_identity_source,
         raw_dagger_residual=raw_dagger_residual,
         raw_packed_pair_metric_dagger_residual=raw_packed_pair_metric_dagger_residual,
         coincident_pairs=coincident_pairs,
@@ -2331,7 +2947,7 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         right_sector_spec_sha256=right_sector.sector_spec_sha256,
         operator_spec_sha256=operator.operator_spec_sha256,
         mu_block_size=mu_block, nu_block_size=nu_block,
-        backend="numpy", device="cpu", realized_dtype=realized_dtype,
+        backend=backend, device=device, realized_dtype=realized_dtype,
         build_wall_time_seconds=build_wall_time_seconds, peak_host_bytes=peak_host_bytes,
         peak_host_bytes_status=peak_host_bytes_status,
         solver_version=_IBP_CORE_VERSION, provenance=provenance,

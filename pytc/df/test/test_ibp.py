@@ -1183,7 +1183,10 @@ class TestIBPCoreArtifact(unittest.TestCase):
         self.assertEqual(full.mu_block_size, sector_a.selected_rank)
         self.assertEqual(full.nu_block_size, sector_b.selected_rank)
 
-    def test_jax_backend_operator_is_explicitly_rejected(self):
+    def test_mixed_backend_operator_and_sector_rejected(self):
+        # JAX cores are now implemented (task #10), but a core cannot MIX
+        # backends: a JAX operator with a NumPy sector (or vice versa) is a
+        # structural error and must be rejected.
         rng = np.random.default_rng(41)
         coords = jnp.asarray(rng.normal(size=(6, 3)))
         weights = jnp.asarray(rng.random(6))
@@ -1193,8 +1196,8 @@ class TestIBPCoreArtifact(unittest.TestCase):
             weights_identity=hashlib.sha256(b"w").hexdigest(),
         )
         plan = build_ibp_operator_plan(grid)
-        _, _, sector_a, _ = self._setup()
-        with self.assertRaises(NotImplementedError):
+        _, _, sector_a, _ = self._setup()   # numpy sector
+        with self.assertRaises(ValueError):
             ibp_core(sector_a, operator=plan)
 
     def test_tampering_via_dataclasses_replace_is_rejected(self):
@@ -1220,6 +1223,7 @@ class TestIBPCoreArtifact(unittest.TestCase):
                 z_reverse_one_sided=core.z_reverse_one_sided,
                 z_sha256=core.z_sha256, z_forward_sha256=core.z_forward_sha256,
                 z_reverse_sha256=core.z_reverse_sha256,
+                output_identity_source=core.output_identity_source,
                 raw_dagger_residual=core.raw_dagger_residual,
                 raw_packed_pair_metric_dagger_residual=core.raw_packed_pair_metric_dagger_residual,
                 coincident_pairs=core.coincident_pairs, n_mu=core.n_mu, n_nu=core.n_nu,
