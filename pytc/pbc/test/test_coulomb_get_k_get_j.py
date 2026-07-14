@@ -268,6 +268,67 @@ class TestGetKVsRealFftdf(unittest.TestCase):
         self.assertLess(rel, 2.5)
 
 
+class TestRetentionPolicyDefaultAvoidsBlowup(unittest.TestCase):
+    """Regression test for the retention-policy fix (design v2.1 section
+    5): the old rtol=1e-8 default silently retained near-singular Pi
+    modes at over-complete rank, whose inverse then amplified V's noise
+    and blew up K (observed relF > 6 on this exact cell at rank=8 with
+    the old default, and outright ValueError from kpt_to_spc's imag_tol
+    gate at higher rank). rtol=1e-4 (the new default) must complete
+    without error and stay in a bounded relF regime at ranks that used
+    to blow up."""
+
+    def test_rank_that_used_to_blow_up_now_stays_bounded(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        n_ao = cell.nao
+        result = coulomb.build(cell, kpts, rank=10, block_size=100)  # default rtol
+        mesh_obj = result["mesh_obj"]
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+
+        rng = np.random.default_rng(42)
+        dm_kpts = _tr_symmetric_hermitian_fixture(
+            rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ao, n_ao)
+        )
+        vk_mine = np.asarray(coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase))
+
+        from pyscf.pbc.df import FFTDF
+        from pyscf.pbc.df.fft_jk import get_k_kpts
+
+        vk_ref = get_k_kpts(FFTDF(cell), dm_kpts, kpts=kpts, exxdiv=None)
+        rel = np.linalg.norm(vk_mine - vk_ref) / np.linalg.norm(vk_ref)
+        # The old default produced relF=39 (a genuine blow-up) at this
+        # exact rank; bounding well below that, not claiming accuracy.
+        self.assertLess(rel, 2.0)
+
+    def test_explicit_old_default_still_blows_up_documenting_why_it_changed(self):
+        # Not a contradiction with the fix -- this documents the ORIGINAL
+        # failure mode still reproduces when a caller explicitly asks
+        # for the old rtol, proving the new default is what changed the
+        # outcome (not some other unrelated change).
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        n_ao = cell.nao
+        result = coulomb.build(cell, kpts, rank=10, block_size=100, rtol=1e-8)
+        mesh_obj = result["mesh_obj"]
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+
+        rng = np.random.default_rng(42)
+        dm_kpts = _tr_symmetric_hermitian_fixture(
+            rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ao, n_ao)
+        )
+        vk_mine = np.asarray(coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase))
+
+        from pyscf.pbc.df import FFTDF
+        from pyscf.pbc.df.fft_jk import get_k_kpts
+
+        vk_ref = get_k_kpts(FFTDF(cell), dm_kpts, kpts=kpts, exxdiv=None)
+        rel = np.linalg.norm(vk_mine - vk_ref) / np.linalg.norm(vk_ref)
+        self.assertGreater(rel, 5.0)
+
+
 class TestGetJ(unittest.TestCase):
     def test_matches_direct_pyscf_fftdf_call(self):
         cell = _make_cell()

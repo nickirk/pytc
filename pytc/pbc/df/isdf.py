@@ -210,7 +210,7 @@ def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
     return Pi, eta
 
 
-def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-8):
+def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-4):
     """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel
     to eta^q over the SPATIAL grid, contract back into a Nip x Nip
     kernel matrix, and solve the Hermitian sandwich for W^q (design
@@ -532,7 +532,7 @@ class RawKernelProvider:
 
 
 def apply_kernel_and_solve_device(
-    provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-8,
+    provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-4,
     retained_solve_residual_gate=1e-10,
 ):
     """S4 pipeline glue (design v2.1 section 6), device-resident,
@@ -628,7 +628,7 @@ def apply_kernel_and_solve_device(
     return W_q, kern_q, solve_info
 
 
-def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-8,
+def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4,
                            retained_solve_residual_gate=1e-10):
     """S4 orchestration (design v2.1 section 6): build the full coul_kpt
     array (Nk, Nip, Nip) by calling apply_kernel_and_solve_device once

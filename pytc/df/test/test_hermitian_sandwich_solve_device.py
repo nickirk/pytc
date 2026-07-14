@@ -93,6 +93,40 @@ class TestHermitianSandwichSolveDevice(unittest.TestCase):
         with self.assertRaises(ValueError):
             hermitian_sandwich_solve_device(Pi, V, rtol=-1e-8)
 
+    def test_default_rtol_is_1e_4(self):
+        rng = np.random.default_rng(66)
+        Pi = _random_hermitian_psd(rng, 4) + np.eye(4)
+        V = _random_hermitian_psd(rng, 4)
+        _, info = hermitian_sandwich_solve_device(Pi, V)
+        self.assertEqual(info["rtol"], 1e-4)
+
+    def test_retention_marginal_matches_numpy_oracle(self):
+        rng = np.random.default_rng(67)
+        n = 6
+
+        def _pi_with_spectrum(eigvals):
+            A = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+            Q, _ = np.linalg.qr(A)
+            return Q @ np.diag(eigvals) @ Q.conj().T
+
+        V = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+        V = V @ V.conj().T
+
+        eigvals_marginal = np.array([1.0, 0.8, 0.6, 0.4, 5e-4, 1e-5])
+        Pi_marginal = _pi_with_spectrum(eigvals_marginal)
+        _, info_np = hermitian_sandwich_solve(Pi_marginal, V, rtol=1e-4)
+        _, info_jax = hermitian_sandwich_solve_device(Pi_marginal, V, rtol=1e-4)
+        self.assertTrue(info_np["retention_marginal"])
+        self.assertTrue(info_jax["retention_marginal"])
+        self.assertAlmostEqual(
+            info_jax["cond_pi_retained"], info_np["cond_pi_retained"], places=6
+        )
+
+        eigvals_healthy = np.array([1.0, 0.8, 0.6, 0.4, 0.3, 0.2])
+        Pi_healthy = _pi_with_spectrum(eigvals_healthy)
+        _, info_healthy = hermitian_sandwich_solve_device(Pi_healthy, V, rtol=1e-4)
+        self.assertFalse(info_healthy["retention_marginal"])
+
 
 if __name__ == "__main__":
     unittest.main()

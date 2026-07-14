@@ -52,7 +52,7 @@ from pytc.pbc.df.isdf import (
 from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts, kpt_to_spc, spc_to_kpt
 
 
-def build(cell, kpts, *, rank, block_size, rtol=1e-8, provider_cls=RawKernelProvider):
+def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProvider):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end:
         S1/S2: stream_ao_blocks + build_periodic_pivot_oracle -> pivot

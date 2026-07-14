@@ -289,7 +289,50 @@ def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
     return jsp_linalg.cho_solve((chol, lower), atb)
 
 
-def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=None):
+_RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR = 10.0
+_RETENTION_MARGINAL_COND_THRESHOLD = 1e3
+
+
+def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller):
+    """Shared diagnostic (design v2.1 section 5, retention-policy fix):
+    the old rtol=1e-8 default's blow-up on over-complete rank came from
+    silently retaining near-singular modes whose inverse then amplifies
+    noise -- rtol=1e-4 fixes the DEFAULT, this catches
+    the case where a caller-supplied rtol (or a system's own spectrum)
+    still leaves the retained subspace close to the danger regime, so
+    the failure mode is a loud warning instead of a silent blow-up.
+
+    Flagged when BOTH hold: the smallest retained eigenvalue is within
+    10x of the retention threshold (rtol*s_max), AND the realized
+    condition number of the retained subspace (s_max/s_min_retained)
+    exceeds 1e3 -- the second check is independent of the first only
+    when a caller overrides rtol far looser than the default, in which
+    case "near the cutoff" alone would not imply high condition number.
+
+    Returns:
+        (retention_marginal, cond_pi): cond_pi is None when
+        s_min_retained is None (n_retained == 0).
+    """
+    if s_min_retained is None or s_min_retained <= 0.0:
+        return False, None
+    cond_pi = s_max / s_min_retained
+    near_cutoff = s_min_retained < _RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR * threshold
+    high_cond = cond_pi > _RETENTION_MARGINAL_COND_THRESHOLD
+    marginal = bool(near_cutoff and high_cond)
+    if marginal:
+        logger.warning(
+            f"{caller}: retention_marginal -- smallest retained eigenvalue "
+            f"{s_min_retained:.3e} is within {_RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR:.0f}x "
+            f"of the rtol={rtol:.1e} cutoff ({threshold:.3e}), and the retained "
+            f"subspace's condition number ({cond_pi:.3e}) exceeds "
+            f"{_RETENTION_MARGINAL_COND_THRESHOLD:.0e} -- this solve is in the danger "
+            f"regime the old, over-loose rtol default used to blow up in silently; "
+            f"consider a tighter rtol for this system if downstream results look off."
+        )
+    return marginal, cond_pi
+
+
+def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=None):
     """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V, via a
     relative-spectral-threshold truncated pseudo-inverse of Pi (task #21,
     #proj-isdf-periodic, design v2.1 section 5). NEW function, added
@@ -325,7 +368,7 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=Non
         Pi: (n,n) array, Hermitian PSD expected (Hermitized internally
             regardless).
         V: (n,n) array, Hermitized internally.
-        rtol: relative spectral retention threshold (default 1e-8).
+        rtol: relative spectral retention threshold (default 1e-4 -- design v2.1 section 5 documents the empirical basis; 1e-8 was 4-5 orders too loose and blew up at over-complete rank).
         target_truncation_residual: optional. If given, after the
             rtol-based retention, ADDITIONAL modes (in decreasing
             eigenvalue order) are retained one at a time until the
@@ -445,6 +488,10 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=Non
         retained_solve_residual = 0.0
         truncation_residual = 1.0
 
+    retention_marginal, cond_pi = _check_retention_marginal(
+        s_max, s_min_retained, threshold, rtol, caller="hermitian_sandwich_solve"
+    )
+
     info = {
         "n_retained": n_retained,
         "n_discarded": n_discarded,
@@ -457,6 +504,8 @@ def hermitian_sandwich_solve(Pi, V, *, rtol=1e-8, target_truncation_residual=Non
         "rtol": rtol,
         "adaptive_retention_used": adaptive_retention_used,
         "target_truncation_residual": target_truncation_residual,
+        "retention_marginal": retention_marginal,
+        "cond_pi_retained": cond_pi,
         "dtype": str(W.dtype),
         "backend": "numpy",
     }
@@ -525,7 +574,7 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol):
     )
 
 
-def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-8):
+def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4):
     """Device (JAX, fixed-shape, jitted) counterpart of
     hermitian_sandwich_solve (design v2.1 sections 5+6/7): the
     same two-sided Hermitian sandwich solve, restructured to avoid
@@ -551,7 +600,7 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-8):
     Args:
         Pi: (n,n) array, Hermitian PSD expected (Hermitized internally).
         V: (n,n) array, Hermitized internally.
-        rtol: relative spectral retention threshold (default 1e-8).
+        rtol: relative spectral retention threshold (default 1e-4 -- design v2.1 section 5 documents the empirical basis; 1e-8 was 4-5 orders too loose and blew up at over-complete rank).
 
     Returns:
         (W, info): W is (n,n) complex128 jax array. info is a dict with
@@ -597,11 +646,18 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-8):
     ) = _hermitian_sandwich_solve_core(Pi_jnp, V_jnp, rtol)
 
     n_retained_i = int(n_retained)
+    s_max_f = float(s_max)
+    s_min_retained_f = None if n_retained_i == 0 else float(s_min_retained)
+    threshold = rtol * s_max_f
+    retention_marginal, cond_pi = _check_retention_marginal(
+        s_max_f, s_min_retained_f, threshold, rtol, caller="hermitian_sandwich_solve_device"
+    )
+
     info = {
         "n_retained": n_retained_i,
         "n_discarded": n - n_retained_i,
-        "s_max": float(s_max),
-        "s_min_retained": None if n_retained_i == 0 else float(s_min_retained),
+        "s_max": s_max_f,
+        "s_min_retained": s_min_retained_f,
         "pi_anti_hermitian_residual": float(pi_anti_hermitian_residual),
         "v_anti_hermitian_residual": float(v_anti_hermitian_residual),
         "retained_solve_residual": float(retained_solve_residual),
@@ -609,6 +665,8 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-8):
         "rtol": rtol,
         "adaptive_retention_used": False,
         "target_truncation_residual": None,
+        "retention_marginal": retention_marginal,
+        "cond_pi_retained": cond_pi,
         "dtype": str(W.dtype),
         "backend": "jax",
     }

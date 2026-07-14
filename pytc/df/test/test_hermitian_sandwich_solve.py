@@ -145,6 +145,70 @@ class TestHermitianSandwichSolve(unittest.TestCase):
         with self.assertRaises(ValueError):
             hermitian_sandwich_solve(Pi, V, rtol=1e-8)
 
+    def test_default_rtol_is_1e_4(self):
+        # The retention-policy fix's headline change: the old 1e-8
+        # default was 4-5 orders too loose and silently blew up on
+        # over-complete rank (design v2.1 section 5). Verified by
+        # constructing a Pi where a stale rtol=1e-8 default would
+        # retain a near-singular mode the new rtol=1e-4 default drops.
+        rng = np.random.default_rng(60)
+        n = 6
+
+        def _pi_with_spectrum(eigvals):
+            A = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+            Q, _ = np.linalg.qr(A)
+            return Q @ np.diag(eigvals) @ Q.conj().T
+
+        eigvals = np.array([1.0, 0.8, 0.6, 0.4, 1e-6, 1e-9])
+        Pi = _pi_with_spectrum(eigvals)
+        V = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+        V = V @ V.conj().T
+        _, info_default = hermitian_sandwich_solve(Pi, V)
+        _, info_explicit_old = hermitian_sandwich_solve(Pi, V, rtol=1e-8)
+        self.assertEqual(info_default["rtol"], 1e-4)
+        self.assertEqual(info_default["n_retained"], 4)  # drops both 1e-6 and 1e-9 modes
+        self.assertEqual(info_explicit_old["n_retained"], 5)  # old default only drops 1e-9
+
+    def test_retention_marginal_flags_near_cutoff_high_condition_case(self):
+        rng = np.random.default_rng(61)
+        n = 6
+
+        def _pi_with_spectrum(eigvals):
+            A = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+            Q, _ = np.linalg.qr(A)
+            return Q @ np.diag(eigvals) @ Q.conj().T
+
+        V = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+        V = V @ V.conj().T
+
+        # Marginal: smallest retained eigenvalue (5e-4) is within 10x of
+        # the rtol=1e-4 cutoff (1e-4) and cond=2000 > 1e3.
+        eigvals_marginal = np.array([1.0, 0.8, 0.6, 0.4, 5e-4, 1e-5])
+        Pi_marginal = _pi_with_spectrum(eigvals_marginal)
+        _, info_marginal = hermitian_sandwich_solve(Pi_marginal, V, rtol=1e-4)
+        self.assertTrue(info_marginal["retention_marginal"])
+        self.assertAlmostEqual(info_marginal["cond_pi_retained"], 2000.0, places=3)
+
+        # Healthy: well-separated spectrum, low condition number.
+        eigvals_healthy = np.array([1.0, 0.8, 0.6, 0.4, 0.3, 0.2])
+        Pi_healthy = _pi_with_spectrum(eigvals_healthy)
+        _, info_healthy = hermitian_sandwich_solve(Pi_healthy, V, rtol=1e-4)
+        self.assertFalse(info_healthy["retention_marginal"])
+
+    def test_retention_marginal_is_false_when_nothing_retained(self):
+        rng = np.random.default_rng(62)
+        n = 4
+        Pi = np.eye(n, dtype=np.complex128) * 1e-20
+        V = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+        V = V @ V.conj().T
+        # rtol threshold is relative to s_max, so a uniformly tiny Pi
+        # still retains all modes (all eigvals == s_max) -- use a
+        # decisively tighter rtol to force n_retained=0 instead.
+        _, info = hermitian_sandwich_solve(Pi, V, rtol=2.0)
+        self.assertEqual(info["n_retained"], 0)
+        self.assertFalse(info["retention_marginal"])
+        self.assertIsNone(info["cond_pi_retained"])
+
 
 if __name__ == "__main__":
     unittest.main()
