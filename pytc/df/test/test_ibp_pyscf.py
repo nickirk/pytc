@@ -636,7 +636,6 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
         # fallback, and vary consistently with rank.
         from pyscf import scf
         from pyscf.mp import dfmp2
-        import pyscf.df.df as dfmod
         mol = self._h2o()
         energies = {}
         for rank in (100, 150, 236):
@@ -645,12 +644,19 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
             ibp = IBPISDF(mol, rank=rank, grid_level=1).build()
             oracle = self._loop_factor_mp2(mol, mf, ibp)
             mf.with_df = ibp
-            calls = {"df_init": 0, "ao2mo": 0, "loop": 0}
-            oi, oa, ol = dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop
+            # Definitive fork spy: PySCF branches between the analytic
+            # _init_mp_df_eris_direct and the factor-streaming _init_mp_df_eris.
+            calls = {"direct": 0, "streamed": 0, "ao2mo": 0, "loop": 0}
+            odir, ostr = dfmp2._init_mp_df_eris_direct, dfmp2._init_mp_df_eris
+            oa, ol = IBPISDF.ao2mo, IBPISDF.loop
 
-            def si(self, *a, **k):
-                calls["df_init"] += 1
-                return oi(self, *a, **k)
+            def sdir(*a, **k):
+                calls["direct"] += 1
+                return odir(*a, **k)
+
+            def sstr(*a, **k):
+                calls["streamed"] += 1
+                return ostr(*a, **k)
 
             def sa(self, *a, **k):
                 calls["ao2mo"] += 1
@@ -661,11 +667,16 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
                 return ol(self, *a, **k)
 
             try:
-                dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop = si, sa, sl
+                dfmp2._init_mp_df_eris_direct = sdir
+                dfmp2._init_mp_df_eris = sstr
+                IBPISDF.ao2mo, IBPISDF.loop = sa, sl
                 e = dfmp2.DFMP2(mf).kernel()[0]
             finally:
-                dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop = oi, oa, ol
-            self.assertEqual(calls["df_init"], 0, f"analytic DF built at rank {rank}")
+                dfmp2._init_mp_df_eris_direct = odir
+                dfmp2._init_mp_df_eris = ostr
+                IBPISDF.ao2mo, IBPISDF.loop = oa, ol
+            self.assertEqual(calls["direct"], 0, f"analytic direct path taken at rank {rank}")
+            self.assertGreater(calls["streamed"], 0, f"streamed factor path not taken at rank {rank}")
             self.assertEqual(calls["ao2mo"], 0)
             self.assertGreater(calls["loop"], 0, f"loop() not called at rank {rank}")
             self.assertAlmostEqual(e, oracle, places=9)  # DFMP2 == loop-factor oracle

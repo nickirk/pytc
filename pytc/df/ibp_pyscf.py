@@ -350,8 +350,8 @@ class IBPISDF(DF):
         lower-triangular only when its two coefficient matrices are identical
         (PySCF ``iden_coeffs``) and ``compact`` is truthy. Routes through
         ``build()`` so lazy build and the stale-molecule guard are inherited;
-        derives solely from W/P via ``loop()`` and never reads the inherited
-        ``_cderi``.
+        streams the provider's single authoritative packed-AO factor
+        ``_cderi`` via ``loop()``.
 
         Coefficients are validated (dtype/shape/finite/real) BEFORE the
         expensive lazy build. Per L block the peak transients are bounded by
