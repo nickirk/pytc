@@ -5,23 +5,18 @@ Coulomb metric.
 ``mf.with_df`` or passed to a post-HF density-fitting helper. This module is
 the high-level adapter: it turns a molecule into the low-level IBP artifacts
 in ``pytc.df.ibp`` and exposes the streamed packed AO-pair factor through the
-standard ``get_naoaux``/``loop`` surface.
+standard ``get_naoaux``/``loop``/``ao2mo`` surface.
 
-This milestone implements the lifecycle, ``get_naoaux``, and the packed
-three-index ``loop`` only. ``ao2mo`` and the unchanged-consumer energy gates
-are a separate step and raise ``NotImplementedError`` here so the inherited
-analytic-DF behavior can never run.
+``get_jk`` raises ``NotImplementedError`` so the inherited analytic-DF SCF
+path can never silently run against a different Coulomb metric.
 
 Version policy: the public DF surface this adapter overrides was measured on
-PySCF 2.10.0 and only ``>=2.10,<2.11`` is claimed. The compatibility matrix
-records the surface-probe parity observed on newer PySCF; support beyond
-2.10.x is not claimed without the full acceptance matrix.
+PySCF 2.10.0 and only ``>=2.10,<2.11`` is claimed.
 """
 
 import dataclasses
 
 import numpy as np
-import pyscf
 from pyscf.ao2mo.incore import iden_coeffs
 from pyscf.df.df import DF
 from pyscf.dft import numint
@@ -29,15 +24,12 @@ from pyscf.lib import pack_tril, unpack_tril
 from scipy.linalg.blas import dgemm
 
 from pytc.df.ibp import (
-    _canonical_spec_sha256,
-    _deep_freeze,
     build_ibp_grid,
     build_ibp_interpolation_sector,
     build_ibp_operator_plan,
     ibp_core,
 )
 
-_IBPISDF_VERSION = "1"
 _IBPISDF_METRIC = "atom_centered_single_ibp"
 _SUPPORTED_IBPISDF_BACKENDS = ("numpy",)
 _SUPPORTED_ON_OVER_RANK = ("truncate", "raise")
@@ -61,74 +53,26 @@ def _validate_positive_float(name, value):
     return value
 
 
-def _plain_python(obj):
-    """Recursively coerce a PySCF parsed-basis / ECP structure into plain
-    Python dict/list/str/int/float/bool/None so the canonical TLV encoder
-    (which rejects object-dtype arrays and unknown types) can hash it. Numpy
-    scalars become their Python items; numpy arrays become nested lists.
-
-    An unknown type is a hard error, never stringified: ``str(obj)`` on an
-    arbitrary object yields an address-bearing, non-deterministic identity
-    (``<... at 0x...>``) -- precisely the representation-based defect the
-    canonical encoder exists to reject."""
-    if isinstance(obj, dict):
-        return {str(k): _plain_python(v) for k, v in obj.items()}
-    if isinstance(obj, np.ndarray):
-        return _plain_python(obj.tolist())
-    if isinstance(obj, (list, tuple)):
-        return [_plain_python(v) for v in obj]
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, (bool, int, float, str, bytes)) or obj is None:
-        return obj
-    raise TypeError(
-        f"_plain_python: unsupported type {type(obj).__name__} in a molecule "
-        f"basis/ECP structure; refusing to stringify an unknown object into a "
-        f"non-deterministic identity."
+def _mol_fingerprint(mol):
+    """A lightweight geometry+basis identity for the stale-molecule guard: an
+    in-place mutation (set_geom_, basis change, cart flip) after build() must
+    not silently reuse stale factors. Compares realized AO count, AO
+    representation, charge/spin, atom charges, and coordinates (bohr)."""
+    return (
+        int(mol.nao),
+        bool(mol.cart),
+        int(mol.charge),
+        int(mol.spin),
+        tuple(int(z) for z in mol.atom_charges()),
+        np.ascontiguousarray(mol.atom_coords()).tobytes(),
     )
-
-
-def _normalized_basis(mol):
-    """The parsed numeric basis (``mol._basis``: per-element list of angular
-    momentum + primitive exponent/coefficient blocks), as plain Python. This
-    is the realized numeric basis, not a repr of the requested basis name, so
-    two molecules that resolve to different contractions are distinguished."""
-    return _plain_python(dict(getattr(mol, "_basis", {}) or {}))
-
-
-def _normalized_ecp(mol):
-    """The parsed ECP (``mol._ecp``), plain Python, or None if none is set."""
-    ecp = getattr(mol, "_ecp", None)
-    if not ecp:
-        return None
-    return _plain_python(dict(ecp))
-
-
-def _canonical_molecule_digest(mol):
-    """A reproducible, canonical identity digest for a molecule, built from
-    normalized numeric/string fields via the closed TLV encoder (never
-    ``repr``): element charges, coordinates (bohr), total charge, spin, the
-    AO representation (``cart`` vs spherical -- it changes ``nao`` for the
-    same basis), the realized AO count, the parsed numeric basis, and any
-    ECP. A different molecule, geometry, basis, or AO representation always
-    yields a different digest, deterministically across processes."""
-    return _canonical_spec_sha256({
-        "atom_charges": np.ascontiguousarray(np.asarray(mol.atom_charges())),
-        "atom_coords_bohr": np.ascontiguousarray(mol.atom_coords()),
-        "charge": int(mol.charge),
-        "spin": int(mol.spin),
-        "cart": bool(mol.cart),
-        "nao": int(mol.nao),
-        "basis": _normalized_basis(mol),
-        "ecp": _normalized_ecp(mol),
-    })
 
 
 @dataclasses.dataclass(frozen=True)
 class IBPISDFConfig:
     """Immutable configuration carrying every algorithmic knob that affects
-    the realized artifacts, so the provider's cache can bind and reject a
-    stale build. Rank is explicit -- there is no silent rank heuristic."""
+    the realized artifacts. Rank is explicit -- there is no silent rank
+    heuristic."""
     rank: int
     grid_level: int = 2
     backend: str = "numpy"
@@ -141,11 +85,9 @@ class IBPISDFConfig:
     source_block_size: int = 4096
     core_mu_block_size: object = None   # None -> full pivot axis
     core_nu_block_size: object = None
-    config_spec_sha256: str = dataclasses.field(default="", compare=False)
 
     def __post_init__(self):
-        rank = _validate_positive_int("rank", self.rank)
-        object.__setattr__(self, "rank", rank)
+        object.__setattr__(self, "rank", _validate_positive_int("rank", self.rank))
         object.__setattr__(self, "grid_level", self._validate_grid_level())
         if self.backend not in _SUPPORTED_IBPISDF_BACKENDS:
             raise ValueError(
@@ -171,19 +113,6 @@ class IBPISDFConfig:
                            _validate_positive_int("eval_block_size", self.eval_block_size))
         object.__setattr__(self, "source_block_size",
                            _validate_positive_int("source_block_size", self.source_block_size))
-        spec = _canonical_spec_sha256({
-            "rank": self.rank, "grid_level": self.grid_level, "backend": self.backend,
-            "psd_rtol": self.psd_rtol, "packed_pair_tol": self.packed_pair_tol,
-            "pivot_effective_rank_rtol": self.pivot_effective_rank_rtol,
-            "pivot_on_over_rank": self.pivot_on_over_rank,
-            "grid_batch_size": self.grid_batch_size,
-            "eval_block_size": self.eval_block_size,
-            "source_block_size": self.source_block_size,
-            "core_mu_block_size": self.core_mu_block_size,
-            "core_nu_block_size": self.core_nu_block_size,
-            "metric": _IBPISDF_METRIC, "version": _IBPISDF_VERSION,
-        })
-        object.__setattr__(self, "config_spec_sha256", spec)
 
     def _validate_grid_level(self):
         if isinstance(self.grid_level, bool) or not isinstance(self.grid_level, (int, np.integer)):
@@ -212,6 +141,16 @@ class IBPISDFConfig:
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be a finite non-negative number, got {value!r}.")
         return value
+
+
+@dataclasses.dataclass(frozen=True)
+class _IBPDiagnostics:
+    """Compact rank/PSD/residual record kept after the factor is published,
+    so the intermediate grid/sector/plan/core artifacts need not be retained."""
+    psd_status: str
+    psd_retained_rank: int
+    raw_packed_pair_metric_dagger_residual: float
+    Z: object
 
 
 class IBPISDF(DF):
@@ -246,31 +185,21 @@ class IBPISDF(DF):
 
     def _clear_custom_cache(self):
         self._ibp_built = False
-        self._ibp_mol_digest = None
-        self._ibp_provenance = None
-        self._ibp_grid = None
-        self._ibp_sector = None
-        self._ibp_plan = None
-        self._ibp_core = None
+        self._ibp_mol_fingerprint = None
         self._ibp_factor = None       # W, (n_mu, retained_rank)
         self._ibp_pair = None         # P, (rank, n_pair)
         self._ibp_naoaux = None
+        self._ibp_diagnostics = None
 
     @property
     def config(self):
         return self._config
 
-    @property
-    def provenance(self):
-        return self._ibp_provenance
-
     @staticmethod
     def _require_supported_molecule(mol):
         """v1 supports all-electron and ECP molecules. A pseudopotential
-        (GTH/pseudo) molecule changes the realized AO/operator artifacts and
-        has not been validated here, so it is rejected explicitly rather than
-        silently omitted from the identity digest (which would let a pseudo
-        change go unnoticed)."""
+        (GTH/pseudo) molecule changes the realized artifacts and has not been
+        validated here, so it is rejected explicitly."""
         if getattr(mol, "_pseudo", None):
             raise NotImplementedError(
                 "IBPISDF v1 does not support pseudopotential (pseudo/GTH) molecules; "
@@ -280,13 +209,13 @@ class IBPISDF(DF):
 
     def build(self):
         # Idempotent: a second build validates that the molecule identity has
-        # not changed under the built cache. An in-place mutation (set_geom_,
-        # basis change, cart flip) after the first build must not silently
-        # reuse stale factors -- it fails loudly and demands reset().
+        # not changed under the built cache. An in-place mutation after the
+        # first build must not silently reuse stale factors -- it fails loudly
+        # and demands reset().
         self._require_supported_molecule(self.mol)
-        current = _canonical_molecule_digest(self.mol)
+        current = _mol_fingerprint(self.mol)
         if self._ibp_built:
-            if current != self._ibp_mol_digest:
+            if current != self._ibp_mol_fingerprint:
                 raise RuntimeError(
                     "IBPISDF: the molecule identity changed after build() (geometry, "
                     "basis, or AO representation differs from the built artifact); call "
@@ -305,10 +234,9 @@ class IBPISDF(DF):
         return self
 
     def copy(self):
-        # An unbuilt copy with the same immutable configuration -- the simplest
-        # honest contract; it must not share this provider's mutable build
-        # cache. PySCF runtime settings are preserved so the copy behaves like
-        # a fresh, unbuilt clone of this provider rather than a defaulted one.
+        # An unbuilt copy with the same immutable configuration; it must not
+        # share this provider's mutable build cache. PySCF runtime settings are
+        # preserved so the copy behaves like a fresh, unbuilt clone.
         new = IBPISDF(self.mol, config=self._config)
         new.blockdim = self.blockdim
         new.max_memory = self.max_memory
@@ -396,11 +324,9 @@ class IBPISDF(DF):
     def _half_transform(b_ao, ca, cb, pack, na, nb):
         """Half-transform one L block of symmetric AO factors to an MO pair
         axis: ``(L|pq) = Ca^T B_L Cb``. Returns ``(n_L, na_pair)`` packed
-        lower-triangular when ``pack`` (bra/ket matrices identical and compact
-        requested), else ``(n_L, na*nb)`` full. Peak transients within this
-        block are the first-einsum ``tmp (n_L, na, nao)`` and the result
-        ``m (n_L, na, nb)`` -- both bounded by blockdim x nmo x nao; no AO
-        four-index tensor is formed."""
+        lower-triangular when ``pack``, else ``(n_L, na*nb)`` full. Peak
+        transients are bounded by blockdim x nmo x nao; no AO four-index tensor
+        is formed."""
         tmp = np.einsum("Lab,ai->Lib", b_ao, ca, optimize=True)   # (n_L, na, nao)
         m = np.einsum("Lib,bj->Lij", tmp, cb, optimize=True)      # (n_L, na, nb)
         if pack:
@@ -410,19 +336,17 @@ class IBPISDF(DF):
     def ao2mo(self, mo_coeffs, compact=True):
         """Full four-index MO ERIs ``(pq|rs)`` for the atom-centered single-IBP
         metric, streamed from the packed pseudo-auxiliary factor. ``compact``
-        follows PySCF's truth-value convention (not a bool-only contract): a
-        pair axis is packed lower-triangular only when its two coefficient
-        matrices are identical (PySCF ``iden_coeffs``) and ``compact`` is
-        truthy. Routes through ``build()`` so lazy build and the stale-molecule
-        guard are inherited; derives solely from W/P via ``loop()`` and never
-        populates or reads the inherited ``_cderi``.
+        follows PySCF's truth-value convention: a pair axis is packed
+        lower-triangular only when its two coefficient matrices are identical
+        (PySCF ``iden_coeffs``) and ``compact`` is truthy. Routes through
+        ``build()`` so lazy build and the stale-molecule guard are inherited;
+        derives solely from W/P via ``loop()`` and never reads the inherited
+        ``_cderi``.
 
         Coefficients are validated (dtype/shape/finite/real) BEFORE the
-        expensive lazy build. Per L block the peak transients are the unpacked
-        ``b_ao (n_L, nao, nao)`` and each half-transform's ``tmp (n_L, na,
-        nao)`` -- all bounded by blockdim; the only output-sized allocation is
-        the ``(bra_dim, ket_dim)`` result, into which ``dgemm`` accumulates in
-        place (beta=1), so there is no output-sized GEMM temporary."""
+        expensive lazy build. Per L block the peak transients are bounded by
+        blockdim; ``dgemm`` accumulates into the ``(bra_dim, ket_dim)`` output
+        in place (beta=1), so there is no output-sized GEMM temporary."""
         c1, c2, c3, c4 = self._normalize_mo_coeffs(mo_coeffs)   # validate before build
         self.build()
         pack_bra = bool(compact) and iden_coeffs(c1, c2)
@@ -451,23 +375,9 @@ class IBPISDF(DF):
 
     # -- build pipeline ------------------------------------------------------
 
-    def _provider_provenance(self, mol_digest):
-        """One closed provenance record identifying exactly which molecule,
-        configuration, adapter, and PySCF produced the artifacts. It is bound
-        into every downstream artifact so the identity travels with the data."""
-        return {
-            "provider": "IBPISDF",
-            "adapter_version": _IBPISDF_VERSION,
-            "metric": _IBPISDF_METRIC,
-            "mol_digest": mol_digest,
-            "config_spec_sha256": self._config.config_spec_sha256,
-            "pyscf_version": str(pyscf.__version__),
-        }
-
-    def _ibp_build(self, mol_digest):
+    def _ibp_build(self, mol_fingerprint):
         cfg = self._config
         mol = self.mol
-        provenance = self._provider_provenance(mol_digest)
 
         # Realized atom grid.
         from pyscf.dft import gen_grid
@@ -484,13 +394,7 @@ class IBPISDF(DF):
         ao_values = np.ascontiguousarray(ao[0].T)                     # (n_ao, n_grid)
         ao_gradients = np.ascontiguousarray(ao[1:4].transpose(0, 2, 1))  # (3, n_ao, n_grid)
 
-        grid = build_ibp_grid(
-            coords, weights,
-            construction_metadata={
-                "source": "pyscf_atom_grid", "grid_level": cfg.grid_level,
-                "provider_provenance": provenance,
-            },
-        )
+        grid = build_ibp_grid(coords, weights)
 
         # Canonical pivot selection uses the WEIGHTED AO values; the sector is
         # built from the RAW values/gradients.
@@ -508,12 +412,10 @@ class IBPISDF(DF):
             ao_values, ao_values, ao_gradients, ao_gradients, pivots, grid,
             pivot_provenance=record, same_factor=True,
             grid_batch_size=cfg.grid_batch_size,
-            upstream_provenance=provenance,
         )
         plan = build_ibp_operator_plan(
             grid, method="direct",
             eval_block_size=cfg.eval_block_size, source_block_size=cfg.source_block_size,
-            upstream_provenance=provenance,
         )
         # Same-sector, two-sided-averaged core. ibp_core hard-fails a materially
         # indefinite core; a within-band PSD factor is produced here.
@@ -521,7 +423,6 @@ class IBPISDF(DF):
             sector, operator=plan, symmetry_mode="two_sided_average",
             mu_block_size=cfg.core_mu_block_size, nu_block_size=cfg.core_nu_block_size,
             psd_rtol=cfg.psd_rtol,
-            upstream_provenance=provenance,
         )
 
         # Gates: the packed AO-pair metric must be Hermitian to tolerance and
@@ -540,15 +441,14 @@ class IBPISDF(DF):
             )
 
         # Atomic publish: only now assign the cache references.
-        self._ibp_grid = grid
-        self._ibp_sector = sector
-        self._ibp_plan = plan
-        self._ibp_core = core
         self._ibp_factor = core.psd_factor            # W
         self._ibp_pair = sector.P                      # P
         self._ibp_naoaux = int(core.psd_retained_rank)
-        # Publish the deep-frozen record so the provider's public provenance
-        # cannot be mutated to diverge from the (frozen) artifact copies.
-        self._ibp_provenance = _deep_freeze(provenance)
-        self._ibp_mol_digest = mol_digest
+        self._ibp_diagnostics = _IBPDiagnostics(
+            psd_status=core.psd_status,
+            psd_retained_rank=int(core.psd_retained_rank),
+            raw_packed_pair_metric_dagger_residual=core.raw_packed_pair_metric_dagger_residual,
+            Z=core.Z,
+        )
+        self._ibp_mol_fingerprint = mol_fingerprint
         self._ibp_built = True

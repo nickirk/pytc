@@ -1,21 +1,14 @@
-"""Direct tests for pytc.df.ibp's canonical single-IBP primitives (task #2,
-#proj-isdf-ibp-coulomb) and typed provenance artifacts (task #5).
-Exercises the primitives at their new home independently of the atom-
-centered benchmark's re-export, so a future change to the benchmark's
-import path cannot silently stop testing the canonical implementation.
+"""Direct tests for pytc.df.ibp's canonical single-IBP primitives and the
+typed numerical artifacts (grid, operator plan, interpolation sector, Z core,
+PSD factorization).
 
 Molecular end-to-end regression coverage (H2O atom-centered grid vs exact
 4-center/analytic-DF references) stays in
-pytc/test/test_atom_centered_single_ibp.py, which already re-runs
-unchanged against pytc.df.ibp via the benchmark's import.
+pytc/test/test_atom_centered_single_ibp.py.
 """
 
-import dataclasses
-import hashlib
-import os
 import subprocess
 import sys
-import types
 import unittest
 from unittest import mock
 
@@ -31,14 +24,68 @@ from pytc.df.ibp import (
     IBPInterpolationSector,
     IBPOperatorPlan,
     PSDFactorization,
+    _validate_grid_inputs,
     build_ibp_grid,
     build_ibp_interpolation_sector,
     build_ibp_operator_plan,
     ibp_core,
-    naive_coulomb_kernel,
     kernel,
     psd_factorize,
 )
+
+
+def naive_coulomb_kernel(
+    density_left,
+    density_right,
+    coords_left,
+    weights_left,
+    *,
+    coords_right=None,
+    weights_right=None,
+    eval_block_size=128,
+    source_block_size=4096,
+):
+    """Diagnostic ``1/r`` quadrature oracle with coincident terms set to zero.
+
+    This is *not* a controlled production self-cell prescription; it exists as
+    a test oracle to quantify how much the bounded single-IBP ``kernel`` helps
+    relative to the naive singular grid sum on the same atom-centered points.
+    """
+    density_left, coords_left, weights_left = _validate_grid_inputs(
+        density_left, coords_left, weights_left, "left"
+    )
+    if coords_right is None:
+        coords_right = coords_left
+    if weights_right is None:
+        weights_right = weights_left
+    density_right, coords_right, weights_right = _validate_grid_inputs(
+        density_right, coords_right, weights_right, "right"
+    )
+    if density_left.dtype != density_right.dtype:
+        raise ValueError("density_left and density_right dtype must match")
+    eval_block_size = int(eval_block_size)
+    source_block_size = int(source_block_size)
+    if eval_block_size <= 0 or source_block_size <= 0:
+        raise ValueError("eval_block_size and source_block_size must be positive")
+
+    result = np.zeros((density_left.shape[0], density_right.shape[0]),
+                      dtype=density_right.dtype)
+    coincident_pairs = 0
+    for i0 in range(0, coords_left.shape[0], eval_block_size):
+        i1 = min(i0 + eval_block_size, coords_left.shape[0])
+        potential = np.zeros((density_right.shape[0], i1 - i0), dtype=density_right.dtype)
+        for j0 in range(0, coords_right.shape[0], source_block_size):
+            j1 = min(j0 + source_block_size, coords_right.shape[0])
+            diff = coords_left[i0:i1, None, :] - coords_right[None, j0:j1, :]
+            radius = np.linalg.norm(diff, axis=-1)
+            coincident_pairs += int(np.count_nonzero(radius == 0.0))
+            inv_r = np.divide(
+                1.0, radius, out=np.zeros_like(radius), where=radius != 0.0
+            )
+            weighted_density = density_right[:, j0:j1] * weights_right[j0:j1]
+            potential += weighted_density @ inv_r.T
+        result += (density_left[:, i0:i1].conj() * weights_left[i0:i1]) @ potential.T
+    return result, coincident_pairs
 
 
 def _normalized_frobenius_residual_ref(a, b):
@@ -195,10 +242,8 @@ class TestIBPGrid(unittest.TestCase):
         self.assertEqual(grid.n_grid, 6)
         self.assertEqual(grid.backend, "numpy")
         self.assertEqual(grid.device, "cpu")
-        self.assertIsNone(grid.jax_version)
         self.assertEqual(grid.dtype, "float64")
         self.assertEqual(grid.coincident_point_policy, "centered_zero")
-        self.assertEqual(grid.schema_version, "1")
         np.testing.assert_allclose(grid.coords, coords)
         np.testing.assert_allclose(grid.weights, weights)
 
@@ -218,47 +263,16 @@ class TestIBPGrid(unittest.TestCase):
         coords_np, weights_np = self._random_grid_arrays()
         coords = jnp.asarray(coords_np)
         weights = jnp.asarray(weights_np)
-        coords_id = hashlib.sha256(b"coords").hexdigest()
-        weights_id = hashlib.sha256(b"weights").hexdigest()
-        grid = build_ibp_grid(
-            coords, weights, backend="jax",
-            coords_identity=coords_id, weights_identity=weights_id,
-        )
+        grid = build_ibp_grid(coords, weights, backend="jax")
         self.assertEqual(grid.backend, "jax")
-        self.assertEqual(grid.jax_version, jax.__version__)
         self.assertEqual(grid.device, str(coords.device))
-        self.assertEqual(grid.coords_sha256, coords_id)
-        self.assertEqual(grid.weights_sha256, weights_id)
         self.assertIs(grid.coords, coords)
         self.assertIs(grid.weights, weights)
 
-    def test_jax_grid_requires_identity(self):
-        coords = jnp.asarray(self._random_grid_arrays()[0])
-        weights = jnp.asarray(self._random_grid_arrays()[1])
-        with self.assertRaises(ValueError):
-            build_ibp_grid(coords, weights, backend="jax")
-
-    def test_jax_grid_rejects_malformed_identity_syntax(self):
-        coords = jnp.asarray(self._random_grid_arrays()[0])
-        weights = jnp.asarray(self._random_grid_arrays()[1])
-        good = hashlib.sha256(b"x").hexdigest()
-        with self.assertRaises(ValueError):
-            build_ibp_grid(
-                coords, weights, backend="jax",
-                coords_identity="not-a-hash", weights_identity=good,
-            )
-        with self.assertRaises(ValueError):
-            build_ibp_grid(
-                coords, weights, backend="jax",
-                coords_identity=good.upper(), weights_identity=good,
-            )
-
-    def test_numpy_grid_rejects_caller_supplied_identity(self):
+    def test_jax_grid_requires_jax_array(self):
         coords, weights = self._random_grid_arrays()
-        with self.assertRaises(ValueError):
-            build_ibp_grid(
-                coords, weights, coords_identity=hashlib.sha256(b"x").hexdigest()
-            )
+        with self.assertRaises(TypeError):
+            build_ibp_grid(coords, weights, backend="jax")
 
     def test_rejects_malformed_shapes(self):
         coords, weights = self._random_grid_arrays()
@@ -300,57 +314,6 @@ class TestIBPGrid(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_ibp_grid(coords, weights, coincident_point_policy="skip")
 
-    def test_construction_metadata_is_deep_frozen(self):
-        coords, weights = self._random_grid_arrays()
-        meta = {"mol": "H2O", "nested": {"grid_level": 2}}
-        grid = build_ibp_grid(coords, weights, construction_metadata=meta)
-        self.assertIsInstance(grid.construction_metadata, types.MappingProxyType)
-        self.assertIsInstance(grid.construction_metadata["nested"], types.MappingProxyType)
-        meta["mol"] = "mutated"
-        meta["nested"]["grid_level"] = 999
-        self.assertEqual(grid.construction_metadata["mol"], "H2O")
-        self.assertEqual(grid.construction_metadata["nested"]["grid_level"], 2)
-        with self.assertRaises(TypeError):
-            grid.construction_metadata["mol"] = "cannot-assign"
-
-    def test_grid_spec_sha256_deterministic_and_content_sensitive(self):
-        coords, weights = self._random_grid_arrays(seed=7)
-        grid_a = build_ibp_grid(coords.copy(), weights.copy())
-        grid_b = build_ibp_grid(coords.copy(), weights.copy())
-        self.assertEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-        other_coords, other_weights = self._random_grid_arrays(seed=8)
-        grid_c = build_ibp_grid(other_coords, other_weights)
-        self.assertNotEqual(grid_a.grid_spec_sha256, grid_c.grid_spec_sha256)
-
-    def test_tampering_via_dataclasses_replace_is_rejected(self):
-        coords, weights = self._random_grid_arrays()
-        grid = build_ibp_grid(coords, weights)
-        for kwargs in (
-            {"grid_spec_sha256": "0" * 64},
-            {"coords_sha256": "0" * 64},
-            {"weights_sha256": "0" * 64},
-            {"n_grid": grid.n_grid + 1},
-            {"device": "gpu:0"},
-            {"dtype": "float32"},
-            {"schema_version": "999"},
-        ):
-            with self.assertRaises(ValueError):
-                dataclasses.replace(grid, **kwargs)
-
-    def test_direct_construction_bypassing_builder_is_still_validated(self):
-        coords, weights = self._random_grid_arrays()
-        grid = build_ibp_grid(coords, weights)
-        with self.assertRaises(ValueError):
-            IBPGrid(
-                coords=grid.coords, weights=grid.weights, n_grid=grid.n_grid,
-                backend=grid.backend, device=grid.device, dtype=grid.dtype,
-                coincident_point_policy=grid.coincident_point_policy,
-                coords_sha256="0" * 64, weights_sha256=grid.weights_sha256,
-                numpy_version=grid.numpy_version, jax_version=grid.jax_version,
-                construction_metadata={}, schema_version=grid.schema_version,
-                grid_spec_sha256=grid.grid_spec_sha256,
-            )
-
 
 class TestIBPOperatorPlan(unittest.TestCase):
     def _grid(self, n=6, seed=3):
@@ -368,17 +331,12 @@ class TestIBPOperatorPlan(unittest.TestCase):
         self.assertEqual(plan.backend, grid.backend)
         self.assertEqual(plan.device, grid.device)
         self.assertEqual(plan.dtype, grid.dtype)
-        self.assertEqual(plan.method_version, "1")
 
     def test_plan_jax_backend_round_trip(self):
         rng = np.random.default_rng(4)
         coords = jnp.asarray(rng.normal(size=(5, 3)))
         weights = jnp.asarray(rng.normal(size=5))
-        grid = build_ibp_grid(
-            coords, weights, backend="jax",
-            coords_identity=hashlib.sha256(b"c").hexdigest(),
-            weights_identity=hashlib.sha256(b"w").hexdigest(),
-        )
+        grid = build_ibp_grid(coords, weights, backend="jax")
         plan = build_ibp_operator_plan(grid)
         self.assertEqual(plan.backend, "jax")
         self.assertEqual(plan.device, grid.device)
@@ -415,43 +373,8 @@ class TestIBPOperatorPlan(unittest.TestCase):
         self.assertEqual(plan.eval_block_size, 8)
         self.assertIsInstance(plan.eval_block_size, int)
 
-    def test_plan_provenance_is_deep_frozen(self):
-        grid = self._grid()
-        plan = build_ibp_operator_plan(
-            grid, upstream_provenance={"caller": "test", "nested": {"a": 1}}
-        )
-        self.assertIsInstance(plan.provenance, types.MappingProxyType)
-        self.assertEqual(plan.provenance["upstream_provenance"]["caller"], "test")
-        with self.assertRaises(TypeError):
-            plan.provenance["caller"] = "cannot-assign"
-
-    def test_plan_tampering_via_dataclasses_replace_is_rejected(self):
-        grid = self._grid()
-        plan = build_ibp_operator_plan(grid)
-        for kwargs in (
-            {"operator_spec_sha256": "0" * 64},
-            {"method": "direct", "backend": "jax"},
-            {"device": "gpu:0"},
-            {"dtype": "float32"},
-            {"method_version": "999"},
-            {"eval_block_size": plan.eval_block_size + 1},
-        ):
-            with self.assertRaises(ValueError):
-                dataclasses.replace(plan, **kwargs)
-
-    def test_plan_direct_construction_bypassing_builder_is_still_validated(self):
-        grid = self._grid()
-        plan = build_ibp_operator_plan(grid)
-        with self.assertRaises(ValueError):
-            IBPOperatorPlan(
-                grid=grid, method=plan.method, eval_block_size=plan.eval_block_size,
-                source_block_size=plan.source_block_size, tolerance=plan.tolerance,
-                backend=plan.backend, device=plan.device, dtype=plan.dtype,
-                method_version=plan.method_version, provenance={},
-                operator_spec_sha256="0" * 64,
-            )
-
     def test_plan_holds_no_array_data_of_its_own(self):
+        import dataclasses
         grid = self._grid()
         plan = build_ibp_operator_plan(grid)
         for field in dataclasses.fields(plan):
@@ -469,89 +392,6 @@ class TestIBPOperatorPlan(unittest.TestCase):
         # float64, and building this plan does none of that work.
         plan = build_ibp_operator_plan(grid, eval_block_size=128, source_block_size=4096)
         self.assertEqual(plan.grid.n_grid, n)
-
-
-class TestIBPProvenanceCanonicalEncoding(unittest.TestCase):
-    """Regressions for Alice's task #5 review finding: repr()-based
-    provenance hashing is hash-seed-dependent for sets/frozensets (a
-    single construction could even disagree with itself) and silently
-    truncates large ndarray content -- fixed by _canonical_encode."""
-
-    def _grid_with_metadata(self, construction_metadata):
-        rng = np.random.default_rng(9)
-        coords = rng.normal(size=(4, 3))
-        weights = rng.normal(size=4)
-        return build_ibp_grid(coords, weights, construction_metadata=construction_metadata)
-
-    def test_cross_process_hash_seed_determinism(self):
-        script = (
-            "import numpy as np\n"
-            "from pytc.df.ibp import build_ibp_grid\n"
-            "c = np.arange(12, dtype=float).reshape(4, 3)\n"
-            "w = np.ones(4)\n"
-            "g = build_ibp_grid(c, w, construction_metadata="
-            "{'labels': {'alpha', 'beta', 'gamma', 'delta'}})\n"
-            "print(g.grid_spec_sha256)\n"
-        )
-        digests = set()
-        for seed in ("1", "2", "3", "4", "0", "100"):
-            full_env = dict(os.environ)
-            full_env["PYTHONHASHSEED"] = seed
-            result = subprocess.run(
-                [sys.executable, "-W", "error", "-c", script],
-                capture_output=True, text=True, env=full_env, check=True,
-            )
-            # pytc's own startup banner logs to stdout too; the digest is
-            # always the last line since it's the script's final print().
-            digests.add(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(len(digests), 1, f"hash-seed-dependent digests: {digests}")
-
-    def test_dict_key_insertion_order_does_not_affect_hash(self):
-        grid_a = self._grid_with_metadata({"a": 1, "b": 2, "c": 3})
-        grid_b = self._grid_with_metadata({"c": 3, "a": 1, "b": 2})
-        self.assertEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-
-    def test_set_construction_order_does_not_affect_hash(self):
-        grid_a = self._grid_with_metadata({"labels": {"alpha", "beta", "gamma", "delta"}})
-        grid_b = self._grid_with_metadata({"labels": {"delta", "gamma", "beta", "alpha"}})
-        self.assertEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-
-    def test_distinct_set_content_gives_distinct_hash(self):
-        grid_a = self._grid_with_metadata({"labels": {"alpha", "beta"}})
-        grid_b = self._grid_with_metadata({"labels": {"alpha", "gamma"}})
-        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-
-    def test_large_array_middle_content_is_not_truncated(self):
-        # repr()'s numpy summarization would show "..." in the middle and
-        # hide a difference confined entirely to the middle of a long array.
-        base = np.arange(2000, dtype=np.float64)
-        modified = base.copy()
-        modified[1000] += 1.0
-        grid_a = self._grid_with_metadata({"payload": base})
-        grid_b = self._grid_with_metadata({"payload": modified})
-        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-
-    def test_tuple_element_order_is_preserved_and_sensitive(self):
-        grid_a = self._grid_with_metadata({"seq": (1, 2, 3)})
-        grid_b = self._grid_with_metadata({"seq": (3, 2, 1)})
-        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-
-    def test_delimiter_collision_in_string_content_is_rejected(self):
-        """Alice's round-2 finding: a delimiter-separated (non-length-
-        prefixed) encoder let a string CONTAINING a literal delimiter
-        collide with an unrelated sibling tuple -- ("a,str:b",) and
-        ("a", "b") serialized to identical bytes. The TLV encoder must
-        distinguish them since they are genuinely different structures."""
-        grid_a = self._grid_with_metadata({"seq": ("a,str:b",)})
-        grid_b = self._grid_with_metadata({"seq": ("a", "b")})
-        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
-
-    def test_delimiter_collision_in_raw_bytes_content_is_rejected(self):
-        # Analogous case with raw bytes instead of str -- exercises the
-        # "y" (bytes) TLV branch rather than "s" (str).
-        grid_a = self._grid_with_metadata({"seq": (b"a,bytes:b",)})
-        grid_b = self._grid_with_metadata({"seq": (b"a", b"bytes:b")})
-        self.assertNotEqual(grid_a.grid_spec_sha256, grid_b.grid_spec_sha256)
 
 
 class TestIBPInterpolationSector(unittest.TestCase):
@@ -584,7 +424,7 @@ class TestIBPInterpolationSector(unittest.TestCase):
         real_dtype = np.empty((), dtype=dtype).real.dtype
         coords = rng.normal(size=(n_grid, 3)).astype(real_dtype)
         weights = rng.random(n_grid).astype(real_dtype)
-        grid = build_ibp_grid(coords, weights, construction_metadata={"case": "unit"})
+        grid = build_ibp_grid(coords, weights)
         return grid, factor_p, factor_q, gradient_p, gradient_q
 
     def _rank_record(self, n_p, n_q, n_pivots, *, same_factor=False,
@@ -615,7 +455,6 @@ class TestIBPInterpolationSector(unittest.TestCase):
             factor_p, factor_q, gradient_p, gradient_q, pivots, grid,
             pivot_provenance=record, same_factor=same_factor,
             grid_batch_size=batch, rcond=1e-14,
-            upstream_provenance={"caller": {"name": "unit"}},
         )
         return sector, case, pivots, record
 
@@ -725,9 +564,6 @@ class TestIBPInterpolationSector(unittest.TestCase):
         )
         self.assertEqual(sector.requested_rank, record["requested_rank"])
         self.assertEqual(sector.selected_rank, record["n_pivots"])
-        self.assertEqual(
-            dict(sector.provenance["pivot_provenance"]), record
-        )
 
     def test_same_factor_uses_packed_lower_pair_layout(self):
         sector, case, pivots, _ = self._build(np.float64, same_factor=True)
@@ -748,8 +584,6 @@ class TestIBPInterpolationSector(unittest.TestCase):
         np.testing.assert_allclose(
             small.grad_Theta, full.grad_Theta, atol=3e-12, rtol=3e-12
         )
-        self.assertNotEqual(small.sector_spec_sha256, full.sector_spec_sha256)
-        self.assertEqual(full.grid_batch_size, full.n_grid)
 
     def test_prepared_solver_is_built_once_and_reused_for_all_gradients(self):
         case = self._case()
@@ -787,8 +621,6 @@ class TestIBPInterpolationSector(unittest.TestCase):
         self.assertEqual(sector.requested_rank, 5)
         self.assertEqual(sector.selected_rank, 3)
         self.assertEqual(sector.numerical_rank, 3)
-        self.assertEqual(sector.numerical_rank_lower_bound, 3)
-        self.assertTrue(sector.rank_exhausted)
 
     def test_rejects_inconsistent_rank_records(self):
         case = self._case()
@@ -813,35 +645,11 @@ class TestIBPInterpolationSector(unittest.TestCase):
                 pivot_provenance={**good, "extra": 1},
             )
 
-    def test_numpy_outputs_and_provenance_are_immutable_and_tamper_checked(self):
+    def test_numpy_outputs_are_immutable(self):
         sector, _, _, _ = self._build()
-        other_grid, *_ = self._case(seed=99)
         self.assertIsInstance(sector, IBPInterpolationSector)
         for array in (sector.P, sector.Theta, sector.grad_Theta, sector.pivots):
             self.assertFalse(array.flags.writeable)
-        self.assertIsInstance(sector.provenance, types.MappingProxyType)
-        self.assertIsInstance(
-            sector.provenance["upstream_provenance"]["caller"],
-            types.MappingProxyType,
-        )
-        with self.assertRaises(TypeError):
-            sector.provenance["x"] = 1
-        altered = np.array(sector.Theta, copy=True)
-        altered[0, 0] += 1.0
-        for kwargs in (
-            {"sector_spec_sha256": "0" * 64},
-            {"selected_rank": sector.selected_rank + 1},
-            {"rcond": True},
-            {"Theta": altered},
-            {"factor_p_sha256": "0" * 64},
-            {"grid": other_grid},
-            {"backend": "jax"},
-            {"device": "gpu"},
-            {"realized_dtype": "float32"},
-            {"solver_version": "999"},
-        ):
-            with self.assertRaises((TypeError, ValueError)):
-                dataclasses.replace(sector, **kwargs)
 
     def test_rejects_malformed_inputs_and_same_factor_lies(self):
         case = self._case()
@@ -869,49 +677,23 @@ class TestIBPInterpolationSector(unittest.TestCase):
                 pivot_provenance=same_record, same_factor=True,
             )
 
-    def test_jax_backend_preserves_device_and_uses_attested_large_input_hashes(self):
+    def test_jax_backend_preserves_device(self):
         numpy_case = self._case(np.float64, seed=33)
         np_grid, fp_np, fq_np, gp_np, gq_np = numpy_case
-        ids = {
-            key: hashlib.sha256(key.encode()).hexdigest()
-            for key in (
-                "factor_p_sha256", "factor_q_sha256",
-                "gradient_p_sha256", "gradient_q_sha256",
-            )
-        }
         coords = jnp.asarray(np_grid.coords)
         weights = jnp.asarray(np_grid.weights)
-        grid = build_ibp_grid(
-            coords, weights, backend="jax",
-            coords_identity=hashlib.sha256(b"coords").hexdigest(),
-            weights_identity=hashlib.sha256(b"weights").hexdigest(),
-        )
+        grid = build_ibp_grid(coords, weights, backend="jax")
         inputs = tuple(jnp.asarray(a) for a in (fp_np, fq_np, gp_np, gq_np))
         pivots = np.array([0, 2, 5, 8, 11])
         record = self._rank_record(2, 3, len(pivots))
-        import pytc.df.ibp as ibp_module
-        original_hash = ibp_module._canonical_sha256
-        with mock.patch.object(
-            ibp_module, "_canonical_sha256", wraps=original_hash
-        ) as hash_spy:
-            sector = build_ibp_interpolation_sector(
-                *inputs, pivots, grid, pivot_provenance=record,
-                upstream_provenance={**ids, "caller": "jax-test"},
-            )
+        sector = build_ibp_interpolation_sector(
+            *inputs, pivots, grid, pivot_provenance=record,
+        )
         self.assertEqual(sector.backend, "jax")
         self.assertEqual(sector.device, grid.device)
         for array in (sector.P, sector.Theta, sector.grad_Theta, sector.pivots):
             self.assertIsInstance(array, jax.Array)
             self.assertEqual(str(array.device), grid.device)
-        self.assertEqual(
-            sector.output_identity_source, "derived_from_attested_inputs_unverified"
-        )
-        self.assertIsNone(sector.theta_sha256)
-        for call in hash_spy.call_args_list:
-            argument = np.asarray(call.args[0])
-            self.assertEqual(argument.ndim, 1)
-            self.assertTrue(np.issubdtype(argument.dtype, np.integer))
-            self.assertEqual(argument.size, len(pivots))
 
     def test_numpy_and_jax_agree_for_all_supported_precisions(self):
         for dtype in (np.float32, np.complex64, np.float64, np.complex128):
@@ -925,20 +707,10 @@ class TestIBPInterpolationSector(unittest.TestCase):
             )
             jax_grid = build_ibp_grid(
                 jnp.asarray(np_grid.coords), jnp.asarray(np_grid.weights), backend="jax",
-                coords_identity=hashlib.sha256(b"coords-agreement").hexdigest(),
-                weights_identity=hashlib.sha256(b"weights-agreement").hexdigest(),
             )
-            identities = {
-                key: hashlib.sha256(f"{key}-{np.dtype(dtype).name}".encode()).hexdigest()
-                for key in (
-                    "factor_p_sha256", "factor_q_sha256",
-                    "gradient_p_sha256", "gradient_q_sha256",
-                )
-            }
             jax_sector = build_ibp_interpolation_sector(
                 *(jnp.asarray(a) for a in (fp, fq, gp, gq)),
                 pivots, jax_grid, pivot_provenance=record, grid_batch_size=3,
-                upstream_provenance=identities,
             )
             real_itemsize = np.empty((), dtype=dtype).real.dtype.itemsize
             tolerance = 5e-4 if real_itemsize == 4 else 5e-11
@@ -951,26 +723,9 @@ class TestIBPInterpolationSector(unittest.TestCase):
                     numpy_value, np.asarray(jax_value), atol=tolerance, rtol=tolerance
                 )
 
-    def test_jax_backend_requires_all_four_attested_identities(self):
-        np_grid, fp, fq, gp, gq = self._case(seed=34)
-        grid = build_ibp_grid(
-            jnp.asarray(np_grid.coords), jnp.asarray(np_grid.weights), backend="jax",
-            coords_identity=hashlib.sha256(b"coords").hexdigest(),
-            weights_identity=hashlib.sha256(b"weights").hexdigest(),
-        )
-        inputs = tuple(jnp.asarray(a) for a in (fp, fq, gp, gq))
-        pivots = np.array([0, 2, 5, 8, 11])
-        record = self._rank_record(2, 3, len(pivots))
-        with self.assertRaises(ValueError):
-            build_ibp_interpolation_sector(
-                *inputs, pivots, grid, pivot_provenance=record,
-                upstream_provenance={"factor_p_sha256": "0" * 64},
-            )
-
 
 class TestPSDFactorize(unittest.TestCase):
-    """Direct unit tests for psd_factorize -- the reusable Hermitian PSD gate
-    (task #8 will call the same helper on Z_AO)."""
+    """Direct unit tests for psd_factorize -- the reusable Hermitian PSD gate."""
 
     def test_positive_semidefinite_exact_reconstruction(self):
         # Full-rank PSD (square generator, well-conditioned) so every mode is
@@ -1184,70 +939,16 @@ class TestIBPCoreArtifact(unittest.TestCase):
         self.assertEqual(full.nu_block_size, sector_b.selected_rank)
 
     def test_mixed_backend_operator_and_sector_rejected(self):
-        # JAX cores are now implemented (task #10), but a core cannot MIX
-        # backends: a JAX operator with a NumPy sector (or vice versa) is a
-        # structural error and must be rejected.
+        # A core cannot MIX backends: a JAX operator with a NumPy sector (or
+        # vice versa) is a structural error and must be rejected.
         rng = np.random.default_rng(41)
         coords = jnp.asarray(rng.normal(size=(6, 3)))
         weights = jnp.asarray(rng.random(6))
-        grid = build_ibp_grid(
-            coords, weights, backend="jax",
-            coords_identity=hashlib.sha256(b"c").hexdigest(),
-            weights_identity=hashlib.sha256(b"w").hexdigest(),
-        )
+        grid = build_ibp_grid(coords, weights, backend="jax")
         plan = build_ibp_operator_plan(grid)
         _, _, sector_a, _ = self._setup()   # numpy sector
         with self.assertRaises(ValueError):
             ibp_core(sector_a, operator=plan)
-
-    def test_tampering_via_dataclasses_replace_is_rejected(self):
-        _, plan, sector_a, sector_b = self._setup()
-        core = ibp_core(sector_a, sector_b, operator=plan)
-        for kwargs in (
-            {"core_spec_sha256": "0" * 64},
-            {"Z": core.Z + 1.0},
-            {"raw_dagger_residual": core.raw_dagger_residual + 1.0},
-            {"symmetry_mode": "one_sided"},
-            {"same_sector": True, "z_reverse_one_sided": None},
-        ):
-            with self.assertRaises(ValueError):
-                dataclasses.replace(core, **kwargs)
-
-    def test_direct_construction_bypassing_builder_is_still_validated(self):
-        _, plan, sector_a, _ = self._setup()
-        core = ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
-        with self.assertRaises(ValueError):
-            IBPCoreArtifact(
-                Z=core.Z, same_sector=core.same_sector, symmetry_mode=core.symmetry_mode,
-                z_forward_one_sided=core.z_forward_one_sided,
-                z_reverse_one_sided=core.z_reverse_one_sided,
-                z_sha256=core.z_sha256, z_forward_sha256=core.z_forward_sha256,
-                z_reverse_sha256=core.z_reverse_sha256,
-                output_identity_source=core.output_identity_source,
-                raw_dagger_residual=core.raw_dagger_residual,
-                raw_packed_pair_metric_dagger_residual=core.raw_packed_pair_metric_dagger_residual,
-                coincident_pairs=core.coincident_pairs, n_mu=core.n_mu, n_nu=core.n_nu,
-                psd_status=core.psd_status, psd_rtol=core.psd_rtol,
-                psd_factor=core.psd_factor, psd_factor_sha256=core.psd_factor_sha256,
-                psd_raw_min_eigenvalue=core.psd_raw_min_eigenvalue,
-                psd_spectral_scale=core.psd_spectral_scale,
-                psd_negative_mode_count=core.psd_negative_mode_count,
-                psd_clipped_mode_count=core.psd_clipped_mode_count,
-                psd_clipped_absolute_weight=core.psd_clipped_absolute_weight,
-                psd_retained_rank=core.psd_retained_rank,
-                psd_reconstruction_residual=core.psd_reconstruction_residual,
-                left_sector_spec_sha256=core.left_sector_spec_sha256,
-                right_sector_spec_sha256=core.right_sector_spec_sha256,
-                operator_spec_sha256=core.operator_spec_sha256,
-                mu_block_size=core.mu_block_size, nu_block_size=core.nu_block_size,
-                eval_block_size=core.eval_block_size, source_block_size=core.source_block_size,
-                backend=core.backend, device=core.device, realized_dtype=core.realized_dtype,
-                build_wall_time_seconds=core.build_wall_time_seconds,
-                peak_host_bytes=core.peak_host_bytes,
-                peak_host_bytes_status=core.peak_host_bytes_status,
-                solver_version=core.solver_version,
-                provenance={}, core_spec_sha256="0" * 64,
-            )
 
     def _hermitian_psd(self, n, seed=3):
         rng = np.random.default_rng(seed)
@@ -1276,8 +977,6 @@ class TestIBPCoreArtifact(unittest.TestCase):
         self.assertLess(core.psd_reconstruction_residual, 1e-10)
         self.assertIsNotNone(core.raw_packed_pair_metric_dagger_residual)
         self.assertGreaterEqual(core.raw_packed_pair_metric_dagger_residual, 0.0)
-        self.assertIsNone(core.peak_host_bytes)
-        self.assertEqual(core.peak_host_bytes_status, "unmeasured_cpu_oracle")
 
     def test_same_sector_material_indefinite_hard_fails_in_builder(self):
         _, plan, sector_a, _ = self._setup()
@@ -1302,32 +1001,6 @@ class TestIBPCoreArtifact(unittest.TestCase):
         one_sided = ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
         self.assertEqual(one_sided.psd_status, "not_applicable")
         self.assertIsNone(one_sided.psd_factor)
-
-    def test_coherent_multi_array_tamper_is_rejected(self):
-        # The exact bypass the scalar-only spec allowed: coherently sign-flip
-        # Z and both raw orientations. Internally self-consistent (Z recomputes
-        # from the orientations; the normalized residual is flip-invariant) but
-        # the bound array content hashes reject it. Cross-sector so PSD is n/a
-        # and the content hash is the sole mechanism catching the tamper.
-        grid, plan, sector_a, sector_b = self._setup(np.complex128)
-        core = ibp_core(sector_a, sector_b, operator=plan)
-        with self.assertRaises(ValueError):
-            dataclasses.replace(
-                core, Z=-core.Z,
-                z_forward_one_sided=-core.z_forward_one_sided,
-                z_reverse_one_sided=-core.z_reverse_one_sided,
-            )
-
-    def test_stored_psd_factor_tamper_is_rejected(self):
-        _, plan, sector_a, _ = self._setup()
-        n = sector_a.selected_rank
-        z_psd = self._hermitian_psd(n)
-        with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_psd, 0)):
-            core = ibp_core(sector_a, operator=plan)
-        # A pure sign flip leaves W Wᵈ (the reconstruction) unchanged, so only
-        # the stored factor's own content hash catches it.
-        with self.assertRaises(ValueError):
-            dataclasses.replace(core, psd_factor=-core.psd_factor)
 
     def test_zero_forward_nonzero_reverse_residual_is_rejected(self):
         _, plan, sector_a, sector_b = self._setup()
@@ -1357,21 +1030,6 @@ class TestIBPCoreArtifact(unittest.TestCase):
         with mock.patch("pytc.df.ibp._ibp_one_sided_block", return_value=(z_bad, 0)):
             with self.assertRaises(ValueError):
                 ibp_core(sector_a, operator=plan, symmetry_mode="one_sided")
-
-    def test_provenance_references_both_sectors_and_operator(self):
-        _, plan, sector_a, sector_b = self._setup()
-        core = ibp_core(
-            sector_a, sector_b, operator=plan, upstream_provenance={"note": "unit"}
-        )
-        self.assertEqual(
-            dict(core.provenance["left_sector_provenance"]), dict(sector_a.provenance)
-        )
-        self.assertEqual(
-            dict(core.provenance["right_sector_provenance"]), dict(sector_b.provenance)
-        )
-        self.assertEqual(core.provenance["upstream_provenance"]["note"], "unit")
-        with self.assertRaises(TypeError):
-            core.provenance["note"] = "cannot-assign"
 
 
 if __name__ == "__main__":

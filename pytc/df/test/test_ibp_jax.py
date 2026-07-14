@@ -1,11 +1,10 @@
-"""Task #10 evidence suite for the tiled device-resident JAX ibp_core backend:
+"""Evidence suite for the tiled device-resident JAX ibp_core backend:
 numpy/jax parity, device placement, whole-builder allocation audit, byte
 bound, cold-vs-warm compile timing, and the device PSD path. float32/complex64
 (x64-off) parity runs in a fresh subprocess (JAX's global x64 flag cannot be
-toggled mid-process) and lives in test_ibp_jax_x32_subprocess.py's helper.
+toggled mid-process).
 """
 
-import hashlib
 import subprocess
 import sys
 import unittest
@@ -19,20 +18,12 @@ import jax.numpy as jnp
 
 import pytc.df.ibp as ibp
 from pytc.df.ibp import (
-    IBPCoreArtifact,
     build_ibp_grid,
     build_ibp_interpolation_sector,
     build_ibp_operator_plan,
     ibp_core,
 )
 from pytc.integrals.coulomb import select_sector_pivots, weight_mo_values
-
-_IDS = {
-    "factor_p_sha256": hashlib.sha256(b"factor").hexdigest(),
-    "factor_q_sha256": hashlib.sha256(b"factor").hexdigest(),
-    "gradient_p_sha256": hashlib.sha256(b"grad").hexdigest(),
-    "gradient_q_sha256": hashlib.sha256(b"grad").hexdigest(),
-}
 
 
 def _data(dtype, ng=24, n_orb=5, seed=5, coincident=True):
@@ -66,30 +57,25 @@ def _numpy_core(coords, weights, fp, gp, *, symmetry_mode, blocks):
 
 def _jax_core(coords, weights, fp, gp, pivots, record, *, symmetry_mode, blocks):
     e, s, mu, nu = blocks
-    grid = build_ibp_grid(
-        jnp.asarray(coords), jnp.asarray(weights), backend="jax",
-        coords_identity=hashlib.sha256(b"c").hexdigest(),
-        weights_identity=hashlib.sha256(b"w").hexdigest(),
-    )
+    grid = build_ibp_grid(jnp.asarray(coords), jnp.asarray(weights), backend="jax")
     sector = build_ibp_interpolation_sector(
         jnp.asarray(fp), jnp.asarray(fp), jnp.asarray(gp), jnp.asarray(gp),
-        pivots, grid, pivot_provenance=record, same_factor=True, upstream_provenance=_IDS,
+        pivots, grid, pivot_provenance=record, same_factor=True,
     )
     plan = build_ibp_operator_plan(grid, eval_block_size=e, source_block_size=s)
     return ibp_core(sector, operator=plan, symmetry_mode=symmetry_mode,
                     mu_block_size=mu, nu_block_size=nu)
 
 
-def _sector(grid, fp, gp, backend, ids=None):
+def _sector(grid, fp, gp, backend):
     xp_fp = fp if backend == "numpy" else jnp.asarray(fp)
     xp_gp = gp if backend == "numpy" else jnp.asarray(gp)
     weighted = weight_mo_values(np.abs(fp),
                                 grid.weights if backend == "numpy" else np.asarray(grid.weights))
     pivots, record = select_sector_pivots(weighted, weighted, fp.shape[0],
                                           same_factor=True, return_provenance=True)
-    kw = {} if backend == "numpy" else {"upstream_provenance": ids}
     return build_ibp_interpolation_sector(xp_fp, xp_fp, xp_gp, xp_gp, pivots, grid,
-                                          pivot_provenance=record, same_factor=True, **kw)
+                                          pivot_provenance=record, same_factor=True)
 
 
 def _cross_cores(dtype, blocks, seed=11):
@@ -102,20 +88,9 @@ def _cross_cores(dtype, blocks, seed=11):
     np_plan = build_ibp_operator_plan(ng_grid, eval_block_size=e, source_block_size=s)
     np_core = ibp_core(np_a, np_b, operator=np_plan, symmetry_mode="two_sided_average",
                        mu_block_size=mu, nu_block_size=nu)
-    jgrid = build_ibp_grid(
-        jnp.asarray(ca), jnp.asarray(wa), backend="jax",
-        coords_identity=hashlib.sha256(b"c").hexdigest(),
-        weights_identity=hashlib.sha256(b"w").hexdigest(),
-    )
-    ids_a = {k: hashlib.sha256(f"a{k}".encode()).hexdigest() for k in
-             ("factor_p_sha256", "factor_q_sha256", "gradient_p_sha256", "gradient_q_sha256")}
-    ids_a["factor_q_sha256"] = ids_a["factor_p_sha256"]
-    ids_a["gradient_q_sha256"] = ids_a["gradient_p_sha256"]
-    ids_b = {k: hashlib.sha256(f"b{k}".encode()).hexdigest() for k in ids_a}
-    ids_b["factor_q_sha256"] = ids_b["factor_p_sha256"]
-    ids_b["gradient_q_sha256"] = ids_b["gradient_p_sha256"]
-    j_a = _sector(jgrid, fpa, gpa, "jax", ids_a)
-    j_b = _sector(jgrid, fpb, gpb, "jax", ids_b)
+    jgrid = build_ibp_grid(jnp.asarray(ca), jnp.asarray(wa), backend="jax")
+    j_a = _sector(jgrid, fpa, gpa, "jax")
+    j_b = _sector(jgrid, fpb, gpb, "jax")
     j_plan = build_ibp_operator_plan(jgrid, eval_block_size=e, source_block_size=s)
     j_core = ibp_core(j_a, j_b, operator=j_plan, symmetry_mode="two_sided_average",
                       mu_block_size=mu, nu_block_size=nu)
@@ -184,14 +159,10 @@ class TestJaxPlacement(unittest.TestCase):
         coords, weights, fp, gp = _data(np.float64)
         np_core, pivots, record = _numpy_core(coords, weights, fp, gp,
                                               symmetry_mode="one_sided", blocks=(8, 16, 2, 3))
-        grid = build_ibp_grid(
-            jnp.asarray(coords), jnp.asarray(weights), backend="jax",
-            coords_identity=hashlib.sha256(b"c").hexdigest(),
-            weights_identity=hashlib.sha256(b"w").hexdigest(),
-        )
+        grid = build_ibp_grid(jnp.asarray(coords), jnp.asarray(weights), backend="jax")
         sector = build_ibp_interpolation_sector(
             jnp.asarray(fp), jnp.asarray(fp), jnp.asarray(gp), jnp.asarray(gp),
-            pivots, grid, pivot_provenance=record, same_factor=True, upstream_provenance=_IDS,
+            pivots, grid, pivot_provenance=record, same_factor=True,
         )
         plan = build_ibp_operator_plan(grid, eval_block_size=8, source_block_size=16)
 
@@ -248,10 +219,7 @@ class TestJaxAllocationAudit(unittest.TestCase):
         """A genuinely conservative upper bound (overcounting allowed) on the
         COMPILED orientation's live bytes: retained padded arguments + output +
         every potentially-simultaneously-live tile / full-grid temporary,
-        itemsize-scaled, with the ng_pad = lcm(E,S) amplification. Scope note:
-        this is the jitted-orientation live scope; a whole-wrapper peak would
-        additionally hold the original unpadded sector/grid arrays while the
-        padded copies exist (not included here)."""
+        itemsize-scaled, with the ng_pad = lcm(E,S) amplification."""
         import math
         ng_pad = ibp._pad_to_multiple(ng, math.lcm(E, S))
         nm_pad = ibp._pad_to_multiple(n_mu, Nm)
@@ -374,17 +342,13 @@ class TestJaxPsdPath(unittest.TestCase):
         n = fp.shape[0]
         # Build a real jax sector/operator; mock the one-sided block to return a
         # forward orientation whose two-sided average equals the injected PSD Z.
-        grid = build_ibp_grid(
-            jnp.asarray(coords), jnp.asarray(weights), backend="jax",
-            coords_identity=hashlib.sha256(b"c").hexdigest(),
-            weights_identity=hashlib.sha256(b"w").hexdigest(),
-        )
+        grid = build_ibp_grid(jnp.asarray(coords), jnp.asarray(weights), backend="jax")
         weighted = weight_mo_values(fp, np.asarray(weights))
         pivots, record = select_sector_pivots(weighted, weighted, n, same_factor=True,
                                               return_provenance=True)
         sector = build_ibp_interpolation_sector(
             jnp.asarray(fp), jnp.asarray(fp), jnp.asarray(gp), jnp.asarray(gp),
-            pivots, grid, pivot_provenance=record, same_factor=True, upstream_provenance=_IDS,
+            pivots, grid, pivot_provenance=record, same_factor=True,
         )
         plan = build_ibp_operator_plan(grid, eval_block_size=8, source_block_size=16)
         zf = jnp.asarray(z_hermitian_psd)  # already Hermitian -> average is itself
@@ -401,7 +365,6 @@ class TestJaxPsdPath(unittest.TestCase):
         self.assertEqual(core.psd_status, "factorized")
         self.assertIsInstance(core.psd_factor, jax.Array)
         self.assertEqual(str(core.psd_factor.device), core.device)
-        self.assertIsNone(core.psd_factor_sha256)
         self.assertEqual(core.psd_retained_rank, n)
         # W W^dagger reconstructs Z
         recon = np.asarray(core.psd_factor) @ np.asarray(core.psd_factor).conj().T
@@ -447,19 +410,16 @@ class TestJaxPsdPath(unittest.TestCase):
         np.testing.assert_allclose(recon, np.asarray(core.Z), atol=1e-10)
 
     def test_factorized_status_invalid_on_one_sided_rejected(self):
-        # tamper: a one_sided same-sector core cannot declare factorized -- the
+        # A one_sided same-sector core cannot declare factorized -- the
         # applicable guard fires on the status alone, before any PSD field.
         import dataclasses
         coords, weights, fp, gp = _data(np.float64)
-        grid = build_ibp_grid(
-            jnp.asarray(coords), jnp.asarray(weights), backend="jax",
-            coords_identity=hashlib.sha256(b"c").hexdigest(),
-            weights_identity=hashlib.sha256(b"w").hexdigest())
+        grid = build_ibp_grid(jnp.asarray(coords), jnp.asarray(weights), backend="jax")
         w = weight_mo_values(np.abs(fp), np.asarray(weights))
         piv, rec = select_sector_pivots(w, w, fp.shape[0], same_factor=True, return_provenance=True)
         sector = build_ibp_interpolation_sector(
             jnp.asarray(fp), jnp.asarray(fp), jnp.asarray(gp), jnp.asarray(gp),
-            piv, grid, pivot_provenance=rec, same_factor=True, upstream_provenance=_IDS)
+            piv, grid, pivot_provenance=rec, same_factor=True)
         plan = build_ibp_operator_plan(grid, eval_block_size=8, source_block_size=16)
         one_sided = ibp_core(sector, operator=plan, symmetry_mode="one_sided")
         with self.assertRaises(ValueError):
@@ -475,33 +435,15 @@ class TestJaxPsdPath(unittest.TestCase):
             dataclasses.replace(core, psd_rtol=-1.0)
 
 
-class TestJaxArtifactFields(unittest.TestCase):
-    def test_jax_core_identity_and_device_fields(self):
-        coords, weights, fp, gp = _data(np.float64)
-        np_core, pivots, record = _numpy_core(coords, weights, fp, gp,
-                                              symmetry_mode="one_sided", blocks=(8, 16, 2, 3))
-        core = _jax_core(coords, weights, fp, gp, pivots, record,
-                         symmetry_mode="one_sided", blocks=(8, 16, 2, 3))
-        self.assertEqual(core.output_identity_source, "derived_from_attested_inputs_unverified")
-        self.assertIsNone(core.z_sha256)
-        self.assertIsNone(core.z_forward_sha256)
-        self.assertEqual(core.peak_host_bytes_status, "unmeasured_jax_device")
-        self.assertIsNone(core.peak_host_bytes)
-        self.assertEqual(core.solver_version, "2")
-        self.assertNotIn("build_wall_time_seconds", core._core_spec_fields(core.n_mu, core.n_nu))
-
-
 class TestJaxFloat32Subprocess(unittest.TestCase):
     def test_float32_complex64_parity_x64_off(self):
         # JAX's global x64 flag cannot be toggled mid-process, so run the
         # low-precision parity in a fresh subprocess with x64 OFF.
         code = (
-            "import numpy as np, jax, jax.numpy as jnp, hashlib\n"
+            "import numpy as np, jax, jax.numpy as jnp\n"
             "from pytc.df.ibp import (build_ibp_grid, build_ibp_operator_plan,\n"
             "  build_ibp_interpolation_sector, ibp_core)\n"
             "from pytc.integrals.coulomb import select_sector_pivots, weight_mo_values\n"
-            "IDS={'factor_p_sha256':hashlib.sha256(b'f').hexdigest(),'factor_q_sha256':hashlib.sha256(b'f').hexdigest(),\n"
-            "  'gradient_p_sha256':hashlib.sha256(b'g').hexdigest(),'gradient_q_sha256':hashlib.sha256(b'g').hexdigest()}\n"
             "assert not jax.config.jax_enable_x64\n"
             "ok=True\n"
             "for dt in (np.float32, np.complex64):\n"
@@ -518,10 +460,9 @@ class TestJaxFloat32Subprocess(unittest.TestCase):
             "  sec=build_ibp_interpolation_sector(fp,fp,gp,gp,piv,g,pivot_provenance=rec,same_factor=True)\n"
             "  pl=build_ibp_operator_plan(g,eval_block_size=8,source_block_size=16)\n"
             "  npc=ibp_core(sec,operator=pl,symmetry_mode='one_sided')\n"
-            "  jg=build_ibp_grid(jnp.asarray(coords.astype('float32')),jnp.asarray(weights.astype('float32')),backend='jax',\n"
-            "    coords_identity=hashlib.sha256(b'c').hexdigest(),weights_identity=hashlib.sha256(b'w').hexdigest())\n"
+            "  jg=build_ibp_grid(jnp.asarray(coords.astype('float32')),jnp.asarray(weights.astype('float32')),backend='jax')\n"
             "  js=build_ibp_interpolation_sector(jnp.asarray(fp),jnp.asarray(fp),jnp.asarray(gp),jnp.asarray(gp),\n"
-            "    piv,jg,pivot_provenance=rec,same_factor=True,upstream_provenance=IDS)\n"
+            "    piv,jg,pivot_provenance=rec,same_factor=True)\n"
             "  jpl=build_ibp_operator_plan(jg,eval_block_size=8,source_block_size=16)\n"
             "  jc=ibp_core(js,operator=jpl,symmetry_mode='one_sided')\n"
             "  err=float(np.max(np.abs(np.asarray(jc.Z)-npc.Z)))\n"

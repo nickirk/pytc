@@ -38,9 +38,63 @@ import numpy as np
 from pyscf import ao2mo, dft, gto, mp, scf
 
 from pytc.df.ibp import (
-    naive_coulomb_kernel,
+    _validate_grid_inputs,
     kernel,
 )
+
+
+def naive_coulomb_kernel(
+    density_left,
+    density_right,
+    coords_left,
+    weights_left,
+    *,
+    coords_right=None,
+    weights_right=None,
+    eval_block_size=128,
+    source_block_size=4096,
+):
+    """Diagnostic ``1/r`` quadrature with coincident terms set to zero.
+
+    This is *not* a controlled production self-cell prescription; it exists to
+    quantify how much the bounded single-IBP ``kernel`` helps relative to the
+    naive singular grid sum on the same atom-centered points.
+    """
+    density_left, coords_left, weights_left = _validate_grid_inputs(
+        density_left, coords_left, weights_left, "left"
+    )
+    if coords_right is None:
+        coords_right = coords_left
+    if weights_right is None:
+        weights_right = weights_left
+    density_right, coords_right, weights_right = _validate_grid_inputs(
+        density_right, coords_right, weights_right, "right"
+    )
+    if density_left.dtype != density_right.dtype:
+        raise ValueError("density_left and density_right dtype must match")
+    eval_block_size = int(eval_block_size)
+    source_block_size = int(source_block_size)
+    if eval_block_size <= 0 or source_block_size <= 0:
+        raise ValueError("eval_block_size and source_block_size must be positive")
+
+    result = np.zeros((density_left.shape[0], density_right.shape[0]),
+                      dtype=density_right.dtype)
+    coincident_pairs = 0
+    for i0 in range(0, coords_left.shape[0], eval_block_size):
+        i1 = min(i0 + eval_block_size, coords_left.shape[0])
+        potential = np.zeros((density_right.shape[0], i1 - i0), dtype=density_right.dtype)
+        for j0 in range(0, coords_right.shape[0], source_block_size):
+            j1 = min(j0 + source_block_size, coords_right.shape[0])
+            diff = coords_left[i0:i1, None, :] - coords_right[None, j0:j1, :]
+            radius = np.linalg.norm(diff, axis=-1)
+            coincident_pairs += int(np.count_nonzero(radius == 0.0))
+            inv_r = np.divide(
+                1.0, radius, out=np.zeros_like(radius), where=radius != 0.0
+            )
+            weighted_density = density_right[:, j0:j1] * weights_right[j0:j1]
+            potential += weighted_density @ inv_r.T
+        result += (density_left[:, i0:i1].conj() * weights_left[i0:i1]) @ potential.T
+    return result, coincident_pairs
 from pytc.df.solvers import (
     prepare_normal_equations_solver,
     solve_normal_equations_batch_prepared,

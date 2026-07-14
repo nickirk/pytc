@@ -26,8 +26,7 @@ from pyscf import gto
 from pytc.df.ibp_pyscf import (
     IBPISDF,
     IBPISDFConfig,
-    _canonical_molecule_digest,
-    _plain_python,
+    _mol_fingerprint,
 )
 
 
@@ -76,31 +75,18 @@ def _dense_ao2mo_oracle(provider, mos, compact):
 
 
 class TestIBPISDFConfig(unittest.TestCase):
-    def test_valid_and_spec_is_stable_and_discriminating(self):
-        a = IBPISDFConfig(rank=8, grid_level=1)
-        b = IBPISDFConfig(rank=8, grid_level=1)
-        self.assertEqual(a.config_spec_sha256, b.config_spec_sha256)
-        self.assertNotEqual(
-            a.config_spec_sha256, IBPISDFConfig(rank=9, grid_level=1).config_spec_sha256
+    def test_valid_config_accepts_all_knobs(self):
+        cfg = IBPISDFConfig(
+            rank=8, grid_level=1, backend="numpy", psd_rtol=1e-9,
+            packed_pair_tol=1e-4, pivot_effective_rank_rtol=1e-5,
+            pivot_on_over_rank="raise", grid_batch_size=64,
+            eval_block_size=256, source_block_size=2048,
+            core_mu_block_size=32, core_nu_block_size=32,
         )
-        # every artifact-affecting knob perturbs the digest
-        for kw in (
-            dict(grid_level=2),
-            dict(backend="numpy", psd_rtol=1e-9),
-            dict(packed_pair_tol=1e-4),
-            dict(pivot_effective_rank_rtol=1e-5),
-            dict(pivot_on_over_rank="raise"),
-            dict(grid_batch_size=64),
-            dict(eval_block_size=256),
-            dict(source_block_size=2048),
-            dict(core_mu_block_size=32),
-            dict(core_nu_block_size=32),
-        ):
-            self.assertNotEqual(
-                a.config_spec_sha256,
-                IBPISDFConfig(rank=8, **{"grid_level": 1, **kw}).config_spec_sha256,
-                msg=f"knob {kw} did not affect the config digest",
-            )
+        self.assertEqual(cfg.rank, 8)
+        self.assertEqual(cfg.grid_level, 1)
+        self.assertEqual(cfg.pivot_on_over_rank, "raise")
+        self.assertEqual(cfg.core_mu_block_size, 32)
 
     def test_rank_required_and_positive(self):
         with self.assertRaises(TypeError):
@@ -183,7 +169,7 @@ class TestIBPISDFStreaming(unittest.TestCase):
         p._ibp_naoaux = int(W.shape[1])
         # Match the current molecule identity so build()'s idempotent identity
         # guard treats this injected cache as a valid built state.
-        p._ibp_mol_digest = _canonical_molecule_digest(p.mol)
+        p._ibp_mol_fingerprint = _mol_fingerprint(p.mol)
         p._ibp_built = True
 
     def test_loop_yields_W_dagger_P_in_blocks(self):
@@ -252,7 +238,7 @@ class TestIBPISDFLifecycle(unittest.TestCase):
         q = p.copy()
         self.assertFalse(q._ibp_built)
         self.assertIsNone(q._ibp_factor)
-        self.assertEqual(q.config.config_spec_sha256, p.config.config_spec_sha256)
+        self.assertEqual(q.config, p.config)
         # mutating the copy's cache does not touch the original
         self.assertTrue(p._ibp_built)
 
@@ -316,86 +302,6 @@ class TestIBPISDFBuildGates(unittest.TestCase):
         self.assertIsNone(p._ibp_factor)
 
 
-class TestMoleculeDigest(unittest.TestCase):
-    """The molecule identity must be canonical (no repr) and complete."""
-
-    def test_cart_vs_spherical_distinguished(self):
-        # Alice's repro: C/cc-pVDZ spherical (14 AO) vs Cartesian (15 AO) must
-        # not share a digest even though the requested basis name is identical.
-        sph = gto.M(atom="C 0 0 0", basis="cc-pvdz", spin=2, verbose=0)
-        cart = gto.M(atom="C 0 0 0", basis="cc-pvdz", spin=2, cart=True, verbose=0)
-        self.assertNotEqual(sph.nao, cart.nao)
-        self.assertNotEqual(
-            _canonical_molecule_digest(sph), _canonical_molecule_digest(cart)
-        )
-
-    def test_geometry_basis_charge_spin_distinguished(self):
-        base = _canonical_molecule_digest(_h2())
-        moved = _canonical_molecule_digest(
-            gto.M(atom="H 0 0 0; H 0 0 0.90", basis="sto-3g", verbose=0)
-        )
-        rebased = _canonical_molecule_digest(
-            gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
-        )
-        self.assertNotEqual(base, moved)
-        self.assertNotEqual(base, rebased)
-
-    def test_digest_is_reproducible(self):
-        self.assertEqual(_canonical_molecule_digest(_h2()),
-                         _canonical_molecule_digest(_h2()))
-
-    def test_unknown_basis_object_is_rejected_not_stringified(self):
-        # An arbitrary object must never be str()'d into an address-bearing,
-        # non-deterministic identity -- it is a hard TypeError.
-        class Odd:
-            pass
-        with self.assertRaises(TypeError):
-            _plain_python(Odd())
-        with self.assertRaises(TypeError):
-            _plain_python({"H": [Odd()]})
-        mol = _h2()
-        mol._basis = {"H": [Odd()]}
-        with self.assertRaises(TypeError):
-            _canonical_molecule_digest(mol)
-
-
-class TestIBPISDFProvenanceBinding(unittest.TestCase):
-    def test_provider_provenance_bound_in_every_artifact(self):
-        p = IBPISDF(_h2(), rank=3, grid_level=1)
-        p.build()
-        prov = p.provenance
-        self.assertEqual(
-            sorted(prov),
-            ["adapter_version", "config_spec_sha256", "metric", "mol_digest",
-             "provider", "pyscf_version"],
-        )
-        self.assertEqual(prov["mol_digest"], _canonical_molecule_digest(p.mol))
-        self.assertEqual(prov["config_spec_sha256"], p.config.config_spec_sha256)
-        # The same closed record travels through grid, sector, plan, and core.
-        self.assertEqual(
-            p._ibp_grid.construction_metadata["provider_provenance"]["mol_digest"],
-            prov["mol_digest"],
-        )
-        for artifact in (p._ibp_sector, p._ibp_plan, p._ibp_core):
-            bound = artifact.provenance["upstream_provenance"]
-            self.assertEqual(bound["mol_digest"], prov["mol_digest"])
-            self.assertEqual(bound["config_spec_sha256"], prov["config_spec_sha256"])
-            self.assertEqual(bound["adapter_version"], prov["adapter_version"])
-
-    def test_public_provenance_is_frozen_and_cannot_diverge(self):
-        # The provider's public provenance must be immutable so it cannot be
-        # mutated to disagree with the frozen artifact copies.
-        p = IBPISDF(_h2(), rank=3, grid_level=1)
-        p.build()
-        with self.assertRaises(TypeError):
-            p.provenance["mol_digest"] = "0" * 64
-        # still consistent with the frozen grid copy
-        self.assertEqual(
-            p.provenance["mol_digest"],
-            p._ibp_grid.construction_metadata["provider_provenance"]["mol_digest"],
-        )
-
-
 class TestIBPISDFStaleMolecule(unittest.TestCase):
     def test_inplace_geometry_mutation_after_build_is_rejected(self):
         p = IBPISDF(_h2(), rank=3, grid_level=1)
@@ -412,7 +318,7 @@ class TestIBPISDFStaleMolecule(unittest.TestCase):
         p.reset()
         p.build()  # clean rebuild on the new geometry
         self.assertTrue(p._ibp_built)
-        self.assertEqual(p.provenance["mol_digest"], _canonical_molecule_digest(p.mol))
+        self.assertEqual(p._ibp_mol_fingerprint, _mol_fingerprint(p.mol))
 
     def test_pseudopotential_molecule_is_rejected(self):
         # v1 supports all-electron/ECP molecules only; a pseudopotential
@@ -622,11 +528,11 @@ class TestIBPISDFPhysicalBuild(unittest.TestCase):
         p = IBPISDF(_h2(), rank=3, grid_level=1)
         p.build()
         self.assertTrue(p._ibp_built)
-        self.assertEqual(p.get_naoaux(), p._ibp_core.psd_retained_rank)
-        self.assertEqual(p._ibp_core.psd_status, "factorized")
+        self.assertEqual(p.get_naoaux(), p._ibp_diagnostics.psd_retained_rank)
+        self.assertEqual(p._ibp_diagnostics.psd_status, "factorized")
         full = np.vstack(list(p.loop()))
         P = p._ibp_pair
-        Z = p._ibp_core.Z
+        Z = p._ibp_diagnostics.Z
         metric = P.conj().T @ Z @ P
         np.testing.assert_allclose(full.conj().T @ full, metric, atol=1e-10, rtol=1e-8)
 
@@ -639,10 +545,10 @@ class TestIBPISDFPhysicalBuild(unittest.TestCase):
         )
         p = IBPISDF(mol, rank=200, grid_level=1)
         p.build()
-        self.assertEqual(p._ibp_core.psd_status, "factorized")
+        self.assertEqual(p._ibp_diagnostics.psd_status, "factorized")
         self.assertGreater(p.get_naoaux(), 0)
         self.assertLessEqual(
-            p._ibp_core.raw_packed_pair_metric_dagger_residual, p.config.packed_pair_tol
+            p._ibp_diagnostics.raw_packed_pair_metric_dagger_residual, p.config.packed_pair_tol
         )
 
 
@@ -673,7 +579,7 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
         # IBP provider, pre-built before the spy so its own DF.__init__ is not counted
         ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
         rank = ibp.get_naoaux()
-        pair_resid = ibp._ibp_core.raw_packed_pair_metric_dagger_residual
+        pair_resid = ibp._ibp_diagnostics.raw_packed_pair_metric_dagger_residual
         calls = {"df_init": 0, "ao2mo": 0}
         orig_init, orig_ao2mo = dfmod.DF.__init__, IBPISDF.ao2mo
 
