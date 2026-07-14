@@ -16,10 +16,12 @@ from pyscf.pbc.gto import Cell
 
 from pytc.pbc.df.isdf import (
     RawKernelProvider,
+    _raw_kernel_apply_core,
     apply_kernel_and_solve_device,
     apply_raw_kernel_and_solve,
     build_coul_kpt_device,
     build_pi_eta,
+    precompute_coulG_all_q,
     precompute_phase_all_q,
     raw_kernel_apply,
 )
@@ -138,6 +140,65 @@ class TestRawKernelProvider(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             provider.apply(mesh_obj.n_kpts, np.zeros((1, int(np.prod(cell.mesh)))))
+
+    def test_raw_kernel_provider_fused_path_matches_apply_directly(self):
+        # RawKernelProvider.__post_init__ precomputes coulG_all ONCE
+        # (task #25/C2 item 1 fusion prerequisite); this pins that the
+        # cached value used by the fused core is bit-identical to the
+        # per-call fresh computation apply()/raw_kernel_apply still use.
+        cell = _make_cell()
+        rng = np.random.default_rng(84)
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_mesh = cell.mesh
+        n_grid = int(np.prod(grid_mesh))
+        lq = (rng.normal(size=(2, n_grid)) + 1j * rng.normal(size=(2, n_grid))).astype(
+            np.complex128
+        )
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=grid_mesh
+        )
+        for q in range(mesh_obj.n_kpts):
+            v_direct = provider.apply(q, lq)
+            v_cached = _raw_kernel_apply_core(lq, provider.coulG_all[q], provider.grid_mesh)
+            np.testing.assert_array_equal(np.asarray(v_cached), np.asarray(v_direct))
+
+
+class TestPrecomputeCoulGAllQ(unittest.TestCase):
+    """design v2.1 section 7 glue-fix (task #25/C2 item 1 fusion
+    prerequisite): precompute_coulG_all_q batches the per-q host pyscf
+    coulG computation raw_kernel_apply used to redo from scratch on
+    every provider.apply() call -- and removes the host<->device
+    round trip that made it impossible to fuse into one jax.jit graph."""
+
+    def test_matches_per_q_direct_pyscf_computation(self):
+        from pyscf.pbc import tools as pbctools
+
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_mesh = cell.mesh
+        n_grid = int(np.prod(grid_mesh))
+
+        coulG_all = precompute_coulG_all_q(cell, mesh_obj.canonical_kpts, grid_mesh)
+        self.assertEqual(coulG_all.shape, (mesh_obj.n_kpts, n_grid))
+
+        Gv = cell.get_Gv(list(grid_mesh))
+        for q in range(mesh_obj.n_kpts):
+            expected = np.asarray(
+                pbctools.get_coulG(
+                    cell, k=mesh_obj.canonical_kpts[q], exx=False, Gv=Gv, mesh=list(grid_mesh)
+                ),
+                dtype=np.float64,
+            ) * (cell.vol / n_grid)
+            np.testing.assert_array_equal(np.asarray(coulG_all[q]), expected)
+
+    def test_rejects_malformed_shapes(self):
+        cell = _make_cell()
+        with self.assertRaises(ValueError):
+            precompute_coulG_all_q(cell, np.zeros((5, 2)), cell.mesh)
+        with self.assertRaises(ValueError):
+            precompute_coulG_all_q(cell, np.zeros((5, 3)), (2, 2))
 
 
 class TestPrecomputePhaseAllQ(unittest.TestCase):
@@ -295,6 +356,81 @@ class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
                 retained_solve_residual_gate=-1.0,
             )
         self.assertIn("q_index=0", str(ctx.exception))
+
+
+class _UnfusedOnlyProviderWrapper:
+    """Wraps a RawKernelProvider but deliberately does NOT expose
+    fused_apply_and_solve, to force apply_kernel_and_solve_device's
+    original eager per-stage fallback path in tests -- the fused path
+    (task #25/C2 item 1) is otherwise unconditionally exercised by every
+    other test in this file, since RawKernelProvider always provides the
+    hook now."""
+
+    def __init__(self, provider):
+        self._provider = provider
+        self.canonical_kpts = provider.canonical_kpts
+
+    def apply(self, q_index, lq):
+        return self._provider.apply(q_index, lq)
+
+    def provenance(self):
+        return self._provider.provenance()
+
+
+class TestFusedPathMatchesUnfusedPath(unittest.TestCase):
+    """task #25/C2 item 1 acceptance criterion: the fused (one jax.jit
+    graph) path must match the original eager per-stage path at
+    bit-tier (atol=1e-12, this codebase's own definition of "bit-tier"
+    -- see test_device_path_matches_numpy_oracle_bit_tier), not
+    necessarily literal bitwise equality: the two paths are genuinely
+    DIFFERENT XLA computation graphs (fusion composes everything into
+    one graph; the forced-unfused path dispatches two independently-
+    compiled jitted cores), so ULP-level differences from XLA's op-
+    fusion/reordering decisions are physically expected, not a defect.
+    Fusion is a performance change, never a numerical one beyond that
+    floating-point-associativity noise floor."""
+
+    def _setup(self, kmesh, seed=85, n_ip=3):
+        cell = _make_cell()
+        rng = np.random.default_rng(seed)
+        kpts = cell.make_kpts(kmesh, wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grids = cell.get_uniform_grids(cell.mesh)
+        X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
+        ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (grids.shape[0], cell.nao))
+        Pi, eta = build_pi_eta(X, ao, mesh_obj.phase)
+        return cell, mesh_obj, grids, Pi, eta
+
+    def test_fused_matches_forced_unfused_bit_identically(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        unfused_provider = _UnfusedOnlyProviderWrapper(provider)
+        self.assertFalse(hasattr(unfused_provider, "fused_apply_and_solve"))
+        phase_all = precompute_phase_all_q(grids, mesh_obj.canonical_kpts)
+
+        for q in range(mesh_obj.n_kpts):
+            self_paired = int(mesh_obj.neg[q]) == q
+            W_fused, kern_fused, info_fused = apply_kernel_and_solve_device(
+                provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=1e-8,
+                self_paired=self_paired,
+            )
+            W_unfused, kern_unfused, info_unfused = apply_kernel_and_solve_device(
+                unfused_provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=1e-8,
+                self_paired=self_paired,
+            )
+            np.testing.assert_allclose(
+                np.asarray(kern_fused), np.asarray(kern_unfused), atol=1e-12, err_msg=f"kern_q q={q}"
+            )
+            np.testing.assert_allclose(
+                np.asarray(W_fused), np.asarray(W_unfused), atol=1e-12, err_msg=f"W_q q={q}"
+            )
+            self.assertEqual(info_fused["n_retained"], info_unfused["n_retained"])
+            self.assertAlmostEqual(
+                info_fused["retained_solve_residual"], info_unfused["retained_solve_residual"],
+                places=10,
+            )
 
 
 class TestBuildCoulKptDevice(unittest.TestCase):

@@ -506,6 +506,107 @@ def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
     return _raw_kernel_apply_core(lq_jnp, jnp.asarray(coulG_scaled), grid_mesh_t)
 
 
+def precompute_coulG_all_q(cell, canonical_kpts, grid_mesh):
+    """Host-side precompute of coulG(q)*vol/Ng for EVERY q at once
+    (design v2.1 section 7, task #25/C2 item 1 eager-glue fusion
+    prerequisite): cell.get_Gv/pbctools.get_coulG are host-only pyscf
+    calls, not jittable, and were previously re-run inside
+    raw_kernel_apply on EVERY provider.apply() call even though the
+    result depends only on q and the (build-invariant) cell/grid_mesh --
+    a per-q constant, recomputed Nk times per build for no reason, and
+    (before this fix) the specific host<->device boundary crossing that
+    made full jax.jit fusion of the per-q apply-and-solve chain
+    impossible (raw_kernel_apply's coulG computation cannot appear
+    inside a jax.jit trace). Computing all Nk values ONCE here (also
+    reusing a single cell.get_Gv call, itself q-independent and
+    previously recomputed per call too) removes that barrier: the
+    result is one plain array that CAN be threaded into a jitted core
+    as a traced argument.
+
+    Args:
+        cell: pyscf.pbc.gto.Cell.
+        canonical_kpts: (Nk, 3) float64 absolute k-vectors.
+        grid_mesh: (3,) positive ints, the real-space integration mesh.
+
+    Returns:
+        coulG_all: (Nk, Ng) float64 jax array; coulG_all[q] is the SAME
+        value raw_kernel_apply computed internally per-call before this
+        fix (verified bit-identical in
+        test_raw_kernel_provider_fused_path_matches_apply_directly).
+
+    Raises:
+        ValueError: malformed shapes.
+    """
+    from pyscf.pbc import tools as pbctools
+
+    canonical_kpts_np = np.asarray(canonical_kpts, dtype=np.float64)
+    if canonical_kpts_np.ndim != 2 or canonical_kpts_np.shape[1] != 3:
+        raise ValueError(
+            f"canonical_kpts must have shape (Nk,3), got {canonical_kpts_np.shape}."
+        )
+    grid_mesh_t = tuple(int(x) for x in grid_mesh)
+    if len(grid_mesh_t) != 3 or any(m <= 0 for m in grid_mesh_t):
+        raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh_t}.")
+
+    n_grid = int(np.prod(grid_mesh_t))
+    Gv = cell.get_Gv(list(grid_mesh_t))
+    n_kpts = canonical_kpts_np.shape[0]
+    coulG_all = np.empty((n_kpts, n_grid), dtype=np.float64)
+    for q in range(n_kpts):
+        coulG = pbctools.get_coulG(
+            cell, k=canonical_kpts_np[q], exx=False, Gv=Gv, mesh=list(grid_mesh_t)
+        )
+        coulG_all[q] = np.asarray(coulG, dtype=np.float64) * (cell.vol / n_grid)
+    return jnp.asarray(coulG_all)
+
+
+@partial(jax.jit, static_argnames=("grid_mesh", "self_paired"))
+def _fused_apply_kernel_and_solve_core(
+    Pi_q, eta_q, phase_q, coulG_scaled_q, grid_mesh, rtol, self_paired
+):
+    """Fully fused, single-jax.jit core of apply_kernel_and_solve_device's
+    per-q hot path (design v2.1 section 6, task #25/C2 item 1 eager-glue
+    fusion): phase-multiply -> raw kernel apply (FFT/coulG/IFFT) ->
+    conjugate -> ZGEMM contract -> Hermitian sandwich solve, as ONE XLA
+    computation graph with zero numpy/jax boundary crossings in between.
+
+    Composes the two PRE-EXISTING jitted cores
+    (_raw_kernel_apply_core, _hermitian_sandwich_solve_core) directly --
+    both were already jit-pure; it was the EAGER HOST GLUE around them
+    (raw_kernel_apply's host pyscf coulG call, hermitian_sandwich_solve_
+    device's host numpy validation) forcing host<->device round trips
+    between every stage that blocked fusion, not the cores themselves.
+    Measured as 6.3x fused-vs-sum-of-decomposed-stages overhead on a
+    real V100 (task #22 tile harness, JID 59179666) once the earlier
+    phase-cache fix (fa7d7f9) had already ruled out the phase recompute
+    as the gap's cause.
+
+    Only reachable via a provider exposing fused_apply_and_solve (see
+    RawKernelProvider below) -- apply_kernel_and_solve_device falls back
+    to the original eager per-stage path for any provider that doesn't.
+    """
+    n_grid = eta_q.shape[1]
+    lq = eta_q * phase_q[None, :]
+    v_q = _raw_kernel_apply_core(lq, coulG_scaled_q, grid_mesh)
+    rq = jnp.conj(v_q)
+    kern_q = (lq @ rq.T) / jnp.sqrt(n_grid)
+    if self_paired:
+        kern_q = kern_q.real.astype(jnp.complex128)
+
+    from pytc.df.solvers import _hermitian_sandwich_solve_core
+
+    (
+        W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
+        v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+    ) = _hermitian_sandwich_solve_core(Pi_q, kern_q, rtol)
+
+    return (
+        W, kern_q, n_retained, s_max, s_min_retained,
+        pi_anti_hermitian_residual, v_anti_hermitian_residual,
+        retained_solve_residual, truncation_residual,
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class RawKernelProvider:
     """The "raw" (bare 4pi/G^2, exx=False) KernelProvider (design v2.1
@@ -514,6 +615,16 @@ class RawKernelProvider:
     is a per-(cell, canonical k-mesh, grid) object -- q_index looks up
     the absolute k-vector from canonical_kpts internally, so callers
     never pass raw k-vectors across the provider boundary.
+
+    Also exposes fused_apply_and_solve(q_index, Pi_q, eta_q, phase_q,
+    rtol, self_paired), an OPTIONAL fast-path hook (task #25/C2 item 1)
+    that apply_kernel_and_solve_device prefers when present: it wraps
+    _fused_apply_kernel_and_solve_core with this provider's precomputed
+    coulG_all[q_index], fusing this provider's entire per-q apply+solve
+    math into one jax.jit graph. Not part of the minimal KernelProvider
+    contract (apply/provenance) -- a future provider (e.g. ibp) can omit
+    it and apply_kernel_and_solve_device will use the portable eager
+    path instead, unfused but correct.
 
     Args:
         cell: pyscf.pbc.gto.Cell.
@@ -536,6 +647,9 @@ class RawKernelProvider:
             raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh}.")
         object.__setattr__(self, "canonical_kpts", canonical_kpts)
         object.__setattr__(self, "grid_mesh", grid_mesh)
+        object.__setattr__(
+            self, "coulG_all", precompute_coulG_all_q(self.cell, canonical_kpts, grid_mesh)
+        )
 
     def apply(self, q_index, lq):
         n_kpts = self.canonical_kpts.shape[0]
@@ -543,6 +657,14 @@ class RawKernelProvider:
             raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         return raw_kernel_apply(
             lq, cell=self.cell, q_kpt=self.canonical_kpts[q_index], grid_mesh=self.grid_mesh
+        )
+
+    def fused_apply_and_solve(self, q_index, Pi_q, eta_q, phase_q, rtol, self_paired):
+        n_kpts = self.canonical_kpts.shape[0]
+        if not (0 <= q_index < n_kpts):
+            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+        return _fused_apply_kernel_and_solve_core(
+            Pi_q, eta_q, phase_q, self.coulG_all[q_index], self.grid_mesh, rtol, self_paired
         )
 
     def provenance(self):
@@ -670,10 +792,9 @@ def apply_kernel_and_solve_device(
             retained_solve_residual_gate -- both include q_index in the
             message.
     """
-    from pytc.df.solvers import hermitian_sandwich_solve_device
+    from pytc.df.solvers import _check_retention_marginal, hermitian_sandwich_solve_device
 
-    eta_q_np = np.asarray(eta_q)
-    n_ip, n_grid = eta_q_np.shape
+    n_ip, n_grid = eta_q.shape
 
     if phase_q is None and grid_coords is None:
         raise ValueError("apply_kernel_and_solve_device: give one of grid_coords/phase_q.")
@@ -694,17 +815,63 @@ def apply_kernel_and_solve_device(
             )
         phase = jnp.exp(-1j * (jnp.asarray(grid_coords_np) @ jnp.asarray(q_kpt)))
 
-    lq = jnp.asarray(eta_q_np, dtype=jnp.complex128) * phase[None, :]
-
-    v_q = provider.apply(q_index, lq)
-    rq = jnp.conj(v_q)
-
-    kern_q = (lq @ rq.T) / jnp.sqrt(n_grid)
-    if self_paired:
-        kern_q = kern_q.real.astype(jnp.complex128)
-
+    eta_q_jnp = jnp.asarray(eta_q, dtype=jnp.complex128)
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
-    W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
+
+    # Eager-glue fusion (task #25/C2 item 1): when the provider exposes a
+    # fused fast path (RawKernelProvider does), the ENTIRE phase-multiply
+    # -> apply -> conjugate -> ZGEMM -> solve chain runs as one jax.jit
+    # graph with zero numpy/jax boundary crossings -- this is the fix for
+    # the 6.3x fused-vs-sum-of-parts eager-orchestration overhead measured
+    # on a real V100 (task #22 tile harness, JID 59179666) after the
+    # earlier phase-cache fix (fa7d7f9) had already ruled out the phase
+    # recompute as the gap's cause. Providers without the hook (e.g. a
+    # future ibp provider) fall back to the original eager per-stage path
+    # below, unfused but correct -- see RawKernelProvider's docstring.
+    fused = getattr(provider, "fused_apply_and_solve", None)
+    if fused is not None:
+        (
+            W_q_unscaled, kern_q, n_retained, s_max, s_min_retained,
+            pi_anti_hermitian_residual, v_anti_hermitian_residual,
+            retained_solve_residual, truncation_residual,
+        ) = fused(q_index, Pi_q_jnp, eta_q_jnp, phase, rtol, self_paired)
+
+        n_retained_i = int(n_retained)
+        s_max_f = float(s_max)
+        s_min_retained_f = None if n_retained_i == 0 else float(s_min_retained)
+        threshold = rtol * s_max_f
+        retention_marginal, cond_pi = _check_retention_marginal(
+            s_max_f, s_min_retained_f, threshold, rtol,
+            caller="apply_kernel_and_solve_device[fused]",
+        )
+        solve_info = {
+            "n_retained": n_retained_i,
+            "n_discarded": n_ip - n_retained_i,
+            "s_max": s_max_f,
+            "s_min_retained": s_min_retained_f,
+            "pi_anti_hermitian_residual": float(pi_anti_hermitian_residual),
+            "v_anti_hermitian_residual": float(v_anti_hermitian_residual),
+            "retained_solve_residual": float(retained_solve_residual),
+            "truncation_residual": float(truncation_residual),
+            "rtol": rtol,
+            "adaptive_retention_used": False,
+            "target_truncation_residual": None,
+            "retention_marginal": retention_marginal,
+            "cond_pi_retained": cond_pi,
+            "dtype": str(W_q_unscaled.dtype),
+            "backend": "jax",
+        }
+    else:
+        lq = eta_q_jnp * phase[None, :]
+
+        v_q = provider.apply(q_index, lq)
+        rq = jnp.conj(v_q)
+
+        kern_q = (lq @ rq.T) / jnp.sqrt(n_grid)
+        if self_paired:
+            kern_q = kern_q.real.astype(jnp.complex128)
+
+        W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
 
     # Host-side gate: the jitted solve cannot raise on a traced value,
     # so degeneracy is turned into a precise, q-indexed error HERE
