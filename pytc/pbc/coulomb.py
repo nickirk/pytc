@@ -131,7 +131,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProv
     }
 
 
-def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=None):
+def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=None, neg=None):
     """Periodic THC-ISDF exchange matrix (design v2.1 section 4/7).
 
     Composition (per density-matrix set):
@@ -166,6 +166,21 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
         kpts: (Nk,3) absolute k-points, required when exxdiv="ewald"
             (pyscf's Ewald helper needs the actual k-vectors, not just
             the mesh shape).
+        neg: (Nk,) int array, e.g. KptsMesh.neg. Optional (default None,
+            preserving prior behavior for callers that don't pass it).
+            When given, rho_kpt[k] is projected to rho_kpt[k].real for
+            every self-paired k (neg[k]==k) BEFORE kpt_to_spc -- the
+            same physics-motivated fix as apply_raw_kernel_and_solve's
+            self_paired handling (design v2.1 section 5 follow-up):
+            neg[k]==k requires rho_kpt[k]=conj(rho_kpt[k]) (real), but a
+            REAL density matrix from an actual SCF loop (as opposed to
+            the synthetic exactly-TR-symmetric fixtures this function's
+            own unit tests use) carries its own small floating-point
+            asymmetry that can trip kpt_to_spc's imag_tol gate on a
+            mesh with many self-paired k (e.g. diamond 2x2x2, where
+            ALL 8 k-points are self-paired) -- confirmed via a real
+            pyscf KRHF run, not a synthetic reproduction. Without neg,
+            callers get the prior (gate-armed, no projection) behavior.
 
     Returns:
         vk_kpts: (nset, Nk, Nao, Nao) complex128 (real-cast when the
@@ -200,12 +215,23 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
             f"got {dm_kpts.shape}."
         )
 
+    if neg is not None:
+        neg = np.asarray(neg)
+        if neg.shape != (n_k,):
+            raise ValueError(f"neg must have shape ({n_k},), got {neg.shape}.")
+        self_paired_mask = neg == np.arange(n_k)
+    else:
+        self_paired_mask = None
+
     coul_spc = kpt_to_spc(coul_kpt, phase) * np.sqrt(n_k)
 
     vk_kpts = np.empty((n_set, n_k, n_ao, n_ao), dtype=np.complex128)
     for i in range(n_set):
         dm_kpt = dm_kpts[i]
         rho_kpt = (inpv_kpt @ dm_kpt @ inpv_kpt.conj().transpose(0, 2, 1)) / n_k
+        if self_paired_mask is not None:
+            rho_kpt = rho_kpt.copy()
+            rho_kpt[self_paired_mask] = rho_kpt[self_paired_mask].real.astype(np.complex128)
         rho_spc = kpt_to_spc(rho_kpt, phase).transpose(0, 2, 1)
 
         v_spc = coul_spc * rho_spc
@@ -435,6 +461,6 @@ class ISDFDF:
             built = self.build()
             vk = get_k(
                 dm_kpts, built["inpv_kpt"], built["coul_kpt"], built["mesh_obj"].phase,
-                exxdiv=exxdiv, cell=self.cell, kpts=kpts,
+                exxdiv=exxdiv, cell=self.cell, kpts=kpts, neg=built["mesh_obj"].neg,
             )
         return vj, vk

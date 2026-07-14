@@ -329,6 +329,92 @@ class TestRetentionPolicyDefaultAvoidsBlowup(unittest.TestCase):
         self.assertGreater(rel, 5.0)
 
 
+class TestGetKNegProjection(unittest.TestCase):
+    """design v2.1 section 5 follow-up: get_k's optional neg parameter
+    projects rho_kpt[k] real for self-paired k (neg[k]==k) before the
+    k<->supercell transform -- a real SCF density matrix (unlike this
+    file's other tests' exactly-TR-symmetric-by-construction fixtures)
+    carries small floating-point asymmetry that can trip kpt_to_spc's
+    imag_tol gate on a mesh where self-paired k's are common (confirmed
+    against a real diamond 2x2x2 pyscf KRHF run in test_isdf_df_adapter.py;
+    reproduced here with a synthetic near-machine-precision perturbation
+    so this test stays fast and self-contained)."""
+
+    def test_neg_none_can_trip_the_gate_neg_provided_fixes_it(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        n_ao = cell.nao
+        result = coulomb.build(cell, kpts, rank=6, block_size=100)
+        mesh_obj = result["mesh_obj"]
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+        n_k = mesh_obj.n_kpts
+
+        rng = np.random.default_rng(99)
+        dm_kpts = np.zeros((n_k, n_ao, n_ao), dtype=np.complex128)
+        gamma = int(np.where(mesh_obj.neg == np.arange(n_k))[0][0])  # a self-paired k
+        h = rng.normal(size=(n_ao, n_ao))
+        dm_real_hermitian = (h + h.T) / 2
+        # Perturb with a TINY anti-symmetric imaginary component --
+        # Hermitian (physically valid density matrix), but no longer
+        # exactly real, simulating a real SCF run's floating-point noise.
+        noise = rng.normal(size=(n_ao, n_ao)) * 1e-9
+        dm_kpts[gamma] = dm_real_hermitian + 1j * (noise - noise.T)
+
+        # Without neg: rho_kpt inherits the perturbation, may (depending
+        # on inpv_kpt's own conditioning) trip kpt_to_spc's imag_tol gate.
+        # With neg: the self-paired k is projected real first, so it never can.
+        vk_with_neg = coulomb.get_k(
+            dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase, neg=mesh_obj.neg
+        )
+        self.assertTrue(np.all(np.isfinite(np.asarray(vk_with_neg))))
+
+    def test_neg_defaults_to_none_and_is_backward_compatible(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        n_ao = cell.nao
+        result = coulomb.build(cell, kpts, rank=6, block_size=100)
+        mesh_obj = result["mesh_obj"]
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+        n_k = mesh_obj.n_kpts
+
+        rng = np.random.default_rng(100)
+        dm_kpts = np.zeros((n_k, n_ao, n_ao), dtype=np.complex128)
+        for k in range(n_k):
+            nk = int(mesh_obj.neg[k])
+            if nk == k:
+                h = rng.normal(size=(n_ao, n_ao))
+                dm_kpts[k] = (h + h.T) / 2
+            elif nk > k:
+                re, im = rng.normal(size=(n_ao, n_ao)), rng.normal(size=(n_ao, n_ao))
+                h = re + 1j * im
+                dm_kpts[k] = (h + h.conj().T) / 2
+                dm_kpts[nk] = dm_kpts[k].conj()
+
+        vk_no_neg = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase)
+        vk_with_neg = coulomb.get_k(
+            dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase, neg=mesh_obj.neg
+        )
+        # Exactly-TR-symmetric input (as built here): neg projection is a
+        # no-op, both calls must agree.
+        np.testing.assert_allclose(
+            np.asarray(vk_no_neg), np.asarray(vk_with_neg), atol=1e-10
+        )
+
+    def test_rejects_malformed_neg(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        n_ao = cell.nao
+        rng = np.random.default_rng(101)
+        inpv_kpt = rng.normal(size=(2, 3, n_ao)).astype(np.complex128)
+        coul_kpt = rng.normal(size=(2, 3, 3)).astype(np.complex128)
+        dm_kpts = rng.normal(size=(2, n_ao, n_ao)).astype(np.complex128)
+        phase = np.eye(2, dtype=np.complex128)
+        with self.assertRaises(ValueError):
+            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, phase, neg=np.array([0]))
+
+
 class TestGetJ(unittest.TestCase):
     def test_matches_direct_pyscf_fftdf_call(self):
         cell = _make_cell()
