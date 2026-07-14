@@ -78,13 +78,14 @@ class TestGetAoEriMatchesGetK(unittest.TestCase):
 
         K = np.zeros((n_k, n_ao, n_ao), dtype=np.complex128)
         for k1 in range(n_k):
-            for k2 in range(n_k):
-                # exchange-diagonal case: k3=k1, k4=k2 (get_ao_eri's own
-                # momentum relation reduces to this when k3=k1).
-                eri_block, k4 = coulomb.get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k1)
-                self.assertEqual(k4, k2)
-                D = dm_kpts[k2]  # D_sq
-                K[k1] += np.einsum("psrq,sq->pr", eri_block, D, optimize=True)
+            for k1d in range(n_k):
+                # standard-convention exchange-diagonal case: querying
+                # (a=q@k1d, b=r@k1 | c=p@k1, d=s@k1d) reduces to
+                # k3=k1, k4=k1d.
+                eri_block, k4 = coulomb.get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1d, k1, k1)
+                self.assertEqual(k4, k1d)
+                D = dm_kpts[k1d]  # D_sq
+                K[k1] += np.einsum("qrps,sq->pr", eri_block, D, optimize=True)
         K = K / n_k
 
         rel = np.abs(K - vk_ref).max() / np.abs(vk_ref).max()
@@ -118,12 +119,12 @@ class TestGetAoEriStructure(unittest.TestCase):
                     eri_block, k4 = coulomb.get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3)
                     self.assertEqual(eri_block.shape, (n_ao, n_ao, n_ao, n_ao))
                     self.assertTrue(0 <= k4 < n_k)
-                    # this module's momentum relation: k1 - k2 - k3 + k4 = 0 (mod G)
+                    # standard pyscf momentum relation: k1 - k2 + k3 - k4 = 0 (mod G)
                     diff = (
                         mesh_obj.canonical_kpts[k1]
                         - mesh_obj.canonical_kpts[k2]
-                        - mesh_obj.canonical_kpts[k3]
-                        + mesh_obj.canonical_kpts[k4]
+                        + mesh_obj.canonical_kpts[k3]
+                        - mesh_obj.canonical_kpts[k4]
                     )
                     scaled = cell.get_scaled_kpts(diff[None])[0]
                     resid = np.linalg.norm(scaled - np.round(scaled))
@@ -170,17 +171,13 @@ class TestGetAoEriVsExactFftdf(unittest.TestCase):
         fftdf = FFTDF(cell)
         k1, k2, k3 = 0, 1, 2
         eri_mine, k4 = coulomb.get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3)
-        # pyscf's own get_eri uses the standard (a,c)-conjugated convention
-        # (k1-k2+k3-k4=0); this module's convention conjugates (a,d)
-        # instead (k1-k2-k3+k4=0), so the last two k-indices/axes swap
-        # when comparing (see get_ao_eri's own docstring convention note).
-        kpts_for_eri = [mesh_obj.canonical_kpts[i] for i in (k1, k2, k4, k3)]
+        # Standard pyscf convention throughout -- no axis/index relabeling.
+        kpts_for_eri = [mesh_obj.canonical_kpts[i] for i in (k1, k2, k3, k4)]
         eri_exact = np.asarray(
             fftdf.get_eri(kpts_for_eri, compact=False)
         ).reshape(n_ao, n_ao, n_ao, n_ao)
-        eri_mine_pyscf_order = eri_mine.transpose(0, 1, 3, 2)
 
-        rel = np.linalg.norm(eri_mine_pyscf_order - eri_exact) / np.linalg.norm(eri_exact)
+        rel = np.linalg.norm(eri_mine - eri_exact) / np.linalg.norm(eri_exact)
         # Rank-matched parity band, not a fixed tight tolerance -- at
         # nip=15 (~1.5x nao) both pytc and an external ISDF reference
         # show O(1) relF vs exact (see get_k's own rank=15 findings);

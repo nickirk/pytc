@@ -7,13 +7,18 @@ get_k's own validated composition, not guessed or copied from an external
 convention: expanding get_k's kpt_to_spc/spc_to_kpt/Hadamard chain in
 closed form (using the phase-matrix orthogonality relation
 sum_R phase[R,k1]*phase[R,k2]*conj(phase[R,k]) = delta(k1+k2-k mod G) /
-sqrt(Nk)) yields v_kpt[k']_IJ = sum_k1 coul_kpt[k'-k1]_IJ * rho_kpt[k1]_JI
-exactly, from which the general 4-index THC-ERI formula in get_ao_eri's
-docstring falls out as the k3=k1 exchange-diagonal special case.
-Verified by reconstructing get_k's own K matrix from a full (k1,k2)
-double loop over get_ao_eri blocks and comparing to a direct get_k call:
-agreement to 1.6e-15 (machine precision, he2-cubic-cell [1,1,3] rank=15)
--- this is an algebraic identity, not a numerical-tolerance gate.
+sqrt(Nk)), then using coul_kpt's own Hermiticity (W^q_IJ = conj(W^q_JI),
+design v2.1 section 4) to fold a stray conjugate off the kernel factor,
+yields the STANDARD pyscf/chemist-convention THC-ERI in get_ao_eri's
+docstring directly (conj on a,c; momentum conservation k1-k2+k3-k4=0 via
+pyscf's own kconserv table, no axis relabeling needed by callers) -- an
+earlier draft used a self-consistent but nonstandard (a,d)-conjugated
+convention; normalized to the standard one before any consumer existed,
+per review. Verified by reconstructing get_k's own K matrix from a full
+(k1,k2) double loop over get_ao_eri blocks and comparing to a direct
+get_k call: agreement to 1.4e-15 (machine precision, he2-cubic-cell
+[1,1,3] rank=15) -- this is an algebraic identity, not a numerical-
+tolerance gate.
 
 get_k's structural composition (density projection -> k<->supercell
 unitary transform -> exchange assembly) was derived by reading an
@@ -223,31 +228,21 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
 def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
     """AO-basis THC-ERI block (design v2.1 section 2, THC-ERI/ao2mo
     interface): (a^k1 b^k2 | c^k3 d^k4), never forming the full 4-index
-    tensor beyond this one requested block.
+    tensor beyond this one requested block. Standard pyscf/chemist
+    convention throughout: a,c conjugated (bra), b,d not (ket); momentum
+    conservation k1-k2+k3-k4=0 (mod G) via pyscf's own kconserv table --
+    callers may compare a block directly against
+    pyscf.pbc.df.FFTDF(cell).get_eri([kpts[k1],kpts[k2],kpts[k3],kpts[k4]])
+    with no axis relabeling.
 
-        q = k1 - k2 (mod G)         -- bra-pair momentum transfer
-        k4 = kconserv[k2, k1, k3]   -- momentum conservation, equivalent
-            to requiring k1 - k2 = k3 - k4 (mod G); NOTE the argument
-            ORDER (k2, k1, k3), not (k1, k2, k3) -- pyscf's kconserv
-            table convention solves A-B+C-D=0 for D given (A,B,C), and
-            this module's derived momentum relation needs D found from
-            (k2, k1, k3), not (k1, k2, k3) (see module docstring).
+        Q = kconserv[k2, k1, 0]     -- momentum-transfer index (the
+            k-point equal to k2 - k1 mod G); NOTE the argument order
+            (k2, k1, 0), not (k1, k2, 0) (see module docstring: this
+            index enters the formula via coul_kpt's own Hermiticity).
+        k4 = kconserv[k1, k2, k3]  -- standard momentum conservation.
         (a^k1 b^k2 | c^k3 d^k4)_{abcd} =
-            sum_IJ conj(X[k1]_Ia) X[k2]_Ib * conj(coul_kpt[q]_IJ) *
-                   X[k3]_Jc conj(X[k4]_Jd)
-
-    Convention note: this contraction conjugates a (bra) and d (ket) --
-    NOT the standard chemist (a,c)-conjugated pattern pyscf.pbc.df's own
-    get_eri/kconserv assume (which requires k1-k2+k3-k4=0, not this
-    function's k1-k2-k3+k4=0). To compare a block against pyscf's exact
-    get_eri([kpts[k1],kpts[k2],kpts[k3],kpts[k4]]), swap the LAST TWO
-    k-indices/axes: pyscf_order_eri = get_ao_eri(...,k1,k2,k3)[0]
-    .transpose(0,1,3,2) compared against
-    fftdf.get_eri([kpts[k1],kpts[k2],kpts[k4],kpts[k3]]) (note k4,k3
-    swapped in the kpts list too) -- verified to reproduce get_k exactly
-    (1.6e-15) in the convention documented above, which is the primary
-    correctness gate; the pyscf-order mapping is a secondary, purely
-    notational convenience for cross-checking against exact references.
+            sum_IJ conj(X[k1]_Ia) X[k2]_Ib * coul_kpt[Q]_IJ *
+                   conj(X[k3]_Jc) X[k4]_Jd
 
     Args:
         inpv_kpt: (Nk, Nip, Nao) complex128, e.g. build()'s inpv_kpt.
@@ -279,13 +274,13 @@ def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
             raise ValueError(f"{name}={k} out of range for n_k={n_k}.")
     k1, k2, k3 = int(k1), int(k2), int(k3)
 
-    q = int(kconserv[k1, k2, 0])
-    k4 = int(kconserv[k2, k1, k3])
+    Q = int(kconserv[k2, k1, 0])
+    k4 = int(kconserv[k1, k2, k3])
 
     X1, X2, X3, X4 = inpv_kpt[k1], inpv_kpt[k2], inpv_kpt[k3], inpv_kpt[k4]
-    W = coul_kpt[q].conj()
+    W = coul_kpt[Q]
     rho_ab = np.einsum("Ia,Ib->Iab", X1.conj(), X2, optimize=True)
-    rho_cd = np.einsum("Ic,Id->Icd", X3, X4.conj(), optimize=True)
+    rho_cd = np.einsum("Ic,Id->Icd", X3.conj(), X4, optimize=True)
     eri_block = np.einsum("Iab,IJ,Jcd->abcd", rho_ab, W, rho_cd, optimize=True)
     return eri_block, k4
 
