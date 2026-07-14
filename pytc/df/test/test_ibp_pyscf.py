@@ -35,6 +35,46 @@ def _h2():
     return gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
 
 
+def _h3():
+    # Three centers -> nao=3, so packed AO pairs and unequal MO blocks are
+    # both non-trivial for the ao2mo shape/identity matrix.
+    return gto.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.5", basis="sto-3g",
+                 spin=1, verbose=0)
+
+
+def _dense_ao2mo_oracle(provider, mos, compact):
+    """A fully independent dense reference for IBPISDF.ao2mo. It expands the
+    packed AO lower-triangle factors from ``loop()`` to the full symmetric AO
+    pair tensor by hand, applies ``C1^T B C2`` / ``C3^T B C4``, and contracts
+    over L -- deliberately never calling the provider's production packing or
+    half-transform helpers, only its public streamed factor."""
+    from pyscf.ao2mo.incore import iden_coeffs
+    c1, c2, c3, c4 = mos
+    b = np.vstack(list(provider.loop()))
+    naoaux = b.shape[0]
+    nao = provider.mol.nao
+    b_full = np.zeros((naoaux, nao, nao))
+    for ell in range(naoaux):
+        idx = 0
+        for i in range(nao):
+            for j in range(i + 1):
+                b_full[ell, i, j] = b[ell, idx]
+                b_full[ell, j, i] = b[ell, idx]
+                idx += 1
+
+    def _flatten(ca, cb, identical):
+        m = np.einsum("Lab,ai,bj->Lij", b_full, ca, cb, optimize=True)
+        na, nb = ca.shape[1], cb.shape[1]
+        if bool(compact) and identical:
+            cols = [m[:, i, j] for i in range(na) for j in range(i + 1)]
+            return np.stack(cols, axis=1)
+        return m.reshape(naoaux, na * nb)
+
+    l_bra = _flatten(c1, c2, iden_coeffs(c1, c2))
+    l_ket = _flatten(c3, c4, iden_coeffs(c3, c4))
+    return l_bra.T @ l_ket
+
+
 class TestIBPISDFConfig(unittest.TestCase):
     def test_valid_and_spec_is_stable_and_discriminating(self):
         a = IBPISDFConfig(rank=8, grid_level=1)
@@ -238,11 +278,6 @@ class TestIBPISDFLifecycle(unittest.TestCase):
         self.assertIsNone(p._ibp_naoaux)
         self.assertIsNone(p._ibp_factor)
 
-    def test_ao2mo_not_implemented(self):
-        p = IBPISDF(_h2(), rank=3)
-        with self.assertRaises(NotImplementedError):
-            p.ao2mo(np.eye(2))
-
     def test_get_jk_not_implemented(self):
         p = IBPISDF(_h2(), rank=3)
         with self.assertRaises(NotImplementedError):
@@ -390,6 +425,116 @@ class TestIBPISDFStaleMolecule(unittest.TestCase):
             p.build()
 
 
+class TestIBPISDFao2mo(unittest.TestCase):
+    """Real-only ao2mo: shape/identity matrix, compact truthiness, and value
+    parity against the fully independent dense oracle."""
+
+    def _provider(self):
+        mol = _h3()
+        nao = mol.nao
+        p = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1)
+        p.build()
+        return p, nao
+
+    def _cols(self, nao, ncol, seed):
+        return np.random.default_rng(seed).normal(size=(nao, ncol))
+
+    def test_identity_and_compact_matrix_vs_oracle(self):
+        p, nao = self._provider()
+        a = self._cols(nao, 2, 1)
+        b = self._cols(nao, 3, 2)
+        c = self._cols(nao, 4, 3)
+        d = self._cols(nao, 2, 4)
+        cases = [
+            ("both-iden one-matrix", (a, a, a, a), True, (3, 3)),
+            ("both-iden noncompact", (a, a, a, a), False, (4, 4)),
+            ("bra-iden only", (a, a, c, d), True, (3, 8)),
+            ("ket-iden only", (a, b, c, c), True, (6, 10)),
+            ("all-distinct compact", (a, b, c, d), True, (6, 8)),
+            ("all-distinct noncompact", (a, b, c, d), False, (6, 8)),
+        ]
+        for name, mos, compact, shape in cases:
+            got = p.ao2mo(mos, compact=compact)
+            self.assertEqual(got.shape, shape, msg=name)
+            np.testing.assert_allclose(
+                got, _dense_ao2mo_oracle(p, mos, compact), atol=1e-10, err_msg=name
+            )
+
+    def test_one_matrix_2d_input_expands_to_all_four(self):
+        p, nao = self._provider()
+        a = self._cols(nao, 3, 7)
+        # passing a bare 2-D array == passing it for all four indices
+        np.testing.assert_allclose(
+            p.ao2mo(a, compact=True), p.ao2mo((a, a, a, a), compact=True), atol=1e-12
+        )
+
+    def test_compact_is_truthy_not_bool_only(self):
+        # PySCF treats compact by truth value; do not reject non-bool.
+        p, nao = self._provider()
+        a = self._cols(nao, 2, 5)
+        packed = p.ao2mo(a, compact=True).shape
+        full = p.ao2mo(a, compact=False).shape
+        self.assertEqual(p.ao2mo(a, compact=1).shape, packed)
+        self.assertEqual(p.ao2mo(a, compact="yes").shape, packed)
+        self.assertEqual(p.ao2mo(a, compact=0).shape, full)
+        self.assertEqual(p.ao2mo(a, compact=None).shape, full)
+
+    def test_complex_coefficients_rejected(self):
+        p, nao = self._provider()
+        a = self._cols(nao, 2, 9).astype(complex)
+        with self.assertRaises(NotImplementedError):
+            p.ao2mo(a)
+
+    def test_malformed_inputs_rejected(self):
+        p, nao = self._provider()
+        good = self._cols(nao, 2, 3)
+        bad_dim = self._cols(nao + 1, 2, 3)          # wrong AO row count
+        nonfinite = self._cols(nao, 2, 3); nonfinite[0, 0] = np.inf
+        for arg in (
+            "not-an-array",
+            np.zeros((nao, 2, 2)),                    # 3-D single
+            (good, good, good),                       # length-3 tuple
+            (good, good, good, bad_dim),              # wrong AO dim in one
+            (good, good, good, nonfinite),            # non-finite
+        ):
+            with self.assertRaises((ValueError, NotImplementedError)):
+                p.ao2mo(arg)
+
+    def test_no_dense_cache_retained_and_cderi_none(self):
+        p, nao = self._provider()
+        a = self._cols(nao, 3, 2)
+        _ = p.ao2mo(a)
+        # ao2mo derives solely from W/P via loop(); no inherited _cderi and no
+        # retained full-B / AO four-index cache.
+        self.assertIsNone(p._cderi)
+        nao_pair = nao * (nao + 1) // 2
+        for name in dir(p):
+            val = getattr(p, name)
+            if isinstance(val, np.ndarray) and val.ndim >= 3:
+                self.fail(f"unexpected dense (>=3-D) cache retained: {name} {val.shape}")
+            if isinstance(val, np.ndarray) and val.ndim == 2 and val.shape[0] > nao_pair:
+                self.fail(f"unexpected full-B-like cache retained: {name} {val.shape}")
+
+    def test_ao2mo_lazy_builds_and_honors_stale_guard(self):
+        # Lazy build through ao2mo.
+        mol = _h3(); nao = mol.nao
+        p = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1)
+        self.assertFalse(p._ibp_built)
+        p.ao2mo(np.eye(nao))
+        self.assertTrue(p._ibp_built)
+        # Stale-molecule guard fires through ao2mo.
+        p.mol.set_geom_("H 0 0 0; H 0 0 0.80; H 0 0 1.6")
+        with self.assertRaises(RuntimeError):
+            p.ao2mo(np.eye(nao))
+
+    def test_ao2mo_after_copy_builds_independently(self):
+        p, nao = self._provider()
+        q = p.copy()
+        self.assertFalse(q._ibp_built)
+        a = self._cols(nao, 2, 1)
+        np.testing.assert_allclose(q.ao2mo(a), p.ao2mo(a), atol=1e-10)
+
+
 class TestIBPISDFPhysicalBuild(unittest.TestCase):
     def test_h2_sto3g_level1_build_and_reconstruction(self):
         """A genuine end-to-end build. The streamed factor B = W^dagger P must
@@ -419,6 +564,77 @@ class TestIBPISDFPhysicalBuild(unittest.TestCase):
         self.assertLessEqual(
             p._ibp_core.raw_packed_pair_metric_dagger_residual, p.config.packed_pair_tol
         )
+
+
+@unittest.skipUnless(os.environ.get("PYTC_RUN_SLOW_IBP"),
+                     "opt-in unchanged-consumer physical gate (set PYTC_RUN_SLOW_IBP=1)")
+class TestIBPISDFUnchangedConsumers(unittest.TestCase):
+    """Run stock PySCF DFMP2/CCSD with mf.with_df = IBPISDF -- no monkeypatch,
+    no shim -- on frozen shared exact-RHF orbitals so the number isolates the
+    integral metric. Spies prove no analytic-DF fallback and no ao2mo path."""
+
+    @staticmethod
+    def _h2o():
+        return gto.M(atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587",
+                     basis="cc-pVDZ", verbose=0)
+
+    def test_dfmp2_within_0p1_mHa_of_exact_four_center(self):
+        from pyscf import scf, mp, df as pyscf_df
+        from pyscf.mp import dfmp2
+        import pyscf.df.df as dfmod
+        mol = self._h2o()
+        nao = mol.nao
+        mf = scf.RHF(mol)
+        mf.kernel()  # exact (non-DF) RHF; its orbitals are shared by all three
+        e_exact = mp.MP2(mf).kernel()[0]
+        # analytic DF-MP2 reference, constructed OUTSIDE the no-fallback spy
+        mf.with_df = pyscf_df.DF(mol).build()
+        e_dfmp2 = dfmp2.DFMP2(mf).kernel()[0]
+        # IBP provider, pre-built before the spy so its own DF.__init__ is not counted
+        ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
+        rank = ibp.get_naoaux()
+        pair_resid = ibp._ibp_core.raw_packed_pair_metric_dagger_residual
+        calls = {"df_init": 0, "ao2mo": 0}
+        orig_init, orig_ao2mo = dfmod.DF.__init__, IBPISDF.ao2mo
+
+        def spy_init(self, *a, **k):
+            calls["df_init"] += 1
+            return orig_init(self, *a, **k)
+
+        def spy_ao2mo(self, *a, **k):
+            calls["ao2mo"] += 1
+            return orig_ao2mo(self, *a, **k)
+
+        mf.with_df = ibp
+        try:
+            dfmod.DF.__init__ = spy_init
+            IBPISDF.ao2mo = spy_ao2mo
+            e_ibp = dfmp2.DFMP2(mf).kernel()[0]
+        finally:
+            dfmod.DF.__init__ = orig_init
+            IBPISDF.ao2mo = orig_ao2mo
+        d_ibp = abs(e_ibp - e_exact) * 1e3
+        print(f"\n[IBP-DFMP2 gate] nao={nao} requested_rank={nao*(nao+1)//2} "
+              f"realized_rank={rank} pair_resid={pair_resid:.2e}\n"
+              f"  e_exact4c={e_exact:.8f}  e_dfmp2={e_dfmp2:.8f}  e_ibp={e_ibp:.8f}\n"
+              f"  |ibp-exact|={d_ibp:.4f} mHa  |dfmp2-exact|={abs(e_dfmp2-e_exact)*1e3:.4f} mHa")
+        self.assertEqual(calls["df_init"], 0, "an analytic DF fallback was constructed")
+        self.assertEqual(calls["ao2mo"], 0, "DFMP2 unexpectedly used ao2mo, not loop")
+        self.assertLess(d_ibp, 0.1)
+
+    def test_ccsd_density_fit_public_path_builds_and_iterates(self):
+        from pyscf import scf, cc
+        mol = self._h2o()
+        nao = mol.nao
+        mf = scf.RHF(mol)
+        mf.kernel()
+        ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
+        mycc = cc.CCSD(mf).density_fit(with_df=ibp)
+        mycc.max_cycle = 1  # DF ERI build + one residual checkpoint, not full convergence
+        mycc.kernel()
+        self.assertTrue(np.isfinite(mycc.e_corr))
+        self.assertTrue(np.all(np.isfinite(mycc.t1)))
+        self.assertTrue(np.all(np.isfinite(mycc.t2)))
 
 
 if __name__ == "__main__":

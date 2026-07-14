@@ -22,8 +22,11 @@ import dataclasses
 
 import numpy as np
 import pyscf
+from pyscf.ao2mo.incore import iden_coeffs
 from pyscf.df.df import DF
 from pyscf.dft import numint
+from pyscf.lib import pack_tril, unpack_tril
+from scipy.linalg.blas import dgemm
 
 from pytc.df.ibp import (
     _canonical_spec_sha256,
@@ -345,11 +348,86 @@ class IBPISDF(DF):
             end = min(start + blksize, naoaux)
             yield np.ascontiguousarray(W[:, start:end].conj().T @ P)
 
+    def _normalize_mo_coeffs(self, mo_coeffs):
+        """Accept the two public PySCF forms -- one 2-D coefficient matrix
+        (used for all four indices) or a length-4 sequence of 2-D matrices --
+        with strict validation. Every matrix must be real, finite, and have
+        exactly ``nao`` rows. Complex coefficients are rejected explicitly:
+        PySCF 2.10 DF ao2mo is real-only, so v1 matches that contract rather
+        than fabricating an unvalidated complex capability."""
+        nao = int(self.mol.nao)
+        if isinstance(mo_coeffs, np.ndarray) and mo_coeffs.ndim == 2:
+            seq = (mo_coeffs,) * 4
+        elif isinstance(mo_coeffs, (tuple, list)) and len(mo_coeffs) == 4:
+            seq = tuple(mo_coeffs)
+        else:
+            raise ValueError(
+                "mo_coeffs must be a single 2-D coefficient matrix or a length-4 "
+                "sequence of 2-D matrices."
+            )
+        normalized = []
+        for k, c in enumerate(seq):
+            c = np.asarray(c)
+            if np.iscomplexobj(c):
+                raise NotImplementedError(
+                    "IBPISDF.ao2mo is real-only in v1 (the pinned PySCF 2.10 DF ao2mo "
+                    "rejects complex coefficients); a complex-capable transform is a "
+                    "separately versioned extension."
+                )
+            if c.ndim != 2:
+                raise ValueError(f"mo_coeffs[{k}] must be 2-D, got ndim={c.ndim}.")
+            if c.shape[0] != nao:
+                raise ValueError(
+                    f"mo_coeffs[{k}] has {c.shape[0]} AO rows, expected nao={nao}."
+                )
+            if not np.all(np.isfinite(c)):
+                raise ValueError(f"mo_coeffs[{k}] contains non-finite values.")
+            normalized.append(np.ascontiguousarray(c, dtype=np.float64))
+        return tuple(normalized)
+
+    @staticmethod
+    def _half_transform(b_ao, ca, cb, pack, na, nb):
+        """Half-transform one L block of symmetric AO factors to an MO pair
+        axis: ``(L|pq) = Ca^T B_L Cb``. Returns ``(n_L, na_pair)`` packed
+        lower-triangular when ``pack`` (bra/ket matrices identical and compact
+        requested), else ``(n_L, na*nb)`` full. Largest transient here is the
+        per-block ``(n_L, na, nb)`` half-transform -- bounded by blockdim x
+        nmo^2, never an AO four-index tensor."""
+        tmp = np.einsum("Lab,ai->Lib", b_ao, ca, optimize=True)
+        m = np.einsum("Lib,bj->Lij", tmp, cb, optimize=True)   # (n_L, na, nb)
+        if pack:
+            return pack_tril(m)                                # (n_L, na_pair)
+        return m.reshape(m.shape[0], na * nb)
+
     def ao2mo(self, mo_coeffs, compact=True):
-        raise NotImplementedError(
-            "IBPISDF.ao2mo is implemented in a later milestone; the inherited "
-            "analytic-DF ao2mo must not run for this Coulomb metric."
-        )
+        """Full four-index MO ERIs ``(pq|rs)`` for the atom-centered single-IBP
+        metric, streamed from the packed pseudo-auxiliary factor. ``compact``
+        follows PySCF's truth-value convention (not a bool-only contract): a
+        pair axis is packed lower-triangular only when its two coefficient
+        matrices are identical (PySCF ``iden_coeffs``) and ``compact`` is
+        truthy. Routes through ``build()`` so lazy build and the stale-molecule
+        guard are inherited; derives solely from W/P via ``loop()`` and never
+        populates or reads the inherited ``_cderi``."""
+        self.build()
+        c1, c2, c3, c4 = self._normalize_mo_coeffs(mo_coeffs)
+        pack_bra = bool(compact) and iden_coeffs(c1, c2)
+        pack_ket = bool(compact) and iden_coeffs(c3, c4)
+        n1, n2 = c1.shape[1], c2.shape[1]
+        n3, n4 = c3.shape[1], c4.shape[1]
+        bra_dim = n1 * (n1 + 1) // 2 if pack_bra else n1 * n2
+        ket_dim = n3 * (n3 + 1) // 2 if pack_ket else n3 * n4
+        # F-contiguous output so dgemm accumulates in place (beta=1) with no
+        # output-sized temporary. AO four-index / full-B tensors are never
+        # materialized; the L block is bounded by blockdim via loop().
+        out = np.zeros((bra_dim, ket_dim), order="F")
+        if self._ibp_naoaux == 0:
+            return out
+        for block in self.loop():                     # (n_L, nao_pair) packed-lower
+            b_ao = unpack_tril(np.ascontiguousarray(block))   # (n_L, nao, nao) symmetric
+            l12 = self._half_transform(b_ao, c1, c2, pack_bra, n1, n2)
+            l34 = self._half_transform(b_ao, c3, c4, pack_ket, n3, n4)
+            out = dgemm(1.0, l12, l34, beta=1.0, c=out, trans_a=1, overwrite_c=1)
+        return out
 
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13,
                omega=None):
