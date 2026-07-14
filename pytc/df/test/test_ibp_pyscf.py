@@ -485,6 +485,19 @@ class TestIBPISDFao2mo(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             p.ao2mo(a)
 
+    def test_dtype_parity_float64_only(self):
+        # PySCF 2.10 DF ao2mo accepts float64 and rejects float32/int/bool; v1
+        # matches with no silent coercion.
+        p, nao = self._provider()
+        f64 = self._cols(nao, 2, 3)                   # float64 accepted
+        self.assertEqual(f64.dtype, np.float64)
+        p.ao2mo(f64)
+        for bad in (f64.astype(np.float32),
+                    f64.astype(np.int64),
+                    (f64 > 0)):                        # bool
+            with self.assertRaises(TypeError):
+                p.ao2mo(bad)
+
     def test_malformed_inputs_rejected(self):
         p, nao = self._provider()
         good = self._cols(nao, 2, 3)
@@ -497,23 +510,58 @@ class TestIBPISDFao2mo(unittest.TestCase):
             (good, good, good, bad_dim),              # wrong AO dim in one
             (good, good, good, nonfinite),            # non-finite
         ):
-            with self.assertRaises((ValueError, NotImplementedError)):
+            with self.assertRaises((ValueError, TypeError, NotImplementedError)):
                 p.ao2mo(arg)
+
+    def test_zero_rank_ao2mo_returns_zero_and_validates_block(self):
+        # An injected valid zero-rank cache: ao2mo iterates loop() (zero blocks
+        # -> zero output) yet still validates the (default) block size.
+        p, nao = self._provider()
+        p._ibp_factor = np.zeros((p._ibp_pair.shape[0], 0))   # W with 0 columns
+        p._ibp_naoaux = 0
+        a = self._cols(nao, 2, 1)
+        out = p.ao2mo(a, compact=True)
+        self.assertEqual(out.shape, (3, 3))
+        np.testing.assert_array_equal(out, 0.0)
+        p.blockdim = True                                     # corrupt default block size
+        with self.assertRaises(ValueError):
+            p.ao2mo(a, compact=True)
+
+    def test_multi_block_dgemm_accumulation_matches_oracle(self):
+        # Force several L blocks (small blockdim) so the beta-accumulate is
+        # exercised across blocks, and the streamed result still matches the
+        # independent oracle.
+        p, nao = self._provider()
+        p.blockdim = 3
+        a = self._cols(nao, 3, 5)
+        b = self._cols(nao, 2, 6)
+        blocks = list(p.loop())
+        self.assertGreater(len(blocks), 1)  # genuinely multi-block
+        np.testing.assert_allclose(
+            p.ao2mo((a, a, b, b), compact=True),
+            _dense_ao2mo_oracle(p, (a, a, b, b), True), atol=1e-10
+        )
 
     def test_no_dense_cache_retained_and_cderi_none(self):
         p, nao = self._provider()
         a = self._cols(nao, 3, 2)
         _ = p.ao2mo(a)
         # ao2mo derives solely from W/P via loop(); no inherited _cderi and no
-        # retained full-B / AO four-index cache.
+        # retained full-B / AO four-index cache. Whitelist the permitted W/P
+        # arrays and reject any other array-valued attribute that is >=3-D or
+        # carries a packed-AO-pair axis (the full-B shape is (naoaux, nao_pair)
+        # with naoaux <= nao_pair, so a bare shape[0] > nao_pair test misses it).
         self.assertIsNone(p._cderi)
         nao_pair = nao * (nao + 1) // 2
-        for name in dir(p):
+        allowed = {"_ibp_factor", "_ibp_pair"}
+        for name in vars(p):
             val = getattr(p, name)
-            if isinstance(val, np.ndarray) and val.ndim >= 3:
+            if not isinstance(val, np.ndarray) or name in allowed:
+                continue
+            if val.ndim >= 3:
                 self.fail(f"unexpected dense (>=3-D) cache retained: {name} {val.shape}")
-            if isinstance(val, np.ndarray) and val.ndim == 2 and val.shape[0] > nao_pair:
-                self.fail(f"unexpected full-B-like cache retained: {name} {val.shape}")
+            if val.ndim == 2 and nao_pair in val.shape:
+                self.fail(f"unexpected packed-AO-pair cache retained: {name} {val.shape}")
 
     def test_ao2mo_lazy_builds_and_honors_stale_guard(self):
         # Lazy build through ao2mo.
@@ -622,19 +670,66 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
         self.assertEqual(calls["ao2mo"], 0, "DFMP2 unexpectedly used ao2mo, not loop")
         self.assertLess(d_ibp, 0.1)
 
-    def test_ccsd_density_fit_public_path_builds_and_iterates(self):
+    def test_ccsd_ibp_drives_integrals_with_no_fallback(self):
+        # The public DF-CCSD path structurally needs a DF-SCF for get_jk, which
+        # IBP v1 does not implement; so the SCF uses an analytic DF reference,
+        # built OUTSIDE the spy, and IBP drives ONLY the CC integral build. The
+        # spy (around the CC kernel only) then requires zero analytic-DF
+        # construction and the probed loop-only path for the CC integrals. Both
+        # the conventional-ERI reference and the IBP CCSD share the SAME DF-SCF
+        # orbitals so the difference isolates the integral metric.
         from pyscf import scf, cc
+        import pyscf.df.df as dfmod
         mol = self._h2o()
         nao = mol.nao
-        mf = scf.RHF(mol)
-        mf.kernel()
+        mf_df = scf.RHF(mol).density_fit()
+        mf_df.kernel()  # analytic DF-SCF reference (shared orbitals), outside the spy
         ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
-        mycc = cc.CCSD(mf).density_fit(with_df=ibp)
-        mycc.max_cycle = 1  # DF ERI build + one residual checkpoint, not full convergence
-        mycc.kernel()
+        # conventional 4-center CCSD reference on the same orbitals, outside spy
+        ref = cc.CCSD(mf_df)
+        ref.max_cycle = 1
+        ref.kernel()
+        calls = {"df_init": 0, "ao2mo": 0, "loop": 0}
+        orig_init, orig_ao2mo, orig_loop = (
+            dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop)
+
+        def spy_init(self, *a, **k):
+            calls["df_init"] += 1
+            return orig_init(self, *a, **k)
+
+        def spy_ao2mo(self, *a, **k):
+            calls["ao2mo"] += 1
+            return orig_ao2mo(self, *a, **k)
+
+        def spy_loop(self, *a, **k):
+            calls["loop"] += 1
+            return orig_loop(self, *a, **k)
+
+        mycc = cc.CCSD(mf_df)
+        mycc.with_df = ibp            # IBP is the CC integral provider
+        mycc.max_cycle = 1            # DF ERI build + one residual checkpoint
+        try:
+            dfmod.DF.__init__ = spy_init
+            IBPISDF.ao2mo = spy_ao2mo
+            IBPISDF.loop = spy_loop
+            mycc.kernel()
+        finally:
+            dfmod.DF.__init__ = orig_init
+            IBPISDF.ao2mo = orig_ao2mo
+            IBPISDF.loop = orig_loop
+        self.assertIs(mycc.with_df, ibp)
+        self.assertEqual(calls["df_init"], 0, "an analytic DF fallback built the CC integrals")
+        self.assertEqual(calls["ao2mo"], 0, "CCSD unexpectedly used ao2mo, not loop")
+        self.assertGreater(calls["loop"], 0, "IBP loop() did not drive the CC integrals")
         self.assertTrue(np.isfinite(mycc.e_corr))
         self.assertTrue(np.all(np.isfinite(mycc.t1)))
         self.assertTrue(np.all(np.isfinite(mycc.t2)))
+        # Direct-reference differences (no acceptance threshold yet).
+        d_ecorr = abs(mycc.e_corr - ref.e_corr) * 1e3
+        d_t1 = float(np.max(np.abs(mycc.t1 - ref.t1)))
+        d_t2 = float(np.max(np.abs(mycc.t2 - ref.t2)))
+        print(f"\n[IBP-CCSD 1-cycle vs conventional, shared DF-SCF orbitals] "
+              f"dE_corr={d_ecorr:.4f} mHa max|dt1|={d_t1:.3e} max|dt2|={d_t2:.3e}")
 
 
 if __name__ == "__main__":

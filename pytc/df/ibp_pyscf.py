@@ -351,10 +351,11 @@ class IBPISDF(DF):
     def _normalize_mo_coeffs(self, mo_coeffs):
         """Accept the two public PySCF forms -- one 2-D coefficient matrix
         (used for all four indices) or a length-4 sequence of 2-D matrices --
-        with strict validation. Every matrix must be real, finite, and have
-        exactly ``nao`` rows. Complex coefficients are rejected explicitly:
-        PySCF 2.10 DF ao2mo is real-only, so v1 matches that contract rather
-        than fabricating an unvalidated complex capability."""
+        with strict validation and NO silent coercion. The pinned PySCF 2.10
+        DF ao2mo accepts float64 and rejects float32/integer/bool with an
+        assertion, so v1 requires the coefficient dtype to be exactly float64
+        (plus real/finite/2-D/``nao``-row checks) and rejects the others
+        explicitly. Complex coefficients are a real-only NotImplementedError."""
         nao = int(self.mol.nao)
         if isinstance(mo_coeffs, np.ndarray) and mo_coeffs.ndim == 2:
             seq = (mo_coeffs,) * 4
@@ -374,6 +375,12 @@ class IBPISDF(DF):
                     "rejects complex coefficients); a complex-capable transform is a "
                     "separately versioned extension."
                 )
+            if c.dtype != np.float64:
+                raise TypeError(
+                    f"mo_coeffs[{k}] must be exactly float64 (PySCF 2.10 DF ao2mo "
+                    f"rejects float32/integer/bool/object; no silent coercion), got "
+                    f"dtype {c.dtype}."
+                )
             if c.ndim != 2:
                 raise ValueError(f"mo_coeffs[{k}] must be 2-D, got ndim={c.ndim}.")
             if c.shape[0] != nao:
@@ -382,7 +389,7 @@ class IBPISDF(DF):
                 )
             if not np.all(np.isfinite(c)):
                 raise ValueError(f"mo_coeffs[{k}] contains non-finite values.")
-            normalized.append(np.ascontiguousarray(c, dtype=np.float64))
+            normalized.append(np.ascontiguousarray(c))
         return tuple(normalized)
 
     @staticmethod
@@ -390,13 +397,14 @@ class IBPISDF(DF):
         """Half-transform one L block of symmetric AO factors to an MO pair
         axis: ``(L|pq) = Ca^T B_L Cb``. Returns ``(n_L, na_pair)`` packed
         lower-triangular when ``pack`` (bra/ket matrices identical and compact
-        requested), else ``(n_L, na*nb)`` full. Largest transient here is the
-        per-block ``(n_L, na, nb)`` half-transform -- bounded by blockdim x
-        nmo^2, never an AO four-index tensor."""
-        tmp = np.einsum("Lab,ai->Lib", b_ao, ca, optimize=True)
-        m = np.einsum("Lib,bj->Lij", tmp, cb, optimize=True)   # (n_L, na, nb)
+        requested), else ``(n_L, na*nb)`` full. Peak transients within this
+        block are the first-einsum ``tmp (n_L, na, nao)`` and the result
+        ``m (n_L, na, nb)`` -- both bounded by blockdim x nmo x nao; no AO
+        four-index tensor is formed."""
+        tmp = np.einsum("Lab,ai->Lib", b_ao, ca, optimize=True)   # (n_L, na, nao)
+        m = np.einsum("Lib,bj->Lij", tmp, cb, optimize=True)      # (n_L, na, nb)
         if pack:
-            return pack_tril(m)                                # (n_L, na_pair)
+            return pack_tril(m)                                   # (n_L, na_pair)
         return m.reshape(m.shape[0], na * nb)
 
     def ao2mo(self, mo_coeffs, compact=True):
@@ -407,21 +415,26 @@ class IBPISDF(DF):
         matrices are identical (PySCF ``iden_coeffs``) and ``compact`` is
         truthy. Routes through ``build()`` so lazy build and the stale-molecule
         guard are inherited; derives solely from W/P via ``loop()`` and never
-        populates or reads the inherited ``_cderi``."""
+        populates or reads the inherited ``_cderi``.
+
+        Coefficients are validated (dtype/shape/finite/real) BEFORE the
+        expensive lazy build. Per L block the peak transients are the unpacked
+        ``b_ao (n_L, nao, nao)`` and each half-transform's ``tmp (n_L, na,
+        nao)`` -- all bounded by blockdim; the only output-sized allocation is
+        the ``(bra_dim, ket_dim)`` result, into which ``dgemm`` accumulates in
+        place (beta=1), so there is no output-sized GEMM temporary."""
+        c1, c2, c3, c4 = self._normalize_mo_coeffs(mo_coeffs)   # validate before build
         self.build()
-        c1, c2, c3, c4 = self._normalize_mo_coeffs(mo_coeffs)
         pack_bra = bool(compact) and iden_coeffs(c1, c2)
         pack_ket = bool(compact) and iden_coeffs(c3, c4)
         n1, n2 = c1.shape[1], c2.shape[1]
         n3, n4 = c3.shape[1], c4.shape[1]
         bra_dim = n1 * (n1 + 1) // 2 if pack_bra else n1 * n2
         ket_dim = n3 * (n3 + 1) // 2 if pack_ket else n3 * n4
-        # F-contiguous output so dgemm accumulates in place (beta=1) with no
-        # output-sized temporary. AO four-index / full-B tensors are never
-        # materialized; the L block is bounded by blockdim via loop().
         out = np.zeros((bra_dim, ket_dim), order="F")
-        if self._ibp_naoaux == 0:
-            return out
+        # Iterate loop() unconditionally: zero retained rank yields zero blocks
+        # (leaving the zero output), and the block-size validation inside loop()
+        # still fires -- no zero-rank short circuit to bypass the contract.
         for block in self.loop():                     # (n_L, nao_pair) packed-lower
             b_ao = unpack_tril(np.ascontiguousarray(block))   # (n_L, nao, nao) symmetric
             l12 = self._half_transform(b_ao, c1, c2, pack_bra, n1, n2)
