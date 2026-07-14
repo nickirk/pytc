@@ -1,40 +1,7 @@
-"""PeriodicFFTISDF consumer (design v2.1 section 2): wires the S1-S4
-pipeline in pytc.pbc.df.{kpts,isdf} into a single build() entry point
-producing the interpolation-point factor and per-q solved kernel.
-
-get_ao_eri/get_mo_eri (THC-ERI/ao2mo) were derived by direct algebra on
-get_k's own validated composition, not guessed or copied from an external
-convention: expanding get_k's kpt_to_spc/spc_to_kpt/Hadamard chain in
-closed form (using the phase-matrix orthogonality relation
-sum_R phase[R,k1]*phase[R,k2]*conj(phase[R,k]) = delta(k1+k2-k mod G) /
-sqrt(Nk)), then using coul_kpt's own Hermiticity (W^q_IJ = conj(W^q_JI),
-design v2.1 section 4) to fold a stray conjugate off the kernel factor,
-yields the STANDARD pyscf/chemist-convention THC-ERI in get_ao_eri's
-docstring directly (conj on a,c; momentum conservation k1-k2+k3-k4=0 via
-pyscf's own kconserv table, no axis relabeling needed by callers) -- an
-earlier draft used a self-consistent but nonstandard (a,d)-conjugated
-convention; normalized to the standard one before any consumer existed,
-per review. Verified by reconstructing get_k's own K matrix from a full
-(k1,k2) double loop over get_ao_eri blocks and comparing to a direct
-get_k call: agreement to 1.4e-15 (machine precision, he2-cubic-cell
-[1,1,3] rank=15) -- this is an algebraic identity, not a numerical-
-tolerance gate.
-
-get_k's structural composition (density projection -> k<->supercell
-unitary transform -> exchange assembly) was derived by reading an
-external reference's own K-build routine for UNDERSTANDING, then
-independently reimplemented here using pytc.pbc.df.kpts' own
-kpt_to_spc/spc_to_kpt. Those functions use the SAME unitary
-transform construction the reference does (a phase matrix built from
-the actual canonical k-vectors and pyscf's own real-space translation
-vectors, k2gamma.translation_vectors_for_kmesh) -- an earlier ifftn-
-reshape-based implementation was found and fixed to be wrong (it
-assumed the flat k-index maps onto FFT frequency positions the same way
-the physical k-ordering does, which is false in general). Validated
-against a real periodic FFTDF K matrix on he2-cubic-cell [1,1,3]: exact
-reduction to the Gamma-only (Nk=1) molecular ISDF-K formula, Hermiticity,
-and rank-matched parity with an external reference implementation at the
-same interpolation-point rank.
+"""PeriodicFFTISDF consumer: wires the S1-S4 pipeline in
+pytc.pbc.df.{kpts,isdf} into build(), plus get_k/get_j and the THC-ERI
+(get_ao_eri/get_mo_eri) and pyscf with_df (ISDFDF) interfaces.
+See design doc §2, §4, §7-§8.
 """
 
 from __future__ import annotations
@@ -54,44 +21,19 @@ from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts, kpt_to_spc, spc_
 
 def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProvider):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
-    kernel for one (cell, k-mesh) system, wiring S1-S4 end to end:
-        S1/S2: stream_ao_blocks + build_periodic_pivot_oracle -> pivot
-            selection via pivoted_cholesky_hermitian.
-        S3: build_pi_eta (Pi^q/eta^q), consuming a streamed AO-block
-            generator for the eta RHS.
-        S4: build_coul_kpt_device (device kernel-apply + Hermitian
-            solve, exploiting the q<->-q conjugate closure).
+    kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
     Args:
-        cell: pyscf.pbc.gto.Cell.
-        kpts: (Nk,3) absolute k-points (any order/gauge -- canonicalized
-            internally).
-        rank: requested interpolation-point rank (forwarded to
-            pivoted_cholesky_hermitian).
-        block_size: grid points per streamed AO block (S1/S3).
-        rtol: forwarded to the device Hermitian sandwich solve.
-        provider_cls: KernelProvider implementation used for S4 (default
-            RawKernelProvider, the bare 4pi/G^2 kernel).
+        kpts: (Nk,3) absolute k-points (canonicalized internally).
+        rank: requested interpolation-point rank.
+        block_size: grid points per streamed AO block.
+        provider_cls: KernelProvider for S4 (default RawKernelProvider).
 
     Returns:
-        dict with keys:
-            mesh_obj: pytc.pbc.df.kpts.KptsMesh.
-            inpv_kpt: (Nk,Nip,Nao) complex128 -- AO values at the
-                selected interpolation points, across all k.
-            coul_kpt: (Nk,Nip,Nip) complex128 -- the solved kernel W^q.
-            kern_kpt: (Nk,Nip,Nip) complex128 -- the raw contracted
-                kernel before the Hermitian sandwich solve.
-            n_selected: int, realized interpolation-point rank (may be
-                less than the requested rank if the pivot metric is
-                numerically exhausted first).
-            n_pipeline_calls: int, from build_coul_kpt_device's
-                conjugate-shortcut accounting.
-            solve_infos: length-Nk list of per-q solve info dicts.
-
-    Raises:
-        ValueError: forwarded from canonicalize_kpts, build_periodic_pivot_oracle,
-            pivoted_cholesky_hermitian, build_pi_eta, or build_coul_kpt_device
-            for malformed inputs.
+        dict: mesh_obj (KptsMesh), inpv_kpt (Nk,Nip,Nao) complex128,
+        coul_kpt / kern_kpt (Nk,Nip,Nip) complex128, n_selected (may be
+        < rank if the pivot metric exhausts), n_pipeline_calls,
+        solve_infos (length-Nk list).
     """
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
@@ -132,7 +74,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, provider_cls=RawKernelProv
 
 
 def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=None, neg=None):
-    """Periodic THC-ISDF exchange matrix (design v2.1 section 4/7).
+    """Periodic THC-ISDF exchange matrix (design doc §4, §7).
 
     Composition (per density-matrix set):
         rho_kpt[k] = inpv_kpt[k] @ dm_kpt[k] @ inpv_kpt[k].conj().T / Nk
@@ -142,58 +84,24 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
         v_kpt      = spc_to_kpt(v_spc, phase)
         vk_kpt     = conj( inpv_kpt.transpose(0,2,1) @ v_kpt @ inpv_kpt.conj() )
 
-    The Hadamard product against the density projected onto interpolation
-    points (transposed) is the standard ISDF exchange-build trick that
-    avoids ever forming a 4-index ERI tensor; kpt_to_spc/spc_to_kpt
-    implement the k<->supercell unitary transform (a sum over k' with
-    momentum-transfer indexing V[k-k'] becomes an elementwise real-space
-    product) so rho and coul are transformed self-consistently.
-
-    exxdiv is applied HERE, after the bare vk_kpt is assembled -- never
-    inside a KernelProvider. Only exxdiv=None (bare vk, for FFTDF
-    cross-checks) and exxdiv="ewald"
-    (pyscf's probe-charge Ewald/Madelung correction) are supported.
+    exxdiv is applied HERE, after the bare vk_kpt -- never inside a
+    KernelProvider. Only None and "ewald" are supported.
 
     Args:
-        dm_kpts: (nset, Nk, Nao, Nao) or (Nk, Nao, Nao) complex128
-            density matrices at each canonical k-point.
-        inpv_kpt: (Nk, Nip, Nao) complex128, e.g. build()'s inpv_kpt.
-        coul_kpt: (Nk, Nip, Nip) complex128, e.g. build()'s coul_kpt.
-        phase: (Nk, Nk) complex128 unitary transform matrix, e.g.
-            KptsMesh.phase.
-        exxdiv: None or "ewald".
-        cell: pyscf.pbc.gto.Cell, required when exxdiv="ewald".
-        kpts: (Nk,3) absolute k-points, required when exxdiv="ewald"
-            (pyscf's Ewald helper needs the actual k-vectors, not just
-            the mesh shape).
-        neg: (Nk,) int array, e.g. KptsMesh.neg. Optional (default None,
-            preserving prior behavior for callers that don't pass it).
-            When given, rho_kpt is symmetrized EXACTLY by construction
-            BEFORE kpt_to_spc, for every k -- self-paired k (neg[k]==k):
-            rho_kpt[k].real; genuine pair k<neg[k]: rho_kpt[neg[k]] :=
-            conj(rho_kpt[k]), discarding the independently-computed
-            value at neg[k] (both encode the same physical information
-            by the time-reversal identity, so nothing is lost). A REAL
-            density matrix from an actual SCF loop (as opposed to the
-            synthetic exactly-TR-symmetric fixtures this function's own
-            unit tests use) computes dm_kpt[k] and dm_kpt[neg[k]]
-            INDEPENDENTLY, satisfying rho_kpt[neg[k]]=conj(rho_kpt[k])
-            only to floating-point precision -- confirmed to trip
-            kpt_to_spc's imag_tol gate on both an all-self-paired mesh
-            (diamond 2x2x2) and a mostly-genuine-pairs mesh (diamond
-            4x4x4, where the self-paired-only version of this fix was
-            insufficient) via real pyscf KRHF runs, not synthetic
-            reproductions. Without neg, callers get the prior
-            (gate-armed, no symmetrization) behavior.
+        dm_kpts: (nset, Nk, Nao, Nao) or (Nk, Nao, Nao) complex128.
+        inpv_kpt: (Nk, Nip, Nao) complex128.
+        coul_kpt: (Nk, Nip, Nip) complex128.
+        phase: (Nk, Nk) unitary matrix (KptsMesh.phase).
+        cell, kpts: required when exxdiv="ewald".
+        neg: (Nk,) int array (KptsMesh.neg), optional. When given,
+            rho_kpt is symmetrized exactly by construction before
+            kpt_to_spc (a real SCF density satisfies
+            rho_kpt[neg[k]]=conj(rho_kpt[k]) only to floating-point
+            precision, which trips kpt_to_spc's imag_tol gate). Without
+            neg, the prior gate-armed, unsymmetrized behavior applies.
 
     Returns:
-        vk_kpts: (nset, Nk, Nao, Nao) complex128 (real-cast when the
-        mesh contains only real-valued k-points, matching pyscf's own
-        get_k_kpts convention).
-
-    Raises:
-        ValueError: malformed shapes, or exxdiv is not None/"ewald", or
-            exxdiv="ewald" without cell/kpts.
+        vk_kpts: (nset, Nk, Nao, Nao) complex128.
     """
     inpv_kpt = np.asarray(inpv_kpt, dtype=np.complex128)
     coul_kpt = np.asarray(coul_kpt, dtype=np.complex128)
@@ -230,29 +138,10 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
         dm_kpt = dm_kpts[i]
         rho_kpt = (inpv_kpt @ dm_kpt @ inpv_kpt.conj().transpose(0, 2, 1)) / n_k
         if neg is not None:
-            # Symmetrize rho_kpt EXACTLY by construction, the same
-            # conjugate-shortcut strategy build_coul_kpt_device already
-            # uses for coul_kpt (design v2.1 section 6): physics requires
-            # rho_kpt[neg[k]] = conj(rho_kpt[k]) for every k, but a REAL
-            # SCF density matrix computes dm_kpt[k] and dm_kpt[neg[k]]
-            # INDEPENDENTLY (pyscf's own mo_coeff/mo_occ machinery, not
-            # constrained to exact conjugate agreement), so rho_kpt built
-            # from them only satisfies the identity to floating-point
-            # precision -- fine for a self-paired-only mesh (design v2.1
-            # section 5 follow-up fix), but on a mesh with many GENUINE
-            # pairs (e.g. diamond 4x4x4, where most k are NOT self-paired,
-            # unlike 2x2x2 where every k is) the same noise source shows
-            # up on pairs too and the self-paired-only fix does not cover
-            # it (confirmed: a real diamond 4x4x4 KRHF run trips this gate
-            # even with the self-paired fix active). Fixing by construction
-            # for EVERY k (self-paired: take .real; genuine pair k<neg[k]:
-            # set rho_kpt[neg[k]] := conj(rho_kpt[k]) directly, discarding
-            # its independently-computed value) removes the noise
-            # entirely rather than merely reducing it, and is the
-            # correct one for physics reasons, not just convenience --
-            # both members of a genuine pair encode the SAME physical
-            # information by the time-reversal identity, so keeping only
-            # one computed value and deriving the other loses nothing.
+            # Symmetrize rho_kpt exactly by construction: a real SCF dm
+            # satisfies rho_kpt[neg[k]]=conj(rho_kpt[k]) only to roundoff,
+            # which trips kpt_to_spc's imag_tol gate; both pair members
+            # encode the same physics, so deriving one loses nothing.
             rho_kpt = rho_kpt.copy()
             visited = np.zeros(n_k, dtype=bool)
             for k in range(n_k):
@@ -285,37 +174,20 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
 
 
 def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
-    """AO-basis THC-ERI block (design v2.1 section 2, THC-ERI/ao2mo
-    interface): (a^k1 b^k2 | c^k3 d^k4), never forming the full 4-index
-    tensor beyond this one requested block. Standard pyscf/chemist
-    convention throughout: a,c conjugated (bra), b,d not (ket); momentum
-    conservation k1-k2+k3-k4=0 (mod G) via pyscf's own kconserv table --
-    callers may compare a block directly against
-    pyscf.pbc.df.FFTDF(cell).get_eri([kpts[k1],kpts[k2],kpts[k3],kpts[k4]])
-    with no axis relabeling.
+    """AO-basis THC-ERI block (a^k1 b^k2 | c^k3 d^k4), one block at a time.
+    Standard pyscf/chemist convention: a,c conjugated; k4 fixed by
+    momentum conservation -- directly comparable to FFTDF.get_eri with no
+    axis relabeling. See design doc §2.
 
-        Q = kconserv[k2, k1, 0]     -- momentum-transfer index (the
-            k-point equal to k2 - k1 mod G); NOTE the argument order
-            (k2, k1, 0), not (k1, k2, 0) (see module docstring: this
-            index enters the formula via coul_kpt's own Hermiticity).
-        k4 = kconserv[k1, k2, k3]  -- standard momentum conservation.
+        Q  = kconserv[k2, k1, 0]   -- NOTE the (k2, k1, 0) argument order,
+             not (k1, k2, 0): this index enters via coul_kpt's Hermiticity.
+        k4 = kconserv[k1, k2, k3]
         (a^k1 b^k2 | c^k3 d^k4)_{abcd} =
             sum_IJ conj(X[k1]_Ia) X[k2]_Ib * coul_kpt[Q]_IJ *
                    conj(X[k3]_Jc) X[k4]_Jd
 
-    Args:
-        inpv_kpt: (Nk, Nip, Nao) complex128, e.g. build()'s inpv_kpt.
-        coul_kpt: (Nk, Nip, Nip) complex128, e.g. build()'s coul_kpt.
-        kconserv: (Nk, Nk, Nk) int64, e.g. pytc.pbc.df.kpts.build_kconserv.
-        k1, k2, k3: canonical k-point indices into inpv_kpt's axis 0.
-
     Returns:
-        (eri_block, k4): eri_block is (Nao, Nao, Nao, Nao) complex128
-        (axes a,b,c,d matching k1,k2,k3,k4); k4 is the int index into
-        inpv_kpt's axis 0 fixed by momentum conservation.
-
-    Raises:
-        ValueError: malformed shapes or out-of-range k-indices.
+        (eri_block, k4): eri_block (Nao, Nao, Nao, Nao) complex128.
     """
     inpv_kpt = np.asarray(inpv_kpt, dtype=np.complex128)
     coul_kpt = np.asarray(coul_kpt, dtype=np.complex128)
@@ -345,30 +217,16 @@ def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
 
 
 def get_mo_eri(inpv_kpt, coul_kpt, kconserv, mo_coeff_kpts, k1, k2, k3):
-    """MO-basis THC-ERI block: get_ao_eri transformed into an arbitrary
-    MO basis per k-point via a one-sided AO->MO contraction on
-    inpv_kpt (periodic ISDF only needs this, unlike the molecular
-    two-sided P/Z sandwich in pytc.df.fit -- coul_kpt is already in a
-    pivot x pivot, not an AO-pair, basis, so there is nothing on the
-    kernel side left to transform).
+    """MO-basis THC-ERI block: get_ao_eri transformed per k-point.
 
     Args:
-        inpv_kpt, coul_kpt, kconserv: as in get_ao_eri.
         mo_coeff_kpts: length-4 sequence (C1, C2, C3, C4), each
-            (Nao, n_i) complex128 -- MO coefficients at k1, k2, k3, and
-            k4 (k4 is derived internally; the caller does not supply a
-            k4 index but MUST supply C4 already selected for whatever
-            k4 turns out to be, e.g. via mo_coeff_kpts[kconserv[k2,k1,k3]]
-            at the call site).
-        k1, k2, k3: as in get_ao_eri.
+            (Nao, n_i) complex128. k4 is derived internally, but the
+            caller MUST supply C4 already selected for whatever k4 turns
+            out to be.
 
     Returns:
-        (eri_mo, k4): eri_mo is (n1, n2, n3, n4) complex128; k4 as in
-        get_ao_eri.
-
-    Raises:
-        ValueError: malformed shapes, forwarded from get_ao_eri, or
-            mo_coeff_kpts does not have exactly 4 entries.
+        (eri_mo, k4): eri_mo (n1, n2, n3, n4) complex128.
     """
     if len(mo_coeff_kpts) != 4:
         raise ValueError(f"mo_coeff_kpts must have exactly 4 entries, got {len(mo_coeff_kpts)}.")
@@ -382,22 +240,11 @@ def get_mo_eri(inpv_kpt, coul_kpt, kconserv, mo_coeff_kpts, k1, k2, k3):
 
 
 def get_j(cell, dm_kpts, kpts):
-    """Periodic Coulomb (J) matrix -- delegates entirely to plain pyscf
-    grid-J (never ISDF-factorized), matching the reference's own
-    approach (design v2.1 section 6). Only the D2H/H2D accounting around
-    this call is a device-pipeline concern, not the J formula itself.
-    Constructs a real pyscf.pbc.df.FFTDF object (not a hand-rolled
-    stand-in) since get_j_kpts needs its full _numint/grids/aoR_loop
-    machinery, not just cell/mesh.
-
-    Args:
-        cell: pyscf.pbc.gto.Cell.
-        dm_kpts: (nset, Nk, Nao, Nao) or (Nk, Nao, Nao) density matrices.
-        kpts: (Nk,3) absolute k-points.
+    """Periodic Coulomb (J) matrix -- delegates entirely to pyscf grid-J
+    via a real FFTDF object (never ISDF-factorized; design doc §6).
 
     Returns:
-        vj_kpts: same leading shape convention as dm_kpts, from pyscf's
-        own get_j_kpts.
+        vj_kpts: same leading shape convention as dm_kpts.
     """
     from pyscf.pbc.df import FFTDF
     from pyscf.pbc.df.fft_jk import get_j_kpts
@@ -406,28 +253,14 @@ def get_j(cell, dm_kpts, kpts):
 
 
 class ISDFDF:
-    """Thin pyscf-compatible `with_df` adapter (design v2.1 section 8,
-    V4 gate): wraps this module's build()/get_k/get_j behind the
-    `get_jk(dm, hermi, kpts, kpts_band, with_j, with_k, omega, exxdiv)`
-    interface pyscf's KRHF/KRKS classes call on `mf.with_df` -- so V4
-    exercises OUR integrals inside PYSCF'S UNMODIFIED SCF machinery
-    against FFTDF's integrals in the SAME machinery, not a hand-rolled
-    SCF loop (which would entangle a from-scratch SCF implementation
-    into the comparison and weaken the gate).
-
-    Gate-thin by design: no caching cleverness beyond the one-time
-    build() memoization every df object needs to avoid rebuilding the
-    interpolation-point factor every SCF iteration, and no feature
-    completeness beyond what KRHF/KRKS actually call (kpts_band and
-    omega are explicitly NOT supported -- band-structure evaluation and
-    range-separated hybrids are out of scope for this gate).
+    """Thin pyscf-compatible `with_df` adapter (design doc §8, V4 gate):
+    wraps build()/get_k/get_j behind the get_jk interface pyscf's
+    KRHF/KRKS call on mf.with_df. Gate-thin: one-time build()
+    memoization only; kpts_band and omega are NOT supported.
 
     Args:
-        cell: pyscf.pbc.gto.Cell.
         kpts: (Nk,3) absolute k-points, e.g. cell.make_kpts(kmesh).
-        rank: requested interpolation-point rank (forwarded to build()).
-        block_size: grid points per streamed AO block (forwarded).
-        rtol: forwarded to the device Hermitian sandwich solve.
+        rank, block_size, rtol: forwarded to build().
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4):
@@ -437,12 +270,8 @@ class ISDFDF:
         self.block_size = block_size
         self.rtol = rtol
         self._built = None
-        # KRHF/KRKS's get_hcore calls with_df.get_pp/get_nuc for the
-        # pseudopotential/nuclear-attraction core-Hamiltonian term -- an
-        # AO-grid integral unrelated to the J/K Coulomb factorization
-        # this adapter exists to gate; delegate to a real FFTDF instance
-        # (composition, not reimplementation) rather than reinventing it,
-        # same pattern get_j already uses.
+        # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
+        # factorization) delegate to a real FFTDF instance.
         from pyscf.pbc.df import FFTDF
 
         self._core_df = FFTDF(cell, kpts)
@@ -454,11 +283,8 @@ class ISDFDF:
         return self._core_df.get_nuc(self.kpts if kpts is None else kpts)
 
     def build(self):
-        """Runs S1-S4 once and caches the result; a real SCF loop calls
-        get_jk every iteration but the interpolation-point factor and
-        solved kernel are density-independent, so rebuilding them per
-        iteration would be wasted (and wrong-scope) work for this gate.
-        """
+        """Run S1-S4 once and cache; the build artifacts are
+        density-independent."""
         if self._built is None:
             self._built = build(
                 self.cell, self.kpts, rank=self.rank, block_size=self.block_size,

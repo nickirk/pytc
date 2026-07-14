@@ -1,17 +1,6 @@
-"""Tests for pytc.pbc.coulomb.get_ao_eri/get_mo_eri (design v2.1 section 2,
-THC-ERI/ao2mo interface).
-
-The primary correctness gate is get_ao_eri_k_reconstruction_matches_get_k:
-contracting a full (k1,k2) double loop of ERI blocks with a density matrix
-(the standard periodic exchange formula) must reproduce coulomb.get_k's
-own output exactly, since get_ao_eri's formula was derived by direct
-algebra on get_k's validated composition (see coulomb.py's module
-docstring) -- this check is rank-INDEPENDENT (an algebraic identity, not
-a numerical-tolerance approximation) and is far stronger than any
-FFTDF/reference comparison, which is rank-limited (see
-test_coulomb_get_k_get_j.py's own get_k-vs-FFTDF findings: ~0.48 relF at
-nip=15 on he2 [1,1,3], not a bug -- the ISDF rank limit).
-"""
+"""Tests for pytc.pbc.coulomb.get_ao_eri/get_mo_eri (design doc §2).
+Primary gate: reconstructing get_k's K from ERI blocks is an exact
+algebraic identity, rank-independent."""
 
 import unittest
 

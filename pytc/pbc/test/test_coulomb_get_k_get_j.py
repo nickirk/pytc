@@ -1,18 +1,6 @@
-"""Structural tests for pytc.pbc.coulomb.get_k/get_j (design v2.1
-section 4/7).
-
-Nk=1: exact reduction to the standard ISDF exchange-matrix formula
-K = X^T (V (had) P) X (P = X D X^T, the density projected onto
-interpolation points) -- derived independently from the ISDF
-literature, not from this module's own code, checked against a
-from-scratch NumPy computation. Nk>1: TestGetKVsRealFftdf below adds
-rank-matched-parity (not exactness) checks against a real periodic
-FFTDF get_k_kpts, for both exxdiv=None and exxdiv="ewald" -- ranks are
-kept in the "sane regime" (see class docstring) since the retained-
-mode solve-residual retention policy is a separate, not-yet-tuned knob
-(design v2.1 section 5) that blows up at overcomplete rank on these
-tiny test cells, independent of the get_k formula itself.
-"""
+"""Structural tests for pytc.pbc.coulomb.get_k/get_j (design doc §4, §7):
+Nk=1 exact reduction to the molecular ISDF-K formula; Nk>1 rank-matched
+parity vs real FFTDF get_k_kpts (exxdiv None and "ewald")."""
 
 import unittest
 

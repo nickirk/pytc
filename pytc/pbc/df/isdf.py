@@ -1,25 +1,7 @@
-"""Periodic ISDF fit machinery (design v2.1 sections 3-5): a generic,
-matrix-free Hermitian-PSD pivoted Cholesky selector, the Pi^q/eta^q
-metric/RHS builders, and a minimal plain-NumPy raw-kernel-apply-and-solve
-function needed to close the V2 reference-replay gate at the CPU/NumPy
-oracle level (correctness oracles close before device work starts; the
-formal KernelProvider class protocol -- device/jit path, pluggable ibp
-slot, provenance dict -- formalizes/wraps this function below, not
-replacing it).
-
-Design decision (design v2.1 section 3): the existing pytc.df.pivots
-molecular pair core
-(_pivoted_cholesky_pair_pivots_core) is one JIT with semantics far
-richer than a (diag, col_eval) skeleton -- dual Cholesky states,
-normalized/legacy tie-break ramps, a latched effective-rank prefix, and
-dtype/rtol-coupled safety thresholds. Extract-and-rewrap cannot be
-byte-identical in behavior or execution placement, so it is not
-attempted. This module is a genuinely SEPARATE, simpler generic
-primitive; pytc/df/pivots.py is not imported and not modified. The
-argmax tie-break RULE (a tiny monotonically increasing ramp added to
-the score before argmax, biasing ties toward the higher index) is
-copied by inspection from pytc.df.pivots's own selector, not shared by
-import -- see pivoted_cholesky_hermitian's docstring.
+"""Periodic ISDF fit machinery: matrix-free Hermitian-PSD pivoted Cholesky
+selector, Pi^q/eta^q builders, kernel-apply-and-solve (NumPy oracle and
+device/KernelProvider paths), and staging policy. See design doc §3-§7.
+Deliberately independent of pytc.df.pivots (see design doc §3).
 """
 
 from __future__ import annotations
@@ -36,55 +18,19 @@ logger = logging.getLogger(__name__)
 
 
 def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=1e-12):
-    """Matrix-free pivoted (partial) Cholesky for an implicit N x N
-    Hermitian PSD matrix M, given only its diagonal and an on-demand
-    column oracle col_eval(j) -> M[:, j] (shape (N,), complex128). M
-    itself is never materialized.
+    """Matrix-free greedy pivoted (partial) Cholesky for an implicit N x N
+    Hermitian PSD matrix M given diag(M) and a column oracle
+    col_eval(j) -> M[:, j] of the ORIGINAL M (shape (N,), complex128).
 
-    Standard greedy pivoted-Cholesky / low-rank PSD approximation
-    algorithm: at each step, select the largest remaining Schur-
-    complement diagonal entry as the next pivot, fetch that column of
-    the ORIGINAL matrix via col_eval, subtract off the already-selected
-    pivots' contribution, and normalize by sqrt(pivot diagonal) to get
-    the next column of the Cholesky factor L. The Schur-complement
-    diagonal is updated by subtracting |l_t|^2 after each step and
-    guarded to stay >= 0 (real, per the design spec) despite roundoff.
-
-    Tie-break rule (copied from pytc.df.pivots's molecular selector, by
-    inspection -- not shared code, not an import): a tiny monotonically
-    increasing ramp `ramp_scale * arange(n) * max(diag)` is added to the
-    score used for argmax, biasing an exact numerical tie toward the
-    HIGHER index -- deterministic and reproducible, matching the
-    molecular selector's own convention, rather than depending on
-    argmax's otherwise implementation-defined first-max behavior.
-
-    Args:
-        diag: (n,) real, non-negative (guarded) diagonal of M.
-        col_eval: callable, col_eval(j) -> (n,) complex128 array, the
-            j-th column of the ORIGINAL M (not the Schur complement).
-        rank: requested number of pivots (upper bound; may return fewer
-            if the Schur-complement diagonal is numerically exhausted
-            first).
-        rcond: relative threshold (vs max(diag)) below which a
-            candidate pivot's Schur-complement diagonal is treated as
-            numerically zero -- selection stops there.
-        ramp_scale: tie-break ramp coefficient (see above).
+    Tie-break: a tiny increasing ramp `ramp_scale * arange(n) * max(diag)`
+    is added to the argmax score, biasing exact ties toward the higher
+    index (matches pytc.df.pivots's convention; copied, not imported).
 
     Returns:
-        (pivots, L, n_selected):
-            pivots: (n_selected,) int64 array of selected column indices.
-            L: (n, n_selected) complex128 array, the partial Cholesky
-                factor restricted to selected columns (M[pivots,pivots]
-                block satisfies L[pivots,:] @ L[pivots,:].conj().T ==
-                M[pivots,pivots] to numerical precision; full
-                reconstruction is L @ L.conj().T approx M when rank is
-                sufficient).
-            n_selected: int, <= rank.
-
-    Raises:
-        ValueError: rank > n, diag has a materially negative entry
-            (M is not PSD within rcond), or col_eval returns a
-            malformed shape/dtype.
+        (pivots, L, n_selected): pivots (n_selected,) int64; L
+        (n, n_selected) complex128 partial Cholesky factor; n_selected
+        <= rank (fewer if the Schur diagonal exhausts below
+        rcond*max(diag) first).
     """
     diag = np.asarray(diag, dtype=np.float64)
     if diag.ndim != 1:
@@ -152,41 +98,20 @@ def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=
 
 
 def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
-    """Build the per-q metric Pi^q and RHS eta^q (design v2.1 section 4/5):
-
-        Pi^q  = pair_convolve(X, X, phase)[q]         (Nip, Nip)
-        eta^q = pair_convolve(X, AO, phase)[q]         (Nip, Ng)
-
-    eta is accumulated over grid blocks by calling pair_convolve once
-    per block and concatenating along the grid axis -- this bounds the
-    memory of any single pair_convolve call to one block's worth of AO
-    data, at the cost of re-walking X's own per-q GEMM/transform
-    machinery once per block (the same reference-first, optimize-later
-    posture as this module's other primitives; a genuinely fused/tiled
-    device pipeline is Phase C's job, not this CPU oracle's).
+    """Build Pi^q = pair_convolve(X, X)[q] and eta^q = pair_convolve(X, AO)[q].
+    eta is accumulated block-by-block so one pair_convolve call holds only
+    one block of AO data. See design doc §4-§5.
 
     Args:
-        X: (Nk, Nip, Nao) complex128 -- the interpolation-point factor
-            (e.g. AO or MO values at the selected pivot points) across
-            the canonical k-mesh.
-        ao_blocks: a single (Nk, Ng, Nao) complex128 array, or an
-            iterable of (Nk, blk_i, Nao) complex128 arrays (AO values at
-            successive grid blocks) across the SAME canonical k-mesh.
-        phase: (Nk, Nk) complex128 unitary k<->supercell-image transform
-            matrix (see pytc.pbc.df.kpts.KptsMesh.phase).
-        imag_tol: forwarded to pair_convolve's imaginary-part gate.
+        X: (Nk, Nip, Nao) complex128 across the canonical k-mesh.
+        ao_blocks: (Nk, Ng, Nao) complex128 array, or iterable of
+            (Nk, blk_i, Nao) blocks on the SAME canonical k-mesh.
+        phase: (Nk, Nk) unitary matrix (KptsMesh.phase).
 
     Returns:
-        (Pi, eta): Pi is (Nk, Nip, Nip) complex128; eta is
-        (Nk, Nip, Ng) complex128, Ng = sum of the ao_blocks' grid sizes.
-
-    Raises:
-        ValueError: forwarded from pair_convolve for malformed shapes,
-            or if X/ao_blocks are not a valid time-reversal-symmetric
-            pair (the imag_tol gate).
+        (Pi, eta): (Nk, Nip, Nip) and (Nk, Nip, Ng) complex128.
     """
-    # Local import: pytc.pbc.df.isdf depends on pytc.pbc.df.kpts (both
-    # are pbc/df/ peers), never the reverse -- kpts.py stays a leaf.
+    # Local import: kpts.py stays a leaf.
     from pytc.pbc.df.kpts import pair_convolve
 
     X = np.asarray(X)
@@ -213,135 +138,42 @@ def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
 def apply_raw_kernel_and_solve(
     Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-4, self_paired=False
 ):
-    """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel
-    to eta^q over the SPATIAL grid, contract back into a Nip x Nip
-    kernel matrix, and solve the Hermitian sandwich for W^q (design
-    v2.1 sections 5+7). Plain NumPy, single q at a time -- a minimal
-    function proving the V0-V6 "raw" provider semantics at the CPU/
-    NumPy oracle level; the formal KernelProvider class/device path is
-    Phase C's job (see module docstring).
+    """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel to
+    eta^q over the spatial grid, contract to (Nip, Nip), and solve the
+    Hermitian sandwich for W^q. Plain NumPy, single q -- the CPU oracle for
+    the device KernelProvider path. See design doc §5, §7.
 
-        lq   = eta_q * exp(-1j * grid_coords @ q_kpt)   # Bloch-phase
-                                                          # correction:
-            eta^q as built by pair_convolve carries only the k-INDEX
-            Alg-1 phase machinery, not the grid-coordinate-dependent
-            Bloch phase a per-q spatial-grid FFT needs -- this factor
-            supplies it.
-        wq   = FFT(lq, grid_mesh)                        # spatial FFT,
-                                                          # one row per
-                                                          # interpolation
-                                                          # point.
-        vq   = cell.get_coulG(q_kpt, exx=False, mesh=grid_mesh)
-               * cell.vol / Ng                            # bare kernel,
-                                                          # G=0 handled
-                                                          # by pyscf's
-                                                          # own exx=False
-                                                          # convention.
-        rq   = conj(IFFT(wq * vq, grid_mesh))             # spatial
-                                                          # IFFT, then
-                                                          # conjugate
-                                                          # (matches the
-                                                          # bare-kernel
-                                                          # convention
-                                                          # verified
-                                                          # against a
-                                                          # real
-                                                          # reference
-                                                          # dump -- see
-                                                          # the V2
-                                                          # reference-
-                                                          # replay
-                                                          # test).
-        kern_q = lq @ rq.T / sqrt(Ng)                     # (Nip, Nip).
-        W_q  = sqrt(Ng) * hermitian_sandwich_solve(Pi_q, kern_q)[0]
-                                                          # the final
-                                                          # sqrt(Ng)
-                                                          # rescale
-                                                          # exactly
-                                                          # cancels
-                                                          # kern_q's own
-                                                          # 1/sqrt(Ng),
-                                                          # per the
-                                                          # paper's Eq.
-                                                          # 10 factor
-                                                          # list
-                                                          # (section 4:
-                                                          # "vol/Ng,
-                                                          # 1/sqrt(Ng),
-                                                          # sqrt(Ng)
-                                                          # factor
-                                                          # placements")
-                                                          # -- empirically
-                                                          # confirmed
-                                                          # against a
-                                                          # real fftisdf
-                                                          # run on he2
-                                                          # [1,1,3]: this
-                                                          # exact
-                                                          # rescale
-                                                          # closes W_q to
-                                                          # ~1e-9
-                                                          # relative
-                                                          # error (see
-                                                          # the V2
-                                                          # reference-
-                                                          # replay
-                                                          # test).
+        lq     = eta_q * exp(-1j * grid_coords @ q_kpt)   # Bloch phase
+        wq     = FFT(lq, grid_mesh)
+        vq     = coulG(q, exx=False) * vol / Ng
+        rq     = conj(IFFT(wq * vq, grid_mesh))
+        kern_q = lq @ rq.T / sqrt(Ng)
+        W_q    = sqrt(Ng) * hermitian_sandwich_solve(Pi_q, kern_q)[0]
 
-    exxdiv is NEVER applied here (per section 4/7: exxdiv ownership
-    belongs to a later get_k post-processing step, never inside a
-    kernel provider) -- this function only ever produces the bare
-    kernel.
+    The final sqrt(Ng) rescale exactly cancels kern_q's 1/sqrt(Ng)
+    (paper Eq. 10 factor placements; verified in the V2 reference-replay
+    test). exxdiv is NEVER applied here -- it is owned by a later get_k
+    post-processing step.
 
     Args:
-        Pi_q: (Nip, Nip) complex128, this q's metric (e.g. from
-            build_pi_eta).
-        eta_q: (Nip, Ng) complex128, this q's RHS (e.g. from
-            build_pi_eta), Ng matching grid_coords/grid_mesh.
-        cell: pyscf.pbc.gto.Cell (needed for cell.vol and
-            cell.get_coulG).
-        q_kpt: (3,) absolute k-vector for this q (e.g.
-            KptsMesh.canonical_kpts[q]).
-        grid_coords: (Ng, 3) real-space grid point coordinates, in the
-            SAME flattened order as eta_q's grid axis.
-        grid_mesh: (3,) positive ints, the REAL-SPACE integration mesh
-            shape (a DIFFERENT mesh from the k-point mesh) -- prod
-            must equal Ng.
+        Pi_q: (Nip, Nip) complex128 metric.
+        eta_q: (Nip, Ng) complex128 RHS.
+        q_kpt: (3,) absolute k-vector for this q.
+        grid_coords: (Ng, 3), same flattened order as eta_q's grid axis.
+        grid_mesh: (3,) positive ints, real-space integration mesh
+            (distinct from the k-point mesh); prod must equal Ng.
         rtol: forwarded to hermitian_sandwich_solve.
-        self_paired: True when this q satisfies neg[q]==q (Gamma, and
-            any other BZ-edge self-paired point) -- physics requires
-            kern_q REAL for such q (kern_q[neg[q]]=conj(kern_q[q]) with
-            neg[q]=q forces kern_q=conj(kern_q)), but kern_q's own
-            construction (Bloch-phase multiply -> FFT -> coulG -> IFFT
-            -> conjugate -> ZGEMM, all genuinely complex intermediates
-            even for a self-paired q) leaves a small measured floating-
-            point residual on the imaginary part -- confirmed NOT to
-            originate in Pi_q/eta_q (forcing those real first does not
-            change kern_q's residual) and confirmed to be amplified by
-            roughly two orders of magnitude through the near-singular
-            solve's pseudo-inverse sandwich before it would otherwise
-            surface downstream (design v2.1 section 5, C1.5 retention
-            diagnostics: only visible once a real system pushes a q
-            toward retention_marginal). When True, kern_q.real is taken
-            BEFORE the solve -- a physics-motivated projection removing
-            only the measured noise component, not a loosened gate;
-            verified to collapse W_q's own residual to EXACTLY 0.0 on a
-            real diamond 2x2x2 system where the unprojected residual was
-            ~4e-9 (well over kpt_to_spc's 1e-10 imag_tol gate downstream,
-            which stays armed at its original threshold).
+        self_paired: True when neg[q]==q. Physics requires kern_q real for
+            such q, but the complex intermediates leave floating-point
+            imaginary noise that the near-singular solve amplifies; when
+            True, kern_q.real is taken BEFORE the solve (noise projection,
+            not a loosened gate). See design doc §5.
 
     Returns:
-        (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 (the
-        solved kernel matrix); kern_q is the raw (Nip, Nip) contracted
-        kernel before the sandwich solve; solve_info is
-        hermitian_sandwich_solve's own info dict.
-
-    Raises:
-        ValueError: malformed shapes, or grid_mesh does not match Ng.
+        (W_q, kern_q, solve_info): W_q (Nip, Nip) complex128; kern_q is
+        the raw contracted kernel before the solve; solve_info is
+        hermitian_sandwich_solve's info dict.
     """
-    # Local imports: pytc.pbc.df.isdf depends on pytc.df.solvers (a
-    # pytc/df/ peer, per the design's dependency direction) and pyscf's
-    # own reciprocal-lattice tool, never the reverse.
     from pyscf.pbc import tools as pbctools
 
     from pytc.df.solvers import hermitian_sandwich_solve
@@ -393,56 +225,29 @@ def apply_raw_kernel_and_solve(
         kern_q = kern_q.real.astype(np.complex128)
 
     W_q_unscaled, solve_info = hermitian_sandwich_solve(Pi_q, kern_q, rtol=rtol)
-    # Final sqrt(Ng) rescale, exactly cancelling kern_q's own 1/sqrt(Ng) --
-    # see the docstring's Eq. 10 factor-placement note; empirically
-    # confirmed against a real fftisdf run (V2 reference-replay test).
+    # sqrt(Ng) rescale cancels kern_q's own 1/sqrt(Ng) (Eq. 10 factor placement).
     W_q = np.sqrt(n_grid) * W_q_unscaled
     return W_q, kern_q, solve_info
 
 
 # ---------------------------------------------------------------------------
-# Device path, KernelProvider protocol (design v2.1 section 7).
+# Device path, KernelProvider protocol (design doc §7).
 #
-# On top of the apply_raw_kernel_and_solve oracle above: KernelProvider.apply
-# (q_index, lq) is a LINEAR q-momentum kernel operator applied to a
-# PRE-PHASED (Nip, Ng) slab, returning v_q BEFORE the final conjugate -- the
-# Bloch-phase multiply
-# (eta_q -> lq) and the outer conjugate (v_q -> rq) are pipeline glue that
-# does not vary between providers, not part of the provider contract. The
-# vol/Ng normalization stays INSIDE the provider (it is part of "kernel on
-# the canonical mesh"); exxdiv stays OUTSIDE, unchanged, owned by a later
-# get_k post-processing step. "Raw" implements the operator in 3 Fourier
-# passes; the contract itself does not fix a step count (a future IBP
-# provider may need several FFT/IFFT passes for gradient/vector-valued
-# G-space components inside one apply() call).
+# KernelProvider.apply(q_index, lq) is a LINEAR q-momentum kernel operator on
+# a PRE-PHASED (Nip, Ng) slab, returning v_q BEFORE the final conjugate; the
+# Bloch-phase multiply and outer conjugate are pipeline glue, not part of the
+# contract. vol/Ng normalization stays INSIDE the provider; exxdiv stays
+# OUTSIDE (owned by get_k post-processing).
 #
-# q<->-q dagger law AT THIS SEAM (derived here, not copied from the original
-# eta_q-based law in the design doc text, since that law was written for the
-# phase-included signature): given
-#     l_q[neg[q]] = conj(l_q[q])
-# (true because eta[neg[q]] = conj(eta[q]) from pair_convolve's own q<->-q
-# closure, and phase(neg[q]) = exp(-1j r.(-q)) = exp(+1j r.q) = conj(phase(q))
-# for phase(k) = exp(-1j r.k)), the raw kernel-apply operator satisfies
-#     apply(neg[q], conj(l_q)) == conj(apply(q, l_q))
-# Proof: (1) coulG(-q)[G] = coulG(q)[-G] -- both equal 4pi/|G+-q|^2, and this
-# value is REAL, so it equals its own conjugate; (2) the standard DFT
-# conjugate-reversal identity FFT(conj(f))[G] = conj(FFT(f)[-G]); composing
-# (1)+(2) through the coulG multiply, then one more IFFT (which turns a
-# G-reversal + conjugate back into a plain conjugate in real/grid space, by
-# the same identity applied in reverse), closes the law with no leftover
-# phase. Verified numerically in test_raw_kernel_apply_dagger_law.
+# Dagger law at this seam: apply(neg[q], conj(l_q)) == conj(apply(q, l_q)),
+# given l_q[neg[q]] = conj(l_q[q]). Verified in test_raw_kernel_apply_dagger_law.
 
 
 @partial(jax.jit, static_argnames=("grid_mesh",))
 def _raw_kernel_apply_core(lq, coulG_scaled, grid_mesh):
-    """Jitted, fixed-shape core of the "raw" KernelProvider: v_q =
-    IFFT(coulG(q)*vol/Ng * FFT(lq)), device-resident throughout. See
-    raw_kernel_apply's docstring for the full contract; this function
-    does no validation (that lives in the host-side wrapper, since
-    validation involves cell/pyscf calls that are not jittable) and
-    performs no phase multiply and no outer conjugate -- both are
-    pipeline glue applied by the caller, not this seam.
-    """
+    """Jitted core of the "raw" provider: v_q = IFFT(coulG_scaled * FFT(lq)).
+    No validation (host wrapper's job), no phase multiply, no outer
+    conjugate."""
     n_ip = lq.shape[0]
     lq_mesh = lq.reshape((n_ip,) + grid_mesh)
     wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
@@ -453,25 +258,15 @@ def _raw_kernel_apply_core(lq, coulG_scaled, grid_mesh):
 
 
 def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
-    """Host-side wrapper: validate inputs, compute coulG(q)*vol/Ng on the
-    host via pyscf (not jittable -- cell.get_Gv/get_coulG are plain
-    Python/NumPy pyscf calls), then dispatch to the jitted device core.
+    """Host-side wrapper: validate, compute coulG(q)*vol/Ng via pyscf (not
+    jittable), dispatch to the jitted core.
 
     Args:
-        lq: (Nip, Ng) complex128, ALREADY Bloch-phase-corrected (the
-            pipeline's job, not this function's -- see module-level
-            comment above).
-        cell: pyscf.pbc.gto.Cell.
-        q_kpt: (3,) absolute k-vector for this q.
-        grid_mesh: (3,) positive ints, the real-space integration mesh
-            (prod must equal Ng).
+        lq: (Nip, Ng) complex128, ALREADY Bloch-phase-corrected.
+        grid_mesh: (3,) positive ints; prod must equal Ng.
 
     Returns:
-        v_q: (Nip, Ng) complex128 jax array, BEFORE the outer conjugate
-        (the pipeline applies conj(v_q) -> rq itself).
-
-    Raises:
-        ValueError: malformed shapes, or grid_mesh does not match Ng.
+        v_q: (Nip, Ng) complex128 jax array, BEFORE the outer conjugate.
     """
     from pyscf.pbc import tools as pbctools
 
@@ -507,35 +302,12 @@ def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
 
 
 def precompute_coulG_all_q(cell, canonical_kpts, grid_mesh):
-    """Host-side precompute of coulG(q)*vol/Ng for EVERY q at once
-    (design v2.1 section 7, task #25/C2 item 1 eager-glue fusion
-    prerequisite): cell.get_Gv/pbctools.get_coulG are host-only pyscf
-    calls, not jittable, and were previously re-run inside
-    raw_kernel_apply on EVERY provider.apply() call even though the
-    result depends only on q and the (build-invariant) cell/grid_mesh --
-    a per-q constant, recomputed Nk times per build for no reason, and
-    (before this fix) the specific host<->device boundary crossing that
-    made full jax.jit fusion of the per-q apply-and-solve chain
-    impossible (raw_kernel_apply's coulG computation cannot appear
-    inside a jax.jit trace). Computing all Nk values ONCE here (also
-    reusing a single cell.get_Gv call, itself q-independent and
-    previously recomputed per call too) removes that barrier: the
-    result is one plain array that CAN be threaded into a jitted core
-    as a traced argument.
-
-    Args:
-        cell: pyscf.pbc.gto.Cell.
-        canonical_kpts: (Nk, 3) float64 absolute k-vectors.
-        grid_mesh: (3,) positive ints, the real-space integration mesh.
+    """Precompute coulG(q)*vol/Ng for every q at once (host-only pyscf
+    calls are not jittable; the result is a per-q constant that can then
+    be threaded into a jitted core as a traced argument).
 
     Returns:
-        coulG_all: (Nk, Ng) float64 jax array; coulG_all[q] is the SAME
-        value raw_kernel_apply computed internally per-call before this
-        fix (verified bit-identical in
-        test_raw_kernel_provider_fused_path_matches_apply_directly).
-
-    Raises:
-        ValueError: malformed shapes.
+        coulG_all: (Nk, Ng) float64 jax array.
     """
     from pyscf.pbc import tools as pbctools
 
@@ -564,27 +336,10 @@ def precompute_coulG_all_q(cell, canonical_kpts, grid_mesh):
 def _fused_apply_kernel_and_solve_core(
     Pi_q, eta_q, phase_q, coulG_scaled_q, grid_mesh, rtol, self_paired
 ):
-    """Fully fused, single-jax.jit core of apply_kernel_and_solve_device's
-    per-q hot path (design v2.1 section 6, task #25/C2 item 1 eager-glue
-    fusion): phase-multiply -> raw kernel apply (FFT/coulG/IFFT) ->
-    conjugate -> ZGEMM contract -> Hermitian sandwich solve, as ONE XLA
-    computation graph with zero numpy/jax boundary crossings in between.
-
-    Composes the two PRE-EXISTING jitted cores
-    (_raw_kernel_apply_core, _hermitian_sandwich_solve_core) directly --
-    both were already jit-pure; it was the EAGER HOST GLUE around them
-    (raw_kernel_apply's host pyscf coulG call, hermitian_sandwich_solve_
-    device's host numpy validation) forcing host<->device round trips
-    between every stage that blocked fusion, not the cores themselves.
-    Measured as 6.3x fused-vs-sum-of-decomposed-stages overhead on a
-    real V100 (task #22 tile harness, JID 59179666) once the earlier
-    phase-cache fix (fa7d7f9) had already ruled out the phase recompute
-    as the gap's cause.
-
-    Only reachable via a provider exposing fused_apply_and_solve (see
-    RawKernelProvider below) -- apply_kernel_and_solve_device falls back
-    to the original eager per-stage path for any provider that doesn't.
-    """
+    """Fully fused single-jax.jit per-q hot path: phase-multiply -> raw
+    kernel apply -> conjugate -> ZGEMM -> Hermitian sandwich solve, one XLA
+    graph with no host round trips. Reachable only via a provider exposing
+    fused_apply_and_solve. See design doc §6."""
     n_grid = eta_q.shape[1]
     lq = eta_q * phase_q[None, :]
     v_q = _raw_kernel_apply_core(lq, coulG_scaled_q, grid_mesh)
@@ -609,28 +364,17 @@ def _fused_apply_kernel_and_solve_core(
 
 @dataclasses.dataclass(frozen=True)
 class RawKernelProvider:
-    """The "raw" (bare 4pi/G^2, exx=False) KernelProvider (design v2.1
-    section 7): wraps raw_kernel_apply behind the KernelProvider seam
-    (apply(q_index, lq) -> v_q) plus a provenance() accessor. A provider
-    is a per-(cell, canonical k-mesh, grid) object -- q_index looks up
-    the absolute k-vector from canonical_kpts internally, so callers
-    never pass raw k-vectors across the provider boundary.
+    """The "raw" (bare 4pi/G^2, exx=False) KernelProvider (design doc §7):
+    apply(q_index, lq) -> v_q plus provenance(). q_index resolves the
+    absolute k-vector from canonical_kpts internally.
 
-    Also exposes fused_apply_and_solve(q_index, Pi_q, eta_q, phase_q,
-    rtol, self_paired), an OPTIONAL fast-path hook (task #25/C2 item 1)
-    that apply_kernel_and_solve_device prefers when present: it wraps
-    _fused_apply_kernel_and_solve_core with this provider's precomputed
-    coulG_all[q_index], fusing this provider's entire per-q apply+solve
-    math into one jax.jit graph. Not part of the minimal KernelProvider
-    contract (apply/provenance) -- a future provider (e.g. ibp) can omit
-    it and apply_kernel_and_solve_device will use the portable eager
-    path instead, unfused but correct.
+    fused_apply_and_solve is an OPTIONAL fast-path hook that
+    apply_kernel_and_solve_device prefers when present; providers without
+    it fall back to the eager per-stage path.
 
     Args:
-        cell: pyscf.pbc.gto.Cell.
-        canonical_kpts: (Nk, 3) float64, e.g. KptsMesh.canonical_kpts --
-            canonical_kpts[q_index] is the absolute k-vector for that q.
-        grid_mesh: (3,) positive ints, the real-space integration mesh.
+        canonical_kpts: (Nk, 3) float64, e.g. KptsMesh.canonical_kpts.
+        grid_mesh: (3,) positive ints, real-space integration mesh.
     """
     cell: object
     canonical_kpts: object
@@ -680,38 +424,17 @@ class RawKernelProvider:
 
 @jax.jit
 def _precompute_phase_all_q_core(grid_coords, canonical_kpts):
-    """Jitted, batched core of precompute_phase_all_q: the per-q Bloch
-    phase exp(-1j * grid_coords @ q_kpt) for EVERY q at once, from a
-    SINGLE grid_coords upload -- design v2.1 section 6 glue-fix
-    (task #25/C2 item 1). One (Ng,3)@(3,Nk) matmul replaces Nk separate
-    (Ng,3)@(3,) matvecs, each of which previously re-uploaded
-    grid_coords to device from scratch.
-    """
+    """Jitted batched core: per-q Bloch phase exp(-1j * grid_coords @ q_kpt)
+    for every q from a single grid_coords upload."""
     return jnp.exp(-1j * (grid_coords @ canonical_kpts.T)).T
 
 
 def precompute_phase_all_q(grid_coords, canonical_kpts):
-    """Host-side wrapper for _precompute_phase_all_q_core (design v2.1
-    section 6 glue-fix): compute the per-q Bloch phase for every q in
-    ONE batched, jitted call, to be sliced per-q and passed into
-    apply_kernel_and_solve_device's phase_q parameter -- eliminates the
-    per-q eager phase recomputation AND the per-q grid_coords re-upload
-    that together measured as 72% of apply_kernel_and_solve_device's
-    unfused per-q wall time on a real V100 (task #22 tile harness).
-
-    Args:
-        grid_coords: (Ng,3) real-space grid point coordinates.
-        canonical_kpts: (Nk,3) absolute k-vectors, e.g.
-            KptsMesh.canonical_kpts / RawKernelProvider.canonical_kpts.
+    """Compute the per-q Bloch phase for every q in one batched jitted
+    call; slice per-q into apply_kernel_and_solve_device's phase_q.
 
     Returns:
-        phase_all: (Nk, Ng) complex128 jax array; phase_all[q] is the
-        SAME array apply_kernel_and_solve_device used to build
-        internally per-call before this fix (verified bit-identical in
-        test_apply_kernel_and_solve_device_phase_q_matches_internal_computation).
-
-    Raises:
-        ValueError: malformed shapes.
+        phase_all: (Nk, Ng) complex128 jax array.
     """
     grid_coords_np = np.asarray(grid_coords, dtype=np.float64)
     if grid_coords_np.ndim != 2 or grid_coords_np.shape[1] != 3:
@@ -730,67 +453,31 @@ def apply_kernel_and_solve_device(
     provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=1e-4,
     retained_solve_residual_gate=1e-10, self_paired=False,
 ):
-    """S4 pipeline glue (design v2.1 section 6), device-resident,
-    provider-agnostic: Bloch-phase multiply -> provider.apply(q_index,
-    lq) -> outer conjugate -> ZGEMM contract to (Nip,Nip) -> device
-    Hermitian sandwich solve. Reproduces apply_raw_kernel_and_solve's
-    exact math when provider is a RawKernelProvider (validated to
-    <=1e-12 in test_apply_kernel_and_solve_device_matches_numpy_oracle),
-    but is written against the provider SEAM so a future ibp provider
-    plugs in here unchanged.
+    """S4 pipeline glue, device-resident, provider-agnostic: phase multiply
+    -> provider.apply -> conjugate -> ZGEMM -> device Hermitian sandwich
+    solve. Matches apply_raw_kernel_and_solve's math for RawKernelProvider.
+    See design doc §6.
 
     Args:
-        provider: object exposing .apply(q_index, lq) -> v_q (Nip, Ng),
-            e.g. RawKernelProvider.
-        q_index: int, canonical index of this q (looked up by the
-            provider itself for any provider-internal k-vector needs).
-        Pi_q: (Nip, Nip) complex128, this q's metric.
-        eta_q: (Nip, Ng) complex128, this q's RHS, NOT yet phase-
-            corrected (the pipeline's job, matching build_pi_eta's raw
-            output).
-        grid_coords: (Ng, 3) real-space grid point coordinates, same
-            flattened order as eta_q's grid axis. Required only when
-            phase_q is not given (see below); ignored if it is.
-        phase_q: (Ng,) complex128 jax array, PRECOMPUTED
-            exp(-1j * grid_coords @ canonical_kpts[q_index]) -- design
-            v2.1 section 6 glue-fix (task #25/C2 item 1). When given,
-            this is used directly instead of recomputing the phase from
-            grid_coords/q_kpt on every call, and grid_coords is not
-            touched at all (no re-upload). Callers looping over many q
-            (e.g. build_coul_kpt_device) should precompute ALL q's phase
-            once via precompute_phase_all_q and pass phase_all[q_index]
-            here -- the per-q phase recomputation (and the grid_coords
-            re-upload it required) measured as 72% of this function's
-            unfused per-q wall time on a real V100 (task #22 tile
-            harness), and is a per-q CONSTANT that never needs
-            recomputing within one build. Exactly one of grid_coords/
-            phase_q must be given.
+        provider: object exposing .apply(q_index, lq) -> v_q (Nip, Ng).
+        Pi_q: (Nip, Nip) complex128 metric.
+        eta_q: (Nip, Ng) complex128 RHS, NOT yet phase-corrected.
+        grid_coords: (Ng, 3); required only when phase_q is not given.
+        phase_q: (Ng,) complex128 precomputed
+            exp(-1j * grid_coords @ canonical_kpts[q_index]); callers
+            looping over q should precompute via precompute_phase_all_q.
+            Exactly one of grid_coords/phase_q must be given.
         rtol: forwarded to the device sandwich solve.
-        retained_solve_residual_gate: HARD host-side gate (design v2.1
-            section 5: "machine-tier, HARD gate <=1e-10 at c128") on
-            solve_info["retained_solve_residual"], checked AFTER the
-            jitted solve returns. Also hard-fails if n_retained == 0.
-            hermitian_sandwich_solve_device cannot raise from inside its
-            own jax.jit graph on a traced value (n_retained==0 there
-            silently degrades to W=0), so THIS host wrapper is
-            responsible for turning that degradation into a precise
-            error at the source -- not a confusing physics mismatch
-            surfacing downstream in a consumer-level parity gate.
-        self_paired: True when this q satisfies neg[q]==q -- see
-            apply_raw_kernel_and_solve's docstring for the full
-            derivation; kern_q.real is taken before the solve.
+        retained_solve_residual_gate: HARD host-side gate on
+            solve_info["retained_solve_residual"]; also hard-fails on
+            n_retained == 0 (the jitted solve cannot raise on traced
+            values, so degradation is turned into an error here).
+        self_paired: True when neg[q]==q; kern_q.real is taken before the
+            solve (see apply_raw_kernel_and_solve).
 
     Returns:
-        (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 jax
-        array (the solved kernel matrix); kern_q is the raw (Nip, Nip)
-        contracted kernel before the sandwich solve; solve_info is the
-        device sandwich solve's own info dict.
-
-    Raises:
-        ValueError: malformed shapes, or (post-solve) n_retained == 0 or
-            solve_info["retained_solve_residual"] exceeds
-            retained_solve_residual_gate -- both include q_index in the
-            message.
+        (W_q, kern_q, solve_info): W_q (Nip, Nip) complex128 jax array;
+        kern_q the raw contracted kernel; solve_info the solve info dict.
     """
     from pytc.df.solvers import _check_retention_marginal, hermitian_sandwich_solve_device
 
@@ -818,16 +505,8 @@ def apply_kernel_and_solve_device(
     eta_q_jnp = jnp.asarray(eta_q, dtype=jnp.complex128)
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
 
-    # Eager-glue fusion (task #25/C2 item 1): when the provider exposes a
-    # fused fast path (RawKernelProvider does), the ENTIRE phase-multiply
-    # -> apply -> conjugate -> ZGEMM -> solve chain runs as one jax.jit
-    # graph with zero numpy/jax boundary crossings -- this is the fix for
-    # the 6.3x fused-vs-sum-of-parts eager-orchestration overhead measured
-    # on a real V100 (task #22 tile harness, JID 59179666) after the
-    # earlier phase-cache fix (fa7d7f9) had already ruled out the phase
-    # recompute as the gap's cause. Providers without the hook (e.g. a
-    # future ibp provider) fall back to the original eager per-stage path
-    # below, unfused but correct -- see RawKernelProvider's docstring.
+    # Providers with a fused fast path run the whole chain as one jax.jit
+    # graph; others fall back to the eager per-stage path below.
     fused = getattr(provider, "fused_apply_and_solve", None)
     if fused is not None:
         (
@@ -873,10 +552,8 @@ def apply_kernel_and_solve_device(
 
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
 
-    # Host-side gate: the jitted solve cannot raise on a traced value,
-    # so degeneracy is turned into a precise, q-indexed error HERE
-    # rather than surfacing as a silent W_q=0 that would only be caught
-    # downstream at a consumer-level parity gate.
+    # Host-side gate: the jitted solve cannot raise on a traced value, so
+    # degeneracy becomes a precise, q-indexed error here (not a silent W_q=0).
     if solve_info["n_retained"] == 0:
         raise ValueError(
             f"apply_kernel_and_solve_device: q_index={q_index} retained ZERO modes of "
@@ -901,54 +578,24 @@ def apply_kernel_and_solve_device(
 
 def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4,
                            retained_solve_residual_gate=1e-10):
-    """S4 orchestration (design v2.1 section 6): build the full coul_kpt
-    array (Nk, Nip, Nip) by calling apply_kernel_and_solve_device once
-    per UNIQUE {q, neg[q]} pair, exploiting the q<->-q conjugate closure
-    to halve the FFT/coulG/solve work -- "S4 streams per-q (and its
-    neg[q] partner, processed together to exploit the conjugate
-    relation)".
-
-    For self-paired q (neg[q] == q -- Gamma, and any other BZ-edge
-    self-paired point), the pipeline runs directly. For a genuine pair
-    {q, neg[q]} with neg[q] != q, only the LOWER-indexed member runs
-    through the pipeline; the other is set by direct conjugation:
-        W[neg[q]]    = conj(W[q])
-        kern[neg[q]] = conj(kern[q])
-    This is an EXACT identity, not an approximation -- it follows from
-    Pi[neg[q]] = conj(Pi[q]) and eta[neg[q]] = conj(eta[q])
-    (pair_convolve's own q<->-q closure) propagating through: lq[neg[q]]
-    = conj(lq[q]) (module-level comment above), kern[neg[q]] =
-    conj(kern[q]) (same derivation extended one ZGEMM further), and
-    hermitian_sandwich_solve's W = Pi^+ V Pi^+ conjugating cleanly
-    because eigh(conj(M)) has the same eigenvalues with conjugated
-    eigenvectors. Verified against INDEPENDENTLY computed neg[q] builds
-    (not just self-consistency) in
+    """S4 orchestration: build coul_kpt (Nk, Nip, Nip) with one
+    apply_kernel_and_solve_device call per unique {q, neg[q]} pair; the
+    partner is set by exact conjugation (W[neg[q]] = conj(W[q]),
+    kern[neg[q]] = conj(kern[q])). See design doc §6; verified against
+    independent neg[q] builds in
     test_build_coul_kpt_device_conjugate_shortcut_matches_independent_build.
 
     Args:
-        provider: KernelProvider (e.g. RawKernelProvider), already
-            constructed against mesh_obj.canonical_kpts/grid_mesh.
-        Pi: (Nk, Nip, Nip) complex128, e.g. from build_pi_eta.
-        eta: (Nk, Nip, Ng) complex128, e.g. from build_pi_eta.
-        grid_coords: (Ng, 3) real-space grid point coordinates.
-        mesh_obj: pytc.pbc.df.kpts.KptsMesh (uses .neg, .n_kpts).
-        rtol: forwarded to the device sandwich solve.
-        retained_solve_residual_gate: forwarded to
-            apply_kernel_and_solve_device.
+        provider: KernelProvider built against mesh_obj.canonical_kpts.
+        Pi: (Nk, Nip, Nip) complex128.
+        eta: (Nk, Nip, Ng) complex128.
+        grid_coords: (Ng, 3).
+        mesh_obj: KptsMesh (uses .neg, .n_kpts).
 
     Returns:
-        (coul_kpt, kern_kpt, infos, n_pipeline_calls): coul_kpt/kern_kpt
-        are (Nk, Nip, Nip) jax arrays; infos is a length-Nk list of solve
-        info dicts (a conjugated q shares its pair partner's dict object
-        -- no independent solve ran for it, so there is no separate info
-        to report); n_pipeline_calls is the number of q's that actually
-        ran the FFT/coulG/solve pipeline (<=Nk, the measured efficiency
-        win from the conjugate shortcut, recorded for provenance).
-
-    Raises:
-        ValueError: malformed shapes, or forwarded from
-            apply_kernel_and_solve_device for any q that runs the
-            pipeline directly.
+        (coul_kpt, kern_kpt, infos, n_pipeline_calls): (Nk, Nip, Nip) jax
+        arrays; length-Nk info list (a conjugated q shares its partner's
+        dict); number of q's that actually ran the pipeline.
     """
     n_kpts = mesh_obj.n_kpts
     Pi = np.asarray(Pi)
@@ -958,12 +605,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
     if eta.shape[0] != n_kpts:
         raise ValueError(f"eta.shape[0]={eta.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
 
-    # Glue-fix (task #25/C2 item 1, design v2.1 section 6): precompute
-    # every q's Bloch phase ONCE (one grid_coords upload, one batched
-    # jitted matmul) instead of letting each apply_kernel_and_solve_device
-    # call recompute it from scratch -- measured as 72% of the unfused
-    # per-q wall time on a real V100 (task #22 tile harness), and a
-    # per-q constant that never changes within one build.
+    # Precompute every q's Bloch phase once: per-q constant within one build.
     phase_all = precompute_phase_all_q(grid_coords, mesh_obj.canonical_kpts)
 
     neg = mesh_obj.neg
@@ -1005,23 +647,11 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
 
 def stream_ao_blocks(cell, kpts, grid_coords, block_size):
     """S1: stream AO values at kpts over grid_coords in blocks of
-    block_size grid points, evaluating cell.pbc_eval_gto once per block --
-    bounds host memory to one block's worth of AO data regardless of Ng.
-    Blocks compose directly with build_pi_eta's own ao_blocks iterable
-    support (pass a generator expression dropping the (g0,g1) bounds).
-
-    Args:
-        cell: pyscf.pbc.gto.Cell.
-        kpts: (Nk,3) absolute k-points.
-        grid_coords: (Ng,3) real-space grid point coordinates.
-        block_size: positive int, grid points per block.
+    block_size grid points; host memory stays bounded by one block.
 
     Yields:
-        (g0, g1, ao_block): g0/g1 are the grid-index bounds [g0,g1) this
-        block covers; ao_block is (Nk, g1-g0, Nao) complex128.
-
-    Raises:
-        ValueError: malformed grid_coords or non-positive block_size.
+        (g0, g1, ao_block): grid-index bounds [g0,g1) and the
+        (Nk, g1-g0, Nao) complex128 block.
     """
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     if grid_coords.ndim != 2 or grid_coords.shape[1] != 3:
@@ -1047,35 +677,17 @@ def stream_ao_blocks(cell, kpts, grid_coords, block_size):
 
 
 def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
-    """S2 periodic pivot-selection metric oracle (design v2.1 section 3):
-    a (diag, col_eval) pair for the reference-cell (R=0 supercell image)
-    pair-density Gram matrix
-
-        M[r,r'] = | sum_{k,mu} conj(AO_k(r,mu)) AO_k(r',mu) |^2 / Nk
-
-    fed to pivoted_cholesky_hermitian for interpolation-point selection.
-    M is never materialized. diag(M) costs ONE streamed AO-grid sweep
-    (a single pass suffices since M[r,r] only needs AO at r itself); each
-    col_eval(j) call costs its OWN full streamed AO-grid sweep (a single
-    extra point evaluation at r_j, then re-sweeping the whole grid against
-    it) -- selecting `rank` pivots therefore costs `rank` full AO-grid
-    sweeps, matching the design's own "measured cost honesty" accounting
-    (this traffic is NOT a cheap column fetch and should be recorded by
-    the caller, not hidden).
-
-    Args:
-        cell: pyscf.pbc.gto.Cell.
-        kpts: (Nk,3) absolute k-points.
-        grid_coords: (Ng,3) real-space grid point coordinates.
-        block_size: forwarded to stream_ao_blocks.
+    """S2 periodic pivot-selection metric oracle (design doc §3): a
+    (diag, col_eval) pair for the reference-cell pair-density Gram matrix
+    M[r,r'] = |sum_{k,mu} conj(AO_k(r,mu)) AO_k(r',mu)|^2 / Nk, never
+    materialized. Each col_eval(j) costs a full streamed AO-grid sweep,
+    so selecting `rank` pivots costs `rank` sweeps -- callers should
+    account for this traffic.
 
     Returns:
-        (diag, col_eval): diag is (Ng,) float64; col_eval(j) -> (Ng,)
-        complex128 (M's j-th column; M is real-valued, complex128 dtype
-        only to match pivoted_cholesky_hermitian's contract).
-
-    Raises:
-        ValueError: forwarded from stream_ao_blocks for malformed inputs.
+        (diag, col_eval): diag (Ng,) float64; col_eval(j) -> (Ng,)
+        complex128 (M is real-valued; complex128 only to match
+        pivoted_cholesky_hermitian's contract).
     """
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     n_grid = grid_coords.shape[0]
@@ -1104,39 +716,18 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
 
 
 # ---------------------------------------------------------------------------
-# Staging-policy layer (design v2.1 section 6): predicted-byte-model-driven
-# selection among three eta-store staging policies (ram/memmap/recompute),
-# plus the memmap/recompute mechanics themselves.
-#
-# Byte model here is PREDICTED ONLY. Observed HBM/XLA figures are a later
-# calibration-gate deliverable; this layer's provenance schema carries the
-# observed fields from day one, explicitly None/"unmeasured", so a later
-# pass backfills real numbers without any schema change. Real host/disk
-# resource queries live in exactly one function (query_host_resources) so
-# the policy-selection decision itself takes plain injected numbers and
-# stays fully testable with synthetic inputs, including forced-demotion
-# cases, with no real memory/disk pressure required.
+# Staging-policy layer (design doc §6): predicted-byte-model-driven selection
+# among ram/memmap/recompute eta-store policies, plus the mechanics.
+# Byte model is PREDICTED ONLY; observed fields exist in the schema as
+# None/"unmeasured" so a later calibration pass backfills without a schema
+# change. Real resource queries live only in query_host_resources.
 
 
 def predicted_byte_model(n_kpts, n_ip, n_grid, n_ao, block_size, *, itemsize=16):
-    """Predicted byte counts for one build (design v2.1 section 6), c128
-    (itemsize=16) throughout. Every quantity is a closed-form prediction
-    from the problem's own shape parameters -- nothing here is measured.
-
-    Returns:
-        dict: ao_grid_block_bytes (one streamed AO block), eta_store_bytes
-        (the full (Nk,Nip,Ng) eta array a staging policy must place
-        somewhere), double_buffer_bytes (per-block device scratch, 2x),
-        fft_workspace_bytes (per-q-slab-pair scratch, 2x),
-        pi_v_w_workspace_bytes (O(Nk*Nip^2) Pi/V/W storage +
-        O(Nip^2) eigh scratch), selection_traffic_bytes (Nip full
-        AO-grid sweeps -- the S2 pivot-selection cost), and
-        total_predicted_bytes (eta_store + selection_traffic, the two
-        terms choose_staging_policy actually gates on).
-
-    Raises:
-        ValueError: any shape parameter is not a positive integer.
-    """
+    """Closed-form predicted byte counts for one build (c128, itemsize=16);
+    nothing here is measured. Returns a dict of the per-component byte
+    terms plus total_predicted_bytes (eta_store + selection_traffic).
+    See design doc §6."""
     for name, value in (
         ("n_kpts", n_kpts), ("n_ip", n_ip), ("n_grid", n_grid),
         ("n_ao", n_ao), ("block_size", block_size),
@@ -1165,38 +756,17 @@ def predicted_byte_model(n_kpts, n_ip, n_grid, n_ao, block_size, *, itemsize=16)
 
 def choose_staging_policy(byte_model, *, available_host_bytes, available_disk_bytes,
                            ram_headroom_fraction=0.5, disk_headroom_fraction=0.9):
-    """Select a staging policy for the eta store from a PREDICTED byte
-    model (predicted_byte_model) and caller-supplied available-resource
-    numbers -- never queried internally here, so this function stays
-    synthetic-input testable (see query_host_resources for the one place
-    real numbers are read).
+    """Select the eta-store staging policy from a predicted byte model and
+    caller-supplied resource numbers (never queried internally, so this
+    stays synthetic-input testable).
 
-    Rule: "ram" if eta_store_bytes fits within ram_headroom_fraction of
-    available_host_bytes; else "memmap" if it fits within
-    disk_headroom_fraction of available_disk_bytes; else "recompute".
+    Rule: "ram" if eta_store_bytes <= ram_headroom_fraction *
+    available_host_bytes; else "memmap" if it fits the disk headroom;
+    else "recompute".
 
-    Args:
-        byte_model: dict from predicted_byte_model.
-        available_host_bytes: free host RAM, as measured or synthesized.
-        available_disk_bytes: free scratch-disk space, as measured or
-            synthesized.
-        ram_headroom_fraction: overridable threshold (default 0.5,
-            matching "<=50% of free RAM else demote policy").
-        disk_headroom_fraction: overridable threshold for the memmap
-            fallback (default 0.9).
-
-    Returns:
-        dict: policy ("ram"|"memmap"|"recompute"), eta_store_bytes,
-        ram_headroom_bytes, disk_headroom_bytes, ram_headroom_fraction,
-        disk_headroom_fraction, available_host_bytes,
-        available_disk_bytes, observed_peak_host_bytes (always None
-        here), observed_status (always "unmeasured" here) -- the last
-        two fields exist so a later calibration pass backfills real
-        values into this SAME schema, never a different one.
-
-    Raises:
-        ValueError: negative resource numbers, or a fraction outside
-            (0,1].
+    Returns a provenance dict; observed_peak_host_bytes/observed_status
+    are always None/"unmeasured" here so a later calibration pass
+    backfills the SAME schema.
     """
     eta_bytes = byte_model["eta_store_bytes"]
     if eta_bytes < 0:
@@ -1239,12 +809,8 @@ def choose_staging_policy(byte_model, *, available_host_bytes, available_disk_by
 
 
 def query_host_resources(scratch_dir="."):
-    """The one place this module reads REAL host/disk resource numbers
-    (psutil / shutil.disk_usage) -- keeps choose_staging_policy itself
-    free of any hidden system call, so its decision logic stays
-    synthetic-input testable. Callers wanting a real-system staging
-    decision call this, then pass the result into choose_staging_policy;
-    tests construct available_host_bytes/available_disk_bytes directly.
+    """The one place this module reads real host/disk resource numbers
+    (psutil / shutil.disk_usage); pass the result to choose_staging_policy.
 
     Returns:
         (available_host_bytes, available_disk_bytes): both int.
@@ -1259,30 +825,10 @@ def query_host_resources(scratch_dir="."):
 
 
 def jit_memory_analysis_smoke(jitted_fn, *args):
-    """Compiled-program memory recording (design v2.1 section 6's "XLA
-    temporaries bounded by the jitted-program's compiled memory report"
-    note): compiles jitted_fn against args and returns its jax
-    CompiledMemoryStats. The label reflects the ACTUAL backend this ran
-    on -- "cpu_backend_structural_smoke_not_hbm" only when
-    jax.default_backend() is "cpu" (this machine, today); on a real GPU
-    backend the label instead reads "gpu_backend_compiled_memory_stats"
-    since compiled memory stats on an actual GPU ARE genuine device
-    memory data, not a smoke test -- mislabeling a real GPU run as
-    "not_hbm" would be exactly the false/omitted-observed-number failure
-    this layer's provenance schema is designed to avoid.
-
-    Args:
-        jitted_fn: a jax.jit-wrapped function.
-        *args: example arguments determining the compiled program's
-            shapes (values are only used for shape/dtype; not executed).
-
-    Returns:
-        dict: backend (jax.default_backend()), label (see above), and
-        every field of jax's CompiledMemoryStats
-        (generated_code_size_in_bytes, argument_size_in_bytes,
-        output_size_in_bytes, alias_size_in_bytes, temp_size_in_bytes,
-        plus the host_* counterparts).
-    """
+    """Compile jitted_fn against args (shapes/dtypes only; not executed)
+    and return its jax CompiledMemoryStats as a dict, labeled by the
+    actual backend (CPU stats are a structural smoke, not HBM data).
+    See design doc §6."""
     backend = jax.default_backend()
     label = (
         "cpu_backend_structural_smoke_not_hbm"
@@ -1307,24 +853,17 @@ def jit_memory_analysis_smoke(jitted_fn, *args):
 
 
 def stage_eta_memmap(eta_chunks_iter, shape, memmap_path):
-    """memmap staging mechanics (policy 2): write streamed eta chunks
-    into a q-major np.memmap on disk at memmap_path, without ever
-    holding the full (Nk,Nip,Ng) eta array in host RAM at once.
+    """memmap staging (policy 2): write streamed eta chunks into an
+    np.memmap at memmap_path without holding the full (Nk,Nip,Ng) eta in
+    RAM.
 
     Args:
-        eta_chunks_iter: iterable of (g0, g1, chunk), chunk shape
-            (Nk,Nip,g1-g0) complex128, covering [0,Ng) contiguously and
-            in order (matches stream_ao_blocks' own (g0,g1,block) shape,
-            after routing each streamed AO block through build_pi_eta's
-            per-block pair_convolve call).
-        shape: (Nk,Nip,Ng), the full logical eta array shape.
-        memmap_path: filesystem path for the backing file.
+        eta_chunks_iter: iterable of (g0, g1, chunk), chunk
+            (Nk,Nip,g1-g0) complex128, covering [0,Ng) in order.
+        shape: (Nk,Nip,Ng).
 
     Returns:
-        np.memmap of shape `shape`, dtype complex128, flushed to disk.
-
-    Raises:
-        ValueError: shape is not a 3-tuple of positive ints.
+        np.memmap, dtype complex128, flushed to disk.
     """
     shape_t = tuple(int(x) for x in shape)
     if len(shape_t) != 3 or any(s <= 0 for s in shape_t):
@@ -1338,27 +877,10 @@ def stage_eta_memmap(eta_chunks_iter, shape, memmap_path):
 
 
 def stage_eta_recompute_tile(X, ao_block_source, phase, q_slice=None):
-    """recompute staging mechanics (policy 3): no staged array at all --
-    re-exposes build_pi_eta's own streaming contract as the "recompute
-    per-q-tile" entry point, so a caller under memory/disk pressure
-    rebuilds eta ON DEMAND by re-streaming grid blocks through
-    ao_block_source, at the cost of one full rebuild per call. The
-    mechanics ARE build_pi_eta's existing streaming support; the only
-    thing this adds is the CONTRACT that ao_block_source is called fresh
-    every time (recompute implies re-streaming from scratch), plus an
-    optional q-tile slice applied after the build.
-
-    Args:
-        X: (Nk,Nip,Nao) complex128, same as build_pi_eta's X.
-        ao_block_source: callable, ao_block_source() -> a FRESH iterable
-            of (Nk,blk,Nao) blocks each call (e.g. a lambda wrapping
-            stream_ao_blocks(...)).
-        phase: forwarded to build_pi_eta.
-        q_slice: optional slice/index applied to Pi/eta's leading (Nk)
-            axis AFTER the full build (this function still runs the
-            complete Alg-1 pair-convolve pass every call; restricting
-            grid streaming itself to a q-tile is a further optimization
-            not implemented here).
+    """recompute staging (policy 3): rebuild eta on demand via build_pi_eta,
+    with ao_block_source() returning a FRESH iterable of (Nk,blk,Nao)
+    blocks on every call. q_slice is applied to the leading (Nk) axis
+    AFTER the full build (the complete pass still runs each call).
 
     Returns:
         (Pi, eta): same as build_pi_eta, optionally sliced by q_slice.

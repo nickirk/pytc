@@ -1,7 +1,6 @@
-"""Generic linear-solve primitives for structured least-squares and SPD
-systems -- model-agnostic (pytc/df/ package reorganization, task #8,
-isdf-coulomb-cuda, 2026-07-12: TC's own orbital fitting and the Coulomb
-path's S-solve share this module, not a parallel implementation)."""
+"""Generic, model-agnostic linear-solve primitives for structured
+least-squares and SPD systems, shared by orbital fitting and the
+Coulomb path's S-solve."""
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
@@ -294,20 +293,10 @@ _RETENTION_MARGINAL_COND_THRESHOLD = 1e3
 
 
 def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller):
-    """Shared diagnostic (design v2.1 section 5, retention-policy fix):
-    the old rtol=1e-8 default's blow-up on over-complete rank came from
-    silently retaining near-singular modes whose inverse then amplifies
-    noise -- rtol=1e-4 fixes the DEFAULT, this catches
-    the case where a caller-supplied rtol (or a system's own spectrum)
-    still leaves the retained subspace close to the danger regime, so
-    the failure mode is a loud warning instead of a silent blow-up.
-
-    Flagged when BOTH hold: the smallest retained eigenvalue is within
-    10x of the retention threshold (rtol*s_max), AND the realized
-    condition number of the retained subspace (s_max/s_min_retained)
-    exceeds 1e3 -- the second check is independent of the first only
-    when a caller overrides rtol far looser than the default, in which
-    case "near the cutoff" alone would not imply high condition number.
+    """Warn loudly when a solve's retained subspace is near the danger
+    regime: flagged when the smallest retained eigenvalue is within 10x of
+    the rtol*s_max cutoff AND the retained condition number exceeds 1e3.
+    See design doc §5.
 
     Returns:
         (retention_marginal, cond_pi): cond_pi is None when
@@ -333,63 +322,32 @@ def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller)
 
 
 def hermitian_sandwich_solve(Pi, V, *, rtol=1e-4, target_truncation_residual=None):
-    """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V, via a
-    relative-spectral-threshold truncated pseudo-inverse of Pi (task #21,
-    #proj-isdf-periodic, design v2.1 section 5). NEW function, added
-    beside the existing SVD/eigh-based solvers above -- reuses NumPy's
-    eigh, not previously-existing code.
+    """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V via a
+    relative-spectral-threshold truncated pseudo-inverse of Pi:
+    W = Pi^+_r V Pi^+_r with modes retained by s_i > rtol * s_max
+    (scale-invariant). Pi and V are Hermitized on entry; their
+    anti-Hermitian residuals are recorded. See design doc §5.
 
-    Both Pi and V are Hermitized on entry (their own anti-Hermitian
-    residuals are recorded, not silently discarded). Pi is eigendecomposed
-    (Hermitian, PSD expected); modes are retained by the RELATIVE
-    threshold s_i > rtol * s_max (scale-invariant -- rescaling Pi/V by a
-    constant does not change which modes are retained). Let U_r be the
-    retained eigenvectors and Sigma_r their eigenvalues; the truncated
-    pseudo-inverse is Pi^+_r = U_r Sigma_r^-1 U_r^dagger, and
-    W = Pi^+_r V Pi^+_r, Hermitized.
-
-    Because U_r consists of Pi's OWN eigenvectors, Pi @ Pi^+_r =
-    Pi^+_r @ Pi = Proj_r (the retained-subspace projector) EXACTLY (to
-    the precision of the eigendecomposition) -- so Pi W Pi = Proj_r V
-    Proj_r exactly on the retained subspace BY CONSTRUCTION, and the
-    total error against the full V is entirely the DISCARDED-space part
-    of V. Two residuals are reported SEPARATELY rather than one combined
-    number, so this cannot be hidden:
-        (i)  retained-space solve residual (machine-tier; should be ~0
-             regardless of rtol -- a numerical sanity check on the
-             eigendecomposition/solve arithmetic, not a scientific gate):
-             ||Proj_r (Pi W Pi - V) Proj_r||_F / ||Proj_r V Proj_r||_F
-        (ii) truncation residual (controlled by rtol/mode retention;
-             REPORTED, not gated here -- its physical consequence is
-             gated downstream at consumer parity):
-             ||V - Proj_r V Proj_r||_F / ||V||_F
+    Two residuals are reported SEPARATELY: retained_solve_residual
+    (machine-tier arithmetic sanity check, ~0 regardless of rtol) and
+    truncation_residual (controlled by rtol; reported, not gated here).
 
     Args:
-        Pi: (n,n) array, Hermitian PSD expected (Hermitized internally
-            regardless).
-        V: (n,n) array, Hermitized internally.
-        rtol: relative spectral retention threshold (default 1e-4 -- design v2.1 section 5 documents the empirical basis; 1e-8 was 4-5 orders too loose and blew up at over-complete rank).
-        target_truncation_residual: optional. If given, after the
-            rtol-based retention, ADDITIONAL modes (in decreasing
-            eigenvalue order) are retained one at a time until the
+        Pi: (n,n), Hermitian PSD expected.
+        V: (n,n).
+        rtol: relative spectral retention threshold (default 1e-4;
+            design doc §5 -- 1e-8 was far too loose at over-complete rank).
+        target_truncation_residual: optional; if given, additional modes
+            are retained (decreasing eigenvalue order) until the
             truncation residual meets this target or all n modes are
-            retained -- recorded via adaptive_retention_used=True and
-            the realized target. The default rtol makes NO promise
-            about the truncation residual; this is how a caller opts
-            into one.
+            retained (adaptive_retention_used=True).
 
     Returns:
-        (W, info) where info is a dict with keys: n_retained,
-        n_discarded, s_max, s_min_retained (None if n_retained==0),
-        pi_anti_hermitian_residual, v_anti_hermitian_residual,
+        (W, info): info keys are n_retained, n_discarded, s_max,
+        s_min_retained (None if n_retained==0), pi/v_anti_hermitian_residual,
         retained_solve_residual, truncation_residual, rtol,
-        adaptive_retention_used, target_truncation_residual (the
-        realized target, or None), dtype, backend ("numpy").
-
-    Raises:
-        ValueError: Pi/V are not square/matching-shape 2-D arrays, or
-            rtol/target_truncation_residual are not finite positive
-            numbers.
+        adaptive_retention_used, target_truncation_residual,
+        retention_marginal, cond_pi_retained, dtype, backend ("numpy").
     """
     Pi = np.asarray(Pi)
     V = np.asarray(V)
@@ -576,42 +534,19 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol):
 
 def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4):
     """Device (JAX, fixed-shape, jitted) counterpart of
-    hermitian_sandwich_solve (design v2.1 sections 5+6/7): the
-    same two-sided Hermitian sandwich solve, restructured to avoid
-    dynamic-shape slicing so the whole computation is one fixed-shape
-    jax.jit graph, entirely device-resident -- see
-    _hermitian_sandwich_solve_core's docstring for the masking rewrite.
+    hermitian_sandwich_solve. See design doc §5-§7.
 
-    Two known simplifications vs the NumPy oracle, both deliberate scope
-    reductions for a first device implementation, not silent bugs:
-      - No hard PSD validation. Raising a Python ValueError from inside a
-        jax.jit graph on a TRACED value (s_max) is not a plain `if`/raise
-        the way host-side NumPy code can do it. A genuinely non-PSD or
-        zero Pi degrades to n_retained=0 (W=0), matching the NumPy
-        oracle's OWN n_retained==0 fallback branch, rather than raising
-        the oracle's separate "Pi not PSD" ValueError. Callers on the
-        device path are expected to have already validated Pi's
-        PSD-ness via the NumPy oracle during development/testing.
-      - No adaptive-retention mode (target_truncation_residual): that is
-        inherently a variable-iteration-count algorithm, which does not
-        fit a fixed-shape jitted graph. It remains a NumPy-host-only
-        diagnostic feature.
-
-    Args:
-        Pi: (n,n) array, Hermitian PSD expected (Hermitized internally).
-        V: (n,n) array, Hermitized internally.
-        rtol: relative spectral retention threshold (default 1e-4 -- design v2.1 section 5 documents the empirical basis; 1e-8 was 4-5 orders too loose and blew up at over-complete rank).
+    Deliberate simplifications vs the NumPy oracle:
+      - No hard PSD validation: the jitted graph cannot raise on a traced
+        value, so a non-PSD/zero Pi degrades to n_retained=0 (W=0)
+        instead of raising.
+      - No adaptive-retention mode (variable iteration count does not fit
+        a fixed-shape jitted graph).
 
     Returns:
-        (W, info): W is (n,n) complex128 jax array. info is a dict with
-        the same keys as hermitian_sandwich_solve's, plus
-        backend="jax"; adaptive_retention_used is always False and
-        target_truncation_residual is always None (see above).
-
-    Raises:
-        ValueError: Pi/V are not square/matching-shape 2-D arrays,
-            not finite, or rtol is not a finite positive number (all
-            host-side checks on the untraced inputs).
+        (W, info): W is (n,n) complex128 jax array; info has the same
+        keys as hermitian_sandwich_solve's, with backend="jax",
+        adaptive_retention_used=False, target_truncation_residual=None.
     """
     Pi_np = np.asarray(Pi)
     V_np = np.asarray(V)

@@ -1,32 +1,7 @@
-"""V2 reference-replay gate: compare Pi^q/eta^q/W^q against the fftisdf
-external CPU oracle (task #20 baseline) on he2-cubic-cell [1,1,3], per
-design v2.1 section 8's V2 spec.
-
-fftisdf lives at ~/Work/src/fftisdf (task #20's clone) and is added to
-sys.path only for THIS test -- reference/oracle only, no fftisdf code
-is imported into any pytc production module (pytc.pbc.df.kpts/isdf
-have zero dependency on it). Skipped cleanly if the clone is absent.
-
-Convention note: fftisdf's own Pi^q/eta^q differ from pytc's own
-pair_convolve-based Pi^q/eta^q by a pure conjugation --
-    fftisdf_Pi[q]  = conj(pytc_Pi[q])
-    fftisdf_eta[q] = conj(pytc_eta[q])
--- since pytc's kpt_to_spc/spc_to_kpt now use the SAME unitary
-k<->supercell transform normalization (1/sqrt(Nk) split evenly across
-both directions, built from the actual canonical k-vectors and pyscf's
-own real-space translation vectors) that fftisdf's own phase-matrix
-construction uses. An earlier pytc implementation used a DIFFERENT
-normalization split (1/Nk on one direction only, via a plain
-np.fft.ifftn reshape that also had an independent k-ordering defect),
-which showed up here as an extra sqrt(Nk) factor on top of the
-conjugation; both were root-caused and fixed together. This is NOT a
-disagreement in either implementation's physics; reference-replay mode
-accounts for the remaining pure conjugation explicitly rather than
-expecting bit-identical raw arrays. apply_raw_kernel_and_solve's own
-kern_q/coulG/FFT logic was verified independently (bit-identical to
-fftisdf's own intermediate values, given the same eta input), isolating
-convention differences precisely to the Pi/eta normalization step, not
-the kernel-application step.
+"""V2 reference-replay gate: compare Pi^q/eta^q/W^q against the external
+fftisdf CPU oracle (sys.path-only, skipped if the clone is absent).
+Convention: fftisdf_Pi[q] = conj(pytc_Pi[q]) and likewise for eta --
+a pure conjugation, accounted for explicitly. See design doc §8.
 """
 
 import os

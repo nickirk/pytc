@@ -1,19 +1,7 @@
 """Periodic k-point canonicalization and the Algorithm-1 pair-convolution
-primitive (task #21, #proj-isdf-periodic, design v2.1 section 4).
+primitive. See design doc §4.
 
-This module is a leaf: it has zero dependency on pytc.df.{pivots,solvers}
-or anything else in pytc, and takes a pyscf Cell object only as an input
-argument (never imports pyscf.pbc.df or fftisdf). It does not evaluate
-AOs itself -- check_time_reversal_residual takes already-evaluated AO
-values as a plain array argument, so this module stays decoupled from
-the actual pbc_eval_gto adapter wiring (a later, Phase-C concern).
-
-k-point canonicalization never compares kpts arrays by exact equality
-(`==`) -- task #20's fftisdf baseline found 8/9 of that repo's own pytest
-suite failing on exactly this mistake: kpts get reprocessed through
-PySCF's own pipeline and come back numerically equivalent but not
-bit-identical (diff ~1e-16), so a strict `==` pre-check fails even
-though the physics is correct. All matching here uses a tolerance
+k-points are never compared by exact equality: matching uses a tolerance
 (ktol) and minimum-image distance on the fractional-coordinate torus.
 """
 
@@ -44,14 +32,9 @@ def _readonly_copy(a):
 
 
 def _fold_fractional(scaled, ktol):
-    """Fold fractional (reciprocal-lattice-vector-unit) coordinates mod 1
-    into [0,1), snapping values within ktol of the 0/1 boundary to exactly
-    0.0 -- this is what makes wrap_around=True and wrap_around=False
-    inputs (and any other gauge) canonicalize to the identical
-    representation: e.g. a BZ-edge fractional coordinate of -0.5 and +0.5
-    are literally the same physical point (mod 1, both fold to 0.5), and
-    roundoff noise near an integer boundary (e.g. -1e-16) folds to exactly
-    0.0 instead of ~1.0 - 1e-16."""
+    """Fold fractional coordinates mod 1 into [0,1), snapping values within
+    ktol of the 0/1 boundary to exactly 0.0 so all wrap_around gauges
+    canonicalize identically."""
     folded = np.mod(scaled, 1.0)
     folded = np.where(folded > 1.0 - ktol, 0.0, folded)
     folded = np.where(folded < ktol, 0.0, folded)
@@ -59,10 +42,9 @@ def _fold_fractional(scaled, ktol):
 
 
 def _match_fractional_points(query, reference, ktol):
-    """Return permutation such that permutation[i] is the unique index j
-    into reference whose minimum-image distance (on the [0,1)^3 torus) to
-    query[i] is <= ktol. Raises if any point has no unique match within
-    tolerance -- never silently picks the nearest-but-too-far point."""
+    """Return permutation with permutation[i] = unique index j into reference
+    within minimum-image distance ktol of query[i]; raises if no unique
+    match."""
     n = query.shape[0]
     if reference.shape[0] != n:
         raise ValueError("query and reference must have the same number of points.")
@@ -88,27 +70,14 @@ def _match_fractional_points(query, reference, ktol):
 class KptsMesh:
     """A canonicalized k-point mesh.
 
-    kpts: the ORIGINAL input k-points (absolute, cell reciprocal units),
-        in the caller's original order.
-    canonical_kpts: a fixed-gauge (wrap_around=False) reference mesh this
-        module generates itself via cell.get_kpts -- the canonical
-        ordering everything else (permutation, neg) is expressed against.
-    permutation: permutation[i] = index into canonical_kpts that kpts[i]
-        matches (within ktol, minimum-image distance in fractional
-        coordinates) -- i.e. canonical_kpts[permutation[i]] is
-        (numerically) the same physical k-point as kpts[i].
-    neg: neg[c] = index into canonical_kpts of -canonical_kpts[c] mod G,
-        an involution (neg[neg[c]] == c for all c).
-    phase: (n_kpts, n_kpts) complex128 unitary k<->supercell-image
-        transform matrix, phase[R,k] = exp(i R.canonical_kpts[k]) /
-        sqrt(n_kpts), R ranging over pyscf's own
-        k2gamma.translation_vectors_for_kmesh(cell, kmesh,
-        wrap_around=False) -- the SAME construction used throughout
-        pyscf's own k2gamma/FFTISDF code, not an independently-invented
-        convention. kpt_to_spc/spc_to_kpt/pair_convolve/build_pi_eta all
-        take this matrix directly (not kmesh) since the correct
-        transform needs the actual k-vectors and real-space translation
-        vectors, not just the mesh shape.
+    kpts: original input k-points (absolute), caller's order.
+    canonical_kpts: fixed-gauge (wrap_around=False) reference mesh;
+        permutation and neg are expressed against it.
+    permutation: permutation[i] = canonical index matching kpts[i].
+    neg: neg[c] = canonical index of -canonical_kpts[c] mod G; involution.
+    phase: (n_kpts, n_kpts) complex128 unitary k<->supercell-image matrix,
+        phase[R,k] = exp(i R.canonical_kpts[k]) / sqrt(n_kpts), with R from
+        k2gamma.translation_vectors_for_kmesh(cell, kmesh, wrap_around=False).
     """
     kpts: object
     kmesh: tuple
@@ -162,9 +131,7 @@ class KptsMesh:
         if not math.isfinite(self.ktol) or self.ktol <= 0.0:
             raise ValueError(f"ktol must be a finite positive float, got {self.ktol!r}.")
 
-        # Gamma must be present, at canonical index 0 -- cell.get_kpts always
-        # places it first for a wrap_around=False mesh containing it; verified
-        # directly here rather than assumed from the builder's own call.
+        # Gamma must be present at canonical index 0; verified, not assumed.
         if not np.allclose(canonical_kpts[0], 0.0, atol=max(self.ktol * 10, 1e-10)):
             raise ValueError(
                 "canonical_kpts[0] must be the Gamma point (0,0,0); this mesh does not "
@@ -197,25 +164,9 @@ class KptsMesh:
 
 
 def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
-    """Canonicalize an arbitrary-order, arbitrary-gauge k-point array
-    against a fixed-gauge reference mesh this module generates itself.
-
-    Args:
-        cell: pyscf.pbc.gto.Cell (or gto.Cell-compatible object exposing
-            get_scaled_kpts/get_abs_kpts/get_kpts).
-        kpts: (n_kpts,3) absolute k-points, any order, any wrap_around
-            gauge -- must form a complete uniform Monkhorst-Pack mesh
-            (checked).
-        ktol: fractional-coordinate matching tolerance (default 1e-8).
-
-    Returns:
-        KptsMesh.
-
-    Raises:
-        ValueError: kpts do not form a complete uniform mesh, or any
-            point cannot be uniquely matched to the canonical mesh
-            within ktol.
-    """
+    """Canonicalize a (n_kpts,3) absolute k-point array (any order/gauge)
+    into a KptsMesh; kpts must form a complete uniform Monkhorst-Pack mesh
+    (checked). Raises ValueError otherwise."""
     kpts_np = np.asarray(kpts, dtype=np.float64)
     if kpts_np.ndim != 2 or kpts_np.shape[1] != 3:
         raise ValueError(f"kpts must have shape (n_kpts,3), got {kpts_np.shape}.")
@@ -251,26 +202,9 @@ def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
 
 
 def build_kconserv(cell, canonical_kpts):
-    """Momentum-conservation table on the canonical mesh: kconserv[k1,k2,k3]
-    = k4 such that (canonical_kpts[k1] - canonical_kpts[k2] +
-    canonical_kpts[k3] - canonical_kpts[k4]) . a = 2*pi*n for integer n
-    (equivalently, k1-k2+k3-k4 is a reciprocal lattice vector) -- pyscf's
-    own convention (pyscf.pbc.lib.kpts_helper.get_kconserv docstring),
-    needed for THC-ERI blocks with 3 independent k-indices (the 4th is
-    fixed by conservation). Delegates to pyscf's own implementation
-    (reuse per the design doc's "no reimplementing existing modules"
-    principle) rather than re-deriving the reciprocal-lattice matching
-    here; canonical_kpts is exactly the uniform-mesh array
-    (cell.get_kpts(kmesh, wrap_around=False)) pyscf's fast path expects,
-    so this is never routed through pyscf's slower general-kpts fallback.
-
-    Args:
-        cell: pyscf.pbc.gto.Cell.
-        canonical_kpts: (n_kpts,3) absolute k-points, e.g. KptsMesh.canonical_kpts.
-
-    Returns:
-        kconserv: (n_kpts, n_kpts, n_kpts) int64 array.
-    """
+    """Momentum-conservation table (n_kpts, n_kpts, n_kpts) int64:
+    kconserv[k1,k2,k3] = k4 with k1-k2+k3-k4 a reciprocal lattice vector
+    (pyscf get_kconserv convention). Delegates to pyscf."""
     from pyscf.pbc.lib.kpts_helper import get_kconserv
 
     canonical_kpts = np.asarray(canonical_kpts, dtype=np.float64)
@@ -278,26 +212,14 @@ def build_kconserv(cell, canonical_kpts):
 
 
 def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
-    """Gate max_k ||AO[neg[k]] - conj(AO[k])|| / ||AO[k]|| <= tol,
-    BEFORE any downstream .real is taken on quantities built from these
-    AO values -- the relation conj(phi^k) = phi^{-k} is a physical
-    identity that must be VERIFIED for a specific realized AO evaluation,
-    never assumed by declaration (a numerical AO evaluator could
-    legitimately fail to preserve it, e.g. through basis-function phase
-    conventions or grid asymmetry).
+    """Gate max_k ||AO[neg[k]] - conj(AO[k])|| / ||AO[k]|| <= tol; must pass
+    before any downstream .real is taken on quantities built from these AOs.
 
     Args:
-        ao_at_kpts: (n_kpts, ..., n_ao) complex128 AO (or AO-derived)
-            values sampled at each canonical k-point, the SAME grid
-            points for every k.
+        ao_at_kpts: (n_kpts, ..., n_ao) complex128, same grid for every k.
         neg: (n_kpts,) int array (KptsMesh.neg).
-        tol: hard gate on the relative residual.
 
-    Returns:
-        max_relative_residual: float.
-
-    Raises:
-        ValueError: the gate fails.
+    Returns the max relative residual; raises ValueError if the gate fails.
     """
     ao = np.asarray(ao_at_kpts)
     neg_np = np.asarray(neg)
@@ -324,36 +246,17 @@ def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
 
 
 def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
-    """Unitary transform from k-space to supercell-image ("R") space:
-    m_spc = (phase @ m_kpt).real, phase[R,k] = exp(i R.k)/sqrt(Nk)
-    (see KptsMesh.phase). This is NOT a plain np.fft.ifftn reshape --
-    an earlier ifftn-based implementation assumed the flat k-index maps
-    onto FFT frequency positions the same way canonical_kpts' actual
-    physical k-ordering does, which is false in general (only a pure
-    normalization-scale coincidence on trivial 1-D-reduced meshes like
-    [1,1,3] masked this for a while; verified wrong by comparing against
-    the explicit unitary construction, which matches an independent
-    reference to machine precision while the ifftn reshape did not).
-    Building `phase` from the actual canonical k-vectors and pyscf's own
-    real-space translation vectors (k2gamma.translation_vectors_for_kmesh)
-    is the only construction that is provably correct on any mesh, not
-    just special-cased ones.
-
-    The imaginary part is gated BEFORE being discarded -- never a silent
-    .real truncation.
+    """Unitary transform k-space -> supercell-image space:
+    m_spc = (phase @ m_kpt).real. NOT a plain np.fft.ifftn reshape --
+    the flat k-index does not map onto FFT frequency positions in general;
+    phase must be the explicit (Nk,Nk) unitary matrix (KptsMesh.phase).
+    The imaginary part is gated (imag_tol) before being discarded.
 
     Args:
-        m_kpt: (Nk, ...) complex128, expected time-reversal-symmetric
-            across k (m_kpt[neg[k]] = conj(m_kpt[k])) -- required for
-            the transform's image to be real.
-        phase: (Nk, Nk) complex128 unitary matrix, e.g. KptsMesh.phase.
-        imag_tol: gate on ||Im(m_spc)||/||m_spc|| before discarding Im.
+        m_kpt: (Nk, ...) complex128, time-reversal-symmetric across k
+            (m_kpt[neg[k]] = conj(m_kpt[k])) so the image is real.
 
-    Returns:
-        m_spc: (Nk, ...) real64.
-
-    Raises:
-        ValueError: malformed shapes, or the imag_tol gate fails.
+    Returns (Nk, ...) real64; raises ValueError on bad shapes or gate fail.
     """
     m_kpt = np.asarray(m_kpt)
     if m_kpt.ndim < 1:
@@ -379,20 +282,8 @@ def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
 
 
 def spc_to_kpt(m_spc, phase):
-    """Inverse of kpt_to_spc (modulo its imag_tol gate; this direction
-    never discards anything): m_kpt = phase^dagger @ m_spc, matching the
-    unitary construction's own adjoint.
-
-    Args:
-        m_spc: (Nk, ...) array, real or complex.
-        phase: (Nk, Nk) complex128 unitary matrix, e.g. KptsMesh.phase.
-
-    Returns:
-        m_kpt: (Nk, ...) complex128.
-
-    Raises:
-        ValueError: malformed shapes.
-    """
+    """Inverse of kpt_to_spc: m_kpt = phase^dagger @ m_spc.
+    Returns (Nk, ...) complex128; this direction never discards anything."""
     m_spc = np.asarray(m_spc)
     if m_spc.ndim < 1:
         raise ValueError("m_spc must have at least 1 dimension (the supercell-image axis).")
@@ -407,34 +298,19 @@ def spc_to_kpt(m_spc, phase):
 
 
 def pair_convolve(X, Y, phase, *, imag_tol=1e-10):
-    """Paper Algorithm 1: assemble Z[q] without an O(Nk^2) direct sum, via
-    per-k GEMM, the unitary k<->supercell-image transform, elementwise
-    square in real (supercell-image) space, then the inverse transform
-    back to momentum space.
-
-        T[k]   = X[k] @ conj(Y[k]).T   -- conj(Y[k]) stands for Y^{-k} by
-                                           the time-reversal identity
-                                           conj(phi^k) = phi^{-k}, not by
-                                           array reindexing.
-        T_R    = kpt_to_spc(T, phase)  -- unitary transform, gated.
-        Z_R    = T_R ** 2               -- elementwise square, real space.
-        Z[q]   = spc_to_kpt(Z_R, phase) -- inverse transform back to
-                                           momentum space.
+    """Paper Algorithm 1: Z[q] without the O(Nk^2) direct sum. Per-k
+    T[k] = X[k] @ conj(Y[k]).T (conj stands for Y^{-k} via time reversal),
+    transform to supercell-image space (gated), square elementwise,
+    transform back. See design doc §4.
 
     Args:
         X: (Nk, Nip, Nao) complex128.
         Y: (Nk, F, Nao) complex128.
-        phase: (Nk, Nk) complex128 unitary transform matrix, e.g.
-            KptsMesh.phase -- the SAME canonical k/q-mesh ordering X/Y's
-            axis 0 is indexed by.
-        imag_tol: gate on ||Im(T_R)|| / ||T_R|| before discarding Im(T_R).
+        phase: (Nk, Nk) unitary matrix in the SAME canonical k/q ordering
+            as X/Y's axis 0.
 
     Returns:
-        Z: (Nk, Nip, F) complex128, in the same canonical k/q ordering.
-
-    Raises:
-        ValueError: malformed shapes, or the imag_tol gate fails
-            (X/Y are not a valid time-reversal-symmetric pair).
+        Z: (Nk, Nip, F) complex128, same canonical k/q ordering.
     """
     X = np.asarray(X)
     Y = np.asarray(Y)

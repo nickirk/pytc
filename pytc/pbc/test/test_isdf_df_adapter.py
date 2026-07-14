@@ -1,14 +1,6 @@
-"""Tests for pytc.pbc.coulomb.ISDFDF (design v2.1 section 8, V4 gate):
-the thin pyscf-compatible with_df adapter that lets a real, unmodified
-pyscf KRHF/KRKS SCF loop consume this module's build()/get_k/get_j.
-
-Real pyscf KRHF runs (not synthetic get_jk-interface mocks) since the
-whole point of this adapter is exercising OUR integrals inside PYSCF'S
-UNMODIFIED SCF machinery -- a synthetic interface test would not catch
-wiring bugs against pyscf's actual get_hcore/get_veff call chain (e.g.
-the with_df.get_pp/get_nuc delegation this class needed once mf.get_hcore
-was actually exercised).
-"""
+"""Tests for pytc.pbc.coulomb.ISDFDF (design doc §8, V4 gate): real,
+unmodified pyscf KRHF runs consuming our integrals via with_df -- not
+synthetic get_jk mocks."""
 
 import unittest
 

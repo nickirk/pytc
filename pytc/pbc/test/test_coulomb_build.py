@@ -1,10 +1,6 @@
-"""End-to-end test for pytc.pbc.coulomb.build (design v2.1 section 2):
-wires S1-S4 together on a real, tiny periodic cell and checks the
-resulting artifact is self-consistent and matches a from-scratch
-reconstruction via the already-tested individual stage functions.
-
-get_k/get_j structural tests live in test_coulomb_get_k_get_j.py.
-"""
+"""End-to-end test for pytc.pbc.coulomb.build (design doc §2): S1-S4 on a
+tiny real cell vs a from-scratch stage-by-stage reconstruction.
+get_k/get_j structural tests live in test_coulomb_get_k_get_j.py."""
 
 import unittest
 
