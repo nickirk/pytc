@@ -258,7 +258,7 @@ class TestGetKVsRealFftdf(unittest.TestCase):
 
 class TestGenuinePairMeshRegression(unittest.TestCase):
     """Permanent regression guard for the Pi/eta q<->-q convention bug
-    (design doc section 4 audit trail, task #25/C2 item 2b): every mesh
+    (design doc section 4 audit trail): every mesh
     used elsewhere in this file before this fix had a self-paired-only
     subset that never exercised it. kmesh=[1,1,4] has neg=[0,3,2,1] --
     q=0,2 self-paired, q=1,3 a genuine pair -- the smallest mesh that
@@ -348,7 +348,7 @@ class TestRetentionPolicyDefaultAvoidsBlowup(unittest.TestCase):
         self.assertLess(rel, 2.0)
 
     def test_explicit_old_default_still_blows_up_documenting_why_it_changed(self):
-        # Historical reframe (task #25/C2 item 2b): this used to assert
+        # Historical reframe: this used to assert
         # rel > 5.0 for the explicit old rtol=1e-8, well above the new
         # default's bounded regime. Post the Pi/eta q<->-q convention fix,
         # rtol=1e-8 and the new default land in the same ~0.77-0.80 rel
