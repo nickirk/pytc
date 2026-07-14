@@ -1422,9 +1422,13 @@ def ibp_core(left, right=None, *, operator, symmetry_mode="two_sided_average",
         left: sector for the same-sector core, or sector A for a cross core.
         right: None (same-sector: right_sector = left, no duplicated compute)
             or sector B (cross-sector).
-        operator: IBPOperatorPlan, REQUIRED. Its bound grid must be the same
-            grid object both sectors were built on; only method="direct" is
-            implemented. The operator and both sectors must share one backend.
+        operator: IBPOperatorPlan, REQUIRED. Its bound grid must be
+            numerically compatible with both sectors' grids -- equal
+            coords/weights and matching backend/device/dtype/n_grid/
+            coincident-point policy (independently built but numerically
+            identical grids are accepted, not only the same object); only
+            method="direct" is implemented. The operator and both sectors must
+            share one backend.
         symmetry_mode: "two_sided_average" (default) or "one_sided" (diagnostic).
         mu_block_size/nu_block_size: bound the pivot-axis blocking; None
             resolves to each sector's full selected_rank.

@@ -476,5 +476,33 @@ class TestJaxFloat32Subprocess(unittest.TestCase):
                       msg=f"stdout={result.stdout}\nstderr={result.stderr[-2000:]}")
 
 
+class TestJaxGridCompat(unittest.TestCase):
+    """ibp_core grid compatibility on the JAX backend is numerical: the
+    device-side scalar-sync equality branch of _grids_equal accepts an
+    independently built numerically-identical grid and rejects a mismatch."""
+
+    def _plan(self, coords, weights):
+        grid = build_ibp_grid(jnp.asarray(coords), jnp.asarray(weights), backend="jax")
+        return build_ibp_operator_plan(grid, eval_block_size=8, source_block_size=16)
+
+    def test_independent_twin_grid_succeeds_and_mismatch_rejects(self):
+        coords, weights, fp, gp = _data(np.float64)
+        g1 = build_ibp_grid(jnp.asarray(coords), jnp.asarray(weights), backend="jax")
+        g2 = build_ibp_grid(jnp.asarray(coords.copy()), jnp.asarray(weights.copy()),
+                            backend="jax")
+        self.assertIsNot(g1, g2)
+        sector = _sector(g1, fp, gp, "jax")
+        twin_plan = build_ibp_operator_plan(g2, eval_block_size=8, source_block_size=16)
+        core = ibp_core(sector, operator=twin_plan, symmetry_mode="one_sided",
+                        mu_block_size=2, nu_block_size=3)  # numerically-equal -> succeeds
+        self.assertEqual(core.backend, "jax")
+        coords_bad = coords.copy(); coords_bad[0, 0] += 1e-9
+        weights_bad = weights.copy(); weights_bad[0] += 1e-9
+        for bad_plan in (self._plan(coords_bad, weights), self._plan(coords, weights_bad)):
+            with self.assertRaises(ValueError):
+                ibp_core(sector, operator=bad_plan, symmetry_mode="one_sided",
+                         mu_block_size=2, nu_block_size=3)
+
+
 if __name__ == "__main__":
     unittest.main()
