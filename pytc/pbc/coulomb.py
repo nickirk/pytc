@@ -344,3 +344,97 @@ def get_j(cell, dm_kpts, kpts):
     from pyscf.pbc.df.fft_jk import get_j_kpts
 
     return get_j_kpts(FFTDF(cell), dm_kpts, kpts=np.asarray(kpts))
+
+
+class ISDFDF:
+    """Thin pyscf-compatible `with_df` adapter (design v2.1 section 8,
+    V4 gate): wraps this module's build()/get_k/get_j behind the
+    `get_jk(dm, hermi, kpts, kpts_band, with_j, with_k, omega, exxdiv)`
+    interface pyscf's KRHF/KRKS classes call on `mf.with_df` -- so V4
+    exercises OUR integrals inside PYSCF'S UNMODIFIED SCF machinery
+    against FFTDF's integrals in the SAME machinery, not a hand-rolled
+    SCF loop (which would entangle a from-scratch SCF implementation
+    into the comparison and weaken the gate).
+
+    Gate-thin by design: no caching cleverness beyond the one-time
+    build() memoization every df object needs to avoid rebuilding the
+    interpolation-point factor every SCF iteration, and no feature
+    completeness beyond what KRHF/KRKS actually call (kpts_band and
+    omega are explicitly NOT supported -- band-structure evaluation and
+    range-separated hybrids are out of scope for this gate).
+
+    Args:
+        cell: pyscf.pbc.gto.Cell.
+        kpts: (Nk,3) absolute k-points, e.g. cell.make_kpts(kmesh).
+        rank: requested interpolation-point rank (forwarded to build()).
+        block_size: grid points per streamed AO block (forwarded).
+        rtol: forwarded to the device Hermitian sandwich solve.
+    """
+
+    def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4):
+        self.cell = cell
+        self.kpts = np.asarray(kpts, dtype=np.float64)
+        self.rank = rank
+        self.block_size = block_size
+        self.rtol = rtol
+        self._built = None
+        # KRHF/KRKS's get_hcore calls with_df.get_pp/get_nuc for the
+        # pseudopotential/nuclear-attraction core-Hamiltonian term -- an
+        # AO-grid integral unrelated to the J/K Coulomb factorization
+        # this adapter exists to gate; delegate to a real FFTDF instance
+        # (composition, not reimplementation) rather than reinventing it,
+        # same pattern get_j already uses.
+        from pyscf.pbc.df import FFTDF
+
+        self._core_df = FFTDF(cell, kpts)
+
+    def get_pp(self, kpts=None):
+        return self._core_df.get_pp(self.kpts if kpts is None else kpts)
+
+    def get_nuc(self, kpts=None):
+        return self._core_df.get_nuc(self.kpts if kpts is None else kpts)
+
+    def build(self):
+        """Runs S1-S4 once and caches the result; a real SCF loop calls
+        get_jk every iteration but the interpolation-point factor and
+        solved kernel are density-independent, so rebuilding them per
+        iteration would be wasted (and wrong-scope) work for this gate.
+        """
+        if self._built is None:
+            self._built = build(
+                self.cell, self.kpts, rank=self.rank, block_size=self.block_size,
+                rtol=self.rtol,
+            )
+        return self._built
+
+    def get_jk(self, dm_kpts, hermi=1, kpts=None, kpts_band=None, with_j=True,
+               with_k=True, omega=None, exxdiv=None):
+        if omega is not None:
+            raise NotImplementedError(
+                "ISDFDF.get_jk: omega (range-separated hybrids) is out of scope for "
+                "the V4 gate-thin adapter."
+            )
+        if kpts_band is not None:
+            raise NotImplementedError(
+                "ISDFDF.get_jk: kpts_band (band-structure evaluation) is out of "
+                "scope for the V4 gate-thin adapter."
+            )
+        kpts = self.kpts if kpts is None else np.asarray(kpts, dtype=np.float64)
+        if kpts.shape != self.kpts.shape or not np.allclose(kpts, self.kpts):
+            raise ValueError(
+                "ISDFDF.get_jk: kpts passed by the caller do not match the kpts "
+                "this adapter was built with -- the cached build() artifact is only "
+                "valid for the ORIGINAL kpts."
+            )
+
+        vj = None
+        vk = None
+        if with_j:
+            vj = get_j(self.cell, dm_kpts, kpts)
+        if with_k:
+            built = self.build()
+            vk = get_k(
+                dm_kpts, built["inpv_kpt"], built["coul_kpt"], built["mesh_obj"].phase,
+                exxdiv=exxdiv, cell=self.cell, kpts=kpts,
+            )
+        return vj, vk
