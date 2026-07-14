@@ -168,6 +168,25 @@ class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(W_dev), W_np, atol=1e-10, err_msg=f"W_q q={q}")
             self.assertEqual(info_dev["n_retained"], info_np["n_retained"])
 
+    def test_self_paired_matches_numpy_oracle_and_is_exactly_real(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        q = 0  # Gamma, always self-paired
+        self.assertEqual(int(mesh_obj.neg[q]), q)
+        W_np, kern_np, _ = apply_raw_kernel_and_solve(
+            Pi[q], eta[q], cell=cell, q_kpt=mesh_obj.canonical_kpts[q],
+            grid_coords=grids, grid_mesh=cell.mesh, rtol=1e-8, self_paired=True,
+        )
+        W_dev, kern_dev, _ = apply_kernel_and_solve_device(
+            provider, q, Pi[q], eta[q], grid_coords=grids, rtol=1e-8, self_paired=True,
+        )
+        np.testing.assert_array_equal(kern_np.imag, 0.0)
+        np.testing.assert_array_equal(np.asarray(kern_dev).imag, 0.0)
+        np.testing.assert_allclose(np.asarray(kern_dev), kern_np, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(W_dev), W_np, atol=1e-10)
+
     def test_device_w_q_is_hermitian(self):
         cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
         provider = RawKernelProvider(
@@ -264,6 +283,20 @@ class TestBuildCoulKptDevice(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(kern_kpt[nq]), np.asarray(kern_independent), atol=1e-12
         )
+
+    def test_all_self_paired_mesh_gives_exactly_real_kern_and_coul(self):
+        # design v2.1 section 5 (retention-policy fix follow-up): a
+        # [2,1,1] mesh has BOTH k-points self-paired (neg=[0,1]) --
+        # build_coul_kpt_device must thread self_paired through to
+        # BOTH, not just q=0/Gamma.
+        cell, mesh_obj, grids, Pi, eta, provider = self._setup([2, 1, 1])
+        self.assertEqual(list(mesh_obj.neg), [0, 1])
+        coul_kpt, kern_kpt, infos, n_calls = build_coul_kpt_device(
+            provider, Pi, eta, grids, mesh_obj, rtol=1e-8,
+        )
+        for q in range(mesh_obj.n_kpts):
+            np.testing.assert_array_equal(np.asarray(kern_kpt[q]).imag, 0.0, err_msg=f"q={q}")
+            np.testing.assert_array_equal(np.asarray(coul_kpt[q]).imag, 0.0, err_msg=f"q={q}")
 
     def test_efficiency_count_is_half_plus_self_paired(self):
         cell, mesh_obj, grids, Pi, eta, provider = self._setup([1, 1, 3])

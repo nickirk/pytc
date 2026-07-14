@@ -210,7 +210,9 @@ def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
     return Pi, eta
 
 
-def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-4):
+def apply_raw_kernel_and_solve(
+    Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-4, self_paired=False
+):
     """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel
     to eta^q over the SPATIAL grid, contract back into a Nip x Nip
     kernel matrix, and solve the Hermitian sandwich for W^q (design
@@ -306,6 +308,27 @@ def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_me
             shape (a DIFFERENT mesh from the k-point mesh) -- prod
             must equal Ng.
         rtol: forwarded to hermitian_sandwich_solve.
+        self_paired: True when this q satisfies neg[q]==q (Gamma, and
+            any other BZ-edge self-paired point) -- physics requires
+            kern_q REAL for such q (kern_q[neg[q]]=conj(kern_q[q]) with
+            neg[q]=q forces kern_q=conj(kern_q)), but kern_q's own
+            construction (Bloch-phase multiply -> FFT -> coulG -> IFFT
+            -> conjugate -> ZGEMM, all genuinely complex intermediates
+            even for a self-paired q) leaves a small measured floating-
+            point residual on the imaginary part -- confirmed NOT to
+            originate in Pi_q/eta_q (forcing those real first does not
+            change kern_q's residual) and confirmed to be amplified by
+            roughly two orders of magnitude through the near-singular
+            solve's pseudo-inverse sandwich before it would otherwise
+            surface downstream (design v2.1 section 5, C1.5 retention
+            diagnostics: only visible once a real system pushes a q
+            toward retention_marginal). When True, kern_q.real is taken
+            BEFORE the solve -- a physics-motivated projection removing
+            only the measured noise component, not a loosened gate;
+            verified to collapse W_q's own residual to EXACTLY 0.0 on a
+            real diamond 2x2x2 system where the unprojected residual was
+            ~4e-9 (well over kpt_to_spc's 1e-10 imag_tol gate downstream,
+            which stays armed at its original threshold).
 
     Returns:
         (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 (the
@@ -366,6 +389,8 @@ def apply_raw_kernel_and_solve(Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_me
 
     kern_q = (lq @ rq.T) / np.sqrt(n_grid)
     kern_q = np.asarray(kern_q, dtype=np.complex128)
+    if self_paired:
+        kern_q = kern_q.real.astype(np.complex128)
 
     W_q_unscaled, solve_info = hermitian_sandwich_solve(Pi_q, kern_q, rtol=rtol)
     # Final sqrt(Ng) rescale, exactly cancelling kern_q's own 1/sqrt(Ng) --
@@ -533,7 +558,7 @@ class RawKernelProvider:
 
 def apply_kernel_and_solve_device(
     provider, q_index, Pi_q, eta_q, *, grid_coords, rtol=1e-4,
-    retained_solve_residual_gate=1e-10,
+    retained_solve_residual_gate=1e-10, self_paired=False,
 ):
     """S4 pipeline glue (design v2.1 section 6), device-resident,
     provider-agnostic: Bloch-phase multiply -> provider.apply(q_index,
@@ -566,6 +591,9 @@ def apply_kernel_and_solve_device(
             responsible for turning that degradation into a precise
             error at the source -- not a confusing physics mismatch
             surfacing downstream in a consumer-level parity gate.
+        self_paired: True when this q satisfies neg[q]==q -- see
+            apply_raw_kernel_and_solve's docstring for the full
+            derivation; kern_q.real is taken before the solve.
 
     Returns:
         (W_q, kern_q, solve_info): W_q is (Nip, Nip) complex128 jax
@@ -598,6 +626,8 @@ def apply_kernel_and_solve_device(
     rq = jnp.conj(v_q)
 
     kern_q = (lq @ rq.T) / jnp.sqrt(n_grid)
+    if self_paired:
+        kern_q = kern_q.real.astype(jnp.complex128)
 
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
     W_q_unscaled, solve_info = hermitian_sandwich_solve_device(Pi_q_jnp, kern_q, rtol=rtol)
@@ -697,9 +727,11 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
     for q in range(n_kpts):
         if done[q]:
             continue
+        nq = int(neg[q])
         W_q, kern_q, info_q = apply_kernel_and_solve_device(
             provider, q, Pi[q], eta[q], grid_coords=grid_coords, rtol=rtol,
             retained_solve_residual_gate=retained_solve_residual_gate,
+            self_paired=(nq == q),
         )
         coul_kpt[q] = W_q
         kern_kpt[q] = kern_q
@@ -707,7 +739,6 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
         done[q] = True
         n_pipeline_calls += 1
 
-        nq = int(neg[q])
         if nq != q and not done[nq]:
             coul_kpt[nq] = jnp.conj(W_q)
             kern_kpt[nq] = jnp.conj(kern_q)

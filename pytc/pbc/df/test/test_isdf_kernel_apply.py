@@ -84,6 +84,34 @@ class TestApplyRawKernelAndSolve(unittest.TestCase):
         sig = inspect.signature(apply_raw_kernel_and_solve)
         self.assertNotIn("exxdiv", sig.parameters)
 
+    def test_self_paired_forces_kern_q_exactly_real(self):
+        # design v2.1 section 5 (retention-policy fix follow-up): for a
+        # self-paired q (neg[q]==q), physics requires kern_q real; its
+        # own FFT-chain construction leaves measured floating-point
+        # noise on the imaginary part that self_paired=True removes
+        # before the solve.
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        q = 0  # Gamma is always self-paired
+        self.assertEqual(int(mesh_obj.neg[q]), q)
+        _, kern_q, _ = apply_raw_kernel_and_solve(
+            Pi[q], eta[q], cell=cell, q_kpt=mesh_obj.canonical_kpts[q],
+            grid_coords=grids, grid_mesh=cell.mesh, rtol=1e-8, self_paired=True,
+        )
+        np.testing.assert_array_equal(kern_q.imag, 0.0)
+
+    def test_self_paired_false_is_the_default_and_leaves_kern_q_unmodified(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 3])
+        q = 0
+        _, kern_q_default, _ = apply_raw_kernel_and_solve(
+            Pi[q], eta[q], cell=cell, q_kpt=mesh_obj.canonical_kpts[q],
+            grid_coords=grids, grid_mesh=cell.mesh, rtol=1e-8,
+        )
+        _, kern_q_explicit_false, _ = apply_raw_kernel_and_solve(
+            Pi[q], eta[q], cell=cell, q_kpt=mesh_obj.canonical_kpts[q],
+            grid_coords=grids, grid_mesh=cell.mesh, rtol=1e-8, self_paired=False,
+        )
+        np.testing.assert_array_equal(kern_q_default, kern_q_explicit_false)
+
     def test_rejects_malformed_shapes(self):
         cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 2])
         q = 0
