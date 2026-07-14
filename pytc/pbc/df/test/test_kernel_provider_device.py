@@ -148,7 +148,7 @@ class TestApplyKernelAndSolveDeviceMatchesNumpyOracle(unittest.TestCase):
         grids = cell.get_uniform_grids(cell.mesh)
         X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
         ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (grids.shape[0], cell.nao))
-        Pi, eta = build_pi_eta(X, ao, mesh_obj.kmesh)
+        Pi, eta = build_pi_eta(X, ao, mesh_obj.phase)
         return cell, mesh_obj, grids, Pi, eta
 
     def test_device_path_matches_numpy_oracle_bit_tier(self):
@@ -224,7 +224,7 @@ class TestBuildCoulKptDevice(unittest.TestCase):
         grids = cell.get_uniform_grids(cell.mesh)
         X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
         ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (grids.shape[0], cell.nao))
-        Pi, eta = build_pi_eta(X, ao, mesh_obj.kmesh)
+        Pi, eta = build_pi_eta(X, ao, mesh_obj.phase)
         provider = RawKernelProvider(
             cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
         )

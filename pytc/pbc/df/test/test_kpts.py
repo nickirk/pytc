@@ -49,12 +49,18 @@ def _tr_symmetric_fixture(rng, n_kpts, neg, shape):
 
 
 def _direct_sum(T, kmesh):
-    """Z[q] = (1/Nk) sum_k T[k] * T[(q-k) mod mesh], with (q-k) mod mesh
-    meaning per-AXIS modular subtraction on the (n1,n2,n3) lattice -- NOT
-    flat-index arithmetic mod Nk, which only coincides with the correct
-    per-axis result for a mesh with a single nontrivial axis (any mesh
-    used in a 1D-reduced test here). Verified this distinction matters by
-    direct failure on a [2,2,2] mesh before this fix."""
+    """Z[q] = (1/sqrt(Nk)) sum_k T[k] * T[(q-k) mod mesh], with
+    (q-k) mod mesh meaning per-AXIS modular subtraction on the
+    (n1,n2,n3) lattice -- NOT flat-index arithmetic mod Nk, which only
+    coincides with the correct per-axis result for a mesh with a single
+    nontrivial axis (any mesh used in a 1D-reduced test here).
+
+    The 1/sqrt(Nk) prefactor (not 1/Nk) matches pair_convolve's own
+    unitary kpt_to_spc/spc_to_kpt convention (1/sqrt(Nk) split evenly
+    across the forward and inverse transforms) -- re-derived directly
+    from the orthogonality relation sum_R exp(iR.(k1+k2-q)) = Nk *
+    delta(k1+k2-q mod G) once per direct-sum collapse, giving an overall
+    (1/sqrt(Nk))*(1/Nk)*Nk = 1/sqrt(Nk) prefactor, not 1/Nk."""
     n1, n2, n3 = kmesh
     n_k = T.shape[0]
     n_ip, n_f = T.shape[1], T.shape[2]
@@ -69,7 +75,7 @@ def _direct_sum(T, kmesh):
                         for k3 in range(n3):
                             qk1, qk2, qk3 = (q1 - k1) % n1, (q2 - k2) % n2, (q3 - k3) % n3
                             acc += T_mesh[k1, k2, k3] * T_mesh[qk1, qk2, qk3]
-                Z_mesh[q1, q2, q3] = acc / n_k
+                Z_mesh[q1, q2, q3] = acc / np.sqrt(n_k)
     return Z_mesh.reshape(n_k, n_ip, n_f)
 
 
@@ -147,7 +153,7 @@ class TestKptsMeshValidation(unittest.TestCase):
         return dict(
             kpts=mesh.kpts, kmesh=mesh.kmesh, n_kpts=mesh.n_kpts,
             canonical_kpts=mesh.canonical_kpts, permutation=mesh.permutation,
-            neg=mesh.neg, ktol=mesh.ktol,
+            neg=mesh.neg, ktol=mesh.ktol, phase=mesh.phase,
         )
 
     def test_valid_construction_round_trips(self):
@@ -201,11 +207,13 @@ class TestCheckTimeReversalResidual(unittest.TestCase):
 
 class TestPairConvolve(unittest.TestCase):
     def test_gamma_only_reduces_to_molecular_elementwise_square(self):
+        cell = _make_cell()
+        mesh = canonicalize_kpts(cell, cell.get_kpts([1, 1, 1], wrap_around=False))
         rng = np.random.default_rng(10)
         n_ip, n_f, n_ao = 3, 4, 5
         X = rng.normal(size=(1, n_ip, n_ao)).astype(np.complex128)
         Y = rng.normal(size=(1, n_f, n_ao)).astype(np.complex128)
-        Z = pair_convolve(X, Y, (1, 1, 1))
+        Z = pair_convolve(X, Y, mesh.phase)
         expected = np.einsum("Iu,fu->If", X[0], Y[0].conj()) ** 2
         np.testing.assert_allclose(Z[0], expected, atol=1e-12)
 
@@ -218,7 +226,7 @@ class TestPairConvolve(unittest.TestCase):
             mesh = canonicalize_kpts(cell, kpts)
             X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_ip, n_ao))
             Y = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_f, n_ao))
-            Z = pair_convolve(X, Y, mesh.kmesh)
+            Z = pair_convolve(X, Y, mesh.phase)
             T = np.einsum("kIu,kfu->kIf", X, Y.conj())
             Z_direct = _direct_sum(T, mesh.kmesh)
             np.testing.assert_allclose(Z, Z_direct, atol=1e-10, err_msg=str(kmesh_spec))
@@ -230,28 +238,30 @@ class TestPairConvolve(unittest.TestCase):
         mesh = canonicalize_kpts(cell, kpts)
         X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (3, 5))
         Y = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (4, 5))
-        Z = pair_convolve(X, Y, mesh.kmesh)
+        Z = pair_convolve(X, Y, mesh.phase)
         np.testing.assert_allclose(Z[mesh.neg], Z.conj(), atol=1e-10)
 
     def test_delta_field_analytic_case(self):
         # X/Y are nonzero only at Gamma (a "delta field" in k-space) -> the
         # real-space T_R is CONSTANT across all Nk supercell images
-        # (T_R[r] = T[0]/Nk, standard IFFT-of-a-delta identity, backward
-        # norm), so Z_R = T_R**2 is also constant = (T[0]/Nk)**2, and
-        # Z[q] = FFT(constant) is nonzero ONLY at q=Gamma (index 0): the
-        # unnormalized forward-FFT of a length-Nk constant array c sums
-        # Nk copies of c at q=0 and cancels (DFT orthogonality) elsewhere,
-        # giving Z[0] = Nk * (T[0]/Nk)**2 = T[0]**2 / Nk.
+        # (T_R[r] = T[0]/Nk, standard IFFT-of-a-delta identity), so
+        # Z_R = T_R**2 is also constant = (T[0]/Nk)**2, and Z[q] is
+        # nonzero ONLY at q=Gamma (index 0): the unitary spc_to_kpt
+        # transform of a length-Nk constant array c sums Nk copies of c
+        # (scaled by 1/sqrt(Nk)) at q=0 and cancels (DFT orthogonality)
+        # elsewhere, giving Z[0] = sqrt(Nk) * (T[0]/sqrt(Nk))**2.
+        cell = _make_cell()
         n_ip, n_f, n_ao = 2, 3, 4
         n_k = 4
+        mesh = canonicalize_kpts(cell, cell.get_kpts([1, 1, n_k], wrap_around=False))
         rng = np.random.default_rng(14)
         X = np.zeros((n_k, n_ip, n_ao), dtype=np.complex128)
         Y = np.zeros((n_k, n_f, n_ao), dtype=np.complex128)
         X[0] = rng.normal(size=(n_ip, n_ao))
         Y[0] = rng.normal(size=(n_f, n_ao))
-        Z = pair_convolve(X, Y, (1, 1, n_k))
+        Z = pair_convolve(X, Y, mesh.phase)
         T0 = X[0] @ Y[0].conj().T
-        expected_gamma = (T0 ** 2) / n_k
+        expected_gamma = (T0 ** 2) / np.sqrt(n_k)
         np.testing.assert_allclose(Z[0], expected_gamma, atol=1e-10)
         for q in range(1, n_k):
             np.testing.assert_allclose(Z[q], 0.0, atol=1e-10)
@@ -260,77 +270,61 @@ class TestPairConvolve(unittest.TestCase):
         rng = np.random.default_rng(15)
         X = rng.normal(size=(2, 3, 4)).astype(np.complex128)
         Y = rng.normal(size=(2, 5, 4)).astype(np.complex128)
+        phase2 = np.eye(2, dtype=np.complex128)
         with self.assertRaises(ValueError):
-            pair_convolve(X, Y, (1, 1, 3))  # prod != Nk
+            pair_convolve(X, Y, np.eye(3, dtype=np.complex128))  # phase shape != (Nk,Nk)
         with self.assertRaises(ValueError):
-            pair_convolve(X, rng.normal(size=(2, 5, 6)).astype(np.complex128), (1, 1, 2))
+            pair_convolve(X, rng.normal(size=(2, 5, 6)).astype(np.complex128), phase2)
         with self.assertRaises(ValueError):
-            pair_convolve(X[:, :0], Y, (1, 1, 2))
+            pair_convolve(X[:, :0], Y, phase2)
 
 
 class TestKptToSpcSpcToKpt(unittest.TestCase):
     def test_round_trip_recovers_original(self):
+        cell = _make_cell()
+        mesh = canonicalize_kpts(cell, cell.get_kpts([1, 1, 3], wrap_around=False))
         rng = np.random.default_rng(60)
-        kmesh = (1, 1, 3)
-        n_k = 3
-        m_spc = rng.normal(size=(n_k, 4, 5))
-        m_kpt = spc_to_kpt(m_spc, kmesh)
-        m_spc_recovered = kpt_to_spc(m_kpt, kmesh)
+        m_spc = rng.normal(size=(mesh.n_kpts, 4, 5))
+        m_kpt = spc_to_kpt(m_spc, mesh.phase)
+        m_spc_recovered = kpt_to_spc(m_kpt, mesh.phase)
         np.testing.assert_allclose(m_spc_recovered, m_spc, atol=1e-12)
 
     def test_pair_convolve_matches_manual_kpt_to_spc_spc_to_kpt_composition(self):
         # pair_convolve is now implemented AS this composition -- an
         # independent manual composition must match it exactly.
+        cell = _make_cell()
+        mesh = canonicalize_kpts(cell, cell.get_kpts([1, 1, 3], wrap_around=False))
         rng = np.random.default_rng(61)
-        kmesh = (1, 1, 3)
-        n_k, n_ip, n_f, n_ao = 3, 3, 4, 5
-        # neg = [0, 2, 1] for a [1,1,3] mesh's canonical Gamma-first ordering.
-        neg = [0, 2, 1]
+        n_ip, n_f, n_ao = 3, 4, 5
 
-        def _tr_symmetric_fixture(shape):
-            arr = np.zeros((n_k,) + shape, dtype=np.complex128)
-            done = set()
-            for k in range(n_k):
-                if k in done:
-                    continue
-                nk = neg[k]
-                if nk == k:
-                    arr[k] = rng.normal(size=shape)
-                else:
-                    re, im = rng.normal(size=shape), rng.normal(size=shape)
-                    arr[k] = re + 1j * im
-                    arr[nk] = re - 1j * im
-                    done.add(nk)
-                done.add(k)
-            return arr
+        X_tr = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_ip, n_ao))
+        Y = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (n_f, n_ao))
 
-        X_tr = _tr_symmetric_fixture((n_ip, n_ao))
-        Y = _tr_symmetric_fixture((n_f, n_ao))
-
-        Z = pair_convolve(X_tr, Y, kmesh)
+        Z = pair_convolve(X_tr, Y, mesh.phase)
 
         T = np.einsum("kIu,kfu->kIf", X_tr, Y.conj(), optimize=True)
-        T_R = kpt_to_spc(T, kmesh)
+        T_R = kpt_to_spc(T, mesh.phase)
         Z_R = T_R * T_R
-        Z_manual = spc_to_kpt(Z_R, kmesh)
+        Z_manual = spc_to_kpt(Z_R, mesh.phase)
 
         np.testing.assert_allclose(Z, Z_manual, atol=0.0)
 
     def test_kpt_to_spc_rejects_non_tr_symmetric_input(self):
+        cell = _make_cell()
+        mesh = canonicalize_kpts(cell, cell.get_kpts([1, 1, 3], wrap_around=False))
         rng = np.random.default_rng(62)
         m_kpt = (rng.normal(size=(3, 2, 2)) + 1j * rng.normal(size=(3, 2, 2))).astype(np.complex128)
         with self.assertRaises(ValueError):
-            kpt_to_spc(m_kpt, (1, 1, 3))
+            kpt_to_spc(m_kpt, mesh.phase)
 
     def test_rejects_malformed_shapes_and_kmesh(self):
         rng = np.random.default_rng(63)
         m = rng.normal(size=(4, 3, 3))
+        phase3 = np.eye(3, dtype=np.complex128)
         with self.assertRaises(ValueError):
-            kpt_to_spc(m, (1, 1, 3))  # prod != Nk
+            kpt_to_spc(m, phase3)  # phase shape != (4,4)
         with self.assertRaises(ValueError):
-            spc_to_kpt(m, (1, 1, 3))
-        with self.assertRaises(ValueError):
-            kpt_to_spc(m, (0, 1, 4))
+            spc_to_kpt(m, phase3)
 
 
 if __name__ == "__main__":

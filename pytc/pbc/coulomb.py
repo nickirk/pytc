@@ -5,21 +5,20 @@ producing the interpolation-point factor and per-q solved kernel.
 The THC-ERI/ao2mo interface is intentionally NOT implemented here yet.
 
 get_k's structural composition (density projection -> k<->supercell
-convolution trick -> exchange assembly) was derived by reading an
+unitary transform -> exchange assembly) was derived by reading an
 external reference's own K-build routine for UNDERSTANDING, then
-independently reimplemented here using this module's own kpt_to_spc/
-spc_to_kpt (design-canonical NumPy-"backward"-FFT convention), never the
-reference's phase-matrix machinery. The reference's stated normalization
-prefactors (1/Nk on the density projection, sqrt(Nk) on the transformed
-kernel) are transcribed faithfully since they are the only concrete
-numeric prescription available; this module's own convention has
-already been shown to differ from the reference's by a characterized
-sqrt(Nk)*conj() factor on Pi^q/eta^q, so get_k's
-ABSOLUTE scale is NOT yet independently confirmed here -- only its
-Hermiticity and its exact reduction to the Gamma-only (Nk=1) molecular
-ISDF-K formula are validated in this module's tests. Numeric validation
-against a real periodic FFTDF K matrix is the explicit next step before
-any production number from get_k should be trusted.
+independently reimplemented here using pytc.pbc.df.kpts' own
+kpt_to_spc/spc_to_kpt. Those functions use the SAME unitary
+transform construction the reference does (a phase matrix built from
+the actual canonical k-vectors and pyscf's own real-space translation
+vectors, k2gamma.translation_vectors_for_kmesh) -- an earlier ifftn-
+reshape-based implementation was found and fixed to be wrong (it
+assumed the flat k-index maps onto FFT frequency positions the same way
+the physical k-ordering does, which is false in general). Validated
+against a real periodic FFTDF K matrix on he2-cubic-cell [1,1,3]: exact
+reduction to the Gamma-only (Nk=1) molecular ISDF-K formula, Hermiticity,
+and rank-matched parity with an external reference implementation at the
+same interpolation-point rank.
 """
 
 from __future__ import annotations
@@ -96,7 +95,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-8, provider_cls=RawKernelProv
             cell, mesh_obj.canonical_kpts, grid_coords, block_size
         )
     )
-    Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.kmesh)
+    Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.phase)
 
     provider = provider_cls(
         cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
@@ -116,26 +115,23 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-8, provider_cls=RawKernelProv
     }
 
 
-def get_k(dm_kpts, inpv_kpt, coul_kpt, kmesh, *, exxdiv=None, cell=None, kpts=None):
+def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=None):
     """Periodic THC-ISDF exchange matrix (design v2.1 section 4/7).
 
     Composition (per density-matrix set):
         rho_kpt[k] = inpv_kpt[k] @ dm_kpt[k] @ inpv_kpt[k].conj().T / Nk
-        rho_spc    = kpt_to_spc(rho_kpt, kmesh).transpose(0,2,1)
-        coul_spc   = kpt_to_spc(coul_kpt, kmesh) * sqrt(Nk)
+        rho_spc    = kpt_to_spc(rho_kpt, phase).transpose(0,2,1)
+        coul_spc   = kpt_to_spc(coul_kpt, phase) * sqrt(Nk)
         v_spc      = coul_spc * rho_spc          -- elementwise (Hadamard)
-        v_kpt      = spc_to_kpt(v_spc, kmesh)
+        v_kpt      = spc_to_kpt(v_spc, phase)
         vk_kpt     = conj( inpv_kpt.transpose(0,2,1) @ v_kpt @ inpv_kpt.conj() )
 
     The Hadamard product against the density projected onto interpolation
     points (transposed) is the standard ISDF exchange-build trick that
     avoids ever forming a 4-index ERI tensor; kpt_to_spc/spc_to_kpt
-    implement the k<->supercell convolution theorem trick (a sum over
-    k' with momentum-transfer indexing V[k-k'] becomes an elementwise
-    real-space product) using THIS module's own canonical FFT
-    convention throughout, so rho and coul are transformed self-
-    consistently even though the ABSOLUTE scale is not yet independently
-    confirmed against a real reference (see module docstring).
+    implement the k<->supercell unitary transform (a sum over k' with
+    momentum-transfer indexing V[k-k'] becomes an elementwise real-space
+    product) so rho and coul are transformed self-consistently.
 
     exxdiv is applied HERE, after the bare vk_kpt is assembled -- never
     inside a KernelProvider. Only exxdiv=None (bare vk, for FFTDF
@@ -147,7 +143,8 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, kmesh, *, exxdiv=None, cell=None, kpts=No
             density matrices at each canonical k-point.
         inpv_kpt: (Nk, Nip, Nao) complex128, e.g. build()'s inpv_kpt.
         coul_kpt: (Nk, Nip, Nip) complex128, e.g. build()'s coul_kpt.
-        kmesh: (3,) positive ints, e.g. KptsMesh.kmesh.
+        phase: (Nk, Nk) complex128 unitary transform matrix, e.g.
+            KptsMesh.phase.
         exxdiv: None or "ewald".
         cell: pyscf.pbc.gto.Cell, required when exxdiv="ewald".
         kpts: (Nk,3) absolute k-points, required when exxdiv="ewald"
@@ -187,16 +184,16 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, kmesh, *, exxdiv=None, cell=None, kpts=No
             f"got {dm_kpts.shape}."
         )
 
-    coul_spc = kpt_to_spc(coul_kpt, kmesh) * np.sqrt(n_k)
+    coul_spc = kpt_to_spc(coul_kpt, phase) * np.sqrt(n_k)
 
     vk_kpts = np.empty((n_set, n_k, n_ao, n_ao), dtype=np.complex128)
     for i in range(n_set):
         dm_kpt = dm_kpts[i]
         rho_kpt = (inpv_kpt @ dm_kpt @ inpv_kpt.conj().transpose(0, 2, 1)) / n_k
-        rho_spc = kpt_to_spc(rho_kpt, kmesh).transpose(0, 2, 1)
+        rho_spc = kpt_to_spc(rho_kpt, phase).transpose(0, 2, 1)
 
         v_spc = coul_spc * rho_spc
-        v_kpt = spc_to_kpt(v_spc, kmesh)
+        v_kpt = spc_to_kpt(v_spc, phase)
 
         vk_kpt = inpv_kpt.transpose(0, 2, 1) @ v_kpt @ inpv_kpt.conj()
         vk_kpts[i] = vk_kpt.conj()

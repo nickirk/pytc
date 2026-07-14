@@ -99,6 +99,16 @@ class KptsMesh:
         (numerically) the same physical k-point as kpts[i].
     neg: neg[c] = index into canonical_kpts of -canonical_kpts[c] mod G,
         an involution (neg[neg[c]] == c for all c).
+    phase: (n_kpts, n_kpts) complex128 unitary k<->supercell-image
+        transform matrix, phase[R,k] = exp(i R.canonical_kpts[k]) /
+        sqrt(n_kpts), R ranging over pyscf's own
+        k2gamma.translation_vectors_for_kmesh(cell, kmesh,
+        wrap_around=False) -- the SAME construction used throughout
+        pyscf's own k2gamma/FFTISDF code, not an independently-invented
+        convention. kpt_to_spc/spc_to_kpt/pair_convolve/build_pi_eta all
+        take this matrix directly (not kmesh) since the correct
+        transform needs the actual k-vectors and real-space translation
+        vectors, not just the mesh shape.
     """
     kpts: object
     kmesh: tuple
@@ -107,6 +117,7 @@ class KptsMesh:
     permutation: object
     neg: object
     ktol: float
+    phase: object
 
     def __post_init__(self):
         kpts = np.asarray(self.kpts, dtype=np.float64)
@@ -160,6 +171,21 @@ class KptsMesh:
                 "contain Gamma at canonical index 0."
             )
 
+        phase = np.asarray(self.phase, dtype=np.complex128)
+        if phase.shape != (n_kpts, n_kpts):
+            raise ValueError(f"phase must have shape ({n_kpts},{n_kpts}), got {phase.shape}.")
+        if not np.all(np.isfinite(phase)):
+            raise ValueError("phase must be finite.")
+        unitary_residual = float(
+            np.linalg.norm(phase.conj().T @ phase - np.eye(n_kpts))
+        )
+        if unitary_residual > max(self.ktol * 1e4, 1e-8):
+            raise ValueError(
+                f"phase is not unitary (||phase^dagger @ phase - I||={unitary_residual:.3e}) -- "
+                f"this indicates canonical_kpts/R vectors do not form a valid Fourier-conjugate "
+                f"pair for this mesh."
+            )
+
         object.__setattr__(self, "kpts", _readonly_copy(kpts))
         object.__setattr__(self, "canonical_kpts", _readonly_copy(canonical_kpts))
         object.__setattr__(self, "permutation", _readonly_copy(permutation.astype(np.int64)))
@@ -167,6 +193,7 @@ class KptsMesh:
         object.__setattr__(self, "kmesh", kmesh)
         object.__setattr__(self, "n_kpts", n_kpts)
         object.__setattr__(self, "ktol", float(self.ktol))
+        object.__setattr__(self, "phase", _readonly_copy(phase))
 
 
 def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
@@ -214,9 +241,12 @@ def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
     neg_frac = _fold_fractional(-folded_canonical, ktol)
     neg = _match_fractional_points(neg_frac, folded_canonical, ktol)
 
+    R_vec_abs = k2gamma.translation_vectors_for_kmesh(cell, list(kmesh), wrap_around=False)
+    phase = np.exp(1j * (R_vec_abs @ canonical_kpts.T)) / np.sqrt(n_kpts)
+
     return KptsMesh(
         kpts=kpts_np, kmesh=kmesh, n_kpts=n_kpts, canonical_kpts=canonical_kpts,
-        permutation=permutation, neg=neg, ktol=float(ktol),
+        permutation=permutation, neg=neg, ktol=float(ktol), phase=phase,
     )
 
 
@@ -266,42 +296,48 @@ def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
     return max_residual
 
 
-def kpt_to_spc(m_kpt, kmesh, *, imag_tol=1e-10):
-    """IFFT over the k-index (reshaped to kmesh's (n1,n2,n3) lattice),
-    NumPy "backward" norm (carries 1/Nk) -- the same transform
-    pair_convolve applies to build its own T_R intermediate, factored
-    out here for reuse. Converts a k-space (Nk, ...) array to its
-    supercell-image (Nk, ...) real-space counterpart (same leading-axis
-    length; the DFT is a bijection on a same-size grid). The imaginary
-    part is gated BEFORE being discarded, exactly like pair_convolve's
-    own T_R step -- never a silent .real truncation.
+def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
+    """Unitary transform from k-space to supercell-image ("R") space:
+    m_spc = (phase @ m_kpt).real, phase[R,k] = exp(i R.k)/sqrt(Nk)
+    (see KptsMesh.phase). This is NOT a plain np.fft.ifftn reshape --
+    an earlier ifftn-based implementation assumed the flat k-index maps
+    onto FFT frequency positions the same way canonical_kpts' actual
+    physical k-ordering does, which is false in general (only a pure
+    normalization-scale coincidence on trivial 1-D-reduced meshes like
+    [1,1,3] masked this for a while; verified wrong by comparing against
+    the explicit unitary construction, which matches an independent
+    reference to machine precision while the ifftn reshape did not).
+    Building `phase` from the actual canonical k-vectors and pyscf's own
+    real-space translation vectors (k2gamma.translation_vectors_for_kmesh)
+    is the only construction that is provably correct on any mesh, not
+    just special-cased ones.
+
+    The imaginary part is gated BEFORE being discarded -- never a silent
+    .real truncation.
 
     Args:
         m_kpt: (Nk, ...) complex128, expected time-reversal-symmetric
             across k (m_kpt[neg[k]] = conj(m_kpt[k])) -- required for
-            the IFFT image to be real.
-        kmesh: (3,) positive ints, prod(kmesh) == Nk.
+            the transform's image to be real.
+        phase: (Nk, Nk) complex128 unitary matrix, e.g. KptsMesh.phase.
         imag_tol: gate on ||Im(m_spc)||/||m_spc|| before discarding Im.
 
     Returns:
         m_spc: (Nk, ...) real64.
 
     Raises:
-        ValueError: malformed shapes/kmesh, or the imag_tol gate fails.
+        ValueError: malformed shapes, or the imag_tol gate fails.
     """
     m_kpt = np.asarray(m_kpt)
     if m_kpt.ndim < 1:
         raise ValueError("m_kpt must have at least 1 dimension (the k axis).")
     n_k = m_kpt.shape[0]
-    kmesh_t = tuple(int(x) for x in kmesh)
-    if len(kmesh_t) != 3 or any(m <= 0 for m in kmesh_t):
-        raise ValueError(f"kmesh must be 3 positive ints, got {kmesh_t}.")
-    if int(np.prod(kmesh_t)) != n_k:
-        raise ValueError(f"prod(kmesh)={int(np.prod(kmesh_t))} != m_kpt.shape[0]={n_k}.")
+    phase = np.asarray(phase, dtype=np.complex128)
+    if phase.ndim != 2 or phase.shape != (n_k, n_k):
+        raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
     trailing_shape = m_kpt.shape[1:]
-    m_kmesh = m_kpt.reshape(kmesh_t + trailing_shape)
-    m_spc_complex = np.fft.ifftn(m_kmesh, axes=(0, 1, 2), norm="backward")
+    m_spc_complex = (phase @ m_kpt.reshape(n_k, -1)).reshape((n_k,) + trailing_shape)
 
     norm_im = float(np.linalg.norm(m_spc_complex.imag))
     norm_total = float(np.linalg.norm(m_spc_complex))
@@ -312,67 +348,65 @@ def kpt_to_spc(m_kpt, kmesh, *, imag_tol=1e-10):
             f"-- m_kpt does not appear to be a valid time-reversal-symmetric collection "
             f"(m_kpt[neg[k]] should equal conj(m_kpt[k]))."
         )
-    return m_spc_complex.real.reshape((n_k,) + trailing_shape)
+    return m_spc_complex.real
 
 
-def spc_to_kpt(m_spc, kmesh):
-    """Forward FFT over the supercell-image axis -- the inverse
-    transform of kpt_to_spc (modulo its imag_tol gate; this direction
-    never discards anything). NumPy "backward" norm (no normalization on
-    the forward transform), matching pair_convolve's own Z[q] =
-    FFT_k(Z_R) convention.
+def spc_to_kpt(m_spc, phase):
+    """Inverse of kpt_to_spc (modulo its imag_tol gate; this direction
+    never discards anything): m_kpt = phase^dagger @ m_spc, matching the
+    unitary construction's own adjoint.
 
     Args:
         m_spc: (Nk, ...) array, real or complex.
-        kmesh: (3,) positive ints, prod(kmesh) == Nk.
+        phase: (Nk, Nk) complex128 unitary matrix, e.g. KptsMesh.phase.
 
     Returns:
         m_kpt: (Nk, ...) complex128.
 
     Raises:
-        ValueError: malformed shapes/kmesh.
+        ValueError: malformed shapes.
     """
     m_spc = np.asarray(m_spc)
     if m_spc.ndim < 1:
         raise ValueError("m_spc must have at least 1 dimension (the supercell-image axis).")
     n_k = m_spc.shape[0]
-    kmesh_t = tuple(int(x) for x in kmesh)
-    if len(kmesh_t) != 3 or any(m <= 0 for m in kmesh_t):
-        raise ValueError(f"kmesh must be 3 positive ints, got {kmesh_t}.")
-    if int(np.prod(kmesh_t)) != n_k:
-        raise ValueError(f"prod(kmesh)={int(np.prod(kmesh_t))} != m_spc.shape[0]={n_k}.")
+    phase = np.asarray(phase, dtype=np.complex128)
+    if phase.ndim != 2 or phase.shape != (n_k, n_k):
+        raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
     trailing_shape = m_spc.shape[1:]
-    m_kmesh = m_spc.reshape(kmesh_t + trailing_shape)
-    m_kpt = np.fft.fftn(m_kmesh, axes=(0, 1, 2), norm="backward")
-    return m_kpt.reshape((n_k,) + trailing_shape).astype(np.complex128)
+    m_kpt = (phase.conj().T @ m_spc.reshape(n_k, -1)).reshape((n_k,) + trailing_shape)
+    return m_kpt.astype(np.complex128)
 
 
-def pair_convolve(X, Y, kmesh, *, imag_tol=1e-10):
+def pair_convolve(X, Y, phase, *, imag_tol=1e-10):
     """Paper Algorithm 1: assemble Z[q] without an O(Nk^2) direct sum, via
-    per-k GEMM, IFFT over the k-index, elementwise square in real
-    (supercell-image) space, then FFT back to momentum space.
+    per-k GEMM, the unitary k<->supercell-image transform, elementwise
+    square in real (supercell-image) space, then the inverse transform
+    back to momentum space.
 
         T[k]   = X[k] @ conj(Y[k]).T   -- conj(Y[k]) stands for Y^{-k} by
                                            the time-reversal identity
                                            conj(phi^k) = phi^{-k}, not by
                                            array reindexing.
-        T_R    = kpt_to_spc(T, kmesh)  -- IFFT over the k index, gated.
+        T_R    = kpt_to_spc(T, phase)  -- unitary transform, gated.
         Z_R    = T_R ** 2               -- elementwise square, real space.
-        Z[q]   = spc_to_kpt(Z_R, kmesh) -- FFT back to momentum space.
+        Z[q]   = spc_to_kpt(Z_R, phase) -- inverse transform back to
+                                           momentum space.
 
     Args:
         X: (Nk, Nip, Nao) complex128.
         Y: (Nk, F, Nao) complex128.
-        kmesh: (3,) positive ints, prod(kmesh) == Nk, the SAME canonical
-            k/q-mesh ordering X/Y's axis 0 is indexed by (see KptsMesh).
+        phase: (Nk, Nk) complex128 unitary transform matrix, e.g.
+            KptsMesh.phase -- the SAME canonical k/q-mesh ordering X/Y's
+            axis 0 is indexed by.
         imag_tol: gate on ||Im(T_R)|| / ||T_R|| before discarding Im(T_R).
 
     Returns:
         Z: (Nk, Nip, F) complex128, in the same canonical k/q ordering.
 
     Raises:
-        ValueError: malformed shapes/kmesh, or the imag_tol gate fails
+        ValueError: malformed shapes, or the imag_tol gate fails
             (X/Y are not a valid time-reversal-symmetric pair).
     """
     X = np.asarray(X)
@@ -387,16 +421,14 @@ def pair_convolve(X, Y, kmesh, *, imag_tol=1e-10):
     if X.shape[1] == 0 or Y.shape[1] == 0:
         raise ValueError("X and Y must have at least one row (Nip/F > 0).")
 
-    kmesh_t = tuple(int(x) for x in kmesh)
-    if len(kmesh_t) != 3 or any(m <= 0 for m in kmesh_t):
-        raise ValueError(f"kmesh must be 3 positive ints, got {kmesh_t}.")
-    if int(np.prod(kmesh_t)) != n_k:
-        raise ValueError(f"prod(kmesh)={int(np.prod(kmesh_t))} != Nk={n_k}.")
+    phase = np.asarray(phase, dtype=np.complex128)
+    if phase.ndim != 2 or phase.shape != (n_k, n_k):
+        raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
     T = np.einsum("kIu,kfu->kIf", X, Y.conj(), optimize=True)  # (Nk, Nip, F)
 
     try:
-        T_R = kpt_to_spc(T, kmesh_t, imag_tol=imag_tol)
+        T_R = kpt_to_spc(T, phase, imag_tol=imag_tol)
     except ValueError as exc:
         raise ValueError(
             f"pair_convolve: {exc} -- this indicates X/Y are not a valid "
@@ -405,4 +437,4 @@ def pair_convolve(X, Y, kmesh, *, imag_tol=1e-10):
         ) from exc
 
     Z_R = T_R * T_R
-    return spc_to_kpt(Z_R, kmesh_t)
+    return spc_to_kpt(Z_R, phase)

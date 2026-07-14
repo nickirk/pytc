@@ -178,13 +178,13 @@ class TestStageEtaRecomputeTile(unittest.TestCase):
         def ao_block_source():
             return (blk for _, _, blk in stream_ao_blocks(cell, mesh_obj.canonical_kpts, grid_coords, 13))
 
-        Pi_recompute, eta_recompute = stage_eta_recompute_tile(X, ao_block_source, mesh_obj.kmesh)
+        Pi_recompute, eta_recompute = stage_eta_recompute_tile(X, ao_block_source, mesh_obj.phase)
 
         ao_full = np.asarray(
             cell.pbc_eval_gto("GTOval", grid_coords, kpts=list(mesh_obj.canonical_kpts)),
             dtype=np.complex128,
         )
-        Pi_direct, eta_direct = build_pi_eta(X, ao_full, mesh_obj.kmesh)
+        Pi_direct, eta_direct = build_pi_eta(X, ao_full, mesh_obj.phase)
 
         np.testing.assert_allclose(Pi_recompute, Pi_direct, atol=1e-12)
         np.testing.assert_allclose(eta_recompute, eta_direct, atol=1e-12)
@@ -201,8 +201,8 @@ class TestStageEtaRecomputeTile(unittest.TestCase):
         def ao_block_source():
             return (blk for _, _, blk in stream_ao_blocks(cell, mesh_obj.canonical_kpts, grid_coords, 13))
 
-        Pi_full, eta_full = stage_eta_recompute_tile(X, ao_block_source, mesh_obj.kmesh)
-        Pi_sliced, eta_sliced = stage_eta_recompute_tile(X, ao_block_source, mesh_obj.kmesh, q_slice=0)
+        Pi_full, eta_full = stage_eta_recompute_tile(X, ao_block_source, mesh_obj.phase)
+        Pi_sliced, eta_sliced = stage_eta_recompute_tile(X, ao_block_source, mesh_obj.phase, q_slice=0)
         np.testing.assert_allclose(Pi_sliced, Pi_full[0], atol=0.0)
         np.testing.assert_allclose(eta_sliced, eta_full[0], atol=0.0)
 

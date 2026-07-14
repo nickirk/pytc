@@ -83,7 +83,7 @@ class TestBuild(unittest.TestCase):
             cell.pbc_eval_gto("GTOval", grid_coords, kpts=list(mesh_obj.canonical_kpts)),
             dtype=np.complex128,
         )
-        Pi, eta = build_pi_eta(inpv_kpt, ao_full, mesh_obj.kmesh)
+        Pi, eta = build_pi_eta(inpv_kpt, ao_full, mesh_obj.phase)
 
         self.assertEqual(result["n_selected"], n_selected)
         np.testing.assert_allclose(result["inpv_kpt"], inpv_kpt, atol=0.0)

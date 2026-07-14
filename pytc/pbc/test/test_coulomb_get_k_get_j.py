@@ -18,6 +18,8 @@ from pyscf.pbc.gto import Cell
 
 from pytc.pbc import coulomb
 
+_PHASE_GAMMA_ONLY = np.array([[1.0 + 0.0j]])  # Nk=1: R=[0,0,0], k=Gamma, exp(i*0)/sqrt(1)=1
+
 
 def _make_cell():
     cell = Cell()
@@ -49,7 +51,7 @@ class TestGetKGammaOnlyReduction(unittest.TestCase):
         coul_kpt = V[None, :, :].astype(np.complex128)  # (1, Nip, Nip)
         dm_kpts = D[None, :, :].astype(np.complex128)  # (1, Nao, Nao)
 
-        K = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, kmesh=(1, 1, 1))
+        K = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, _PHASE_GAMMA_ONLY)
 
         P = X @ D @ X.T  # density projected onto interpolation points
         K_expected = X.T @ (V * P) @ X  # Hadamard product, then sandwich
@@ -66,10 +68,10 @@ class TestGetKGammaOnlyReduction(unittest.TestCase):
         coul_kpt = coul_kpt + coul_kpt.conj().transpose(0, 2, 1)
         dm_single = rng.normal(size=(1, n_ao, n_ao)).astype(np.complex128)
 
-        K_single = coulomb.get_k(dm_single, inpv_kpt, coul_kpt, kmesh=(1, 1, 1))
+        K_single = coulomb.get_k(dm_single, inpv_kpt, coul_kpt, _PHASE_GAMMA_ONLY)
         self.assertEqual(K_single.shape, (1, n_ao, n_ao))
 
-        K_multi = coulomb.get_k(dm_single[None], inpv_kpt, coul_kpt, kmesh=(1, 1, 1))
+        K_multi = coulomb.get_k(dm_single[None], inpv_kpt, coul_kpt, _PHASE_GAMMA_ONLY)
         self.assertEqual(K_multi.shape, (1, 1, n_ao, n_ao))
         np.testing.assert_allclose(K_multi[0], K_single, atol=0.0)
 
@@ -109,7 +111,7 @@ class TestGetKHermiticityAndValidation(unittest.TestCase):
         dm_raw = _tr_symmetric_fixture((n_ao, n_ao))
         dm_kpts = dm_raw + dm_raw.conj().transpose(0, 2, 1)  # Hermitian density per k
 
-        K = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.kmesh)
+        K = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase)
         for k in range(n_k):
             Kk = np.asarray(K[k])
             np.testing.assert_allclose(Kk, Kk.conj().T, atol=1e-8, err_msg=f"k={k}")
@@ -119,10 +121,11 @@ class TestGetKHermiticityAndValidation(unittest.TestCase):
         inpv_kpt = rng.normal(size=(2, 3, 4)).astype(np.complex128)
         coul_kpt = rng.normal(size=(2, 3, 3)).astype(np.complex128)
         dm_kpts = rng.normal(size=(2, 4, 4)).astype(np.complex128)
+        phase2 = np.eye(2, dtype=np.complex128)
         with self.assertRaises(ValueError):
-            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt[:, :2, :2], kmesh=(1, 1, 2))
+            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt[:, :2, :2], phase2)
         with self.assertRaises(ValueError):
-            coulomb.get_k(dm_kpts[:, :3, :3], inpv_kpt, coul_kpt, kmesh=(1, 1, 2))
+            coulomb.get_k(dm_kpts[:, :3, :3], inpv_kpt, coul_kpt, phase2)
 
     def test_rejects_bad_exxdiv(self):
         rng = np.random.default_rng(74)
@@ -130,7 +133,7 @@ class TestGetKHermiticityAndValidation(unittest.TestCase):
         coul_kpt = rng.normal(size=(1, 2, 2)).astype(np.complex128)
         dm_kpts = rng.normal(size=(1, 3, 3)).astype(np.complex128)
         with self.assertRaises(ValueError):
-            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, kmesh=(1, 1, 1), exxdiv="bogus")
+            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, _PHASE_GAMMA_ONLY, exxdiv="bogus")
 
     def test_exxdiv_ewald_requires_cell_and_kpts(self):
         rng = np.random.default_rng(75)
@@ -138,7 +141,7 @@ class TestGetKHermiticityAndValidation(unittest.TestCase):
         coul_kpt = rng.normal(size=(1, 2, 2)).astype(np.complex128)
         dm_kpts = rng.normal(size=(1, 3, 3)).astype(np.complex128)
         with self.assertRaises(ValueError):
-            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, kmesh=(1, 1, 1), exxdiv="ewald")
+            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, _PHASE_GAMMA_ONLY, exxdiv="ewald")
 
     def test_exxdiv_ewald_changes_the_result(self):
         cell = _make_cell()
@@ -173,9 +176,9 @@ class TestGetKHermiticityAndValidation(unittest.TestCase):
         dm_raw = _tr_symmetric_fixture((n_ao, n_ao))
         dm_kpts = dm_raw + dm_raw.conj().transpose(0, 2, 1)
 
-        K_bare = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.kmesh)
+        K_bare = coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase)
         K_ewald = coulomb.get_k(
-            dm_kpts, inpv_kpt, coul_kpt, mesh_obj.kmesh,
+            dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase,
             exxdiv="ewald", cell=cell, kpts=mesh_obj.canonical_kpts,
         )
         self.assertGreater(np.abs(np.asarray(K_bare) - np.asarray(K_ewald)).max(), 0.0)

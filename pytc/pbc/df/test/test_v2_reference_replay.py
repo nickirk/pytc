@@ -7,22 +7,26 @@ sys.path only for THIS test -- reference/oracle only, no fftisdf code
 is imported into any pytc production module (pytc.pbc.df.kpts/isdf
 have zero dependency on it). Skipped cleanly if the clone is absent.
 
-Convention note (discovered empirically while writing this test, not
-assumed): fftisdf's own Pi^q/eta^q differ from pytc's own
-pair_convolve-based Pi^q/eta^q by a KNOWN, exact relationship --
-    fftisdf_Pi[q]  = sqrt(Nk) * conj(pytc_Pi[q])
-    fftisdf_eta[q] = sqrt(Nk) * conj(pytc_eta[q])
--- a pure normalization/conjugation CONVENTION difference (fftisdf's
-internal k<->supercell phase transform uses a different -- but equally
-valid -- normalization than pytc's own NumPy-"backward"-FFT convention,
-which design v2.1 section 4 explicitly fixes as pytc's canonical
-choice). This is NOT a bug in either implementation; reference-replay
-mode accounts for it explicitly rather than expecting bit-identical
-raw arrays. apply_raw_kernel_and_solve's own kern_q/coulG/FFT logic
-was verified independently (bit-identical to fftisdf's own intermediate
-values, given the same eta input) BEFORE this convention difference was
-even identified, isolating it precisely to the Pi/eta normalization
-step, not the kernel-application step.
+Convention note: fftisdf's own Pi^q/eta^q differ from pytc's own
+pair_convolve-based Pi^q/eta^q by a pure conjugation --
+    fftisdf_Pi[q]  = conj(pytc_Pi[q])
+    fftisdf_eta[q] = conj(pytc_eta[q])
+-- since pytc's kpt_to_spc/spc_to_kpt now use the SAME unitary
+k<->supercell transform normalization (1/sqrt(Nk) split evenly across
+both directions, built from the actual canonical k-vectors and pyscf's
+own real-space translation vectors) that fftisdf's own phase-matrix
+construction uses. An earlier pytc implementation used a DIFFERENT
+normalization split (1/Nk on one direction only, via a plain
+np.fft.ifftn reshape that also had an independent k-ordering defect),
+which showed up here as an extra sqrt(Nk) factor on top of the
+conjugation; both were root-caused and fixed together. This is NOT a
+disagreement in either implementation's physics; reference-replay mode
+accounts for the remaining pure conjugation explicitly rather than
+expecting bit-identical raw arrays. apply_raw_kernel_and_solve's own
+kern_q/coulG/FFT logic was verified independently (bit-identical to
+fftisdf's own intermediate values, given the same eta input), isolating
+convention differences precisely to the Pi/eta normalization step, not
+the kernel-application step.
 """
 
 import os
@@ -73,7 +77,7 @@ class TestV2ReferenceReplay(unittest.TestCase):
             dtype=np.complex128,
         )
         cls.Pi_mine, cls.eta_mine = build_pi_eta(
-            cls.inpv_kpt, cls.ao_full, cls.mesh_obj.kmesh
+            cls.inpv_kpt, cls.ao_full, cls.mesh_obj.phase
         )
 
     def test_pi_matches_fftisdf_within_v2_tolerance(self):
@@ -82,17 +86,15 @@ class TestV2ReferenceReplay(unittest.TestCase):
         phase = get_phase_factor(self.cell, self.kpts_ref)
         Pi_ref = fftisdf_contract(self.inpv_kpt, self.inpv_kpt, phase)
         n_k = self.mesh_obj.n_kpts
-        sqrt_nk = np.sqrt(n_k)
         for q in range(n_k):
-            expected = sqrt_nk * self.Pi_mine[q].conj()
+            expected = self.Pi_mine[q].conj()
             rel = np.abs(expected - Pi_ref[q]).max() / np.abs(Pi_ref[q]).max()
             self.assertLess(rel, 1e-6, msg=f"q={q}")
 
     def test_eta_matches_fftisdf_within_v2_tolerance(self):
         n_k = self.mesh_obj.n_kpts
-        sqrt_nk = np.sqrt(n_k)
         for q in range(n_k):
-            expected = sqrt_nk * self.eta_mine[q].conj()
+            expected = self.eta_mine[q].conj()
             rel = np.abs(expected - self.eta_ref[q]).max() / np.abs(self.eta_ref[q]).max()
             self.assertLess(rel, 1e-6, msg=f"q={q}")
 
@@ -101,10 +103,9 @@ class TestV2ReferenceReplay(unittest.TestCase):
         # inpv_kpt) AND account for the known Pi/eta convention
         # difference, then compare the fully-solved W^q.
         n_k = self.mesh_obj.n_kpts
-        sqrt_nk = np.sqrt(n_k)
         for q in range(n_k):
-            Pi_q = sqrt_nk * self.Pi_mine[q].conj()
-            eta_q = sqrt_nk * self.eta_mine[q].conj()
+            Pi_q = self.Pi_mine[q].conj()
+            eta_q = self.eta_mine[q].conj()
             W_q, kern_q, info = apply_raw_kernel_and_solve(
                 Pi_q, eta_q, cell=self.cell, q_kpt=self.mesh_obj.canonical_kpts[q],
                 grid_coords=self.grid_coords, grid_mesh=self.cell.mesh, rtol=1e-8,
@@ -135,7 +136,7 @@ class TestV2ReferenceReplay(unittest.TestCase):
             rq = pbctools.ifft(wq * vq, mesh).conj()
             kern_ref = lib.dot(lq, rq.T) / np.sqrt(n_grid)
 
-            Pi_q = np.sqrt(self.mesh_obj.n_kpts) * self.Pi_mine[q].conj()
+            Pi_q = self.Pi_mine[q].conj()
             _, kern_mine, _ = apply_raw_kernel_and_solve(
                 Pi_q, self.eta_ref[q], cell=self.cell, q_kpt=self.mesh_obj.canonical_kpts[q],
                 grid_coords=coord, grid_mesh=mesh, rtol=1e-8,

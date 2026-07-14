@@ -151,19 +151,19 @@ def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=
     return pivots[:n_selected], L[:, :n_selected], n_selected
 
 
-def build_pi_eta(X, ao_blocks, kmesh, *, imag_tol=1e-10):
+def build_pi_eta(X, ao_blocks, phase, *, imag_tol=1e-10):
     """Build the per-q metric Pi^q and RHS eta^q (design v2.1 section 4/5):
 
-        Pi^q  = pair_convolve(X, X, kmesh)[q]         (Nip, Nip)
-        eta^q = pair_convolve(X, AO, kmesh)[q]         (Nip, Ng)
+        Pi^q  = pair_convolve(X, X, phase)[q]         (Nip, Nip)
+        eta^q = pair_convolve(X, AO, phase)[q]         (Nip, Ng)
 
     eta is accumulated over grid blocks by calling pair_convolve once
     per block and concatenating along the grid axis -- this bounds the
     memory of any single pair_convolve call to one block's worth of AO
-    data, at the cost of re-walking X's own per-q GEMM/FFT machinery
-    once per block (the same reference-first, optimize-later posture as
-    this module's other primitives; a genuinely fused/tiled device
-    pipeline is Phase C's job, not this CPU oracle's).
+    data, at the cost of re-walking X's own per-q GEMM/transform
+    machinery once per block (the same reference-first, optimize-later
+    posture as this module's other primitives; a genuinely fused/tiled
+    device pipeline is Phase C's job, not this CPU oracle's).
 
     Args:
         X: (Nk, Nip, Nao) complex128 -- the interpolation-point factor
@@ -172,8 +172,8 @@ def build_pi_eta(X, ao_blocks, kmesh, *, imag_tol=1e-10):
         ao_blocks: a single (Nk, Ng, Nao) complex128 array, or an
             iterable of (Nk, blk_i, Nao) complex128 arrays (AO values at
             successive grid blocks) across the SAME canonical k-mesh.
-        kmesh: (3,) positive ints, the canonical k/q-mesh shape (see
-            pytc.pbc.df.kpts.KptsMesh.kmesh).
+        phase: (Nk, Nk) complex128 unitary k<->supercell-image transform
+            matrix (see pytc.pbc.df.kpts.KptsMesh.phase).
         imag_tol: forwarded to pair_convolve's imaginary-part gate.
 
     Returns:
@@ -193,7 +193,7 @@ def build_pi_eta(X, ao_blocks, kmesh, *, imag_tol=1e-10):
     if X.ndim != 3:
         raise ValueError(f"X must be 3-D (Nk, Nip, Nao), got shape {X.shape}.")
 
-    Pi = pair_convolve(X, X, kmesh, imag_tol=imag_tol)
+    Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)
 
     if isinstance(ao_blocks, np.ndarray):
         ao_blocks = [ao_blocks]
@@ -203,7 +203,7 @@ def build_pi_eta(X, ao_blocks, kmesh, *, imag_tol=1e-10):
         raise ValueError("ao_blocks must be nonempty.")
 
     eta_chunks = [
-        pair_convolve(X, np.asarray(block), kmesh, imag_tol=imag_tol)
+        pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)
         for block in ao_blocks
     ]
     eta = np.concatenate(eta_chunks, axis=2)
@@ -1057,7 +1057,7 @@ def stage_eta_memmap(eta_chunks_iter, shape, memmap_path):
     return mm
 
 
-def stage_eta_recompute_tile(X, ao_block_source, kmesh, q_slice=None):
+def stage_eta_recompute_tile(X, ao_block_source, phase, q_slice=None):
     """recompute staging mechanics (policy 3): no staged array at all --
     re-exposes build_pi_eta's own streaming contract as the "recompute
     per-q-tile" entry point, so a caller under memory/disk pressure
@@ -1073,7 +1073,7 @@ def stage_eta_recompute_tile(X, ao_block_source, kmesh, q_slice=None):
         ao_block_source: callable, ao_block_source() -> a FRESH iterable
             of (Nk,blk,Nao) blocks each call (e.g. a lambda wrapping
             stream_ao_blocks(...)).
-        kmesh: forwarded to build_pi_eta.
+        phase: forwarded to build_pi_eta.
         q_slice: optional slice/index applied to Pi/eta's leading (Nk)
             axis AFTER the full build (this function still runs the
             complete Alg-1 pair-convolve pass every call; restricting
@@ -1083,7 +1083,7 @@ def stage_eta_recompute_tile(X, ao_block_source, kmesh, q_slice=None):
     Returns:
         (Pi, eta): same as build_pi_eta, optionally sliced by q_slice.
     """
-    Pi, eta = build_pi_eta(X, ao_block_source(), kmesh)
+    Pi, eta = build_pi_eta(X, ao_block_source(), phase)
     if q_slice is not None:
         return Pi[q_slice], eta[q_slice]
     return Pi, eta
