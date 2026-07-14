@@ -485,18 +485,27 @@ class TestIBPISDFao2mo(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             p.ao2mo(a)
 
-    def test_dtype_parity_float64_only(self):
-        # PySCF 2.10 DF ao2mo accepts float64 and rejects float32/int/bool; v1
-        # matches with no silent coercion.
-        p, nao = self._provider()
-        f64 = self._cols(nao, 2, 3)                   # float64 accepted
+    def test_dtype_parity_float64_only_and_rejected_before_build(self):
+        # PySCF 2.10 DF ao2mo accepts float64 and rejects float32/int/bool/
+        # object; v1 matches with no silent coercion, and the rejection happens
+        # BEFORE the expensive lazy build (a fresh provider stays unbuilt).
+        mol = _h3()
+        nao = mol.nao
+        f64 = np.random.default_rng(3).normal(size=(nao, 2))
         self.assertEqual(f64.dtype, np.float64)
-        p.ao2mo(f64)
+        obj = np.array(f64, dtype=object)             # object dtype
         for bad in (f64.astype(np.float32),
                     f64.astype(np.int64),
-                    (f64 > 0)):                        # bool
+                    (f64 > 0),                          # bool
+                    obj):
+            p = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1)
             with self.assertRaises(TypeError):
                 p.ao2mo(bad)
+            self.assertFalse(p._ibp_built, "dtype rejection must precede lazy build")
+        # float64 is accepted (and builds)
+        p = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1)
+        p.ao2mo(f64)
+        self.assertTrue(p._ibp_built)
 
     def test_malformed_inputs_rejected(self):
         p, nao = self._provider()
@@ -529,17 +538,40 @@ class TestIBPISDFao2mo(unittest.TestCase):
 
     def test_multi_block_dgemm_accumulation_matches_oracle(self):
         # Force several L blocks (small blockdim) so the beta-accumulate is
-        # exercised across blocks, and the streamed result still matches the
-        # independent oracle.
+        # exercised across blocks, spy the module-level dgemm to prove every
+        # call accumulates in place into the one F-contiguous output object
+        # (same buffer, overwrite_c=1), and confirm the streamed result still
+        # matches the independent oracle.
+        import pytc.df.ibp_pyscf as mod
         p, nao = self._provider()
         p.blockdim = 3
         a = self._cols(nao, 3, 5)
         b = self._cols(nao, 2, 6)
-        blocks = list(p.loop())
-        self.assertGreater(len(blocks), 1)  # genuinely multi-block
+        self.assertGreater(len(list(p.loop())), 1)  # genuinely multi-block
+
+        seen = []
+        orig = mod.dgemm
+
+        def spy(*args, **kwargs):
+            ret = orig(*args, **kwargs)
+            seen.append((kwargs.get("c"), kwargs.get("overwrite_c"), ret))
+            return ret
+
+        try:
+            mod.dgemm = spy
+            got = p.ao2mo((a, a, b, b), compact=True)
+        finally:
+            mod.dgemm = orig
+
+        self.assertGreater(len(seen), 1, "dgemm was not called per block")
+        first_c = seen[0][0]
+        for c_arg, overwrite, ret in seen:
+            self.assertEqual(overwrite, 1)
+            self.assertTrue(c_arg.flags.f_contiguous)
+            self.assertIs(c_arg, first_c)                 # one output object across blocks
+            self.assertTrue(np.shares_memory(ret, c_arg))  # accumulated in place
         np.testing.assert_allclose(
-            p.ao2mo((a, a, b, b), compact=True),
-            _dense_ao2mo_oracle(p, (a, a, b, b), True), atol=1e-10
+            got, _dense_ao2mo_oracle(p, (a, a, b, b), True), atol=1e-10
         )
 
     def test_no_dense_cache_retained_and_cderi_none(self):
@@ -671,24 +703,28 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
         self.assertLess(d_ibp, 0.1)
 
     def test_ccsd_ibp_drives_integrals_with_no_fallback(self):
-        # The public DF-CCSD path structurally needs a DF-SCF for get_jk, which
-        # IBP v1 does not implement; so the SCF uses an analytic DF reference,
-        # built OUTSIDE the spy, and IBP drives ONLY the CC integral build. The
-        # spy (around the CC kernel only) then requires zero analytic-DF
-        # construction and the probed loop-only path for the CC integrals. Both
-        # the conventional-ERI reference and the IBP CCSD share the SAME DF-SCF
-        # orbitals so the difference isolates the integral metric.
+        # Exact (non-DF) RHF reference: cc.CCSD(mf) is a conventional
+        # four-center RCCSD (pyscf.cc.ccsd.CCSD, no with_df), built OUTSIDE the
+        # spy. cc.CCSD(mf).density_fit(with_df=ibp) is a DF-CCSD
+        # (pyscf.cc.dfccsd.RCCSD) whose CC integral build uses IBP. Both share
+        # the same exact-RHF orbitals so the difference isolates the integral
+        # metric. The provider and the DF-CCSD object are constructed before the
+        # spy; the spy wraps only the IBP CC kernel and requires zero
+        # analytic-DF construction, zero ao2mo, and loop() > 0.
         from pyscf import scf, cc
         import pyscf.df.df as dfmod
         mol = self._h2o()
         nao = mol.nao
-        mf_df = scf.RHF(mol).density_fit()
-        mf_df.kernel()  # analytic DF-SCF reference (shared orbitals), outside the spy
-        ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
-        # conventional 4-center CCSD reference on the same orbitals, outside spy
-        ref = cc.CCSD(mf_df)
+        mf = scf.RHF(mol)
+        mf.kernel()  # exact non-DF RHF; frozen orbitals shared by ref and IBP
+        ref = cc.CCSD(mf)             # conventional four-center CCSD
         ref.max_cycle = 1
         ref.kernel()
+        self.assertFalse(hasattr(ref, "with_df"))
+        ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
+        mycc = cc.CCSD(mf).density_fit(with_df=ibp)   # dfccsd.RCCSD, built outside spy
+        mycc.max_cycle = 1
+        self.assertIs(mycc.with_df, ibp)
         calls = {"df_init": 0, "ao2mo": 0, "loop": 0}
         orig_init, orig_ao2mo, orig_loop = (
             dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop)
@@ -705,9 +741,6 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
             calls["loop"] += 1
             return orig_loop(self, *a, **k)
 
-        mycc = cc.CCSD(mf_df)
-        mycc.with_df = ibp            # IBP is the CC integral provider
-        mycc.max_cycle = 1            # DF ERI build + one residual checkpoint
         try:
             dfmod.DF.__init__ = spy_init
             IBPISDF.ao2mo = spy_ao2mo
@@ -717,19 +750,18 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
             dfmod.DF.__init__ = orig_init
             IBPISDF.ao2mo = orig_ao2mo
             IBPISDF.loop = orig_loop
-        self.assertIs(mycc.with_df, ibp)
         self.assertEqual(calls["df_init"], 0, "an analytic DF fallback built the CC integrals")
         self.assertEqual(calls["ao2mo"], 0, "CCSD unexpectedly used ao2mo, not loop")
         self.assertGreater(calls["loop"], 0, "IBP loop() did not drive the CC integrals")
         self.assertTrue(np.isfinite(mycc.e_corr))
         self.assertTrue(np.all(np.isfinite(mycc.t1)))
         self.assertTrue(np.all(np.isfinite(mycc.t2)))
-        # Direct-reference differences (no acceptance threshold yet).
+        # Direct conventional-reference differences (no acceptance threshold yet).
         d_ecorr = abs(mycc.e_corr - ref.e_corr) * 1e3
         d_t1 = float(np.max(np.abs(mycc.t1 - ref.t1)))
         d_t2 = float(np.max(np.abs(mycc.t2 - ref.t2)))
-        print(f"\n[IBP-CCSD 1-cycle vs conventional, shared DF-SCF orbitals] "
-              f"dE_corr={d_ecorr:.4f} mHa max|dt1|={d_t1:.3e} max|dt2|={d_t2:.3e}")
+        print(f"\n[IBP DF-CCSD 1-cycle vs conventional 4c, exact-RHF orbitals] "
+              f"dE_corr={d_ecorr:.6f} mHa max|dt1|={d_t1:.3e} max|dt2|={d_t2:.3e}")
 
 
 if __name__ == "__main__":
