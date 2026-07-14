@@ -273,6 +273,18 @@ class TestIBPISDFLifecycle(unittest.TestCase):
         self.assertFalse(p._ibp_built)
         self.assertIsNone(p._cderi)
 
+    def test_build_copy_mutate_no_alias(self):
+        # A built provider and an independently built copy must not share the
+        # _cderi factor buffer; mutating one leaves the other untouched.
+        p = IBPISDF(_h2(), rank=3, grid_level=1).build()
+        q = p.copy()
+        self.assertFalse(q._ibp_built)
+        q.build()
+        self.assertIsNot(p._cderi, q._cderi)
+        before = p._cderi.copy()
+        q._cderi[:] = 0.0
+        np.testing.assert_array_equal(p._cderi, before)
+
     def test_get_jk_not_implemented(self):
         p = IBPISDF(_h2(), rank=3)
         with self.assertRaises(NotImplementedError):
