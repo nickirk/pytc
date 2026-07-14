@@ -193,10 +193,13 @@ class IBPISDF(DF):
     def _clear_custom_cache(self):
         self._ibp_built = False
         self._ibp_mol_fingerprint = None
-        self._ibp_factor = None       # W, (n_mu, retained_rank)
-        self._ibp_pair = None         # P, (rank, n_pair)
-        self._ibp_naoaux = None
         self._ibp_diagnostics = None
+        # _cderi is the SINGLE authoritative packed-AO factor buffer
+        # (naoaux, nao_pair), aosym='s2', float64 -- the genuine cderi that
+        # unchanged PySCF DF consumers (e.g. DFMP2) read. loop()/get_naoaux()/
+        # ao2mo() all consume this one state, so a perturbation of the factor
+        # propagates. No separate W/P copy is retained.
+        self._cderi = None
 
     @property
     def config(self):
@@ -267,21 +270,21 @@ class IBPISDF(DF):
 
     def get_naoaux(self):
         self.build()
-        return self._ibp_naoaux
+        return self._cderi.shape[0]
 
     def loop(self, blksize=None):
         self.build()
         # Validate the block size first -- before the zero-rank short circuit --
         # so an invalid blksize/blockdim is rejected regardless of rank.
         blksize = self._resolve_blksize(blksize)
-        naoaux = self._ibp_naoaux
+        cderi = self._cderi
+        naoaux = cderi.shape[0]
         if naoaux == 0:
             return
-        W = self._ibp_factor
-        P = self._ibp_pair
+        # Stream row blocks of the single authoritative packed-AO factor.
         for start in range(0, naoaux, blksize):
             end = min(start + blksize, naoaux)
-            yield np.ascontiguousarray(W[:, start:end].conj().T @ P)
+            yield np.ascontiguousarray(cderi[start:end])
 
     def _normalize_mo_coeffs(self, mo_coeffs):
         """Accept the two public PySCF forms -- one 2-D coefficient matrix
@@ -447,10 +450,23 @@ class IBPISDF(DF):
                 f"before the provider becomes built."
             )
 
-        # Atomic publish: only now assign the cache references.
-        self._ibp_factor = core.psd_factor            # W
-        self._ibp_pair = sector.P                      # P
-        self._ibp_naoaux = int(core.psd_retained_rank)
+        # Materialize the single authoritative packed-AO DF factor
+        # _cderi = W^dagger P, shape (naoaux, nao_pair), aosym='s2', float64 --
+        # the genuine cderi that unchanged PySCF DF consumers read (loop()
+        # streams from it; DFMP2 hits its non-analytic path).
+        cderi = np.ascontiguousarray(core.psd_factor.conj().T @ sector.P, dtype=np.float64)
+        nao = int(self.mol.nao)
+        nao_pair = nao * (nao + 1) // 2
+        naoaux = int(core.psd_retained_rank)
+        if cderi.shape != (naoaux, nao_pair):
+            raise ValueError(
+                f"_cderi shape {cderi.shape} must be (naoaux, nao_pair)="
+                f"{(naoaux, nao_pair)} (packed s2 lower-triangular AO pairs).")
+        if cderi.dtype != np.float64 or not cderi.flags["C_CONTIGUOUS"]:
+            raise ValueError("_cderi must be a C-contiguous float64 array.")
+        if not np.all(np.isfinite(cderi)):
+            raise ValueError("_cderi has non-finite entries.")
+        self._cderi = cderi
         self._ibp_diagnostics = _IBPDiagnostics(
             psd_status=core.psd_status,
             psd_retained_rank=int(core.psd_retained_rank),

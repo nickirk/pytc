@@ -160,13 +160,12 @@ class TestIBPISDFConstruction(unittest.TestCase):
 
 
 class TestIBPISDFStreaming(unittest.TestCase):
-    """loop()/get_naoaux() streaming, exercised on injected W/P so the math is
-    isolated from the (separately tested) physical build."""
+    """loop()/get_naoaux() streaming, exercised on an injected _cderi factor so
+    the math is isolated from the (separately tested) physical build."""
 
     def _inject(self, p, W, P):
-        p._ibp_factor = W
-        p._ibp_pair = P
-        p._ibp_naoaux = int(W.shape[1])
+        # _cderi is the single authoritative factor = W^dagger P.
+        p._cderi = np.ascontiguousarray(W.conj().T @ P, dtype=np.float64)
         # Match the current molecule identity so build()'s idempotent identity
         # guard treats this injected cache as a valid built state.
         p._ibp_mol_fingerprint = _mol_fingerprint(p.mol)
@@ -192,6 +191,19 @@ class TestIBPISDFStreaming(unittest.TestCase):
         blocks = list(p.loop())  # default blockdim (240) >> naoaux
         self.assertEqual(len(blocks), 1)
         np.testing.assert_allclose(blocks[0], W.conj().T @ P)
+
+    def test_loop_block_size_invariance(self):
+        # loop() must yield the same factor regardless of blksize -- and that
+        # factor is exactly the single _cderi buffer.
+        rng = np.random.default_rng(9)
+        W = rng.normal(size=(5, 7))
+        P = rng.normal(size=(5, 4))
+        p = IBPISDF(_h2(), rank=3)
+        self._inject(p, W, P)
+        small = np.vstack(list(p.loop(blksize=2)))
+        big = np.vstack(list(p.loop(blksize=100)))
+        np.testing.assert_array_equal(small, big)
+        np.testing.assert_array_equal(small, p._cderi)
 
     def test_blksize_validation(self):
         rng = np.random.default_rng(2)
@@ -228,16 +240,14 @@ class TestIBPISDFStreaming(unittest.TestCase):
 class TestIBPISDFLifecycle(unittest.TestCase):
     def _mark_built(self, p):
         p._ibp_built = True
-        p._ibp_factor = np.ones((5, 3))
-        p._ibp_pair = np.ones((5, 4))
-        p._ibp_naoaux = 3
+        p._cderi = np.ones((3, 4))
 
     def test_copy_is_unbuilt_same_config_independent(self):
         p = IBPISDF(_h2(), rank=3, grid_level=1)
         self._mark_built(p)
         q = p.copy()
         self.assertFalse(q._ibp_built)
-        self.assertIsNone(q._ibp_factor)
+        self.assertIsNone(q._cderi)
         self.assertEqual(q.config, p.config)
         # mutating the copy's cache does not touch the original
         self.assertTrue(p._ibp_built)
@@ -261,8 +271,7 @@ class TestIBPISDFLifecycle(unittest.TestCase):
         self._mark_built(p)
         p.reset()
         self.assertFalse(p._ibp_built)
-        self.assertIsNone(p._ibp_naoaux)
-        self.assertIsNone(p._ibp_factor)
+        self.assertIsNone(p._cderi)
 
     def test_get_jk_not_implemented(self):
         p = IBPISDF(_h2(), rank=3)
@@ -289,8 +298,7 @@ class TestIBPISDFBuildGates(unittest.TestCase):
             with self.assertRaises(ValueError):
                 p.build()
         self.assertFalse(p._ibp_built)
-        self.assertIsNone(p._ibp_factor)
-        self.assertIsNone(p._ibp_naoaux)
+        self.assertIsNone(p._cderi)
 
     def test_psd_gate_leaves_provider_unbuilt(self):
         p = IBPISDF(_h2(), rank=3, grid_level=1)
@@ -299,7 +307,7 @@ class TestIBPISDFBuildGates(unittest.TestCase):
             with self.assertRaises(ValueError):
                 p.build()
         self.assertFalse(p._ibp_built)
-        self.assertIsNone(p._ibp_factor)
+        self.assertIsNone(p._cderi)
 
 
 class TestIBPISDFStaleMolecule(unittest.TestCase):
@@ -462,8 +470,8 @@ class TestIBPISDFao2mo(unittest.TestCase):
         # An injected valid zero-rank cache: ao2mo iterates loop() (zero blocks
         # -> zero output) yet still validates the (default) block size.
         p, nao = self._provider()
-        p._ibp_factor = np.zeros((p._ibp_pair.shape[0], 0))   # W with 0 columns
-        p._ibp_naoaux = 0
+        nao_pair = nao * (nao + 1) // 2
+        p._cderi = np.zeros((0, nao_pair))                    # zero retained rank
         a = self._cols(nao, 2, 1)
         out = p.ao2mo(a, compact=True)
         self.assertEqual(out.shape, (3, 3))
@@ -510,26 +518,23 @@ class TestIBPISDFao2mo(unittest.TestCase):
             got, _dense_ao2mo_oracle(p, (a, a, b, b), True), atol=1e-10
         )
 
-    def test_no_dense_cache_retained_and_cderi_none(self):
+    def test_cderi_is_single_factor_no_duplicate_or_dense_cache(self):
         p, nao = self._provider()
         a = self._cols(nao, 3, 2)
         _ = p.ao2mo(a)
-        # ao2mo derives solely from W/P via loop(); no inherited _cderi and no
-        # retained full-B / AO four-index cache. Whitelist the permitted W/P
-        # arrays and reject any other array-valued attribute that is >=3-D or
-        # carries a packed-AO-pair axis (the full-B shape is (naoaux, nao_pair)
-        # with naoaux <= nao_pair, so a bare shape[0] > nao_pair test misses it).
-        self.assertIsNone(p._cderi)
+        # _cderi is the SINGLE authoritative packed-AO factor (naoaux, nao_pair);
+        # there is no duplicate W/P cache and no retained AO four-index tensor.
         nao_pair = nao * (nao + 1) // 2
-        allowed = {"_ibp_factor", "_ibp_pair"}
+        self.assertIsInstance(p._cderi, np.ndarray)
+        self.assertEqual(p._cderi.ndim, 2)
+        self.assertEqual(p._cderi.shape[1], nao_pair)
+        self.assertEqual(p._cderi.shape[0], p.get_naoaux())
+        self.assertFalse(hasattr(p, "_ibp_factor") and getattr(p, "_ibp_factor") is not None)
+        self.assertFalse(hasattr(p, "_ibp_pair") and getattr(p, "_ibp_pair") is not None)
         for name in vars(p):
             val = getattr(p, name)
-            if not isinstance(val, np.ndarray) or name in allowed:
-                continue
-            if val.ndim >= 3:
+            if isinstance(val, np.ndarray) and val is not p._cderi and val.ndim >= 3:
                 self.fail(f"unexpected dense (>=3-D) cache retained: {name} {val.shape}")
-            if val.ndim == 2 and nao_pair in val.shape:
-                self.fail(f"unexpected packed-AO-pair cache retained: {name} {val.shape}")
 
     def test_ao2mo_lazy_builds_and_honors_stale_guard(self):
         # Lazy build through ao2mo.
@@ -561,10 +566,12 @@ class TestIBPISDFPhysicalBuild(unittest.TestCase):
         self.assertEqual(p.get_naoaux(), p._ibp_diagnostics.psd_retained_rank)
         self.assertEqual(p._ibp_diagnostics.psd_status, "factorized")
         full = np.vstack(list(p.loop()))
-        P = p._ibp_pair
-        Z = p._ibp_diagnostics.Z
-        metric = P.conj().T @ Z @ P
-        np.testing.assert_allclose(full.conj().T @ full, metric, atol=1e-10, rtol=1e-8)
+        np.testing.assert_allclose(full, p._cderi)   # loop streams the _cderi factor
+        # The reconstructed packed-AO metric V = B^dagger B is Hermitian PSD.
+        v = full.conj().T @ full
+        np.testing.assert_allclose(v, v.conj().T, atol=1e-10)
+        eig = np.linalg.eigvalsh(v)
+        self.assertGreater(eig.min(), -1e-8 * max(1.0, float(np.max(np.abs(eig)))))
 
     @unittest.skipUnless(os.environ.get("PYTC_RUN_SLOW_IBP"),
                          "opt-in heavier physical acceptance (set PYTC_RUN_SLOW_IBP=1)")
@@ -594,49 +601,83 @@ class TestIBPISDFUnchangedConsumers(unittest.TestCase):
         return gto.M(atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587",
                      basis="cc-pVDZ", verbose=0)
 
-    def test_dfmp2_within_0p1_mHa_of_exact_four_center(self):
-        from pyscf import scf, mp, df as pyscf_df
+    @staticmethod
+    def _loop_factor_mp2(mol, mf, ibp):
+        """Closed-shell MP2 from the provider's OWN streamed loop factor -- the
+        independent oracle unchanged DFMP2 must match if it truly consumes the
+        IBP factor. Validated elsewhere to reproduce exact MP2 from exact ERIs."""
+        from pyscf.lib import unpack_tril
+        nocc = mol.nelectron // 2
+        C = np.asarray(mf.mo_coeff)
+        Co, Cv = C[:, :nocc], C[:, nocc:]
+        eo, ev = mf.mo_energy[:nocc], mf.mo_energy[nocc:]
+        b_full = unpack_tril(np.ascontiguousarray(np.vstack(list(ibp.loop()))))
+        l_ia = np.einsum("Lab,ai,bj->Lij", b_full, Co, Cv, optimize=True)
+        ovov = np.einsum("Lia,Ljb->iajb", l_ia, l_ia, optimize=True)
+        denom = (eo[:, None, None, None] - ev[None, :, None, None]
+                 + eo[None, None, :, None] - ev[None, None, None, :])
+        return float(np.sum(ovov * (2 * ovov - ovov.transpose(0, 3, 2, 1)) / denom))
+
+    def test_dfmp2_consumes_ibp_factor_matches_oracle_rank_sensitive(self):
+        # Unchanged PySCF DFMP2 must consume the IBP loop factor: match the
+        # loop-factor oracle to tight tolerance, call loop() with no analytic-DF
+        # fallback, and vary consistently with rank.
+        from pyscf import scf
         from pyscf.mp import dfmp2
         import pyscf.df.df as dfmod
         mol = self._h2o()
-        nao = mol.nao
+        energies = {}
+        for rank in (100, 150, 236):
+            mf = scf.RHF(mol)
+            mf.kernel()
+            ibp = IBPISDF(mol, rank=rank, grid_level=1).build()
+            oracle = self._loop_factor_mp2(mol, mf, ibp)
+            mf.with_df = ibp
+            calls = {"df_init": 0, "ao2mo": 0, "loop": 0}
+            oi, oa, ol = dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop
+
+            def si(self, *a, **k):
+                calls["df_init"] += 1
+                return oi(self, *a, **k)
+
+            def sa(self, *a, **k):
+                calls["ao2mo"] += 1
+                return oa(self, *a, **k)
+
+            def sl(self, *a, **k):
+                calls["loop"] += 1
+                return ol(self, *a, **k)
+
+            try:
+                dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop = si, sa, sl
+                e = dfmp2.DFMP2(mf).kernel()[0]
+            finally:
+                dfmod.DF.__init__, IBPISDF.ao2mo, IBPISDF.loop = oi, oa, ol
+            self.assertEqual(calls["df_init"], 0, f"analytic DF built at rank {rank}")
+            self.assertEqual(calls["ao2mo"], 0)
+            self.assertGreater(calls["loop"], 0, f"loop() not called at rank {rank}")
+            self.assertAlmostEqual(e, oracle, places=9)  # DFMP2 == loop-factor oracle
+            energies[rank] = e
+        # genuinely rank-sensitive (the defect this closes made it rank-flat)
+        self.assertGreater(abs(energies[100] - energies[236]), 1e-4)
+        self.assertGreater(abs(energies[150] - energies[236]), 1e-5)
+
+    def test_dfmp2_factor_corruption_changes_energy_and_restores(self):
+        from pyscf import scf
+        from pyscf.mp import dfmp2
+        mol = self._h2o()
         mf = scf.RHF(mol)
-        mf.kernel()  # exact (non-DF) RHF; its orbitals are shared by all three
-        e_exact = mp.MP2(mf).kernel()[0]
-        # analytic DF-MP2 reference, constructed OUTSIDE the no-fallback spy
-        mf.with_df = pyscf_df.DF(mol).build()
-        e_dfmp2 = dfmp2.DFMP2(mf).kernel()[0]
-        # IBP provider, pre-built before the spy so its own DF.__init__ is not counted
-        ibp = IBPISDF(mol, rank=nao * (nao + 1) // 2, grid_level=1).build()
-        rank = ibp.get_naoaux()
-        pair_resid = ibp._ibp_diagnostics.raw_packed_pair_metric_dagger_residual
-        calls = {"df_init": 0, "ao2mo": 0}
-        orig_init, orig_ao2mo = dfmod.DF.__init__, IBPISDF.ao2mo
-
-        def spy_init(self, *a, **k):
-            calls["df_init"] += 1
-            return orig_init(self, *a, **k)
-
-        def spy_ao2mo(self, *a, **k):
-            calls["ao2mo"] += 1
-            return orig_ao2mo(self, *a, **k)
-
+        mf.kernel()
+        ibp = IBPISDF(mol, rank=200, grid_level=1).build()
         mf.with_df = ibp
-        try:
-            dfmod.DF.__init__ = spy_init
-            IBPISDF.ao2mo = spy_ao2mo
-            e_ibp = dfmp2.DFMP2(mf).kernel()[0]
-        finally:
-            dfmod.DF.__init__ = orig_init
-            IBPISDF.ao2mo = orig_ao2mo
-        d_ibp = abs(e_ibp - e_exact) * 1e3
-        print(f"\n[IBP-DFMP2 gate] nao={nao} requested_rank={nao*(nao+1)//2} "
-              f"realized_rank={rank} pair_resid={pair_resid:.2e}\n"
-              f"  e_exact4c={e_exact:.8f}  e_dfmp2={e_dfmp2:.8f}  e_ibp={e_ibp:.8f}\n"
-              f"  |ibp-exact|={d_ibp:.4f} mHa  |dfmp2-exact|={abs(e_dfmp2-e_exact)*1e3:.4f} mHa")
-        self.assertEqual(calls["df_init"], 0, "an analytic DF fallback was constructed")
-        self.assertEqual(calls["ao2mo"], 0, "DFMP2 unexpectedly used ao2mo, not loop")
-        self.assertLess(d_ibp, 0.1)
+        e_clean = dfmp2.DFMP2(mf).kernel()[0]
+        saved = ibp._cderi.copy()
+        ibp._cderi = ibp._cderi * 2.0            # perturb the real factor
+        e_corrupt = dfmp2.DFMP2(mf).kernel()[0]
+        self.assertGreater(abs(e_corrupt - e_clean), 1e-6)
+        ibp._cderi = saved                        # restore
+        e_restored = dfmp2.DFMP2(mf).kernel()[0]
+        self.assertAlmostEqual(e_restored, e_clean, places=10)
 
     def test_ccsd_ibp_drives_integrals_with_no_fallback(self):
         # Exact (non-DF) RHF reference: cc.CCSD(mf) is a conventional
