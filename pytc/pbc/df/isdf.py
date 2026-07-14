@@ -821,3 +821,260 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
         return col
 
     return diag, col_eval
+
+
+# ---------------------------------------------------------------------------
+# Staging-policy layer (design v2.1 section 6): predicted-byte-model-driven
+# selection among three eta-store staging policies (ram/memmap/recompute),
+# plus the memmap/recompute mechanics themselves.
+#
+# Byte model here is PREDICTED ONLY. Observed HBM/XLA figures are a later
+# calibration-gate deliverable; this layer's provenance schema carries the
+# observed fields from day one, explicitly None/"unmeasured", so a later
+# pass backfills real numbers without any schema change. Real host/disk
+# resource queries live in exactly one function (query_host_resources) so
+# the policy-selection decision itself takes plain injected numbers and
+# stays fully testable with synthetic inputs, including forced-demotion
+# cases, with no real memory/disk pressure required.
+
+
+def predicted_byte_model(n_kpts, n_ip, n_grid, n_ao, block_size, *, itemsize=16):
+    """Predicted byte counts for one build (design v2.1 section 6), c128
+    (itemsize=16) throughout. Every quantity is a closed-form prediction
+    from the problem's own shape parameters -- nothing here is measured.
+
+    Returns:
+        dict: ao_grid_block_bytes (one streamed AO block), eta_store_bytes
+        (the full (Nk,Nip,Ng) eta array a staging policy must place
+        somewhere), double_buffer_bytes (per-block device scratch, 2x),
+        fft_workspace_bytes (per-q-slab-pair scratch, 2x),
+        pi_v_w_workspace_bytes (O(Nk*Nip^2) Pi/V/W storage +
+        O(Nip^2) eigh scratch), selection_traffic_bytes (Nip full
+        AO-grid sweeps -- the S2 pivot-selection cost), and
+        total_predicted_bytes (eta_store + selection_traffic, the two
+        terms choose_staging_policy actually gates on).
+
+    Raises:
+        ValueError: any shape parameter is not a positive integer.
+    """
+    for name, value in (
+        ("n_kpts", n_kpts), ("n_ip", n_ip), ("n_grid", n_grid),
+        ("n_ao", n_ao), ("block_size", block_size),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+
+    ao_grid_block_bytes = n_kpts * block_size * n_ao * itemsize
+    eta_store_bytes = n_kpts * n_ip * n_grid * itemsize
+    double_buffer_bytes = 2 * n_ip * block_size * itemsize
+    fft_workspace_bytes = 2 * n_ip * n_grid * itemsize
+    pi_v_w_workspace_bytes = (n_kpts * n_ip * n_ip + n_ip * n_ip) * itemsize
+    selection_traffic_bytes = n_ip * n_kpts * n_grid * n_ao * itemsize
+    total_predicted_bytes = eta_store_bytes + selection_traffic_bytes
+
+    return {
+        "ao_grid_block_bytes": ao_grid_block_bytes,
+        "eta_store_bytes": eta_store_bytes,
+        "double_buffer_bytes": double_buffer_bytes,
+        "fft_workspace_bytes": fft_workspace_bytes,
+        "pi_v_w_workspace_bytes": pi_v_w_workspace_bytes,
+        "selection_traffic_bytes": selection_traffic_bytes,
+        "total_predicted_bytes": total_predicted_bytes,
+    }
+
+
+def choose_staging_policy(byte_model, *, available_host_bytes, available_disk_bytes,
+                           ram_headroom_fraction=0.5, disk_headroom_fraction=0.9):
+    """Select a staging policy for the eta store from a PREDICTED byte
+    model (predicted_byte_model) and caller-supplied available-resource
+    numbers -- never queried internally here, so this function stays
+    synthetic-input testable (see query_host_resources for the one place
+    real numbers are read).
+
+    Rule: "ram" if eta_store_bytes fits within ram_headroom_fraction of
+    available_host_bytes; else "memmap" if it fits within
+    disk_headroom_fraction of available_disk_bytes; else "recompute".
+
+    Args:
+        byte_model: dict from predicted_byte_model.
+        available_host_bytes: free host RAM, as measured or synthesized.
+        available_disk_bytes: free scratch-disk space, as measured or
+            synthesized.
+        ram_headroom_fraction: overridable threshold (default 0.5,
+            matching "<=50% of free RAM else demote policy").
+        disk_headroom_fraction: overridable threshold for the memmap
+            fallback (default 0.9).
+
+    Returns:
+        dict: policy ("ram"|"memmap"|"recompute"), eta_store_bytes,
+        ram_headroom_bytes, disk_headroom_bytes, ram_headroom_fraction,
+        disk_headroom_fraction, available_host_bytes,
+        available_disk_bytes, observed_peak_host_bytes (always None
+        here), observed_status (always "unmeasured" here) -- the last
+        two fields exist so a later calibration pass backfills real
+        values into this SAME schema, never a different one.
+
+    Raises:
+        ValueError: negative resource numbers, or a fraction outside
+            (0,1].
+    """
+    eta_bytes = byte_model["eta_store_bytes"]
+    if eta_bytes < 0:
+        raise ValueError(f"byte_model['eta_store_bytes'] must be non-negative, got {eta_bytes}.")
+    for name, value in (
+        ("available_host_bytes", available_host_bytes),
+        ("available_disk_bytes", available_disk_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
+    for name, value in (
+        ("ram_headroom_fraction", ram_headroom_fraction),
+        ("disk_headroom_fraction", disk_headroom_fraction),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 < value <= 1.0):
+            raise ValueError(f"{name} must be in (0,1], got {value!r}.")
+
+    ram_headroom_bytes = int(ram_headroom_fraction * available_host_bytes)
+    disk_headroom_bytes = int(disk_headroom_fraction * available_disk_bytes)
+
+    if eta_bytes <= ram_headroom_bytes:
+        policy = "ram"
+    elif eta_bytes <= disk_headroom_bytes:
+        policy = "memmap"
+    else:
+        policy = "recompute"
+
+    return {
+        "policy": policy,
+        "eta_store_bytes": eta_bytes,
+        "ram_headroom_bytes": ram_headroom_bytes,
+        "disk_headroom_bytes": disk_headroom_bytes,
+        "ram_headroom_fraction": ram_headroom_fraction,
+        "disk_headroom_fraction": disk_headroom_fraction,
+        "available_host_bytes": available_host_bytes,
+        "available_disk_bytes": available_disk_bytes,
+        "observed_peak_host_bytes": None,
+        "observed_status": "unmeasured",
+    }
+
+
+def query_host_resources(scratch_dir="."):
+    """The one place this module reads REAL host/disk resource numbers
+    (psutil / shutil.disk_usage) -- keeps choose_staging_policy itself
+    free of any hidden system call, so its decision logic stays
+    synthetic-input testable. Callers wanting a real-system staging
+    decision call this, then pass the result into choose_staging_policy;
+    tests construct available_host_bytes/available_disk_bytes directly.
+
+    Returns:
+        (available_host_bytes, available_disk_bytes): both int.
+    """
+    import shutil
+
+    import psutil
+
+    available_host_bytes = int(psutil.virtual_memory().available)
+    available_disk_bytes = int(shutil.disk_usage(scratch_dir).free)
+    return available_host_bytes, available_disk_bytes
+
+
+def jit_memory_analysis_smoke(jitted_fn, *args):
+    """Optional CPU-backend structural smoke recording (design v2.1
+    section 6's "XLA temporaries bounded by the jitted-program's compiled
+    memory report" note): compiles jitted_fn against args and returns its
+    jax CompiledMemoryStats, labeled explicitly as CPU-backend structural
+    data -- NOT an HBM/GPU measurement. Exercises the recording path end
+    to end on this machine so nobody mistakes the structure for real GPU
+    numbers later; a genuine device-memory reading is a calibration-gate
+    deliverable, not this layer's job.
+
+    Args:
+        jitted_fn: a jax.jit-wrapped function.
+        *args: example arguments determining the compiled program's
+            shapes (values are only used for shape/dtype; not executed).
+
+    Returns:
+        dict: backend (jax.default_backend()), label
+        "cpu_backend_structural_smoke_not_hbm", and every field of
+        jax's CompiledMemoryStats (generated_code_size_in_bytes,
+        argument_size_in_bytes, output_size_in_bytes, alias_size_in_bytes,
+        temp_size_in_bytes, plus the host_* counterparts).
+    """
+    stats = jitted_fn.lower(*args).compile().memory_analysis()
+    return {
+        "backend": jax.default_backend(),
+        "label": "cpu_backend_structural_smoke_not_hbm",
+        "generated_code_size_in_bytes": stats.generated_code_size_in_bytes,
+        "argument_size_in_bytes": stats.argument_size_in_bytes,
+        "output_size_in_bytes": stats.output_size_in_bytes,
+        "alias_size_in_bytes": stats.alias_size_in_bytes,
+        "temp_size_in_bytes": stats.temp_size_in_bytes,
+        "host_generated_code_size_in_bytes": stats.host_generated_code_size_in_bytes,
+        "host_argument_size_in_bytes": stats.host_argument_size_in_bytes,
+        "host_output_size_in_bytes": stats.host_output_size_in_bytes,
+        "host_alias_size_in_bytes": stats.host_alias_size_in_bytes,
+        "host_temp_size_in_bytes": stats.host_temp_size_in_bytes,
+    }
+
+
+def stage_eta_memmap(eta_chunks_iter, shape, memmap_path):
+    """memmap staging mechanics (policy 2): write streamed eta chunks
+    into a q-major np.memmap on disk at memmap_path, without ever
+    holding the full (Nk,Nip,Ng) eta array in host RAM at once.
+
+    Args:
+        eta_chunks_iter: iterable of (g0, g1, chunk), chunk shape
+            (Nk,Nip,g1-g0) complex128, covering [0,Ng) contiguously and
+            in order (matches stream_ao_blocks' own (g0,g1,block) shape,
+            after routing each streamed AO block through build_pi_eta's
+            per-block pair_convolve call).
+        shape: (Nk,Nip,Ng), the full logical eta array shape.
+        memmap_path: filesystem path for the backing file.
+
+    Returns:
+        np.memmap of shape `shape`, dtype complex128, flushed to disk.
+
+    Raises:
+        ValueError: shape is not a 3-tuple of positive ints.
+    """
+    shape_t = tuple(int(x) for x in shape)
+    if len(shape_t) != 3 or any(s <= 0 for s in shape_t):
+        raise ValueError(f"shape must be 3 positive ints, got {shape_t}.")
+
+    mm = np.memmap(memmap_path, dtype=np.complex128, mode="w+", shape=shape_t)
+    for g0, g1, chunk in eta_chunks_iter:
+        mm[:, :, g0:g1] = chunk
+    mm.flush()
+    return mm
+
+
+def stage_eta_recompute_tile(X, ao_block_source, kmesh, q_slice=None):
+    """recompute staging mechanics (policy 3): no staged array at all --
+    re-exposes build_pi_eta's own streaming contract as the "recompute
+    per-q-tile" entry point, so a caller under memory/disk pressure
+    rebuilds eta ON DEMAND by re-streaming grid blocks through
+    ao_block_source, at the cost of one full rebuild per call. The
+    mechanics ARE build_pi_eta's existing streaming support; the only
+    thing this adds is the CONTRACT that ao_block_source is called fresh
+    every time (recompute implies re-streaming from scratch), plus an
+    optional q-tile slice applied after the build.
+
+    Args:
+        X: (Nk,Nip,Nao) complex128, same as build_pi_eta's X.
+        ao_block_source: callable, ao_block_source() -> a FRESH iterable
+            of (Nk,blk,Nao) blocks each call (e.g. a lambda wrapping
+            stream_ao_blocks(...)).
+        kmesh: forwarded to build_pi_eta.
+        q_slice: optional slice/index applied to Pi/eta's leading (Nk)
+            axis AFTER the full build (this function still runs the
+            complete Alg-1 pair-convolve pass every call; restricting
+            grid streaming itself to a q-tile is a further optimization
+            not implemented here).
+
+    Returns:
+        (Pi, eta): same as build_pi_eta, optionally sliced by q_slice.
+    """
+    Pi, eta = build_pi_eta(X, ao_block_source(), kmesh)
+    if q_slice is not None:
+        return Pi[q_slice], eta[q_slice]
+    return Pi, eta
