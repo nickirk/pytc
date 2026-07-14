@@ -266,6 +266,88 @@ def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
     return max_residual
 
 
+def kpt_to_spc(m_kpt, kmesh, *, imag_tol=1e-10):
+    """IFFT over the k-index (reshaped to kmesh's (n1,n2,n3) lattice),
+    NumPy "backward" norm (carries 1/Nk) -- the same transform
+    pair_convolve applies to build its own T_R intermediate, factored
+    out here for reuse. Converts a k-space (Nk, ...) array to its
+    supercell-image (Nk, ...) real-space counterpart (same leading-axis
+    length; the DFT is a bijection on a same-size grid). The imaginary
+    part is gated BEFORE being discarded, exactly like pair_convolve's
+    own T_R step -- never a silent .real truncation.
+
+    Args:
+        m_kpt: (Nk, ...) complex128, expected time-reversal-symmetric
+            across k (m_kpt[neg[k]] = conj(m_kpt[k])) -- required for
+            the IFFT image to be real.
+        kmesh: (3,) positive ints, prod(kmesh) == Nk.
+        imag_tol: gate on ||Im(m_spc)||/||m_spc|| before discarding Im.
+
+    Returns:
+        m_spc: (Nk, ...) real64.
+
+    Raises:
+        ValueError: malformed shapes/kmesh, or the imag_tol gate fails.
+    """
+    m_kpt = np.asarray(m_kpt)
+    if m_kpt.ndim < 1:
+        raise ValueError("m_kpt must have at least 1 dimension (the k axis).")
+    n_k = m_kpt.shape[0]
+    kmesh_t = tuple(int(x) for x in kmesh)
+    if len(kmesh_t) != 3 or any(m <= 0 for m in kmesh_t):
+        raise ValueError(f"kmesh must be 3 positive ints, got {kmesh_t}.")
+    if int(np.prod(kmesh_t)) != n_k:
+        raise ValueError(f"prod(kmesh)={int(np.prod(kmesh_t))} != m_kpt.shape[0]={n_k}.")
+
+    trailing_shape = m_kpt.shape[1:]
+    m_kmesh = m_kpt.reshape(kmesh_t + trailing_shape)
+    m_spc_complex = np.fft.ifftn(m_kmesh, axes=(0, 1, 2), norm="backward")
+
+    norm_im = float(np.linalg.norm(m_spc_complex.imag))
+    norm_total = float(np.linalg.norm(m_spc_complex))
+    imchk = norm_im / norm_total if norm_total > 0.0 else norm_im
+    if imchk > imag_tol:
+        raise ValueError(
+            f"kpt_to_spc: ||Im(m_spc)||/||m_spc||={imchk:.3e} exceeds imag_tol={imag_tol:.1e} "
+            f"-- m_kpt does not appear to be a valid time-reversal-symmetric collection "
+            f"(m_kpt[neg[k]] should equal conj(m_kpt[k]))."
+        )
+    return m_spc_complex.real.reshape((n_k,) + trailing_shape)
+
+
+def spc_to_kpt(m_spc, kmesh):
+    """Forward FFT over the supercell-image axis -- the inverse
+    transform of kpt_to_spc (modulo its imag_tol gate; this direction
+    never discards anything). NumPy "backward" norm (no normalization on
+    the forward transform), matching pair_convolve's own Z[q] =
+    FFT_k(Z_R) convention.
+
+    Args:
+        m_spc: (Nk, ...) array, real or complex.
+        kmesh: (3,) positive ints, prod(kmesh) == Nk.
+
+    Returns:
+        m_kpt: (Nk, ...) complex128.
+
+    Raises:
+        ValueError: malformed shapes/kmesh.
+    """
+    m_spc = np.asarray(m_spc)
+    if m_spc.ndim < 1:
+        raise ValueError("m_spc must have at least 1 dimension (the supercell-image axis).")
+    n_k = m_spc.shape[0]
+    kmesh_t = tuple(int(x) for x in kmesh)
+    if len(kmesh_t) != 3 or any(m <= 0 for m in kmesh_t):
+        raise ValueError(f"kmesh must be 3 positive ints, got {kmesh_t}.")
+    if int(np.prod(kmesh_t)) != n_k:
+        raise ValueError(f"prod(kmesh)={int(np.prod(kmesh_t))} != m_spc.shape[0]={n_k}.")
+
+    trailing_shape = m_spc.shape[1:]
+    m_kmesh = m_spc.reshape(kmesh_t + trailing_shape)
+    m_kpt = np.fft.fftn(m_kmesh, axes=(0, 1, 2), norm="backward")
+    return m_kpt.reshape((n_k,) + trailing_shape).astype(np.complex128)
+
+
 def pair_convolve(X, Y, kmesh, *, imag_tol=1e-10):
     """Paper Algorithm 1: assemble Z[q] without an O(Nk^2) direct sum, via
     per-k GEMM, IFFT over the k-index, elementwise square in real
@@ -275,12 +357,9 @@ def pair_convolve(X, Y, kmesh, *, imag_tol=1e-10):
                                            the time-reversal identity
                                            conj(phi^k) = phi^{-k}, not by
                                            array reindexing.
-        T_R    = IFFT_k(T)             -- over the k index reshaped to
-                                           (n1,n2,n3); NumPy default norm
-                                           ("backward") carries the 1/Nk.
-        assert ||Im(T_R)|| / ||T_R|| <= imag_tol, BEFORE discarding Im(T_R)
-        Z_R    = Re(T_R) ** 2          -- elementwise square, real space.
-        Z[q]   = FFT_k(Z_R)            -- no normalization (NumPy default).
+        T_R    = kpt_to_spc(T, kmesh)  -- IFFT over the k index, gated.
+        Z_R    = T_R ** 2               -- elementwise square, real space.
+        Z[q]   = spc_to_kpt(Z_R, kmesh) -- FFT back to momentum space.
 
     Args:
         X: (Nk, Nip, Nao) complex128.
@@ -314,27 +393,16 @@ def pair_convolve(X, Y, kmesh, *, imag_tol=1e-10):
     if int(np.prod(kmesh_t)) != n_k:
         raise ValueError(f"prod(kmesh)={int(np.prod(kmesh_t))} != Nk={n_k}.")
 
-    n_ip = X.shape[1]
-    n_f = Y.shape[1]
-
     T = np.einsum("kIu,kfu->kIf", X, Y.conj(), optimize=True)  # (Nk, Nip, F)
 
-    T_kmesh = T.reshape(kmesh_t + (n_ip, n_f))
-    T_R = np.fft.ifftn(T_kmesh, axes=(0, 1, 2), norm="backward")
-
-    norm_im = float(np.linalg.norm(T_R.imag))
-    norm_total = float(np.linalg.norm(T_R))
-    imchk = norm_im / norm_total if norm_total > 0.0 else norm_im
-    if imchk > imag_tol:
+    try:
+        T_R = kpt_to_spc(T, kmesh_t, imag_tol=imag_tol)
+    except ValueError as exc:
         raise ValueError(
-            f"pair_convolve: ||Im(T_R)||/||T_R||={imchk:.3e} exceeds imag_tol={imag_tol:.1e} "
-            f"-- the intermediate real-space quantity should be real by time-reversal "
-            f"symmetry; this indicates X/Y are not a valid time-reversal-symmetric pair "
-            f"(conj(X[neg[k]]) should equal X[k], and likewise for Y)."
-        )
-    T_R = T_R.real
+            f"pair_convolve: {exc} -- this indicates X/Y are not a valid "
+            f"time-reversal-symmetric pair (conj(X[neg[k]]) should equal X[k], and "
+            f"likewise for Y)."
+        ) from exc
 
     Z_R = T_R * T_R
-
-    Z_kmesh = np.fft.fftn(Z_R, axes=(0, 1, 2), norm="backward")
-    return Z_kmesh.reshape(n_k, n_ip, n_f).astype(np.complex128)
+    return spc_to_kpt(Z_R, kmesh_t)

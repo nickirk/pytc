@@ -2,7 +2,8 @@
 wires S1-S4 together on a real, tiny periodic cell and checks the
 resulting artifact is self-consistent and matches a from-scratch
 reconstruction via the already-tested individual stage functions.
-get_k/get_j are checked to be explicit not-implemented stubs.
+
+get_k/get_j structural tests live in test_coulomb_get_k_get_j.py.
 """
 
 import unittest
@@ -95,13 +96,6 @@ class TestBuild(unittest.TestCase):
             np.testing.assert_allclose(
                 np.asarray(result["coul_kpt"][q]), W_np, atol=1e-9, err_msg=f"q={q}"
             )
-
-    def test_get_k_and_get_j_are_explicit_stubs(self):
-        with self.assertRaises(NotImplementedError):
-            coulomb.get_k()
-        with self.assertRaises(NotImplementedError):
-            coulomb.get_j()
-
 
 if __name__ == "__main__":
     unittest.main()

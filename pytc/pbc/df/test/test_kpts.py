@@ -10,7 +10,9 @@ from pytc.pbc.df.kpts import (
     KptsMesh,
     canonicalize_kpts,
     check_time_reversal_residual,
+    kpt_to_spc,
     pair_convolve,
+    spc_to_kpt,
 )
 
 
@@ -264,6 +266,71 @@ class TestPairConvolve(unittest.TestCase):
             pair_convolve(X, rng.normal(size=(2, 5, 6)).astype(np.complex128), (1, 1, 2))
         with self.assertRaises(ValueError):
             pair_convolve(X[:, :0], Y, (1, 1, 2))
+
+
+class TestKptToSpcSpcToKpt(unittest.TestCase):
+    def test_round_trip_recovers_original(self):
+        rng = np.random.default_rng(60)
+        kmesh = (1, 1, 3)
+        n_k = 3
+        m_spc = rng.normal(size=(n_k, 4, 5))
+        m_kpt = spc_to_kpt(m_spc, kmesh)
+        m_spc_recovered = kpt_to_spc(m_kpt, kmesh)
+        np.testing.assert_allclose(m_spc_recovered, m_spc, atol=1e-12)
+
+    def test_pair_convolve_matches_manual_kpt_to_spc_spc_to_kpt_composition(self):
+        # pair_convolve is now implemented AS this composition -- an
+        # independent manual composition must match it exactly.
+        rng = np.random.default_rng(61)
+        kmesh = (1, 1, 3)
+        n_k, n_ip, n_f, n_ao = 3, 3, 4, 5
+        # neg = [0, 2, 1] for a [1,1,3] mesh's canonical Gamma-first ordering.
+        neg = [0, 2, 1]
+
+        def _tr_symmetric_fixture(shape):
+            arr = np.zeros((n_k,) + shape, dtype=np.complex128)
+            done = set()
+            for k in range(n_k):
+                if k in done:
+                    continue
+                nk = neg[k]
+                if nk == k:
+                    arr[k] = rng.normal(size=shape)
+                else:
+                    re, im = rng.normal(size=shape), rng.normal(size=shape)
+                    arr[k] = re + 1j * im
+                    arr[nk] = re - 1j * im
+                    done.add(nk)
+                done.add(k)
+            return arr
+
+        X_tr = _tr_symmetric_fixture((n_ip, n_ao))
+        Y = _tr_symmetric_fixture((n_f, n_ao))
+
+        Z = pair_convolve(X_tr, Y, kmesh)
+
+        T = np.einsum("kIu,kfu->kIf", X_tr, Y.conj(), optimize=True)
+        T_R = kpt_to_spc(T, kmesh)
+        Z_R = T_R * T_R
+        Z_manual = spc_to_kpt(Z_R, kmesh)
+
+        np.testing.assert_allclose(Z, Z_manual, atol=0.0)
+
+    def test_kpt_to_spc_rejects_non_tr_symmetric_input(self):
+        rng = np.random.default_rng(62)
+        m_kpt = (rng.normal(size=(3, 2, 2)) + 1j * rng.normal(size=(3, 2, 2))).astype(np.complex128)
+        with self.assertRaises(ValueError):
+            kpt_to_spc(m_kpt, (1, 1, 3))
+
+    def test_rejects_malformed_shapes_and_kmesh(self):
+        rng = np.random.default_rng(63)
+        m = rng.normal(size=(4, 3, 3))
+        with self.assertRaises(ValueError):
+            kpt_to_spc(m, (1, 1, 3))  # prod != Nk
+        with self.assertRaises(ValueError):
+            spc_to_kpt(m, (1, 1, 3))
+        with self.assertRaises(ValueError):
+            kpt_to_spc(m, (0, 1, 4))
 
 
 if __name__ == "__main__":
