@@ -331,14 +331,19 @@ class TestRetentionPolicyDefaultAvoidsBlowup(unittest.TestCase):
 
 class TestGetKNegProjection(unittest.TestCase):
     """design v2.1 section 5 follow-up: get_k's optional neg parameter
-    projects rho_kpt[k] real for self-paired k (neg[k]==k) before the
-    k<->supercell transform -- a real SCF density matrix (unlike this
-    file's other tests' exactly-TR-symmetric-by-construction fixtures)
-    carries small floating-point asymmetry that can trip kpt_to_spc's
-    imag_tol gate on a mesh where self-paired k's are common (confirmed
-    against a real diamond 2x2x2 pyscf KRHF run in test_isdf_df_adapter.py;
-    reproduced here with a synthetic near-machine-precision perturbation
-    so this test stays fast and self-contained)."""
+    symmetrizes rho_kpt EXACTLY by construction before the k<->supercell
+    transform -- self-paired k (neg[k]==k): take .real; genuine pair
+    k<neg[k]: set rho_kpt[neg[k]] := conj(rho_kpt[k]) directly. A real
+    SCF density matrix (unlike this file's other tests'
+    exactly-TR-symmetric-by-construction fixtures) computes dm_kpt[k]
+    and dm_kpt[neg[k]] INDEPENDENTLY, so rho_kpt only satisfies the
+    identity to floating-point precision -- confirmed to trip
+    kpt_to_spc's imag_tol gate on both an all-self-paired mesh (diamond
+    2x2x2) and a mostly-genuine-pairs mesh (diamond 4x4x4, where a
+    self-paired-only version of this fix was insufficient) via real
+    pyscf KRHF runs (test_isdf_df_adapter.py); reproduced here with
+    synthetic near-machine-precision perturbations so these tests stay
+    fast and self-contained."""
 
     def test_neg_none_can_trip_the_gate_neg_provided_fixes_it(self):
         cell = _make_cell()
@@ -364,6 +369,40 @@ class TestGetKNegProjection(unittest.TestCase):
         # Without neg: rho_kpt inherits the perturbation, may (depending
         # on inpv_kpt's own conditioning) trip kpt_to_spc's imag_tol gate.
         # With neg: the self-paired k is projected real first, so it never can.
+        vk_with_neg = coulomb.get_k(
+            dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase, neg=mesh_obj.neg
+        )
+        self.assertTrue(np.all(np.isfinite(np.asarray(vk_with_neg))))
+
+    def test_genuine_pair_mismatch_is_fixed_by_construction(self):
+        # The broader case beyond self-paired k: dm_kpts[k] and
+        # dm_kpts[neg[k]] for a GENUINE pair (k != neg[k]) computed
+        # independently (not exact conjugates of each other) -- this is
+        # what a real diamond 4x4x4 SCF run exposed (most k's there are
+        # genuine pairs, unlike 2x2x2's all-self-paired mesh).
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        n_ao = cell.nao
+        result = coulomb.build(cell, kpts, rank=6, block_size=100)
+        mesh_obj = result["mesh_obj"]
+        inpv_kpt = np.asarray(result["inpv_kpt"])
+        coul_kpt = np.asarray(result["coul_kpt"])
+        n_k = mesh_obj.n_kpts
+
+        rng = np.random.default_rng(102)
+        dm_kpts = np.zeros((n_k, n_ao, n_ao), dtype=np.complex128)
+        k = int(np.where(mesh_obj.neg != np.arange(n_k))[0][0])  # a genuine pair
+        nk = int(mesh_obj.neg[k])
+        re, im = rng.normal(size=(n_ao, n_ao)), rng.normal(size=(n_ao, n_ao))
+        h = re + 1j * im
+        dm_kpts[k] = (h + h.conj().T) / 2
+        # dm_kpts[nk] should be conj(dm_kpts[k]) exactly -- perturb it
+        # slightly so it ISN'T, simulating independent SCF computation.
+        noise = rng.normal(size=(n_ao, n_ao)) * 1e-8
+        dm_kpts[nk] = dm_kpts[k].conj() + (noise + noise.conj().T)
+
+        with self.assertRaises(ValueError):
+            coulomb.get_k(dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase)
         vk_with_neg = coulomb.get_k(
             dm_kpts, inpv_kpt, coul_kpt, mesh_obj.phase, neg=mesh_obj.neg
         )

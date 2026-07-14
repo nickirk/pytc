@@ -168,19 +168,23 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
             the mesh shape).
         neg: (Nk,) int array, e.g. KptsMesh.neg. Optional (default None,
             preserving prior behavior for callers that don't pass it).
-            When given, rho_kpt[k] is projected to rho_kpt[k].real for
-            every self-paired k (neg[k]==k) BEFORE kpt_to_spc -- the
-            same physics-motivated fix as apply_raw_kernel_and_solve's
-            self_paired handling (design v2.1 section 5 follow-up):
-            neg[k]==k requires rho_kpt[k]=conj(rho_kpt[k]) (real), but a
-            REAL density matrix from an actual SCF loop (as opposed to
-            the synthetic exactly-TR-symmetric fixtures this function's
-            own unit tests use) carries its own small floating-point
-            asymmetry that can trip kpt_to_spc's imag_tol gate on a
-            mesh with many self-paired k (e.g. diamond 2x2x2, where
-            ALL 8 k-points are self-paired) -- confirmed via a real
-            pyscf KRHF run, not a synthetic reproduction. Without neg,
-            callers get the prior (gate-armed, no projection) behavior.
+            When given, rho_kpt is symmetrized EXACTLY by construction
+            BEFORE kpt_to_spc, for every k -- self-paired k (neg[k]==k):
+            rho_kpt[k].real; genuine pair k<neg[k]: rho_kpt[neg[k]] :=
+            conj(rho_kpt[k]), discarding the independently-computed
+            value at neg[k] (both encode the same physical information
+            by the time-reversal identity, so nothing is lost). A REAL
+            density matrix from an actual SCF loop (as opposed to the
+            synthetic exactly-TR-symmetric fixtures this function's own
+            unit tests use) computes dm_kpt[k] and dm_kpt[neg[k]]
+            INDEPENDENTLY, satisfying rho_kpt[neg[k]]=conj(rho_kpt[k])
+            only to floating-point precision -- confirmed to trip
+            kpt_to_spc's imag_tol gate on both an all-self-paired mesh
+            (diamond 2x2x2) and a mostly-genuine-pairs mesh (diamond
+            4x4x4, where the self-paired-only version of this fix was
+            insufficient) via real pyscf KRHF runs, not synthetic
+            reproductions. Without neg, callers get the prior
+            (gate-armed, no symmetrization) behavior.
 
     Returns:
         vk_kpts: (nset, Nk, Nao, Nao) complex128 (real-cast when the
@@ -219,19 +223,48 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
         neg = np.asarray(neg)
         if neg.shape != (n_k,):
             raise ValueError(f"neg must have shape ({n_k},), got {neg.shape}.")
-        self_paired_mask = neg == np.arange(n_k)
-    else:
-        self_paired_mask = None
-
     coul_spc = kpt_to_spc(coul_kpt, phase) * np.sqrt(n_k)
 
     vk_kpts = np.empty((n_set, n_k, n_ao, n_ao), dtype=np.complex128)
     for i in range(n_set):
         dm_kpt = dm_kpts[i]
         rho_kpt = (inpv_kpt @ dm_kpt @ inpv_kpt.conj().transpose(0, 2, 1)) / n_k
-        if self_paired_mask is not None:
+        if neg is not None:
+            # Symmetrize rho_kpt EXACTLY by construction, the same
+            # conjugate-shortcut strategy build_coul_kpt_device already
+            # uses for coul_kpt (design v2.1 section 6): physics requires
+            # rho_kpt[neg[k]] = conj(rho_kpt[k]) for every k, but a REAL
+            # SCF density matrix computes dm_kpt[k] and dm_kpt[neg[k]]
+            # INDEPENDENTLY (pyscf's own mo_coeff/mo_occ machinery, not
+            # constrained to exact conjugate agreement), so rho_kpt built
+            # from them only satisfies the identity to floating-point
+            # precision -- fine for a self-paired-only mesh (design v2.1
+            # section 5 follow-up fix), but on a mesh with many GENUINE
+            # pairs (e.g. diamond 4x4x4, where most k are NOT self-paired,
+            # unlike 2x2x2 where every k is) the same noise source shows
+            # up on pairs too and the self-paired-only fix does not cover
+            # it (confirmed: a real diamond 4x4x4 KRHF run trips this gate
+            # even with the self-paired fix active). Fixing by construction
+            # for EVERY k (self-paired: take .real; genuine pair k<neg[k]:
+            # set rho_kpt[neg[k]] := conj(rho_kpt[k]) directly, discarding
+            # its independently-computed value) removes the noise
+            # entirely rather than merely reducing it, and is the
+            # correct one for physics reasons, not just convenience --
+            # both members of a genuine pair encode the SAME physical
+            # information by the time-reversal identity, so keeping only
+            # one computed value and deriving the other loses nothing.
             rho_kpt = rho_kpt.copy()
-            rho_kpt[self_paired_mask] = rho_kpt[self_paired_mask].real.astype(np.complex128)
+            visited = np.zeros(n_k, dtype=bool)
+            for k in range(n_k):
+                if visited[k]:
+                    continue
+                nk = int(neg[k])
+                if nk == k:
+                    rho_kpt[k] = rho_kpt[k].real.astype(np.complex128)
+                elif not visited[nk]:
+                    rho_kpt[nk] = rho_kpt[k].conj()
+                visited[k] = True
+                visited[nk] = True
         rho_spc = kpt_to_spc(rho_kpt, phase).transpose(0, 2, 1)
 
         v_spc = coul_spc * rho_spc
