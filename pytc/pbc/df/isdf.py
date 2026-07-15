@@ -27,7 +27,7 @@ DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR = 1.10
 
 
 class JAXCachedMatrixFreeCapacityError(RuntimeError):
-    """Raised when the exact AO cache exceeds the declared selector policy."""
+    """Raised when predicted selector peak exceeds the declared policy."""
 
     condition = "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY"
 
