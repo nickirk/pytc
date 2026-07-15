@@ -1,0 +1,64 @@
+{
+  "schema": "pytc-reciprocal-primitive-ao-pilot/v1",
+  "scope": "CPU-only standalone feasibility pilot; no production integration, default change, GPU run, or large-supercell execution.",
+  "input": {
+    "system": "diamond 211 supercell",
+    "basis": "gth-dzvp",
+    "pseudo": "gth-pbe",
+    "ke_cutoff_hartree": 30.0,
+    "mesh": [27, 13, 13],
+    "n_grid": 4563,
+    "n_primitive_ao": 26,
+    "n_supercell_ao": 52,
+    "k_mesh": [3, 2, 1],
+    "sampled_k_indices": [0, 1, 2],
+    "neg_sampled_k_indices": [0, 1, 4]
+  },
+  "direct_relation": {
+    "relation": "phi_(R+tau),k(r) = phi_R,k(r-tau)",
+    "periodic_factor": "exp(-i k.tau) exp(i k.r) u_R,k(r-tau)",
+    "max_abs_errors": [1.3253287356462806e-15, 1.339292356879287e-15, 1.317677499661318e-15],
+    "relative_frobenius_errors": [4.945174559857273e-16, 5.78341047210112e-16, 4.908114011895036e-16]
+  },
+  "reciprocal_generator": {
+    "same_mesh_method": "u=exp(-i k.r) phi; IFFT[exp(-i G.tau) FFT(u)]",
+    "same_mesh_max_abs_error": 0.003070084980285356,
+    "same_mesh_relative_frobenius_error": 0.0010226033441662692,
+    "oversampled_mesh": [54, 26, 26],
+    "oversampled_method": "directly sampled periodic seed on the denser mesh; this is convergence evidence, not exact interpolation",
+    "oversampled_max_abs_error": 3.690103885743359e-13,
+    "oversampled_relative_frobenius_error": 8.616029953609836e-14
+  },
+  "selector_relevance": {
+    "metric_column_errors": {
+      "0": {"max_abs": 0.00012007413811826115, "relative_frobenius": 0.0005456479012106118},
+      "1521": {"max_abs": 0.003439190302363393, "relative_frobenius": 0.0021247260896868026},
+      "4562": {"max_abs": 0.00012549216559019916, "relative_frobenius": 0.00013955976703192892}
+    },
+    "direct_pivot_prefix": [3733, 1380, 2641, 444],
+    "generated_pivot_prefix": [3733, 1380, 2641, 444],
+    "metric_assembly": "all AO-group complex contributions are accumulated before abs-squared"
+  },
+  "timing_seconds": {
+    "direct_full_ao_oracle": 0.08143474999815226,
+    "real_space_shift_oracle": 0.08240999998815823,
+    "fft_setup_one_k_group": 0.0020876670023426414,
+    "one_translated_replica": 0.00388474999635946,
+    "full_three_k_sweep": 0.0115555419906741,
+    "repeated_short_pivot_sweep": 0.009740624998812564
+  },
+  "live_bytes": {
+    "one_group_seed": 1898208,
+    "one_group_periodic_part": 1898208,
+    "one_group_fft": 1898208,
+    "one_group_generated_output": 1898208,
+    "one_group_four_buffer_total": 7592832
+  },
+  "projected_444_bytes": {
+    "n_grid": 438976,
+    "one_group_four_buffer_total": 730456064,
+    "two_group_four_buffer_total": 1460912128,
+    "dense_L_rank_16640": 58436485120
+  },
+  "conclusion": "The direct identity is exact and a denser sampled grid converges, but same-mesh spectral translation has measurable aliasing. The generator can keep one or two primitive groups resident; it does not by itself remove the dense out-of-core L requirement or justify a production selector."
+}
