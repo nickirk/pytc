@@ -750,11 +750,29 @@ def periodic_metric_from_ao(ao):
     return (np.abs(flat.conj() @ flat.T) ** 2 / n_kpts).astype(np.complex128)
 
 
+def periodic_metric_column_from_ao(ao, index):
+    """Return one periodic-metric column without materializing the metric."""
+    ao = np.asarray(ao, dtype=np.complex128)
+    if ao.ndim != 3:
+        raise ValueError(f"ao must have shape (Nk,Npanel,Nao), got {ao.shape}.")
+    n_kpts, n_panel, _ = ao.shape
+    if not 0 <= index < n_panel:
+        raise ValueError(f"index={index} is outside panel size {n_panel}.")
+    gram = np.einsum("km,krm->r", ao[:, index, :].conj(), ao, optimize=True)
+    return (np.abs(gram) ** 2 / n_kpts).astype(np.complex128)
+
+
 def candidate_panel_indices(diag, rank, *, panel_factor=4, ramp_scale=1e-12):
     """Deterministically combine high-score and spatially stratified candidates."""
     diag = np.asarray(diag, dtype=np.float64)
-    if diag.ndim != 1 or diag.size == 0:
+    if diag.ndim != 1 or diag.size == 0 or not np.all(np.isfinite(diag)):
         raise ValueError("diag must be a nonempty 1-D array.")
+    if np.any(diag < 0) or np.max(diag) <= 0:
+        raise ValueError("diag must be nonnegative with a positive maximum.")
+    if isinstance(rank, bool) or not isinstance(rank, (int, np.integer)):
+        raise ValueError("rank must be an integer.")
+    if isinstance(panel_factor, bool) or not isinstance(panel_factor, (int, np.integer)):
+        raise ValueError("panel_factor must be an integer.")
     if rank <= 0 or panel_factor < 2:
         raise ValueError("rank must be positive and panel_factor must be at least 2.")
     n_grid = diag.size
@@ -788,8 +806,9 @@ def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
         if cache is None:
             cache = np.empty((n_kpts, n_grid, ao_block.shape[2]), dtype=np.complex128)
         cache[:, g0:g1] = ao_block
-    metric = periodic_metric_from_ao(cache)
-    return metric.real.diagonal().copy(), lambda j: metric[:, j], cache
+    pooled = np.sum(np.abs(cache) ** 2, axis=(0, 2))
+    diag = pooled ** 2 / n_kpts
+    return diag, lambda j: periodic_metric_column_from_ao(cache, j), cache
 
 
 # ---------------------------------------------------------------------------

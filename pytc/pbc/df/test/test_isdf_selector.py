@@ -9,6 +9,7 @@ from scipy.linalg.lapack import zpstrf
 
 from pytc.pbc.df.isdf import (
     candidate_panel_indices,
+    periodic_metric_column_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
 )
@@ -113,12 +114,19 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
             for s in range(5):
                 direct[r, s] = abs(np.vdot(ao[:, r, :], ao[:, s, :])) ** 2 / 3
         np.testing.assert_allclose(metric, direct, atol=1e-12)
+        for column in range(5):
+            np.testing.assert_allclose(periodic_metric_column_from_ao(ao, column), direct[:, column])
 
     def test_candidate_panel_is_unique_and_uses_higher_index_ties(self):
         panel = candidate_panel_indices(np.ones(20), rank=3, panel_factor=4)
         self.assertEqual(panel.size, 12)
         self.assertEqual(len(set(panel.tolist())), panel.size)
         self.assertEqual(panel[0], 19)
+
+    def test_candidate_panel_contract_on_nonuniform_diagonal(self):
+        diag = np.array([1., 9., 2., 8., 3., 7., 4., 6., 5., 10.])
+        panel = candidate_panel_indices(diag, rank=2, panel_factor=4)
+        np.testing.assert_array_equal(panel, np.array([9, 1, 3, 5, 7, 8, 6, 4]))
 
     def test_determinism_across_repeated_calls(self):
         rng = np.random.default_rng(26)
