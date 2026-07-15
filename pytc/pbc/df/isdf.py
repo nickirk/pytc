@@ -32,6 +32,195 @@ class JAXCachedMatrixFreeCapacityError(RuntimeError):
     condition = "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY"
 
 
+class JAXTranslationMatrixFreeCapacityError(RuntimeError):
+    """Raised when the exact translation-cache selector exceeds policy."""
+
+    condition = "JAX_TRANSLATION_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY"
+
+
+class TranslationAORepresentationError(RuntimeError):
+    """Raised when k-points do not admit the exact real translation cache."""
+
+    condition = "TRANSLATION_AO_REQUIRES_GAMMA_ORTHOGONAL_PHASE_CLASSES"
+
+
+@dataclasses.dataclass(frozen=True)
+class TranslationAORepresentation:
+    """Exact lattice-image phase classes for a gamma-containing k mesh."""
+
+    lattice_vectors: np.ndarray
+    groups: tuple[np.ndarray, ...]
+    unitary_phase: np.ndarray
+    kpts: np.ndarray
+    gamma_kpt: np.ndarray
+    phase_orthogonality_residual: float
+
+    @property
+    def n_classes(self):
+        return len(self.groups)
+
+
+def build_translation_ao_representation(cell, kpts, *, phase_tol=1e-10):
+    """Group lattice images whose Bloch phases agree on the full k mesh.
+
+    For a complete gamma-containing Monkhorst-Pack mesh, lattice images fall
+    into at most ``Nk`` phase classes.  If ``B_c`` is the gamma AO sum over
+    class ``c`` and ``P[k,c]`` its phase, then ``P.conj().T @ P = Nk I`` and
+    the scaled real factors ``sqrt(Nk) B_c`` have exactly the same grid Gram
+    matrix as the materialized complex Bloch factors.  For a complete mesh
+    the class rank is still ``Nk``: this is an exact complex-to-real 2x cache
+    reduction, not a sparse channel reduction.  This function verifies those
+    identities before any AO evaluation.
+    """
+    kpts = np.asarray(kpts, dtype=np.float64)
+    if kpts.ndim != 2 or kpts.shape[1] != 3 or kpts.shape[0] == 0:
+        raise ValueError(f"kpts must have nonempty shape (Nk,3), got {kpts.shape}.")
+    if not isinstance(phase_tol, (int, float)) or phase_tol <= 0:
+        raise ValueError("phase_tol must be positive.")
+
+    gamma_index = int(np.argmin(np.linalg.norm(kpts, axis=1)))
+    gamma_kpt = kpts[gamma_index]
+    if np.linalg.norm(gamma_kpt) > phase_tol:
+        raise TranslationAORepresentationError(
+            f"{TranslationAORepresentationError.condition}: k mesh has no gamma point."
+        )
+
+    lattice_vectors = np.asarray(cell.get_lattice_Ls(), dtype=np.float64)
+    if lattice_vectors.ndim != 2 or lattice_vectors.shape[1] != 3:
+        raise ValueError(
+            "cell.get_lattice_Ls() must return shape (Nimages,3), got "
+            f"{lattice_vectors.shape}."
+        )
+    phases = np.exp(1j * (kpts @ lattice_vectors.T))
+    representatives = []
+    groups = []
+    for image in range(lattice_vectors.shape[0]):
+        for class_index, representative in enumerate(representatives):
+            if np.max(np.abs(phases[:, image] - phases[:, representative])) <= phase_tol:
+                groups[class_index].append(image)
+                break
+        else:
+            representatives.append(image)
+            groups.append([image])
+
+    phase = phases[:, representatives]
+    n_kpts = kpts.shape[0]
+    gram = phase.conj().T @ phase / n_kpts
+    residual = float(np.max(np.abs(gram - np.eye(len(groups)))))
+    if len(groups) > n_kpts or residual > 10 * phase_tol:
+        raise TranslationAORepresentationError(
+            f"{TranslationAORepresentationError.condition}: {len(groups)} phase classes "
+            f"for {n_kpts} k-points, normalized phase-Gram residual={residual:.3e}."
+        )
+    return TranslationAORepresentation(
+        lattice_vectors=lattice_vectors,
+        groups=tuple(np.asarray(group, dtype=np.int64) for group in groups),
+        unitary_phase=np.asarray(phase / np.sqrt(n_kpts), dtype=np.complex128),
+        kpts=np.asarray(kpts, dtype=np.float64),
+        gamma_kpt=np.asarray(gamma_kpt, dtype=np.float64),
+        phase_orthogonality_residual=residual,
+    )
+
+
+def jax_translation_matrix_free_byte_model(
+    n_kpts, n_classes, n_grid, n_ao, rank, *,
+    ao_block_size,
+    selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
+    peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
+):
+    """Return bounded host/device residency for translation-class selection.
+
+    The real class cache persists on the host while it is copied to the JAX
+    device.  During construction, one full-k complex AO block and its
+    complex class-transform block coexist with that cache.  The declared
+    host peak therefore covers cache construction, while the device peak
+    covers the compiled pivot kernel.
+    """
+    values = {
+        "n_kpts": n_kpts,
+        "n_classes": n_classes,
+        "n_grid": n_grid,
+        "n_ao": n_ao,
+        "rank": rank,
+        "ao_block_size": ao_block_size,
+        "selection_peak_max_bytes": selection_peak_max_bytes,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+    if n_classes > n_kpts:
+        raise ValueError("n_classes cannot exceed n_kpts for the orthogonal representation.")
+    if not isinstance(peak_safety_factor, (int, float)) or peak_safety_factor < 1.0:
+        raise ValueError("peak_safety_factor must be a real number >= 1.0.")
+
+    ao_block_size = min(int(ao_block_size), int(n_grid))
+    cache_bytes = int(n_classes) * int(n_ao) * int(n_grid) * np.dtype(np.float64).itemsize
+    complex_cache_bytes = (
+        int(n_kpts) * int(n_ao) * int(n_grid) * np.dtype(np.complex128).itemsize
+    )
+    factor_bytes = int(n_grid) * int(rank) * np.dtype(np.float64).itemsize
+    gram_work_bytes = int(n_grid) * np.dtype(np.float64).itemsize
+    real_work_bytes = 2 * int(n_grid) * np.dtype(np.float64).itemsize
+    selector_bytes = int(n_grid) * np.dtype(np.bool_).itemsize
+    pivot_bytes = int(rank) * np.dtype(np.int64).itemsize
+    phase_bytes = int(n_kpts) * int(n_classes) * np.dtype(np.complex128).itemsize
+    ao_block_bytes = (
+        int(n_kpts) * int(ao_block_size) * int(n_ao) * np.dtype(np.complex128).itemsize
+    )
+    transform_block_bytes = (
+        int(n_classes) * int(ao_block_size) * int(n_ao)
+        * np.dtype(np.complex128).itemsize
+    )
+    work_bytes = gram_work_bytes + real_work_bytes + selector_bytes + pivot_bytes
+    selection_peak_device_bytes = cache_bytes + factor_bytes + work_bytes
+    selection_peak_host_bytes = (
+        cache_bytes + phase_bytes + ao_block_bytes + transform_block_bytes
+    )
+    device_with_safety = int(
+        np.ceil(selection_peak_device_bytes * float(peak_safety_factor))
+    )
+    host_with_safety = int(
+        np.ceil(selection_peak_host_bytes * float(peak_safety_factor))
+    )
+    device_condition = (
+        None
+        if device_with_safety <= int(selection_peak_max_bytes)
+        else JAXTranslationMatrixFreeCapacityError.condition
+    )
+    host_condition = (
+        None
+        if host_with_safety <= int(selection_peak_max_bytes)
+        else JAXTranslationMatrixFreeCapacityError.condition
+    )
+    condition = device_condition or host_condition
+    return {
+        "mode": "jax_translation_matrix_free",
+        "translation_cache_layout": "sqrt(Nk)*B[Nclass,Nao,Ng]",
+        "translation_cache_real_float64_bytes": cache_bytes,
+        "complex_bloch_cache_equivalent_bytes": complex_cache_bytes,
+        "translation_cache_to_complex_cache_ratio": cache_bytes / complex_cache_bytes,
+        "unitary_phase_complex128_bytes": phase_bytes,
+        "bounded_ao_block_complex128_bytes": ao_block_bytes,
+        "bounded_transform_block_complex128_bytes": transform_block_bytes,
+        "ao_block_size": ao_block_size,
+        "cholesky_real_float64_bytes": factor_bytes,
+        "pivot_work_bytes": work_bytes,
+        "selection_peak_device_bytes": selection_peak_device_bytes,
+        "selection_peak_host_bytes": selection_peak_host_bytes,
+        "selection_peak_safety_factor": float(peak_safety_factor),
+        "selection_peak_device_with_safety_bytes": device_with_safety,
+        "selection_peak_host_with_safety_bytes": host_with_safety,
+        "selection_peak_required_with_safety_bytes": max(
+            device_with_safety, host_with_safety,
+        ),
+        "selection_peak_max_bytes": int(selection_peak_max_bytes),
+        "device_capacity_condition": device_condition,
+        "host_capacity_condition": host_condition,
+        "capacity_condition": condition,
+        "within_cache_policy": condition is None,
+    }
+
+
 def jax_cached_matrix_free_byte_model(
     n_kpts, n_grid, n_ao, rank, *,
     selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
@@ -189,6 +378,149 @@ def select_jax_cached_matrix_free(
         "pivot_executor": "jax.jit/lax.fori_loop",
         "pivot_loop_device_resident": True,
         "ao_cache_dtype": str(f_cache.dtype),
+        "factor_dtype": str(factor.dtype),
+        "device_platforms": sorted({device.platform for device in f_cache.devices()}),
+    }
+    return pivots_host, factor_host, n_selected, provenance
+
+
+def build_translation_ao_cache(
+    cell, grid_coords, block_size, representation, *, stats=None, imag_tol=1e-12,
+):
+    """Build ``sqrt(Nk) B[Nclass,Nao,Ng]`` without materializing k-AOs.
+
+    Each full-k AO block is evaluated once and immediately transformed by the
+    verified unitary phase matrix.  Thus all-k AOs exist only for one bounded
+    block; the persistent cache is the real translation-class coefficient.
+    A non-negligible imaginary component fails closed instead of silently
+    changing the representation.
+    """
+    if not isinstance(representation, TranslationAORepresentation):
+        raise TypeError("representation must be a TranslationAORepresentation.")
+    grid_coords = np.asarray(grid_coords, dtype=np.float64)
+    if grid_coords.ndim != 2 or grid_coords.shape[1] != 3 or grid_coords.shape[0] == 0:
+        raise ValueError(
+            f"grid_coords must have nonempty shape (Ng,3), got {grid_coords.shape}."
+        )
+    if isinstance(block_size, bool) or not isinstance(block_size, (int, np.integer)):
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}.")
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    if not isinstance(imag_tol, (int, float)) or imag_tol < 0:
+        raise ValueError("imag_tol must be nonnegative.")
+
+    n_grid = grid_coords.shape[0]
+    n_ao = int(cell.nao_nr())
+    cache = np.empty((representation.n_classes, n_ao, n_grid), dtype=np.float64)
+    for g0 in range(0, n_grid, block_size):
+        g1 = min(g0 + block_size, n_grid)
+        ao = np.asarray(cell.pbc_eval_gto(
+            "GTOval", grid_coords[g0:g1], kpts=list(representation.kpts),
+        ), dtype=np.complex128)
+        expected = (representation.kpts.shape[0], g1 - g0, n_ao)
+        if ao.shape != expected:
+            raise ValueError(f"full-k AO block must have shape {expected}, got {ao.shape}.")
+        coefficients = np.einsum(
+            "ck,kba->cba", representation.unitary_phase.conj().T, ao, optimize=True,
+        )
+        imag_max = float(np.max(np.abs(coefficients.imag)))
+        real_scale = max(1.0, float(np.max(np.abs(coefficients.real))))
+        if imag_max > imag_tol * real_scale:
+            raise TranslationAORepresentationError(
+                "translation-class coefficients are not real within "
+                f"imag_tol={imag_tol:.1e}: max imaginary={imag_max:.3e}."
+            )
+        cache[:, :, g0:g1] = coefficients.real.transpose(0, 2, 1)
+        if stats is not None:
+            stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
+            stats["grid_points"] = stats.get("grid_points", 0) + (g1 - g0)
+    return cache
+
+
+def stream_ao_blocks_from_translation_cache(
+    translation_cache, unitary_phase, block_size, *, stats=None,
+):
+    """Reconstruct exact ``(Nk,block,Nao)`` AO blocks from the real cache."""
+    cache = np.asarray(translation_cache, dtype=np.float64)
+    phase = np.asarray(unitary_phase, dtype=np.complex128)
+    if cache.ndim != 3 or any(size <= 0 for size in cache.shape):
+        raise ValueError("translation_cache must have shape (Nclass,Nao,Ng).")
+    if phase.ndim != 2 or phase.shape[1] != cache.shape[0] or phase.shape[0] == 0:
+        raise ValueError(
+            "unitary_phase must have shape (Nk,Nclass) matching translation_cache."
+        )
+    if isinstance(block_size, bool) or not isinstance(block_size, (int, np.integer)):
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}.")
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    n_grid = cache.shape[2]
+    for g0 in range(0, n_grid, block_size):
+        g1 = min(g0 + block_size, n_grid)
+        ao_block = np.einsum(
+            "kc,cab->kba", phase, cache[:, :, g0:g1], optimize=True,
+        ).astype(np.complex128, copy=False)
+        if stats is not None:
+            stats["translation_reconstruction_calls"] = (
+                stats.get("translation_reconstruction_calls", 0) + 1
+            )
+            stats["translation_reconstruction_grid_points"] = (
+                stats.get("translation_reconstruction_grid_points", 0) + (g1 - g0)
+            )
+        yield g0, g1, ao_block
+
+
+def select_jax_translation_matrix_free(
+    translation_cache, n_kpts, rank, *, rcond=1e-12, ramp_scale=1e-12,
+    ao_block_size,
+    selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
+    peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
+    return_factor=False,
+):
+    """Select exact pivots from the scaled real translation-class factors."""
+    cache = np.asarray(translation_cache)
+    if cache.ndim != 3 or any(size <= 0 for size in cache.shape):
+        raise ValueError("translation_cache must have nonempty shape (Nclass,Nao,Ng).")
+    if np.iscomplexobj(cache):
+        raise ValueError("translation_cache must be real float64.")
+    cache = np.asarray(cache, dtype=np.float64)
+    n_classes, n_ao, n_grid = cache.shape
+    if isinstance(rank, bool) or not isinstance(rank, (int, np.integer)):
+        raise ValueError(f"rank must be an integer, got {rank!r}.")
+    rank = int(rank)
+    if rank <= 0 or rank > n_grid:
+        raise ValueError(f"rank must be in [1,{n_grid}], got {rank}.")
+    byte_model = jax_translation_matrix_free_byte_model(
+        n_kpts, n_classes, n_grid, n_ao, rank,
+        ao_block_size=ao_block_size,
+        selection_peak_max_bytes=selection_peak_max_bytes,
+        peak_safety_factor=peak_safety_factor,
+    )
+    if byte_model["capacity_condition"] is not None:
+        raise JAXTranslationMatrixFreeCapacityError(
+            f"{byte_model['capacity_condition']}: selector peak with safety requires "
+            f"{byte_model['selection_peak_required_with_safety_bytes']} bytes, policy allows "
+            f"{byte_model['selection_peak_max_bytes']} bytes."
+        )
+    if not jax.config.read("jax_enable_x64"):
+        raise RuntimeError(
+            "jax_translation_matrix_free requires jax_enable_x64=True for the real "
+            "float64 translation cache and residual/L."
+        )
+
+    f_cache = jnp.asarray(cache.reshape(n_classes * n_ao, n_grid), dtype=jnp.float64)
+    _, factor, pivots, _, count = _select_jax_cached_matrix_free_kernel(
+        f_cache, rank=rank, n_kpts=n_kpts, rcond=rcond, ramp_scale=ramp_scale,
+    )
+    n_selected = int(np.asarray(count))
+    pivots_host = np.asarray(pivots)[:n_selected]
+    factor_host = np.asarray(factor)[:, :n_selected] if return_factor else None
+    provenance = {
+        **byte_model,
+        "pivot_executor": "jax.jit/lax.fori_loop",
+        "pivot_loop_device_resident": True,
+        "translation_cache_dtype": str(f_cache.dtype),
         "factor_dtype": str(factor.dtype),
         "device_platforms": sorted({device.platform for device in f_cache.devices()}),
     }

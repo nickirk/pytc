@@ -34,6 +34,36 @@ def _make_cell():
 
 
 class TestBuild(unittest.TestCase):
+    def test_translation_mode_matches_complex_cache_end_to_end(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        kwargs = dict(
+            rank=3, block_size=13, rtol=1e-8,
+            selection_peak_max_bytes=10**9,
+        )
+        cached = coulomb.build(
+            cell, kpts, selection_mode="jax_cached_matrix_free", **kwargs,
+        )
+        translated = coulomb.build(
+            cell, kpts, selection_mode="jax_translation_matrix_free", **kwargs,
+        )
+        np.testing.assert_array_equal(
+            cached["selection_provenance"]["pivot_indices"],
+            translated["selection_provenance"]["pivot_indices"],
+        )
+        self.assertEqual(
+            2 * translated["selection_provenance"]["cache_bytes"],
+            cached["selection_provenance"]["cache_bytes"],
+        )
+        self.assertEqual(
+            translated["selection_provenance"]["eta_ao_source"],
+            "blocked_reconstruction_from_translation_classes",
+        )
+        for key in ("inpv_kpt", "coul_kpt", "kern_kpt"):
+            np.testing.assert_allclose(
+                np.asarray(translated[key]), np.asarray(cached[key]), atol=2e-10, rtol=2e-10,
+            )
+
     def test_build_produces_self_consistent_artifact(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)

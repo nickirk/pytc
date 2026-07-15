@@ -7,20 +7,28 @@ import unittest
 import jax
 jax.config.update("jax_enable_x64", True)
 import numpy as np
+from pyscf.pbc.gto import Cell
 from scipy.linalg.lapack import zpstrf
 
 from pytc.pbc.df.isdf import (
+    build_translation_ao_cache,
+    build_translation_ao_representation,
     build_cached_periodic_pivot_oracle,
     build_periodic_pivot_oracle,
     candidate_panel_indices,
     explicit_candidate_identity,
     full_grid_candidate_identity,
     JAXCachedMatrixFreeCapacityError,
+    JAXTranslationMatrixFreeCapacityError,
+    TranslationAORepresentationError,
     jax_cached_matrix_free_byte_model,
+    jax_translation_matrix_free_byte_model,
     periodic_metric_column_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
     select_jax_cached_matrix_free,
+    select_jax_translation_matrix_free,
+    stream_ao_blocks_from_translation_cache,
 )
 
 
@@ -46,6 +54,33 @@ class _SyntheticPeriodicCell:
     def assert_label(label):
         if label != "GTOval":
             raise AssertionError(label)
+
+
+def _translation_test_cell():
+    cell = Cell()
+    cell.atom = "He 0.2 0.3 0.4"
+    cell.a = np.array([[3.2, 0.0, 0.0], [0.3, 3.0, 0.0], [0.1, 0.2, 2.9]])
+    cell.basis = "gth-dzvp"
+    cell.pseudo = "gth-pade"
+    cell.mesh = [4, 3, 3]
+    cell.verbose = 0
+    cell.build()
+    return cell
+
+
+def _translation_diamond_cell():
+    cell = Cell()
+    cell.atom = "C 0.0 0.0 0.0; C 0.8917 0.8917 0.8917"
+    cell.a = """0.0 1.7834 1.7834
+1.7834 0.0 1.7834
+1.7834 1.7834 0.0"""
+    cell.unit = "A"
+    cell.basis = "gth-dzvp"
+    cell.pseudo = "gth-pbe"
+    cell.ke_cutoff = 60.0
+    cell.verbose = 0
+    cell.build()
+    return cell
 
 
 class TestPivotedCholeskyHermitian(unittest.TestCase):
@@ -211,6 +246,110 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
             "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
         ):
             select_jax_cached_matrix_free(ao_cache, rank=3, selection_peak_max_bytes=1)
+
+    def test_translation_cache_reconstructs_bloch_aos_and_exact_pivots(self):
+        cell = _translation_test_cell()
+        kpts = cell.make_kpts([2, 2, 2], wrap_around=False)
+        coords = cell.get_uniform_grids(cell.mesh)
+        representation = build_translation_ao_representation(cell, kpts)
+        self.assertEqual(representation.n_classes, len(kpts))
+        self.assertLess(representation.phase_orthogonality_residual, 1e-12)
+
+        stats = {}
+        cache = build_translation_ao_cache(
+            cell, coords, block_size=7, representation=representation, stats=stats,
+        )
+        reconstructed = np.concatenate([
+            block for _, _, block in stream_ao_blocks_from_translation_cache(
+                cache, representation.unitary_phase, block_size=5,
+            )
+        ], axis=1)
+        direct = np.asarray(cell.pbc_eval_gto("GTOval", coords, kpts=list(kpts)))
+        np.testing.assert_allclose(reconstructed, direct, atol=2e-12, rtol=2e-12)
+
+        streamed_diag, streamed_col = build_periodic_pivot_oracle(
+            cell, kpts, coords, block_size=7,
+        )
+        streamed_pivots, _, streamed_count = pivoted_cholesky_hermitian(
+            streamed_diag, streamed_col, rank=4,
+        )
+        pivots, factor, count, provenance = select_jax_translation_matrix_free(
+            cache, len(kpts), rank=4, selection_peak_max_bytes=10**9,
+            ao_block_size=7,
+            return_factor=True,
+        )
+        self.assertEqual(count, streamed_count)
+        np.testing.assert_array_equal(pivots, streamed_pivots)
+        self.assertEqual(factor.dtype, np.float64)
+        self.assertEqual(provenance["mode"], "jax_translation_matrix_free")
+        self.assertEqual(provenance["translation_cache_dtype"], "float64")
+        self.assertEqual(
+            stats["pbc_eval_calls"],
+            int(np.ceil(len(coords) / 7)),
+        )
+
+    def test_translation_cache_is_half_the_complex_bloch_cache(self):
+        full = jax_cached_matrix_free_byte_model(
+            4, 27, 5, 6, selection_peak_max_bytes=10**9,
+        )
+        translated = jax_translation_matrix_free_byte_model(
+            4, 4, 27, 5, 6, ao_block_size=7, selection_peak_max_bytes=10**9,
+        )
+        self.assertEqual(
+            2 * translated["translation_cache_real_float64_bytes"],
+            full["ao_cache_complex128_bytes"],
+        )
+        self.assertEqual(translated["translation_cache_to_complex_cache_ratio"], 0.5)
+        self.assertEqual(
+            translated["bounded_ao_block_complex128_bytes"], 4 * 7 * 5 * 16,
+        )
+        self.assertEqual(
+            translated["bounded_transform_block_complex128_bytes"], 4 * 7 * 5 * 16,
+        )
+        self.assertGreater(
+            translated["selection_peak_host_bytes"],
+            translated["translation_cache_real_float64_bytes"],
+        )
+
+    def test_translation_selector_capacity_is_fail_closed(self):
+        cache = np.ones((2, 3, 9), dtype=np.float64)
+        with self.assertRaisesRegex(
+            JAXTranslationMatrixFreeCapacityError,
+            "JAX_TRANSLATION_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
+        ):
+            select_jax_translation_matrix_free(
+                cache, n_kpts=2, rank=3, ao_block_size=3,
+                selection_peak_max_bytes=1,
+            )
+
+    def test_translation_representation_rejects_mesh_without_gamma(self):
+        cell = _translation_test_cell()
+        shifted = cell.make_kpts(
+            [3, 1, 1], wrap_around=False, scaled_center=[0.17, 0.0, 0.0],
+        )
+        with self.assertRaisesRegex(
+            TranslationAORepresentationError,
+            "TRANSLATION_AO_REQUIRES_GAMMA_ORTHOGONAL_PHASE_CLASSES",
+        ):
+            build_translation_ao_representation(cell, shifted)
+
+    def test_translation_representation_rejects_nonorthogonal_gamma_mesh(self):
+        cell = _translation_test_cell()
+        nonorthogonal = np.array([[0.0, 0.0, 0.0], [0.37, 0.0, 0.0]])
+        with self.assertRaisesRegex(
+            TranslationAORepresentationError,
+            "TRANSLATION_AO_REQUIRES_GAMMA_ORTHOGONAL_PHASE_CLASSES",
+        ):
+            build_translation_ao_representation(cell, nonorthogonal)
+
+    def test_diamond_4x4x4_has_64_orthogonal_translation_classes(self):
+        cell = _translation_diamond_cell()
+        representation = build_translation_ao_representation(
+            cell, cell.make_kpts([4, 4, 4], wrap_around=False),
+        )
+        self.assertEqual(representation.lattice_vectors.shape[0], 887)
+        self.assertEqual(representation.n_classes, 64)
+        self.assertLess(representation.phase_orthogonality_residual, 1e-12)
 
     def test_panel_metric_matches_direct_periodic_definition(self):
         rng = np.random.default_rng(29)

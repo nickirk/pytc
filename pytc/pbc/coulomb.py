@@ -11,11 +11,14 @@ import numpy as np
 from pytc.pbc.df.isdf import (
     DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
     DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
+    JAXTranslationMatrixFreeCapacityError,
     RawKernelProvider,
     build_cached_periodic_pivot_oracle,
     build_coul_kpt_device,
     build_periodic_pivot_oracle,
     build_pi_eta,
+    build_translation_ao_cache,
+    build_translation_ao_representation,
     candidate_panel_indices,
     explicit_candidate_identity,
     full_grid_candidate_identity,
@@ -23,8 +26,11 @@ from pytc.pbc.df.isdf import (
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
     jax_cached_matrix_free_byte_model,
+    jax_translation_matrix_free_byte_model,
     select_jax_cached_matrix_free,
+    select_jax_translation_matrix_free,
     stream_ao_blocks,
+    stream_ao_blocks_from_translation_cache,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
@@ -52,11 +58,13 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         solve_infos (length-Nk list).
     """
     valid_selection_modes = {
-        "jax_cached_matrix_free", "streamed", "cached_full", "panel_dense", "panel_oracle",
+        "jax_cached_matrix_free", "jax_translation_matrix_free", "streamed", "cached_full",
+        "panel_dense", "panel_oracle",
     }
     if selection_mode not in valid_selection_modes:
         raise ValueError(
-            "selection_mode must be 'jax_cached_matrix_free', 'streamed', 'cached_full', "
+            "selection_mode must be 'jax_cached_matrix_free', "
+            "'jax_translation_matrix_free', 'streamed', 'cached_full', "
             "'panel_dense', or 'panel_oracle'"
         )
     mesh_obj = canonicalize_kpts(cell, kpts)
@@ -73,7 +81,53 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         "ao_dtype": np.dtype(np.complex128).name,
     }
     cached_ao = None
-    if selection_mode == "jax_cached_matrix_free":
+    translation_cache = None
+    translation_representation = None
+    if selection_mode == "jax_translation_matrix_free":
+        n_ao = int(cell.nao_nr())
+        translation_representation = build_translation_ao_representation(
+            cell, mesh_obj.canonical_kpts,
+        )
+        byte_model = jax_translation_matrix_free_byte_model(
+            mesh_obj.n_kpts, translation_representation.n_classes,
+            grid_coords.shape[0], n_ao, rank,
+            ao_block_size=block_size,
+            selection_peak_max_bytes=selection_peak_max_bytes,
+            peak_safety_factor=selection_peak_safety_factor,
+        )
+        if byte_model["capacity_condition"] is not None:
+            raise JAXTranslationMatrixFreeCapacityError(
+                f"{byte_model['capacity_condition']}: selector peak with safety requires "
+                f"{byte_model['selection_peak_required_with_safety_bytes']} bytes, policy allows "
+                f"{byte_model['selection_peak_max_bytes']} bytes."
+            )
+        translation_cache = build_translation_ao_cache(
+            cell, grid_coords, block_size, translation_representation, stats=ao_stats,
+        )
+        pivots, _, n_selected, translation_provenance = (
+            select_jax_translation_matrix_free(
+                translation_cache, mesh_obj.n_kpts, rank,
+                ao_block_size=block_size,
+                selection_peak_max_bytes=selection_peak_max_bytes,
+                peak_safety_factor=selection_peak_safety_factor,
+            )
+        )
+        selection_provenance.update(translation_provenance)
+        selection_provenance.update({
+            "cache_bytes": int(translation_cache.nbytes),
+            "eta_ao_source": "blocked_reconstruction_from_translation_classes",
+            "lattice_image_count": int(
+                translation_representation.lattice_vectors.shape[0]
+            ),
+            "translation_class_count": int(translation_representation.n_classes),
+            "translation_class_sizes": [
+                int(group.size) for group in translation_representation.groups
+            ],
+            "phase_orthogonality_residual": (
+                translation_representation.phase_orthogonality_residual
+            ),
+        })
+    elif selection_mode == "jax_cached_matrix_free":
         n_ao = int(cell.nao_nr())
         byte_model = jax_cached_matrix_free_byte_model(
             mesh_obj.n_kpts, grid_coords.shape[0], n_ao, rank,
@@ -109,7 +163,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         diag, col_eval = build_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
-    if selection_mode == "jax_cached_matrix_free":
+    if selection_mode in {"jax_cached_matrix_free", "jax_translation_matrix_free"}:
         pass
     elif selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
@@ -152,11 +206,21 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     ao_stats["grid_points"] += int(pivots.size)
     ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
 
-    ao_blocks_for_eta = cached_ao if cached_ao is not None else (
-        blk for _, _, blk in stream_ao_blocks(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+    if translation_cache is not None:
+        ao_blocks_for_eta = (
+            blk for _, _, blk in stream_ao_blocks_from_translation_cache(
+                translation_cache, translation_representation.unitary_phase,
+                block_size, stats=ao_stats,
+            )
         )
-    )
+    elif cached_ao is not None:
+        ao_blocks_for_eta = cached_ao
+    else:
+        ao_blocks_for_eta = (
+            blk for _, _, blk in stream_ao_blocks(
+                cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            )
+        )
     Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg)
 
     provider = provider_cls(
@@ -181,6 +245,12 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             "n_selected": n_selected,
             "ao_calls_through_eta": ao_stats["pbc_eval_calls"],
             "ao_grid_points_through_eta": ao_stats["grid_points"],
+            "translation_reconstruction_calls": ao_stats.get(
+                "translation_reconstruction_calls", 0,
+            ),
+            "translation_reconstruction_grid_points": ao_stats.get(
+                "translation_reconstruction_grid_points", 0,
+            ),
         },
     }
 
