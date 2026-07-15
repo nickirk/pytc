@@ -17,6 +17,158 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# The exact E1 selector keeps the complete Bloch AO cache on the JAX device.
+# This is intentionally a bounded, fail-closed baseline; E3 will provide the
+# distinct localized large-system algorithm rather than silently changing the
+# exact selector's physical candidate set.
+DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES = 24 * 2**30
+
+
+class JAXCachedMatrixFreeCapacityError(RuntimeError):
+    """Raised when the exact AO cache exceeds the declared selector policy."""
+
+    condition = "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY"
+
+
+def jax_cached_matrix_free_byte_model(
+    n_kpts, n_grid, n_ao, rank, *, cache_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES,
+):
+    """Return exact selector residency terms without allocating an AO cache.
+
+    ``F`` is the complex128 matrix with shape ``(Nk*Nao, Ng)`` used by the
+    device pivot loop.  The Cholesky factor and residual are real float64;
+    the metric column is formed transiently from ``F.conj().T @ F[:, pivot]``.
+    A cache-policy failure is named in the returned record so callers can
+    refuse before evaluating the complete AO grid.
+    """
+    values = {
+        "n_kpts": n_kpts,
+        "n_grid": n_grid,
+        "n_ao": n_ao,
+        "rank": rank,
+        "cache_max_bytes": cache_max_bytes,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+
+    cache_bytes = int(n_kpts) * int(n_ao) * int(n_grid) * np.dtype(np.complex128).itemsize
+    factor_bytes = int(n_grid) * int(rank) * np.dtype(np.float64).itemsize
+    gram_work_bytes = int(n_grid) * np.dtype(np.complex128).itemsize
+    real_work_bytes = 2 * int(n_grid) * np.dtype(np.float64).itemsize
+    selector_bytes = int(n_grid) * np.dtype(np.bool_).itemsize
+    pivot_bytes = int(rank) * np.dtype(np.int64).itemsize
+    work_bytes = gram_work_bytes + real_work_bytes + selector_bytes + pivot_bytes
+    capacity_condition = (
+        None
+        if cache_bytes <= int(cache_max_bytes)
+        else JAXCachedMatrixFreeCapacityError.condition
+    )
+    return {
+        "mode": "jax_cached_matrix_free",
+        "ao_cache_layout": "F[Nk*Nao,Ng]",
+        "ao_cache_complex128_bytes": cache_bytes,
+        "cholesky_real_float64_bytes": factor_bytes,
+        "pivot_work_bytes": work_bytes,
+        "selection_peak_device_bytes": cache_bytes + factor_bytes + work_bytes,
+        "cache_max_bytes": int(cache_max_bytes),
+        "capacity_condition": capacity_condition,
+        "within_cache_policy": capacity_condition is None,
+    }
+
+
+def select_jax_cached_matrix_free(
+    ao_cache, rank, *, rcond=1e-12, ramp_scale=1e-12,
+    cache_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES,
+):
+    """Select exact full-grid pivots in one JIT/device control-flow loop.
+
+    ``ao_cache`` has shape ``(Nk, Ng, Nao)``.  The returned pivots use the
+    same metric, residual update, threshold, and high-index tie convention as
+    :func:`pivoted_cholesky_hermitian`; the only change is that every pivot
+    column is formed from the already cached AO matrix on the JAX device.
+    Host conversion happens only after the complete device loop returns.
+    """
+    ao_cache = np.asarray(ao_cache, dtype=np.complex128)
+    if ao_cache.ndim != 3 or any(size <= 0 for size in ao_cache.shape):
+        raise ValueError("ao_cache must have nonempty shape (Nk,Ng,Nao).")
+    n_kpts, n_grid, n_ao = ao_cache.shape
+    if isinstance(rank, bool) or not isinstance(rank, (int, np.integer)):
+        raise ValueError(f"rank must be an integer, got {rank!r}.")
+    rank = int(rank)
+    if rank <= 0 or rank > n_grid:
+        raise ValueError(f"rank must be in [1,{n_grid}], got {rank}.")
+    byte_model = jax_cached_matrix_free_byte_model(
+        n_kpts, n_grid, n_ao, rank, cache_max_bytes=cache_max_bytes,
+    )
+    if byte_model["capacity_condition"] is not None:
+        raise JAXCachedMatrixFreeCapacityError(
+            f"{byte_model['capacity_condition']}: AO cache requires "
+            f"{byte_model['ao_cache_complex128_bytes']} bytes, policy allows "
+            f"{byte_model['cache_max_bytes']} bytes."
+        )
+    if not jax.config.read("jax_enable_x64"):
+        raise RuntimeError(
+            "jax_cached_matrix_free requires jax_enable_x64=True for real float64 "
+            "residual/L and complex128 AO cache."
+        )
+
+    # F is the only AO object used by the pivot loop: rows are flattened
+    # (k, AO) channels and columns are physical-grid points.
+    f_cache = jnp.asarray(
+        np.ascontiguousarray(ao_cache.transpose(0, 2, 1).reshape(n_kpts * n_ao, n_grid)),
+        dtype=jnp.complex128,
+    )
+
+    @jax.jit
+    def _select(f):
+        diagonal = jnp.sum(jnp.abs(f) ** 2, axis=0) ** 2 / n_kpts
+        max_diagonal = jnp.max(diagonal)
+        ramp = ramp_scale * jnp.arange(n_grid, dtype=jnp.float64) * max_diagonal
+        threshold = rcond * max_diagonal
+        initial = (
+            diagonal.astype(jnp.float64),
+            jnp.zeros((n_grid, rank), dtype=jnp.float64),
+            jnp.full((rank,), -1, dtype=jnp.int64),
+            jnp.zeros((n_grid,), dtype=jnp.bool_),
+            jnp.array(0, dtype=jnp.int64),
+        )
+
+        def body(t, state):
+            residual, factor, pivots, selected, count = state
+            pivot = jnp.argmax(jnp.where(selected, -jnp.inf, residual + ramp))
+            active = residual[pivot] > threshold
+            gram = f.conj().T @ f[:, pivot]
+            metric_column = (jnp.abs(gram) ** 2 / n_kpts).astype(jnp.float64)
+            previous = factor @ factor[pivot, :]
+            denominator = jnp.sqrt(jnp.maximum(residual[pivot], jnp.finfo(jnp.float64).tiny))
+            new_column = (metric_column - previous) / denominator
+            new_column = jnp.where(active, new_column, jnp.zeros_like(new_column))
+            factor = factor.at[:, t].set(new_column)
+            residual = jnp.where(
+                active, jnp.maximum(residual - new_column ** 2, 0.0), residual,
+            )
+            pivots = pivots.at[t].set(jnp.where(active, pivot, -1))
+            selected = jnp.where(active, selected.at[pivot].set(True), selected)
+            return residual, factor, pivots, selected, count + active.astype(jnp.int64)
+
+        return jax.lax.fori_loop(0, rank, body, initial)
+
+    _, factor, pivots, _, count = _select(f_cache)
+    n_selected = int(np.asarray(count))
+    pivots_host = np.asarray(pivots)[:n_selected]
+    factor_host = np.asarray(factor)[:, :n_selected]
+    provenance = {
+        **byte_model,
+        "pivot_executor": "jax.jit/lax.fori_loop",
+        "pivot_loop_device_resident": True,
+        "ao_cache_dtype": str(f_cache.dtype),
+        "factor_dtype": str(factor.dtype),
+        "device_platforms": sorted({device.platform for device in f_cache.devices()}),
+    }
+    return pivots_host, factor_host, n_selected, provenance
+
+
 def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=1e-12):
     """Matrix-free greedy pivoted (partial) Cholesky for an implicit N x N
     Hermitian PSD matrix M given diag(M) and a column oracle

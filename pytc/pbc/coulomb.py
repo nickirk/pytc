@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from pytc.pbc.df.isdf import (
+    DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES,
     RawKernelProvider,
     build_cached_periodic_pivot_oracle,
     build_coul_kpt_device,
@@ -20,13 +21,16 @@ from pytc.pbc.df.isdf import (
     periodic_metric_column_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
+    jax_cached_matrix_free_byte_model,
+    select_jax_cached_matrix_free,
     stream_ao_blocks,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
 
 def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
-          provider_cls=RawKernelProvider, selection_mode="streamed"):
+          provider_cls=RawKernelProvider, selection_mode="jax_cached_matrix_free",
+          selection_cache_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -45,11 +49,13 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
-    valid_selection_modes = {"streamed", "cached_full", "panel_dense", "panel_oracle"}
+    valid_selection_modes = {
+        "jax_cached_matrix_free", "streamed", "cached_full", "panel_dense", "panel_oracle",
+    }
     if selection_mode not in valid_selection_modes:
         raise ValueError(
-            "selection_mode must be 'streamed', 'cached_full', 'panel_dense', or "
-            "'panel_oracle'"
+            "selection_mode must be 'jax_cached_matrix_free', 'streamed', 'cached_full', "
+            "'panel_dense', or 'panel_oracle'"
         )
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
@@ -65,7 +71,33 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         "ao_dtype": np.dtype(np.complex128).name,
     }
     cached_ao = None
-    if selection_mode == "cached_full":
+    if selection_mode == "jax_cached_matrix_free":
+        n_ao = int(cell.nao_nr())
+        byte_model = jax_cached_matrix_free_byte_model(
+            mesh_obj.n_kpts, grid_coords.shape[0], n_ao, rank,
+            cache_max_bytes=selection_cache_max_bytes,
+        )
+        # The exact cache policy is checked before any full-grid AO allocation.
+        # select_jax_cached_matrix_free raises the named capacity condition if
+        # this record is outside policy; there is deliberately no dense/panel
+        # fallback from the production default.
+        if byte_model["capacity_condition"] is not None:
+            from pytc.pbc.df.isdf import JAXCachedMatrixFreeCapacityError
+            raise JAXCachedMatrixFreeCapacityError(
+                f"{byte_model['capacity_condition']}: AO cache requires "
+                f"{byte_model['ao_cache_complex128_bytes']} bytes, policy allows "
+                f"{byte_model['cache_max_bytes']} bytes."
+            )
+        _, _, cached_ao = build_cached_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+        )
+        pivots, _, n_selected, jax_provenance = select_jax_cached_matrix_free(
+            cached_ao, rank, cache_max_bytes=selection_cache_max_bytes,
+        )
+        selection_provenance.update(jax_provenance)
+        selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
+        selection_provenance["eta_ao_source"] = "same_full_grid_ao_cache"
+    elif selection_mode == "cached_full":
         diag, col_eval, cached_ao = build_cached_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
@@ -73,7 +105,9 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         diag, col_eval = build_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
-    if selection_mode == "streamed":
+    if selection_mode == "jax_cached_matrix_free":
+        pass
+    elif selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
     elif selection_mode == "cached_full":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)

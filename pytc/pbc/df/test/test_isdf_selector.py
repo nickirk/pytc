@@ -4,6 +4,8 @@
 
 import unittest
 
+import jax
+jax.config.update("jax_enable_x64", True)
 import numpy as np
 from scipy.linalg.lapack import zpstrf
 
@@ -13,9 +15,12 @@ from pytc.pbc.df.isdf import (
     candidate_panel_indices,
     explicit_candidate_identity,
     full_grid_candidate_identity,
+    JAXCachedMatrixFreeCapacityError,
+    jax_cached_matrix_free_byte_model,
     periodic_metric_column_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
+    select_jax_cached_matrix_free,
 )
 
 
@@ -160,6 +165,44 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertEqual(cached_count, streamed_count)
         np.testing.assert_array_equal(cached_pivots, streamed_pivots)
         self.assertEqual(cached_stats, {"pbc_eval_calls": 3, "grid_points": 9})
+
+    def test_jax_cached_matrix_free_matches_streamed_pivots_and_rank(self):
+        cell = _SyntheticPeriodicCell()
+        grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
+        kpts = np.zeros((2, 3))
+        streamed_diag, streamed_col = build_periodic_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4,
+        )
+        cache_stats = {}
+        _, _, ao_cache = build_cached_periodic_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4, stats=cache_stats,
+        )
+        streamed_pivots, _, streamed_count = pivoted_cholesky_hermitian(
+            streamed_diag, streamed_col, rank=3,
+        )
+        pivots, factor, count, provenance = select_jax_cached_matrix_free(
+            ao_cache, rank=3, cache_max_bytes=10**9,
+        )
+        self.assertEqual(count, streamed_count)
+        np.testing.assert_array_equal(pivots, streamed_pivots)
+        self.assertEqual(factor.dtype, np.float64)
+        self.assertEqual(provenance["pivot_executor"], "jax.jit/lax.fori_loop")
+        self.assertTrue(provenance["pivot_loop_device_resident"])
+        self.assertEqual(cache_stats, {"pbc_eval_calls": 3, "grid_points": 9})
+
+    def test_jax_cached_matrix_free_capacity_is_fail_closed_before_selection(self):
+        model = jax_cached_matrix_free_byte_model(2, 9, 3, 3, cache_max_bytes=1)
+        self.assertFalse(model["within_cache_policy"])
+        self.assertEqual(
+            model["capacity_condition"],
+            "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY",
+        )
+        ao_cache = np.ones((2, 9, 3), dtype=np.complex128)
+        with self.assertRaisesRegex(
+            JAXCachedMatrixFreeCapacityError,
+            "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY",
+        ):
+            select_jax_cached_matrix_free(ao_cache, rank=3, cache_max_bytes=1)
 
     def test_panel_metric_matches_direct_periodic_definition(self):
         rng = np.random.default_rng(29)
