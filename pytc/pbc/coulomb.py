@@ -10,9 +10,13 @@ import numpy as np
 
 from pytc.pbc.df.isdf import (
     RawKernelProvider,
+    build_cached_periodic_pivot_oracle,
     build_coul_kpt_device,
     build_periodic_pivot_oracle,
     build_pi_eta,
+    candidate_panel_indices,
+    periodic_metric_column_from_ao,
+    periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
     stream_ao_blocks,
 )
@@ -20,7 +24,7 @@ from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kp
 
 
 def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
-          provider_cls=RawKernelProvider):
+          provider_cls=RawKernelProvider, selection_mode="streamed"):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -45,7 +49,38 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     diag, col_eval = build_periodic_pivot_oracle(
         cell, mesh_obj.canonical_kpts, grid_coords, block_size
     )
-    pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
+    if selection_mode == "streamed":
+        pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
+    elif selection_mode == "cached_full":
+        cached_diag, cached_col_eval, _ = build_cached_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+        )
+        cached_pivots, _, n_selected = pivoted_cholesky_hermitian(
+            cached_diag, cached_col_eval, rank=rank
+        )
+        streamed_pivots, _, _ = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
+        if not np.array_equal(cached_pivots, streamed_pivots):
+            raise AssertionError("cached_full selection must reproduce streamed pivot indices exactly")
+        pivots = cached_pivots
+    elif selection_mode == "panel":
+        candidates = candidate_panel_indices(diag, rank)
+        panel_ao = np.asarray(cell.pbc_eval_gto(
+            "GTOval", grid_coords[candidates], kpts=list(mesh_obj.canonical_kpts)
+        ), dtype=np.complex128)
+        panel_metric = periodic_metric_from_ao(panel_ao)
+        dense_pivots, _, dense_count = pivoted_cholesky_hermitian(
+            panel_metric.real.diagonal(), lambda j: panel_metric[:, j], rank=rank
+        )
+        oracle_pivots, _, oracle_count = pivoted_cholesky_hermitian(
+            panel_metric.real.diagonal(),
+            lambda j: periodic_metric_column_from_ao(panel_ao, j), rank=rank,
+        )
+        if dense_count != oracle_count or not np.array_equal(dense_pivots, oracle_pivots):
+            raise AssertionError("panel dense and on-demand metric selectors must agree")
+        pivots = candidates[dense_pivots]
+        n_selected = dense_count
+    else:
+        raise ValueError("selection_mode must be 'streamed', 'cached_full', or 'panel'")
 
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
