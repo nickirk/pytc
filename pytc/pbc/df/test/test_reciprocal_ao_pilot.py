@@ -9,9 +9,11 @@ from pyscf.pbc import gto, tools
 from pytc.pbc.df.kpts import canonicalize_kpts
 from pytc.pbc.df.reciprocal_ao_pilot import (
     metric_column_from_ao_groups,
+    downsample_uniform_grid_values,
     pivot_prefix_from_ao_groups,
     reciprocal_translate_bloch_ao,
     relative_frobenius_error,
+    uniform_grid_downsample_indices,
 )
 
 
@@ -31,6 +33,79 @@ def _diamond_211():
 
 
 class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
+    def test_oversampled_target_grid_metrics_and_on_demand_pivots(self):
+        cell = _diamond_211()
+        mesh = np.asarray(cell.mesh)
+        fine_mesh = 2 * mesh
+        coords = cell.get_uniform_grids(mesh)
+        fine_coords = cell.get_uniform_grids(fine_mesh)
+        index_map = uniform_grid_downsample_indices(mesh, fine_mesh)
+        np.testing.assert_allclose(coords, fine_coords[index_map], atol=0.0)
+        mesh_obj = canonicalize_kpts(cell, cell.make_kpts([3, 2, 1], wrap_around=False))
+        selected = np.array([0, 1, 2])
+        kpts = mesh_obj.canonical_kpts[selected]
+        n_primitive_ao = cell.nao_nr() // 2
+        translation = cell.atom_coords()[2] - cell.atom_coords()[0]
+        direct = np.asarray(cell.pbc_eval_gto(
+            "GTOval", coords, kpts=list(kpts),
+        ), dtype=np.complex128)
+        coarse_target = direct[:, :, n_primitive_ao:]
+
+        fine_seeds = []
+        for kpt in kpts:
+            fine_direct = np.asarray(cell.pbc_eval_gto(
+                "GTOval", fine_coords, kpts=[kpt],
+            ), dtype=np.complex128)[0]
+            fine_seeds.append(fine_direct[:, :n_primitive_ao])
+        fine_seeds = np.asarray(fine_seeds)
+
+        def generate_target_grid():
+            return np.asarray([
+                downsample_uniform_grid_values(
+                    reciprocal_translate_bloch_ao(
+                        fine_seeds[k], fine_coords, fine_mesh, kpt,
+                        translation, cell.get_Gv(fine_mesh),
+                    ),
+                    mesh, fine_mesh,
+                )
+                for k, kpt in enumerate(kpts)
+            ])
+
+        accurate_target = generate_target_grid()
+        target_error = relative_frobenius_error(coarse_target, accurate_target)
+        self.assertLess(target_error["max_abs"], 5e-11)
+        self.assertLess(target_error["relative_frobenius"], 5e-11)
+
+        direct_groups = lambda: iter((direct[:, :, :n_primitive_ao], coarse_target))
+        accurate_groups = lambda: iter((direct[:, :, :n_primitive_ao], accurate_target))
+        for pivot in (0, len(coords) // 3, len(coords) - 1):
+            np.testing.assert_allclose(
+                metric_column_from_ao_groups(direct_groups(), pivot, len(kpts)),
+                metric_column_from_ao_groups(accurate_groups(), pivot, len(kpts)),
+                atol=3e-10, rtol=3e-10,
+            )
+        direct_prefix, _, direct_count = pivot_prefix_from_ao_groups(
+            direct_groups, len(coords), len(kpts), rank=16,
+        )
+        accurate_prefix, _, accurate_count = pivot_prefix_from_ao_groups(
+            accurate_groups, len(coords), len(kpts), rank=16,
+        )
+        self.assertEqual(accurate_count, direct_count)
+        np.testing.assert_array_equal(accurate_prefix, direct_prefix)
+
+        regenerations = {"count": 0}
+
+        def on_demand_groups():
+            regenerations["count"] += 1
+            return iter((direct[:, :, :n_primitive_ao], generate_target_grid()))
+
+        on_demand_prefix, _, on_demand_count = pivot_prefix_from_ao_groups(
+            on_demand_groups, len(coords), len(kpts), rank=4,
+        )
+        self.assertEqual(regenerations["count"], 5)
+        self.assertEqual(on_demand_count, 4)
+        np.testing.assert_array_equal(on_demand_prefix, direct_prefix[:4])
+
     def test_211_direct_shift_reciprocal_convergence_and_selector_prefix(self):
         cell = _diamond_211()
         mesh = np.asarray(cell.mesh)

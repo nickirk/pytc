@@ -64,6 +64,29 @@ def relative_frobenius_error(reference, candidate):
     }
 
 
+def uniform_grid_downsample_indices(coarse_mesh, fine_mesh):
+    """Map a commensurate fine uniform grid back to its coarse-grid points."""
+    coarse_mesh = np.asarray(coarse_mesh, dtype=np.int64)
+    fine_mesh = np.asarray(fine_mesh, dtype=np.int64)
+    if coarse_mesh.shape != (3,) or fine_mesh.shape != (3,):
+        raise ValueError("meshes must have shape (3,).")
+    if np.any(coarse_mesh <= 0) or np.any(fine_mesh <= 0):
+        raise ValueError("mesh entries must be positive.")
+    if np.any(fine_mesh % coarse_mesh):
+        raise ValueError("fine_mesh must be an integer multiple of coarse_mesh.")
+    factor = fine_mesh // coarse_mesh
+    coarse_indices = np.array(np.unravel_index(np.arange(np.prod(coarse_mesh)), coarse_mesh)).T
+    return np.ravel_multi_index((coarse_indices * factor).T, fine_mesh)
+
+
+def downsample_uniform_grid_values(values, coarse_mesh, fine_mesh):
+    """Select matching coarse-grid coordinates from a fine-grid AO array."""
+    values = np.asarray(values)
+    if values.shape[0] != int(np.prod(fine_mesh)):
+        raise ValueError("values first axis must equal the fine-grid size.")
+    return values[uniform_grid_downsample_indices(coarse_mesh, fine_mesh)]
+
+
 def metric_column_from_ao_groups(groups, pivot, n_kpts):
     """Form one exact metric column after accumulating every AO group."""
     accumulator = None

@@ -1,0 +1,71 @@
+{
+  "schema": "pytc-jax-periodic-spherical-ao-pilot/v2",
+  "scope": "CPU-only standalone comparator closure; no production wiring, default change, GPU execution, or large-supercell execution.",
+  "input": {
+    "system": "diamond 211 supercell",
+    "basis": "gth-dzvp",
+    "pseudo": "gth-pbe",
+    "ke_cutoff_hartree": 30.0,
+    "uniform_mesh": [27, 13, 13],
+    "n_grid": 4563,
+    "grid_block_size": 128,
+    "image_block_size": 8,
+    "n_ao": 52,
+    "shell_contractions": 20,
+    "max_primitives_per_contraction": 4,
+    "lattice_images": 711,
+    "k_mesh": [3, 2, 1],
+    "sampled_k_indices": [0, 1, 2],
+    "neg_sampled_k_indices": [0, 1, 4]
+  },
+  "semantics": {
+    "core": "pytc.ansatz.gto_spherical MolGTO_Spherical and eval_ao_spherical",
+    "angular_path": "real spherical only",
+    "lattice_images": "cell.get_lattice_Ls() exactly",
+    "phase_weight": "exp(+i k.L)",
+    "screening": "same finite PySCF lattice-image list; no independent screening rule"
+  },
+  "full_uniform_grid_parity": {
+    "ao_max_abs_error": 3.8487743943488653e-13,
+    "ao_relative_frobenius_error": 1.789385468402299e-13,
+    "metric_column_errors": {
+      "0": {"max_abs": 2.6617597015388128e-14, "relative_frobenius": 2.2468718532036827e-13},
+      "1521": {"max_abs": 6.303291222309326e-14, "relative_frobenius": 6.688883911055412e-14},
+      "4562": {"max_abs": 8.197609258076e-14, "relative_frobenius": 1.0517361858904992e-13}
+    },
+    "direct_pivot_prefix_rank_16": [3733, 1380, 2641, 444, 2569, 372, 353, 2562, 2316, 2226, 2953, 587, 2232, 2446, 3770, 4525],
+    "generated_pivot_prefix_rank_16": [3733, 1380, 2641, 444, 2569, 372, 353, 2562, 2316, 2226, 2953, 587, 2232, 2446, 3770, 4525]
+  },
+  "actual_image_batching": {
+    "implementation": "The compiled evaluator vmaps real-spherical AO evaluation over each padded image block and contracts image weights after the batched call.",
+    "grid_blocks": 108,
+    "image_blocks": 9612,
+    "jax_compiled_calls": 9612,
+    "jax_image_evaluations": 76788,
+    "call_count_rule": "grid_blocks times image_blocks; one compiled call per image block, not per image",
+    "live_bytes": {
+      "batched_real_contribution": 425984,
+      "complex_accumulator": 106496,
+      "two_live_block_total": 532480
+    },
+    "forbidden_dense_grid_shell_image_primitive_shape": [128, 20, 8, 4]
+  },
+  "timing_seconds": {
+    "pyscf_direct_three_k": 0.0816675420064712,
+    "jax_compile": 0.1324990830034949,
+    "jax_warm_three_k_repeats": [3.3369032079936005, 3.2101451250055106, 3.2079965000011725],
+    "jax_warm_three_k_median": 3.2101451250055106
+  },
+  "projected_444": {
+    "n_ao": 1664,
+    "grid_block_size": 128,
+    "image_block_size": 8,
+    "shell_contractions": 1280,
+    "max_primitives_per_contraction": 4,
+    "batched_real_contribution_bytes": 13631488,
+    "complex_accumulator_bytes": 3407872,
+    "two_live_block_total_bytes": 17039360,
+    "forbidden_dense_grid_shell_image_primitive_shape": [128, 1280, 8, 4]
+  },
+  "conclusion": "The actual batched-image JAX comparator reproduces full-cell PySCF AO, metric columns, and the rank-16 pivot prefix with one JIT call per image block. It remains far slower than direct PySCF on this CPU pilot and does not establish a production or GPU decision."
+}

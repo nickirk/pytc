@@ -1,0 +1,59 @@
+{
+  "schema": "pytc-reciprocal-primitive-ao-pilot/v2",
+  "scope": "CPU-only standalone closure pilot; no production integration, default change, GPU run, or large-supercell execution.",
+  "input": {
+    "system": "diamond 211 supercell",
+    "basis": "gth-dzvp",
+    "pseudo": "gth-pbe",
+    "ke_cutoff_hartree": 30.0,
+    "target_mesh": [27, 13, 13],
+    "target_n_grid": 4563,
+    "oversampled_mesh": [54, 26, 26],
+    "oversampled_n_grid": 36504,
+    "n_primitive_ao": 26,
+    "n_supercell_ao": 52,
+    "k_mesh": [3, 2, 1],
+    "sampled_k_indices": [0, 1, 2],
+    "neg_sampled_k_indices": [0, 1, 4]
+  },
+  "method": {
+    "reciprocal_translation": "u=exp(-i k.r) phi; IFFT[exp(-i G.tau) FFT(u)]; phi_tau=exp(-i k.tau) exp(+i k.r) u_tau",
+    "target_grid_closure": "evaluate the primitive seed and reciprocal translation on the commensurate 2x mesh, then select the target-grid lattice points",
+    "not_claimed": "The 2x mesh is a convergence closure, not an exact interpolation theorem or production selector design."
+  },
+  "target_grid_parity": {
+    "ao_max_abs_error": 3.8490654900158235e-13,
+    "ao_relative_frobenius_error": 1.8970807565848962e-13,
+    "metric_column_errors": {
+      "0": {"max_abs": 1.2649603586822877e-14, "relative_frobenius": 1.7035981455262954e-13},
+      "1521": {"max_abs": 6.733502644351574e-14, "relative_frobenius": 4.5041516572649525e-14},
+      "4562": {"max_abs": 1.3211653993039363e-14, "relative_frobenius": 2.2418876039704005e-14}
+    },
+    "metric_assembly": "all complex AO-group contributions are summed before abs-squared",
+    "direct_pivot_prefix_rank_16": [3733, 1380, 2641, 444, 2569, 372, 353, 2562, 2316, 2226, 2953, 587, 2232, 2446, 3770, 4525],
+    "generated_pivot_prefix_rank_16": [3733, 1380, 2641, 444, 2569, 372, 353, 2562, 2316, 2226, 2953, 587, 2232, 2446, 3770, 4525]
+  },
+  "on_demand_measurement": {
+    "definition": "Each pivot-column group request regenerates its translated 2x-grid AO group; no cached generated group is reused.",
+    "rank": 4,
+    "regenerations": 5,
+    "pivot_prefix": [3733, 1380, 2641, 444],
+    "one_2x_group_four_complex_buffers_bytes": 60742656,
+    "two_2x_groups_four_complex_buffers_bytes": 121485312,
+    "target_grid_generated_output_bytes_per_group": 1898208,
+    "timing_seconds": {
+      "one_2x_sweep": 0.09097037499304861,
+      "on_demand_four_pivot_prefix": 0.4288030829920899
+    }
+  },
+  "projected_444": {
+    "target_n_grid": 438976,
+    "oversampled_n_grid": 3511808,
+    "n_primitive_ao": 26,
+    "one_2x_group_four_complex_buffers_bytes": 5843648512,
+    "two_2x_groups_four_complex_buffers_bytes": 11687297024,
+    "target_grid_generated_output_bytes_per_group": 182614016,
+    "dense_L_rank_16640_bytes": 58436485120
+  },
+  "conclusion": "The 2x commensurate closure removes the target-grid aliasing observed at 1x for this pilot and reproduces target-grid AO, three metric columns, and the rank-16 deterministic pivot prefix. The measured pivot path really regenerates groups and retains at most one or two 2x AO groups, but its 444 byte projection and the unchanged dense-L requirement do not justify production integration."
+}
