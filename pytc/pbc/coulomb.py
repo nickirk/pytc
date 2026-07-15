@@ -49,10 +49,12 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     diag, col_eval = build_periodic_pivot_oracle(
         cell, mesh_obj.canonical_kpts, grid_coords, block_size
     )
+    selection_provenance = {"mode": selection_mode, "ao_calls_selection": 1}
+    cached_ao = None
     if selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
     elif selection_mode == "cached_full":
-        cached_diag, cached_col_eval, _ = build_cached_periodic_pivot_oracle(
+        cached_diag, cached_col_eval, cached_ao = build_cached_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size
         )
         cached_pivots, _, n_selected = pivoted_cholesky_hermitian(
@@ -62,6 +64,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         if not np.array_equal(cached_pivots, streamed_pivots):
             raise AssertionError("cached_full selection must reproduce streamed pivot indices exactly")
         pivots = cached_pivots
+        selection_provenance["ao_calls_selection"] = 1
+        selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
     elif selection_mode == "panel":
         candidates = candidate_panel_indices(diag, rank)
         panel_ao = np.asarray(cell.pbc_eval_gto(
@@ -79,6 +83,11 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             raise AssertionError("panel dense and on-demand metric selectors must agree")
         pivots = candidates[dense_pivots]
         n_selected = dense_count
+        selection_provenance.update({
+            "candidate_count": int(candidates.size),
+            "candidate_indices": candidates.tolist(),
+            "panel_bytes": int(panel_ao.nbytes + panel_metric.nbytes),
+        })
     else:
         raise ValueError("selection_mode must be 'streamed', 'cached_full', or 'panel'")
 
@@ -88,7 +97,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     )
     ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
 
-    ao_blocks_for_eta = (
+    ao_blocks_for_eta = cached_ao if cached_ao is not None else (
         blk for _, _, blk in stream_ao_blocks(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size
         )
@@ -111,6 +120,12 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         "n_pipeline_calls": n_pipeline_calls,
         "solve_infos": solve_infos,
         "ao_tr_residual": ao_tr_residual,
+        "selection_provenance": {
+            **selection_provenance,
+            "pivot_indices": pivots.tolist(),
+            "n_selected": n_selected,
+            "ao_calls_through_eta": selection_provenance["ao_calls_selection"] + (0 if cached_ao is not None else 1),
+        },
     }
 
 
