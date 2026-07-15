@@ -756,6 +756,10 @@ def periodic_metric_column_from_ao(ao, index):
     if ao.ndim != 3:
         raise ValueError(f"ao must have shape (Nk,Npanel,Nao), got {ao.shape}.")
     n_kpts, n_panel, _ = ao.shape
+    if n_kpts == 0 or n_panel == 0:
+        raise ValueError("ao must have nonempty k and panel axes.")
+    if isinstance(index, bool) or not isinstance(index, (int, np.integer)):
+        raise ValueError("index must be an integer.")
     if not 0 <= index < n_panel:
         raise ValueError(f"index={index} is outside panel size {n_panel}.")
     gram = np.einsum("km,krm->r", ao[:, index, :].conj(), ao, optimize=True)
