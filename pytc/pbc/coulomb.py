@@ -15,6 +15,8 @@ from pytc.pbc.df.isdf import (
     build_periodic_pivot_oracle,
     build_pi_eta,
     candidate_panel_indices,
+    explicit_candidate_identity,
+    full_grid_candidate_identity,
     periodic_metric_column_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
@@ -57,7 +59,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         "mode": selection_mode,
         "candidate_rule": "all_grid_points_v1",
         "candidate_count": int(grid_coords.shape[0]),
-        "candidate_indices": list(range(grid_coords.shape[0])),
+        "candidate_identity": full_grid_candidate_identity(grid_coords.shape[0]),
         "cache_bytes": 0,
         "panel_bytes": 0,
         "ao_dtype": np.dtype(np.complex128).name,
@@ -99,7 +101,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         selection_provenance.update({
             "candidate_rule": "top_half_effective_diag_plus_stratified_bins_v1",
             "candidate_count": int(candidates.size),
-            "candidate_indices": candidates.tolist(),
+            "candidate_identity": explicit_candidate_identity(candidates),
         })
 
     selection_provenance["ao_calls_selection"] = ao_stats["pbc_eval_calls"]

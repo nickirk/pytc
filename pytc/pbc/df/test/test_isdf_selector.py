@@ -11,6 +11,8 @@ from pytc.pbc.df.isdf import (
     build_cached_periodic_pivot_oracle,
     build_periodic_pivot_oracle,
     candidate_panel_indices,
+    explicit_candidate_identity,
+    full_grid_candidate_identity,
     periodic_metric_column_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
@@ -125,6 +127,18 @@ class TestPivotedCholeskyHermitian(unittest.TestCase):
 
 
 class TestExperimentalSelectionPrimitives(unittest.TestCase):
+    def test_full_grid_identity_is_compact_range(self):
+        identity = full_grid_candidate_identity(10**9)
+        self.assertEqual(
+            identity,
+            {"kind": "range", "start": 0, "stop": 10**9, "step": 1},
+        )
+        self.assertNotIn("indices", identity)
+
+    def test_panel_identity_keeps_explicit_indices(self):
+        identity = explicit_candidate_identity(np.array([7, 2, 5], dtype=np.int64))
+        self.assertEqual(identity, {"kind": "explicit_indices", "indices": [7, 2, 5]})
+
     def test_cached_full_oracle_matches_streamed_pivots(self):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))

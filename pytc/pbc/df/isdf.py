@@ -810,6 +810,21 @@ def candidate_panel_indices(diag, rank, *, panel_factor=4, ramp_scale=1e-12):
     return np.asarray(unique, dtype=np.int64)
 
 
+def full_grid_candidate_identity(n_grid):
+    """Return a compact identity for the complete grid candidate set."""
+    if isinstance(n_grid, bool) or not isinstance(n_grid, (int, np.integer)) or n_grid <= 0:
+        raise ValueError("n_grid must be a positive integer.")
+    return {"kind": "range", "start": 0, "stop": int(n_grid), "step": 1}
+
+
+def explicit_candidate_identity(indices):
+    """Return the persisted identity for a bounded explicit candidate panel."""
+    indices = np.asarray(indices)
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError("indices must be a one-dimensional integer array.")
+    return {"kind": "explicit_indices", "indices": indices.tolist()}
+
+
 def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
     """Experimental full-cache oracle with the same metric as the streamed path."""
     kpts_np = np.asarray(kpts, dtype=np.float64)
