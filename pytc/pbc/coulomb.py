@@ -317,13 +317,15 @@ class ISDFDF:
         rank, block_size, rtol, retention_mode: forwarded to build().
     """
 
-    def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single"):
+    def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
+                 selection_mode="streamed"):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
         self.block_size = block_size
         self.rtol = rtol
         self.retention_mode = retention_mode
+        self.selection_mode = selection_mode
         self._built = None
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
         # factorization) delegate to a real FFTDF instance.
@@ -344,6 +346,7 @@ class ISDFDF:
             self._built = build(
                 self.cell, self.kpts, rank=self.rank, block_size=self.block_size,
                 rtol=self.rtol, retention_mode=self.retention_mode,
+                selection_mode=self.selection_mode,
             )
         return self._built
 
