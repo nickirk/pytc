@@ -7,7 +7,11 @@ import unittest
 import numpy as np
 from scipy.linalg.lapack import zpstrf
 
-from pytc.pbc.df.isdf import pivoted_cholesky_hermitian
+from pytc.pbc.df.isdf import (
+    candidate_panel_indices,
+    periodic_metric_from_ao,
+    pivoted_cholesky_hermitian,
+)
 
 
 def _random_psd(rng, n, true_rank, dtype=np.complex128):
@@ -97,6 +101,24 @@ class TestPivotedCholeskyHermitian(unittest.TestCase):
         recon = L @ L.conj().T
         np.testing.assert_allclose(recon, M_real_valued, atol=1e-10)
         np.testing.assert_allclose(recon.imag, 0.0, atol=1e-10)
+
+
+class TestExperimentalSelectionPrimitives(unittest.TestCase):
+    def test_panel_metric_matches_direct_periodic_definition(self):
+        rng = np.random.default_rng(29)
+        ao = rng.normal(size=(3, 5, 2)) + 1j * rng.normal(size=(3, 5, 2))
+        metric = periodic_metric_from_ao(ao)
+        direct = np.empty((5, 5), dtype=np.complex128)
+        for r in range(5):
+            for s in range(5):
+                direct[r, s] = abs(np.vdot(ao[:, r, :], ao[:, s, :])) ** 2 / 3
+        np.testing.assert_allclose(metric, direct, atol=1e-12)
+
+    def test_candidate_panel_is_unique_and_uses_higher_index_ties(self):
+        panel = candidate_panel_indices(np.ones(20), rank=3, panel_factor=4)
+        self.assertEqual(panel.size, 12)
+        self.assertEqual(len(set(panel.tolist())), panel.size)
+        self.assertEqual(panel[0], 19)
 
     def test_determinism_across_repeated_calls(self):
         rng = np.random.default_rng(26)

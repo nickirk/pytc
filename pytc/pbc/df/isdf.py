@@ -738,6 +738,60 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
     return diag, col_eval
 
 
+def periodic_metric_from_ao(ao):
+    """Materialize the periodic metric for an explicit, bounded AO panel."""
+    ao = np.asarray(ao, dtype=np.complex128)
+    if ao.ndim != 3:
+        raise ValueError(f"ao must have shape (Nk,Npanel,Nao), got {ao.shape}.")
+    n_kpts, n_panel, _ = ao.shape
+    if n_kpts == 0 or n_panel == 0:
+        raise ValueError("ao must have nonempty k and panel axes.")
+    flat = ao.transpose(1, 0, 2).reshape(n_panel, -1)
+    return (np.abs(flat.conj() @ flat.T) ** 2 / n_kpts).astype(np.complex128)
+
+
+def candidate_panel_indices(diag, rank, *, panel_factor=4, ramp_scale=1e-12):
+    """Deterministically combine high-score and spatially stratified candidates."""
+    diag = np.asarray(diag, dtype=np.float64)
+    if diag.ndim != 1 or diag.size == 0:
+        raise ValueError("diag must be a nonempty 1-D array.")
+    if rank <= 0 or panel_factor < 2:
+        raise ValueError("rank must be positive and panel_factor must be at least 2.")
+    n_grid = diag.size
+    panel_size = min(n_grid, panel_factor * rank)
+    score = diag + ramp_scale * np.arange(n_grid) * float(np.max(diag))
+    order = np.argsort(score, kind="stable")[::-1]
+    high_count = min(panel_size // 2, n_grid)
+    selected = list(order[:high_count])
+    bins = np.array_split(np.arange(n_grid), panel_size - high_count)
+    for indices in bins:
+        selected.append(indices[np.argmax(score[indices])])
+    unique = []
+    seen = set()
+    for index in selected + list(order):
+        index = int(index)
+        if index not in seen:
+            unique.append(index)
+            seen.add(index)
+        if len(unique) == panel_size:
+            break
+    return np.asarray(unique, dtype=np.int64)
+
+
+def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
+    """Experimental full-cache oracle with the same metric as the streamed path."""
+    kpts_np = np.asarray(kpts, dtype=np.float64)
+    n_grid = len(grid_coords)
+    n_kpts = len(kpts_np)
+    cache = None
+    for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size):
+        if cache is None:
+            cache = np.empty((n_kpts, n_grid, ao_block.shape[2]), dtype=np.complex128)
+        cache[:, g0:g1] = ao_block
+    metric = periodic_metric_from_ao(cache)
+    return metric.real.diagonal().copy(), lambda j: metric[:, j], cache
+
+
 # ---------------------------------------------------------------------------
 # Staging-policy layer (design doc §6): predicted-byte-model-driven selection
 # among ram/memmap/recompute eta-store policies, plus the mechanics.
