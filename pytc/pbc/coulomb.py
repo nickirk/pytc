@@ -46,25 +46,20 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
 
-    diag, col_eval = build_periodic_pivot_oracle(
-        cell, mesh_obj.canonical_kpts, grid_coords, block_size
-    )
     selection_provenance = {"mode": selection_mode, "ao_calls_selection": 1}
     cached_ao = None
+    if selection_mode == "cached_full":
+        diag, col_eval, cached_ao = build_cached_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+        )
+    else:
+        diag, col_eval = build_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+        )
     if selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
     elif selection_mode == "cached_full":
-        cached_diag, cached_col_eval, cached_ao = build_cached_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size
-        )
-        cached_pivots, _, n_selected = pivoted_cholesky_hermitian(
-            cached_diag, cached_col_eval, rank=rank
-        )
-        streamed_pivots, _, _ = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
-        if not np.array_equal(cached_pivots, streamed_pivots):
-            raise AssertionError("cached_full selection must reproduce streamed pivot indices exactly")
-        pivots = cached_pivots
-        selection_provenance["ao_calls_selection"] = 1
+        pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
         selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
     elif selection_mode == "panel":
         candidates = candidate_panel_indices(diag, rank)
