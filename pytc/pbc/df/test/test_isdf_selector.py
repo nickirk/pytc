@@ -203,12 +203,12 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertFalse(model["within_cache_policy"])
         self.assertEqual(
             model["capacity_condition"],
-            "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY",
+            "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
         )
         ao_cache = np.ones((2, 9, 3), dtype=np.complex128)
         with self.assertRaisesRegex(
             JAXCachedMatrixFreeCapacityError,
-            "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY",
+            "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
         ):
             select_jax_cached_matrix_free(ao_cache, rank=3, selection_peak_max_bytes=1)
 

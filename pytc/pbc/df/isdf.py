@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 # The exact E1 selector keeps the complete Bloch AO cache on the JAX device.
-# This is intentionally a bounded, fail-closed baseline; E3 will provide the
-# distinct localized large-system algorithm rather than silently changing the
-# exact selector's physical candidate set.  Any future localized backend is
-# separately held until measured capacity evidence justifies it.
+# This is intentionally a bounded, fail-closed baseline.  Any distinct
+# localized backend is separately held until measured capacity evidence and
+# owner direction justify it; no fallback changes this selector's physical
+# candidate set.
 DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES = 24 * 2**30
 DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR = 1.10
 
@@ -29,7 +29,7 @@ DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR = 1.10
 class JAXCachedMatrixFreeCapacityError(RuntimeError):
     """Raised when the exact AO cache exceeds the declared selector policy."""
 
-    condition = "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY"
+    condition = "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY"
 
 
 def jax_cached_matrix_free_byte_model(
