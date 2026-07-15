@@ -43,61 +43,78 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
-    valid_selection_modes = {"streamed", "cached_full", "panel"}
+    valid_selection_modes = {"streamed", "cached_full", "panel_dense", "panel_oracle"}
     if selection_mode not in valid_selection_modes:
         raise ValueError(
-            "selection_mode must be 'streamed', 'cached_full', or 'panel'"
+            "selection_mode must be 'streamed', 'cached_full', 'panel_dense', or "
+            "'panel_oracle'"
         )
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
 
-    selection_provenance = {"mode": selection_mode, "ao_calls_selection": 1}
+    ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
+    selection_provenance = {
+        "mode": selection_mode,
+        "candidate_rule": "all_grid_points_v1",
+        "candidate_count": int(grid_coords.shape[0]),
+        "candidate_indices": list(range(grid_coords.shape[0])),
+        "cache_bytes": 0,
+        "panel_bytes": 0,
+        "ao_dtype": np.dtype(np.complex128).name,
+    }
     cached_ao = None
     if selection_mode == "cached_full":
         diag, col_eval, cached_ao = build_cached_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
     else:
         diag, col_eval = build_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
     if selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
     elif selection_mode == "cached_full":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
         selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
-    elif selection_mode == "panel":
+    else:
         candidates = candidate_panel_indices(diag, rank)
         panel_ao = np.asarray(cell.pbc_eval_gto(
             "GTOval", grid_coords[candidates], kpts=list(mesh_obj.canonical_kpts)
         ), dtype=np.complex128)
-        panel_metric = periodic_metric_from_ao(panel_ao)
-        dense_pivots, _, dense_count = pivoted_cholesky_hermitian(
-            panel_metric.real.diagonal(), lambda j: panel_metric[:, j], rank=rank
-        )
-        oracle_pivots, _, oracle_count = pivoted_cholesky_hermitian(
-            panel_metric.real.diagonal(),
-            lambda j: periodic_metric_column_from_ao(panel_ao, j), rank=rank,
-        )
-        if dense_count != oracle_count or not np.array_equal(dense_pivots, oracle_pivots):
-            raise AssertionError("panel dense and on-demand metric selectors must agree")
-        pivots = candidates[dense_pivots]
-        n_selected = dense_count
+        ao_stats["pbc_eval_calls"] += 1
+        ao_stats["grid_points"] += int(candidates.size)
+        if selection_mode == "panel_dense":
+            panel_metric = periodic_metric_from_ao(panel_ao)
+            panel_pivots, _, n_selected = pivoted_cholesky_hermitian(
+                panel_metric.real.diagonal(), lambda j: panel_metric[:, j], rank=rank
+            )
+            selection_provenance["panel_bytes"] = int(panel_ao.nbytes + panel_metric.nbytes)
+        else:
+            panel_pivots, _, n_selected = pivoted_cholesky_hermitian(
+                np.sum(np.abs(panel_ao) ** 2, axis=(0, 2)) ** 2 / panel_ao.shape[0],
+                lambda j: periodic_metric_column_from_ao(panel_ao, j), rank=rank,
+            )
+            selection_provenance["panel_bytes"] = int(panel_ao.nbytes)
+        pivots = candidates[panel_pivots]
         selection_provenance.update({
+            "candidate_rule": "top_half_effective_diag_plus_stratified_bins_v1",
             "candidate_count": int(candidates.size),
             "candidate_indices": candidates.tolist(),
-            "panel_bytes": int(panel_ao.nbytes + panel_metric.nbytes),
         })
 
+    selection_provenance["ao_calls_selection"] = ao_stats["pbc_eval_calls"]
+    selection_provenance["ao_grid_points_selection"] = ao_stats["grid_points"]
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
         dtype=np.complex128,
     )
+    ao_stats["pbc_eval_calls"] += 1
+    ao_stats["grid_points"] += int(pivots.size)
     ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
 
     ao_blocks_for_eta = cached_ao if cached_ao is not None else (
         blk for _, _, blk in stream_ao_blocks(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
     )
     Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg)
@@ -122,7 +139,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             **selection_provenance,
             "pivot_indices": pivots.tolist(),
             "n_selected": n_selected,
-            "ao_calls_through_eta": selection_provenance["ao_calls_selection"] + (0 if cached_ao is not None else 1),
+            "ao_calls_through_eta": ao_stats["pbc_eval_calls"],
+            "ao_grid_points_through_eta": ao_stats["grid_points"],
         },
     }
 

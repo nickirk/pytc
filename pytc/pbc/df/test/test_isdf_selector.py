@@ -8,6 +8,8 @@ import numpy as np
 from scipy.linalg.lapack import zpstrf
 
 from pytc.pbc.df.isdf import (
+    build_cached_periodic_pivot_oracle,
+    build_periodic_pivot_oracle,
     candidate_panel_indices,
     periodic_metric_column_from_ao,
     periodic_metric_from_ao,
@@ -19,6 +21,24 @@ def _random_psd(rng, n, true_rank, dtype=np.complex128):
     A = rng.normal(size=(n, true_rank)) + 1j * rng.normal(size=(n, true_rank))
     A = A.astype(dtype)
     return A @ A.conj().T
+
+
+class _SyntheticPeriodicCell:
+    def pbc_eval_gto(self, label, coords, kpts):
+        self.assert_label(label)
+        grid_index = np.asarray(coords[:, 0], dtype=np.int64)
+        n_kpts = len(kpts)
+        ao_index = np.arange(3)[None, :]
+        values = []
+        for k_index in range(n_kpts):
+            phase = np.exp(1j * (k_index + 1) * (grid_index[:, None] + ao_index))
+            values.append((grid_index[:, None] + 1 + ao_index) * phase)
+        return np.asarray(values)
+
+    @staticmethod
+    def assert_label(label):
+        if label != "GTOval":
+            raise AssertionError(label)
 
 
 class TestPivotedCholeskyHermitian(unittest.TestCase):
@@ -105,6 +125,28 @@ class TestPivotedCholeskyHermitian(unittest.TestCase):
 
 
 class TestExperimentalSelectionPrimitives(unittest.TestCase):
+    def test_cached_full_oracle_matches_streamed_pivots(self):
+        cell = _SyntheticPeriodicCell()
+        grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
+        kpts = np.zeros((2, 3))
+        streamed_diag, streamed_col = build_periodic_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4,
+        )
+        cached_stats = {}
+        cached_diag, cached_col, _ = build_cached_periodic_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4, stats=cached_stats,
+        )
+        streamed_pivots, _, streamed_count = pivoted_cholesky_hermitian(
+            streamed_diag, streamed_col, rank=3,
+        )
+        cached_pivots, _, cached_count = pivoted_cholesky_hermitian(
+            cached_diag, cached_col, rank=3,
+        )
+        np.testing.assert_allclose(cached_diag, streamed_diag)
+        self.assertEqual(cached_count, streamed_count)
+        np.testing.assert_array_equal(cached_pivots, streamed_pivots)
+        self.assertEqual(cached_stats, {"pbc_eval_calls": 3, "grid_points": 9})
+
     def test_panel_metric_matches_direct_periodic_definition(self):
         rng = np.random.default_rng(29)
         ao = rng.normal(size=(3, 5, 2)) + 1j * rng.normal(size=(3, 5, 2))
@@ -116,6 +158,19 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         np.testing.assert_allclose(metric, direct, atol=1e-12)
         for column in range(5):
             np.testing.assert_allclose(periodic_metric_column_from_ao(ao, column), direct[:, column])
+
+    def test_panel_dense_and_oracle_select_identical_pivots(self):
+        rng = np.random.default_rng(31)
+        ao = rng.normal(size=(3, 8, 3)) + 1j * rng.normal(size=(3, 8, 3))
+        metric = periodic_metric_from_ao(ao)
+        dense_pivots, _, dense_count = pivoted_cholesky_hermitian(
+            metric.real.diagonal(), lambda j: metric[:, j], rank=4,
+        )
+        oracle_pivots, _, oracle_count = pivoted_cholesky_hermitian(
+            metric.real.diagonal(), lambda j: periodic_metric_column_from_ao(ao, j), rank=4,
+        )
+        self.assertEqual(oracle_count, dense_count)
+        np.testing.assert_array_equal(oracle_pivots, dense_pivots)
 
     def test_candidate_panel_is_unique_and_uses_higher_index_ties(self):
         panel = candidate_panel_indices(np.ones(20), rank=3, panel_factor=4)

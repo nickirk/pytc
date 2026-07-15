@@ -668,7 +668,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
 # either stays bounded by one block regardless of the full grid size Ng.
 
 
-def stream_ao_blocks(cell, kpts, grid_coords, block_size):
+def stream_ao_blocks(cell, kpts, grid_coords, block_size, *, stats=None):
     """S1: stream AO values at kpts over grid_coords in blocks of
     block_size grid points; host memory stays bounded by one block.
 
@@ -696,10 +696,13 @@ def stream_ao_blocks(cell, kpts, grid_coords, block_size):
         ao_block = np.asarray(
             cell.pbc_eval_gto("GTOval", grid_coords[g0:g1], kpts=kpts_list), dtype=np.complex128,
         )
+        if stats is not None:
+            stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
+            stats["grid_points"] = stats.get("grid_points", 0) + (g1 - g0)
         yield g0, g1, ao_block
 
 
-def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
+def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
     """S2 periodic pivot-selection metric oracle (design doc §3): a
     (diag, col_eval) pair for the reference-cell pair-density Gram matrix
     M[r,r'] = |sum_{k,mu} conj(AO_k(r,mu)) AO_k(r',mu)|^2 / Nk, never
@@ -718,7 +721,9 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
     n_kpts = kpts_np.shape[0]
 
     diag = np.empty(n_grid, dtype=np.float64)
-    for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size):
+    for g0, g1, ao_block in stream_ao_blocks(
+        cell, kpts_np, grid_coords, block_size, stats=stats,
+    ):
         pooled = np.sum(np.abs(ao_block) ** 2, axis=(0, 2))  # (blk,), sum_{k,mu} |AO_k(r,mu)|^2
         diag[g0:g1] = pooled ** 2 / n_kpts
 
@@ -727,10 +732,15 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
             cell.pbc_eval_gto("GTOval", grid_coords[j:j + 1], kpts=list(kpts_np)),
             dtype=np.complex128,
         )
+        if stats is not None:
+            stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
+            stats["grid_points"] = stats.get("grid_points", 0) + 1
         ao_j = ao_j_block[:, 0, :]  # (Nk, Nao)
 
         col = np.empty(n_grid, dtype=np.complex128)
-        for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size):
+        for g0, g1, ao_block in stream_ao_blocks(
+            cell, kpts_np, grid_coords, block_size, stats=stats,
+        ):
             gram = np.einsum("km,krm->r", ao_j.conj(), ao_block, optimize=True)
             col[g0:g1] = (np.abs(gram) ** 2 / n_kpts).astype(np.complex128)
         return col
@@ -800,13 +810,15 @@ def candidate_panel_indices(diag, rank, *, panel_factor=4, ramp_scale=1e-12):
     return np.asarray(unique, dtype=np.int64)
 
 
-def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size):
+def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
     """Experimental full-cache oracle with the same metric as the streamed path."""
     kpts_np = np.asarray(kpts, dtype=np.float64)
     n_grid = len(grid_coords)
     n_kpts = len(kpts_np)
     cache = None
-    for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size):
+    for g0, g1, ao_block in stream_ao_blocks(
+        cell, kpts_np, grid_coords, block_size, stats=stats,
+    ):
         if cache is None:
             cache = np.empty((n_kpts, n_grid, ao_block.shape[2]), dtype=np.complex128)
         cache[:, g0:g1] = ao_block
