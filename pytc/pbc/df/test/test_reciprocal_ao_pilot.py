@@ -46,32 +46,45 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         kpts = mesh_obj.canonical_kpts[selected]
         n_primitive_ao = cell.nao_nr() // 2
         translation = cell.atom_coords()[2] - cell.atom_coords()[0]
+        fine_gvectors = cell.get_Gv(fine_mesh)
         direct = np.asarray(cell.pbc_eval_gto(
             "GTOval", coords, kpts=list(kpts),
         ), dtype=np.complex128)
         coarse_target = direct[:, :, n_primitive_ao:]
 
-        fine_seeds = []
-        for kpt in kpts:
+        started = time.perf_counter()
+        fine_seeds = np.empty(
+            (len(kpts), len(fine_coords), n_primitive_ao), dtype=np.complex128,
+        )
+        for k_index, kpt in enumerate(kpts):
             fine_direct = np.asarray(cell.pbc_eval_gto(
                 "GTOval", fine_coords, kpts=[kpt],
-            ), dtype=np.complex128)[0]
-            fine_seeds.append(fine_direct[:, :n_primitive_ao])
-        fine_seeds = np.asarray(fine_seeds)
+            ), dtype=np.complex128)
+            fine_seeds[k_index] = fine_direct[0, :, :n_primitive_ao]
+        del fine_direct
+        seed_build_seconds = time.perf_counter() - started
+        self.assertGreaterEqual(seed_build_seconds, 0.0)
+        self.assertEqual(
+            fine_seeds.nbytes,
+            len(kpts) * len(fine_coords) * n_primitive_ao * np.dtype(np.complex128).itemsize,
+        )
 
         def generate_target_grid():
             return np.asarray([
                 downsample_uniform_grid_values(
                     reciprocal_translate_bloch_ao(
                         fine_seeds[k], fine_coords, fine_mesh, kpt,
-                        translation, cell.get_Gv(fine_mesh),
+                        translation, fine_gvectors,
                     ),
                     mesh, fine_mesh,
                 )
                 for k, kpt in enumerate(kpts)
             ])
 
+        started = time.perf_counter()
         accurate_target = generate_target_grid()
+        one_sweep_seconds = time.perf_counter() - started
+        self.assertGreaterEqual(one_sweep_seconds, 0.0)
         target_error = relative_frobenius_error(coarse_target, accurate_target)
         self.assertLess(target_error["max_abs"], 5e-11)
         self.assertLess(target_error["relative_frobenius"], 5e-11)
@@ -99,12 +112,16 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
             regenerations["count"] += 1
             return iter((direct[:, :, :n_primitive_ao], generate_target_grid()))
 
+        rank = 4
+        started = time.perf_counter()
         on_demand_prefix, _, on_demand_count = pivot_prefix_from_ao_groups(
-            on_demand_groups, len(coords), len(kpts), rank=4,
+            on_demand_groups, len(coords), len(kpts), rank=rank,
         )
-        self.assertEqual(regenerations["count"], 5)
-        self.assertEqual(on_demand_count, 4)
-        np.testing.assert_array_equal(on_demand_prefix, direct_prefix[:4])
+        on_demand_seconds = time.perf_counter() - started
+        self.assertGreaterEqual(on_demand_seconds, 0.0)
+        self.assertEqual(regenerations["count"], rank + 1)
+        self.assertEqual(on_demand_count, rank)
+        np.testing.assert_array_equal(on_demand_prefix, direct_prefix[:rank])
 
     def test_211_direct_shift_reciprocal_convergence_and_selector_prefix(self):
         cell = _diamond_211()
