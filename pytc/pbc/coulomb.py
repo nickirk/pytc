@@ -9,7 +9,8 @@ from __future__ import annotations
 import numpy as np
 
 from pytc.pbc.df.isdf import (
-    DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES,
+    DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
+    DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
     RawKernelProvider,
     build_cached_periodic_pivot_oracle,
     build_coul_kpt_device,
@@ -30,7 +31,8 @@ from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kp
 
 def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode="jax_cached_matrix_free",
-          selection_cache_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES):
+          selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
+          selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -75,7 +77,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         n_ao = int(cell.nao_nr())
         byte_model = jax_cached_matrix_free_byte_model(
             mesh_obj.n_kpts, grid_coords.shape[0], n_ao, rank,
-            cache_max_bytes=selection_cache_max_bytes,
+            selection_peak_max_bytes=selection_peak_max_bytes,
+            peak_safety_factor=selection_peak_safety_factor,
         )
         # The exact cache policy is checked before any full-grid AO allocation.
         # select_jax_cached_matrix_free raises the named capacity condition if
@@ -84,15 +87,16 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         if byte_model["capacity_condition"] is not None:
             from pytc.pbc.df.isdf import JAXCachedMatrixFreeCapacityError
             raise JAXCachedMatrixFreeCapacityError(
-                f"{byte_model['capacity_condition']}: AO cache requires "
-                f"{byte_model['ao_cache_complex128_bytes']} bytes, policy allows "
-                f"{byte_model['cache_max_bytes']} bytes."
+                f"{byte_model['capacity_condition']}: selector peak with safety requires "
+                f"{byte_model['selection_peak_device_with_safety_bytes']} bytes, policy allows "
+                f"{byte_model['selection_peak_max_bytes']} bytes."
             )
         _, _, cached_ao = build_cached_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
         pivots, _, n_selected, jax_provenance = select_jax_cached_matrix_free(
-            cached_ao, rank, cache_max_bytes=selection_cache_max_bytes,
+            cached_ao, rank, selection_peak_max_bytes=selection_peak_max_bytes,
+            peak_safety_factor=selection_peak_safety_factor,
         )
         selection_provenance.update(jax_provenance)
         selection_provenance["cache_bytes"] = int(cached_ao.nbytes)

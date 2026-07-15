@@ -181,7 +181,7 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
             streamed_diag, streamed_col, rank=3,
         )
         pivots, factor, count, provenance = select_jax_cached_matrix_free(
-            ao_cache, rank=3, cache_max_bytes=10**9,
+            ao_cache, rank=3, selection_peak_max_bytes=10**9, return_factor=True,
         )
         self.assertEqual(count, streamed_count)
         np.testing.assert_array_equal(pivots, streamed_pivots)
@@ -189,9 +189,17 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertEqual(provenance["pivot_executor"], "jax.jit/lax.fori_loop")
         self.assertTrue(provenance["pivot_loop_device_resident"])
         self.assertEqual(cache_stats, {"pbc_eval_calls": 3, "grid_points": 9})
+        production_pivots, production_factor, production_count, _ = (
+            select_jax_cached_matrix_free(
+                ao_cache, rank=3, selection_peak_max_bytes=10**9,
+            )
+        )
+        self.assertIsNone(production_factor)
+        self.assertEqual(production_count, streamed_count)
+        np.testing.assert_array_equal(production_pivots, streamed_pivots)
 
     def test_jax_cached_matrix_free_capacity_is_fail_closed_before_selection(self):
-        model = jax_cached_matrix_free_byte_model(2, 9, 3, 3, cache_max_bytes=1)
+        model = jax_cached_matrix_free_byte_model(2, 9, 3, 3, selection_peak_max_bytes=1)
         self.assertFalse(model["within_cache_policy"])
         self.assertEqual(
             model["capacity_condition"],
@@ -202,7 +210,7 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
             JAXCachedMatrixFreeCapacityError,
             "JAX_CACHED_MATRIX_FREE_AO_CACHE_EXCEEDS_POLICY",
         ):
-            select_jax_cached_matrix_free(ao_cache, rank=3, cache_max_bytes=1)
+            select_jax_cached_matrix_free(ao_cache, rank=3, selection_peak_max_bytes=1)
 
     def test_panel_metric_matches_direct_periodic_definition(self):
         rng = np.random.default_rng(29)

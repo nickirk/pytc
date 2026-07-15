@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 # The exact E1 selector keeps the complete Bloch AO cache on the JAX device.
 # This is intentionally a bounded, fail-closed baseline; E3 will provide the
 # distinct localized large-system algorithm rather than silently changing the
-# exact selector's physical candidate set.
-DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES = 24 * 2**30
+# exact selector's physical candidate set.  Any future localized backend is
+# separately held until measured capacity evidence justifies it.
+DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES = 24 * 2**30
+DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR = 1.10
 
 
 class JAXCachedMatrixFreeCapacityError(RuntimeError):
@@ -31,7 +33,9 @@ class JAXCachedMatrixFreeCapacityError(RuntimeError):
 
 
 def jax_cached_matrix_free_byte_model(
-    n_kpts, n_grid, n_ao, rank, *, cache_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES,
+    n_kpts, n_grid, n_ao, rank, *,
+    selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
+    peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
 ):
     """Return exact selector residency terms without allocating an AO cache.
 
@@ -46,11 +50,13 @@ def jax_cached_matrix_free_byte_model(
         "n_grid": n_grid,
         "n_ao": n_ao,
         "rank": rank,
-        "cache_max_bytes": cache_max_bytes,
+        "selection_peak_max_bytes": selection_peak_max_bytes,
     }
     for name, value in values.items():
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
             raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+    if not isinstance(peak_safety_factor, (int, float)) or peak_safety_factor < 1.0:
+        raise ValueError("peak_safety_factor must be a real number >= 1.0.")
 
     cache_bytes = int(n_kpts) * int(n_ao) * int(n_grid) * np.dtype(np.complex128).itemsize
     factor_bytes = int(n_grid) * int(rank) * np.dtype(np.float64).itemsize
@@ -59,27 +65,76 @@ def jax_cached_matrix_free_byte_model(
     selector_bytes = int(n_grid) * np.dtype(np.bool_).itemsize
     pivot_bytes = int(rank) * np.dtype(np.int64).itemsize
     work_bytes = gram_work_bytes + real_work_bytes + selector_bytes + pivot_bytes
+    selection_peak_device_bytes = cache_bytes + factor_bytes + work_bytes
+    selection_peak_device_with_safety_bytes = int(
+        np.ceil(selection_peak_device_bytes * float(peak_safety_factor))
+    )
     capacity_condition = (
         None
-        if cache_bytes <= int(cache_max_bytes)
+        if selection_peak_device_with_safety_bytes <= int(selection_peak_max_bytes)
         else JAXCachedMatrixFreeCapacityError.condition
     )
     return {
         "mode": "jax_cached_matrix_free",
         "ao_cache_layout": "F[Nk*Nao,Ng]",
         "ao_cache_complex128_bytes": cache_bytes,
+        "host_ao_cache_complex128_bytes": cache_bytes,
         "cholesky_real_float64_bytes": factor_bytes,
         "pivot_work_bytes": work_bytes,
-        "selection_peak_device_bytes": cache_bytes + factor_bytes + work_bytes,
-        "cache_max_bytes": int(cache_max_bytes),
+        "selection_peak_device_bytes": selection_peak_device_bytes,
+        "selection_peak_host_bytes": cache_bytes,
+        "selection_peak_safety_factor": float(peak_safety_factor),
+        "selection_peak_device_with_safety_bytes": selection_peak_device_with_safety_bytes,
+        "selection_peak_max_bytes": int(selection_peak_max_bytes),
         "capacity_condition": capacity_condition,
         "within_cache_policy": capacity_condition is None,
     }
 
 
+@partial(jax.jit, static_argnames=("rank", "n_kpts"))
+def _select_jax_cached_matrix_free_kernel(
+    f, *, rank, n_kpts, rcond=1e-12, ramp_scale=1e-12,
+):
+    """Stable compiled kernel for the exact full-grid JAX selector."""
+    _, n_grid = f.shape
+    diagonal = jnp.sum(jnp.abs(f) ** 2, axis=0) ** 2 / n_kpts
+    max_diagonal = jnp.max(diagonal)
+    ramp = ramp_scale * jnp.arange(n_grid, dtype=jnp.float64) * max_diagonal
+    threshold = rcond * max_diagonal
+    initial = (
+        diagonal.astype(jnp.float64),
+        jnp.zeros((n_grid, rank), dtype=jnp.float64),
+        jnp.full((rank,), -1, dtype=jnp.int64),
+        jnp.zeros((n_grid,), dtype=jnp.bool_),
+        jnp.array(0, dtype=jnp.int64),
+    )
+
+    def body(t, state):
+        residual, factor, pivots, selected, count = state
+        pivot = jnp.argmax(jnp.where(selected, -jnp.inf, residual + ramp))
+        active = residual[pivot] > threshold
+        gram = f.conj().T @ f[:, pivot]
+        metric_column = (jnp.abs(gram) ** 2 / n_kpts).astype(jnp.float64)
+        previous = factor @ factor[pivot, :]
+        denominator = jnp.sqrt(jnp.maximum(residual[pivot], jnp.finfo(jnp.float64).tiny))
+        new_column = (metric_column - previous) / denominator
+        new_column = jnp.where(active, new_column, jnp.zeros_like(new_column))
+        factor = factor.at[:, t].set(new_column)
+        residual = jnp.where(
+            active, jnp.maximum(residual - new_column ** 2, 0.0), residual,
+        )
+        pivots = pivots.at[t].set(jnp.where(active, pivot, -1))
+        selected = jnp.where(active, selected.at[pivot].set(True), selected)
+        return residual, factor, pivots, selected, count + active.astype(jnp.int64)
+
+    return jax.lax.fori_loop(0, rank, body, initial)
+
+
 def select_jax_cached_matrix_free(
     ao_cache, rank, *, rcond=1e-12, ramp_scale=1e-12,
-    cache_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_CACHE_MAX_BYTES,
+    selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
+    peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
+    return_factor=False,
 ):
     """Select exact full-grid pivots in one JIT/device control-flow loop.
 
@@ -87,7 +142,8 @@ def select_jax_cached_matrix_free(
     same metric, residual update, threshold, and high-index tie convention as
     :func:`pivoted_cholesky_hermitian`; the only change is that every pivot
     column is formed from the already cached AO matrix on the JAX device.
-    Host conversion happens only after the complete device loop returns.
+    Only the compact pivot vector/count is copied to host in production.
+    ``return_factor=True`` is test-only and explicitly requests a host factor.
     """
     ao_cache = np.asarray(ao_cache, dtype=np.complex128)
     if ao_cache.ndim != 3 or any(size <= 0 for size in ao_cache.shape):
@@ -99,13 +155,15 @@ def select_jax_cached_matrix_free(
     if rank <= 0 or rank > n_grid:
         raise ValueError(f"rank must be in [1,{n_grid}], got {rank}.")
     byte_model = jax_cached_matrix_free_byte_model(
-        n_kpts, n_grid, n_ao, rank, cache_max_bytes=cache_max_bytes,
+        n_kpts, n_grid, n_ao, rank,
+        selection_peak_max_bytes=selection_peak_max_bytes,
+        peak_safety_factor=peak_safety_factor,
     )
     if byte_model["capacity_condition"] is not None:
         raise JAXCachedMatrixFreeCapacityError(
-            f"{byte_model['capacity_condition']}: AO cache requires "
-            f"{byte_model['ao_cache_complex128_bytes']} bytes, policy allows "
-            f"{byte_model['cache_max_bytes']} bytes."
+            f"{byte_model['capacity_condition']}: selector peak with safety requires "
+            f"{byte_model['selection_peak_device_with_safety_bytes']} bytes, policy allows "
+            f"{byte_model['selection_peak_max_bytes']} bytes."
         )
     if not jax.config.read("jax_enable_x64"):
         raise RuntimeError(
@@ -120,44 +178,12 @@ def select_jax_cached_matrix_free(
         dtype=jnp.complex128,
     )
 
-    @jax.jit
-    def _select(f):
-        diagonal = jnp.sum(jnp.abs(f) ** 2, axis=0) ** 2 / n_kpts
-        max_diagonal = jnp.max(diagonal)
-        ramp = ramp_scale * jnp.arange(n_grid, dtype=jnp.float64) * max_diagonal
-        threshold = rcond * max_diagonal
-        initial = (
-            diagonal.astype(jnp.float64),
-            jnp.zeros((n_grid, rank), dtype=jnp.float64),
-            jnp.full((rank,), -1, dtype=jnp.int64),
-            jnp.zeros((n_grid,), dtype=jnp.bool_),
-            jnp.array(0, dtype=jnp.int64),
-        )
-
-        def body(t, state):
-            residual, factor, pivots, selected, count = state
-            pivot = jnp.argmax(jnp.where(selected, -jnp.inf, residual + ramp))
-            active = residual[pivot] > threshold
-            gram = f.conj().T @ f[:, pivot]
-            metric_column = (jnp.abs(gram) ** 2 / n_kpts).astype(jnp.float64)
-            previous = factor @ factor[pivot, :]
-            denominator = jnp.sqrt(jnp.maximum(residual[pivot], jnp.finfo(jnp.float64).tiny))
-            new_column = (metric_column - previous) / denominator
-            new_column = jnp.where(active, new_column, jnp.zeros_like(new_column))
-            factor = factor.at[:, t].set(new_column)
-            residual = jnp.where(
-                active, jnp.maximum(residual - new_column ** 2, 0.0), residual,
-            )
-            pivots = pivots.at[t].set(jnp.where(active, pivot, -1))
-            selected = jnp.where(active, selected.at[pivot].set(True), selected)
-            return residual, factor, pivots, selected, count + active.astype(jnp.int64)
-
-        return jax.lax.fori_loop(0, rank, body, initial)
-
-    _, factor, pivots, _, count = _select(f_cache)
+    _, factor, pivots, _, count = _select_jax_cached_matrix_free_kernel(
+        f_cache, rank=rank, n_kpts=n_kpts, rcond=rcond, ramp_scale=ramp_scale,
+    )
     n_selected = int(np.asarray(count))
     pivots_host = np.asarray(pivots)[:n_selected]
-    factor_host = np.asarray(factor)[:, :n_selected]
+    factor_host = np.asarray(factor)[:, :n_selected] if return_factor else None
     provenance = {
         **byte_model,
         "pivot_executor": "jax.jit/lax.fori_loop",
