@@ -43,6 +43,11 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
+    valid_selection_modes = {"streamed", "cached_full", "panel"}
+    if selection_mode not in valid_selection_modes:
+        raise ValueError(
+            "selection_mode must be 'streamed', 'cached_full', or 'panel'"
+        )
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
 
@@ -83,8 +88,6 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             "candidate_indices": candidates.tolist(),
             "panel_bytes": int(panel_ao.nbytes + panel_metric.nbytes),
         })
-    else:
-        raise ValueError("selection_mode must be 'streamed', 'cached_full', or 'panel'")
 
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
