@@ -9,9 +9,12 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import numpy as np
 from pyscf.pbc.gto import Cell
+from pyscf.pbc import mp
 from pyscf.pbc.scf import KRHF
 
 from pytc.pbc.coulomb import ISDFDF
+from pytc.pbc.df.isdf import build_periodic_pivot_oracle, pivoted_cholesky_hermitian
+from pytc.pbc.df.kpts import canonicalize_kpts
 
 
 def _make_cell():
@@ -71,6 +74,26 @@ class TestISDFDFStructure(unittest.TestCase):
         expected = FFTDF(cell, kpts).get_pp(kpts)
         got = adapter.get_pp(kpts)
         np.testing.assert_allclose(np.asarray(got), np.asarray(expected), atol=0.0)
+
+    def test_kmp2_uses_fixed_pivot_adapter_ao2mo(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_coords = cell.get_uniform_grids(cell.mesh)
+        diagonal, column = build_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size=13,
+        )
+        pivots, _, _ = pivoted_cholesky_hermitian(diagonal, column, rank=3)
+        mf = KRHF(cell, kpts)
+        mf.verbose = 0
+        mf.with_df = ISDFDF(
+            cell, kpts, rank=3, block_size=13, rtol=1e-8,
+            fixed_pivots=pivots,
+        )
+        mf.kernel()
+        self.assertTrue(mf.converged)
+        correlation, _ = mp.KMP2(mf).kernel()
+        self.assertTrue(np.isfinite(correlation))
 
 
 class TestISDFDFRealKrhf(unittest.TestCase):

@@ -85,6 +85,28 @@ class TestBuild(unittest.TestCase):
             W_q = np.asarray(result["coul_kpt"][q])
             np.testing.assert_allclose(W_q, W_q.conj().T, atol=1e-8, err_msg=f"q={q}")
 
+    def test_fixed_pivots_reuse_exact_ao_downstream(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_coords = cell.get_uniform_grids(cell.mesh)
+        diagonal, column = build_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size=13,
+        )
+        pivots, _, _ = pivoted_cholesky_hermitian(diagonal, column, rank=3)
+        selected = coulomb.build(
+            cell, kpts, rank=3, block_size=13, rtol=1e-8,
+            selection_mode="streamed", fixed_pivots=pivots,
+        )
+        baseline = coulomb.build(
+            cell, kpts, rank=3, block_size=13, rtol=1e-8,
+            selection_mode="streamed",
+        )
+        self.assertEqual(selected["selection_provenance"]["mode"], "fixed_pivots_experimental")
+        self.assertEqual(selected["selection_provenance"]["pivot_indices"], pivots.tolist())
+        np.testing.assert_allclose(selected["inpv_kpt"], baseline["inpv_kpt"], atol=0.0)
+        np.testing.assert_allclose(selected["coul_kpt"], baseline["coul_kpt"], atol=1e-10, rtol=1e-10)
+
     def test_build_matches_manual_stage_by_stage_reconstruction(self):
         # Strongest check: reconstruct the SAME artifact by manually
         # driving the individual stage functions (as opposed to

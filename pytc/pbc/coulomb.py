@@ -38,7 +38,8 @@ from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kp
 def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode="jax_cached_matrix_free",
           selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
-          selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR):
+          selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
+          fixed_pivots=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -57,15 +58,22 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
+    if fixed_pivots is not None:
+        if selection_mode not in {"streamed", "cached_full"}:
+            raise ValueError(
+                "fixed_pivots is only compatible with exact 'streamed' or "
+                "'cached_full' selection provenance."
+            )
+        selection_mode = "fixed_pivots"
     valid_selection_modes = {
         "jax_cached_matrix_free", "jax_translation_matrix_free", "streamed", "cached_full",
-        "panel_dense", "panel_oracle",
+        "panel_dense", "panel_oracle", "fixed_pivots",
     }
     if selection_mode not in valid_selection_modes:
         raise ValueError(
             "selection_mode must be 'jax_cached_matrix_free', "
             "'jax_translation_matrix_free', 'streamed', 'cached_full', "
-            "'panel_dense', or 'panel_oracle'"
+            "'panel_dense', 'panel_oracle', or 'fixed_pivots'"
         )
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
@@ -83,7 +91,27 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     cached_ao = None
     translation_cache = None
     translation_representation = None
-    if selection_mode == "jax_translation_matrix_free":
+    if selection_mode == "fixed_pivots":
+        pivots = np.asarray(fixed_pivots)
+        if pivots.ndim != 1 or not np.issubdtype(pivots.dtype, np.integer):
+            raise ValueError("fixed_pivots must be a one-dimensional integer array.")
+        pivots = pivots.astype(np.int64, copy=False)
+        if pivots.size != rank:
+            raise ValueError(
+                f"fixed_pivots must contain exactly rank={rank} entries, got {pivots.size}."
+            )
+        if np.any(pivots < 0) or np.any(pivots >= grid_coords.shape[0]):
+            raise ValueError("fixed_pivots contains an out-of-range grid index.")
+        if np.unique(pivots).size != pivots.size:
+            raise ValueError("fixed_pivots must be unique.")
+        n_selected = int(pivots.size)
+        selection_provenance.update({
+            "mode": "fixed_pivots_experimental",
+            "candidate_rule": "externally_fixed_pivots_v1",
+            "candidate_count": int(pivots.size),
+            "candidate_identity": explicit_candidate_identity(pivots),
+        })
+    elif selection_mode == "jax_translation_matrix_free":
         n_ao = int(cell.nao_nr())
         translation_representation = build_translation_ao_representation(
             cell, mesh_obj.canonical_kpts,
@@ -163,7 +191,9 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         diag, col_eval = build_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
-    if selection_mode in {"jax_cached_matrix_free", "jax_translation_matrix_free"}:
+    if selection_mode in {
+        "jax_cached_matrix_free", "jax_translation_matrix_free", "fixed_pivots",
+    }:
         pass
     elif selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
@@ -446,7 +476,7 @@ class ISDFDF:
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
-                 selection_mode="streamed"):
+                 selection_mode="streamed", fixed_pivots=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -454,6 +484,7 @@ class ISDFDF:
         self.rtol = rtol
         self.retention_mode = retention_mode
         self.selection_mode = selection_mode
+        self.fixed_pivots = None if fixed_pivots is None else np.asarray(fixed_pivots)
         self._built = None
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
         # factorization) delegate to a real FFTDF instance.
@@ -475,8 +506,43 @@ class ISDFDF:
                 self.cell, self.kpts, rank=self.rank, block_size=self.block_size,
                 rtol=self.rtol, retention_mode=self.retention_mode,
                 selection_mode=self.selection_mode,
+                fixed_pivots=self.fixed_pivots,
             )
         return self._built
+
+    def ao2mo(self, mo_coeffs, kpts, compact=False):
+        """Return one momentum-conserving MO ERI block for periodic MP2.
+
+        This experimental adapter path deliberately reuses the already-built
+        fixed-pivot ISDF factorization.  PySCF's KMP2 requests
+        ``compact=False`` blocks, so packed output is intentionally not
+        implemented.
+        """
+        if compact:
+            raise NotImplementedError("ISDFDF.ao2mo supports compact=False only.")
+        if len(mo_coeffs) != 4:
+            raise ValueError("mo_coeffs must contain exactly four k-point coefficient arrays.")
+        kpts = np.asarray(kpts, dtype=np.float64)
+        if kpts.shape != (4, 3):
+            raise ValueError("kpts must have shape (4, 3).")
+        built = self.build()
+        canonical = built["mesh_obj"].canonical_kpts
+        indices = []
+        for kpt in kpts:
+            matches = np.flatnonzero(np.all(np.isclose(canonical, kpt, atol=1e-8), axis=1))
+            if matches.size != 1:
+                raise ValueError("ao2mo kpts must belong uniquely to this adapter's canonical mesh.")
+            indices.append(int(matches[0]))
+        from pytc.pbc.df.kpts import build_kconserv
+
+        kconserv = build_kconserv(self.cell, canonical)
+        eri, k4 = get_mo_eri(
+            built["inpv_kpt"], built["coul_kpt"], kconserv, mo_coeffs,
+            indices[0], indices[1], indices[2],
+        )
+        if k4 != indices[3]:
+            raise ValueError("ao2mo kpts violate momentum conservation for this mesh.")
+        return eri.reshape(-1)
 
     def get_jk(self, dm_kpts, hermi=1, kpts=None, kpts_band=None, with_j=True,
                with_k=True, omega=None, exxdiv=None):
