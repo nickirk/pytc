@@ -182,9 +182,19 @@ def _reciprocal_same_grid_translate_kernel(
 def reciprocal_same_grid_byte_model(
     n_kpts, n_grid, nao_reused, nao_unique, n_replicas, rank, *,
     selection_peak_max_bytes, peak_safety_factor=1.10,
-    process_pipeline_allowance_bytes=0,
+    process_pipeline_allowance_bytes=None,
 ):
-    """Account for persistent seed, one group, real L, and pipeline allowance."""
+    """Fail-closed host/device accounting for primitive-seed selection.
+
+    The explicit process allowance covers interpreter/JAX runtime residency not
+    attributable to a tensor below.  It is mandatory: a tensor-only estimate
+    cannot safely stand in for a process peak.
+    """
+    if process_pipeline_allowance_bytes is None:
+        raise ReciprocalSameGridCapacityError(
+            "RECIPROCAL_SAME_GRID_PROCESS_PIPELINE_ALLOWANCE_REQUIRED: "
+            "an explicit positive process_pipeline_allowance_bytes is required."
+        )
     values = {
         "n_kpts": n_kpts, "n_grid": n_grid, "nao_reused": nao_reused,
         "nao_unique": nao_unique, "n_replicas": n_replicas, "rank": rank,
@@ -202,17 +212,29 @@ def reciprocal_same_grid_byte_model(
     f64 = np.dtype(np.float64).itemsize
     seed_bytes = int(n_kpts) * int(n_grid) * int(nao_reused) * c128
     generated_bytes = seed_bytes
-    reciprocal_workspace_bytes = seed_bytes
+    fft_workspace_bytes = seed_bytes
     unique_group_bytes = int(n_kpts) * int(n_grid) * int(nao_unique) * c128
     factor_bytes = int(n_grid) * int(rank) * f64
     residual_bytes = int(n_grid) * f64
     metric_column_bytes = int(n_grid) * c128
     selector_bytes = int(n_grid) * np.dtype(np.bool_).itemsize + int(rank) * np.dtype(np.int64).itemsize
     work_bytes = residual_bytes + metric_column_bytes + selector_bytes
-    generated_peak = generated_bytes + reciprocal_workspace_bytes
-    group_peak = max(generated_peak, unique_group_bytes)
-    host_peak = seed_bytes + group_peak + factor_bytes + work_bytes + int(process_pipeline_allowance_bytes)
-    device_peak = seed_bytes + group_peak + factor_bytes + work_bytes + int(process_pipeline_allowance_bytes)
+    phase_plane_bytes = int(n_kpts) * int(n_grid) * c128
+    reciprocal_phase_bytes = int(n_grid) * c128
+    # Host keeps only the NumPy seed, a single emitted group, the host-side
+    # pivot state, and the caller-declared process allowance.  Device FFT
+    # execution also retains the JAX seed and phase planes plus input/Fourier/
+    # translated/output buffers.  These are intentionally separate peaks.
+    host_group_bytes = max(generated_bytes, unique_group_bytes)
+    host_tensor_peak = seed_bytes + host_group_bytes + factor_bytes + work_bytes
+    device_tensor_peak = (
+        seed_bytes
+        + 2 * phase_plane_bytes
+        + reciprocal_phase_bytes
+        + 4 * fft_workspace_bytes
+    )
+    host_peak = host_tensor_peak + int(process_pipeline_allowance_bytes)
+    device_peak = device_tensor_peak + int(process_pipeline_allowance_bytes)
     host_with_safety = int(np.ceil(host_peak * float(peak_safety_factor)))
     device_with_safety = int(np.ceil(device_peak * float(peak_safety_factor)))
     condition = None
@@ -222,10 +244,16 @@ def reciprocal_same_grid_byte_model(
         "mode": "reciprocal_same_grid",
         "persistent_seed_complex128_bytes": seed_bytes,
         "one_generated_group_complex128_bytes": generated_bytes,
-        "one_generated_group_fft_workspace_complex128_bytes": reciprocal_workspace_bytes,
+        "one_generated_group_fft_workspace_complex128_bytes": fft_workspace_bytes,
         "unique_direct_group_max_complex128_bytes": unique_group_bytes,
         "cholesky_real_float64_bytes": factor_bytes,
         "pivot_work_bytes": work_bytes,
+        "host_tensor_peak_bytes": host_tensor_peak,
+        "device_jax_seed_complex128_bytes": seed_bytes,
+        "device_remove_restore_phase_complex128_bytes_each": phase_plane_bytes,
+        "device_reciprocal_phase_complex128_bytes": reciprocal_phase_bytes,
+        "device_fft_value_fourier_translated_output_complex128_bytes": 4 * fft_workspace_bytes,
+        "device_tensor_peak_bytes": device_tensor_peak,
         "process_pipeline_allowance_bytes": int(process_pipeline_allowance_bytes),
         "selection_peak_host_bytes": host_peak,
         "selection_peak_device_bytes": device_peak,
@@ -288,9 +316,25 @@ def reciprocal_same_grid_ao_groups(
     if g_vectors.shape != grid_coords.shape:
         raise ValueError("cell G-vectors must have shape (Ng,3) for the selected grid.")
     yield seed
+    # The metric consumers explicitly drop their previous group before
+    # advancing this generator.  Delete the generator's reference too before
+    # constructing another replica, so a multi-replica orbit never retains two
+    # generated NumPy groups across a ``next()`` transition.
+    generated = None
+    restore_phase = None
+    reciprocal_phase = None
     for target_slice, translation in zip(
         validation["replica_shell_slices"], validation["replica_translations"], strict=True,
     ):
+        if generated is not None:
+            del generated
+            generated = None
+        if restore_phase is not None:
+            del restore_phase
+            restore_phase = None
+        if reciprocal_phase is not None:
+            del reciprocal_phase
+            reciprocal_phase = None
         restore_phase = jnp.asarray(
             np.exp(-1j * (kpts @ translation))[:, None]
             * np.exp(1j * (kpts @ grid_coords.T)),
@@ -329,7 +373,7 @@ def reciprocal_same_grid_ao_groups(
 def select_reciprocal_same_grid(
     cell, canonical_kpts, grid_coords, rank, partition, *,
     selection_peak_max_bytes, peak_safety_factor=1.10,
-    process_pipeline_allowance_bytes=0, return_factor=False,
+    process_pipeline_allowance_bytes=None, return_factor=False,
 ):
     """Select non-default pivots from seed-plus-one-group reciprocal AOs."""
     validation = validate_reciprocal_orbit_partition(cell, partition)
@@ -386,6 +430,7 @@ def select_reciprocal_same_grid(
         "hidden_full_supercell_ao_allocation": bool(
             stats.get("full_supercell_ao_allocation", False)
         ),
+        "generated_group_live_limit": 1,
         "selector_ao_layout": "persistent primitive seed + one generated replica or direct unique group",
     }
     return pivots, factor if return_factor else None, n_selected, provenance
@@ -476,6 +521,10 @@ def metric_column_from_ao_groups(groups, pivot, n_kpts):
             "ka,kga->g", group[:, pivot, :].conj(), group, optimize=True,
         )
         accumulator = contribution if accumulator is None else accumulator + contribution
+        # See reciprocal_same_grid_ao_groups: releasing this consumer-side
+        # reference before the next ``next()`` prevents two replica groups
+        # being live during a multi-replica transition.
+        del group
     if accumulator is None:
         raise ValueError("at least one AO group is required.")
     return np.abs(accumulator) ** 2 / n_kpts
@@ -490,6 +539,7 @@ def metric_diagonal_from_ao_groups(groups, n_kpts):
             raise ValueError("each AO group must have shape (Nk,Ng,Nao).")
         contribution = np.sum(np.abs(group) ** 2, axis=(0, 2))
         density = contribution if density is None else density + contribution
+        del group
     if density is None:
         raise ValueError("at least one AO group is required.")
     return density ** 2 / n_kpts

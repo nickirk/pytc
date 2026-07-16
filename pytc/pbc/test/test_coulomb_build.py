@@ -59,6 +59,17 @@ class TestBuild(unittest.TestCase):
             translated["selection_provenance"]["eta_ao_source"],
             "blocked_reconstruction_from_translation_classes",
         )
+        provenance = translated["selection_provenance"]
+        self.assertEqual(
+            provenance["translation_reconstruction_calls"],
+            provenance["translation_reconstruction_calls_selection"]
+            + int(np.ceil(cell.get_uniform_grids(cell.mesh).shape[0] / kwargs["block_size"])),
+        )
+        self.assertEqual(
+            provenance["translation_reconstruction_grid_points"],
+            provenance["translation_reconstruction_grid_points_selection"]
+            + cell.get_uniform_grids(cell.mesh).shape[0],
+        )
         for key in ("inpv_kpt", "coul_kpt", "kern_kpt"):
             np.testing.assert_allclose(
                 np.asarray(translated[key]), np.asarray(cached[key]), atol=2e-10, rtol=2e-10,

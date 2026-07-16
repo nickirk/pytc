@@ -47,7 +47,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
           selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
           fixed_pivots=None, reciprocal_orbit_partition=None,
-          process_pipeline_allowance_bytes=0):
+          process_pipeline_allowance_bytes=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -263,9 +263,21 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     if selection_mode != "reciprocal_same_grid":
         selector_ao_calls = ao_stats["pbc_eval_calls"]
         selector_ao_grid_points = ao_stats["grid_points"]
+    selector_translation_reconstruction_calls = ao_stats.get(
+        "translation_reconstruction_calls", 0,
+    )
+    selector_translation_reconstruction_grid_points = ao_stats.get(
+        "translation_reconstruction_grid_points", 0,
+    )
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance["ao_calls_selection"] = selector_ao_calls
     selection_provenance["ao_grid_points_selection"] = selector_ao_grid_points
+    selection_provenance["translation_reconstruction_calls_selection"] = (
+        selector_translation_reconstruction_calls
+    )
+    selection_provenance["translation_reconstruction_grid_points_selection"] = (
+        selector_translation_reconstruction_grid_points
+    )
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
         dtype=np.complex128,
@@ -315,10 +327,10 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             "ao_grid_points_through_eta": selector_ao_grid_points + ao_stats["grid_points"],
             "translation_reconstruction_calls": ao_stats.get(
                 "translation_reconstruction_calls", 0,
-            ),
+            ) + selector_translation_reconstruction_calls,
             "translation_reconstruction_grid_points": ao_stats.get(
                 "translation_reconstruction_grid_points", 0,
-            ),
+            ) + selector_translation_reconstruction_grid_points,
         },
     }
 

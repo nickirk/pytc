@@ -44,6 +44,7 @@ from pytc.pbc.df.reciprocal_selection_study import (
 FROZEN_RANK = 624
 FROZEN_BLOCK_SIZE = 256
 WARM_REPEATS = 5
+FROZEN_PROCESS_PIPELINE_ALLOWANCE_BYTES = 384 * 2**20
 
 
 def frozen_211_partition(cell):
@@ -71,11 +72,15 @@ def _timed_call(callable_):
     return value, {"seconds": elapsed, "rss_peak_bytes": max(before, _rss_bytes())}
 
 
-def _selection_runner(mode, cell, mesh_obj, grid_coords, rank, *, peak_max_bytes):
+def _selection_runner(
+    mode, cell, mesh_obj, grid_coords, rank, *, peak_max_bytes,
+    process_pipeline_allowance_bytes,
+):
     if mode == "reciprocal_same_grid":
         return lambda: select_reciprocal_same_grid(
             cell, mesh_obj.canonical_kpts, grid_coords, rank, frozen_211_partition(cell),
             selection_peak_max_bytes=peak_max_bytes,
+            process_pipeline_allowance_bytes=process_pipeline_allowance_bytes,
         )
     if mode == "jax_cached_matrix_free":
         def run():
@@ -97,8 +102,14 @@ def _selection_runner(mode, cell, mesh_obj, grid_coords, rank, *, peak_max_bytes
     raise ValueError(f"unknown selector mode {mode!r}.")
 
 
-def _measure_selection(mode, cell, mesh_obj, grid_coords, rank, *, peak_max_bytes):
-    runner = _selection_runner(mode, cell, mesh_obj, grid_coords, rank, peak_max_bytes=peak_max_bytes)
+def _measure_selection(
+    mode, cell, mesh_obj, grid_coords, rank, *, peak_max_bytes,
+    process_pipeline_allowance_bytes,
+):
+    runner = _selection_runner(
+        mode, cell, mesh_obj, grid_coords, rank, peak_max_bytes=peak_max_bytes,
+        process_pipeline_allowance_bytes=process_pipeline_allowance_bytes,
+    )
     cold_value, cold = _timed_call(runner)
     raw = []
     warm_values = []
@@ -150,7 +161,8 @@ def _projection(record, *, n_ao_bulk):
 
 
 def run_benchmark(*, rank=FROZEN_RANK, peak_max_bytes=24 * 2**30,
-                  peak_safety_factor=1.10, process_pipeline_allowance_bytes=0,
+                  peak_safety_factor=1.10,
+                  process_pipeline_allowance_bytes=FROZEN_PROCESS_PIPELINE_ALLOWANCE_BYTES,
                   run_downstream=True):
     """Run the frozen R2 CPU selector and exact-downstream evidence package."""
     if rank != FROZEN_RANK:
@@ -163,6 +175,7 @@ def run_benchmark(*, rank=FROZEN_RANK, peak_max_bytes=24 * 2**30,
     selection = {
         mode: _measure_selection(
             mode, cell, mesh_obj, grid_coords, rank, peak_max_bytes=peak_max_bytes,
+            process_pipeline_allowance_bytes=process_pipeline_allowance_bytes,
         )
         for mode in modes
     }

@@ -82,6 +82,22 @@ class _HybridOrbitCell:
         return np.asarray(columns, dtype=np.complex128).T[None]
 
 
+class _ThreeReplicaOrbitCell(_HybridOrbitCell):
+    """Three identical one-AO replica groups for residency regression."""
+
+    nbas = 3
+    _bas = np.array([[0, 1], [1, 1], [2, 1]], dtype=np.int32)
+
+    def atom_coords(self):
+        return np.array([[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]])
+
+    def pbc_eval_gto(self, name, coords, *, kpts, shls_slice=None):
+        if shls_slice is None:
+            raise AssertionError("selector must never request a full-supercell AO tensor")
+        values = np.linspace(1.0, 2.0, len(coords))
+        return np.repeat(values[None, :, None], shls_slice[1] - shls_slice[0], axis=2)
+
+
 class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
     def test_hybrid_orbit_partition_accumulates_reused_and_unique_groups(self):
         cell = _HybridOrbitCell()
@@ -95,7 +111,8 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         )
         pivots, factor, count, provenance = select_reciprocal_same_grid(
             cell, np.zeros((1, 3)), coords, rank=2, partition=partition,
-            selection_peak_max_bytes=10**9, return_factor=True,
+            selection_peak_max_bytes=10**9, process_pipeline_allowance_bytes=2**20,
+            return_factor=True,
         )
         seed = cell.pbc_eval_gto("GTOval", coords, kpts=[np.zeros(3)], shls_slice=(0, 1))
         replica = cell.pbc_eval_gto("GTOval", coords, kpts=[np.zeros(3)], shls_slice=(1, 2))
@@ -110,6 +127,7 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         self.assertEqual(provenance["NAO_reused"], 1)
         self.assertEqual(provenance["NAO_unique"], 1)
         self.assertEqual(provenance["realized_cache_factor"], 1.5)
+        self.assertEqual(provenance["generated_group_live_limit"], 1)
         self.assertEqual(provenance["reconstruction_count"], count + 1)
         self.assertEqual(provenance["unique_direct_evaluations"], count + 1)
 
@@ -125,18 +143,50 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         with self.assertRaisesRegex(ReciprocalOrbitPartitionError, "INVALID_ORBIT_PARTITION"):
             select_reciprocal_same_grid(
                 cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=invalid,
-                selection_peak_max_bytes=10**9,
+                selection_peak_max_bytes=10**9, process_pipeline_allowance_bytes=2**20,
             )
         model = reciprocal_same_grid_byte_model(
             1, 8, 1, 1, 2, 2, selection_peak_max_bytes=1,
+            process_pipeline_allowance_bytes=2**20,
         )
         self.assertEqual(model["capacity_condition"], "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY")
         valid = dataclasses.replace(invalid, replica_translations=np.zeros((1, 3)))
+        with self.assertRaisesRegex(
+            ReciprocalSameGridCapacityError,
+            "PROCESS_PIPELINE_ALLOWANCE_REQUIRED",
+        ):
+            select_reciprocal_same_grid(
+                cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=valid,
+                selection_peak_max_bytes=10**9,
+            )
         with self.assertRaisesRegex(ReciprocalSameGridCapacityError, "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY"):
             select_reciprocal_same_grid(
                 cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=valid,
-                selection_peak_max_bytes=1,
+                selection_peak_max_bytes=1, process_pipeline_allowance_bytes=2**20,
             )
+
+    def test_three_replica_groups_release_before_next_generation(self):
+        cell = _ThreeReplicaOrbitCell()
+        coords = np.zeros((8, 3))
+        partition = ReciprocalOrbitPartition(
+            seed_shell_slice=(0, 1),
+            replica_shell_slices=((1, 2), (2, 3)),
+            replica_translations=np.array([[1., 0., 0.], [2., 0., 0.]]),
+            supercell_matrix=np.diag([3, 1, 1]),
+        )
+        pivots, _, count, provenance = select_reciprocal_same_grid(
+            cell, np.zeros((1, 3)), coords, rank=2, partition=partition,
+            selection_peak_max_bytes=10**9, process_pipeline_allowance_bytes=2**20,
+        )
+        reference = cell.pbc_eval_gto("GTOval", coords, kpts=[np.zeros(3)], shls_slice=(0, 1))
+        expected, _, expected_count = pivot_prefix_from_ao_groups(
+            lambda: iter((reference, reference, reference)), len(coords), 1, rank=2,
+        )
+        self.assertEqual(count, expected_count)
+        np.testing.assert_array_equal(pivots, expected)
+        self.assertEqual(provenance["generated_group_live_limit"], 1)
+        self.assertEqual(provenance["n_replicas"], 3)
+        self.assertEqual(provenance["reconstruction_count"], 2 * (count + 1))
 
     def test_diamond_same_grid_selector_uses_seed_and_one_generated_group(self):
         cell = _diamond_211()
@@ -145,7 +195,7 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         pivots, factor, count, provenance = select_reciprocal_same_grid(
             cell, mesh_obj.canonical_kpts, coords, rank=4,
             partition=_diamond_211_partition(cell), selection_peak_max_bytes=10**9,
-            return_factor=True,
+            process_pipeline_allowance_bytes=2**20, return_factor=True,
         )
         direct = np.asarray(cell.pbc_eval_gto(
             "GTOval", coords, kpts=list(mesh_obj.canonical_kpts),
@@ -179,6 +229,7 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
             selection_mode="reciprocal_same_grid",
             reciprocal_orbit_partition=_diamond_211_partition(cell),
             selection_peak_max_bytes=10**9,
+            process_pipeline_allowance_bytes=2**20,
         )
         mesh_obj = result["mesh_obj"]
         pivots = np.asarray(result["selection_provenance"]["pivot_indices"])
