@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import numpy as np
 
+import jax
+import jax.numpy as jnp
+
 from pytc.pbc.df.isdf import (
     DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
     DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
@@ -387,6 +390,141 @@ def get_k(dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=No
     if single_set:
         vk_kpts = vk_kpts[0]
     return vk_kpts
+
+
+def _relative_imag_norm(z, axes):
+    norm_im = jnp.sqrt(jnp.sum(jnp.square(jnp.imag(z)), axis=axes))
+    norm_total = jnp.sqrt(jnp.sum(jnp.square(jnp.abs(z)), axis=axes))
+    return jnp.where(
+        norm_total > 0,
+        norm_im / jnp.where(norm_total > 0, norm_total, 1.0),
+        norm_im,
+    )
+
+
+@jax.jit
+def _get_k_bare_device_preflight(dm_sets, inpv_kpt, coul_kpt, phase, neg):
+    """Build gated supercell quantities without host transfers."""
+    n_k = dm_sets.shape[1]
+    rho = jnp.einsum(
+        "kia,skab,kjb->skij", inpv_kpt, dm_sets, jnp.conj(inpv_kpt),
+        optimize=True,
+    ) / n_k
+    indices = jnp.arange(n_k)
+    rho = jnp.where(
+        (indices <= neg)[None, :, None, None], rho, jnp.conj(rho[:, neg]),
+    )
+    rho = jnp.where(
+        (indices == neg)[None, :, None, None],
+        jnp.real(rho).astype(jnp.complex128),
+        rho,
+    )
+    rho_spc_complex = jnp.einsum("rk,skij->srij", phase, rho, optimize=True)
+    coul_spc_complex = jnp.sqrt(n_k) * jnp.einsum(
+        "rk,kij->rij", phase, coul_kpt, optimize=True,
+    )
+    rho_ratio = _relative_imag_norm(rho_spc_complex, axes=(1, 2, 3))
+    coul_ratio = _relative_imag_norm(coul_spc_complex, axes=(0, 1, 2))
+    return rho_spc_complex, coul_spc_complex, rho_ratio, coul_ratio
+
+
+@jax.jit
+def _get_k_bare_device_core(rho_spc_complex, coul_spc_complex, inpv_kpt, phase):
+    """Contract validated bare exchange entirely on device."""
+    rho_spc = jnp.swapaxes(jnp.real(rho_spc_complex), -1, -2)
+    v_spc = jnp.real(coul_spc_complex)[None, :, :, :] * rho_spc
+    v_kpt = jnp.einsum("rk,srij->skij", jnp.conj(phase), v_spc, optimize=True)
+    return jnp.conj(jnp.einsum(
+        "kia,skij,kjb->skab", inpv_kpt, v_kpt, jnp.conj(inpv_kpt), optimize=True,
+    ))
+
+
+def _validate_bare_k_device_inputs(dm_kpts, inpv_kpt, coul_kpt, phase, neg):
+    """Validate the small host boundary for the private c128 device lane."""
+    if not jax.config.read("jax_enable_x64"):
+        raise RuntimeError("get_k_bare_device requires jax_enable_x64=True for complex128.")
+
+    def shape_dtype(value, name):
+        try:
+            return tuple(value.shape), np.dtype(value.dtype)
+        except (AttributeError, TypeError):
+            raise ValueError(f"{name} must provide shape and dtype metadata.") from None
+
+    inpv_shape, inpv_dtype = shape_dtype(inpv_kpt, "inpv_kpt")
+    if len(inpv_shape) != 3:
+        raise ValueError(f"inpv_kpt must have shape (Nk,Nip,Nao), got {inpv_shape}.")
+    n_k, n_ip, n_ao = inpv_shape
+    if any(size <= 0 for size in inpv_shape) or inpv_dtype != np.dtype(np.complex128):
+        raise TypeError("inpv_kpt must be nonempty complex128 with shape (Nk,Nip,Nao).")
+
+    coul_shape, coul_dtype = shape_dtype(coul_kpt, "coul_kpt")
+    if coul_shape != (n_k, n_ip, n_ip) or coul_dtype != np.dtype(np.complex128):
+        raise ValueError(
+            f"coul_kpt must be complex128 with shape ({n_k},{n_ip},{n_ip}), got "
+            f"shape {coul_shape}, dtype {coul_dtype}."
+        )
+    phase_shape, phase_dtype = shape_dtype(phase, "phase")
+    if phase_shape != (n_k, n_k) or phase_dtype != np.dtype(np.complex128):
+        raise ValueError(
+            f"phase must be complex128 with shape ({n_k},{n_k}), got "
+            f"shape {phase_shape}, dtype {phase_dtype}."
+        )
+
+    dm_shape, dm_dtype = shape_dtype(dm_kpts, "dm_kpts")
+    single_set = len(dm_shape) == 3
+    if single_set:
+        expected_dm_shape = (n_k, n_ao, n_ao)
+    elif len(dm_shape) == 4:
+        expected_dm_shape = (dm_shape[0], n_k, n_ao, n_ao)
+    else:
+        expected_dm_shape = None
+    if dm_dtype != np.dtype(np.complex128) or dm_shape != expected_dm_shape:
+        raise ValueError(
+            f"dm_kpts must be complex128 with shape ({n_k},{n_ao},{n_ao}) or "
+            f"(Nset,{n_k},{n_ao},{n_ao}), got shape {dm_shape}, dtype {dm_dtype}."
+        )
+
+    neg_np = np.asarray(neg)
+    if neg_np.shape != (n_k,) or not np.issubdtype(neg_np.dtype, np.integer):
+        raise ValueError(f"neg must be an integer array with shape ({n_k},), got {neg_np.shape}.")
+    if np.any(neg_np < 0) or np.any(neg_np >= n_k):
+        raise ValueError("neg must contain only in-range k-point indices.")
+    if not np.array_equal(neg_np[neg_np], np.arange(n_k)):
+        raise ValueError("neg must be an involution: neg[neg[k]] == k.")
+    return single_set, neg_np
+
+
+def _get_k_bare_device(dm_kpts, inpv_kpt, coul_kpt, phase, *, neg, imag_tol=1e-10):
+    """Private c128 bare-K CPU/JAX parity boundary; no Ewald or PySCF adapter."""
+    single_set, neg_np = _validate_bare_k_device_inputs(
+        dm_kpts, inpv_kpt, coul_kpt, phase, neg,
+    )
+    if not isinstance(imag_tol, (int, float)) or imag_tol < 0:
+        raise ValueError("imag_tol must be a nonnegative real scalar.")
+    dm_sets = jnp.asarray(dm_kpts, dtype=jnp.complex128)
+    inpv_device = jnp.asarray(inpv_kpt, dtype=jnp.complex128)
+    coul_device = jnp.asarray(coul_kpt, dtype=jnp.complex128)
+    phase_device = jnp.asarray(phase, dtype=jnp.complex128)
+    if single_set:
+        dm_sets = dm_sets[None, :, :, :]
+    rho_spc, coul_spc, rho_ratio, coul_ratio = _get_k_bare_device_preflight(
+        dm_sets, inpv_device, coul_device, phase_device, jnp.asarray(neg_np),
+    )
+    rho_ratio_host = np.asarray(rho_ratio)
+    coul_ratio_host = float(np.asarray(coul_ratio))
+    invalid_sets = np.flatnonzero(rho_ratio_host > imag_tol)
+    if invalid_sets.size:
+        raise ValueError(
+            "get_k_bare_device: kpt_to_spc imaginary gate failed for density sets "
+            f"{invalid_sets.tolist()} at imag_tol={imag_tol:.1e}."
+        )
+    if coul_ratio_host > imag_tol:
+        raise ValueError(
+            "get_k_bare_device: kpt_to_spc imaginary gate failed for coul_kpt at "
+            f"imag_tol={imag_tol:.1e}."
+        )
+    vk_sets = _get_k_bare_device_core(rho_spc, coul_spc, inpv_device, phase_device)
+    return vk_sets[0] if single_set else vk_sets
 
 
 def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
