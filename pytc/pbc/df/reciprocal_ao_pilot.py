@@ -8,6 +8,7 @@ approximation explicitly so a pilot can compare it with direct AO values.
 from __future__ import annotations
 
 import dataclasses
+import weakref
 from functools import partial
 
 import jax
@@ -195,6 +196,15 @@ def reciprocal_same_grid_byte_model(
             "RECIPROCAL_SAME_GRID_PROCESS_PIPELINE_ALLOWANCE_REQUIRED: "
             "an explicit positive process_pipeline_allowance_bytes is required."
         )
+    if (
+        isinstance(process_pipeline_allowance_bytes, bool)
+        or not isinstance(process_pipeline_allowance_bytes, (int, np.integer))
+        or int(process_pipeline_allowance_bytes) <= 0
+    ):
+        raise ReciprocalSameGridCapacityError(
+            "RECIPROCAL_SAME_GRID_PROCESS_PIPELINE_ALLOWANCE_REQUIRED: "
+            "process_pipeline_allowance_bytes must be a positive integer."
+        )
     values = {
         "n_kpts": n_kpts, "n_grid": n_grid, "nao_reused": nao_reused,
         "nao_unique": nao_unique, "n_replicas": n_replicas, "rank": rank,
@@ -323,12 +333,27 @@ def reciprocal_same_grid_ao_groups(
     generated = None
     restore_phase = None
     reciprocal_phase = None
+
+    def release_generated():
+        nonlocal generated
+        if generated is None:
+            return
+        prior_ref = weakref.ref(generated)
+        del generated
+        generated = None
+        if stats is not None:
+            stats["generated_group_release_checks"] = (
+                stats.get("generated_group_release_checks", 0) + 1
+            )
+            stats["generated_group_release_failures"] = (
+                stats.get("generated_group_release_failures", 0)
+                + int(prior_ref() is not None)
+            )
+
     for target_slice, translation in zip(
         validation["replica_shell_slices"], validation["replica_translations"], strict=True,
     ):
-        if generated is not None:
-            del generated
-            generated = None
+        release_generated()
         if restore_phase is not None:
             del restore_phase
             restore_phase = None
@@ -358,7 +383,27 @@ def reciprocal_same_grid_ao_groups(
             stats["full_supercell_ao_allocation"] = False
             stats.setdefault("generated_target_shell_slices", []).append(list(target_slice))
         yield generated
+    release_generated()
+    unique = None
+
+    def release_unique():
+        nonlocal unique
+        if unique is None:
+            return
+        prior_ref = weakref.ref(unique)
+        del unique
+        unique = None
+        if stats is not None:
+            stats["unique_group_release_checks"] = (
+                stats.get("unique_group_release_checks", 0) + 1
+            )
+            stats["unique_group_release_failures"] = (
+                stats.get("unique_group_release_failures", 0)
+                + int(prior_ref() is not None)
+            )
+
     for unique_slice in validation["unique_shell_slices"]:
+        release_unique()
         unique = np.asarray(cell.pbc_eval_gto(
             "GTOval", grid_coords, kpts=list(kpts), shls_slice=unique_slice,
         ), dtype=np.complex128)
@@ -368,6 +413,7 @@ def reciprocal_same_grid_ao_groups(
             stats["grid_points"] = stats.get("grid_points", 0) + int(n_grid)
             stats["full_supercell_ao_allocation"] = False
         yield unique
+    release_unique()
 
 
 def select_reciprocal_same_grid(
@@ -431,6 +477,10 @@ def select_reciprocal_same_grid(
             stats.get("full_supercell_ao_allocation", False)
         ),
         "generated_group_live_limit": 1,
+        "generated_group_release_checks": int(stats.get("generated_group_release_checks", 0)),
+        "generated_group_release_failures": int(stats.get("generated_group_release_failures", 0)),
+        "unique_group_release_checks": int(stats.get("unique_group_release_checks", 0)),
+        "unique_group_release_failures": int(stats.get("unique_group_release_failures", 0)),
         "selector_ao_layout": "persistent primitive seed + one generated replica or direct unique group",
     }
     return pivots, factor if return_factor else None, n_selected, provenance

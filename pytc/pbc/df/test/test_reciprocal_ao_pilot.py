@@ -130,6 +130,9 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         self.assertEqual(provenance["generated_group_live_limit"], 1)
         self.assertEqual(provenance["reconstruction_count"], count + 1)
         self.assertEqual(provenance["unique_direct_evaluations"], count + 1)
+        self.assertEqual(provenance["generated_group_release_failures"], 0)
+        self.assertEqual(provenance["unique_group_release_checks"], count + 1)
+        self.assertEqual(provenance["unique_group_release_failures"], 0)
 
     def test_invalid_hybrid_orbit_and_capacity_fail_closed(self):
         cell = _HybridOrbitCell()
@@ -159,6 +162,14 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
                 cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=valid,
                 selection_peak_max_bytes=10**9,
             )
+        with self.assertRaisesRegex(
+            ReciprocalSameGridCapacityError,
+            "PROCESS_PIPELINE_ALLOWANCE_REQUIRED",
+        ):
+            reciprocal_same_grid_byte_model(
+                1, 8, 1, 1, 2, 2, selection_peak_max_bytes=10**9,
+                process_pipeline_allowance_bytes=0,
+            )
         with self.assertRaisesRegex(ReciprocalSameGridCapacityError, "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY"):
             select_reciprocal_same_grid(
                 cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=valid,
@@ -187,6 +198,8 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         self.assertEqual(provenance["generated_group_live_limit"], 1)
         self.assertEqual(provenance["n_replicas"], 3)
         self.assertEqual(provenance["reconstruction_count"], 2 * (count + 1))
+        self.assertEqual(provenance["generated_group_release_checks"], 2 * (count + 1))
+        self.assertEqual(provenance["generated_group_release_failures"], 0)
 
     def test_diamond_same_grid_selector_uses_seed_and_one_generated_group(self):
         cell = _diamond_211()
