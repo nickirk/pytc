@@ -435,6 +435,9 @@ def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
 def get_mo_eri(inpv_kpt, coul_kpt, kconserv, mo_coeff_kpts, k1, k2, k3):
     """MO-basis THC-ERI block: get_ao_eri transformed per k-point.
 
+    The AO convention is ``(a* b | c* d)``, so the first and third
+    MO coefficient matrices are conjugated in the transformation.
+
     Args:
         mo_coeff_kpts: length-4 sequence (C1, C2, C3, C4), each
             (Nao, n_i) complex128. k4 is derived internally, but the
@@ -450,7 +453,8 @@ def get_mo_eri(inpv_kpt, coul_kpt, kconserv, mo_coeff_kpts, k1, k2, k3):
 
     eri_ao, k4 = get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3)
     eri_mo = np.einsum(
-        "abcd,ai,bj,ck,dl->ijkl", eri_ao, C1, C2, C3, C4, optimize=True
+        "abcd,ai,bj,ck,dl->ijkl", eri_ao, C1.conj(), C2, C3.conj(), C4,
+        optimize=True,
     )
     return eri_mo, k4
 

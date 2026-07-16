@@ -8,10 +8,11 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 import numpy as np
+from pyscf.pbc.df import FFTDF
 from pyscf.pbc.gto import Cell
 
 from pytc.pbc import coulomb
-from pytc.pbc.df.kpts import build_kconserv
+from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts
 
 
 def _make_cell():
@@ -205,13 +206,37 @@ class TestGetMoEri(unittest.TestCase):
         eri_mo_manual = np.einsum(
             "abcd,ai,bj,ck,dl->ijkl",
             eri_ao,
-            mo_coeff_kpts[0],
+            mo_coeff_kpts[0].conj(),
             mo_coeff_kpts[1],
-            mo_coeff_kpts[2],
+            mo_coeff_kpts[2].conj(),
             mo_coeff_kpts[3],
             optimize=True,
         )
         np.testing.assert_allclose(eri_mo, eri_mo_manual, atol=1e-10)
+
+    def test_fftdf_ao2mo_uses_bra_conjugation_for_complex_k_quartet(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        kconserv = build_kconserv(cell, mesh_obj.canonical_kpts)
+        k1, k2, k3 = 0, 1, 2
+        k4 = int(kconserv[k1, k2, k3])
+        rng = np.random.default_rng(91)
+        mo_coeffs = tuple(
+            rng.normal(size=(cell.nao, cell.nao))
+            + 1j * rng.normal(size=(cell.nao, cell.nao))
+            for _ in range(4)
+        )
+        quartet = [mesh_obj.canonical_kpts[index] for index in (k1, k2, k3, k4)]
+        fftdf = FFTDF(cell)
+        eri_ao = np.asarray(fftdf.get_eri(quartet, compact=False)).reshape((cell.nao,) * 4)
+        expected = np.einsum(
+            "abcd,ai,bj,ck,dl->ijkl", eri_ao,
+            mo_coeffs[0].conj(), mo_coeffs[1], mo_coeffs[2].conj(), mo_coeffs[3],
+            optimize=True,
+        )
+        actual = np.asarray(fftdf.ao2mo(mo_coeffs, kpts=quartet, compact=False))
+        np.testing.assert_allclose(actual.reshape(expected.shape), expected, atol=1e-10, rtol=1e-10)
 
     def test_rejects_wrong_number_of_mo_coeff_sets(self):
         rng = np.random.default_rng(91)

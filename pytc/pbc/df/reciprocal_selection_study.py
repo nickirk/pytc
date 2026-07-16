@@ -218,12 +218,13 @@ def _adapter_mo_eri_audit(adapter, mf, built, fftdf):
     adapter_eri = adapter.ao2mo(
         mo_coeffs, canonical[[k1, k2, k3, k4]], compact=False,
     ).reshape(expected.shape)
-    reference_ao = np.asarray(
-        fftdf.get_eri([canonical[index] for index in (k1, k2, k3, k4)], compact=False)
-    ).reshape((adapter.cell.nao_nr(),) * 4)
-    reference_mo = np.einsum(
-        "abcd,ai,bj,ck,dl->ijkl", reference_ao, *mo_coeffs, optimize=True,
-    )
+    reference_mo = np.asarray(
+        fftdf.ao2mo(
+            mo_coeffs,
+            kpts=[canonical[index] for index in (k1, k2, k3, k4)],
+            compact=False,
+        )
+    ).reshape(expected.shape)
     return {
         "k_indices": [k1, k2, k3, k4],
         "adapter_return_shape": list(adapter_eri.shape),
