@@ -107,6 +107,15 @@ class TestBuild(unittest.TestCase):
         np.testing.assert_allclose(selected["inpv_kpt"], baseline["inpv_kpt"], atol=0.0)
         np.testing.assert_allclose(selected["coul_kpt"], baseline["coul_kpt"], atol=1e-10, rtol=1e-10)
 
+    def test_fixed_pivot_mode_requires_explicit_indices(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        with self.assertRaisesRegex(ValueError, "requires an explicit fixed_pivots"):
+            coulomb.build(
+                cell, kpts, rank=3, block_size=13, rtol=1e-8,
+                selection_mode="fixed_pivots",
+            )
+
     def test_build_matches_manual_stage_by_stage_reconstruction(self):
         # Strongest check: reconstruct the SAME artifact by manually
         # driving the individual stage functions (as opposed to

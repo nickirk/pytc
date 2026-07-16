@@ -8,9 +8,11 @@ values at the chosen indices and on the full uniform grid.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +21,7 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 import numpy as np
+import pyscf
 from pyscf.pbc import gto, mp, scf, tools
 from pyscf.pbc.df import FFTDF
 
@@ -32,7 +35,29 @@ from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts
 from pytc.pbc.df.reciprocal_ao_pilot import reciprocal_translate_bloch_ao
 
 
-RANK_MULTIPLIERS = (2, 4, 6, 8, 10)
+RANK_MULTIPLIERS = (2, 4, 6, 8, 10, 12, 14)
+RTOL = 1e-5
+RETENTION_MODE = "single"
+SCF_CONTROLS = {
+    "conv_tol": 1e-9,
+    "max_cycle": 50,
+    "init_guess": "minao",
+    "exxdiv": "ewald",
+}
+
+
+def _git_revision():
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True,
+    ).strip()
+
+
+def _configure_scf(mf):
+    mf.conv_tol = SCF_CONTROLS["conv_tol"]
+    mf.max_cycle = SCF_CONTROLS["max_cycle"]
+    mf.init_guess = SCF_CONTROLS["init_guess"]
+    mf.exxdiv = SCF_CONTROLS["exxdiv"]
+    return mf
 
 
 def diamond_211():
@@ -157,7 +182,7 @@ def _compare_cached_and_streamed_exact(cell, canonical_kpts, grid_coords, block_
 
 
 def _reference(cell, kpts):
-    mf = scf.KRHF(cell, kpts)
+    mf = _configure_scf(scf.KRHF(cell, kpts))
     mf.verbose = 0
     mf.with_df = FFTDF(cell, kpts)
     total = float(mf.kernel())
@@ -174,11 +199,41 @@ def _reference(cell, kpts):
     }
 
 
+def _adapter_mo_eri_audit(adapter, mf, built, fftdf):
+    """Audit the adapter's PySCF ao2mo convention on a nontrivial quartet."""
+    canonical = built["mesh_obj"].canonical_kpts
+    kconserv = build_kconserv(adapter.cell, canonical)
+    k1, k2, k3 = 0, 1, 2
+    k4 = int(kconserv[k1, k2, k3])
+    mo_coeffs = [mf.mo_coeff[index] for index in (k1, k2, k3, k4)]
+    expected, actual_k4 = coulomb.get_mo_eri(
+        built["inpv_kpt"], built["coul_kpt"], kconserv, mo_coeffs, k1, k2, k3,
+    )
+    if actual_k4 != k4:
+        raise RuntimeError("Direct MO-ERI momentum reconstruction disagrees with kconserv.")
+    adapter_eri = adapter.ao2mo(
+        mo_coeffs, canonical[[k1, k2, k3, k4]], compact=False,
+    ).reshape(expected.shape)
+    reference_ao = np.asarray(
+        fftdf.get_eri([canonical[index] for index in (k1, k2, k3, k4)], compact=False)
+    ).reshape((adapter.cell.nao_nr(),) * 4)
+    reference_mo = np.einsum(
+        "abcd,ai,bj,ck,dl->ijkl", reference_ao, *mo_coeffs, optimize=True,
+    )
+    return {
+        "k_indices": [k1, k2, k3, k4],
+        "adapter_return_shape": list(adapter_eri.shape),
+        "adapter_vs_direct_build_get_mo_eri": _relative_error(expected, adapter_eri),
+        "adapter_vs_fftdf_mo_eri": _relative_error(reference_mo, adapter_eri),
+    }
+
+
 def _run_fixed_pivot_path(cell, kpts, pivots, block_size, reference_mf, reference_values):
     rank = int(len(pivots))
     started = time.perf_counter()
     built = coulomb.build(
-        cell, kpts, rank=rank, block_size=block_size, rtol=1e-4,
+        cell, kpts, rank=rank, block_size=block_size, rtol=RTOL,
+        retention_mode=RETENTION_MODE,
         selection_mode="streamed", fixed_pivots=pivots,
     )
     build_seconds = time.perf_counter() - started
@@ -201,23 +256,31 @@ def _run_fixed_pivot_path(cell, kpts, pivots, block_size, reference_mf, referenc
         ], compact=False)
     ).reshape((cell.nao_nr(),) * 4)
     adapter = coulomb.ISDFDF(
-        cell, kpts, rank=rank, block_size=block_size, rtol=1e-4,
+        cell, kpts, rank=rank, block_size=block_size, rtol=RTOL,
+        retention_mode=RETENTION_MODE,
         selection_mode="streamed", fixed_pivots=pivots,
     )
     adapter._built = built
-    mf = scf.KRHF(cell, kpts)
+    mf = _configure_scf(scf.KRHF(cell, kpts))
     mf.verbose = 0
     mf.with_df = adapter
     started = time.perf_counter()
     total = float(mf.kernel())
     scf_seconds = time.perf_counter() - started
     if mf.converged:
+        ao2mo_calls_before_kmp2 = adapter._ao2mo_call_count
         started = time.perf_counter()
         correlation, _ = mp.KMP2(mf).kernel()
         mp2_seconds = time.perf_counter() - started
+        ao2mo_calls_after_kmp2 = adapter._ao2mo_call_count
+        if ao2mo_calls_after_kmp2 <= ao2mo_calls_before_kmp2:
+            raise RuntimeError("KMP2 completed without consuming ISDFDF.ao2mo.")
         correlation = float(correlation)
         mp2_record = {
             "status": "completed",
+            "ao2mo_calls_during_kmp2": (
+                ao2mo_calls_after_kmp2 - ao2mo_calls_before_kmp2
+            ),
             "correlation": correlation,
             "total": total + correlation,
             "correlation_per_atom_error": abs(
@@ -232,7 +295,10 @@ def _run_fixed_pivot_path(cell, kpts, pivots, block_size, reference_mf, referenc
         mp2_record = {
             "status": "not_run",
             "reason": "ISDF KRHF did not converge; no MP2 proxy was substituted.",
+            "ao2mo_calls_during_kmp2": 0,
         }
+    adapter_audit = _adapter_mo_eri_audit(adapter, mf, built, fftdf)
+    adapter_audit["ao2mo_calls_total_after_audit"] = adapter._ao2mo_call_count
     return {
         "requested_rank": rank,
         "realized_rank": int(built["n_selected"]),
@@ -240,7 +306,10 @@ def _run_fixed_pivot_path(cell, kpts, pivots, block_size, reference_mf, referenc
         "scf_seconds": scf_seconds,
         "mp2_seconds": mp2_seconds,
         "jk_vs_fftdf": {
-            "j": _relative_error(vj_ref, vj),
+            "j": {
+                **_relative_error(vj_ref, vj),
+                "interpretation": "zero by construction: J delegates to FFTDF, not ISDF",
+            },
             "k": _relative_error(vk_ref, vk),
         },
         "deterministic_ao_eri_vs_fftdf": {
@@ -254,6 +323,7 @@ def _run_fixed_pivot_path(cell, kpts, pivots, block_size, reference_mf, referenc
             "per_atom_error": abs(total - reference_values["krhf_total"]) / cell.natm,
         },
         "kmp2": mp2_record,
+        "adapter_ao2mo_audit": adapter_audit,
         "retained_mode_warnings": [
             info.get("retention_warning") for info in built["solve_infos"]
             if info.get("retention_warning") is not None
@@ -279,6 +349,8 @@ def _first_rank_meeting(records, selector, metric):
 
 def run_study(block_size=256):
     """Run the frozen R1 paired CPU study and return JSON-ready evidence."""
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    source_commit = _git_revision()
     cell = diamond_211()
     kpts = cell.make_kpts([3, 2, 1], wrap_around=False)
     mesh = canonicalize_kpts(cell, kpts)
@@ -355,7 +427,7 @@ def run_study(block_size=256):
         "fft_selected_first_rank_meeting_both_kmp2_targets": _first_rank_meeting(
             records, "fft_selected", "kmp2",
         ),
-        "additional_pivots_needed": "not measured: the frozen ladder ends at cIP=10; no unequal-rank extension was authorized",
+        "additional_pivots_needed": "bounded measurement through cIP=14; no extension beyond cIP=14 is authorized without consultation",
         "equal_rank_integral_error_ratios_fft_over_exact": [
             record["fft_selected"]["deterministic_ao_eri_vs_fftdf"]["relative_frobenius"]
             / max(
@@ -380,11 +452,21 @@ def run_study(block_size=256):
             "rank_multipliers": list(RANK_MULTIPLIERS),
             "requested_ranks": ranks,
             "block_size": block_size,
+            "rtol": RTOL,
+            "retention_mode": RETENTION_MODE,
+            "scf_controls": SCF_CONTROLS,
         },
         "provenance": {
+            "started_at_utc": started_at,
+            "source_commit": source_commit,
+            "runner_commit": source_commit,
             "python": sys.version,
             "platform": platform.platform(),
+            "numpy_version": np.__version__,
+            "pyscf_version": pyscf.__version__,
+            "jax_version": jax.__version__,
             "jax_x64_enabled": bool(jax.config.jax_enable_x64),
+            "jax_backend": jax.default_backend(),
             "selection_isolation": "Both paths pass only fixed indices to an exact PySCF-AO build; approximate AO arrays never enter Pi, eta, kernels, ERIs, SCF, or MP2.",
         },
         "reference_fftdf": reference_values,
@@ -417,7 +499,12 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="JSON result path; overwritten atomically.")
     parser.add_argument("--block-size", type=int, default=256)
     args = parser.parse_args(argv)
-    _write_json_atomically(args.output, run_study(block_size=args.block_size))
+    record = run_study(block_size=args.block_size)
+    record["provenance"]["command"] = (
+        "python -m pytc.pbc.df.reciprocal_selection_study "
+        f"--output {args.output} --block-size {args.block_size}"
+    )
+    _write_json_atomically(args.output, record)
 
 
 if __name__ == "__main__":

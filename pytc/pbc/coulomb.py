@@ -58,6 +58,10 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
+    if selection_mode == "fixed_pivots" and fixed_pivots is None:
+        raise ValueError(
+            "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
+        )
     if fixed_pivots is not None:
         if selection_mode not in {"streamed", "cached_full"}:
             raise ValueError(
@@ -486,6 +490,7 @@ class ISDFDF:
         self.selection_mode = selection_mode
         self.fixed_pivots = None if fixed_pivots is None else np.asarray(fixed_pivots)
         self._built = None
+        self._ao2mo_call_count = 0
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
         # factorization) delegate to a real FFTDF instance.
         from pyscf.pbc.df import FFTDF
@@ -542,6 +547,7 @@ class ISDFDF:
         )
         if k4 != indices[3]:
             raise ValueError("ao2mo kpts violate momentum conservation for this mesh.")
+        self._ao2mo_call_count += 1
         return eri.reshape(-1)
 
     def get_jk(self, dm_kpts, hermi=1, kpts=None, kpts_band=None, with_j=True,

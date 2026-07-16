@@ -12,9 +12,9 @@ from pyscf.pbc.gto import Cell
 from pyscf.pbc import mp
 from pyscf.pbc.scf import KRHF
 
-from pytc.pbc.coulomb import ISDFDF
+from pytc.pbc.coulomb import ISDFDF, get_mo_eri
 from pytc.pbc.df.isdf import build_periodic_pivot_oracle, pivoted_cholesky_hermitian
-from pytc.pbc.df.kpts import canonicalize_kpts
+from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts
 
 
 def _make_cell():
@@ -94,6 +94,24 @@ class TestISDFDFStructure(unittest.TestCase):
         self.assertTrue(mf.converged)
         correlation, _ = mp.KMP2(mf).kernel()
         self.assertTrue(np.isfinite(correlation))
+        self.assertGreater(mf.with_df._ao2mo_call_count, 0)
+
+        built = mf.with_df.build()
+        kconserv = build_kconserv(cell, built["mesh_obj"].canonical_kpts)
+        k1, k2, k3 = 0, 1, 0
+        k4 = int(kconserv[k1, k2, k3])
+        mo_coeffs = [mf.mo_coeff[index] for index in (k1, k2, k3, k4)]
+        expected, expected_k4 = get_mo_eri(
+            built["inpv_kpt"], built["coul_kpt"], kconserv, mo_coeffs, k1, k2, k3,
+        )
+        actual = mf.with_df.ao2mo(
+            mo_coeffs,
+            built["mesh_obj"].canonical_kpts[[k1, k2, k3, k4]],
+            compact=False,
+        )
+        self.assertEqual(expected_k4, k4)
+        self.assertEqual(actual.shape, (expected.size,))
+        np.testing.assert_allclose(actual.reshape(expected.shape), expected, atol=1e-11, rtol=1e-11)
 
 
 class TestISDFDFRealKrhf(unittest.TestCase):
