@@ -29,7 +29,9 @@ def _diamond_211():
     primitive.ke_cutoff = 30.0
     primitive.verbose = 0
     primitive.build()
-    return tools.super_cell(primitive, [2, 1, 1])
+    cell = tools.super_cell(primitive, [2, 1, 1])
+    cell.mesh = np.array([27, 13, 13], dtype=np.int32)
+    return cell
 
 
 class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
