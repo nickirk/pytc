@@ -1,0 +1,131 @@
+{
+  "schema": "pytc-periodic-reciprocal-same-grid-r2/v1",
+  "scope": "CPU-only, non-default reciprocal_same_grid pivot selector. Downstream AOs/Pi/eta/kernels are exact PySCF values; no GPU/HPC/larger-supercell claim.",
+  "source_commit": "eebf10a",
+  "input": {
+    "system": "diamond 211 supercell",
+    "basis": "gth-dzvp",
+    "pseudo": "gth-pbe",
+    "ke_cutoff_hartree": 30.0,
+    "mesh": [27, 13, 13],
+    "k_mesh": [3, 2, 1],
+    "rtol": 1e-05,
+    "rank": 624,
+    "block_size": 256,
+    "warm_repeats": 5,
+    "device": "cpu"
+  },
+  "orbit_partition": {
+    "seed_shell_slice": [0, 6],
+    "replica_shell_slices": [[6, 12]],
+    "supercell_matrix": [[2, 0, 0], [0, 1, 0], [0, 0, 1]],
+    "NAO_reused": 26,
+    "NAO_unique": 0,
+    "orbit_validation_residual": 4.440892098500626e-16,
+    "realized_cache_factor": 2.0
+  },
+  "selection_timing_seconds": {
+    "reciprocal_same_grid": {
+      "cold": 8.097177500021644,
+      "warm_raw": [8.889956125000026, 8.323912666004617, 10.115665833000094, 7.917010832985397, 8.128024415986147],
+      "warm_median": 8.323912666004617,
+      "warm_peak_rss_bytes": 389513216
+    },
+    "jax_cached_matrix_free": {
+      "cold": 0.8169326249917503,
+      "warm_raw": [0.7335031669936143, 0.6138648329942953, 0.6017006249749102, 0.5457929580006748, 0.7353198749769945],
+      "warm_median": 0.6138648329942953,
+      "warm_peak_rss_bytes": 436109312
+    },
+    "reciprocal_over_cached_warm_ratio": 13.560004814709639,
+    "required_reciprocal_over_cached_warm_ratio_max": 0.25,
+    "performance_gate": "failed"
+  },
+  "reciprocal_byte_and_work_ledger": {
+    "persistent_seed_complex128_bytes": 11389248,
+    "one_generated_group_complex128_bytes": 11389248,
+    "one_generated_group_fft_workspace_complex128_bytes": 11389248,
+    "real_cholesky_L_float64_bytes": 22778496,
+    "selection_peak_host_device_bytes": 57065307,
+    "selection_peak_with_safety_bytes": 62771838,
+    "peak_safety_factor": 1.1,
+    "reconstruction_count": 625,
+    "fft_count": 7500,
+    "seed_evaluations": 1,
+    "unique_direct_evaluations": 0,
+    "hidden_full_supercell_ao_allocation": false,
+    "residency": "one persistent primitive seed plus one generated internal replica"
+  },
+  "analytic_projections_only_not_capacity_evidence": {
+    "222": {
+      "rank": 2496,
+      "modeled_safety_peak_bytes": 551763498,
+      "reconstruction_count": 17479,
+      "fft_count": 209748
+    },
+    "333": {
+      "rank": 8424,
+      "modeled_safety_peak_bytes": 5075636932,
+      "reconstruction_count": 219050,
+      "fft_count": 2628600
+    },
+    "444": {
+      "rank": 19968,
+      "modeled_safety_peak_bytes": 26864593642,
+      "reconstruction_count": 1258047,
+      "fft_count": 15096564,
+      "capacity_condition": "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY"
+    }
+  },
+  "exact_metric_check": {
+    "cached_realized_rank": 624,
+    "reciprocal_realized_rank": 624,
+    "pivot_overlap_count": 338,
+    "pivot_overlap_fraction": 0.5416666666666666,
+    "same_position_count": 47,
+    "cached_residual": {
+      "max_abs": 0.00017552255504946367,
+      "relative_to_initial_max": 8.793433092076376e-05
+    },
+    "reciprocal_residual": {
+      "max_abs": 0.00017344319986328764,
+      "relative_to_initial_max": 8.689260322376504e-05
+    }
+  },
+  "exact_downstream_r1_reference": {
+    "artifact": "docs/reciprocal-selection-study-211-r1-rtol1e-5-mo-convention.json",
+    "comparison": "R2 rank624 pivot overlap and exact-metric residual reproduce the accepted R1 values; downstream remains unchanged exact AO.",
+    "reciprocal_krhf_per_atom_error": 4.3281378840021034e-05,
+    "reciprocal_kmp2_correlation_per_atom_error": 1.8434807902978356e-06,
+    "reciprocal_kmp2_total_per_atom_error": 4.143789804977871e-05,
+    "chemistry_gate_ha_per_atom": 0.0001,
+    "chemistry_gate": "passed by accepted R1 exact-downstream evidence"
+  },
+  "streamed_provenance_only": {
+    "rank300": {
+      "status": "completed",
+      "wrapper": "/usr/bin/time -l",
+      "exit_status": 0,
+      "wall_seconds": 42.73,
+      "peak_rss_bytes": 284360704
+    },
+    "rank624": {
+      "status": "incomplete_post_selection_formatter_failure",
+      "wrapper": "/usr/bin/time -l",
+      "wall_seconds_total_not_selector_time": 63.26,
+      "peak_rss_bytes": 391217152,
+      "exception": "TypeError: unsupported format string passed to dict.__format__",
+      "not_a_timed_baseline": true
+    }
+  },
+  "focused_tests": {
+    "pytc/pbc/df/test/test_reciprocal_ao_pilot.py": "6 passed",
+    "pytc/pbc/test/test_coulomb_build.py": "5 passed",
+    "hybrid_orbit_coverage": "synthetic reused+unique parity/byte test and invalid coordinate/capacity fail-closed cases"
+  },
+  "decision": {
+    "memory_objective": "passed on frozen 211",
+    "performance_objective": "failed on frozen CPU; repeated on-demand reconstruction/FFT dominates cached exact selection",
+    "production_conclusion": "do not promote, optimize, or escalate reciprocal_same_grid from this CPU evidence"
+  }
+}
