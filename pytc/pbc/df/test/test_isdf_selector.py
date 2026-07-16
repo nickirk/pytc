@@ -14,6 +14,7 @@ from pytc.pbc.df.isdf import (
     build_translation_ao_cache,
     build_translation_ao_representation,
     build_cached_periodic_pivot_oracle,
+    build_periodic_batched_pivot_oracle,
     build_periodic_pivot_oracle,
     candidate_panel_indices,
     explicit_candidate_identity,
@@ -24,8 +25,10 @@ from pytc.pbc.df.isdf import (
     jax_cached_matrix_free_byte_model,
     jax_translation_matrix_free_byte_model,
     periodic_metric_column_from_ao,
+    periodic_metric_columns_from_ao,
     periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
+    pivoted_cholesky_batched_hermitian,
     select_jax_cached_matrix_free,
     select_jax_translation_matrix_free,
     stream_ao_blocks_from_translation_cache,
@@ -167,6 +170,44 @@ class TestPivotedCholeskyHermitian(unittest.TestCase):
 
 
 class TestExperimentalSelectionPrimitives(unittest.TestCase):
+    def test_batched_selector_is_deterministic_and_uses_exact_batch_columns(self):
+        rng = np.random.default_rng(41)
+        feature = rng.normal(size=(16, 7)) + 1j * rng.normal(size=(16, 7))
+        metric = feature @ feature.conj().T
+        diagonal = np.real(np.diag(metric))
+        calls = []
+
+        def batch_columns(indices):
+            calls.append(np.asarray(indices).copy())
+            return metric[:, indices]
+
+        first = pivoted_cholesky_batched_hermitian(
+            diagonal, batch_columns, rank=7, mesh=(4, 4, 1), batch_size=4,
+        )
+        second = pivoted_cholesky_batched_hermitian(
+            diagonal, lambda indices: metric[:, indices], rank=7,
+            mesh=(4, 4, 1), batch_size=4,
+        )
+        pivots, factor, count, rounds = first
+        self.assertEqual(count, 7)
+        np.testing.assert_array_equal(pivots, second[0])
+        np.testing.assert_allclose(factor @ factor.conj().T, metric, atol=1e-10)
+        self.assertEqual(sum(len(round_["retained_pivots"]) for round_ in rounds), count)
+        self.assertTrue(all(1 <= len(indices) <= 4 for indices in calls))
+
+    def test_batched_streamed_and_cached_columns_match(self):
+        cell = _SyntheticPeriodicCell()
+        grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
+        kpts = np.zeros((2, 3))
+        _, streamed_batch = build_periodic_batched_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4,
+        )
+        _, _, cache = build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size=4)
+        indices = np.array([1, 4, 7], dtype=np.int64)
+        np.testing.assert_allclose(
+            streamed_batch(indices), periodic_metric_columns_from_ao(cache, indices), atol=1e-12,
+        )
+
     def test_full_grid_identity_is_compact_range(self):
         identity = full_grid_candidate_identity(10**9)
         self.assertEqual(

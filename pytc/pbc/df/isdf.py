@@ -607,6 +607,99 @@ def pivoted_cholesky_hermitian(diag, col_eval, rank, *, rcond=1e-12, ramp_scale=
     return pivots[:n_selected], L[:, :n_selected], n_selected
 
 
+def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
+    """Choose a deterministic, minimum-image-separated stale-diagonal batch."""
+    score = np.where(selected, -np.inf, diag + ramp)
+    order = np.argsort(score, kind="stable")[::-1]
+    accepted = []
+    coordinates = []
+    mesh = np.asarray(mesh, dtype=np.int64)
+    for index in order:
+        if not np.isfinite(score[index]):
+            break
+        coordinate = np.asarray(np.unravel_index(int(index), tuple(mesh)), dtype=np.int64)
+        if coordinates:
+            delta = np.abs(np.asarray(coordinates) - coordinate)
+            delta = np.minimum(delta, mesh - delta)
+            if np.any(np.linalg.norm(delta, axis=1) < min_separation):
+                continue
+        accepted.append(int(index))
+        coordinates.append(coordinate)
+        if len(accepted) == batch_size:
+            break
+    return np.asarray(accepted, dtype=np.int64)
+
+
+def pivoted_cholesky_batched_hermitian(
+    diag, col_batch_eval, rank, *, mesh, batch_size, min_separation=2.0,
+    rcond=1e-12, ramp_scale=1e-12,
+):
+    """Approximate greedy selection with exact batched columns and updates.
+
+    A batch is chosen from the stale residual diagonal, but its columns are
+    exact.  ``pivoted_cholesky_hermitian`` re-pivots the true residual batch
+    submatrix before the corresponding global rank-one updates are applied.
+    """
+    diag = np.asarray(diag, dtype=np.float64)
+    mesh = tuple(int(value) for value in mesh)
+    if diag.ndim != 1 or np.prod(mesh) != diag.size:
+        raise ValueError("mesh must be a positive grid shape matching diag.")
+    if rank <= 0 or rank > diag.size or batch_size <= 0 or min_separation < 0:
+        raise ValueError("invalid rank, batch_size, or min_separation.")
+    initial_max = float(np.max(diag))
+    if initial_max <= 0:
+        raise ValueError("diag is entirely non-positive.")
+    threshold = rcond * initial_max
+    ramp = ramp_scale * np.arange(diag.size, dtype=np.float64) * initial_max
+    factor = np.zeros((diag.size, rank), dtype=np.complex128)
+    selected = np.zeros(diag.size, dtype=bool)
+    pivots = []
+    rounds = []
+    while len(pivots) < rank:
+        requested = min(batch_size, rank - len(pivots))
+        candidates = _batch_candidates(
+            diag, selected, requested, mesh, min_separation, ramp,
+        )
+        if candidates.size == 0 or diag[candidates[0]] <= threshold:
+            break
+        columns = np.asarray(col_batch_eval(candidates), dtype=np.complex128)
+        if columns.shape != (diag.size, candidates.size):
+            raise ValueError("col_batch_eval must return shape (n_grid, n_batch).")
+        existing = factor[:, :len(pivots)]
+        residual_batch = columns[candidates]
+        if pivots:
+            residual_batch = residual_batch - existing[candidates] @ existing[candidates].conj().T
+        local_diag = np.maximum(np.real(np.diag(residual_batch)), 0.0)
+        local_pivots, _, local_count = pivoted_cholesky_hermitian(
+            local_diag, lambda index: residual_batch[:, index],
+            rank=min(candidates.size, rank - len(pivots)), rcond=rcond,
+            ramp_scale=ramp_scale,
+        )
+        retained = []
+        for local_index in local_pivots[:local_count]:
+            index = int(candidates[local_index])
+            if selected[index] or diag[index] <= threshold:
+                continue
+            correction = existing @ existing[index].conj() if pivots else 0.0
+            vector = (columns[:, local_index] - correction) / np.sqrt(diag[index])
+            factor[:, len(pivots)] = vector
+            diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
+            selected[index] = True
+            pivots.append(index)
+            retained.append(index)
+            existing = factor[:, :len(pivots)]
+            if len(pivots) == rank:
+                break
+        rounds.append({
+            "requested_candidates": candidates.tolist(),
+            "within_batch_pivots": [int(candidates[index]) for index in local_pivots[:local_count]],
+            "retained_pivots": retained,
+        })
+        if not retained:
+            break
+    return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
+
+
 def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     """Build Pi^q = pair_convolve(X, X)[q] and eta^q = pair_convolve(X, AO)[q].
     eta is accumulated block-by-block so one pair_convolve call holds only
@@ -1258,6 +1351,37 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=No
     return diag, col_eval
 
 
+def build_periodic_batched_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
+    """Exact streamed periodic metric with one full AO sweep per column batch."""
+    diagonal, _ = build_periodic_pivot_oracle(
+        cell, kpts, grid_coords, block_size, stats=stats,
+    )
+    kpts_np = np.asarray(kpts, dtype=np.float64)
+    n_grid = len(grid_coords)
+    n_kpts = len(kpts_np)
+
+    def col_batch_eval(indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or indices.size == 0 or np.any(indices < 0) or np.any(indices >= n_grid):
+            raise ValueError("indices must be a nonempty in-range integer vector.")
+        pivot_ao = np.asarray(
+            cell.pbc_eval_gto("GTOval", grid_coords[indices], kpts=list(kpts_np)),
+            dtype=np.complex128,
+        )
+        if stats is not None:
+            stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
+            stats["grid_points"] = stats.get("grid_points", 0) + int(indices.size)
+        columns = np.empty((n_grid, indices.size), dtype=np.complex128)
+        for g0, g1, ao_block in stream_ao_blocks(
+            cell, kpts_np, grid_coords, block_size, stats=stats,
+        ):
+            gram = np.einsum("kbm,krm->br", pivot_ao.conj(), ao_block, optimize=True)
+            columns[g0:g1] = (np.abs(gram) ** 2 / n_kpts).T
+        return columns
+
+    return diagonal, col_batch_eval
+
+
 def periodic_metric_from_ao(ao):
     """Materialize the periodic metric for an explicit, bounded AO panel."""
     ao = np.asarray(ao, dtype=np.complex128)
@@ -1350,6 +1474,19 @@ def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, s
     pooled = np.sum(np.abs(cache) ** 2, axis=(0, 2))
     diag = pooled ** 2 / n_kpts
     return diag, lambda j: periodic_metric_column_from_ao(cache, j), cache
+
+
+def periodic_metric_columns_from_ao(ao, indices):
+    """Exact periodic-metric columns for a bounded batch from a cached AO tensor."""
+    ao = np.asarray(ao, dtype=np.complex128)
+    indices = np.asarray(indices, dtype=np.int64)
+    if ao.ndim != 3 or indices.ndim != 1 or indices.size == 0:
+        raise ValueError("ao must be (Nk,Ng,Nao) and indices must be nonempty 1-D.")
+    if np.any(indices < 0) or np.any(indices >= ao.shape[1]):
+        raise ValueError("indices are outside the AO grid.")
+    pivot_ao = ao[:, indices, :]
+    gram = np.einsum("kbm,krm->br", pivot_ao.conj(), ao, optimize=True)
+    return (np.abs(gram) ** 2 / ao.shape[0]).T.astype(np.complex128)
 
 
 # ---------------------------------------------------------------------------
