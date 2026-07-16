@@ -1,13 +1,23 @@
 """CPU feasibility test for reciprocal primitive-AO translation."""
 
+import dataclasses
 import time
 import unittest
 
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import numpy as np
 from pyscf.pbc import gto, tools
 
+from pytc.pbc import coulomb
 from pytc.pbc.df.kpts import canonicalize_kpts
 from pytc.pbc.df.reciprocal_ao_pilot import (
+    ReciprocalOrbitPartition,
+    ReciprocalOrbitPartitionError,
+    ReciprocalSameGridCapacityError,
+    reciprocal_same_grid_byte_model,
+    select_reciprocal_same_grid,
     metric_column_from_ao_groups,
     downsample_uniform_grid_values,
     pivot_prefix_from_ao_groups,
@@ -34,7 +44,152 @@ def _diamond_211():
     return cell
 
 
+def _diamond_211_partition(cell):
+    return ReciprocalOrbitPartition(
+        seed_shell_slice=(0, 6),
+        replica_shell_slices=((6, 12),),
+        replica_translations=np.asarray([cell.atom_coords()[2] - cell.atom_coords()[0]]),
+        supercell_matrix=np.diag([2, 1, 1]),
+    )
+
+
+class _HybridOrbitCell:
+    """Small shell-sliced AO fixture that rejects accidental full AO requests."""
+
+    nbas = 3
+    mesh = np.array([2, 2, 2], dtype=np.int64)
+    _bas = np.array([[0, 1], [1, 1], [2, 2]], dtype=np.int32)
+
+    def ao_loc_nr(self):
+        return np.array([0, 1, 2, 3], dtype=np.int64)
+
+    def atom_coords(self):
+        return np.array([[0., 0., 0.], [0., 0., 0.], [.3, .2, .1]])
+
+    def get_Gv(self, mesh):
+        return np.zeros((int(np.prod(mesh)), 3))
+
+    def pbc_eval_gto(self, name, coords, *, kpts, shls_slice=None):
+        if shls_slice is None:
+            raise AssertionError("selector must never request a full-supercell AO tensor")
+        n_grid = len(coords)
+        columns = []
+        for shell in range(*shls_slice):
+            if shell in (0, 1):
+                columns.append(np.linspace(1.0, 2.0, n_grid))
+            else:
+                columns.append(np.linspace(2.0, 1.0, n_grid))
+        return np.asarray(columns, dtype=np.complex128).T[None]
+
+
 class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
+    def test_hybrid_orbit_partition_accumulates_reused_and_unique_groups(self):
+        cell = _HybridOrbitCell()
+        coords = np.zeros((8, 3))
+        partition = ReciprocalOrbitPartition(
+            seed_shell_slice=(0, 1),
+            replica_shell_slices=((1, 2),),
+            replica_translations=np.zeros((1, 3)),
+            unique_shell_slices=((2, 3),),
+            supercell_matrix=np.diag([2, 1, 1]),
+        )
+        pivots, factor, count, provenance = select_reciprocal_same_grid(
+            cell, np.zeros((1, 3)), coords, rank=2, partition=partition,
+            selection_peak_max_bytes=10**9, return_factor=True,
+        )
+        seed = cell.pbc_eval_gto("GTOval", coords, kpts=[np.zeros(3)], shls_slice=(0, 1))
+        replica = cell.pbc_eval_gto("GTOval", coords, kpts=[np.zeros(3)], shls_slice=(1, 2))
+        unique = cell.pbc_eval_gto("GTOval", coords, kpts=[np.zeros(3)], shls_slice=(2, 3))
+        expected, _, expected_count = pivot_prefix_from_ao_groups(
+            lambda: iter((seed, replica, unique)), len(coords), 1, rank=2,
+        )
+        self.assertEqual(count, expected_count)
+        np.testing.assert_array_equal(pivots, expected)
+        self.assertEqual(factor.dtype, np.float64)
+        self.assertFalse(provenance["hidden_full_supercell_ao_allocation"])
+        self.assertEqual(provenance["NAO_reused"], 1)
+        self.assertEqual(provenance["NAO_unique"], 1)
+        self.assertEqual(provenance["realized_cache_factor"], 1.5)
+        self.assertEqual(provenance["reconstruction_count"], count + 1)
+        self.assertEqual(provenance["unique_direct_evaluations"], count + 1)
+
+    def test_invalid_hybrid_orbit_and_capacity_fail_closed(self):
+        cell = _HybridOrbitCell()
+        invalid = ReciprocalOrbitPartition(
+            seed_shell_slice=(0, 1),
+            replica_shell_slices=((1, 2),),
+            replica_translations=np.array([[1.0, 0.0, 0.0]]),
+            unique_shell_slices=((2, 3),),
+            supercell_matrix=np.diag([2, 1, 1]),
+        )
+        with self.assertRaisesRegex(ReciprocalOrbitPartitionError, "INVALID_ORBIT_PARTITION"):
+            select_reciprocal_same_grid(
+                cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=invalid,
+                selection_peak_max_bytes=10**9,
+            )
+        model = reciprocal_same_grid_byte_model(
+            1, 8, 1, 1, 2, 2, selection_peak_max_bytes=1,
+        )
+        self.assertEqual(model["capacity_condition"], "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY")
+        valid = dataclasses.replace(invalid, replica_translations=np.zeros((1, 3)))
+        with self.assertRaisesRegex(ReciprocalSameGridCapacityError, "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY"):
+            select_reciprocal_same_grid(
+                cell, np.zeros((1, 3)), np.zeros((8, 3)), rank=2, partition=valid,
+                selection_peak_max_bytes=1,
+            )
+
+    def test_diamond_same_grid_selector_uses_seed_and_one_generated_group(self):
+        cell = _diamond_211()
+        mesh_obj = canonicalize_kpts(cell, cell.make_kpts([3, 2, 1], wrap_around=False))
+        coords = cell.get_uniform_grids(cell.mesh)
+        pivots, factor, count, provenance = select_reciprocal_same_grid(
+            cell, mesh_obj.canonical_kpts, coords, rank=4,
+            partition=_diamond_211_partition(cell), selection_peak_max_bytes=10**9,
+            return_factor=True,
+        )
+        direct = np.asarray(cell.pbc_eval_gto(
+            "GTOval", coords, kpts=list(mesh_obj.canonical_kpts),
+        ), dtype=np.complex128)
+        generated = np.asarray([
+            reciprocal_translate_bloch_ao(
+                direct[k, :, :26], coords, cell.mesh, kpt,
+                cell.atom_coords()[2] - cell.atom_coords()[0], cell.get_Gv(cell.mesh),
+            )
+            for k, kpt in enumerate(mesh_obj.canonical_kpts)
+        ])
+        expected, _, expected_count = pivot_prefix_from_ao_groups(
+            lambda: iter((direct[:, :, :26], generated)), len(coords), len(mesh_obj.canonical_kpts),
+            rank=4,
+        )
+        self.assertEqual(count, expected_count)
+        np.testing.assert_array_equal(pivots, expected)
+        self.assertEqual(factor.dtype, np.float64)
+        self.assertFalse(provenance["hidden_full_supercell_ao_allocation"])
+        self.assertEqual(provenance["NAO_reused"], 26)
+        self.assertEqual(provenance["NAO_unique"], 0)
+        self.assertEqual(provenance["n_replicas"], 2)
+        self.assertEqual(provenance["reconstruction_count"], count + 1)
+        self.assertEqual(provenance["fft_count"], 2 * len(mesh_obj.canonical_kpts) * (count + 1))
+
+    def test_nondefault_build_uses_exact_downstream_aos(self):
+        cell = _diamond_211()
+        kpts = cell.make_kpts([3, 2, 1], wrap_around=False)
+        result = coulomb.build(
+            cell, kpts, rank=2, block_size=256, rtol=1e-5,
+            selection_mode="reciprocal_same_grid",
+            reciprocal_orbit_partition=_diamond_211_partition(cell),
+            selection_peak_max_bytes=10**9,
+        )
+        mesh_obj = result["mesh_obj"]
+        pivots = np.asarray(result["selection_provenance"]["pivot_indices"])
+        exact_inpv = np.asarray(cell.pbc_eval_gto(
+            "GTOval", cell.get_uniform_grids(cell.mesh)[pivots],
+            kpts=list(mesh_obj.canonical_kpts),
+        ), dtype=np.complex128)
+        np.testing.assert_allclose(result["inpv_kpt"], exact_inpv, atol=0.0, rtol=0.0)
+        self.assertEqual(result["selection_provenance"]["eta_ao_source"], "exact_streamed_pyscf_ao")
+        self.assertFalse(result["selection_provenance"]["hidden_full_supercell_ao_allocation"])
+
     def test_oversampled_target_grid_metrics_and_on_demand_pivots(self):
         cell = _diamond_211()
         mesh = np.asarray(cell.mesh)

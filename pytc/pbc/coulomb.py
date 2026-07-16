@@ -35,6 +35,10 @@ from pytc.pbc.df.isdf import (
     stream_ao_blocks,
     stream_ao_blocks_from_translation_cache,
 )
+from pytc.pbc.df.reciprocal_ao_pilot import (
+    ReciprocalOrbitPartition,
+    select_reciprocal_same_grid,
+)
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
 
@@ -42,7 +46,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode="jax_cached_matrix_free",
           selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
           selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
-          fixed_pivots=None):
+          fixed_pivots=None, reciprocal_orbit_partition=None,
+          process_pipeline_allowance_bytes=0):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -74,13 +79,13 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         selection_mode = "fixed_pivots"
     valid_selection_modes = {
         "jax_cached_matrix_free", "jax_translation_matrix_free", "streamed", "cached_full",
-        "panel_dense", "panel_oracle", "fixed_pivots",
+        "panel_dense", "panel_oracle", "fixed_pivots", "reciprocal_same_grid",
     }
     if selection_mode not in valid_selection_modes:
         raise ValueError(
             "selection_mode must be 'jax_cached_matrix_free', "
             "'jax_translation_matrix_free', 'streamed', 'cached_full', "
-            "'panel_dense', 'panel_oracle', or 'fixed_pivots'"
+            "'panel_dense', 'panel_oracle', 'fixed_pivots', or 'reciprocal_same_grid'"
         )
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
@@ -98,6 +103,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     cached_ao = None
     translation_cache = None
     translation_representation = None
+    selector_ao_calls = 0
+    selector_ao_grid_points = 0
     if selection_mode == "fixed_pivots":
         pivots = np.asarray(fixed_pivots)
         if pivots.ndim != 1 or not np.issubdtype(pivots.dtype, np.integer):
@@ -190,6 +197,25 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         selection_provenance.update(jax_provenance)
         selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
         selection_provenance["eta_ao_source"] = "same_full_grid_ao_cache"
+    elif selection_mode == "reciprocal_same_grid":
+        if not isinstance(reciprocal_orbit_partition, ReciprocalOrbitPartition):
+            raise ValueError(
+                "selection_mode='reciprocal_same_grid' requires an explicit "
+                "ReciprocalOrbitPartition."
+            )
+        pivots, _, n_selected, reciprocal_provenance = select_reciprocal_same_grid(
+            cell, mesh_obj.canonical_kpts, grid_coords, rank, reciprocal_orbit_partition,
+            selection_peak_max_bytes=selection_peak_max_bytes,
+            peak_safety_factor=selection_peak_safety_factor,
+            process_pipeline_allowance_bytes=process_pipeline_allowance_bytes,
+        )
+        selection_provenance.update(reciprocal_provenance)
+        selection_provenance["cache_bytes"] = int(
+            reciprocal_provenance["persistent_seed_complex128_bytes"]
+        )
+        selection_provenance["eta_ao_source"] = "exact_streamed_pyscf_ao"
+        selector_ao_calls = int(reciprocal_provenance["pbc_eval_calls"])
+        selector_ao_grid_points = int(reciprocal_provenance["ao_grid_points"])
     elif selection_mode == "cached_full":
         diag, col_eval, cached_ao = build_cached_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
@@ -200,6 +226,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         )
     if selection_mode in {
         "jax_cached_matrix_free", "jax_translation_matrix_free", "fixed_pivots",
+        "reciprocal_same_grid",
     }:
         pass
     elif selection_mode == "streamed":
@@ -233,8 +260,12 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             "candidate_identity": explicit_candidate_identity(candidates),
         })
 
-    selection_provenance["ao_calls_selection"] = ao_stats["pbc_eval_calls"]
-    selection_provenance["ao_grid_points_selection"] = ao_stats["grid_points"]
+    if selection_mode != "reciprocal_same_grid":
+        selector_ao_calls = ao_stats["pbc_eval_calls"]
+        selector_ao_grid_points = ao_stats["grid_points"]
+    ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
+    selection_provenance["ao_calls_selection"] = selector_ao_calls
+    selection_provenance["ao_grid_points_selection"] = selector_ao_grid_points
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
         dtype=np.complex128,
@@ -280,8 +311,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             **selection_provenance,
             "pivot_indices": pivots.tolist(),
             "n_selected": n_selected,
-            "ao_calls_through_eta": ao_stats["pbc_eval_calls"],
-            "ao_grid_points_through_eta": ao_stats["grid_points"],
+            "ao_calls_through_eta": selector_ao_calls + ao_stats["pbc_eval_calls"],
+            "ao_grid_points_through_eta": selector_ao_grid_points + ao_stats["grid_points"],
             "translation_reconstruction_calls": ao_stats.get(
                 "translation_reconstruction_calls", 0,
             ),
