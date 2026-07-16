@@ -8,6 +8,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import numpy as np
 from pyscf.pbc.gto import Cell
+from pyscf.pbc.scf import KRHF
 
 from pytc.pbc import coulomb
 
@@ -122,6 +123,75 @@ class TestGetKBareDevice(unittest.TestCase):
         with mock.patch.object(jax.config, "read", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "jax_enable_x64"):
                 coulomb._get_k_bare_device(dm, inpv, coul_kpt, phase, neg=neg)
+
+
+class TestGetKBareDeviceAdapter(unittest.TestCase):
+    """V3 parity for the private device-to-host exchange adapter."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cell = _make_cell()
+        cls.kpts = cls.cell.make_kpts([1, 1, 3], wrap_around=False)
+        cls.built = coulomb.build(
+            cls.cell, cls.kpts, rank=6, block_size=100, rtol=1e-8,
+        )
+        cls.mesh = cls.built["mesh_obj"]
+        cls.inpv = np.asarray(cls.built["inpv_kpt"])
+        cls.coul = np.asarray(cls.built["coul_kpt"])
+        mf = KRHF(cls.cell, cls.kpts)
+        mf.verbose = 0
+        mf.kernel()
+        if not mf.converged:
+            raise RuntimeError("KRHF fixture did not converge.")
+        cls.dm = np.asarray(mf.make_rdm1(), dtype=np.complex128)
+
+    def _adapter(self, exxdiv):
+        return coulomb._get_k_bare_device_adapter(
+            self.dm, self.inpv, self.coul, self.mesh.phase,
+            exxdiv=exxdiv,
+            cell=self.cell if exxdiv == "ewald" else None,
+            kpts=self.mesh.canonical_kpts if exxdiv == "ewald" else None,
+            neg=self.mesh.neg,
+        )
+
+    def _numpy_oracle(self, exxdiv):
+        return coulomb.get_k(
+            self.dm, self.inpv, self.coul, self.mesh.phase,
+            exxdiv=exxdiv,
+            cell=self.cell if exxdiv == "ewald" else None,
+            kpts=self.mesh.canonical_kpts if exxdiv == "ewald" else None,
+            neg=self.mesh.neg,
+        )
+
+    def test_real_scf_genuine_pair_numpy_parity_and_fftdf(self):
+        self.assertTrue(np.any(self.mesh.neg != np.arange(self.mesh.n_kpts)))
+        from pyscf.pbc.df import FFTDF
+        from pyscf.pbc.df.fft_jk import get_k_kpts
+
+        for exxdiv, bound in ((None, 1.5), ("ewald", 2.5)):
+            with self.subTest(exxdiv=exxdiv):
+                vk_adapter = self._adapter(exxdiv)
+                vk_numpy = self._numpy_oracle(exxdiv)
+                np.testing.assert_allclose(
+                    vk_adapter, vk_numpy, rtol=1e-12, atol=1e-12,
+                )
+                vk_ref = get_k_kpts(
+                    FFTDF(self.cell), self.dm, kpts=self.kpts, exxdiv=exxdiv,
+                )
+                rel = np.linalg.norm(vk_adapter - vk_ref) / np.linalg.norm(vk_ref)
+                self.assertLess(rel, bound)
+
+    def test_validates_requested_host_ewald_boundary(self):
+        with self.assertRaisesRegex(ValueError, "requires both cell and kpts"):
+            coulomb._get_k_bare_device_adapter(
+                self.dm, self.inpv, self.coul, self.mesh.phase,
+                exxdiv="ewald", neg=self.mesh.neg,
+            )
+        with self.assertRaisesRegex(ValueError, "exxdiv must be None or 'ewald'"):
+            coulomb._get_k_bare_device_adapter(
+                self.dm, self.inpv, self.coul, self.mesh.phase,
+                exxdiv="vcut_sph", neg=self.mesh.neg,
+            )
 
 
 if __name__ == "__main__":

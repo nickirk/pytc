@@ -527,6 +527,34 @@ def _get_k_bare_device(dm_kpts, inpv_kpt, coul_kpt, phase, *, neg, imag_tol=1e-1
     return vk_sets[0] if single_set else vk_sets
 
 
+def _get_k_bare_device_adapter(
+    dm_kpts, inpv_kpt, coul_kpt, phase, *, exxdiv=None, cell=None, kpts=None, neg,
+):
+    """Private host adapter: one result transfer, then unchanged host Ewald."""
+    if exxdiv not in (None, "ewald"):
+        raise ValueError(f"exxdiv must be None or 'ewald', got {exxdiv!r}.")
+    if exxdiv == "ewald" and (cell is None or kpts is None):
+        raise ValueError("exxdiv='ewald' requires both cell and kpts.")
+
+    vk_device = _get_k_bare_device(
+        dm_kpts, inpv_kpt, coul_kpt, phase, neg=neg,
+    )
+    vk_host = np.asarray(vk_device)  # The adapter's sole device-to-host transfer.
+    if exxdiv != "ewald":
+        return vk_host
+    vk_host = vk_host.copy()  # PySCF applies the Ewald correction in place.
+
+    dm_host = np.asarray(dm_kpts, dtype=np.complex128)
+    single_set = dm_host.ndim == 3
+    dm_sets = dm_host[None, ...] if single_set else dm_host
+    vk_sets = vk_host[None, ...] if single_set else vk_host
+    from pyscf.pbc.df.df_jk import _ewald_exxdiv_for_G0
+
+    for i in range(dm_sets.shape[0]):
+        _ewald_exxdiv_for_G0(cell, kpts, dm_sets[i][None], vk_sets[i][None])
+    return vk_sets[0] if single_set else vk_sets
+
+
 def get_ao_eri(inpv_kpt, coul_kpt, kconserv, k1, k2, k3):
     """AO-basis THC-ERI block (a^k1 b^k2 | c^k3 d^k4), one block at a time.
     Standard pyscf/chemist convention: a,c conjugated; k4 fixed by
