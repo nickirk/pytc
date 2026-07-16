@@ -1,7 +1,7 @@
 {
   "schema": "pytc-periodic-reciprocal-same-grid-r2/v1",
   "scope": "CPU-only, non-default reciprocal_same_grid pivot selector. Downstream AOs/Pi/eta/kernels are exact PySCF values; no GPU/HPC/larger-supercell claim.",
-  "source_commit": "eebf10a",
+  "source_commit": "271ea3fc5f0952d9716ab16624d0425048200be3",
   "input": {
     "system": "diamond 211 supercell",
     "basis": "gth-dzvp",
@@ -13,7 +13,8 @@
     "rank": 624,
     "block_size": 256,
     "warm_repeats": 5,
-    "device": "cpu"
+    "device": "cpu",
+    "process_pipeline_allowance_bytes": 402653184
   },
   "orbit_partition": {
     "seed_shell_slice": [0, 6],
@@ -46,8 +47,13 @@
     "one_generated_group_complex128_bytes": 11389248,
     "one_generated_group_fft_workspace_complex128_bytes": 11389248,
     "real_cholesky_L_float64_bytes": 22778496,
-    "selection_peak_host_device_bytes": 57065307,
-    "selection_peak_with_safety_bytes": 62771838,
+    "host_tensor_peak_bytes": 45676059,
+    "device_tensor_peak_bytes": 57895344,
+    "process_pipeline_allowance_bytes": 402653184,
+    "selection_peak_host_bytes": 448329243,
+    "selection_peak_device_bytes": 460548528,
+    "selection_peak_host_with_safety_bytes": 493162168,
+    "selection_peak_device_with_safety_bytes": 506603381,
     "peak_safety_factor": 1.1,
     "reconstruction_count": 625,
     "fft_count": 7500,
@@ -59,19 +65,19 @@
   "analytic_projections_only_not_capacity_evidence": {
     "222": {
       "rank": 2496,
-      "modeled_safety_peak_bytes": 551763498,
+      "modeled_safety_peak_bytes": 944569310,
       "reconstruction_count": 17479,
       "fft_count": 209748
     },
     "333": {
       "rank": 8424,
-      "modeled_safety_peak_bytes": 5075636932,
+      "modeled_safety_peak_bytes": 5349426474,
       "reconstruction_count": 219050,
       "fft_count": 2628600
     },
     "444": {
       "rank": 19968,
-      "modeled_safety_peak_bytes": 26864593642,
+      "modeled_safety_peak_bytes": 26906610615,
       "reconstruction_count": 1258047,
       "fft_count": 15096564,
       "capacity_condition": "RECIPROCAL_SAME_GRID_SELECTION_PEAK_EXCEEDS_POLICY"
@@ -121,10 +127,11 @@
   "focused_tests": {
     "pytc/pbc/df/test/test_reciprocal_ao_pilot.py": "6 passed",
     "pytc/pbc/test/test_coulomb_build.py": "5 passed",
-    "hybrid_orbit_coverage": "synthetic reused+unique parity/byte test and invalid coordinate/capacity fail-closed cases"
+    "hybrid_orbit_coverage": "synthetic reused+unique parity/byte test, 3-replica residency regression, and invalid coordinate/capacity/required-allowance fail-closed cases",
+    "translation_counter_coverage": "selection and eta reconstruction counters are preserved and summed"
   },
   "decision": {
-    "memory_objective": "passed on frozen 211",
+    "memory_objective": "passed on frozen 211 with explicit 384 MiB process/pipeline allowance; measured RSS was 389513216 B",
     "performance_objective": "failed on frozen CPU; repeated on-demand reconstruction/FFT dominates cached exact selection",
     "production_conclusion": "do not promote, optimize, or escalate reciprocal_same_grid from this CPU evidence"
   }
