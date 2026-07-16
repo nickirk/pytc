@@ -18,12 +18,19 @@ from pytc.pbc.df.reciprocal_ao_pilot import (
     ReciprocalSameGridCapacityError,
     reciprocal_same_grid_byte_model,
     select_reciprocal_same_grid,
+    validate_reciprocal_orbit_partition,
     metric_column_from_ao_groups,
     downsample_uniform_grid_values,
     pivot_prefix_from_ao_groups,
     reciprocal_translate_bloch_ao,
     relative_frobenius_error,
     uniform_grid_downsample_indices,
+)
+from pytc.pbc.df.reciprocal_222_selector_benchmark import (
+    FROZEN_RANK as R3_FROZEN_RANK,
+    diamond_222,
+    frozen_222_partition,
+    time_model,
 )
 
 
@@ -200,6 +207,18 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         self.assertEqual(provenance["reconstruction_count"], 2 * (count + 1))
         self.assertEqual(provenance["generated_group_release_checks"], 2 * (count + 1))
         self.assertEqual(provenance["generated_group_release_failures"], 0)
+
+    def test_r3_222_frozen_partition_and_pre_submission_model(self):
+        cell = diamond_222()
+        validation = validate_reciprocal_orbit_partition(cell, frozen_222_partition(cell))
+        model = time_model()
+        self.assertEqual(cell.mesh.tolist(), [27, 27, 27])
+        self.assertEqual(validation["NAO_reused"], 26)
+        self.assertEqual(validation["n_replicas"], 8)
+        self.assertLess(validation["orbit_validation_residual"], 1e-12)
+        self.assertEqual(model["rank"], R3_FROZEN_RANK)
+        self.assertEqual(model["planned_runs"]["streamed"]["warm"], 3)
+        self.assertTrue(model["fits_envelope_by_model"])
 
     def test_diamond_same_grid_selector_uses_seed_and_one_generated_group(self):
         cell = _diamond_211()
