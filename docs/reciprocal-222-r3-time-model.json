@@ -1,0 +1,28 @@
+{
+  "source_commit": "f5bcdb59481ced92b4663f57ab1efc692603703f",
+  "cached_exact_single_run_seconds": "not extrapolated; anchor-only and expected inexpensive",
+  "fits_envelope_by_model": true,
+  "kind": "conservative_pre_submission_time_model_not_measurement",
+  "n_grid": 19683,
+  "planned_runs": {
+    "jax_cached_matrix_free": {
+      "cold": 1,
+      "warm": 5
+    },
+    "reciprocal_same_grid": {
+      "cold": 1,
+      "warm": 5
+    },
+    "streamed": {
+      "cold": 1,
+      "warm": 3
+    }
+  },
+  "projected_selector_seconds_with_15pct_overhead": 15185.11265272157,
+  "rank": 2496,
+  "reciprocal_fft_count": 209748,
+  "reciprocal_reconstructions": 17479,
+  "reciprocal_single_run_seconds": 1178.3764103163924,
+  "streamed_single_run_seconds": 1533.5468307692308,
+  "walltime_envelope_seconds": 18000
+}
