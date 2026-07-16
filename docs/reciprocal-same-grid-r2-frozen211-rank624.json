@@ -1,7 +1,10 @@
 {
   "schema": "pytc-periodic-reciprocal-same-grid-r2/v1",
   "scope": "CPU-only, non-default reciprocal_same_grid pivot selector. Downstream AOs/Pi/eta/kernels are exact PySCF values; no GPU/HPC/larger-supercell claim.",
-  "source_commit": "271ea3fc5f0952d9716ab16624d0425048200be3",
+  "source_commits": [
+    "271ea3fc5f0952d9716ab16624d0425048200be3",
+    "7d0fc9fad1dcdf1869d8e07b5a5e7cd6d22bf67d"
+  ],
   "input": {
     "system": "diamond 211 supercell",
     "basis": "gth-dzvp",
@@ -125,9 +128,9 @@
     }
   },
   "focused_tests": {
-    "pytc/pbc/df/test/test_reciprocal_ao_pilot.py": "6 passed",
+    "pytc/pbc/df/test/test_reciprocal_ao_pilot.py": "7 passed",
     "pytc/pbc/test/test_coulomb_build.py": "5 passed",
-    "hybrid_orbit_coverage": "synthetic reused+unique parity/byte test, 3-replica residency regression, and invalid coordinate/capacity/required-allowance fail-closed cases",
+    "hybrid_orbit_coverage": "synthetic reused+unique parity/byte test with weakref-observed release, 3-replica weakref-observed residency regression, and invalid coordinate/capacity/zero-or-missing-allowance fail-closed cases",
     "translation_counter_coverage": "selection and eta reconstruction counters are preserved and summed"
   },
   "decision": {
