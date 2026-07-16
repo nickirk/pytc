@@ -73,7 +73,10 @@ def diamond_211():
     primitive.ke_cutoff = 30.0
     primitive.verbose = 0
     primitive.build()
-    return tools.super_cell(primitive, [2, 1, 1])
+    cell = tools.super_cell(primitive, [2, 1, 1])
+    # This study's comparison grid is a frozen input, not a PySCF mesh heuristic.
+    cell.mesh = np.array([27, 13, 13], dtype=np.int32)
+    return cell
 
 
 def _relative_error(reference, candidate):
