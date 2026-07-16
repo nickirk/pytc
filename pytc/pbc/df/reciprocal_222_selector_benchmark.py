@@ -39,11 +39,17 @@ from pytc.pbc.df.reciprocal_selection_study import RTOL, _residual_for_fixed_piv
 
 FROZEN_222_MESH = (27, 27, 27)
 FROZEN_KMESH = (3, 2, 1)
-FROZEN_RANK = 2496
+# The R2 per-NAO rank projection is 2496, but the conservative streamed
+# time model rejects it.  All R3 modes therefore use this documented lower
+# matched rank.
+FROZEN_RANK = 624
+MAX_MODELED_RANK = 2496
 BLOCK_SIZE = 256
 PROCESS_PIPELINE_ALLOWANCE_BYTES = 384 * 2**20
 SELECTION_PEAK_MAX_BYTES = 24 * 2**30
 R2_211_NGRID = 4563
+R2_211_NAO = 52
+R3_222_NAO = 208
 R2_211_STREAMED_RANK300_SECONDS = 42.73
 R2_211_RECIPROCAL_WARM_SECONDS = 8.323912666004617
 R2_211_RECIPROCAL_RECONSTRUCTIONS = 625
@@ -156,13 +162,16 @@ def write_record(path, record):
 
 def time_model(*, rank=FROZEN_RANK):
     """Conservative pre-submission model, not a capacity or runtime claim."""
-    if rank <= 0 or rank > FROZEN_RANK:
-        raise ValueError(f"rank must be in [1,{FROZEN_RANK}].")
+    if rank <= 0 or rank > MAX_MODELED_RANK:
+        raise ValueError(f"rank must be in [1,{MAX_MODELED_RANK}].")
     n_grid = int(np.prod(FROZEN_222_MESH))
     grid_factor = n_grid / R2_211_NGRID
     fft_size_factor = (n_grid * math.log(n_grid)) / (R2_211_NGRID * math.log(R2_211_NGRID))
     reciprocal_reconstructions = 7 * (rank + 1)
-    streamed_seconds = R2_211_STREAMED_RANK300_SECONDS * grid_factor * rank / 300
+    nao_factor = R3_222_NAO / R2_211_NAO
+    streamed_seconds = (
+        R2_211_STREAMED_RANK300_SECONDS * nao_factor * grid_factor * rank / 300
+    )
     reciprocal_seconds = (
         R2_211_RECIPROCAL_WARM_SECONDS
         * reciprocal_reconstructions / R2_211_RECIPROCAL_RECONSTRUCTIONS
@@ -173,6 +182,7 @@ def time_model(*, rank=FROZEN_RANK):
         "kind": "conservative_pre_submission_time_model_not_measurement",
         "rank": rank,
         "n_grid": n_grid,
+        "streamed_nao_factor": nao_factor,
         "streamed_single_run_seconds": streamed_seconds,
         "reciprocal_single_run_seconds": reciprocal_seconds,
         "cached_exact_single_run_seconds": "not extrapolated; anchor-only and expected inexpensive",
@@ -186,14 +196,17 @@ def time_model(*, rank=FROZEN_RANK):
         "walltime_envelope_seconds": 5 * 3600,
         "projected_selector_seconds_with_15pct_overhead": projected_selector_seconds,
         "fits_envelope_by_model": projected_selector_seconds <= 5 * 3600,
+        "rank_binding": (
+            "R3 runs rank=624 for every mode; 1248 and 2496 are rejected by this model."
+        ),
     }
 
 
 def run_mode(mode, *, rank=FROZEN_RANK, warm_repeats=None):
     if mode not in {"streamed", "reciprocal_same_grid", "jax_cached_matrix_free"}:
         raise ValueError("mode must be streamed, reciprocal_same_grid, or jax_cached_matrix_free.")
-    if rank <= 0 or rank > FROZEN_RANK:
-        raise ValueError(f"rank must be in [1,{FROZEN_RANK}].")
+    if rank != FROZEN_RANK:
+        raise ValueError(f"R3 execution is frozen at matched rank={FROZEN_RANK}.")
     if warm_repeats is None:
         warm_repeats = 3 if mode == "streamed" else 5
     if warm_repeats < 1:
@@ -206,7 +219,8 @@ def run_mode(mode, *, rank=FROZEN_RANK, warm_repeats=None):
     cold, cold_measurement = _timed(runner)
     warm = [_timed(runner) for _ in range(warm_repeats)]
     pivots, count, provenance = warm[-1][0]
-    if not all(np.array_equal(pivots, value[0]) and count == value[1] for value, _ in warm):
+    all_runs = (cold,) + tuple(value for value, _ in warm)
+    if not all(np.array_equal(pivots, value[0]) and count == value[1] for value in all_runs):
         raise RuntimeError(f"{mode} failed deterministic within-mode pivot gate.")
     return {
         "schema": "pytc-periodic-r3-222-selector-mode/v1",

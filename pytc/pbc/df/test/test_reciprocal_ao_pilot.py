@@ -219,6 +219,8 @@ class TestReciprocalPrimitiveAOPilot(unittest.TestCase):
         self.assertEqual(model["rank"], R3_FROZEN_RANK)
         self.assertEqual(model["planned_runs"]["streamed"]["warm"], 3)
         self.assertTrue(model["fits_envelope_by_model"])
+        self.assertFalse(time_model(rank=1248)["fits_envelope_by_model"])
+        self.assertFalse(time_model(rank=2496)["fits_envelope_by_model"])
 
     def test_diamond_same_grid_selector_uses_seed_and_one_generated_group(self):
         cell = _diamond_211()
