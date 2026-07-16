@@ -36,6 +36,7 @@ from pytc.pbc.df.reciprocal_ao_pilot import reciprocal_translate_bloch_ao
 
 
 RANK_MULTIPLIERS = (2, 4, 6, 8, 10, 12, 14)
+FROZEN_GRID_MESH = (27, 13, 13)
 RTOL = 1e-5
 RETENTION_MODE = "single"
 SCF_CONTROLS = {
@@ -75,7 +76,7 @@ def diamond_211():
     primitive.build()
     cell = tools.super_cell(primitive, [2, 1, 1])
     # This study's comparison grid is a frozen input, not a PySCF mesh heuristic.
-    cell.mesh = np.array([27, 13, 13], dtype=np.int32)
+    cell.mesh = np.array(FROZEN_GRID_MESH, dtype=np.int32)
     return cell
 
 
@@ -450,6 +451,10 @@ def run_study(block_size=256):
             "pseudo": "gth-pbe",
             "ke_cutoff_hartree": 30.0,
             "grid_mesh": [int(value) for value in cell.mesh],
+            "realized_mesh_override": {
+                "mesh": list(FROZEN_GRID_MESH),
+                "applied_before_fftdf_and_isdf": True,
+            },
             "k_mesh": [3, 2, 1],
             "n_ao_supercell": n_ao,
             "rank_multipliers": list(RANK_MULTIPLIERS),
