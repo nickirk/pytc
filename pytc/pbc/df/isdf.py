@@ -632,13 +632,14 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
 
 def pivoted_cholesky_batched_hermitian(
     diag, col_batch_eval, rank, *, mesh, batch_size, min_separation=2.0,
-    n_topup=0, rcond=1e-12, ramp_scale=1e-12,
+    candidate_oversampling=1, n_topup=0, rcond=1e-12, ramp_scale=1e-12,
 ):
     """Approximate greedy selection with exact batched columns and updates.
 
-    A batch is chosen from the stale residual diagonal, but its columns are
-    exact.  ``pivoted_cholesky_hermitian`` re-pivots the true residual batch
-    submatrix before the corresponding global rank-one updates are applied.
+    A stale-diagonal candidate pool of ``candidate_oversampling * batch_size``
+    members is chosen, but only ``batch_size`` members are retained after exact
+    within-pool re-pivoting.  Columns are exact, so oversampling changes only
+    the cheap per-round column GEMM, not the streamed AO-sweep count.
     Optionally, the final ``n_topup`` pivots are selected as exact greedy
     singleton batches; this repairs final-residual order-statistic error
     without changing the preceding batched rounds.
@@ -649,10 +650,16 @@ def pivoted_cholesky_batched_hermitian(
         raise ValueError("mesh must be a positive grid shape matching diag.")
     if (
         rank <= 0 or rank > diag.size or batch_size <= 0 or min_separation < 0
+        or isinstance(candidate_oversampling, bool)
+        or not isinstance(candidate_oversampling, (int, np.integer))
+        or candidate_oversampling <= 0
         or isinstance(n_topup, bool) or not isinstance(n_topup, (int, np.integer))
         or n_topup < 0 or n_topup > rank
     ):
-        raise ValueError("invalid rank, batch_size, min_separation, or n_topup.")
+        raise ValueError(
+            "invalid rank, batch_size, min_separation, candidate_oversampling, or n_topup."
+        )
+    candidate_oversampling = int(candidate_oversampling)
     n_topup = int(n_topup)
     initial_max = float(np.max(diag))
     if initial_max <= 0:
@@ -665,7 +672,8 @@ def pivoted_cholesky_batched_hermitian(
     rounds = []
     batched_rank = rank - n_topup
     while len(pivots) < batched_rank:
-        requested = min(batch_size, batched_rank - len(pivots))
+        retain_count = min(batch_size, batched_rank - len(pivots))
+        requested = min(candidate_oversampling * retain_count, diag.size - len(pivots))
         candidates = _batch_candidates(
             diag, selected, requested, mesh, min_separation, ramp,
         )
@@ -681,7 +689,7 @@ def pivoted_cholesky_batched_hermitian(
         local_diag = np.maximum(np.real(np.diag(residual_batch)), 0.0)
         local_pivots, _, local_count = pivoted_cholesky_hermitian(
             local_diag, lambda index: residual_batch[:, index],
-            rank=min(candidates.size, rank - len(pivots)), rcond=rcond,
+            rank=min(candidates.size, retain_count), rcond=rcond,
             ramp_scale=ramp_scale,
         )
         retained = []

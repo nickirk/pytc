@@ -212,6 +212,27 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertEqual(rounds[-1]["mode"], "exact_topup")
         self.assertEqual(rounds[-1]["n_requested"], 7)
 
+    def test_batched_selector_oversampling_keeps_batch_rank(self):
+        rng = np.random.default_rng(52)
+        feature = rng.normal(size=(18, 9)) + 1j * rng.normal(size=(18, 9))
+        metric = feature @ feature.conj().T
+        diagonal = np.real(np.diag(metric))
+        calls = []
+
+        def batch_columns(indices):
+            calls.append(np.asarray(indices).copy())
+            return metric[:, indices]
+
+        pivots, _, count, rounds = pivoted_cholesky_batched_hermitian(
+            diagonal, batch_columns, rank=8, mesh=(3, 3, 2), batch_size=4,
+            candidate_oversampling=2, min_separation=0.0,
+        )
+        self.assertEqual(count, 8)
+        self.assertEqual(len(pivots), 8)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(len(indices) == 8 for indices in calls))
+        self.assertTrue(all(len(round_["retained_pivots"]) == 4 for round_ in rounds))
+
     def test_batched_streamed_and_cached_columns_match(self):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
