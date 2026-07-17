@@ -726,7 +726,9 @@ class ISDFDF:
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
-                 selection_mode="streamed", fixed_pivots=None):
+                 selection_mode="streamed", fixed_pivots=None, bpc_batch_size=16,
+                 bpc_min_separation=2.0, bpc_candidate_oversampling=1,
+                 bpc_n_topup=0):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -735,6 +737,10 @@ class ISDFDF:
         self.retention_mode = retention_mode
         self.selection_mode = selection_mode
         self.fixed_pivots = None if fixed_pivots is None else np.asarray(fixed_pivots)
+        self.bpc_batch_size = bpc_batch_size
+        self.bpc_min_separation = bpc_min_separation
+        self.bpc_candidate_oversampling = bpc_candidate_oversampling
+        self.bpc_n_topup = bpc_n_topup
         self._built = None
         self._ao2mo_call_count = 0
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
@@ -758,6 +764,10 @@ class ISDFDF:
                 rtol=self.rtol, retention_mode=self.retention_mode,
                 selection_mode=self.selection_mode,
                 fixed_pivots=self.fixed_pivots,
+                bpc_batch_size=self.bpc_batch_size,
+                bpc_min_separation=self.bpc_min_separation,
+                bpc_candidate_oversampling=self.bpc_candidate_oversampling,
+                bpc_n_topup=self.bpc_n_topup,
             )
         return self._built
 

@@ -3,6 +3,7 @@ unmodified pyscf KRHF runs consuming our integrals via with_df -- not
 synthetic get_jk mocks."""
 
 import unittest
+from unittest.mock import patch
 
 import jax
 
@@ -12,6 +13,7 @@ from pyscf.pbc.gto import Cell
 from pyscf.pbc import mp
 from pyscf.pbc.scf import KRHF
 
+import pytc.pbc.coulomb as coulomb
 from pytc.pbc.coulomb import ISDFDF, get_mo_eri
 from pytc.pbc.df.isdf import build_periodic_pivot_oracle, pivoted_cholesky_hermitian
 from pytc.pbc.df.kpts import build_kconserv, canonicalize_kpts
@@ -31,6 +33,23 @@ def _make_cell():
 
 
 class TestISDFDFStructure(unittest.TestCase):
+    def test_build_forwards_bpc_selection_configuration(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        adapter = ISDFDF(
+            cell, kpts, rank=4, block_size=100, selection_mode="bpc_streamed",
+            bpc_batch_size=8, bpc_min_separation=2.0,
+            bpc_candidate_oversampling=4, bpc_n_topup=16,
+        )
+        sentinel = {"sentinel": True}
+        with patch.object(coulomb, "build", return_value=sentinel) as mocked_build:
+            self.assertIs(adapter.build(), sentinel)
+        self.assertEqual(mocked_build.call_args.kwargs["selection_mode"], "bpc_streamed")
+        self.assertEqual(mocked_build.call_args.kwargs["bpc_batch_size"], 8)
+        self.assertEqual(mocked_build.call_args.kwargs["bpc_min_separation"], 2.0)
+        self.assertEqual(mocked_build.call_args.kwargs["bpc_candidate_oversampling"], 4)
+        self.assertEqual(mocked_build.call_args.kwargs["bpc_n_topup"], 16)
+
     def test_get_jk_rejects_omega(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
