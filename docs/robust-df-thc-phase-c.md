@@ -62,19 +62,27 @@ pair collocation is only a mathematical definition in this note:
 C[(ac),m] = P[a,m] P[c,m].
 G = C^T C = (P^T P) elementwise-times (P^T P).
 X[m,Q] = (C^T B)[m,Q] = sum_a,c P[a,m] P[c,m] B[a,c,Q].
-Y = G^+ X, with the explicit FP64 rcond retained in the diagnostic record.
+Y = G^+ X.
 ```
 
 `X` is accumulated over an `a` panel from the metric-applied DF source.  The
 implementation holds `P`, `G`, `X/Y`, and source/panel tensors but never
 constructs `C[v^2,r]`, a fitted `B_tilde[v^2,Q]`, or `V[a,c,b,d]`.
 
+The requested `rcond` is retained verbatim.  Because the implicit route uses
+an FP64 normal equation (`G` squares the singular spectrum), it also reports
+`normal_equation_resolution_rcond=sqrt(eps)` and uses
+`resolved_rcond=max(requested_rcond, sqrt(eps))` for its effective rank and
+condition number.  This is deliberately not claimed to reproduce arbitrary
+dense-C SVD rank semantics below that resolution floor.
+
 For a rank panel `(m,n)` and auxiliary panel `Qp`, the contractions are:
 
 ```text
 T_ijmd = sum_c t2_ijcd P_cm
-left-cross_ijab  = sum_m,Q,d P_am Y_mQ B_bdQ T_ijmd
-right-cross_ijab = sum_n,Q,c B_acQ Y_nQ (sum_d t2_ijcd P_dn)
+D_bdm = sum_Q B_bdQ Y_mQ                 # accumulated over Q panels
+left-cross_ijab  = sum_m,d P_am T_ijmd D_bdm
+right-cross_ijab = sum_m,c D_acm (sum_d t2_ijcd P_dm) P_bm
 
 Z_ijmn = sum_c,d P_cm t2_ijcd P_dn
 M_mn   = sum_Q Y_mQ Y_nQ
@@ -83,10 +91,14 @@ full_ijab = sum_m,n P_am Z_ijmn M_mn P_bn
 robust_ijab = left-cross_ijab + right-cross_ijab - full_ijab.
 ```
 
-The independent exact source term is also evaluated in auxiliary panels as
-`B_Q @ t2 @ B_Q.T`.  Both partial-THC terms are retained separately in the
-test API so the sign and RCCSD pair-swap relation can be audited before their
-subtraction.  This is a source/algebra prototype only; it does not change
+`D[v,v,rank_panel]` is built before either occupied-pair contraction and is
+shared by the two pair orders.  Thus no partial-THC intermediate has both an
+occupied pair and an auxiliary-panel axis.  The independent exact source term
+is still evaluated in auxiliary panels as `B_Q @ t2 @ B_Q.T`, solely as a
+small diagnostic oracle; it is not part of the proposed lower-scaling robust
+route.  Both partial-THC terms are retained separately in the test API so the
+sign and RCCSD pair-swap relation can be audited before their subtraction.
+This is a source/algebra prototype only; it does not change
 `pytc/solver/xtc_ccsd.py` or introduce a production call site.
 
 ## Deterministic dense-oracle gate
@@ -104,8 +116,12 @@ exact - robust = sandwich(B - B_tilde, B - B_tilde, t2)
 
 and verifies the RCCSD pair swap
 `left-cross[i,j,a,b] = right-cross[j,i,b,a]` plus pair symmetry of exact,
-full, and robust results.  The seeded source arrays are canonical FP64
-fingerprinted so the oracle coordinates are explicit:
+full, and robust results.  It also compares two non-dividing rank/auxiliary
+panel pairs and carries a source-faithful `v=3,r=8,q=5` overcomplete case
+against dense-C SVD using the explicitly reported resolved normal-equation
+rule; it validates effective rank, represented fitted action, and robust
+sandwich.  The seeded source arrays are canonical FP64 fingerprinted so the
+oracle coordinates are explicit:
 
 | input | shape | canonical SHA-256 |
 | --- | --- | --- |
@@ -125,7 +141,7 @@ actual contraction-order leading counts used by the test-only ledger:
 | fit: panelled `C^T B` | `2 v^2 r q` |
 | fit: eigensolve / project-back | `r^3 + 4 r^2 q` |
 | exact DF sandwich | `4 o^2 v^3 q` |
-| both partial-THC cross terms | `8 o^2 r v^2 + 4 o^2 r v^2 q + 4 o^2 r v q` |
+| both partial-THC cross terms | shared endpoint `2 v^2 r q` + PPL `12 o^2 r v^2` |
 | full-THC subtraction | `4 o^2 v^2 r + 4 o^2 v r^2 + 2 r^2 q + o^2 r^2` |
 
 The `phase_c_shape_flop_memory_ledger` helper records every listed tensor in
@@ -138,7 +154,7 @@ could expose.  The test-only audit API keeps five `t2`-shaped outputs
 The corresponding conservative live-element estimates are, respectively,
 `4r^2 + 2rq` for the fit excluding its immutable source, plus either `v^2q`
 (in-core source) or `v^2qp` (streamed source panel); `o^2v^2(1+qp)` for the
-exact contraction; `o^2v^2 + o^2rpv + o^2rpvqp` for one partial cross term;
+exact contraction; `o^2v^2 + o^2rpv + v^2rp` for one partial cross term;
 and `o^2v^2 + 2o^2rpv + 2o^2rp^2 + rp^2` for full-THC.  The audit-API peak is
 also recorded separately because retaining all five output tensors is a test
 diagnostic, not a target implementation policy.

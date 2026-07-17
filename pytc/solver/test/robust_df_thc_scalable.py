@@ -17,6 +17,7 @@ from numpy.typing import NDArray
 
 
 Float64Array = NDArray[np.float64]
+NORMAL_EQUATION_RESOLUTION_RCOND = float(np.sqrt(np.finfo(np.float64).eps))
 
 
 def _as_fp64(name: str, value: object, ndim: int) -> Float64Array:
@@ -41,7 +42,11 @@ class ScalableLSTHCFit:
     y: Float64Array
     gram: Float64Array
     cross: Float64Array
+    # Requested dense-C/SVD threshold; the implicit normal-equation floor is
+    # retained separately for rank/conditioning provenance.
     rcond: float
+    resolved_rcond: float
+    normal_equation_resolution_rcond: float
     effective_rank: int
     singular_values: Float64Array
     singular_max: float
@@ -75,9 +80,10 @@ def fit_panelled_lsthc(
     ``(C.T @ B)[m,Q] = sum_ac P[a,m] P[c,m] B[a,c,Q]``.
 
     The latter is accumulated over the first virtual axis, so only a native
-    ``B[a_panel,c,Q]`` source panel is consumed at a time.  The retained
-    eigenspace matches the dense least-squares ``rcond`` rule in singular
-    value units.
+    ``B[a_panel,c,Q]`` source panel is consumed at a time.  Normal equations
+    square the singular spectrum, so FP64 ``G`` cannot honestly resolve a
+    dense-C/SVD threshold below ``sqrt(eps)``.  The requested threshold and
+    ``resolved_rcond=max(requested, sqrt(eps))`` are both reported.
     """
 
     p = _as_fp64("p_virtual", p_virtual, 2)
@@ -105,7 +111,8 @@ def fit_panelled_lsthc(
     eigenvectors = eigenvectors[:, order]
     singular_values = np.sqrt(eigenvalues)
     singular_max = float(singular_values[0]) if rank else 0.0
-    keep = singular_values > float(rcond) * singular_max
+    resolved_rcond = max(float(rcond), NORMAL_EQUATION_RESOLUTION_RCOND)
+    keep = singular_values > resolved_rcond * singular_max
     effective_rank = int(np.count_nonzero(keep))
     if effective_rank:
         kept_vectors = eigenvectors[:, keep]
@@ -124,6 +131,8 @@ def fit_panelled_lsthc(
         gram=gram,
         cross=cross,
         rcond=float(rcond),
+        resolved_rcond=resolved_rcond,
+        normal_equation_resolution_rcond=NORMAL_EQUATION_RESOLUTION_RCOND,
         effective_rank=effective_rank,
         singular_values=singular_values,
         singular_max=singular_max,
@@ -173,54 +182,41 @@ def _exact_df_panelled(
     return out
 
 
-def _fit_left_df_right_panelled(
+def _partial_thc_crosses_panelled(
     b: Float64Array,
     fit: ScalableLSTHCFit,
     t2: Float64Array,
     rank_panel: int,
     aux_panel: int,
-) -> Float64Array:
-    """``B_tilde[a,c,Q] B[b,d,Q] t2[ij,c,d]`` in rank/aux panels."""
+) -> tuple[Float64Array, Float64Array]:
+    """Return both partial-THC crosses with a precontracted DF endpoint.
+
+    For a rank panel, ``D[b,d,m] = sum_Q B[b,d,Q] Y[m,Q]`` is accumulated
+    before the occupied-pair contractions.  Thus neither pair order ever
+    retains an ``(ij,m,b,Qp)`` or ``(ij,a,m,Qp)`` intermediate; the endpoint
+    is only ``D[v,v,m_panel]`` and is shared by both source pair orders.
+    """
 
     p = fit.p_virtual
-    out = np.zeros_like(t2)
+    fit_left_df_right = np.zeros_like(t2)
+    df_left_fit_right = np.zeros_like(t2)
     for m0 in range(0, p.shape[1], rank_panel):
         m1 = min(m0 + rank_panel, p.shape[1])
         p_panel = p[:, m0:m1]
-        tau_projected = np.einsum("ijcd,cm->ijmd", t2, p_panel, optimize=True)
+        endpoint = np.zeros((b.shape[0], b.shape[1], m1 - m0), dtype=np.float64)
         for q0 in range(0, b.shape[2], aux_panel):
             q1 = min(q0 + aux_panel, b.shape[2])
-            right = np.einsum(
-                "ijmd,bdq->ijmbq", tau_projected, b[:, :, q0:q1], optimize=True
+            endpoint += np.einsum(
+                "bdq,mq->bdm", b[:, :, q0:q1], fit.y[m0:m1, q0:q1], optimize=True
             )
-            right *= fit.y[m0:m1, q0:q1][None, None, :, None, :]
-            out += np.einsum("am,ijmb->ijab", p_panel, right.sum(axis=-1), optimize=True)
-    return out
+        tau_left = np.einsum("ijcd,cm->ijmd", t2, p_panel, optimize=True)
+        right = np.einsum("ijmd,bdm->ijmb", tau_left, endpoint, optimize=True)
+        fit_left_df_right += np.einsum("am,ijmb->ijab", p_panel, right, optimize=True)
 
-
-def _df_left_fit_right_panelled(
-    b: Float64Array,
-    fit: ScalableLSTHCFit,
-    t2: Float64Array,
-    rank_panel: int,
-    aux_panel: int,
-) -> Float64Array:
-    """``B[a,c,Q] B_tilde[b,d,Q] t2[ij,c,d]`` in rank/aux panels."""
-
-    p = fit.p_virtual
-    out = np.zeros_like(t2)
-    for n0 in range(0, p.shape[1], rank_panel):
-        n1 = min(n0 + rank_panel, p.shape[1])
-        p_panel = p[:, n0:n1]
-        tau_projected = np.einsum("ijcd,dn->ijcn", t2, p_panel, optimize=True)
-        for q0 in range(0, b.shape[2], aux_panel):
-            q1 = min(q0 + aux_panel, b.shape[2])
-            left = np.einsum(
-                "acq,ijcn->ijanq", b[:, :, q0:q1], tau_projected, optimize=True
-            )
-            left *= fit.y[n0:n1, q0:q1][None, None, None, :, :]
-            out += np.einsum("bn,ijan->ijab", p_panel, left.sum(axis=-1), optimize=True)
-    return out
+        tau_right = np.einsum("ijcd,dm->ijcm", t2, p_panel, optimize=True)
+        left = np.einsum("acm,ijcm->ijam", endpoint, tau_right, optimize=True)
+        df_left_fit_right += np.einsum("bm,ijam->ijab", p_panel, left, optimize=True)
+    return fit_left_df_right, df_left_fit_right
 
 
 def _full_thc_panelled(
@@ -271,10 +267,7 @@ def direct_df_sandwiches_panelled(
         b, fit, t2, rank_panel=rank_panel, aux_panel=aux_panel
     )
     exact = _exact_df_panelled(df_factor, amplitudes, resolved_aux_panel)
-    fit_left_df_right = _fit_left_df_right_panelled(
-        df_factor, fit, amplitudes, resolved_rank_panel, resolved_aux_panel
-    )
-    df_left_fit_right = _df_left_fit_right_panelled(
+    fit_left_df_right, df_left_fit_right = _partial_thc_crosses_panelled(
         df_factor, fit, amplitudes, resolved_rank_panel, resolved_aux_panel
     )
     full_thc = _full_thc_panelled(
@@ -324,7 +317,8 @@ def phase_c_shape_flop_memory_ledger(
         "fit_cross_panel_live": m * q_panel,
         "exact_aux_panel_live": o * o * v * v * q_panel,
         "partial_t2_rank_projection_live": o * o * m * v,
-        "partial_cross_panel_live": o * o * m * v * q_panel,
+        "partial_df_y_endpoint_live": v * v * m,
+        "partial_rank_to_virtual_live": o * o * m * v,
         "full_thc_rank_pair_live": o * o * m * m,
         "full_thc_rank_to_virtual_live": o * o * m * v,
     }
@@ -337,11 +331,10 @@ def phase_c_shape_flop_memory_ledger(
     contraction_flops = {
         # Per Q: B_Q @ t2 @ B_Q.T, evaluated as two v-by-v products.
         "exact_df": 4 * o * o * v * v * v * q,
-        # Each cross term has P-projection, DF contraction, Q reduction,
-        # and endpoint projection.  Both terms have this same cost.
-        "both_partial_thc_cross_terms": 8 * o * o * r * v * v
-        + 4 * o * o * r * v * v * q
-        + 4 * o * o * r * v * q,
+        # Build D[b,d,m] = sum_Q B[b,d,Q] Y[m,Q] once, then use it for
+        # both pair orders.  No occupied-pair intermediate carries Q.
+        "both_partial_thc_cross_terms": 2 * v * v * r * q
+        + 12 * o * o * r * v * v,
         "full_thc_subtraction": 2 * o * o * v * v * r
         + 2 * o * o * v * r * r
         + 2 * r * r * q
@@ -359,7 +352,7 @@ def phase_c_shape_flop_memory_ledger(
         "one_partial_cross_term": (
             o * o * v * v
             + o * o * m * v
-            + o * o * m * v * q_panel
+            + v * v * m
         ),
         "full_thc_subtraction": (
             o * o * v * v
@@ -374,7 +367,7 @@ def phase_c_shape_flop_memory_ledger(
             5 * o * o * v * v
             + max(
                 o * o * v * v * q_panel,
-                o * o * m * v * q_panel,
+                o * o * m * v + v * v * m,
                 2 * o * o * m * v + 2 * o * o * m * m + m * m,
             )
         ),

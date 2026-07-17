@@ -12,6 +12,7 @@ from pytc.solver.test.robust_df_thc_h10_fingerprint import (
     canonical_array_fingerprint,
 )
 from pytc.solver.test.robust_df_thc_scalable import (
+    NORMAL_EQUATION_RESOLUTION_RCOND,
     direct_df_sandwiches_panelled,
     fit_panelled_lsthc,
     phase_c_shape_flop_memory_ledger,
@@ -49,6 +50,10 @@ class TestPanelledRobustDFTHCOracle(unittest.TestCase):
     def test_panelled_fit_matches_dense_weights_rank_and_conditioning(self):
         self.assertEqual(self.fit.effective_rank, self.dense_model.effective_rank)
         self.assertEqual(self.fit.rcond, self.dense_model.rcond)
+        self.assertEqual(
+            self.fit.resolved_rcond,
+            max(self.rcond, NORMAL_EQUATION_RESOLUTION_RCOND),
+        )
         np.testing.assert_allclose(
             self.fit.y, self.dense_model.weights, rtol=1e-11, atol=1e-11
         )
@@ -121,6 +126,70 @@ class TestPanelledRobustDFTHCOracle(unittest.TestCase):
                 value, value.transpose(pair_swap), rtol=1e-11, atol=1e-11
             )
 
+    def test_irregular_rank_and_auxiliary_panels_are_invariant(self):
+        """Both choices deliberately leave tails on rank and auxiliary axes."""
+
+        first = direct_df_sandwiches_panelled(
+            self.b, self.fit, self.t2, rank_panel=3, aux_panel=4
+        )
+        second = direct_df_sandwiches_panelled(
+            self.b, self.fit, self.t2, rank_panel=3, aux_panel=5
+        )
+        for name in (
+            "exact",
+            "fit_left_df_right",
+            "df_left_fit_right",
+            "full_thc",
+            "robust",
+        ):
+            np.testing.assert_allclose(
+                getattr(first, name), getattr(second, name), rtol=1e-11, atol=1e-11
+            )
+
+    def test_overcomplete_source_uses_reported_normal_equation_resolution_floor(self):
+        """Rank provenance must not retain Gram-roundoff modes as LS modes."""
+
+        rng = np.random.default_rng(20260717)
+        nvir, rank, naux, nocc = 3, 8, 5, 2
+        p = rng.normal(size=(nvir, rank)).astype(np.float64)
+        b_raw = rng.normal(size=(nvir, nvir, naux)).astype(np.float64)
+        b = 0.5 * (b_raw + b_raw.swapaxes(0, 1))
+        t2_raw = rng.normal(size=(nocc, nocc, nvir, nvir)).astype(np.float64)
+        t2 = 0.5 * (t2_raw + t2_raw.transpose(1, 0, 3, 2))
+
+        fit = fit_panelled_lsthc(p, b, rcond=1.0e-12, virtual_panel=2)
+        dense = robust_df_thc.build_robust_df_thc_model(
+            b, p, rcond=fit.resolved_rcond
+        )
+        represented_b_tilde = np.einsum(
+            "am,cm,mq->acq", p, p, fit.y, optimize=True
+        )
+        panelled = direct_df_sandwiches_panelled(
+            b, fit, t2, rank_panel=3, aux_panel=2
+        )
+        dense_sandwiches = robust_df_thc.direct_df_sandwiches(dense, t2)
+
+        self.assertEqual(fit.rcond, 1.0e-12)
+        self.assertEqual(fit.normal_equation_resolution_rcond, NORMAL_EQUATION_RESOLUTION_RCOND)
+        self.assertEqual(fit.resolved_rcond, NORMAL_EQUATION_RESOLUTION_RCOND)
+        self.assertEqual(fit.effective_rank, dense.effective_rank)
+        self.assertEqual(fit.effective_rank, nvir * (nvir + 1) // 2)
+        np.testing.assert_allclose(
+            represented_b_tilde,
+            dense.b_tilde.reshape(nvir, nvir, naux),
+            rtol=1e-11,
+            atol=1e-11,
+        )
+        np.testing.assert_allclose(
+            panelled.exact, dense_sandwiches.exact, rtol=1e-11, atol=1e-11
+        )
+        np.testing.assert_allclose(
+            panelled.full_thc, dense_sandwiches.lsthc, rtol=1e-11, atol=1e-11
+        )
+        np.testing.assert_allclose(
+            panelled.robust, dense_sandwiches.robust, rtol=1e-11, atol=1e-11
+        )
+
     def test_seeded_random_inputs_have_canonical_fp64_fingerprints(self):
         fingerprints = {
             "b": canonical_array_fingerprint(self.b),
@@ -153,6 +222,8 @@ class TestPanelledRobustDFTHCOracle(unittest.TestCase):
         self.assertNotIn("scalar_pair_collocation(", source)
         self.assertNotIn("virtual_pair_df_matrix(", source)
         self.assertNotIn("build_robust_df_thc_model(", source)
+        self.assertNotIn("ijmbq", source)
+        self.assertNotIn("ijanq", source)
 
 
 class TestPhaseCShapeFlopMemoryLedger(unittest.TestCase):
@@ -173,6 +244,10 @@ class TestPhaseCShapeFlopMemoryLedger(unittest.TestCase):
         self.assertEqual(ledger["forbidden_dense_shapes"]["fitted_df_factor_b_tilde"], [25, 180])
         self.assertEqual(ledger["forbidden_dense_shapes"]["vvvv_tensor"], [5, 5, 5, 5])
         self.assertEqual(ledger["fp64_bytes"]["df_source_panel"], 5 * 5 * 31 * 8)
+        self.assertEqual(
+            ledger["fp64_element_shapes"]["partial_df_y_endpoint_live"], 5 * 5 * 17
+        )
+        self.assertNotIn("partial_cross_panel_live", ledger["fp64_element_shapes"])
         self.assertGreater(
             ledger["peak_fp64_bytes_estimate"]["audit_api_all_returned_outputs_plus_largest_term"],
             0,
@@ -180,4 +255,8 @@ class TestPhaseCShapeFlopMemoryLedger(unittest.TestCase):
         self.assertEqual(
             ledger["contraction_leading_flops"]["exact_df"],
             4 * 5 * 5 * 5 * 5 * 5 * 180,
+        )
+        self.assertEqual(
+            ledger["contraction_leading_flops"]["both_partial_thc_cross_terms"],
+            2 * 5 * 5 * 240 * 180 + 12 * 5 * 5 * 240 * 5 * 5,
         )
