@@ -17,6 +17,7 @@ from pytc.pbc.df.isdf import (
     JAXTranslationMatrixFreeCapacityError,
     RawKernelProvider,
     build_cached_periodic_pivot_oracle,
+    build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
     build_coul_kpt_device,
     build_periodic_pivot_oracle,
@@ -85,14 +86,14 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     valid_selection_modes = {
         "jax_cached_matrix_free", "jax_translation_matrix_free", "streamed", "cached_full",
         "panel_dense", "panel_oracle", "fixed_pivots", "reciprocal_same_grid",
-        "bpc_streamed", "bpc_cached_full",
+        "bpc_streamed", "bpc_cached_full", "bpc_cached_gemm",
     }
     if selection_mode not in valid_selection_modes:
         raise ValueError(
             "selection_mode must be 'jax_cached_matrix_free', "
             "'jax_translation_matrix_free', 'streamed', 'cached_full', "
             "'panel_dense', 'panel_oracle', 'fixed_pivots', 'reciprocal_same_grid', "
-            "'bpc_streamed', or 'bpc_cached_full'"
+            "'bpc_streamed', 'bpc_cached_full', or 'bpc_cached_gemm'"
         )
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
@@ -236,6 +237,10 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
         col_batch_eval = lambda indices: periodic_metric_columns_from_ao(cached_ao, indices)
+    elif selection_mode == "bpc_cached_gemm":
+        diag, col_batch_eval, cached_ao = build_cached_periodic_bpc_gemm_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+        )
     else:
         diag, col_eval = build_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
@@ -250,7 +255,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     elif selection_mode == "cached_full":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
         selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
-    elif selection_mode in {"bpc_streamed", "bpc_cached_full"}:
+    elif selection_mode in {"bpc_streamed", "bpc_cached_full", "bpc_cached_gemm"}:
         pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
             batch_size=bpc_batch_size, min_separation=bpc_min_separation,
@@ -265,7 +270,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             "bpc_rounds": rounds,
             "bpc_joint_within_batch_exact_pivoting": True,
         })
-        if selection_mode == "bpc_cached_full":
+        if selection_mode in {"bpc_cached_full", "bpc_cached_gemm"}:
             selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
     else:
         candidates = candidate_panel_indices(diag, rank)

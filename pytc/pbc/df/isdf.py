@@ -1580,6 +1580,29 @@ def periodic_metric_columns_from_ao(ao, indices):
     return (np.abs(gram) ** 2 / ao.shape[0]).T.astype(np.complex128)
 
 
+def build_cached_periodic_bpc_gemm_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
+    """Opt-in contiguous feature cache for BPC's threaded candidate GEMM."""
+    kpts_np = np.asarray(kpts, dtype=np.float64)
+    n_grid = len(grid_coords)
+    n_kpts = len(kpts_np)
+    features = None
+    for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size, stats=stats):
+        if features is None:
+            features = np.empty((n_grid, n_kpts * ao_block.shape[2]), dtype=np.complex128)
+        features[g0:g1] = ao_block.transpose(1, 0, 2).reshape(g1 - g0, -1)
+    pooled = np.sum(np.abs(features) ** 2, axis=1)
+    diag = pooled ** 2 / n_kpts
+
+    def col_batch_eval(indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or indices.size == 0 or np.any(indices < 0) or np.any(indices >= n_grid):
+            raise ValueError("indices must be a nonempty in-range integer vector.")
+        gram = features[indices].conj() @ features.T
+        return (np.abs(gram) ** 2 / n_kpts).T.astype(np.complex128)
+
+    return diag, col_batch_eval, features
+
+
 # ---------------------------------------------------------------------------
 # Staging-policy layer (design doc §6): predicted-byte-model-driven selection
 # among ram/memmap/recompute eta-store policies, plus the mechanics.
