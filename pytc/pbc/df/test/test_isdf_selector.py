@@ -253,6 +253,64 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertTrue(all(len(indices) == 8 for indices in calls))
         self.assertTrue(all(len(round_["retained_pivots"]) == 4 for round_ in rounds))
 
+    def test_blocked_projection_matches_sequential_pivots(self):
+        # task #45: the opt-in BLAS-3 blocked projection/update is a reordering
+        # of the accepted sequential per-pivot factor update, so it must
+        # reproduce the sequential pivots bit-for-bit (residual arbitrates any
+        # summation-order tie) across ranks/oversampling/top-up, and its factor
+        # must agree to fp noise.
+        configs = [
+            dict(seed=1, n=64, true_rank=40, rank=30, batch_size=8,
+                 candidate_oversampling=2, n_topup=4, min_separation=1.0),
+            dict(seed=2, n=64, true_rank=64, rank=48, batch_size=16,
+                 candidate_oversampling=1, n_topup=0, min_separation=0.0),
+            dict(seed=3, n=81, true_rank=50, rank=40, batch_size=8,
+                 candidate_oversampling=3, n_topup=8, min_separation=1.5),
+            dict(seed=4, n=100, true_rank=100, rank=60, batch_size=16,
+                 candidate_oversampling=2, n_topup=10, min_separation=0.0),
+        ]
+        for cfg in configs:
+            rng = np.random.default_rng(cfg["seed"])
+            metric = _random_psd(rng, cfg["n"], cfg["true_rank"])
+            diagonal = np.real(np.diag(metric))
+            side = int(round(cfg["n"] ** 0.5))
+            mesh = (side, cfg["n"] // side, 1)
+            self.assertEqual(mesh[0] * mesh[1], cfg["n"])
+            kw = dict(
+                mesh=mesh, batch_size=cfg["batch_size"],
+                min_separation=cfg["min_separation"],
+                candidate_oversampling=cfg["candidate_oversampling"],
+                n_topup=cfg["n_topup"],
+            )
+
+            def columns(indices):
+                return metric[:, indices]
+
+            p_seq, f_seq, c_seq, _ = pivoted_cholesky_batched_hermitian(
+                diagonal, columns, rank=cfg["rank"],
+                blocked_projection=False, **kw)
+            p_blk, f_blk, c_blk, _ = pivoted_cholesky_batched_hermitian(
+                diagonal, columns, rank=cfg["rank"],
+                blocked_projection=True, **kw)
+            with self.subTest(**cfg):
+                self.assertEqual(c_blk, c_seq)
+                np.testing.assert_array_equal(p_blk, p_seq)
+                np.testing.assert_allclose(f_blk, f_seq, atol=1e-11, rtol=0)
+                np.testing.assert_allclose(
+                    f_blk @ f_blk.conj().T, f_seq @ f_seq.conj().T, atol=1e-11)
+
+    def test_blocked_projection_reconstructs_metric(self):
+        # Blocked path is a valid partial Cholesky in its own right.
+        rng = np.random.default_rng(77)
+        metric = _random_psd(rng, 25, 25)
+        diagonal = np.real(np.diag(metric))
+        pivots, factor, count, _ = pivoted_cholesky_batched_hermitian(
+            diagonal, lambda indices: metric[:, indices], rank=25,
+            mesh=(5, 5, 1), batch_size=6, candidate_oversampling=2,
+            n_topup=3, blocked_projection=True)
+        self.assertEqual(count, 25)
+        np.testing.assert_allclose(factor @ factor.conj().T, metric, atol=1e-9)
+
     def test_batched_streamed_and_cached_columns_match(self):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))

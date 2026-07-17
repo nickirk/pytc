@@ -634,7 +634,7 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
 def pivoted_cholesky_batched_hermitian(
     diag, col_batch_eval, rank, *, mesh, batch_size, min_separation=2.0,
     candidate_oversampling=1, n_topup=0, rcond=1e-12, ramp_scale=1e-12,
-    stage_stats=None,
+    stage_stats=None, blocked_projection=False,
 ):
     """Approximate greedy selection with exact batched columns and updates.
 
@@ -704,24 +704,76 @@ def pivoted_cholesky_batched_hermitian(
         within_batch_seconds = time.perf_counter() - within_batch_started
         retained = []
         factor_update_seconds = 0.0
-        for local_index in local_pivots[:local_count]:
-            index = int(candidates[local_index])
-            if selected[index] or diag[index] <= threshold:
-                continue
-            projection_started = time.perf_counter()
-            correction = existing @ existing[index].conj() if pivots else 0.0
-            projection_seconds += time.perf_counter() - projection_started
-            factor_update_started = time.perf_counter()
-            vector = (columns[:, local_index] - correction) / np.sqrt(diag[index])
-            factor[:, len(pivots)] = vector
-            diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
-            factor_update_seconds += time.perf_counter() - factor_update_started
-            selected[index] = True
-            pivots.append(index)
-            retained.append(index)
+        if blocked_projection:
+            # --- Blocked BLAS-3 projection + update (task #45): replicate the
+            # sequential per-pivot arithmetic below as three level-3 ops.
+            #   (a) pre-round-L correction: block = columns - L @ conj(L[idx]).T
+            #       (one (Ng x p) x (p x m) zGEMM against pre-round L only);
+            #   (b) round-mate orthogonalization via the within-batch Cholesky
+            #       R (R^H R = the retained sub-Gram of residual_batch, i.e. the
+            #       same factorization the sequential loop performs implicitly):
+            #       block = V R  =>  V = block R^{-1} by one triangular solve;
+            #   (c) one blocked diagonal update, diag -= sum(|V|^2, axis=1),
+            #       which sums the retained columns in the same order as the
+            #       sequential loop.
+            # local_pivots / candidate residual Gram are byte-for-byte the same,
+            # so this is a reordering of identical arithmetic; the only fp delta
+            # is R's Gram recursion vs the sequential coefficient accumulation,
+            # residual-arbitrated on any pivot tie.
+            from scipy.linalg import solve_triangular
+            retained_local = []
+            for local_index in local_pivots[:local_count]:
+                index = int(candidates[local_index])
+                if selected[index] or diag[index] <= threshold:
+                    continue
+                retained_local.append(int(local_index))
+                selected[index] = True
+                pivots.append(index)
+                retained.append(index)
+                if len(pivots) == rank:
+                    break
+            m = len(retained_local)
+            if m:
+                p0 = len(pivots) - m
+                retained_local = np.asarray(retained_local, dtype=np.int64)
+                retained_idx = candidates[retained_local]
+                projection_started = time.perf_counter()
+                block = np.array(columns[:, retained_local], dtype=np.complex128)
+                if p0:
+                    factor_L = factor[:, :p0]
+                    block -= factor_L @ factor_L[retained_idx].conj().T
+                projection_seconds += time.perf_counter() - projection_started
+                factor_update_started = time.perf_counter()
+                gram = residual_batch[np.ix_(retained_local, retained_local)]
+                upper_R = np.linalg.cholesky(gram).conj().T
+                block_factor = solve_triangular(
+                    upper_R.T, block.T, lower=True,
+                ).T
+                factor[:, p0:p0 + m] = block_factor
+                diag = np.maximum(
+                    diag - np.sum(np.abs(block_factor) ** 2, axis=1), 0.0,
+                )
+                factor_update_seconds += time.perf_counter() - factor_update_started
             existing = factor[:, :len(pivots)]
-            if len(pivots) == rank:
-                break
+        else:
+            for local_index in local_pivots[:local_count]:
+                index = int(candidates[local_index])
+                if selected[index] or diag[index] <= threshold:
+                    continue
+                projection_started = time.perf_counter()
+                correction = existing @ existing[index].conj() if pivots else 0.0
+                projection_seconds += time.perf_counter() - projection_started
+                factor_update_started = time.perf_counter()
+                vector = (columns[:, local_index] - correction) / np.sqrt(diag[index])
+                factor[:, len(pivots)] = vector
+                diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
+                factor_update_seconds += time.perf_counter() - factor_update_started
+                selected[index] = True
+                pivots.append(index)
+                retained.append(index)
+                existing = factor[:, :len(pivots)]
+                if len(pivots) == rank:
+                    break
         rounds.append({
             "requested_candidates": candidates.tolist(),
             "within_batch_pivots": [int(candidates[index]) for index in local_pivots[:local_count]],
