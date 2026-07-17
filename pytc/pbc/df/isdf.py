@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import time
 from functools import partial
 
 import jax
@@ -633,6 +634,7 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
 def pivoted_cholesky_batched_hermitian(
     diag, col_batch_eval, rank, *, mesh, batch_size, min_separation=2.0,
     candidate_oversampling=1, n_topup=0, rcond=1e-12, ramp_scale=1e-12,
+    stage_stats=None,
 ):
     """Approximate greedy selection with exact batched columns and updates.
 
@@ -659,6 +661,8 @@ def pivoted_cholesky_batched_hermitian(
         raise ValueError(
             "invalid rank, batch_size, min_separation, candidate_oversampling, or n_topup."
         )
+    if stage_stats is not None and not isinstance(stage_stats, list):
+        raise ValueError("stage_stats must be a list when supplied.")
     candidate_oversampling = int(candidate_oversampling)
     n_topup = int(n_topup)
     initial_max = float(np.max(diag))
@@ -679,28 +683,39 @@ def pivoted_cholesky_batched_hermitian(
         )
         if candidates.size == 0 or diag[candidates[0]] <= threshold:
             break
+        candidate_started = time.perf_counter()
         columns = np.asarray(col_batch_eval(candidates), dtype=np.complex128)
+        candidate_seconds = time.perf_counter() - candidate_started
         if columns.shape != (diag.size, candidates.size):
             raise ValueError("col_batch_eval must return shape (n_grid, n_batch).")
         existing = factor[:, :len(pivots)]
+        projection_started = time.perf_counter()
         residual_batch = columns[candidates]
         if pivots:
             residual_batch = residual_batch - existing[candidates] @ existing[candidates].conj().T
+        projection_seconds = time.perf_counter() - projection_started
         local_diag = np.maximum(np.real(np.diag(residual_batch)), 0.0)
+        within_batch_started = time.perf_counter()
         local_pivots, _, local_count = pivoted_cholesky_hermitian(
             local_diag, lambda index: residual_batch[:, index],
             rank=min(candidates.size, retain_count), rcond=rcond,
             ramp_scale=ramp_scale,
         )
+        within_batch_seconds = time.perf_counter() - within_batch_started
         retained = []
+        factor_update_seconds = 0.0
         for local_index in local_pivots[:local_count]:
             index = int(candidates[local_index])
             if selected[index] or diag[index] <= threshold:
                 continue
+            projection_started = time.perf_counter()
             correction = existing @ existing[index].conj() if pivots else 0.0
+            projection_seconds += time.perf_counter() - projection_started
+            factor_update_started = time.perf_counter()
             vector = (columns[:, local_index] - correction) / np.sqrt(diag[index])
             factor[:, len(pivots)] = vector
             diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
+            factor_update_seconds += time.perf_counter() - factor_update_started
             selected[index] = True
             pivots.append(index)
             retained.append(index)
@@ -712,6 +727,15 @@ def pivoted_cholesky_batched_hermitian(
             "within_batch_pivots": [int(candidates[index]) for index in local_pivots[:local_count]],
             "retained_pivots": retained,
         })
+        if stage_stats is not None:
+            stage_stats.append({
+                "stage": "batched", "round_index": len(rounds) - 1,
+                "candidate_count": int(candidates.size), "retained_count": len(retained),
+                "candidate_eval_seconds": candidate_seconds,
+                "projection_seconds": projection_seconds,
+                "within_batch_pivot_seconds": within_batch_seconds,
+                "factor_update_seconds": factor_update_seconds,
+            })
         if not retained:
             break
     topup_start_max_index = None
@@ -730,17 +754,32 @@ def pivoted_cholesky_batched_hermitian(
         index = int(np.argmax(score))
         if diag[index] <= threshold:
             break
+        candidate_started = time.perf_counter()
         column = np.asarray(col_batch_eval(np.asarray([index], dtype=np.int64)), dtype=np.complex128)
+        candidate_seconds = time.perf_counter() - candidate_started
         if column.shape != (diag.size, 1):
             raise ValueError("col_batch_eval singleton must return shape (n_grid, 1).")
         existing = factor[:, :len(pivots)]
+        projection_started = time.perf_counter()
         correction = existing @ existing[index].conj() if pivots else 0.0
+        projection_seconds = time.perf_counter() - projection_started
+        factor_update_started = time.perf_counter()
         vector = (column[:, 0] - correction) / np.sqrt(diag[index])
         factor[:, len(pivots)] = vector
         diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
+        factor_update_seconds = time.perf_counter() - factor_update_started
         selected[index] = True
         pivots.append(index)
         topup_pivots.append(index)
+        if stage_stats is not None:
+            stage_stats.append({
+                "stage": "topup", "round_index": len(topup_pivots) - 1,
+                "candidate_count": 1, "retained_count": 1,
+                "candidate_eval_seconds": candidate_seconds,
+                "projection_seconds": projection_seconds,
+                "within_batch_pivot_seconds": 0.0,
+                "factor_update_seconds": factor_update_seconds,
+            })
     if n_topup:
         rounds.append({
             "mode": "exact_topup",

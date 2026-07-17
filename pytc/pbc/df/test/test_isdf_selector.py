@@ -212,6 +212,25 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertEqual(rounds[-1]["mode"], "exact_topup")
         self.assertEqual(rounds[-1]["n_requested"], 7)
 
+    def test_batched_selector_stage_stats_are_observational(self):
+        rng = np.random.default_rng(113)
+        feature = rng.normal(size=(12, 8)) + 1j * rng.normal(size=(12, 8))
+        metric = feature @ feature.conj().T
+        stats = []
+        pivots, _, count, _ = pivoted_cholesky_batched_hermitian(
+            np.real(np.diag(metric)), lambda indices: metric[:, indices], rank=7,
+            mesh=(3, 4, 1), batch_size=4, n_topup=2, stage_stats=stats,
+        )
+        self.assertEqual(count, 7)
+        self.assertEqual(len(pivots), 7)
+        self.assertGreaterEqual(len(stats), 4)
+        self.assertEqual([item["stage"] for item in stats[-2:]], ["topup", "topup"])
+        for item in stats:
+            self.assertGreaterEqual(item["candidate_eval_seconds"], 0.0)
+            self.assertGreaterEqual(item["projection_seconds"], 0.0)
+            self.assertGreaterEqual(item["within_batch_pivot_seconds"], 0.0)
+            self.assertGreaterEqual(item["factor_update_seconds"], 0.0)
+
     def test_batched_selector_oversampling_keeps_batch_rank(self):
         rng = np.random.default_rng(52)
         feature = rng.normal(size=(18, 9)) + 1j * rng.normal(size=(18, 9))
