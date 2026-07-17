@@ -632,20 +632,28 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
 
 def pivoted_cholesky_batched_hermitian(
     diag, col_batch_eval, rank, *, mesh, batch_size, min_separation=2.0,
-    rcond=1e-12, ramp_scale=1e-12,
+    n_topup=0, rcond=1e-12, ramp_scale=1e-12,
 ):
     """Approximate greedy selection with exact batched columns and updates.
 
     A batch is chosen from the stale residual diagonal, but its columns are
     exact.  ``pivoted_cholesky_hermitian`` re-pivots the true residual batch
     submatrix before the corresponding global rank-one updates are applied.
+    Optionally, the final ``n_topup`` pivots are selected as exact greedy
+    singleton batches; this repairs final-residual order-statistic error
+    without changing the preceding batched rounds.
     """
     diag = np.asarray(diag, dtype=np.float64)
     mesh = tuple(int(value) for value in mesh)
     if diag.ndim != 1 or np.prod(mesh) != diag.size:
         raise ValueError("mesh must be a positive grid shape matching diag.")
-    if rank <= 0 or rank > diag.size or batch_size <= 0 or min_separation < 0:
-        raise ValueError("invalid rank, batch_size, or min_separation.")
+    if (
+        rank <= 0 or rank > diag.size or batch_size <= 0 or min_separation < 0
+        or isinstance(n_topup, bool) or not isinstance(n_topup, (int, np.integer))
+        or n_topup < 0 or n_topup > rank
+    ):
+        raise ValueError("invalid rank, batch_size, min_separation, or n_topup.")
+    n_topup = int(n_topup)
     initial_max = float(np.max(diag))
     if initial_max <= 0:
         raise ValueError("diag is entirely non-positive.")
@@ -655,8 +663,9 @@ def pivoted_cholesky_batched_hermitian(
     selected = np.zeros(diag.size, dtype=bool)
     pivots = []
     rounds = []
-    while len(pivots) < rank:
-        requested = min(batch_size, rank - len(pivots))
+    batched_rank = rank - n_topup
+    while len(pivots) < batched_rank:
+        requested = min(batch_size, batched_rank - len(pivots))
         candidates = _batch_candidates(
             diag, selected, requested, mesh, min_separation, ramp,
         )
@@ -697,6 +706,41 @@ def pivoted_cholesky_batched_hermitian(
         })
         if not retained:
             break
+    topup_start_max_index = None
+    topup_start_was_last_round_rejected = None
+    if len(pivots) < rank and n_topup:
+        topup_start_max_index = int(np.argmax(np.where(selected, -np.inf, diag + ramp)))
+        if rounds:
+            last_round = rounds[-1]
+            topup_start_was_last_round_rejected = (
+                topup_start_max_index in last_round["requested_candidates"]
+                and topup_start_max_index not in last_round["retained_pivots"]
+            )
+    topup_pivots = []
+    while len(pivots) < rank:
+        score = np.where(selected, -np.inf, diag + ramp)
+        index = int(np.argmax(score))
+        if diag[index] <= threshold:
+            break
+        column = np.asarray(col_batch_eval(np.asarray([index], dtype=np.int64)), dtype=np.complex128)
+        if column.shape != (diag.size, 1):
+            raise ValueError("col_batch_eval singleton must return shape (n_grid, 1).")
+        existing = factor[:, :len(pivots)]
+        correction = existing @ existing[index].conj() if pivots else 0.0
+        vector = (column[:, 0] - correction) / np.sqrt(diag[index])
+        factor[:, len(pivots)] = vector
+        diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
+        selected[index] = True
+        pivots.append(index)
+        topup_pivots.append(index)
+    if n_topup:
+        rounds.append({
+            "mode": "exact_topup",
+            "n_requested": n_topup,
+            "topup_pivots": topup_pivots,
+            "pre_topup_max_index": topup_start_max_index,
+            "pre_topup_max_was_last_round_rejected": topup_start_was_last_round_rejected,
+        })
     return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
 
 

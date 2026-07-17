@@ -51,7 +51,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
           fixed_pivots=None, reciprocal_orbit_partition=None,
           process_pipeline_allowance_bytes=None, bpc_batch_size=16,
-          bpc_min_separation=2.0):
+          bpc_min_separation=2.0, bpc_n_topup=0):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -253,10 +253,12 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
             batch_size=bpc_batch_size, min_separation=bpc_min_separation,
+            n_topup=bpc_n_topup,
         )
         selection_provenance.update({
             "bpc_batch_size": int(bpc_batch_size),
             "bpc_min_separation_grid_units": float(bpc_min_separation),
+            "bpc_n_topup": int(bpc_n_topup),
             "bpc_rounds": rounds,
             "bpc_joint_within_batch_exact_pivoting": True,
         })
