@@ -14,6 +14,7 @@ from pytc.pbc.df.isdf import (
     build_translation_ao_cache,
     build_translation_ao_representation,
     build_cached_periodic_pivot_oracle,
+    build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
     build_periodic_pivot_oracle,
     candidate_panel_indices,
@@ -264,6 +265,18 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         np.testing.assert_allclose(
             streamed_batch(indices), periodic_metric_columns_from_ao(cache, indices), atol=1e-12,
         )
+
+    def test_cached_bpc_gemm_columns_match_existing_cache(self):
+        cell = _SyntheticPeriodicCell()
+        grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
+        kpts = np.zeros((2, 3))
+        _, _, cache = build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size=4)
+        diag, gemm_columns, _ = build_cached_periodic_bpc_gemm_oracle(
+            cell, kpts, grid_coords, block_size=4,
+        )
+        indices = np.array([1, 4, 7], dtype=np.int64)
+        np.testing.assert_allclose(diag, np.sum(np.abs(cache) ** 2, axis=(0, 2)) ** 2 / 2)
+        np.testing.assert_allclose(gemm_columns(indices), periodic_metric_columns_from_ao(cache, indices))
 
     def test_full_grid_identity_is_compact_range(self):
         identity = full_grid_candidate_identity(10**9)
