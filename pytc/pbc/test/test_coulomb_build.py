@@ -165,5 +165,66 @@ class TestBuild(unittest.TestCase):
                 np.asarray(result["coul_kpt"][q]), W_np, atol=1e-9, err_msg=f"q={q}"
             )
 
+class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
+    """Regression for task #47. The ISDF device W-solve silently ran in single
+    precision whenever jax_enable_x64 was off: hermitian_sandwich_solve_device
+    casts to complex128, but JAX downcasts to complex64 without x64, so the
+    eigh/solve loses ~9 digits and trips the 1e-10 machine-tier retained-solve
+    gate three stages downstream. It surfaced at the diamond-111 primitive cell
+    because that was the first NON-TEST build ever routed through the device
+    solve (every test module and accepted production runner enables x64), and
+    diamond-111/k222 is a fully self-paired (all-TRIM) mesh -- every q is its
+    own negative, so all q's take the Pi_q.real self-paired path. Guards BOTH
+    branches: x64 on passes the gate at all self-paired q's; x64 off now fails
+    closed at the boundary with the actionable dtype error instead of the opaque
+    downstream gate trip."""
+
+    @staticmethod
+    def _diamond_111():
+        cell = Cell()
+        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
+        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
+        cell.unit = "A"
+        cell.basis = "gth-dzvp"
+        cell.pseudo = "gth-pbe"
+        cell.ke_cutoff = 20.0
+        cell.verbose = 0
+        cell.build()
+        return cell
+
+    def test_x64_on_full_build_passes_machine_tier_gate_all_self_paired_q(self):
+        cell = self._diamond_111()
+        kpts = cell.make_kpts([2, 2, 2])
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        # Precondition the regression asserts it actually covers: diamond-111/
+        # k222 is fully self-paired, so every q exercises the Pi_q.real path.
+        self.assertTrue(
+            all(int(mesh_obj.neg[q]) == q for q in range(mesh_obj.n_kpts)),
+            msg="diamond-111/k222 is expected to be a fully self-paired mesh",
+        )
+        result = coulomb.build(
+            cell, kpts, rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+            selection_mode="streamed",
+        )
+        for q, info in enumerate(result["solve_infos"]):
+            self.assertLessEqual(
+                info["retained_solve_residual"], 1e-10,
+                msg=f"q={q} retained_solve_residual exceeds the 1e-10 gate in float64",
+            )
+
+    def test_x64_off_full_build_fails_closed_with_actionable_dtype_error(self):
+        cell = self._diamond_111()
+        kpts = cell.make_kpts([2, 2, 2])
+        with jax.enable_x64(False):
+            with self.assertRaises(ValueError) as ctx:
+                coulomb.build(
+                    cell, kpts, rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                    selection_mode="streamed",
+                )
+        message = str(ctx.exception)
+        self.assertIn("jax_enable_x64", message)
+        self.assertIn("complex64", message)
+
+
 if __name__ == "__main__":
     unittest.main()

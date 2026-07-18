@@ -1288,6 +1288,23 @@ def apply_kernel_and_solve_device(
 
     eta_q_jnp = jnp.asarray(eta_q, dtype=jnp.complex128)
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
+    # Fail closed at the boundary common to BOTH the fused and eager solve
+    # paths (task #47): with jax_enable_x64 off, JAX silently downcasts the
+    # complex128 casts above to complex64, the device solve runs in single
+    # precision (~1e-5 accuracy), and W is silently corrupted -- surfacing only
+    # as an opaque trip of the 1e-10 machine-tier retained-solve gate below.
+    # The fused path never reaches hermitian_sandwich_solve_device's guard, so
+    # the check must live here.
+    if eta_q_jnp.dtype != jnp.complex128 or Pi_q_jnp.dtype != jnp.complex128:
+        raise ValueError(
+            f"apply_kernel_and_solve_device: q_index={q_index} resolved to dtype "
+            f"{Pi_q_jnp.dtype}, not complex128 -- jax_enable_x64 is off, so JAX "
+            f"silently downcast to complex64 and the device solve would run in single "
+            f"precision (~1e-5 accuracy), corrupting W and tripping the 1e-10 "
+            f"machine-tier gate downstream. Call jax.config.update('jax_enable_x64', "
+            f"True) before building (design v2.1 section 1 fixes c128 as the only tier "
+            f"with defined 1e-6-class gates)."
+        )
     if self_paired:
         Pi_q_jnp = Pi_q_jnp.real.astype(jnp.complex128)
 

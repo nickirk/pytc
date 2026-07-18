@@ -770,11 +770,20 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4, retention_mode="single"
     Pi_jnp = jnp.asarray(Pi_np, dtype=jnp.complex128)
     V_jnp = jnp.asarray(V_np, dtype=jnp.complex128)
     if Pi_jnp.dtype != jnp.complex128:
-        logger.warning(
+        # Hard-fail at the boundary: JAX silently downcast the complex128 cast
+        # because jax_enable_x64 is off, so the eigh/solve would run in single
+        # precision (~1e-5 accuracy) and silently corrupt W -- surfacing only
+        # three stages downstream as an opaque trip of the 1e-10 machine-tier
+        # retained-solve gate (task #47). A warn-only guard in front of a hard
+        # gate is incoherent; fail closed here with an actionable message.
+        raise ValueError(
             f"hermitian_sandwich_solve_device: resolved dtype is {Pi_jnp.dtype}, not "
-            f"complex128 -- verify jax.config.update('jax_enable_x64', True) is set "
-            f"before trusting production numbers from this path (design v2.1 section 1 "
-            f"fixes c128 as the only tier with defined 1e-6-class gates)."
+            f"complex128 -- jax_enable_x64 is off, so JAX silently downcast the "
+            f"complex128 cast and the device solve would run in single precision "
+            f"(~1e-5 accuracy), corrupting W and tripping the 1e-10 machine-tier gate "
+            f"downstream. Call jax.config.update('jax_enable_x64', True) before building "
+            f"(design v2.1 section 1 fixes c128 as the only tier with defined "
+            f"1e-6-class gates)."
         )
 
     (
