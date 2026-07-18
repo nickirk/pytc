@@ -6,6 +6,8 @@ See design doc §2, §4, §7-§8.
 
 from __future__ import annotations
 
+import gc
+
 import numpy as np
 
 import jax
@@ -53,7 +55,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           fixed_pivots=None, reciprocal_orbit_partition=None,
           process_pipeline_allowance_bytes=None, bpc_batch_size=16,
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
-          bpc_n_topup=0):
+          bpc_n_topup=0, reuse_ao_cache_for_eta=True):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -323,6 +325,19 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     ao_stats["pbc_eval_calls"] += 1
     ao_stats["grid_points"] += int(pivots.size)
     ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
+
+    if not reuse_ao_cache_for_eta and cached_ao is not None:
+        # Memory-constrained campaign (task #46): free the selection AO cache --
+        # AND the selector closure (col_batch_eval) that also holds it -- before
+        # the eta stage, so the selection peak and the build peak (dominated by
+        # the per-q eta slab) do NOT overlap. Costs one extra AO streaming pass
+        # for eta; buys ~ (AO cache size) of headroom, the difference between a
+        # feasible and an infeasible 444 build. The campaign runner's phase-peak
+        # preflight is computed from THIS SAME flag so the two cannot drift.
+        cached_ao = None
+        col_batch_eval = None
+        diag = None
+        gc.collect()
 
     if translation_cache is not None:
         ao_blocks_for_eta = (
@@ -747,7 +762,7 @@ class ISDFDF:
     def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
                  selection_mode="streamed", fixed_pivots=None, bpc_batch_size=16,
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
-                 bpc_n_topup=0):
+                 bpc_n_topup=0, reuse_ao_cache_for_eta=True):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -760,6 +775,7 @@ class ISDFDF:
         self.bpc_min_separation = bpc_min_separation
         self.bpc_candidate_oversampling = bpc_candidate_oversampling
         self.bpc_n_topup = bpc_n_topup
+        self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
         self._built = None
         self._ao2mo_call_count = 0
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
@@ -787,6 +803,7 @@ class ISDFDF:
                 bpc_min_separation=self.bpc_min_separation,
                 bpc_candidate_oversampling=self.bpc_candidate_oversampling,
                 bpc_n_topup=self.bpc_n_topup,
+                reuse_ao_cache_for_eta=self.reuse_ao_cache_for_eta,
             )
         return self._built
 

@@ -287,6 +287,42 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
                 msg=f"q={q} retained_solve_residual exceeds the 1e-10 gate",
             )
 
+    def test_reuse_ao_cache_for_eta_false_gives_equivalent_build(self):
+        # task #46 memory lever: reuse_ao_cache_for_eta=False frees the selection
+        # AO cache (and the selector closure holding it) before the eta stage and
+        # re-streams the AOs, so the 444 selection and build peaks don't overlap.
+        # The build is EQUIVALENT to the reuse=True path: same pivots + inpv_kpt
+        # (bit-identical -- same selection, same interpolation vectors), and
+        # coul_kpt allclose (streamed-vs-cached AOs are the same values; the only
+        # residual is the device solve's own fp-tie). Correctness is independent
+        # of the memory strategy.
+        cell = Cell()
+        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
+        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
+        cell.unit = "A"
+        cell.basis = "gth-dzvp"
+        cell.pseudo = "gth-pbe"
+        cell.ke_cutoff = 20.0
+        cell.verbose = 0
+        cell.build()
+        kpts = cell.make_kpts([2, 2, 2])
+        kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                  selection_mode="bpc_cached_gemm", bpc_batch_size=64,
+                  bpc_min_separation=2.0, bpc_candidate_oversampling=4, bpc_n_topup=16)
+        reuse = coulomb.build(cell, kpts, reuse_ao_cache_for_eta=True, **kw)
+        freed = coulomb.build(cell, kpts, reuse_ao_cache_for_eta=False, **kw)
+        np.testing.assert_array_equal(
+            reuse["selection_provenance"]["pivot_indices"],
+            freed["selection_provenance"]["pivot_indices"],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(reuse["inpv_kpt"]), np.asarray(freed["inpv_kpt"]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(reuse["coul_kpt"]), np.asarray(freed["coul_kpt"]),
+            rtol=0.0, atol=1e-10,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
