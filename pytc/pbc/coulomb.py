@@ -332,7 +332,21 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             )
         )
     elif cached_ao is not None:
-        ao_blocks_for_eta = cached_ao
+        # The bpc_cached_gemm oracle caches AO features in the contiguous 2-D
+        # (Ng, Nk*Nao) layout its threaded candidate GEMM needs
+        # (build_cached_periodic_bpc_gemm_oracle), whereas build_pi_eta consumes
+        # the 3-D (Nk, Ng, Nao) blocks the pivot-oracle caches produce. Recover
+        # the 3-D block by inverting that oracle's exact pack
+        # (ao_block.transpose(1, 0, 2).reshape(g, -1)) so the AO-reuse benefit is
+        # kept for eta instead of re-streaming the AOs.
+        if cached_ao.ndim == 2:
+            n_kpts_eta = len(mesh_obj.canonical_kpts)
+            n_ao_eta = cell.nao_nr()
+            ao_blocks_for_eta = cached_ao.reshape(
+                cached_ao.shape[0], n_kpts_eta, n_ao_eta
+            ).transpose(1, 0, 2)
+        else:
+            ao_blocks_for_eta = cached_ao
     else:
         ao_blocks_for_eta = (
             blk for _, _, blk in stream_ao_blocks(

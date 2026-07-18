@@ -13,9 +13,11 @@ from pytc.pbc import coulomb
 from pytc.pbc.df.isdf import (
     RawKernelProvider,
     apply_raw_kernel_and_solve,
+    build_cached_periodic_bpc_gemm_oracle,
     build_periodic_pivot_oracle,
     build_pi_eta,
     pivoted_cholesky_hermitian,
+    stream_ao_blocks,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts
 
@@ -224,6 +226,66 @@ class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("jax_enable_x64", message)
         self.assertIn("complex64", message)
+
+
+class TestBpcCachedGemmEtaReuse(unittest.TestCase):
+    """Regression for task #46 Step 2. The bpc_cached_gemm oracle caches AO
+    features in the contiguous 2-D (Ng, Nk*Nao) layout its threaded candidate
+    GEMM needs, but coulomb.build reuses that cache for eta, where build_pi_eta
+    requires the 3-D (Nk, Ng, Nao) blocks the pivot-oracle caches produce -- so
+    the raw reuse tripped `pair_convolve: X and Y must be 3-D`. The fix inverts
+    the oracle's exact pack (ao_block.transpose(1,0,2).reshape(g,-1)). Same
+    selection-only coverage gap as #47: #42/44/45 exercised the BPC selection
+    but never round-tripped its cache through the full build. Pins BOTH layers:
+    the reshape reproduces the stream_ao_blocks output EXACTLY (layout
+    equivalence, not just shape), and a full bpc_cached_gemm build round-trips
+    on diamond-111."""
+
+    def test_reshape_recovers_stream_ao_blocks_exactly(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_coords = cell.get_uniform_grids(cell.mesh)
+        block_size = 9
+        _, _, features = build_cached_periodic_bpc_gemm_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size
+        )
+        n_grid = len(grid_coords)
+        n_kpts = len(mesh_obj.canonical_kpts)
+        n_ao = cell.nao_nr()
+        reshaped = features.reshape(n_grid, n_kpts, n_ao).transpose(1, 0, 2)
+        streamed = np.concatenate(
+            [blk for _, _, blk in stream_ao_blocks(
+                cell, mesh_obj.canonical_kpts, grid_coords, block_size)],
+            axis=1,
+        )
+        self.assertEqual(reshaped.shape, (n_kpts, n_grid, n_ao))
+        # Exact layout equivalence -- the reuse must be the same numbers
+        # stream_ao_blocks would have produced, not merely the right shape.
+        np.testing.assert_array_equal(reshaped, streamed)
+
+    def test_bpc_cached_gemm_full_build_roundtrips_on_diamond_111(self):
+        cell = Cell()
+        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
+        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
+        cell.unit = "A"
+        cell.basis = "gth-dzvp"
+        cell.pseudo = "gth-pbe"
+        cell.ke_cutoff = 20.0
+        cell.verbose = 0
+        cell.build()
+        kpts = cell.make_kpts([2, 2, 2])
+        # Exercises the eta-reuse path end to end (build_pi_eta consumes the
+        # reshaped bpc cache); with the pre-fix code this raised in pair_convolve.
+        result = coulomb.build(
+            cell, kpts, rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+            selection_mode="bpc_cached_gemm",
+        )
+        for q, info in enumerate(result["solve_infos"]):
+            self.assertLessEqual(
+                info["retained_solve_residual"], 1e-10,
+                msg=f"q={q} retained_solve_residual exceeds the 1e-10 gate",
+            )
 
 
 if __name__ == "__main__":
