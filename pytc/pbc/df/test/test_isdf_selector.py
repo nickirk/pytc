@@ -336,6 +336,38 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         np.testing.assert_allclose(diag, np.sum(np.abs(cache) ** 2, axis=(0, 2)) ** 2 / 2)
         np.testing.assert_allclose(gemm_columns(indices), periodic_metric_columns_from_ao(cache, indices))
 
+    def test_real_f64_l_periodic_factor_matches_complex_reference(self):
+        # real-f64-L (task #46): the periodic metric M = |gram|^2/Nk is real, so
+        # the BPC pivoted-Cholesky factor L is stored float64 -- HALVING the
+        # dominant [Ng x rank] selection-phase term. The selection is unchanged:
+        # pivots are BIT-IDENTICAL to a complex-recast reference and the factor
+        # matches its real part to BLAS precision (real-vs-complex GEMM, dgemm vs
+        # zgemm, differs only at ~1e-15 -- the factor is NOT bit-for-bit, the
+        # PIVOTS are). The complex reference's imaginary part is identically zero.
+        cell = _translation_diamond_cell()
+        kpts = cell.make_kpts([2, 2, 2])
+        grid_coords = cell.get_uniform_grids(cell.mesh)
+        diag, real_columns, _ = build_cached_periodic_bpc_gemm_oracle(
+            cell, kpts, grid_coords, block_size=256,
+        )
+        complex_columns = lambda idx: np.asarray(real_columns(idx)).astype(np.complex128)
+        kw = dict(rank=4 * cell.nao_nr(), mesh=cell.mesh, batch_size=64,
+                  min_separation=2.0, candidate_oversampling=4, n_topup=16)
+        pivots_real, factor_real, n_real, _ = pivoted_cholesky_batched_hermitian(
+            diag.copy(), real_columns, **kw)
+        pivots_cplx, factor_cplx, n_cplx, _ = pivoted_cholesky_batched_hermitian(
+            diag.copy(), complex_columns, **kw)
+        # factor follows the metric dtype: real metric -> float64 (halved).
+        self.assertEqual(factor_real.dtype, np.float64)
+        self.assertEqual(factor_cplx.dtype, np.complex128)
+        self.assertEqual(factor_cplx.nbytes, 2 * factor_real.nbytes)
+        # selection is IDENTICAL (pivots bit-for-bit); metric was genuinely real.
+        self.assertEqual(n_real, n_cplx)
+        np.testing.assert_array_equal(pivots_real, pivots_cplx)
+        self.assertEqual(float(np.max(np.abs(factor_cplx.imag))), 0.0)
+        # factor matches to BLAS precision (dgemm vs zgemm), not bit-for-bit.
+        np.testing.assert_allclose(factor_real, factor_cplx.real, rtol=0.0, atol=1e-11)
+
     def test_full_grid_identity_is_compact_range(self):
         identity = full_grid_candidate_identity(10**9)
         self.assertEqual(
@@ -455,6 +487,21 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         self.assertEqual(
             stats["pbc_eval_calls"],
             int(np.ceil(len(coords) / 7)),
+        )
+        # Drift-guard (real-f64-L, task #46): the fail-closed capacity model must
+        # size the Cholesky factor L from the factor's ACTUAL dtype itemsize, not
+        # a frozen assumption. If the factor's dtype ever changes, this asserts
+        # the capacity gate moves with it rather than silently under/over-counting
+        # (a mis-sized static gate can pass a job that then OOMs, or reject a
+        # feasible one). factor is float64 here (asserted above); the model's L
+        # term must equal n_grid * rank * that dtype's itemsize.
+        model = jax_translation_matrix_free_byte_model(
+            len(kpts), representation.n_classes, len(coords), cell.nao_nr(), 4,
+            ao_block_size=7, selection_peak_max_bytes=10**9,
+        )
+        self.assertEqual(
+            model["cholesky_real_float64_bytes"],
+            len(coords) * 4 * factor.dtype.itemsize,
         )
 
     def test_translation_cache_is_half_the_complex_bloch_cache(self):

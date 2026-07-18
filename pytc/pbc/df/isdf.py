@@ -670,7 +670,12 @@ def pivoted_cholesky_batched_hermitian(
         raise ValueError("diag is entirely non-positive.")
     threshold = rcond * initial_max
     ramp = ramp_scale * np.arange(diag.size, dtype=np.float64) * initial_max
-    factor = np.zeros((diag.size, rank), dtype=np.complex128)
+    # factor L follows the metric's dtype (real-f64-L): the periodic selection
+    # metric M = |S|^2/Nk is real, so its factor is float64 and this [Ng x rank]
+    # array -- the dominant selection-phase memory term -- halves; a general
+    # complex Hermitian metric keeps a complex128 factor unchanged. Allocated
+    # lazily on the first column batch, once columns.dtype is known.
+    factor = None
     selected = np.zeros(diag.size, dtype=bool)
     pivots = []
     rounds = []
@@ -684,10 +689,12 @@ def pivoted_cholesky_batched_hermitian(
         if candidates.size == 0 or diag[candidates[0]] <= threshold:
             break
         candidate_started = time.perf_counter()
-        columns = np.asarray(col_batch_eval(candidates), dtype=np.complex128)
+        columns = np.asarray(col_batch_eval(candidates))
         candidate_seconds = time.perf_counter() - candidate_started
         if columns.shape != (diag.size, candidates.size):
             raise ValueError("col_batch_eval must return shape (n_grid, n_batch).")
+        if factor is None:
+            factor = np.zeros((diag.size, rank), dtype=columns.dtype)
         existing = factor[:, :len(pivots)]
         projection_started = time.perf_counter()
         residual_batch = columns[candidates]
@@ -738,7 +745,7 @@ def pivoted_cholesky_batched_hermitian(
                 retained_local = np.asarray(retained_local, dtype=np.int64)
                 retained_idx = candidates[retained_local]
                 projection_started = time.perf_counter()
-                block = np.array(columns[:, retained_local], dtype=np.complex128)
+                block = np.array(columns[:, retained_local])
                 if p0:
                     factor_L = factor[:, :p0]
                     block -= factor_L @ factor_L[retained_idx].conj().T
@@ -807,10 +814,12 @@ def pivoted_cholesky_batched_hermitian(
         if diag[index] <= threshold:
             break
         candidate_started = time.perf_counter()
-        column = np.asarray(col_batch_eval(np.asarray([index], dtype=np.int64)), dtype=np.complex128)
+        column = np.asarray(col_batch_eval(np.asarray([index], dtype=np.int64)))
         candidate_seconds = time.perf_counter() - candidate_started
         if column.shape != (diag.size, 1):
             raise ValueError("col_batch_eval singleton must return shape (n_grid, 1).")
+        if factor is None:
+            factor = np.zeros((diag.size, rank), dtype=column.dtype)
         existing = factor[:, :len(pivots)]
         projection_started = time.perf_counter()
         correction = existing @ existing[index].conj() if pivots else 0.0
@@ -840,6 +849,13 @@ def pivoted_cholesky_batched_hermitian(
             "pre_topup_max_index": topup_start_max_index,
             "pre_topup_max_was_last_round_rejected": topup_start_was_last_round_rejected,
         })
+    if factor is None:
+        # No column was ever evaluated -> nothing selected (empty first batch /
+        # exhausted diag). No metric dtype was observed, so don't guess one:
+        # return an empty (Ng, 0) factor, matching the pre-real-f64-L empty
+        # return exactly. len(pivots) is 0 here.
+        return (np.asarray(pivots, dtype=np.int64),
+                np.zeros((diag.size, 0), dtype=np.complex128), len(pivots), rounds)
     return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
 
 
@@ -1646,7 +1662,10 @@ def periodic_metric_columns_from_ao(ao, indices):
         raise ValueError("indices are outside the AO grid.")
     pivot_ao = ao[:, indices, :]
     gram = np.einsum("kbm,krm->br", pivot_ao.conj(), ao, optimize=True)
-    return (np.abs(gram) ** 2 / ao.shape[0]).T.astype(np.complex128)
+    # M = |gram|^2/Nk is real, nonnegative; return float64 (not the historical
+    # interface-convenience complex128) so the pivoted-Cholesky factor L it feeds
+    # is stored real (real-f64-L, task #46).
+    return (np.abs(gram) ** 2 / ao.shape[0]).T.astype(np.float64)
 
 
 def build_cached_periodic_bpc_gemm_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
@@ -1667,7 +1686,8 @@ def build_cached_periodic_bpc_gemm_oracle(cell, kpts, grid_coords, block_size, *
         if indices.ndim != 1 or indices.size == 0 or np.any(indices < 0) or np.any(indices >= n_grid):
             raise ValueError("indices must be a nonempty in-range integer vector.")
         gram = features[indices].conj() @ features.T
-        return (np.abs(gram) ** 2 / n_kpts).T.astype(np.complex128)
+        # real M -> float64 columns so the BPC factor L is stored real (real-f64-L).
+        return (np.abs(gram) ** 2 / n_kpts).T.astype(np.float64)
 
     return diag, col_batch_eval, features
 
