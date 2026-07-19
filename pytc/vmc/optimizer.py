@@ -659,7 +659,8 @@ def create_gradient_mask(ansatz, params, frozen_params):
     if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
         raise TypeError(f"Jastrow params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
 
-    # Build a new list of jastrow params; entries are reused, not copied
+    # Builds a new outer list; parameter pytrees are not deep-copied,
+    # though selected entries pass through tree_map(stop_gradient)
     masked_jastrow_params = []
     for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
         should_freeze = False
@@ -694,7 +695,8 @@ def apply_gradient_mask(grads, mask):
         return grads
         
     def _apply_mask(g, m):
-        # isinstance check is a tautology (stop_gradient preserves type), so this zeros every gradient
+        # isinstance check is a tautology (stop_gradient preserves type),
+        # so this zeros every gradient
         if isinstance(m, type(stop_gradient(m))):
             return jnp.zeros_like(g)
         return g

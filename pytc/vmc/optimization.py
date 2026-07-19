@@ -439,7 +439,6 @@ def optimize(
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         opt_state = optimizer.init(params)
         
-        # Create Optax training step
         if gradient_mask is not None:
             # No-op passthrough wrapper; gradient masking is not applied here
             original_loss_fn = internal_loss_fn

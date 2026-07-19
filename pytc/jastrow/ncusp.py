@@ -171,7 +171,6 @@ class NuclearCusp(Jastrow):
             'X4': jnp.zeros(self.n_types),
         }
         
-        # Initialize X4 for each nucleus type
         for Z_idx, Z in enumerate(self.unique_Z):
             nucleus_idx = int(self.Z_idx_to_nucleus[Z_idx])
             phi_0 = self.eval_mo_at_r(nucleus_idx, 0.0)
