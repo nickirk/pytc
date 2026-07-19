@@ -166,15 +166,13 @@ class NuclearCusp(Jastrow):
 
     def init_params(self):
         """Initialize parameter dictionary structure."""
-        # Initialize parameters for each unique nuclear type
         params = {
             'rc': jnp.array([1.0/float(Z) for Z in self.unique_Z]), 
             'X4': jnp.zeros(self.n_types),
         }
         
-        # Initialize X4 and compute alpha coefficients for each nucleus type
+        # Initialize X4 for each nucleus type
         for Z_idx, Z in enumerate(self.unique_Z):
-            # Find first nucleus of this type
             nucleus_idx = int(self.Z_idx_to_nucleus[Z_idx])
             phi_0 = self.eval_mo_at_r(nucleus_idx, 0.0)
             # X4 = ln|φ(0)|. We want φ_cusp(0) = φ_s(0) * 1.1 approximately?
@@ -221,10 +219,8 @@ class NuclearCusp(Jastrow):
     
     def _compute(self, r1, r2, params):
         """Compute nuclear cusp correction for a single electron."""
-        # Clip parameters before use
         params = self._clip_params(params)
 
-        # Compute polynomial coefficients from current params
         poly_coeffs = self._precompute_poly_coeffs(params)
 
         return self._compute_inner(r1, r2, params, poly_coeffs)
@@ -252,26 +248,20 @@ class NuclearCusp(Jastrow):
         be called inside the N² vmap / folx.forward_laplacian.
         """
 
-        # Vectorized computation over nuclei
         def compute_nucleus_contribution(nucleus_idx):
-            # Get distance from electron to this nucleus
             dr = r1 - self.coords[nucleus_idx]
             # Add epsilon inside sqrt to avoid singular gradient at r = 0 while keeping it smooth
             r = jnp.sqrt(jnp.sum(dr**2) + 1e-16)
             
-            # Use array indexing instead of dictionary lookup
             Z = self.charges[nucleus_idx]
             Z_idx = self.Z_to_idx[Z.astype(jnp.int32)]
             rc = clipped_params['rc'][Z_idx]
             
-            # Use computed poly_coeffs instead of params
             coeffs = poly_coeffs[Z_idx]
             
             # Compute φ_cusp = exp(poly(r))
-            # Use where to conditionally evaluate only when r <= rc
             poly_val = jnp.where(r<=rc, self._eval_poly(r, coeffs), 0.0)
             
-            # Get φ_s value with numerical safeguard
             phi_s = jnp.where(r<=rc, self.eval_mo_at_r(nucleus_idx, r), 1.0)
             
             # Guard against phi_s = 0 or phi_s < 0 (orbitals can be negative).
@@ -280,11 +270,9 @@ class NuclearCusp(Jastrow):
             safe_phi_s = jnp.maximum(jnp.abs(phi_s), 1e-16)
             log_term = poly_val - jnp.log(safe_phi_s)  # log(jnp.exp(poly_val)/phi_s) = poly_val - log(phi_s)
             
-            # Combine using cutoff
             cutoff = self._cutoff_function(r, rc)
             return jnp.where(r <= rc, log_term * cutoff, 0.0)
 
-        # Sum over all nuclei using vmap
         contributions = jax.vmap(compute_nucleus_contribution)(jnp.arange(self.n_nuclei))
         total = jnp.sum(contributions)
         
@@ -314,10 +302,8 @@ class NuclearCusp(Jastrow):
 
     def eval_mo_at_r(self, nucleus_idx, r):
         """JAX-compatible cubic spline evaluation."""
-        # Handle scalar vs array inputs differently
         r_is_array = hasattr(r, 'shape') and r.ndim > 0
         
-        # Stack all spline data for vectorized operations
         # In the dataclass version, self.spline_xs and self.spline_coeffs are ALREADY stacked arrays
         xs = self.spline_xs
         coeffs = self.spline_coeffs
@@ -325,58 +311,45 @@ class NuclearCusp(Jastrow):
         x = xs[nucleus_idx]
         c = coeffs[nucleus_idx]
         
-        # Process differently based on input type
         if r_is_array:
-            # Vectorized processing for array inputs
             dx = x[1] - x[0]
             
             indices = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
             indices_stopped = jax.lax.stop_gradient(indices)
             indices_int = jnp.floor(indices_stopped).astype(jnp.int32)
             
-            # Calculate local coordinates relative to left endpoint
             x_i = jnp.take(x, indices_int)
             t = r - x_i
             
-            # Use vmap to apply the spline evaluation to each element
             def eval_spline_at_idx(idx, t):
                 return c[3,idx] + t*(c[2,idx] + t*(c[1,idx] + t*c[0,idx]))
             
-            # Use vmap instead of fori_loop for better traceability
             values = jax.vmap(eval_spline_at_idx)(indices_int, t)
             return values
         else:
-            # Scalar processing - use same logic as array processing
             dx = x[1] - x[0]
-            # Compute index and t value same as array case
             index = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
             index_stopped = jax.lax.stop_gradient(index)
             indices_int = jnp.floor(index_stopped).astype(jnp.int32)
-            # Calculate local coordinate
             x_i = jnp.take(x, indices_int)
             t = r - x_i
-            # Use same coefficient order as array case
             return c[3,indices_int] + t*(c[2,indices_int] + t*(c[1,indices_int] + t*c[0,indices_int]))
     
     def _get_phi_s_derivatives(self, nucleus_idx, r):
         """JAX-compatible derivatives computation."""
-        # Convert inputs to arrays and combine spline data
         xs = self.spline_xs
         coeffs = self.spline_coeffs
         
         x = xs[nucleus_idx]
         c = coeffs[nucleus_idx]
         
-        # Find interval using safe integer operations
         dx = x[1] - x[0]
         index = jnp.clip((r - x[0]) / dx, 0, len(x)-2)
         index_stopped = jax.lax.stop_gradient(index)
         index_int = jnp.floor(index_stopped).astype(jnp.int32)
         
-        # Get local coordinate
         t = r - x[index_int]  # Note: not normalized by dx here
         
-        # Get coefficients for this interval
         c0 = c[0, index_int]
         c1 = c[1, index_int]
         c2 = c[2, index_int]

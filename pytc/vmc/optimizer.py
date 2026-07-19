@@ -164,7 +164,6 @@ class NewtonOptimizer:
     def step(self, params, state, rng, batch, global_step_int=None):
         walkers, ansatz = batch
         
-        # 2. Define MVP or Solve Exact
         if self.solver == "exact" or self.solver == "cholesky":
             # Exact inversion: (M + lambda I) delta = -g
             
@@ -181,11 +180,9 @@ class NewtonOptimizer:
                 vmap_fn = self._get_vmap()
                 jac = vmap_fn(single_log_psi_grad, in_axes=(0, None))(walkers, params)
                 
-                # Flatten params structure for linear algebra
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
                 jac_mat = jnp.concatenate([jnp.reshape(leaf, (walkers.shape[0], -1)) for leaf in jac_flat], axis=1)
                 
-                # Center the Jacobian (Covariance)
                 jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
                 
                 # S = 1/N * J.T @ J
@@ -217,7 +214,6 @@ class NewtonOptimizer:
                 
                 n_walkers_total = walkers.shape[0]
                 
-                # Sub-sample walkers for the Jacobian if requested
                 if self.jacobian_sample_size > 0 and self.jacobian_sample_size < n_walkers_total:
                     sample_size = self.jacobian_sample_size
                     # In multi-device mode, shard_map requires the sharded axis
@@ -228,7 +224,6 @@ class NewtonOptimizer:
                         if sample_size % ndev != 0:
                             sample_size = max(ndev, (sample_size // ndev) * ndev)
                         sample_size = min(sample_size, n_walkers_total)
-                    # Use rng to select a random subset of walker indices
                     indices = jax.random.choice(rng, n_walkers_total,
                                                 shape=(sample_size,), replace=False)
                     indices = jnp.sort(indices).astype(jnp.int32)  # sort for deterministic gather
@@ -383,7 +378,6 @@ class NewtonOptimizer:
                         sum_jtj - n_valid * jnp.outer(mean_j, mean_j)
                     )
                 else:
-                    # Compute energies and Jacobian for (sub-sampled) walkers
                     vmap_fn = self._get_vmap()
                     energies, jac = vmap_fn(
                         single_local_energy_and_grad,
@@ -435,7 +429,6 @@ class NewtonOptimizer:
                     # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
                     grads_vec = (2.0 / (n_valid - 1)) * (jac_mat.T @ energy_diff)
 
-                    # Center the Jacobian for curvature matrix
                     mean_jac = jnp.sum(jac_mat, axis=0, keepdims=True) / n_valid
                     jac_centered = jnp.where(finite_mask[:, None], jac_mat - mean_jac, 0.0)
                     curvature_mat = (2.0 / n_valid) * (jac_centered.T @ jac_centered)
@@ -443,7 +436,6 @@ class NewtonOptimizer:
             else:
                 raise ValueError(f"Unknown curvature type: {self.curvature_type}")
             
-            # Add damping
             curvature_mat = curvature_mat + self.damping * jnp.eye(curvature_mat.shape[0])
             
             # Flatten gradients to match matrix (for fisher, grads are pytree; for gauss_newton, already flat)
@@ -453,9 +445,7 @@ class NewtonOptimizer:
                 # gauss_newton: grads_vec is already flat, need unravel_fn
                 _, unravel_fn = jax.flatten_util.ravel_pytree(params)
             
-            # Solve linear system
             # (M + lambda I) delta = -g
-            # Use provided solve_kwargs or default to assume_a='pos'
             solve_kwargs = self.solve_kwargs.copy()
             if "assume_a" not in solve_kwargs:
                 solve_kwargs["assume_a"] = "pos"
@@ -473,22 +463,18 @@ class NewtonOptimizer:
                 delta_scale = jnp.minimum(1.0, trust_radius / jnp.maximum(delta_norm, 1e-300))
                 delta_vec = delta_vec * delta_scale
 
-            # Unflatten delta to match params structure
             delta = unravel_fn(delta_vec)
 
-            # Update
             lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
             new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
 
             return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr, "n_dropped_walkers": n_dropped}
 
-        # CG Solver: need loss + grads from value_and_grad_func
         (loss, aux_data), grads = self.value_and_grad_func(params, batch)
         
         if self.curvature_type == "fisher":
             # SR: S = Cov(grad_log_psi)
             
-            # Helper for single walker log_psi
             def single_log_psi(w, p):
                 return ansatz(w, p)[0][1]
 
@@ -512,7 +498,6 @@ class NewtonOptimizer:
                 
                 per_walker_grads = vmap_fn(compute_vjp)(walkers, w_centered)
                 
-                # Sum over walkers
                 u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
                 
                 # S = 1/N * J.T @ (J @ v centered)
@@ -522,7 +507,6 @@ class NewtonOptimizer:
         elif self.curvature_type == "gauss_newton":
             # GN: G = 2/N * J.T @ J
             
-            # Helper for single walker local energy
             def single_local_energy(w, p):
                 return ansatz.local_energy(w, p)[0]
 
@@ -544,7 +528,6 @@ class NewtonOptimizer:
                 
                 per_walker_grads = vmap_fn(compute_vjp)(walkers, w_centered)
                 
-                # Sum over walkers
                 u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
                 
                 n_walkers = walkers.shape[0]
@@ -553,13 +536,10 @@ class NewtonOptimizer:
         else:
             raise ValueError(f"Unknown curvature type: {self.curvature_type}")
 
-        # Add damping
         def damped_mvp(v):
             mvp_val = mvp(v)
             return jax.tree_util.tree_map(lambda x, y: x + self.damping * y, mvp_val, v)
 
-        # 3. Solve (S + lambda I) delta = -g
-        # RHS is -grads
         rhs = jax.tree_util.tree_map(lambda x: -x, grads)
         
         delta, info = spla.cg(
@@ -568,7 +548,6 @@ class NewtonOptimizer:
             maxiter=self.maxiter
         )
         
-        # 4. Update
         lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
         new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
         
@@ -590,7 +569,6 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
     
     merged_kwargs = {**opt_kwargs}
     
-    # Define a default schedule if learning_rate is a float
     if not callable(learning_rate):
         def schedule_lr(step):
             decay_rate = merged_kwargs.get("decay_rate", 1.0)
@@ -626,7 +604,6 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
         if "value_and_grad_func" not in merged_kwargs:
             raise ValueError("Newton optimizer requires value_and_grad_func in opt_kwargs")
             
-        # For Newton, wrap the schedule with a minimum value
         min_lr = merged_kwargs.get("min_learning_rate", 0.01)
         
         def newton_schedule(step):
@@ -669,7 +646,7 @@ def create_gradient_mask(ansatz, params, frozen_params):
         are wrapped with `jax.lax.stop_gradient`.
     """
     if not frozen_params:
-        return params  # No freezing requested, return params unchanged
+        return params
 
     if not isinstance(params, (list, tuple)) or len(params) != 2:
         raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
@@ -682,7 +659,7 @@ def create_gradient_mask(ansatz, params, frozen_params):
     if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
         raise TypeError(f"Jastrow params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
 
-    # Deep copy the parameters to avoid modifying the input
+    # Build a new list of jastrow params; entries are reused, not copied
     masked_jastrow_params = []
     for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
         should_freeze = False
@@ -696,12 +673,10 @@ def create_gradient_mask(ansatz, params, frozen_params):
                     break
         
         if should_freeze:
-            # Apply stop_gradient to all leaves in the frozen parameter PyTree
             param_pytree = tree_map(stop_gradient, param_pytree)
             logger.info(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
         masked_jastrow_params.append(param_pytree)
 
-    # Return the masked parameters
     return [masked_jastrow_params, linear_coeffs]
 
 def apply_gradient_mask(grads, mask):
@@ -719,7 +694,7 @@ def apply_gradient_mask(grads, mask):
         return grads
         
     def _apply_mask(g, m):
-        # If m is already stop_gradient'd, zero out the gradient
+        # isinstance check is a tautology (stop_gradient preserves type), so this zeros every gradient
         if isinstance(m, type(stop_gradient(m))):
             return jnp.zeros_like(g)
         return g

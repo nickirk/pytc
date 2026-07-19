@@ -39,19 +39,15 @@ def compute_jastrow_terms(sj, elec_coords, jastrow_params):
     else:
         g1s, l1s = jastrow.get_pair_grid_grad_lap(elec_coords, jastrow_params)
 
-    # 3. Mask diagonal (i == j)
     mask = 1.0 - jnp.eye(n_electrons)
-    # Expand mask for gradients (N, N, 1)
     mask_grad = mask[:, :, None]
 
     g1s = g1s * mask_grad
     l1s = l1s * mask
 
-    # 4. Sum over j to get values for each electron i
     sum_g1 = jnp.sum(g1s, axis=1)
     sum_l1 = jnp.sum(l1s, axis=1)
 
-    # 5. Result
     # grad_k U = sum_{j!=k} grad_1(rk, rj)
     # The factor of 0.5 from the definition U = 0.5 * sum u(ri, rj) cancels with the
     # fact that we have two identical sums (one for i=k, one for j=k).
@@ -122,7 +118,6 @@ def compute_single_walker_energy(sj, walker, jastrow_params):
     """
     n_alpha = sj.dets[0].n_alpha
 
-    # Compute Jastrow terms internally
     grad_J_over_J, lap_J_over_J = compute_jastrow_terms(
         sj, walker.positions, jastrow_params
     )

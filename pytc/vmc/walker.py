@@ -121,7 +121,6 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None, log_in
             )
         return initial_walkers
 
-    # If initial_walkers are positions, use them
     if initial_walkers is not None:
         positions = initial_walkers
         if positions.shape[0] != n_walkers:
@@ -132,19 +131,16 @@ def initialize_walkers(ansatz, n_walkers, initial_walkers=None, key=None, log_in
                 f"Walker-instance case above."
             )
     else:
-        # Get molecular information needed for initialization
         # ansatz here is a SlaterDet, which now has atom_coords and atom_charges as attributes
         atom_coords = ansatz.atom_coords
         atom_charges = ansatz.atom_charges
         n_electrons = ansatz.n_electrons
         n_alpha = ansatz.n_alpha
         
-        # Initialize electron positions based on nuclear positions and spin counts
         key, subkey = random.split(key)
         positions = init_electron_configs(
             atom_coords, atom_charges, n_electrons, n_walkers, subkey,
             n_alpha=n_alpha, log_init=log_init
         )
     
-    # Create Walker state with all-True move_mask
     return initialize_walker_state(ansatz, positions)

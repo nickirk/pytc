@@ -31,7 +31,6 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one",
         - new_walker: New walker state after one sampling step
         - acceptance_rate: Fraction of proposals that were accepted
     """
-    # Choose move type
     if move_type == "all":
         psi_values, new_psi_values, current_walker, proposals = _all_electron_move(
             ansatz, walker, step_size, key, params, batch_ansatz=batch_ansatz)
@@ -41,33 +40,27 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one",
     else:
         raise ValueError("move_type must be either 'all' or 'one'")
     
-    # Compute acceptance probabilities
-    # psi_values and new_psi_values are now (sign, log|psi|) tuples
     # Acceptance probability: |ψ'|²/|ψ|² = exp(2*(log|ψ'| - log|ψ|))
     psi_sign, psi_logabs = psi_values
     new_psi_sign, new_psi_logabs = new_psi_values
     acceptance_prob = jnp.exp(2.0 * (new_psi_logabs - psi_logabs))
     
-    # Accept or reject
     key, subkey = random.split(key)
     n_walkers = walker.positions.shape[0]
     accept_mask = random.uniform(subkey, shape=(n_walkers,)) < acceptance_prob
     accept_count = jnp.sum(accept_mask)
     
-    # Create new walker by selecting accepted proposals or keeping current
-    # Reshape accept_mask for broadcasting
-    accept_mask_3d = accept_mask[:, None, None]  # For 2D matrices
-    accept_mask_4d = accept_mask[:, None, None, None]  # For gradients (3D tensors)
+    accept_mask_3d = accept_mask[:, None, None]
+    accept_mask_4d = accept_mask[:, None, None, None]
 
     # Use current_walker (with updated matrices) instead of original walker
-    # Handle det_up and det_down tuples (sign, log|det|) separately
     new_det_up = (
-        jnp.where(accept_mask, proposals.det_up[0], current_walker.det_up[0]),  # signs
-        jnp.where(accept_mask, proposals.det_up[1], current_walker.det_up[1])   # log|det|
+        jnp.where(accept_mask, proposals.det_up[0], current_walker.det_up[0]),
+        jnp.where(accept_mask, proposals.det_up[1], current_walker.det_up[1])
     )
     new_det_down = (
-        jnp.where(accept_mask, proposals.det_down[0], current_walker.det_down[0]),  # signs
-        jnp.where(accept_mask, proposals.det_down[1], current_walker.det_down[1])   # log|det|
+        jnp.where(accept_mask, proposals.det_down[0], current_walker.det_down[0]),
+        jnp.where(accept_mask, proposals.det_down[1], current_walker.det_down[1])
     )
     
     new_walker = current_walker.replace(
@@ -88,7 +81,6 @@ def metropolis_hastings(ansatz, walker, step_size, key, params, move_type="one",
         log_jastrow=jnp.where(accept_mask, proposals.log_jastrow, current_walker.log_jastrow),
     )
     
-    # Calculate acceptance rate
     acceptance_rate = accept_count / n_walkers
 
     return new_walker, acceptance_rate
@@ -110,7 +102,6 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
         - new_walkers: New walker configurations after one sampling step
         - acceptance_rate: Fraction of proposals that were accepted
     """
-    # Compute initial wavefunction values and quantum forces with parameters
     # ansatz() and quantum_force() now work with single walkers, so vmap over batch
     batch_ansatz = jax.vmap(lambda w, p: ansatz(w, p), in_axes=(0, None))
     batch_quantum_force = jax.vmap(lambda w, p: ansatz.quantum_force(w, p), in_axes=(0, None))
@@ -130,14 +121,11 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     key, subkey = random.split(key)
     random_term = diffusion_coef * random.normal(subkey, walkers.positions.shape)
     
-    # Combine drift and diffusion terms for proposed positions
     proposed_positions = walkers.positions + drift_term + random_term
     
-    # Create proposal walkers with new positions and full recomputation mask
     from .walker import initialize_walker_state
     proposal_walkers = initialize_walker_state(ansatz, proposed_positions)
     
-    # Compute new wavefunction values and quantum forces at proposed positions
     (new_psi_sign, new_psi_logabs), proposal_walkers = batch_ansatz(proposal_walkers, params)
     new_quantum_forces = batch_quantum_force(proposal_walkers, params)
     
@@ -146,23 +134,18 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
     forward_density = _compute_green_function(proposed_positions, walkers.positions, quantum_forces, time_step)
     backward_density = _compute_green_function(walkers.positions, proposed_positions, new_quantum_forces, time_step)
     
-    # Compute acceptance probabilities with Green's function ratio
-    # psi_values and new_psi_values are now (sign, log|psi|) tuples
     # Acceptance probability: |ψ'|²/|ψ|² * (G_back/G_fwd) = exp(2*(log|ψ'| - log|ψ|)) * (G_back/G_fwd)
     acceptance_prob = jnp.exp(2.0 * (new_psi_logabs - psi_logabs)) * (backward_density / forward_density)
     
-    # Accept or reject
     key, subkey = random.split(key)
     accept_mask = random.uniform(subkey, shape=(walkers.positions.shape[0],)) < acceptance_prob
     accept_count = jnp.sum(accept_mask)
     
-    # Update walkers: accepted moves get new walker state, rejected keep old state
     # We need to update all walker fields, not just positions
     accept_mask_3d = accept_mask[:, jnp.newaxis, jnp.newaxis]
     accept_mask_4d = accept_mask[:, jnp.newaxis, jnp.newaxis, jnp.newaxis]
     accept_mask_1d = accept_mask[:, jnp.newaxis]
     
-    # For tuple fields (det_up, det_down), unpack and update each component
     old_det_up_sign, old_det_up_logabs = walkers.det_up
     new_det_up_sign, new_det_up_logabs = proposal_walkers.det_up
     old_det_down_sign, old_det_down_logabs = walkers.det_down
@@ -192,7 +175,6 @@ def metropolis_hastings_importance_sampling(ansatz, walkers, time_step, key, par
         log_jastrow=jnp.where(accept_mask, proposal_walkers.log_jastrow, walkers.log_jastrow),
     )
     
-    # Calculate acceptance rate
     acceptance_rate = accept_count / walkers.positions.shape[0]
     
     return new_walkers, acceptance_rate
@@ -223,7 +205,6 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0, me
     Raises:
         ValueError: If move_type is not "all" or "one"
     """
-    # Validate move_type at factory creation time (not JIT time)
     if move_type not in ["all", "one"]:
         raise ValueError(f"move_type must be either 'all' or 'one', got '{move_type}'")
     
@@ -231,7 +212,6 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0, me
     # by the factory caller, not the training-loop caller.
     captured_ansatz = ansatz
     
-    # Create batch_ansatz based on max_vmap_batch_size
     if max_vmap_batch_size > 0:
         batch_ansatz = folx.batched_vmap(
             lambda w, p: captured_ansatz(w, p), 
@@ -288,7 +268,6 @@ def make_mcmc_step(ansatz, step_size, move_type="one", max_vmap_batch_size=0, me
             new_walkers, acceptance_rate = _mcmc_step_single_device(walkers, key, params)
         return new_walkers, acceptance_rate
     
-    # JIT compile the step function
     return jax.jit(mcmc_step)
 
 
@@ -338,5 +317,4 @@ def make_mcmc_step_importance(ansatz, time_step, mesh=None):
             new_walkers, acceptance_rate = _mcmc_step_single_device(walkers, key, params)
         return new_walkers, acceptance_rate
     
-    # JIT compile the step function
     return jax.jit(mcmc_step)
