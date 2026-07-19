@@ -41,14 +41,12 @@ class TestTC(unittest.TestCase):
         """Set up a simple H2 molecule for all tests in this class."""
         cls.mol, cls.mf = get_h2_sto3g()
         cls.jastrow = REXP([1])  # alpha = 0.5
-        # Update TC initialization to include jastrow_factor
         cls.tc = TC(cls.mf, cls.jastrow, grid_lvl=1)  # Use coarse grid for testing
     
     def test_grid_initialization(self):
         """Test if grid is properly initialized."""
         self.assertIsNotNone(self.tc.grid_points)
         self.assertIsNotNone(self.tc.weights)
-        # Update shape assertions to match new layout (N_grid, 3)
         self.assertEqual(self.tc.grid_points.shape[-1], 3)
         self.assertEqual(self.tc.grid_points.shape[0], len(self.tc.weights))
     
@@ -58,11 +56,9 @@ class TestTC(unittest.TestCase):
         n_grid = len(self.tc.weights)
         n_ao = self.mol.nao
         
-        # Update shape assertions to match new layout
-        self.assertEqual(rho.shape, (n_ao, n_grid))  # Changed from (n_grid, n_ao)
-        self.assertEqual(nabla_rho.shape, (n_ao, n_grid, 3))  # Changed from (n_grid, 3, n_ao)
+        self.assertEqual(rho.shape, (n_ao, n_grid))
+        self.assertEqual(nabla_rho.shape, (n_ao, n_grid, 3))
         
-        # Test if cached values are returned
         rho2, nabla_rho2 = self.tc._eval_basis_on_grid()
         np.testing.assert_array_equal(rho, rho2)
         np.testing.assert_array_equal(nabla_rho, nabla_rho2)
@@ -71,12 +67,10 @@ class TestTC(unittest.TestCase):
         """Test calculation of two-body terms."""
         from pytc.legacy.kmat import calc_K1, calc_K2, calc_K3
         
-        # Get orbital values on grid
         rho, nabla_rho = self.tc._get_intermediates()
         rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.tc.weights))
         nabla_rho_paired = np.einsum('ind,jn->ijnd', nabla_rho, rho).reshape(-1, len(self.tc.weights), 3)
         
-        # Calculate terms individually
         k1 = calc_K1(rho_paired, nabla_rho_paired, 
                      self.tc.jastrow_factor, self.tc.grid_points, self.tc.weights)
         k2 = calc_K2(rho_paired, nabla_rho_paired,
@@ -84,10 +78,8 @@ class TestTC(unittest.TestCase):
         k3 = calc_K3(rho_paired, self.tc.jastrow_factor,
                      self.tc.grid_points, self.tc.weights)
         
-        # Get combined result from TC class
         combined = self.tc.get_2b()
         
-        # Reconstruct expected result matching TC.get_2b logic
         n_orb = self.tc.n_orb
         k1 = k1.reshape(n_orb, n_orb, n_orb, n_orb)
         k3 = k3.reshape(n_orb, n_orb, n_orb, n_orb)
@@ -95,17 +87,14 @@ class TestTC(unittest.TestCase):
         # TC uses - (K1 + K1^T) for Laplacian part (K2)
         k_laplacian = - (k1 + k1.swapaxes(0, 1))
         
-        # TC formula: 0.5 * (K2 + K3) + K1 + transpose
         result = 0.5 * (k_laplacian + k3)
         result += k1
         result += result.transpose(2, 3, 0, 1)
         
-        # Add ERI
         eri1 = get_eri(self.tc.mf, self.tc.mo_coeff)
         
         expected = eri1 - result
         
-        # Compare results
         np.testing.assert_array_almost_equal(combined, expected)
     
 

@@ -47,13 +47,10 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
     
     for k in range(min(n_rank, n)):
         if k > 0:
-            # Update diagonal elements
             d[perm[k:]] = np.diag(M)[perm[k:]] - np.sum(L[perm[k:], :k]**2, axis=1)
         
-        # Find maximum diagonal element
         max_val = np.max(d[perm[k:]])
         
-        # Check for numerical stability
         if max_val < tol:
             logger.warning(f"Small pivot encountered at step {k}: {max_val:.2e}")
             end_time = time.time()
@@ -62,7 +59,6 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
         
         pivot = k + np.argmax(d[perm[k:]])
         
-        # Swap pivot if needed
         if pivot != k:
             perm[k], perm[pivot] = perm[pivot], perm[k]
         
@@ -72,12 +68,9 @@ def pivoted_cholesky(M: np.ndarray, n_rank: int, tol: float = 1e-12) -> Tuple[np
             row_k = M[perm[k], perm[k+1:]] - L[perm[k], :k] @ L[perm[k+1:], :k].T
             L[perm[k+1:], k] = row_k / L[perm[k], k]
         
-        # Calculate error
         current_err = np.sum(d[perm[k+1:]])
         rel_err = current_err / initial_err
-        #print(f"Step {k}: Relative error = {rel_err:.2e}")
         
-        # Early termination if accuracy is reached
         if rel_err < tol:
             logger.info(f"Converged at step {k} with relative error {rel_err:.2e}")
             end_time = time.time()
@@ -145,11 +138,9 @@ def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_ran
         xi2: Interpolation coefficients for rho2 (n_fused, N_grid, *trailing_dims)
         piv_fused: Combined pivot indices
     """
-    # Normalize rho1 and rho2 along trailing dimensions
     rho1_normed = calculate_norm(rho1)
     rho2_normed = calculate_norm(rho2)
 
-    # Form overlap matrices S1 and S2
     S1 = rho1_normed.T @ rho1_normed
     S2 = rho2_normed.T @ rho2_normed
 
@@ -159,14 +150,11 @@ def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_ran
     S1[np.diag_indices_from(S1)] += shift1
     S2[np.diag_indices_from(S2)] += shift2
 
-    # Get pivots for each density separately
     _, piv1 = pivoted_cholesky(S1, n_rank1)
     _, piv2 = pivoted_cholesky(S2, n_rank2)
 
-    # Combine and uniquify pivots
     piv_fused = np.unique(np.concatenate([piv1, piv2]))
 
-    # Select columns using fused pivots
     if rho1.ndim > 2:
         C1 = np.take(rho1, piv_fused, axis=1)
     else:
@@ -177,7 +165,6 @@ def isdf_decompose_multi(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_ran
     else:
         C2 = rho2[:, piv_fused]
 
-    # Solve least squares problems
     xi1 = solve_least_squares(C1, rho1)
     xi2 = solve_least_squares(C2, rho2)
 
@@ -231,31 +218,25 @@ def test_multi_accuracy(rho1: np.ndarray, rho2: np.ndarray, n_rank1: int, n_rank
     """
     C1, xi1, C2, xi2, piv_fused = isdf_decompose_multi(rho1, rho2, n_rank1, n_rank2)
     
-    # Reuse test_accuracy for both rho1 and rho2
     rel_error1, abs_error1 = test_accuracy(rho1, C1, xi1)
     rel_error2, abs_error2 = test_accuracy(rho2, C2, xi2)
     
     return rel_error1, abs_error1, rel_error2, abs_error2, len(piv_fused)
 
-# Example usage
 if __name__ == "__main__":
-    # Generate test data
     Nb = 10
     N_grid = 500
     rank = 5
     U = np.random.randn(Nb**2, rank)
     V = np.random.randn(N_grid, rank)
-    rho = U @ V.T  # Construct low-rank matrix
+    rho = U @ V.T
 
-    # Perform Cholesky-based ISDF decomposition with fixed rank
     C, P = isdf_decompose_cholesky(rho, n_rank=rank)
 
-    # Test reconstruction accuracy
     error = test_accuracy(rho, C, P)
     print(f"Reconstruction relative error: {error:.2e}")
     print(f"Number of auxiliary basis: {C.shape[1]}")
 
-    # Test with two densities of different ranks
     rank1, rank2 = 5, 8
     U1 = np.random.randn(Nb**2, rank1)
     U2 = np.random.randn(Nb**2, rank2)
