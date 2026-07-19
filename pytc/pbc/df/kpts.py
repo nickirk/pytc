@@ -12,6 +12,7 @@ import math
 
 import numpy as np
 from pyscf.pbc.tools import k2gamma
+from scipy.linalg.blas import zgemm
 
 _DEFAULT_KTOL = 1e-8
 
@@ -328,9 +329,17 @@ def pair_convolve(X, Y, phase, *, imag_tol=1e-10):
     if phase.ndim != 2 or phase.shape != (n_k, n_k):
         raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
-    # Batched GEMM, not einsum: einsum does not dispatch this contraction to BLAS
-    # and runs a serial loop (~33x slower at campaign shapes).
-    T = np.matmul(X, Y.conj().transpose(0, 2, 1))  # (Nk, Nip, F)
+    # BLAS, not einsum: einsum never dispatches this contraction and runs a
+    # serial loop (24x slower at campaign shapes, pi_zhu JID 59244732).
+    # Among BLAS spellings, taking the conjugation as zgemm's op flag beats a
+    # batched matmul by 1.5x on OpenBLAS (JID 59244734) because conj(Y) is
+    # never materialized -- at 444 that copy is 205 MiB per call. The ranking
+    # is BLAS-dependent (the two are at parity on Apple Accelerate), so this
+    # is a target-hardware optimization, not a portable truth.
+    if X.dtype == np.complex128 and Y.dtype == np.complex128:
+        T = np.stack([zgemm(1.0, X[k], Y[k], trans_b=2) for k in range(n_k)])
+    else:
+        T = np.matmul(X, Y.conj().transpose(0, 2, 1))  # (Nk, Nip, F)
 
     try:
         T_R = kpt_to_spc(T, phase, imag_tol=imag_tol)
