@@ -71,6 +71,32 @@ class TestGradientMask(unittest.TestCase):
         )
         np.testing.assert_allclose(new_params[1], jnp.array([3.2]))
 
+    def test_lion_weight_decay_cannot_move_frozen_parameters(self):
+        params = _params()
+        mask = create_gradient_mask(_ansatz(), params, [0])
+
+        def loss_fn(current_params, _):
+            leaves = jax.tree_util.tree_leaves(current_params)
+            return sum(jnp.sum(leaf**2) for leaf in leaves), ()
+
+        optimizer = optax.lion(learning_rate=0.1, weight_decay=0.01)
+        opt_step = make_opt_update_step(loss_fn, optimizer, gradient_mask=mask)
+        opt_state = optimizer.init(params)
+
+        new_params, _, _, _ = opt_step(
+            None, params, None, opt_state, jax.random.PRNGKey(0)
+        )
+
+        np.testing.assert_array_equal(
+            new_params[0][0]["coefficient"], params[0][0]["coefficient"]
+        )
+        self.assertFalse(
+            np.array_equal(
+                new_params[0][1]["coefficient"],
+                params[0][1]["coefficient"],
+            )
+        )
+
     def test_empty_frozen_params_does_not_create_mask(self):
         self.assertIsNone(create_gradient_mask(_ansatz(), _params(), []))
 

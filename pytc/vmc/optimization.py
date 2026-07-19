@@ -83,6 +83,7 @@ def make_opt_update_step(loss_fn, optimizer, gradient_mask=None):
         grads = apply_gradient_mask(grads, gradient_mask)
         
         updates, opt_state = optimizer.update(grads, opt_state, params)
+        updates = apply_gradient_mask(updates, gradient_mask)
         new_params = optax.apply_updates(params, updates)
         
         return new_params, opt_state, loss, aux_data
