@@ -7,6 +7,7 @@ Deliberately independent of pytc.df.pivots (see design doc §3).
 from __future__ import annotations
 
 import dataclasses
+import gc
 import logging
 import os
 import time
@@ -1359,6 +1360,7 @@ def precompute_phase_all_q(grid_coords, canonical_kpts):
 def apply_kernel_and_solve_device(
     provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=1e-4,
     retained_solve_residual_gate=1e-10, self_paired=False, retention_mode="single",
+    kern_blocking=None,
 ):
     """S4 pipeline glue, device-resident, provider-agnostic: phase multiply
     -> provider.apply -> conjugate -> ZGEMM -> device Hermitian sandwich
@@ -1436,8 +1438,17 @@ def apply_kernel_and_solve_device(
 
     # Providers with a fused fast path run the whole chain as one jax.jit
     # graph; others fall back to the eager per-stage path below.
-    fused = getattr(provider, "fused_apply_and_solve", None)
-    if fused is not None:
+    if kern_blocking is not None:
+        # Blocked path (task #46 prerequisite #3): never materialize a full
+        # (Nip, Ng) array. Bypasses the fused graph, which assumes residency.
+        kern_q = jnp.asarray(
+            build_kern_q_blocked(
+                provider, q_index, np.asarray(eta_q), np.asarray(phase),
+                self_paired=self_paired, **kern_blocking),
+            dtype=jnp.complex128)
+        W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
+            Pi_q_jnp, kern_q, rtol=rtol, retention_mode=retention_mode)
+    elif (fused := getattr(provider, "fused_apply_and_solve", None)) is not None:
         (
             W_q_unscaled, kern_q, n_retained, s_max, s_min_retained,
             pi_anti_hermitian_residual, v_anti_hermitian_residual,
@@ -1488,8 +1499,62 @@ def apply_kernel_and_solve_device(
     return W_q, kern_q, solve_info
 
 
+def build_kern_q_blocked(provider, q_index, eta_q, phase, *, staging_root,
+                         row_block=2048, grid_chunk=4096, self_paired=False):
+    """kern_q without ever holding a full (Nip, Ng) array.
+
+    Pass 1 row-blocks the transform (the FFT's axis 0 is a pure batch axis) and
+    stages rq; pass 2 accumulates kern_q over grid chunks. Peak is
+    max(2*row_block*Ng, 2*Nip*grid_chunk) + Nip^2 instead of ~3*Nip*Ng, which is
+    what admits diamond-444. Design and costs:
+    docs/isdf-periodic/task46_phaseB_solve_blocking_spec.md.
+    """
+    n_ip, n_grid = int(eta_q.shape[0]), int(eta_q.shape[1])
+    phase = np.asarray(phase, dtype=np.complex128)
+    itemsize = np.dtype(np.complex128).itemsize
+    predicted = n_ip * n_grid * itemsize
+    stat = os.statvfs(staging_root)
+    free = stat.f_bavail * stat.f_frsize
+    if free < predicted * 1.25:
+        raise OSError(
+            f"rq staging REFUSED for q={int(q_index)}: {staging_root} has "
+            f"{free / 2**30:.1f} GiB free, needs {predicted * 1.25 / 2**30:.1f} GiB."
+        )
+
+    rq_path = os.path.join(
+        staging_root, f"isdf_rq_q{int(q_index)}_{os.getpid()}.dat")
+    rq = None
+    try:
+        rq = np.memmap(rq_path, dtype=np.complex128, mode="w+",
+                       shape=(n_ip, n_grid))
+        for r0 in range(0, n_ip, int(row_block)):
+            r1 = min(r0 + int(row_block), n_ip)
+            lq_rows = np.asarray(eta_q[r0:r1], dtype=np.complex128) * phase[None, :]
+            rq[r0:r1] = np.conj(np.asarray(provider.apply(q_index, lq_rows)))
+        rq.flush()
+
+        kern = np.zeros((n_ip, n_ip), dtype=np.complex128)
+        for g0 in range(0, n_grid, int(grid_chunk)):
+            g1 = min(g0 + int(grid_chunk), n_grid)
+            lq_c = (np.asarray(eta_q[:, g0:g1], dtype=np.complex128)
+                    * phase[None, g0:g1])
+            kern += lq_c @ np.asarray(rq[:, g0:g1]).T
+        kern /= np.sqrt(n_grid)
+        if self_paired:
+            kern = kern.real.astype(np.complex128)
+        return kern
+    finally:
+        rq = None
+        gc.collect()
+        try:
+            os.unlink(rq_path)
+        except FileNotFoundError:
+            pass
+
+
 def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4,
-                           retained_solve_residual_gate=1e-10, retention_mode="single"):
+                           retained_solve_residual_gate=1e-10, retention_mode="single",
+                           kern_blocking=None):
     """S4 orchestration: build coul_kpt (Nk, Nip, Nip) with one
     apply_kernel_and_solve_device call per unique {q, neg[q]} pair; the
     partner is set by exact conjugation (W[neg[q]] = conj(W[q]),
@@ -1535,6 +1600,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
             provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=rtol,
             retained_solve_residual_gate=retained_solve_residual_gate,
             self_paired=(nq == q), retention_mode=retention_mode,
+            kern_blocking=kern_blocking,
         )
         coul_kpt[q] = W_q
         kern_kpt[q] = kern_q

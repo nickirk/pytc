@@ -376,6 +376,55 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         self.assertGreater(stats["staged_bytes"], 0)
         self.assertIsNone(in_ram["eta_staging"])
 
+    def test_blocked_solve_matches_resident_build(self):
+        # task #46 prerequisite #3: the full 444-shaped configuration -- eta
+        # staged, AO cache freed, and the per-q solve blocked so no full
+        # (Nip, Ng) array is ever resident. Asserts equivalence to today's
+        # resident path. Tolerance is 1e-9 rather than the 1e-10 used elsewhere:
+        # the grid-chunked Gram accumulation reorders a summation, and that
+        # fp-tie is amplified through the retained-space pseudo-inverse (kern_q
+        # itself agrees to ~5e-17; coul_kpt lands at ~5e-10, rel ~6e-11).
+        import glob
+        import tempfile
+
+        cell = Cell()
+        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
+        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
+        cell.unit = "A"
+        cell.basis = "gth-dzvp"
+        cell.pseudo = "gth-pbe"
+        cell.ke_cutoff = 20.0
+        cell.verbose = 0
+        cell.build()
+        kpts = cell.make_kpts([2, 2, 2])
+        kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                  selection_mode="bpc_cached_gemm", bpc_batch_size=64,
+                  bpc_min_separation=2.0, bpc_candidate_oversampling=4,
+                  bpc_n_topup=16)
+        resident = coulomb.build(cell, kpts, **kw)
+        with tempfile.TemporaryDirectory() as root:
+            blocked = coulomb.build(
+                cell, kpts, reuse_ao_cache_for_eta=False, stage_eta_root=root,
+                stage_eta_block=4096,
+                kern_blocking=dict(staging_root=root, row_block=64,
+                                   grid_chunk=256),
+                **kw)
+            leftover = glob.glob(os.path.join(root, "*"))
+        self.assertEqual(leftover, [], "staging files were not cleaned up")
+
+        np.testing.assert_array_equal(
+            resident["selection_provenance"]["pivot_indices"],
+            blocked["selection_provenance"]["pivot_indices"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(resident["kern_kpt"]), np.asarray(blocked["kern_kpt"]),
+            rtol=0.0, atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            np.asarray(resident["coul_kpt"]), np.asarray(blocked["coul_kpt"]),
+            rtol=0.0, atol=1e-9,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

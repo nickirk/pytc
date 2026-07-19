@@ -58,7 +58,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           process_pipeline_allowance_bytes=None, bpc_batch_size=16,
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
-          stage_eta_root=None, stage_eta_block=4096):
+          stage_eta_root=None, stage_eta_block=4096, kern_blocking=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -398,7 +398,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         )
         coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
             provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
-            retention_mode=retention_mode
+            retention_mode=retention_mode, kern_blocking=kern_blocking,
         )
     finally:
         # Never strand a 1.6 TB staging file, on success or on any failure.
@@ -797,7 +797,7 @@ class ISDFDF:
                  selection_mode="streamed", fixed_pivots=None, bpc_batch_size=16,
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
-                 stage_eta_root=None, stage_eta_block=4096):
+                 stage_eta_root=None, stage_eta_block=4096, kern_blocking=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -813,6 +813,7 @@ class ISDFDF:
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
+        self.kern_blocking = kern_blocking
         self._built = None
         self._ao2mo_call_count = 0
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
@@ -843,6 +844,7 @@ class ISDFDF:
                 reuse_ao_cache_for_eta=self.reuse_ao_cache_for_eta,
                 stage_eta_root=self.stage_eta_root,
                 stage_eta_block=self.stage_eta_block,
+                kern_blocking=self.kern_blocking,
             )
         return self._built
 
