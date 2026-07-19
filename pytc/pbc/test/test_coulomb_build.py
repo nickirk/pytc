@@ -2,6 +2,7 @@
 tiny real cell vs a from-scratch stage-by-stage reconstruction.
 get_k/get_j structural tests live in test_coulomb_get_k_get_j.py."""
 
+import os
 import unittest
 
 import jax
@@ -322,6 +323,58 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
             np.asarray(reuse["coul_kpt"]), np.asarray(freed["coul_kpt"]),
             rtol=0.0, atol=1e-10,
         )
+
+    def test_stage_eta_root_matches_in_ram_build_and_cleans_up(self):
+        # task #46 Phase-B route (b): eta staged to a memmap instead of held in
+        # RAM. At 444/cIP8 the resident eta is 1616 GiB (refused by the
+        # preflight); staged, only one q's contiguous (Nip, Ng) slab is read at a
+        # time. The math is untouched -- this asserts the staged build is
+        # EQUIVALENT to the in-RAM build, and that the staging file is always
+        # removed (a stranded 1.6 TB file would be its own incident).
+        import glob
+        import tempfile
+
+        cell = Cell()
+        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
+        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
+        cell.unit = "A"
+        cell.basis = "gth-dzvp"
+        cell.pseudo = "gth-pbe"
+        cell.ke_cutoff = 20.0
+        cell.verbose = 0
+        cell.build()
+        kpts = cell.make_kpts([2, 2, 2])
+        kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                  selection_mode="bpc_cached_gemm", bpc_batch_size=64,
+                  bpc_min_separation=2.0, bpc_candidate_oversampling=4,
+                  bpc_n_topup=16)
+        in_ram = coulomb.build(cell, kpts, **kw)
+        with tempfile.TemporaryDirectory() as staging_root:
+            # The campaign combination: free the AO cache AND stage eta, so the
+            # AO blocks arrive as a stream rather than one resident array.
+            staged = coulomb.build(cell, kpts, reuse_ao_cache_for_eta=False,
+                                   stage_eta_root=staging_root,
+                                   stage_eta_block=4096, **kw)
+            leftover = glob.glob(os.path.join(staging_root, "*"))
+        self.assertEqual(leftover, [], "staging file was not cleaned up")
+
+        np.testing.assert_array_equal(
+            in_ram["selection_provenance"]["pivot_indices"],
+            staged["selection_provenance"]["pivot_indices"],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(in_ram["inpv_kpt"]), np.asarray(staged["inpv_kpt"]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(in_ram["coul_kpt"]), np.asarray(staged["coul_kpt"]),
+            rtol=0.0, atol=1e-10,
+        )
+        # Write runs must be staging_block-sized (64 KiB at 4096), not the AO
+        # block's -- that decoupling is what makes the staged write viable.
+        stats = staged["eta_staging"]
+        self.assertEqual(stats["write_run_bytes"], 4096 * 16)
+        self.assertGreater(stats["staged_bytes"], 0)
+        self.assertIsNone(in_ram["eta_staging"])
 
 
 if __name__ == "__main__":

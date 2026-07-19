@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 from functools import partial
 
@@ -924,6 +925,115 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     ]
     eta = np.concatenate(eta_chunks, axis=2)[neg]
     return Pi, eta
+
+
+def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
+                        staging_block=4096, imag_tol=1e-10,
+                        free_bytes_safety=1.25):
+    """Identical math to build_pi_eta, but eta is written to a
+    (Nk, Nip, Ng) C-order complex128 memmap instead of being materialized in RAM
+    (task #46 Phase-B route (b)).
+
+    Why: at diamond-444/cIP8 the resident eta is 1616 GiB, which no node holds --
+    the preflight refuses it. Per-q reads from a C-order memmap are CONTIGUOUS,
+    which is exactly what the solve consumes (`eta[q]` is one (Nip, Ng) slab), so
+    only one q need ever be resident (202 GiB at 444).
+
+    Note the q axis is NOT separable -- pair_convolve couples all k through
+    kpt_to_spc's dense phase@T and squares in supercell-image space -- so eta is
+    still produced all-q-per-grid-block. Staging moves the assembled array to
+    disk; it does not restructure the math.
+
+    Writes are buffered to `staging_block` grid points so each write run is
+    staging_block*16 bytes, decoupled from the AO block size: 4096 -> 64 KiB runs
+    (measured 0.77 GB/s on pi_zhu scratch) vs the AO block's 256 -> 4 KiB runs.
+
+    The CALLER owns the staged file and must unlink it (coulomb.build does so in
+    a finally). Returns (Pi, eta_memmap, stats) where stats carries the measured
+    staging throughput so the run's own rate lands in the evidence JSON.
+    """
+    from pytc.pbc.df.kpts import pair_convolve
+
+    X = np.asarray(X)
+    if X.ndim != 3:
+        raise ValueError(f"X must be 3-D (Nk, Nip, Nao), got shape {X.shape}.")
+    neg = np.asarray(neg)
+    if neg.shape != (X.shape[0],):
+        raise ValueError(f"neg must have shape ({X.shape[0]},), got {neg.shape}.")
+    n_kpts, n_ip = int(X.shape[0]), int(X.shape[1])
+    n_grid = int(n_grid)
+    if n_grid <= 0 or int(staging_block) <= 0:
+        raise ValueError("n_grid and staging_block must be positive.")
+
+    Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
+
+    # Fail-closed BEFORE writing: never start a 1.6 TB stage we cannot finish.
+    predicted = n_kpts * n_ip * n_grid * np.dtype(np.complex128).itemsize
+    staging_dir = os.path.dirname(os.path.abspath(staging_path)) or "."
+    stat = os.statvfs(staging_dir)
+    free = stat.f_bavail * stat.f_frsize
+    if free < predicted * float(free_bytes_safety):
+        raise OSError(
+            f"eta staging REFUSED: {staging_dir} has {free / 2**30:.1f} GiB free, "
+            f"needs {predicted * float(free_bytes_safety) / 2**30:.1f} GiB "
+            f"({predicted / 2**30:.1f} GiB x {free_bytes_safety} safety)."
+        )
+
+    # A single 3-D array (the reused AO cache) is one block; an iterable is
+    # STREAMED as-is -- deliberately not list()-ed, since the whole point is to
+    # avoid holding the grid at once. (Staging pairs with
+    # reuse_ao_cache_for_eta=False, where this is a generator.)
+    if isinstance(ao_blocks, np.ndarray):
+        ao_blocks = [ao_blocks]
+
+    eta = np.memmap(staging_path, dtype=np.complex128, mode="w+",
+                    shape=(n_kpts, n_ip, n_grid))
+    pending, pending_cols, col0 = [], 0, 0
+    write_seconds, bytes_written = 0.0, 0
+
+    def _flush(pending, pending_cols, col0):
+        if not pending:
+            return col0, 0.0, 0
+        chunk = pending[0] if len(pending) == 1 else np.concatenate(pending, axis=2)
+        started = time.perf_counter()
+        eta[:, :, col0:col0 + pending_cols] = chunk
+        return col0 + pending_cols, time.perf_counter() - started, chunk.nbytes
+
+    for block in ao_blocks:
+        # [neg] per block then concatenating equals concatenating then [neg]:
+        # the relabel permutes axis 0, the concatenation extends axis 2.
+        Z = pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)[neg]
+        pending.append(Z)
+        pending_cols += int(Z.shape[2])
+        if pending_cols >= int(staging_block):
+            col0, dt, nb = _flush(pending, pending_cols, col0)
+            write_seconds += dt
+            bytes_written += nb
+            pending, pending_cols = [], 0
+    col0, dt, nb = _flush(pending, pending_cols, col0)
+    write_seconds += dt
+    bytes_written += nb
+
+    if col0 != n_grid:
+        raise ValueError(
+            f"staged eta covered {col0} grid points, expected {n_grid} -- the AO "
+            f"block stream did not span the grid."
+        )
+    started = time.perf_counter()
+    eta.flush()
+    write_seconds += time.perf_counter() - started
+
+    stats = {
+        "staging_path": str(staging_path),
+        "staged_bytes": int(bytes_written),
+        "staging_block": int(staging_block),
+        "write_run_bytes": int(staging_block) * np.dtype(np.complex128).itemsize,
+        "write_seconds": float(write_seconds),
+        "write_gb_per_s": (float(bytes_written) / 1e9 / write_seconds
+                           if write_seconds > 0 else None),
+        "free_bytes_before": int(free),
+    }
+    return Pi, eta, stats
 
 
 def apply_raw_kernel_and_solve(

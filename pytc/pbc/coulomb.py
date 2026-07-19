@@ -7,6 +7,7 @@ See design doc §2, §4, §7-§8.
 from __future__ import annotations
 
 import gc
+import os
 
 import numpy as np
 
@@ -24,6 +25,7 @@ from pytc.pbc.df.isdf import (
     build_coul_kpt_device,
     build_periodic_pivot_oracle,
     build_pi_eta,
+    build_pi_eta_staged,
     build_translation_ao_cache,
     build_translation_ao_representation,
     candidate_panel_indices,
@@ -55,7 +57,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           fixed_pivots=None, reciprocal_orbit_partition=None,
           process_pipeline_allowance_bytes=None, bpc_batch_size=16,
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
-          bpc_n_topup=0, reuse_ao_cache_for_eta=True):
+          bpc_n_topup=0, reuse_ao_cache_for_eta=True,
+          stage_eta_root=None, stage_eta_block=4096):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -368,14 +371,44 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
                 cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
             )
         )
-    Pi, eta = build_pi_eta(inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg)
+    # Route (b) of the Phase-B eta prerequisite (task #46): with stage_eta_root
+    # set, eta is written to a memmap there instead of being materialized in RAM
+    # -- at 444/cIP8 the resident array is 1616 GiB, which no node holds. Per-q
+    # reads off a C-order memmap are contiguous, so build_coul_kpt_device's
+    # eta[q] becomes a lazy read of exactly the slab it was going to consume and
+    # only one q is resident. Default (None) keeps today's in-RAM path untouched.
+    eta = None
+    staged_path = None
+    eta_staging_stats = None
+    try:
+        if stage_eta_root is not None:
+            staged_path = os.path.join(
+                stage_eta_root, f"isdf_eta_stage_{os.getpid()}.dat")
+            Pi, eta, eta_staging_stats = build_pi_eta_staged(
+                inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg,
+                staging_path=staged_path, n_grid=int(grid_coords.shape[0]),
+                staging_block=stage_eta_block,
+            )
+        else:
+            Pi, eta = build_pi_eta(
+                inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg)
 
-    provider = provider_cls(
-        cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
-    )
-    coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
-        provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol, retention_mode=retention_mode
-    )
+        provider = provider_cls(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
+            provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
+            retention_mode=retention_mode
+        )
+    finally:
+        # Never strand a 1.6 TB staging file, on success or on any failure.
+        if staged_path is not None:
+            eta = None
+            gc.collect()
+            try:
+                os.unlink(staged_path)
+            except FileNotFoundError:
+                pass
 
     return {
         "mesh_obj": mesh_obj,
@@ -385,6 +418,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         "n_selected": n_selected,
         "n_pipeline_calls": n_pipeline_calls,
         "solve_infos": solve_infos,
+        "eta_staging": eta_staging_stats,
         "ao_tr_residual": ao_tr_residual,
         "selection_provenance": {
             **selection_provenance,
@@ -762,7 +796,8 @@ class ISDFDF:
     def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
                  selection_mode="streamed", fixed_pivots=None, bpc_batch_size=16,
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
-                 bpc_n_topup=0, reuse_ao_cache_for_eta=True):
+                 bpc_n_topup=0, reuse_ao_cache_for_eta=True,
+                 stage_eta_root=None, stage_eta_block=4096):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -776,6 +811,8 @@ class ISDFDF:
         self.bpc_candidate_oversampling = bpc_candidate_oversampling
         self.bpc_n_topup = bpc_n_topup
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
+        self.stage_eta_root = stage_eta_root
+        self.stage_eta_block = stage_eta_block
         self._built = None
         self._ao2mo_call_count = 0
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
@@ -804,6 +841,8 @@ class ISDFDF:
                 bpc_candidate_oversampling=self.bpc_candidate_oversampling,
                 bpc_n_topup=self.bpc_n_topup,
                 reuse_ao_cache_for_eta=self.reuse_ao_cache_for_eta,
+                stage_eta_root=self.stage_eta_root,
+                stage_eta_block=self.stage_eta_block,
             )
         return self._built
 
