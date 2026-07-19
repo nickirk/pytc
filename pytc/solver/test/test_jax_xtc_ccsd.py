@@ -190,8 +190,6 @@ class TestXTCCCSD(unittest.TestCase):
         tau = t2 + np.einsum('ia,jb->ijab', t1, t1)
         woooo_tau_ref = lib.einsum('klij,klab->ijab', Woooo_ref, tau)
         print(f"Ref Woooo*tau Norm: {np.linalg.norm(woooo_tau_ref)}")
-        
-
 
         print("\nRunning Reference Update Amps (Cycle 1)...")
         t1new_ref, t2new_ref = cc_ref.update_amps(t1, t2, eris_ref)

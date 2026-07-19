@@ -58,8 +58,6 @@ def _make_h2():
     params = [jastrow_params, linear_coeffs]
     return sj, det, params, mol, mf
 
-
-
 # When this module is imported by a test runner that has already imported jax
 # (e.g. unittest discover walking other test modules first), the XLA_FLAGS
 # setdefault above is too late and we end up with one CPU device. In that case
@@ -155,7 +153,6 @@ class TestShardingUtilities(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         jax.clear_caches()
-
 
 
 @_NEEDS_4_DEVICES
@@ -309,7 +306,6 @@ class TestShardedComputation(unittest.TestCase):
         jax.clear_caches()
 
 
-
 @_NEEDS_4_DEVICES
 class TestNewtonMultiGPU(unittest.TestCase):
     """Test that NewtonOptimizer with multi_gpu=True gives correct results."""
@@ -417,7 +413,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         jax.clear_caches()
-
 
 
 @_NEEDS_4_DEVICES

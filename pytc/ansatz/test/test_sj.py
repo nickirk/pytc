@@ -230,8 +230,6 @@ class TestAnsatzH2(unittest.TestCase):
         ])
         
         grad_J_over_J_3, lap_J_over_J_3 = compute_jastrow_terms(simple_ansatz, three_electron_pos, simple_jastrow_params)
-        
-        
 
         # For 3 electron case, the expected gradients and laplacians are:
         # For electron 1 at [0,0,0]:
@@ -260,8 +258,6 @@ class TestAnsatzH2(unittest.TestCase):
         # Distance = √2
         # ∇₃u(r₃₂) = 0.5 * [-1,1,0]/√2 ≈ [-0.35, 0.35, 0]
         # Total: ∇₃J/J = [-0.35, 0.85, 0]
-
-
 
         expected_grad_3 = jnp.array([
             [-0.5, -0.5, 0.0],    # gradient for electron 1
