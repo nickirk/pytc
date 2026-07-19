@@ -564,8 +564,6 @@ def _round_robin_pipeline(tile_specs, issue_tile, consume_tile, devices=None,
         for f in issue_futures:
             f.result()
 
-        # Then wait for all consume futures.  Re-raises the first
-        # consume-thread exception.
         for f in consume_futures:
             f.result()
 

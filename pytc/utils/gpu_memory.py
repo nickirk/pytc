@@ -105,7 +105,7 @@ def estimate_persistent_gpu_bytes(nocc, nvir, include_eris=True,
     int
         Estimated bytes (float64).
     """
-    B = 8  # bytes per float64 element
+    B = 8
     O, V = nocc, nvir
 
     mem = 0
@@ -606,7 +606,7 @@ def estimate_blksize(nocc, nvir, phase, *,
 
     elif phase == 'acc_decision':
         # This phase is just deciding whether accumulators fit on GPU.
-        # Return the accumulator size directly.
+        # Return whether the accumulators fit, as a 0/1 flag.
         acc_bytes = (V * O * O * V * 2 + O * V * O * O * 2) * B
         can_fit = available * 0.8 > acc_bytes
         return int(can_fit), budget
@@ -622,7 +622,6 @@ def estimate_blksize(nocc, nvir, phase, *,
         # Per-blk cost: std_blk + tc_blk on host
         host_per_blk = O * V * V * B * 2  # std_blk + tc_blk
 
-        # GPU side: query *actually free* memory in JAX's pool.
         gpu_free = _get_gpu_free_bytes()
 
         N_fused = n_fused if n_fused is not None else (naux if naux is not None else 0)
@@ -1161,7 +1160,6 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
 
     max_rank_block = max(min_block, int(available * budget_fraction / peak_per_rank))
 
-    # Round down to power of 2
     max_rank_block = 2 ** int(np.log2(max(max_rank_block, 1)))
     max_rank_block = min(max_rank_block, max_block, N_fused)
     max_rank_block = max(max_rank_block, min_block)
@@ -1237,7 +1235,6 @@ def enable_xla_compilation_cache(cache_dir=None):
         cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jax_xla")
 
     jax.config.update("jax_compilation_cache_dir", cache_dir)
-    # Cache every compiled program, regardless of size or compile time.
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 

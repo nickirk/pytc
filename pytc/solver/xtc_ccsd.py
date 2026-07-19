@@ -131,7 +131,6 @@ class RCCSD(rccsd.RCCSD):
         '''
         new_cc = self.copy()
         
-        # 1. Setup Standard Coulomb DF
         if with_df is not None:
              new_cc.with_df = with_df
         elif getattr(self._scf, 'with_df', None):
@@ -145,13 +144,11 @@ class RCCSD(rccsd.RCCSD):
              new_cc.with_df = new_cc.with_df.copy()
              new_cc.with_df.auxbasis = auxbasis
              
-        # 2. Setup ISDF-XTC
         from pytc.xtc import ISDFXTC
         if with_isdf_xtc is not None:
             new_cc.xtc_obj = with_isdf_xtc
         elif n_rank_xtc is not None:
             if not isinstance(self.xtc_obj, ISDFXTC):
-                 # Convert to ISDFXTC
                  new_cc.xtc_obj = ISDFXTC.from_xtc(self.xtc_obj, n_rank=n_rank_xtc, **kwargs)
                  # Ensure ISDF kernels are computed
                  if self.jastrow_params is not None:
@@ -162,9 +159,6 @@ class RCCSD(rccsd.RCCSD):
         return new_cc
 
 
-# GPU pipeline primitives are imported at the top of the module (see
-# pytc.utils.gpu_pipeline) and include _AsyncHDF5Writer used by the
-# large-blocks / vvvv write paths below.
 
 
 class _ChemistsERIs(rccsd._ChemistsERIs):
@@ -224,7 +218,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
     nocc = eris.nocc
     nmo = eris.fock.shape[0]
     nvir = nmo - nocc
-    # mo_o removed as unused
     
     # 1. Fock matrix construction 
     # Start from MF Fock matrix (diagonal in MO basis if mo_coeff are mf.mo_coeff)
@@ -234,7 +227,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
     fock_std = reduce(np.dot, (mo_coeff.T, fock_std, mo_coeff))
 
     
-    # orb_block_size=None → get_delta_h auto-picks from probed GPU free memory.
     h1e_corr = np.asarray(xtc_obj.get_1b(jastrow_params))
     eris.e_core = np.asarray(xtc_obj.get_const(jastrow_params, delta_h=h1e_corr))
     # Corrections to Fock from TC 2-body part: (pq|ii) and (pi|iq) corrections.
@@ -268,10 +260,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         h2e_pqii_corr, h2e_piiq_corr = _fock_results
     else:
         # Single-device (or CPU) run — issue serially so the two big
-        # intermediates do not coexist on the same GPU.  Codex P1
-        # observation: dispatching both to the same accelerator
-        # concurrently doubles peak VRAM in the 1-GPU path and was
-        # the dominant OOM trigger before this guard.
+        # intermediates do not coexist on the same GPU.
         _device = _fock_devices[0] if _fock_devices else None
         h2e_pqii_corr = _fock_worker(_fock_ranges[0], _device)
         h2e_piiq_corr = _fock_worker(_fock_ranges[1], _device)
@@ -281,15 +270,12 @@ def _make_xtc_eris(cc, mo_coeff=None):
     eris.fvo = eris.fock[nocc:, :nocc].copy()
     eris.mo_energy = np.diag(eris.fock)
 
-    # 2. Materialize required blocks (except vvvv) using ISDF efficiently
     
-    # Check for density fitting
     with_df = getattr(cc, 'with_df', None)
     if with_df is None and getattr(cc._scf, 'with_df', None):
         with_df = cc._scf.with_df
 
     if with_df is not None:
-        # --- Density Fitting Path ---
         logger.info("Using Density Fitting for standard Coulomb integrals in XTC-CCSD")
         
         # Prepare 3-index tensors L_pq = (L|pq)
@@ -323,9 +309,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # Chunking axis-2 at panel_blk makes every write slab exactly cover
         # an integer number of chunks on that axis — no read-modify-write
         # of boundary chunks, which was the main write amplifier that made
-        # HDF5 writes the pipeline bottleneck (consume threads held the
-        # acc_lock for the full RMW, blocking all other consume threads and
-        # eventually stalling the main dispatch thread on host_sem).
+        # HDF5 writes the pipeline bottleneck.
         #
         # Axes 1 and 3 are chunked at 64 each so a single chunk is ~15 MB
         # for typical (nocc, nvir, panel_blk) — a good HDF5 compromise
@@ -373,10 +357,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
             eris, xtc_obj, jastrow_params, Lov_reshaped, L_vv_full,
             nocc, nvir, nmo, panel_blk)
 
-        # Medium blocks: tiled multi-GPU pipeline (same approach as ovvv/vovv).
-        # oovv/vvoo/ovov/ovvo/vovo each have two virtual indices; we tile over
-        # one virtual dimension in chunks of panel_blk and dispatch across all
-        # local GPUs via _round_robin_pipeline.
         _medium_devices = _solver_local_devices()
         _medium_results = _compute_medium_blocks_tiled(
             xtc_obj, jastrow_params, Loo, Lov_reshaped, L_vv_full,
@@ -396,7 +376,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
         else:
             logger.info(f"VVVV will be saved to disk ({vvvv_bytes/1e9:.2f} GB). "
                         f"Set on_the_fly_vvvv=True to compute on-the-fly instead.")
-            # Save vvvv block-wise to HDF5 (same file as ovvv/vovv)
             vvvv_shape = (nvir, nvir, nvir, nvir)
             if 'vvvv' in eris.feri:
                 del eris.feri['vvvv']
@@ -404,10 +383,8 @@ def _make_xtc_eris(cc, mo_coeff=None):
             _compute_vvvv_block_df(eris, xtc_obj, jastrow_params,
                                    L_vv_full, nocc, nvir, nmo, cc)
 
-        # Free L_vv_full after we are done with all blocks needing it
         del L_vv_full
 
-        # Assign remaining medium blocks from the tiled pipeline results
         eris.ovvo = _medium_results['ovvo']
         eris.ovov = _medium_results['ovov']
         eris.vovo = _medium_results['vovo']
@@ -432,7 +409,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
         return eris
 
     else:
-        # --- Standard Path (ao2mo) --- 
         logger.info("Using standard ao2mo for Coulomb integrals")
         eri_std_full = ao2mo.kernel(cc.mol, mo_coeff, compact=False, aosym='s1', intor='int2e')
         eri_std_full = eri_std_full.reshape(nmo, nmo, nmo, nmo)
@@ -457,7 +433,6 @@ def _make_xtc_eris(cc, mo_coeff=None):
         eris.vvov = get_block('vvov')
         eris.vovv = get_block('vovv')
         
-        # --- VVVV handling ---
         vvvv_bytes = float(nvir)**4 * 8
         on_the_fly = getattr(cc, 'on_the_fly_vvvv', False)
         if on_the_fly:
@@ -490,7 +465,6 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             return lib.einsum('abcd,ijcd->ijab', vvvv.transpose(0, 2, 1, 3), t2)
 
         if isinstance(eris.vvvv, h5py.Dataset):
-            # HDF5-backed: read blocks from disk
             if out is None:
                 out = np.zeros_like(t2)
             nocc = cc.nocc
@@ -532,7 +506,6 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
     if with_df is None and getattr(cc._scf, 'with_df', None):
          with_df = cc._scf.with_df
 
-    # Memory-efficient block size using centralized utility
     _naux = None
     if with_df is not None and hasattr(eris, 'vvL'):
         _naux = eris.vvL.shape[1]
@@ -605,7 +578,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
         )
         t0 = time.perf_counter()
         vvvv_tile = np.asarray(tile_handle)
-        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
+        release_gpu_slot()
         if with_df is not None:
             std_tile = np.tensordot(L_vv_full[p0:p1], L_vv_full[r0:r1], axes=((2,), (2,)))
             vvvv_tile = vvvv_tile[:p_len, :, :r_len, :] + std_tile
@@ -629,9 +602,7 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
 
     # Tile-id round-robin; see the parallel call site in
     # ``jax_xtc_ccsd._contract_vvvv_t2`` for why we no longer pass
-    # ``device_key=lambda spec: spec[0]`` — the original locality benefit
-    # is now redundant (post Apr-7 per-device ISDF kernel caching) and
-    # at ``p_blksize=1`` the p-block grouping monopolises device 0.
+    # ``device_key=lambda spec: spec[0]``.
     _round_robin_pipeline(tile_specs, issue_tile, consume_tile,
                           devices=devices)
 
@@ -699,7 +670,7 @@ def _update_amps(cc, t1, t2, eris):
     t1new +=-2*lib.einsum('lcki,lc,ka->ia', eris_ovoo, t1, t1)
     t1new +=   lib.einsum('kcli,lc,ka->ia', eris_ovoo, t1, t1)
 
-    # Pre-allocate large intermediates that fit in RAM (11GB)
+    # Pre-allocate large host-side intermediates
     # Wvoov: (a, k, i, c) -> (nvir, nocc, nocc, nvir)
     Wvoov = np.zeros((nvir, nocc, nocc, nvir))
     # Wvovo: (a, k, c, i) -> (nvir, nocc, nvir, nocc)
@@ -714,11 +685,9 @@ def _update_amps(cc, t1, t2, eris):
     # tmp_b: (k, b, i, j) -> (nocc, nvir, nocc, nocc)
     tmp_b = np.zeros((nocc, nvir, nocc, nocc))
     
-    # Prepare Tau for tmp_a/b
     tau = t2 + np.einsum('ia,jb->ijab', t1, t1)
     
     # Add non-ovvv contributions to Wvoov/Wvovo
-    # Wvoov += eris.ovvo.transpose(...) etc.
     # Logic copied from rintermediates.py but using arrays
     # Wvoov (akic)
     Wvoov += eris_ovvo.transpose(2,0,3,1)
@@ -739,7 +708,6 @@ def _update_amps(cc, t1, t2, eris):
 
 
     mem_host = cc.max_memory * 1e6
-    # Handle ovvv contributions - branch based on array type
     if isinstance(eris.ovvv, np.ndarray):
         # In-memory path: compute t1new ovvv terms and tmp_a/tmp_b
         # Lvv, Wvoov, Wvovo are computed by imd.* calls later
@@ -773,7 +741,7 @@ def _update_amps(cc, t1, t2, eris):
     
     # Handle vovv contributions - branch based on array type
     if isinstance(eris.vovv, np.ndarray):
-        # In-memory path (matches working code)
+        # In-memory path
         tmp2  = lib.einsum('kibc,ka->abic', eris_oovv, -t1)
         tmp2 += np.asarray(eris.vovv).transpose(0, 2, 1, 3)
         tmp = lib.einsum('abic,jc->ijab', tmp2, t1)
@@ -806,7 +774,6 @@ def _update_amps(cc, t1, t2, eris):
     t2new += np.asarray(eris.vovo).transpose(1,3,0,2)
     logger.debug("t2new basic terms done in %.3f s", time.perf_counter()-t_start)
 
-    # Add W loops
     Loo = imd.Loo(t1, t2, eris)
     Loo[np.diag_indices(nocc)] -= mo_e_o
     
@@ -826,7 +793,6 @@ def _update_amps(cc, t1, t2, eris):
     t2new += _contract_vvvv_t2(cc, tau, eris)
     logger.debug("_contract_vvvv_t2 done in %.3f s", time.perf_counter()-t_vvvv)
 
-    # Use precomputed tmp_a, tmp_b
     t2new -= lib.einsum('kb,kaij->ijab', t1, tmp_a)
     t2new -= lib.einsum('ka,kbij->ijab', t1, tmp_b)
 
@@ -859,8 +825,6 @@ def _energy(cc, t1, t2, eris):
     """CCSD correlation energy for non-Hermitian case."""
     nocc, nvir = t1.shape
     fock = eris.fock
-    # e = 2*np.einsum('ia,ia', fock[:nocc,nocc:], t1)
-    # Non-Hermitian: uses fov?
     fov = fock[:nocc, nocc:]
     e = 2*np.einsum('ia,ia', fov, t1)
     tau = np.einsum('ia,jb->ijab',t1,t1)
@@ -993,10 +957,7 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     Loo = np.empty((naux, nocc, nocc))
     Lov = np.empty((naux, nocc, nvir))
     
-    # Use max_memory to estimate chunk size (approximate)
     mem_elements = int(eris.max_memory * 1e6 / 8)
-    # Ensure reasonable lower bound for chunking (e.g. 1% of memory or at least some blocks)
-    # 4e8 in original code likely meant ~3GB. We replace it with mem_elements.
     chunks = (min(nvir_pair, int(mem_elements/with_df.blockdim)), min(naux, with_df.blockdim))
     eris.vvL = eris.feri.create_dataset('vvL', (nvir_pair, naux), 'f8', chunks=chunks)
     
@@ -1140,18 +1101,17 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
         blk, i0, i1 = spec
         i_len     = i1 - i0
         t0 = time.perf_counter()
-        tc_raw    = np.asarray(handle)             # GPU→CPU transfer
+        tc_raw    = np.asarray(handle)
         t1 = time.perf_counter()
-        release_gpu_slot()                          # free GPU slot immediately
+        release_gpu_slot()
         tc_view   = blk.trim_fn(tc_raw, i_len)     # strip JIT padding (view)
         if blk.df_fn is not None:
             # IN-PLACE add: allocate the DF buffer once, then accumulate the
             # TC view into it.  This avoids a 3rd host-side 5 GB allocation
-            # per tile (which was the main cause of the 50 % host RAM blow-up
-            # vs. the pre-refactoring path).
+            # per tile.
             tile = blk.df_fn(i0, i1)               # fresh contiguous alloc
             t2 = time.perf_counter()
-            np.add(tile, tc_view, out=tile)        # tile += tc_view
+            np.add(tile, tc_view, out=tile)
             t3 = time.perf_counter()
             df_s  = t2 - t1
             add_s = t3 - t2
@@ -1617,9 +1577,9 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
                     r_len = r1 - r0
                     device_key = getattr(device, "id", "host")
                     t0 = time.perf_counter()
-                    tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]  # GPU→CPU transfer
+                    tc_tile = np.asarray(tile_handle)[:p_len, :, :r_len, :]
                     t1 = time.perf_counter()
-                    release_gpu_slot()  # GPU pipeline is now free to issue the next tile
+                    release_gpu_slot()
                     std_tile = np.tensordot(_L_p, L_vv_full[r0:r1], axes=((2,), (2,)))
                     t2 = time.perf_counter()
                     # vvvv_slab writes are non-overlapping (different r-ranges) — no lock needed
@@ -1713,7 +1673,6 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
         for p0, p1 in lib.prange(0, nvir, blksize):
             slab_sem.acquire()
             try:
-                # Compute only the needed block of standard integrals
                 std_blk = ao2mo.general(
                     mol, (mo_v[:, p0:p1], mo_v, mo_v, mo_v), compact=False)
                 std_blk = std_blk.reshape(p1-p0, nvir, nvir, nvir)
