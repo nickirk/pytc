@@ -930,7 +930,7 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
 
 def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
                         staging_block=4096, imag_tol=1e-10,
-                        free_bytes_safety=1.25):
+                        free_bytes_safety=1.25, additional_reserve_bytes=0):
     """Identical math to build_pi_eta, but eta is written to a
     (Nk, Nip, Ng) C-order complex128 memmap instead of being materialized in RAM
     (task #46 Phase-B route (b)).
@@ -969,15 +969,20 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
     Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
 
     # Fail-closed BEFORE writing: never start a 1.6 TB stage we cannot finish.
+    # Reserve the concurrent peak, not just eta: with the blocked solve, a per-q
+    # rq file lives alongside eta later. Checking it here fails before the
+    # multi-TiB eta write rather than after.
     predicted = n_kpts * n_ip * n_grid * np.dtype(np.complex128).itemsize
+    required = predicted + int(additional_reserve_bytes)
     staging_dir = os.path.dirname(os.path.abspath(staging_path)) or "."
     stat = os.statvfs(staging_dir)
     free = stat.f_bavail * stat.f_frsize
-    if free < predicted * float(free_bytes_safety):
+    if free < required * float(free_bytes_safety):
         raise OSError(
             f"eta staging REFUSED: {staging_dir} has {free / 2**30:.1f} GiB free, "
-            f"needs {predicted * float(free_bytes_safety) / 2**30:.1f} GiB "
-            f"({predicted / 2**30:.1f} GiB x {free_bytes_safety} safety)."
+            f"needs {required * float(free_bytes_safety) / 2**30:.1f} GiB "
+            f"(eta {predicted / 2**30:.1f} + reserved "
+            f"{int(additional_reserve_bytes) / 2**30:.1f} GiB, x{free_bytes_safety})."
         )
 
     # A single 3-D array (the reused AO cache) is one block; an iterable is

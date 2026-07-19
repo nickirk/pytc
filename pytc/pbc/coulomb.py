@@ -388,6 +388,10 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
                 inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg,
                 staging_path=staged_path, n_grid=int(grid_coords.shape[0]),
                 staging_block=stage_eta_block,
+                # the blocked solve stages a per-q rq alongside eta
+                additional_reserve_bytes=(
+                    int(inpv_kpt.shape[1]) * int(grid_coords.shape[0]) * 16
+                    if kern_blocking is not None else 0),
             )
         else:
             Pi, eta = build_pi_eta(
