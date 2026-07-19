@@ -169,18 +169,10 @@ class TestBuild(unittest.TestCase):
             )
 
 class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
-    """Regression for task #47. The ISDF device W-solve silently ran in single
-    precision whenever jax_enable_x64 was off: hermitian_sandwich_solve_device
-    casts to complex128, but JAX downcasts to complex64 without x64, so the
-    eigh/solve loses ~9 digits and trips the 1e-10 machine-tier retained-solve
-    gate three stages downstream. It surfaced at the diamond-111 primitive cell
-    because that was the first NON-TEST build ever routed through the device
-    solve (every test module and accepted production runner enables x64), and
-    diamond-111/k222 is a fully self-paired (all-TRIM) mesh -- every q is its
-    own negative, so all q's take the Pi_q.real self-paired path. Guards BOTH
-    branches: x64 on passes the gate at all self-paired q's; x64 off now fails
-    closed at the boundary with the actionable dtype error instead of the opaque
-    downstream gate trip."""
+    """The device W-solve requires complex128: without jax_enable_x64 JAX
+    downcasts silently and the solve loses ~9 digits, tripping the machine-tier
+    retained-solve gate. Guards both branches -- x64 on passes the gate at every
+    self-paired q; x64 off fails closed at the boundary with a dtype error."""
 
     @staticmethod
     def _diamond_111():
@@ -289,14 +281,9 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
             )
 
     def test_reuse_ao_cache_for_eta_false_gives_equivalent_build(self):
-        # task #46 memory lever: reuse_ao_cache_for_eta=False frees the selection
-        # AO cache (and the selector closure holding it) before the eta stage and
-        # re-streams the AOs, so the 444 selection and build peaks don't overlap.
-        # The build is EQUIVALENT to the reuse=True path: same pivots + inpv_kpt
-        # (bit-identical -- same selection, same interpolation vectors), and
-        # coul_kpt allclose (streamed-vs-cached AOs are the same values; the only
-        # residual is the device solve's own fp-tie). Correctness is independent
-        # of the memory strategy.
+        # Freeing the AO cache before eta re-streams the AOs, which must not
+        # change the result: same pivots and inpv_kpt, coul_kpt to the solve's
+        # own fp-tie. Correctness is independent of the memory strategy.
         cell = Cell()
         cell.atom = "C 0 0 0; C .8917 .8917 .8917"
         cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
@@ -325,12 +312,8 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         )
 
     def test_stage_eta_root_matches_in_ram_build_and_cleans_up(self):
-        # task #46 Phase-B route (b): eta staged to a memmap instead of held in
-        # RAM. At 444/cIP8 the resident eta is 1616 GiB (refused by the
-        # preflight); staged, only one q's contiguous (Nip, Ng) slab is read at a
-        # time. The math is untouched -- this asserts the staged build is
-        # EQUIVALENT to the in-RAM build, and that the staging file is always
-        # removed (a stranded 1.6 TB file would be its own incident).
+        # Staging eta must not change the result, and the staging file must
+        # always be removed.
         import glob
         import tempfile
 
@@ -369,21 +352,17 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
             np.asarray(in_ram["coul_kpt"]), np.asarray(staged["coul_kpt"]),
             rtol=0.0, atol=1e-10,
         )
-        # Write runs must be staging_block-sized (64 KiB at 4096), not the AO
-        # block's -- that decoupling is what makes the staged write viable.
+        # Write runs follow staging_block, not the AO block size.
         stats = staged["eta_staging"]
         self.assertEqual(stats["write_run_bytes"], 4096 * 16)
         self.assertGreater(stats["staged_bytes"], 0)
         self.assertIsNone(in_ram["eta_staging"])
 
     def test_blocked_solve_matches_resident_build(self):
-        # task #46 prerequisite #3: the full 444-shaped configuration -- eta
-        # staged, AO cache freed, and the per-q solve blocked so no full
-        # (Nip, Ng) array is ever resident. Asserts equivalence to today's
-        # resident path. Tolerance is 1e-9 rather than the 1e-10 used elsewhere:
-        # the grid-chunked Gram accumulation reorders a summation, and that
-        # fp-tie is amplified through the retained-space pseudo-inverse (kern_q
-        # itself agrees to ~5e-17; coul_kpt lands at ~5e-10, rel ~6e-11).
+        # Full staged+blocked configuration must match the resident path.
+        # Tolerance is 1e-9, not 1e-10: the grid-chunked Gram reorders a
+        # summation and the pseudo-inverse amplifies that tie (kern_q agrees to
+        # ~5e-17; coul_kpt to ~5e-10, rel ~6e-11).
         import glob
         import tempfile
 

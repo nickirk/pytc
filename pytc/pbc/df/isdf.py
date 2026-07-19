@@ -931,27 +931,17 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
 def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
                         staging_block=4096, imag_tol=1e-10,
                         free_bytes_safety=1.25, additional_reserve_bytes=0):
-    """Identical math to build_pi_eta, but eta is written to a
-    (Nk, Nip, Ng) C-order complex128 memmap instead of being materialized in RAM
-    (task #46 Phase-B route (b)).
+    """build_pi_eta with eta written to a (Nk, Nip, Ng) C-order memmap rather
+    than held in RAM, so only one q's contiguous slab need be resident.
 
-    Why: at diamond-444/cIP8 the resident eta is 1616 GiB, which no node holds --
-    the preflight refuses it. Per-q reads from a C-order memmap are CONTIGUOUS,
-    which is exactly what the solve consumes (`eta[q]` is one (Nip, Ng) slab), so
-    only one q need ever be resident (202 GiB at 444).
+    The q axis is not separable (pair_convolve couples all k), so eta is still
+    produced all-q-per-grid-block; this stages the assembled array without
+    restructuring the math. Writes are buffered to `staging_block` grid points,
+    decoupling the write run length from the AO block size.
 
-    Note the q axis is NOT separable -- pair_convolve couples all k through
-    kpt_to_spc's dense phase@T and squares in supercell-image space -- so eta is
-    still produced all-q-per-grid-block. Staging moves the assembled array to
-    disk; it does not restructure the math.
-
-    Writes are buffered to `staging_block` grid points so each write run is
-    staging_block*16 bytes, decoupled from the AO block size: 4096 -> 64 KiB runs
-    (measured 0.77 GB/s on pi_zhu scratch) vs the AO block's 256 -> 4 KiB runs.
-
-    The CALLER owns the staged file and must unlink it (coulomb.build does so in
-    a finally). Returns (Pi, eta_memmap, stats) where stats carries the measured
-    staging throughput so the run's own rate lands in the evidence JSON.
+    The caller owns the staged file and must unlink it. Returns
+    (Pi, eta_memmap, stats). Costs and design:
+    docs/isdf-periodic/task46_phaseB_eta_staging_spec.md.
     """
     from pytc.pbc.df.kpts import pair_convolve
 
@@ -968,10 +958,8 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
 
     Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
 
-    # Fail-closed BEFORE writing: never start a 1.6 TB stage we cannot finish.
-    # Reserve the concurrent peak, not just eta: with the blocked solve, a per-q
-    # rq file lives alongside eta later. Checking it here fails before the
-    # multi-TiB eta write rather than after.
+    # Fail closed before writing: never start a stage we cannot finish.
+    # Reserve the concurrent peak so the refusal precedes the large write.
     predicted = n_kpts * n_ip * n_grid * np.dtype(np.complex128).itemsize
     required = predicted + int(additional_reserve_bytes)
     staging_dir = os.path.dirname(os.path.abspath(staging_path)) or "."
@@ -985,10 +973,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
             f"{int(additional_reserve_bytes) / 2**30:.1f} GiB, x{free_bytes_safety})."
         )
 
-    # A single 3-D array (the reused AO cache) is one block; an iterable is
-    # STREAMED as-is -- deliberately not list()-ed, since the whole point is to
-    # avoid holding the grid at once. (Staging pairs with
-    # reuse_ao_cache_for_eta=False, where this is a generator.)
+    # One 3-D array is a single block; an iterable is streamed, never list()-ed.
     if isinstance(ao_blocks, np.ndarray):
         ao_blocks = [ao_blocks]
 
@@ -1006,8 +991,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
         return col0 + pending_cols, time.perf_counter() - started, chunk.nbytes
 
     for block in ao_blocks:
-        # [neg] per block then concatenating equals concatenating then [neg]:
-        # the relabel permutes axis 0, the concatenation extends axis 2.
+        # [neg] commutes with the concatenation: it permutes axis 0.
         Z = pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)[neg]
         pending.append(Z)
         pending_cols += int(Z.shape[2])
@@ -1444,8 +1428,7 @@ def apply_kernel_and_solve_device(
     # Providers with a fused fast path run the whole chain as one jax.jit
     # graph; others fall back to the eager per-stage path below.
     if kern_blocking is not None:
-        # Blocked path (task #46 prerequisite #3): never materialize a full
-        # (Nip, Ng) array. Bypasses the fused graph, which assumes residency.
+        # Bypasses the fused graph, which assumes a resident (Nip, Ng).
         kern_q = jnp.asarray(
             build_kern_q_blocked(
                 provider, q_index, np.asarray(eta_q), np.asarray(phase),
@@ -1506,12 +1489,11 @@ def apply_kernel_and_solve_device(
 
 def build_kern_q_blocked(provider, q_index, eta_q, phase, *, staging_root,
                          row_block=2048, grid_chunk=4096, self_paired=False):
-    """kern_q without ever holding a full (Nip, Ng) array.
+    """kern_q without holding a full (Nip, Ng) array.
 
-    Pass 1 row-blocks the transform (the FFT's axis 0 is a pure batch axis) and
-    stages rq; pass 2 accumulates kern_q over grid chunks. Peak is
-    max(2*row_block*Ng, 2*Nip*grid_chunk) + Nip^2 instead of ~3*Nip*Ng, which is
-    what admits diamond-444. Design and costs:
+    Pass 1 row-blocks the transform (the FFT's axis 0 is a batch axis) and stages
+    rq; pass 2 accumulates kern_q over grid chunks. Peak is
+    max(2*row_block*Ng, 2*Nip*grid_chunk) + Nip^2. Design and costs:
     docs/isdf-periodic/task46_phaseB_solve_blocking_spec.md.
     """
     n_ip, n_grid = int(eta_q.shape[0]), int(eta_q.shape[1])

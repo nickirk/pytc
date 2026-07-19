@@ -330,13 +330,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
     ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
 
     if not reuse_ao_cache_for_eta and cached_ao is not None:
-        # Memory-constrained campaign (task #46): free the selection AO cache --
-        # AND the selector closure (col_batch_eval) that also holds it -- before
-        # the eta stage, so the selection peak and the build peak (dominated by
-        # the per-q eta slab) do NOT overlap. Costs one extra AO streaming pass
-        # for eta; buys ~ (AO cache size) of headroom, the difference between a
-        # feasible and an infeasible 444 build. The campaign runner's phase-peak
-        # preflight is computed from THIS SAME flag so the two cannot drift.
+        # Free the AO cache -- and the selector closure that also holds it -- so
+        # the selection and build peaks do not overlap. Costs one extra AO pass.
         cached_ao = None
         col_batch_eval = None
         diag = None
@@ -371,12 +366,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
                 cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
             )
         )
-    # Route (b) of the Phase-B eta prerequisite (task #46): with stage_eta_root
-    # set, eta is written to a memmap there instead of being materialized in RAM
-    # -- at 444/cIP8 the resident array is 1616 GiB, which no node holds. Per-q
-    # reads off a C-order memmap are contiguous, so build_coul_kpt_device's
-    # eta[q] becomes a lazy read of exactly the slab it was going to consume and
-    # only one q is resident. Default (None) keeps today's in-RAM path untouched.
+    # With stage_eta_root set, eta is staged to a memmap: per-q reads off a
+    # C-order file are contiguous, so only one q is resident. None keeps in-RAM.
     eta = None
     staged_path = None
     eta_staging_stats = None
@@ -405,7 +396,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
             retention_mode=retention_mode, kern_blocking=kern_blocking,
         )
     finally:
-        # Never strand a 1.6 TB staging file, on success or on any failure.
+        # Never strand the staging file, on success or failure.
         if staged_path is not None:
             eta = None
             gc.collect()
