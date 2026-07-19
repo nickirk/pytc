@@ -93,28 +93,6 @@ def kernel_process_ovvv_block(ovvv_blk, t1, t2, tau):
 
     Implementation notes
     --------------------
-    This kernel has been rewritten three times in response to production
-    XLA failures on pCV5Z-class (≈30 GB f64 ``ovvv_blk``) inputs:
-
-    * v1 (textbook): paired ``'kdac'``/``'kcad'`` einsums against the
-      same ``ovvv_blk``.  XLA fused an axis-1↔3 transpose of the 30 GB
-      tile into several downstream contractions (``input_transpose_fusion``
-      HLOs) and the autotuner aborted with ``NOT_FOUND: No valid config
-      found!`` on shapes like ``f64[1179, 3070116]``.
-
-    * v2 (commit ``eeb39b2``): precomputed ``ovvv_swap`` and
-      ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` inside this ``@jax.jit``.
-      XLA's common-subexpression / fusion passes still re-fused the
-      transpose into the downstream GEMMs that contract ``(c, d)``
-      against ``tau`` in ``tmp_a`` and ``tmp_b``.  The natural GEMM plan
-      for ``einsum('kdac,ijcd->kaij', ovvv_blk, tau)`` wants
-      ``(k*a, d*c) @ (d*c, i*j)``, which requires reshape-after-transpose
-      of ``ovvv_blk`` into layout ``(k, a, c, d)``.  At
-      ``(nocc=21, nvir=1179, blk=124)`` that scratch is 27 GB, and the
-      BFC allocator could not fit it alongside ``ovvv_blk`` +
-      ``ovvv_swap`` + ``ovvv_t1sym`` + t1/t2/tau → OOM → autotuner
-      reports "NOT_FOUND" (no config can allocate its scratch).
-
     * v3 (current): two targeted changes.
 
       1. Materialise ``ovvv_swap`` with an ``optimization_barrier`` so
