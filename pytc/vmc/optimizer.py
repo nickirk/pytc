@@ -7,7 +7,6 @@ import jax.scipy.sparse.linalg as spla
 import optax
 import folx
 from jax.tree_util import tree_map
-from jax.lax import stop_gradient
 import jax.flatten_util
 
 logger = logging.getLogger(__name__)
@@ -629,7 +628,7 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
 def create_gradient_mask(ansatz, params, frozen_params):
-    """Create a gradient mask PyTree for the combined params structure.
+    """Create a trainable-leaf mask for the combined parameter PyTree.
     
     Assumes params = [jastrow_params, linear_coeffs]. The mask is applied
     only to the jastrow_params part based on frozen_params identifiers.
@@ -642,11 +641,12 @@ def create_gradient_mask(ansatz, params, frozen_params):
                        for Jastrow factors whose parameters should be frozen.
 
     Returns:
-        A PyTree with the same structure as params, where frozen parameters
-        are wrapped with `jax.lax.stop_gradient`.
+        A boolean PyTree with the same structure as params. ``False`` leaves
+        are frozen and ``True`` leaves remain trainable. Returns ``None``
+        when no parameters are frozen.
     """
     if not frozen_params:
-        return params
+        return None
 
     if not isinstance(params, (list, tuple)) or len(params) != 2:
         raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
@@ -657,28 +657,48 @@ def create_gradient_mask(ansatz, params, frozen_params):
     logger.info(f"Creating gradient mask for frozen Jastrow parameters: {frozen_params}")
     jastrows = ansatz.jastrow.jastrows
     if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
-        raise TypeError(f"Jastrow params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
+        raise TypeError(
+            f"Jastrow params structure (length {len(jastrow_params)}) does not "
+            f"match jastrows (length {len(jastrows)})"
+        )
 
-    # Builds a new outer list; parameter pytrees are not deep-copied,
-    # though selected entries pass through tree_map(stop_gradient)
-    masked_jastrow_params = []
+    frozen_indices = set()
+    for identifier in frozen_params:
+        if isinstance(identifier, bool) or not isinstance(identifier, (int, str)):
+            raise TypeError("frozen_params identifiers must be integer indices or strings")
+
+        if isinstance(identifier, int):
+            matches = [identifier] if 0 <= identifier < len(jastrows) else []
+        else:
+            matches = [
+                i
+                for i, jastrow in enumerate(jastrows)
+                if identifier
+                in (jastrow.__class__.__name__, getattr(jastrow, "name", None))
+            ]
+        if not matches:
+            raise ValueError(f"Unknown frozen Jastrow parameter: {identifier!r}")
+        frozen_indices.update(matches)
+
+    jastrow_mask_leaves = []
     for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
-        should_freeze = False
-        for fp in frozen_params:
-            if isinstance(fp, int) and fp == i:
-                should_freeze = True
-                break
-            elif isinstance(fp, str):
-                if fp == jastrow.__class__.__name__ or fp == getattr(jastrow, 'name', None):
-                    should_freeze = True
-                    break
-        
+        should_freeze = i in frozen_indices
         if should_freeze:
-            param_pytree = tree_map(stop_gradient, param_pytree)
-            logger.info(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
-        masked_jastrow_params.append(param_pytree)
+            logger.info(
+                f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, "
+                f"name={getattr(jastrow, 'name', None)}"
+            )
+        jastrow_mask_leaves.append(
+            tree_map(lambda _: not should_freeze, param_pytree)
+        )
 
-    return [masked_jastrow_params, linear_coeffs]
+    jastrow_mask = (
+        tuple(jastrow_mask_leaves)
+        if isinstance(jastrow_params, tuple)
+        else jastrow_mask_leaves
+    )
+    mask = (jastrow_mask, tree_map(lambda _: True, linear_coeffs))
+    return mask if isinstance(params, tuple) else list(mask)
 
 def apply_gradient_mask(grads, mask):
     """Apply gradient mask to gradients to freeze parameters.
@@ -694,11 +714,10 @@ def apply_gradient_mask(grads, mask):
     if mask is None:
         return grads
         
-    def _apply_mask(g, m):
-        # isinstance check is a tautology (stop_gradient preserves type),
-        # so this zeros every gradient
-        if isinstance(m, type(stop_gradient(m))):
-            return jnp.zeros_like(g)
-        return g
-        
-    return tree_map(_apply_mask, grads, mask)
+    return tree_map(
+        lambda gradient, trainable: jnp.where(
+            trainable, gradient, jnp.zeros_like(gradient)
+        ),
+        grads,
+        mask,
+    )
