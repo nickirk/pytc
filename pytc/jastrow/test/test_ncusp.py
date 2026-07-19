@@ -16,7 +16,6 @@ from pytc.vmc.walker import Walker
 def create_test_walker(positions, n_alpha, n_beta):
     """Helper to create a Walker for testing."""
     n_walkers = positions.shape[0]
-    # Ensure positions are (n_walkers, n_elec, 3)
     if positions.ndim == 2:
         positions = positions[None, ...]
         n_walkers = 1
@@ -48,34 +47,28 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         self.mf = scf.RHF(self.mol)
         self.mf.kernel()
         
-        # Initialize and setup NuclearCuspJastrow
         self.ncusp = NuclearCusp.create(self.mol, n_radial=1000)
         
     def test_mo_values_symmetry(self):
         """Test that MO values follow expected symmetry for H2O.
         The two H atoms should have similar magnitude but potentially opposite signs
         due to the molecular orbital symmetry."""
-        # Test points
         distances = np.linspace(0.1, 2.0, 1000)
         
-        # Get values for both H atoms
         val1 = self.ncusp.eval_mo_at_r(0, distances)  # First H
         val2 = self.ncusp.eval_mo_at_r(2, distances)  # Second H
         
-        # Test that magnitudes are similar
         np.testing.assert_allclose(abs(val1), abs(val2), rtol=1e-5,
                                  err_msg=f"MO value magnitudes not symmetric for H atoms")
         
 
     def test_mo_sums_debug(self):
         """Debug MO sums calculation."""
-        # Print debug information
         nocc = self.mol.nelec[0]
         
         print("\nAO values at first point for each nucleus:")
         for i in range(self.ncusp.n_nuclei):
             print(f"\nNucleus {i}:")
-            # AO values no longer stored
             pass
     
     
@@ -88,18 +81,14 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             Z_idx = self.ncusp.Z_to_idx[int(Z)]
             rc = params['rc'][Z_idx]
             
-            # Extract X4 value from params
             X4 = params['X4'][Z_idx]
             
-            # Compute X values and alpha coefficients for this nucleus
             X = self.ncusp._compute_X_values(Z_idx, rc, X4)
             poly_coeffs = self.ncusp._compute_alpha_coeffs(Z, rc, X)
             
-            # Test matching conditions at r = rc
             phi_rc_vals = self.ncusp._get_phi_s_derivatives(nucleus_idx, rc)
             phi_s, phi_s_d1, phi_s_d2 = phi_rc_vals
             
-            # Compute φ_cusp and its derivatives at rc
             poly_val = self.ncusp._eval_poly(rc, poly_coeffs)
             phi_cusp = np.exp(poly_val)
             
@@ -157,7 +146,6 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         """Test parameter initialization and constraints."""
         params = self.ncusp.init_params()
         
-        # Create Z_dict dynamically from the array-based representation
         Z_dict = {}
         for Z in self.ncusp.unique_Z:
             Z_int = int(Z)
@@ -168,10 +156,8 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             Z = float(Z_type)
             rc = params['rc'][Z_idx]
             
-            # Check rc initialization
             self.assertAlmostEqual(rc, 1.0/Z)
             
-            # Get X4 value and compute polynomial coefficients
             X4 = params['X4'][Z_idx]
             X = self.ncusp._compute_X_values(Z_idx, rc, X4)
             coeffs = self.ncusp._compute_alpha_coeffs(Z, rc, X)
@@ -185,23 +171,17 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         """Compare eval_mo_at_r results with NumPy's cubic spline interpolation."""
         from scipy.interpolate import CubicSpline
         
-        # Initialize parameters
         params = self.ncusp.init_params()
         
-        # Test for each nucleus
         for nucleus_idx in range(self.ncusp.n_nuclei):
-            # Use ncusp's internal radial grid and coefficients
             r_grid = self.ncusp.r_grids[nucleus_idx]
             spline_coeffs = self.ncusp.spline_coeffs[nucleus_idx]
             
-            # Evaluate at grid points
             jax_values_at_grid = self.ncusp.eval_mo_at_r(nucleus_idx, r_grid)
             
-            # Evaluate at midpoints
             midpoints = (r_grid[:-1] + r_grid[1:]) / 2
             jax_values_at_mid = self.ncusp.eval_mo_at_r(nucleus_idx, midpoints)
             
-            # Just check finite
             self.assertTrue(np.all(np.isfinite(jax_values_at_grid)))
             self.assertTrue(np.all(np.isfinite(jax_values_at_mid)))
     
@@ -221,10 +201,8 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         ]
         
         for r1, r2 in test_points:
-            # Compute the Jastrow value
             u = self.ncusp._compute(r1, r2, params)
             
-            # Check each nucleus contribution
             for nucleus_idx in range(self.ncusp.n_nuclei):
                 nucleus_pos = self.mol.atom_coords()[nucleus_idx]
                 r1_dist = np.linalg.norm(r1 - nucleus_pos)
@@ -233,26 +211,22 @@ class TestNuclearCuspJastrow(unittest.TestCase):
                 Z_idx = self.ncusp.Z_to_idx[int(Z)]
                 rc = params['rc'][Z_idx]
                 
-                # Test if distances are within rc
                 phi_s = self.ncusp.eval_mo_at_r(nucleus_idx, r1_dist)
 
     def test_log_gradients(self):
         """Test gradient and laplacian calculations."""
         params = self.ncusp.init_params()
         
-        # Test points near each nucleus
         for nucleus_idx in range(self.ncusp.n_nuclei):
             nucleus_pos = self.mol.atom_coords()[nucleus_idx]
             Z = self.mol.atom_charges()[nucleus_idx]
             Z_idx = self.ncusp.Z_to_idx[int(Z)]
             rc = params['rc'][Z_idx]
             
-            # Test point slightly offset from nucleus
             r1 = nucleus_pos + np.array([0.0, 0.0, 0.01])
             r2 = nucleus_pos + np.array([0.0, 0.0, -.01])
             
             value = self.ncusp._compute(r1, r2, params)
-            # Get gradients and laplacian
             grad_u, lap_u = self.ncusp.get_log_grads_r1(r1, r2, params)
             
             # Check basic physics:
@@ -264,7 +238,6 @@ class TestNuclearCuspJastrow(unittest.TestCase):
                 self.assertGreater(grad_radial, -100.0, 
                     "Gradient should not be strongly attractive inside rc")
             
-            # 2. Values should be finite
             self.assertTrue(np.all(np.isfinite(grad_u)), 
                           f"Non-finite gradient values found")
             self.assertTrue(np.isfinite(lap_u),
@@ -276,50 +249,38 @@ class TestNuclearCuspJastrow(unittest.TestCase):
         from pytc.ansatz.det import SlaterDet
         import jax.numpy as jnp
         
-        # Create RHF determinant
         det = SlaterDet.create(self.mol, self.mf.mo_coeff)
         
-        # Create SlaterJastrow with nuclear cusp
         sj = SlaterJastrow.create(self.mol, self.ncusp, [det])
         
-        # Initialize parameters
         jastrow_params = self.ncusp.init_params()
         linear_coeffs = jnp.array([1.0])  # Single determinant
-        # Combine parameters for SlaterJastrow
         params = [jastrow_params, linear_coeffs]
         
-        # Set up fixed positions for other electrons (random but fixed)
         key = jax.random.PRNGKey(42)
         n_electrons = 10  # Water molecule has 10 electrons
         fixed_positions = jax.random.normal(key, (n_electrons-1, 3)) + 4.0
         
-        # Create grid points along x-axis through O atom
         x_points = np.linspace(-0.02, 0.02, 100)
         energies = []
         jastrow_vals = []
         
         
-        # JIT compile the evaluation for speed
         @jax.jit
         def eval_point(pos):
-            # Create full electron configuration
             elec_coords = jnp.vstack([pos[None, :], fixed_positions])
             
-            # Create walker and populate it
             walker = create_test_walker(elec_coords, det.n_alpha, det.n_beta)
             single_walker = jax.tree_util.tree_map(lambda x: x[0], walker)
             
             psi, updated_walker = sj(single_walker, params)
             
-            # Compute local energy using combined parameters
             E_L = sj.local_energy(updated_walker, params)[0]
             
-            # Compute Jastrow value
             # Ensure we use sj.jastrow._compute directly to be consistent with params
             u = sj.jastrow._compute(pos, fixed_positions[0], params[0])
             return E_L, jnp.exp(u)
 
-        # Evaluate Jastrow and local energy at each point
         for x in x_points:
             pos = jnp.array([x, 0.0, 0.0])
             E_L, j_val = eval_point(pos)
@@ -327,7 +288,6 @@ class TestNuclearCuspJastrow(unittest.TestCase):
             energies.append(float(E_L))
             jastrow_vals.append(float(j_val))
         
-        # Print results
         print("\nEnergies and Jastrow values along x-axis through O atom:")
         print("x-coordinate  Energy (hartree)    Jastrow value")
         print("-" * 50)

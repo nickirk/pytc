@@ -604,7 +604,7 @@ class TestComputeMediumBlocksTiled(unittest.TestCase):
                 elif layout == "qr":
                     padded = np.zeros((p, ps, ps, s))
                     padded[:, :q, :r, :] = block
-                else:   # "ps"
+                else:
                     padded = np.zeros((ps, q, r, ps))
                     padded[:p, :, :, :s] = block
                 block = padded

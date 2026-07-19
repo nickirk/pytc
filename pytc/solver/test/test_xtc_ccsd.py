@@ -10,13 +10,11 @@ from pytc.jastrow import rexp
 from pytc.solver import xtc_ccsd
 
 
-# Enable float64 for JAX
 jax.config.update("jax_enable_x64", True)
 
 class TestXTCCCSD(unittest.TestCase):
     def setUp(self):
 
-        # CO System
         self.mol = gto.M(
             atom='C 0 0 0; O 0 0 1.128',
             basis='sto-6g',
@@ -24,17 +22,13 @@ class TestXTCCCSD(unittest.TestCase):
         )
         self.mf = scf.RHF(self.mol).run()
         
-        # Jastrow (Standard parameters)
         self.jastrow = rexp.REXP()
         self.jastrow_params = {'alpha': jnp.array([0.5])}
         
-        # XTC Object (Low grid level for speed)
         self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=1)
         
-        # Reference calculation (Exact XTC)
         self.n_rank = self.xtc_obj.n_orb * 12 # Sufficiently high rank
         self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_xtc_ccsd_test.h5")
-        #self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params) # Precompute kernels
 
     def test_rccsd_energy(self):
         print("\nRunning Reference Exact XTC CCSD...")
@@ -47,11 +41,9 @@ class TestXTCCCSD(unittest.TestCase):
 
         
         # Compare blocks BEFORE zeroing vvvv
-        # Compare Fock
         fock_diff = np.linalg.norm(eris_new.fock - eris_exact.fock)
         print(f"Fock Matrix Difference Norm: {fock_diff}")
     
-        # Compare OOOO
         try:
             if eris_new.oooo.shape == eris_exact.oooo.shape:
                 oooo_diff = np.linalg.norm(eris_new.oooo - eris_exact.oooo)
@@ -61,7 +53,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OOOO check failed: {e}")
         
-        # Compare OOVV (uses oo and vv pairs)
         try:
             if eris_new.oovv.shape == eris_exact.oovv.shape:
                 oovv_diff = np.linalg.norm(eris_new.oovv - eris_exact.oovv)
@@ -71,7 +62,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OOVV check failed: {e}")
 
-        # Compare OVOV (uses ov pairs)
         try:
             if eris_new.ovov.shape == eris_exact.ovov.shape:
                 ovov_diff = np.linalg.norm(eris_new.ovov - eris_exact.ovov)
@@ -81,7 +71,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OVOV check failed: {e}")
         
-        # Compare OVOO (uses ov and oo pairs)
         try:
             if eris_new.ovoo.shape == eris_exact.ovoo.shape:
                 ovoo_diff = np.linalg.norm(eris_new.ovoo - eris_exact.ovoo)
@@ -91,7 +80,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OVOO check failed: {e}")
 
-        # Compare OVVV with explicit unpacking
         if eris_exact.ovvv is not None:
             def unpack_if_needed(ov):
                 if ov.ndim == 3: # packed (nocc, nvir, pair)
@@ -114,7 +102,6 @@ class TestXTCCCSD(unittest.TestCase):
             else:
                 print(f"OVVV shapes still differ: {ovvv_new.shape} vs {ovvv_ref.shape}")
         
-        # Compare VVVV (before zeroing)
         if eris_exact.vvvv is not None and eris_new.vvvv is not None:
             # Save copies before zeroing for comparison
             # Use np.array() instead of .copy() to handle both numpy arrays and HDF5 Datasets
@@ -154,14 +141,12 @@ class TestXTCCCSD(unittest.TestCase):
         eris_xtc = self.xtc_obj.make_eris(self.mf, large_alpha_params)
         e_xtc, _, _ = cc_xtc.kernel(eris=eris_xtc)
         
-        # PySCF Standard
         cc_std = cc.rccsd.RCCSD(self.mf)
         e_std, _, _ = cc_std.kernel()
         
         print(f"XTC (Large Alpha) Energy: {e_xtc}")
         print(f"PySCF Standard Energy: {e_std}")
         
-        # Diagnostics
         print("\nComparing mo_energy:")
         print(f"XTC mo_energy: {eris_xtc.mo_energy}")
         print(f"STD mo_energy: {self.mf.mo_energy}")

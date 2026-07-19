@@ -9,7 +9,6 @@ from pyscf import gto
 from pytc.jastrow import NeuralEN, NeuralEE, NeuralEEN
 from pytc.jastrow import CompositeJastrow
 
-# Enable float64 support
 jax.config.update("jax_enable_x64", True)
 
 def get_h2_molecule(bond_length=1.4):
@@ -46,7 +45,6 @@ class TestNeuralBase(unittest.TestCase):
         self.h2o_charges = jnp.array([8., 1., 1.])
         self.key = random.PRNGKey(0)
 
-        # Add molecule instances
         self.h2_mol = get_h2_molecule()
         self.h2o_mol = get_h2o_molecule()
 
@@ -136,12 +134,10 @@ class TestCompositeNeural(TestNeuralBase):
     
     def setUp(self):
         super().setUp()
-        # Create individual components
         self.en = NeuralEN.create(self.h2_mol, layer_widths=[4, 4])
         self.ee = NeuralEE.create(self.h2_mol, layer_widths=[4, 4])
         self.een = NeuralEEN.create(mol=self.h2_mol, layer_widths=[4, 4])
         
-        # Create composite with initialized params
         self.jastrow = CompositeJastrow.create([self.en, self.ee, self.een])
         self.params = [
             self.en.init_params(key=self.key),
@@ -156,7 +152,6 @@ class TestCompositeNeural(TestNeuralBase):
         value = self.jastrow._compute(r1, r2, self.params)
         self.assertTrue(jnp.isfinite(value))
         
-        # Test that composite gradient matches sum of individual gradients
         grad_composite = jax.grad(lambda x: self.jastrow._compute(x, r2, self.params))(r1)
         grad_parts = [
             jax.grad(lambda x: self.en._compute(x, r2, self.params[0]))(r1),
