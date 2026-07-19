@@ -59,9 +59,6 @@ def _make_h2():
     return sj, det, params, mol, mf
 
 
-# ======================================================================
-# Test utilities
-# ======================================================================
 
 # When this module is imported by a test runner that has already imported jax
 # (e.g. unittest discover walking other test modules first), the XLA_FLAGS
@@ -103,7 +100,6 @@ class TestShardingUtilities(unittest.TestCase):
         x = jnp.ones((8, 3))
         xs = shard_walker(x, mesh)
         self.assertEqual(xs.shape, (8, 3))
-        # Should be sharded on the 'walkers' axis
         spec = xs.sharding.spec
         self.assertEqual(spec[0], "walkers")
 
@@ -115,7 +111,6 @@ class TestShardingUtilities(unittest.TestCase):
         mesh = create_mesh()
         ws = shard_walker(walkers, mesh)
 
-        # positions should be sharded
         self.assertEqual(ws.positions.sharding.spec[0], "walkers")
         # det_up is a tuple of arrays — both should be sharded
         self.assertEqual(ws.det_up[0].sharding.spec[0], "walkers")
@@ -133,12 +128,9 @@ class TestShardingUtilities(unittest.TestCase):
         """get_vmap_fn returns shard_vmap in multi-device environment."""
         from pytc.vmc.sharding import shard_vmap
         
-        # Auto-detects 4 devices
         fn = get_vmap_fn()
-        # It returns a partial(shard_vmap, ...)
         self.assertEqual(fn.func, shard_vmap)
 
-        # Still returns shard_vmap if max_vmap_batch_size=0
         fn2 = get_vmap_fn(max_vmap_batch_size=0)
         self.assertEqual(fn2.func, shard_vmap)
 
@@ -150,7 +142,6 @@ class TestShardingUtilities(unittest.TestCase):
         padded, original_n = pad_walker(walkers, 8)
         self.assertEqual(original_n, 6)
         self.assertEqual(padded.positions.shape[0], 8)
-        # First 6 rows should be unchanged
         np.testing.assert_allclose(padded.positions[:6], walkers.positions)
 
     def test_initialize_walkers_sharded(self):
@@ -166,9 +157,6 @@ class TestShardingUtilities(unittest.TestCase):
         jax.clear_caches()
 
 
-# ======================================================================
-# Test sharded computation correctness
-# ======================================================================
 
 @_NEEDS_4_DEVICES
 class TestShardedComputation(unittest.TestCase):
@@ -185,18 +173,15 @@ class TestShardedComputation(unittest.TestCase):
 
         walkers = initialize_walkers(det, n_walkers, key=key)
 
-        # Warm up cache
         batch_ansatz = jax.vmap(lambda w, p: sj(w, p), in_axes=(0, None))
         _, walkers = batch_ansatz(walkers, params)
 
-        # --- Single-device reference ---
         def single_e_and_grad(w, p):
             return jax.value_and_grad(lambda pp: sj.local_energy(w, pp)[0])(p)
 
         energies_ref, jac_ref = jax.vmap(single_e_and_grad, in_axes=(0, None))(walkers, params)
         e_mean_ref = jnp.mean(energies_ref)
 
-        # --- Sharded ---
         mesh = create_mesh()
         ws = shard_walker(walkers, mesh)
         ps = replicate(params, mesh)
@@ -204,7 +189,6 @@ class TestShardedComputation(unittest.TestCase):
         energies_s, jac_s = jax.vmap(single_e_and_grad, in_axes=(0, None))(ws, ps)
         e_mean_s = jnp.mean(energies_s)
 
-        # Values should match
         np.testing.assert_allclose(float(e_mean_s), float(e_mean_ref), rtol=1e-10)
         np.testing.assert_allclose(np.array(energies_s), np.array(energies_ref), rtol=1e-10)
 
@@ -228,7 +212,6 @@ class TestShardedComputation(unittest.TestCase):
         def single_e_and_grad(w, p):
             return jax.value_and_grad(lambda pp: sj.local_energy(w, pp)[0])(p)
 
-        # --- Reference ---
         energies_ref, jac_ref = jax.vmap(single_e_and_grad, in_axes=(0, None))(walkers, params)
         jac_flat_ref = jnp.concatenate(
             [jnp.reshape(leaf, (n_walkers, -1))
@@ -240,7 +223,6 @@ class TestShardedComputation(unittest.TestCase):
         jac_c_ref = jac_flat_ref - jnp.mean(jac_flat_ref, axis=0, keepdims=True)
         curv_ref = (2.0 / n_walkers) * (jac_c_ref.T @ jac_c_ref)
 
-        # --- Sharded ---
         mesh = create_mesh()
         ws = shard_walker(walkers, mesh)
         ps = replicate(params, mesh)
@@ -256,7 +238,6 @@ class TestShardedComputation(unittest.TestCase):
         jac_c_s = jac_flat_s - jnp.mean(jac_flat_s, axis=0, keepdims=True)
         curv_s = (2.0 / n_walkers) * (jac_c_s.T @ jac_c_s)
 
-        # Curvature and gradient must match
         np.testing.assert_allclose(np.array(curv_s), np.array(curv_ref), rtol=1e-10)
         np.testing.assert_allclose(np.array(grad_s), np.array(grad_ref), rtol=1e-10)
 
@@ -290,7 +271,6 @@ class TestShardedComputation(unittest.TestCase):
         accept_val = float(accept)
         self.assertGreater(accept_val, 0.0)
         self.assertLess(accept_val, 1.0)
-        # New walkers should still be sharded
         self.assertEqual(new_walkers.positions.sharding.spec[0], "walkers")
 
         print(f"✓ MCMC step with sharded walkers: acceptance={accept_val:.3f}")
@@ -329,9 +309,6 @@ class TestShardedComputation(unittest.TestCase):
         jax.clear_caches()
 
 
-# ======================================================================
-# Test Newton optimizer with multi_gpu flag
-# ======================================================================
 
 @_NEEDS_4_DEVICES
 class TestNewtonMultiGPU(unittest.TestCase):
@@ -357,7 +334,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
                                      max_vmap_batch_size=0)
         loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
 
-        # --- Single-device reference ---
         opt_ref = NewtonOptimizer(
             value_and_grad_func=loss_fn_jvp,
             learning_rate=0.1,
@@ -372,7 +348,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
         )
         loss_ref = float(stats_ref['loss'])
 
-        # --- Multi-GPU ---
         mesh = create_mesh()
         ws = shard_walker(walkers, mesh)
         ps = replicate(params, mesh)
@@ -396,7 +371,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
         np.testing.assert_allclose(loss_mg, loss_ref, rtol=1e-9,
                                    err_msg="Loss mismatch between multi_gpu and single")
 
-        # Compare updated params
         for i, (p_ref, p_mg) in enumerate(zip(
             jax.tree_util.tree_leaves(new_params_ref),
             jax.tree_util.tree_leaves(new_params_mg)
@@ -445,9 +419,6 @@ class TestNewtonMultiGPU(unittest.TestCase):
         jax.clear_caches()
 
 
-# ======================================================================
-# Integration test: full optimize_ref_var with multi_gpu
-# ======================================================================
 
 @_NEEDS_4_DEVICES
 class TestOptimizeRefVarMultiGPU(unittest.TestCase):

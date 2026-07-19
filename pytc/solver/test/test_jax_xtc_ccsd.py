@@ -12,7 +12,6 @@ from pytc.solver import jax_xtc_ccsd
 import logging
 
 
-# Enable float64 for JAX
 jax.config.update("jax_enable_x64", True)
 
 import h5py
@@ -46,7 +45,6 @@ def load_eris_from_h5(path, mol):
 class TestXTCCCSD(unittest.TestCase):
     def setUp(self):
 
-        # CO System
         self.mol = gto.M(
             atom='C 0 0 0; O 0 0 1.128',
             basis='sto-6g',
@@ -54,14 +52,11 @@ class TestXTCCCSD(unittest.TestCase):
         )
         self.mf = scf.RHF(self.mol).run()
         
-        # Jastrow (Standard parameters)
         self.jastrow = rexp.REXP()
         self.jastrow_params = {'alpha': jnp.array([0.5])}
         
-        # XTC Object (Low grid level for speed)
         self.xtc_obj = xtc.XTC.from_pyscf(self.mf, self.jastrow, grid_lvl=1)
         
-        # Reference calculation (Exact XTC)
         self.n_rank = self.xtc_obj.n_orb * 12 # Sufficiently high rank
         self.isdf_xtc = xtc.ISDFXTC.from_xtc(self.xtc_obj, n_rank=self.n_rank, save_path="isdf_xtc_ccsd_test.h5")
         self.isdf_xtc = self.isdf_xtc.isdf(self.jastrow_params) # Precompute kernels
@@ -99,10 +94,8 @@ class TestXTCCCSD(unittest.TestCase):
         t2 = ovov_ref.transpose(0,2,1,3).conj() / eijab
         t1 = np.zeros((nocc, nvir)) # Start with t1=0
         
-        # Reference intermediates
         cc_ref = xtc_ccsd.RCCSD(self.mf, self.xtc_obj, self.jastrow_params)
         
-        # JAX intermediates
         import jax.numpy as jnp
         fock_jax = jnp.asarray(eris_new.fock)
         eris_ovvo_jax = jnp.asarray(eris_new.ovvo)
@@ -114,7 +107,6 @@ class TestXTCCCSD(unittest.TestCase):
         t1_jax = jnp.asarray(t1)
         t2_jax = jnp.asarray(t2)
         
-        # Compare Foo, Fvv, Fov
         from pyscf.cc import rintermediates as imd
         Foo_ref = imd.cc_Foo(t1, t2, eris_ref)
         Fvv_ref = imd.cc_Fvv(t1, t2, eris_ref)
@@ -128,12 +120,10 @@ class TestXTCCCSD(unittest.TestCase):
         print(f"Fvv Difference Norm: {np.linalg.norm(Fvv_ref - Fvv_jax)}")
         print(f"Fov Difference Norm: {np.linalg.norm(Fov_ref - Fov_jax)}")
         
-        # Compare Woooo
         Woooo_jax = jax_xtc_ccsd._jax_cc_Woooo(t1_jax, t2_jax, eris_oooo_jax, eris_ovov_jax, eris_ovoo_jax)
         Woooo_ref = imd.cc_Woooo(t1, t2, eris_ref)
         print(f"Woooo Difference Norm: {np.linalg.norm(Woooo_ref - Woooo_jax)}")
         
-        # Compare Loo
         mo_e = eris_ref.mo_energy
         Loo_ref = imd.Loo(t1, t2, eris_ref)
         Loo_ref[np.diag_indices(nocc)] -= mo_e[:nocc]
@@ -143,7 +133,6 @@ class TestXTCCCSD(unittest.TestCase):
         
         print(f"Loo (shifted) Difference Norm: {np.linalg.norm(Loo_ref - Loo_jax)}")
         
-        # Compare Lvv (non-ovvv part)
         Lvv_ref = imd.cc_Fvv(t1, t2, eris_ref) - np.einsum('kc,ka->ac', eris_ref.fock[:nocc, nocc:], t1)
         Lvv_ref[np.diag_indices(nvir)] -= mo_e[nocc:]
         
@@ -152,10 +141,8 @@ class TestXTCCCSD(unittest.TestCase):
         
         print(f"Lvv (non-ovvv, shifted) Difference Norm: {np.linalg.norm(Lvv_ref - Lvv_jax)}")
         
-        # Compare Wvoov / Wvovo (partial, without ovvv)
         # Ref Wvoov is full. We can extract non-ovvv part from ref or compute full jax
         
-        # Compute "Basic" W parts in JAX (from _update_amps logic)
         Wvoov_jax = eris_ovvo_jax.transpose(2,0,3,1)
         Wvoov_jax -= jnp.einsum('kcli,la->akic', eris_ovoo_jax, t1_jax)
         Wvoov_jax -= 0.5 * jnp.einsum('ldkc,ilda->akic', eris_ovov_jax, t2_jax)
@@ -168,14 +155,9 @@ class TestXTCCCSD(unittest.TestCase):
         Wvovo_jax -= 0.5 * jnp.einsum('lckd,ilda->akci', eris_ovov_jax, t2_jax)
         Wvovo_jax -=       jnp.einsum('lckd,id,la->akci', eris_ovov_jax, t1_jax, t1_jax)
 
-        # Now add ovvv part if available
         ovvv_all_jax = jnp.asarray(eris_new.ovvv)
         tau_jax = t2_jax + jnp.einsum('ia,jb->ijab', t1_jax, t1_jax)
         
-        # Call kernel_process_ovvv_block for full block
-        # It handles slicing on 'a' (axis 2). We pass the whole thing.
-        # But wait, kernel_process_ovvv_block expects ovvv_blk (nocc, nvir, blk, nvir).
-        # We can pass the full ovvv as the block.
         _, Lvv_ovvv, Wvoov_ovvv, Wvovo_ovvv, _, _ = jax_xtc_ccsd.kernel_process_ovvv_block(ovvv_all_jax, t1_jax, t2_jax, tau_jax)
         
         Wvoov_jax_full = Wvoov_jax + Wvoov_ovvv
@@ -197,29 +179,20 @@ class TestXTCCCSD(unittest.TestCase):
         ovov_jax_trans = eris_new.ovov.transpose(0,2,1,3)
         print(f"JAX Internals (ovov vs vovo) Difference Norm: {np.linalg.norm(ovov_jax_trans - vovo_jax_trans)}")
         
-        # Check t1new driver terms (Cycle 1: t1=0)
-        # Ref: fov + ovoo part
         ovoo_t2_ref = -2*lib.einsum('lcki,klac->ia', eris_ref.ovoo, t2)
         ovoo_t2_ref += lib.einsum('kcli,klac->ia', eris_ref.ovoo, t2)
         
-        # JAX t1new partial:
-        # Reconstruct "Core" t1new manually or skip checks and trust full update
         
-        # Check ovvv contribution to t1new
         ovvv_t1_ref = 2*lib.einsum('kdac,ikcd->ia', eris_ref.get_ovvv(), t2)
         ovvv_t1_ref -= lib.einsum('kcad,ikcd->ia', eris_ref.get_ovvv(), t2)
         print(f"Ref ovvv*t2 Norm: {np.linalg.norm(ovvv_t1_ref)}")
         
-        # Check t2new basic terms
         tau = t2 + np.einsum('ia,jb->ijab', t1, t1)
         woooo_tau_ref = lib.einsum('klij,klab->ijab', Woooo_ref, tau)
         print(f"Ref Woooo*tau Norm: {np.linalg.norm(woooo_tau_ref)}")
         
-        # Compare finalize t2new -> Handled by full update test
 
-        # ...
 
-        # Compare t1new and t2new after first cycle
         print("\nRunning Reference Update Amps (Cycle 1)...")
         t1new_ref, t2new_ref = cc_ref.update_amps(t1, t2, eris_ref)
         
@@ -231,11 +204,9 @@ class TestXTCCCSD(unittest.TestCase):
 
         
         # Compare blocks BEFORE zeroing vvvv
-        # Compare Fock
         fock_diff = np.linalg.norm(eris_new.fock - eris_exact.fock)
         print(f"Fock Difference Norm: {fock_diff}")
     
-        # Compare OOOO
         try:
             if eris_new.oooo.shape == eris_exact.oooo.shape:
                 oooo_diff = np.linalg.norm(eris_new.oooo - eris_exact.oooo)
@@ -245,7 +216,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OOOO check failed: {e}")
         
-        # Compare OOVV (uses oo and vv pairs)
         try:
             if eris_new.oovv.shape == eris_exact.oovv.shape:
                 oovv_diff = np.linalg.norm(eris_new.oovv - eris_exact.oovv)
@@ -255,7 +225,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OOVV check failed: {e}")
 
-        # Compare OVOV (uses ov pairs)
         try:
             if eris_new.ovov.shape == eris_exact.ovov.shape:
                 ovov_diff = np.linalg.norm(eris_new.ovov - eris_exact.ovov)
@@ -265,7 +234,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OVOV check failed: {e}")
         
-        # Compare OVOO (uses ov and oo pairs)
         try:
             if eris_new.ovoo.shape == eris_exact.ovoo.shape:
                 ovoo_diff = np.linalg.norm(eris_new.ovoo - eris_exact.ovoo)
@@ -275,7 +243,6 @@ class TestXTCCCSD(unittest.TestCase):
         except Exception as e:
             print(f"OVOO check failed: {e}")
 
-        # Compare OVVV with explicit unpacking
         if eris_exact.ovvv is not None:
             def unpack_if_needed(ov):
                 if ov.ndim == 3: # packed (nocc, nvir, pair)
@@ -298,7 +265,6 @@ class TestXTCCCSD(unittest.TestCase):
             else:
                 print(f"OVVV shapes still differ: {ovvv_new.shape} vs {ovvv_ref.shape}")
         
-        # Compare VVVV (before zeroing)
         if eris_exact.vvvv is not None and eris_new.vvvv is not None:
             # Save copies before zeroing for comparison
             # Use np.array() instead of .copy() to handle both numpy arrays and HDF5 Datasets
@@ -347,14 +313,12 @@ class TestXTCCCSD(unittest.TestCase):
             
         e_xtc, _, _ = cc_xtc.kernel(eris=eris_xtc)
         
-        # PySCF Standard
         cc_std = cc.rccsd.RCCSD(self.mf)
         e_std, _, _ = cc_std.kernel()
         
         print(f"XTC (Large Alpha) Energy: {e_xtc}")
         print(f"PySCF Standard Energy: {e_std}")
         
-        # Diagnostics
         print("\nComparing mo_energy:")
         print(f"XTC mo_energy: {eris_xtc.mo_energy}")
         print(f"STD mo_energy: {self.mf.mo_energy}")

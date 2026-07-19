@@ -19,15 +19,12 @@ def make_h_chain(n, dist=1.4):
 def run_benchmark():
     print("Running ISDF TCSCF Benchmark on H4 chain...", flush=True)
     
-    # System Setup
     mol = gto.M(atom=make_h_chain(2), basis='sto-3g', verbose=5)
     print(f"System: H2, Basis: STO-3G, N_orb: {mol.nao_nr()}", flush=True)
     
-    # Jastrow Setup
     jastrow = REXP()
     params = {'alpha': jnp.array([1.0])}
     
-    # --- Standard TCSCF ---
     print("\n--- Standard TCSCF ---")
     mf_std = TCSCF(mol, jastrow, params)
     
@@ -40,7 +37,6 @@ def run_benchmark():
     print(f"Total Time: {time_std:.4f} s")
     print(f"Energy: {e_std:.8f} Ha")
     
-    # --- ISDF TCSCF ---
     print("\n--- ISDF TCSCF (Rank 100) ---")
     mf_isdf = TCSCF(mol, jastrow, params).isdf(n_rank=400)
     
@@ -53,12 +49,10 @@ def run_benchmark():
     print(f"Total Time: {time_isdf:.4f} s")
     print(f"Energy: {e_isdf:.8f} Ha")
     
-    # --- Comparison ---
     print("\n--- Results ---")
     print(f"Speedup: {time_std / time_isdf:.2f}x")
     print(f"Energy Diff: {abs(e_std - e_isdf):.2e} Ha")
     
-    # Verify accuracy
     if abs(e_std - e_isdf) > 1e-3:
         print("WARNING: Energy difference is large!")
     else:

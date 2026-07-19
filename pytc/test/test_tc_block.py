@@ -33,10 +33,8 @@ class TestTCBlock(unittest.TestCase):
         slice_o = slice(0, self.nocc)
         expected = full_2b[slice_o, slice_o, slice_o, slice_o]
         
-        # Check shapes
         self.assertEqual(block_2b.shape, expected.shape)
         
-        # Check values - get_2b now handles symmetrization
         np.testing.assert_allclose(block_2b, expected, atol=1e-8)
 
     def test_full_vs_block_oovv(self):
@@ -68,14 +66,8 @@ class TestTCBlock(unittest.TestCase):
         
         np.testing.assert_allclose(block_2b, expected, atol=1e-8)
 
-    # NOTE: A ``test_recompilation`` test previously lived here, timing a
-    # cold vs. warm ``get_2b(block_str='oooo')`` call and asserting the
-    # second was faster.  Empirically (H2O/sto-6g, CPU) every call takes
-    # ~2.85 s regardless of JIT cache state — Python / shard_map setup
-    # overhead drowns out the compile — so the assertion had no signal and
-    # was removed.  If we want to guard recompilations in the future the
-    # correct tool is counting XLA compile events (e.g. via
-    # ``jax.clear_caches()`` + compile instrumentation), not wall-clock.
+    # NOTE: to guard against recompilations here, count XLA compile events
+    # (e.g. ``jax.clear_caches()`` + compile instrumentation), not wall-clock.
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@
 import unittest
 import numpy as np
 import jax
-# Enable float64 support
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pytc.legacy.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
@@ -18,23 +17,17 @@ class TestKmat(unittest.TestCase):
         """Set up test fixtures."""
         rng = np.random.RandomState(42)
         
-        # Create multiple test systems with different sizes
         self.test_configs = [
-            # Small system
             {'Nb': 2, 'N_grid': 3, 'name': 'small'},
-            # Medium system
             {'Nb': 4, 'N_grid': 10, 'name': 'medium'},
-            # Larger system
             {'Nb': 6, 'N_grid': 20, 'name': 'large'}
         ]
         
         for config in self.test_configs:
             Nb, N_grid = config['Nb'], config['N_grid']
-            # Create test data for each configuration
             config['grid_points'] = rng.randn(N_grid, 3)
             config['weights'] = rng.rand(N_grid)  # Random weights
             
-            # Generate orbitals (phi) and gradients (grad_phi)
             config['phi'] = rng.randn(Nb, N_grid)
             config['grad_phi'] = rng.randn(Nb, N_grid, 3)
             
@@ -46,7 +39,6 @@ class TestKmat(unittest.TestCase):
             # Note: This matches JAX calc_K1 logic (grad on first index)
             config['grad_phi_paired'] = np.einsum('ind,jn->ijnd', config['grad_phi'], config['phi']).reshape(Nb * Nb, N_grid, 3)
         
-        # Create Jastrow factors
         self.params = jnp.array([1.0])
         self.jastrow_jax = Poly()
         
@@ -57,7 +49,6 @@ class TestKmat(unittest.TestCase):
                 
             def grad(self, r1, r2):
                 """Numpy gradient computation handling both single and batched inputs."""
-                # Handle single point inputs
                 if r1.ndim == 1:
                     r1 = r1[None, :]
                 if r2.ndim == 1:
@@ -68,7 +59,6 @@ class TestKmat(unittest.TestCase):
                 grad = diff / r12[..., None]
                 grad = grad * self.params[0]
                 
-                # Return single point result without batch dimensions
                 if grad.shape[0] == 1 and grad.shape[1] == 1:
                     return grad[0, 0]
                 return grad
@@ -84,7 +74,7 @@ class TestKmat(unittest.TestCase):
                     jnp.asarray(config['phi']),
                     jnp.asarray(config['grad_phi']),
                     self.jastrow_jax,
-                    self.params,  # Add params argument
+                    self.params,
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights'])
                 )
@@ -98,11 +88,10 @@ class TestKmat(unittest.TestCase):
                     jnp.asarray(config['phi']),
                     jnp.asarray(config['grad_phi']),
                     self.jastrow_jax,
-                    self.params,  # Add params argument
+                    self.params,
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights'])
                 )
-                # JAX returns (Nb, Nb, Nb, Nb) flattened to (Nb^2, Nb^2)
                 # This matches NumPy (Nb^2, Nb^2)
                 k1_jax = k1_jax_raw
                 
@@ -128,7 +117,7 @@ class TestKmat(unittest.TestCase):
                 result = calc_K3(
                     jnp.asarray(config['phi']),
                     self.jastrow_jax,
-                    self.params,  # Add params argument
+                    self.params,
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights'])
                 )
@@ -141,7 +130,7 @@ class TestKmat(unittest.TestCase):
                 k3_jax = calc_K3(
                     jnp.asarray(config['phi']),
                     self.jastrow_jax,
-                    self.params,  # Add params argument
+                    self.params,
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights'])
                 )
@@ -161,15 +150,14 @@ class TestKmat(unittest.TestCase):
     
     def test_batch_size_handling(self):
         """Test different batch sizes produce same results."""
-        config = self.test_configs[-1]  # Use largest system
+        config = self.test_configs[-1]
         batch_sizes = [1, 5, 10, 20]
         
-        # Get reference result with default batch size
         ref_k1 = calc_K1(
             jnp.asarray(config['phi']),
             jnp.asarray(config['grad_phi']),
             self.jastrow_jax,
-            self.params,  # Add params argument
+            self.params,
             jnp.asarray(config['grid_points']),
             jnp.asarray(config['weights'])
         )
@@ -177,30 +165,28 @@ class TestKmat(unittest.TestCase):
         ref_k3 = calc_K3(
             jnp.asarray(config['phi']),
             self.jastrow_jax,
-            self.params,  # Add params argument
+            self.params,
             jnp.asarray(config['grid_points']),
             jnp.asarray(config['weights'])
         )
         
         for batch_size in batch_sizes:
             with self.subTest(batch_size=batch_size):
-                # Test K1
                 k1 = calc_K1(
                     jnp.asarray(config['phi']),
                     jnp.asarray(config['grad_phi']),
                     self.jastrow_jax,
-                    self.params,  # Add params argument
+                    self.params,
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights']),
                     batch_size=batch_size
                 )
                 np.testing.assert_allclose(k1, ref_k1, rtol=1e-5, atol=1e-5)
                 
-                # Test K3
                 k3 = calc_K3(
                     jnp.asarray(config['phi']),
                     self.jastrow_jax,
-                    self.params,  # Add params argument
+                    self.params,
                     jnp.asarray(config['grid_points']),
                     jnp.asarray(config['weights']),
                     batch_size=batch_size

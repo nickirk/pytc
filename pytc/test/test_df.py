@@ -10,14 +10,12 @@ jax.config.update("jax_enable_x64", True)
 
 class TestISDFReconstruction(unittest.TestCase):
     def setUp(self):
-        # Setup H4 chain system with ccpvtz basis
         atom = []
         for i in range(4):
             atom.append(f'H 0 0 {i*1.4}')
         self.mol = gto.M(atom=atom, basis='ccpvtz', unit='Bohr', verbose=0)
         self.mf = scf.RHF(self.mol).run()
         
-        # Initialize TC object to get orbitals and gradients on grid
         # We use a dummy Jastrow factor as we only need phi and grad_phi
         from pytc.jastrow.rexp import REXP
         self.tc = TC.from_pyscf(self.mf, REXP(), grid_lvl=1)
@@ -49,7 +47,6 @@ class TestISDFReconstruction(unittest.TestCase):
         prev_G_error = float('inf')
         
         for n_rank in ranks:
-            # Perform ISDF decomposition
             phi_piv, xi_phi, grad_phi_piv, xi_grad, pivots, _ = isdf_decompose(
                 self.phi, self.grad_phi, n_rank, n_rank, weights=self.weights, rcond=1e-14, is_incore=True
             )
@@ -69,17 +66,14 @@ class TestISDFReconstruction(unittest.TestCase):
             C_grad = jnp.einsum('pmc,qm->pqmc', grad_phi_piv, phi_piv).reshape(-1, len(pivots), 3)
             G_reconst = jnp.einsum('nmc,mc->nc', C_grad, xi_grad_weighted_sum).reshape(n_orb, n_orb, 3)
             
-            # Compute relative errors
             S_error = jnp.linalg.norm(S_reconst - S_exact) / jnp.linalg.norm(S_exact)
             G_error = jnp.linalg.norm(G_reconst - G_exact) / jnp.linalg.norm(G_exact)
             
-            # Compute max absolute errors
             S_max_abs = jnp.max(jnp.abs(S_reconst - S_exact))
             G_max_abs = jnp.max(jnp.abs(G_reconst - G_exact))
             
             print(f"{n_rank:<10} {S_error:<15.2e} {S_max_abs:<15.2e} {G_error:<15.2e} {G_max_abs:<15.2e}")
             
-            # Check for convergence
             if n_rank > ranks[0]:
                 if S_error > 1e-12:
                     self.assertLess(S_error, prev_S_error, f"S error did not decrease at rank {n_rank}")
@@ -89,7 +83,6 @@ class TestISDFReconstruction(unittest.TestCase):
             prev_S_error = S_error
             prev_G_error = G_error
             
-        # Final accuracy check
         self.assertLess(S_error, 1e-4, f"Final S reconstruction error {S_error} is too high")
         self.assertLess(G_error, 1e-3, f"Final G reconstruction error {G_error} is too high")
 

@@ -18,31 +18,25 @@ from pytc.vmc.loss import (
 
 def test_energy_loss():
     """Test energy loss function factory."""
-    # Create simple H2 molecule
     mol = gto.Mole()
     mol.atom = 'H 0 0 0; H 0 0 0.74'
     mol.basis = 'sto-3g'
     mol.build()
     
-    # HF calculation
     mf = scf.RHF(mol)
     mf.kernel()
     
-    # Create ansatz
     det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
     ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
-    # Initialize parameters
     jastrow_params = jastrow.init_params()
     linear_coeffs = jnp.ones(1)
     params = [jastrow_params, linear_coeffs]
     
-    # Initialize walkers
     key = random.PRNGKey(42)
     walkers = initialize_walkers(ansatz, n_walkers=10, key=key)
     
-    # Create energy loss
     loss_fn = make_energy_loss(ansatz, optimizer_type="adam")
     
     # Compute loss (aux is an AuxData namedtuple; first two fields are
@@ -56,7 +50,6 @@ def test_energy_loss():
     print(f"  Energy std: {std_e:.6f}")
     print(f"  HF reference: {mf.e_tot:.6f}")
     
-    # Test gradient
     grad_fn = jax.grad(lambda p: loss_fn(p, walkers)[0], argnums=0)
     grads = grad_fn(params)
     
@@ -70,34 +63,27 @@ def test_energy_loss():
 
 def test_variance_loss():
     """Test variance loss function factory."""
-    # Create simple H2 molecule
     mol = gto.Mole()
     mol.atom = 'H 0 0 0; H 0 0 0.74'
     mol.basis = 'sto-3g'
     mol.build()
     
-    # HF calculation
     mf = scf.RHF(mol)
     mf.kernel()
     
-    # Create ansatz
     det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
     ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
-    # Initialize parameters
     jastrow_params = jastrow.init_params()
     linear_coeffs = jnp.ones(1)
     params = [jastrow_params, linear_coeffs]
     
-    # Initialize walkers
     key = random.PRNGKey(42)
     walkers = initialize_walkers(ansatz, n_walkers=10, key=key)
     
-    # Create variance loss
     loss_fn = make_variance_loss(ansatz, optimizer_type="adam")
     
-    # Compute loss
     variance, (mean_e, std_e) = loss_fn(params, walkers)
     
     print(f"Variance loss test:")
@@ -105,7 +91,6 @@ def test_variance_loss():
     print(f"  Mean energy: {mean_e:.6f}")
     print(f"  Energy std: {std_e:.6f}")
     
-    # Test gradient
     grad_fn = jax.grad(lambda p: loss_fn(p, walkers)[0], argnums=0)
     grads = grad_fn(params)
     
@@ -118,31 +103,25 @@ def test_variance_loss():
 
 def test_combined_loss():
     """Test combined loss function factory."""
-    # Create simple H2 molecule
     mol = gto.Mole()
     mol.atom = 'H 0 0 0; H 0 0 0.74'
     mol.basis = 'sto-3g'
     mol.build()
     
-    # HF calculation
     mf = scf.RHF(mol)
     mf.kernel()
     
-    # Create ansatz
     det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
     ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
-    # Initialize parameters
     jastrow_params = jastrow.init_params()
     linear_coeffs = jnp.ones(1)
     params = [jastrow_params, linear_coeffs]
     
-    # Initialize walkers
     key = random.PRNGKey(42)
     walkers = initialize_walkers(ansatz, n_walkers=10, key=key)
     
-    # Create combined loss manually in test
     energy_loss_fn = make_energy_loss(ansatz, optimizer_type="adam")
     variance_loss_fn = make_variance_loss(ansatz, optimizer_type="adam", use_custom_jvp=False)
     
@@ -151,7 +130,6 @@ def test_combined_loss():
         v_loss, _ = variance_loss_fn(params, batch_data)
         return e_loss + 0.1 * v_loss, aux
     
-    # Compute loss
     loss, aux = loss_fn(params, walkers)
     mean_e = aux[0] if isinstance(aux, tuple) else aux.mean_energy
     std_e = aux[1] if isinstance(aux, tuple) else aux.energy_std
@@ -161,7 +139,6 @@ def test_combined_loss():
     print(f"  Mean energy: {mean_e:.6f}")
     print(f"  Energy std: {std_e:.6f}")
     
-    # Test gradient
     grad_fn = jax.grad(lambda p: loss_fn(p, walkers)[0], argnums=0)
     grads = grad_fn(params)
     
@@ -174,41 +151,32 @@ def test_combined_loss():
 
 def test_batched_energy_loss():
     """Test batched energy loss function for memory efficiency."""
-    # Create simple H2 molecule
     mol = gto.Mole()
     mol.atom = 'H 0 0 0; H 0 0 0.74'
     mol.basis = 'sto-3g'
     mol.build()
     
-    # HF calculation
     mf = scf.RHF(mol)
     mf.kernel()
     
-    # Create ansatz
     det = SlaterDet.create(mol, mf.mo_coeff)
     jastrow = REXP()
     ansatz = SlaterJastrow.create(mol, jastrow, [det])
     
-    # Initialize parameters
     jastrow_params = jastrow.init_params()
     linear_coeffs = jnp.ones(1)
     params = [jastrow_params, linear_coeffs]
     
-    # Initialize walkers
     key = random.PRNGKey(42)
     walkers = initialize_walkers(ansatz, n_walkers=50, key=key)
     
-    # Create unbatched loss (max_vmap_batch_size=0 means standard vmap)
     loss_fn_unbatched = make_energy_loss(ansatz, optimizer_type="adam", max_vmap_batch_size=0)
     
-    # Create batched loss (max_vmap_batch_size=10 means use folx.batched_vmap)
     loss_fn_batched = make_energy_loss(ansatz, optimizer_type="adam", max_vmap_batch_size=10)
     
-    # Compute losses
     loss_unbatched, aux_unbatched = loss_fn_unbatched(params, walkers)
     loss_batched, aux_batched = loss_fn_batched(params, walkers)
     
-    # Extract mean and std (namedtuples are indexable)
     mean_e_unbatched, std_e_unbatched = aux_unbatched[0], aux_unbatched[1]
     mean_e_batched, std_e_batched = aux_batched[0], aux_batched[1]
     
@@ -217,14 +185,12 @@ def test_batched_energy_loss():
     print(f"  Batched   - Loss: {loss_batched:.6f}, Mean E: {mean_e_batched:.6f}")
     print(f"  Difference: {abs(loss_unbatched - loss_batched):.10f}")
     
-    # Test gradients match
     grad_fn_unbatched = jax.grad(lambda p: loss_fn_unbatched(p, walkers)[0], argnums=0)
     grad_fn_batched = jax.grad(lambda p: loss_fn_batched(p, walkers)[0], argnums=0)
     
     grads_unbatched = grad_fn_unbatched(params)
     grads_batched = grad_fn_batched(params)
     
-    # Check gradients are close
     def flatten_pytree(tree):
         leaves, _ = jax.tree_util.tree_flatten(tree)
         return jnp.concatenate([jnp.ravel(x) for x in leaves])
@@ -236,7 +202,6 @@ def test_batched_energy_loss():
     print(f"  Gradient difference norm: {grad_diff:.10f}")
     print(f"  Gradients computed successfully!")
     
-    # Verify they're approximately equal
     assert jnp.allclose(loss_unbatched, loss_batched, rtol=1e-10), \
         "Batched and unbatched losses should match"
     assert grad_diff < 1e-8, "Batched and unbatched gradients should match"

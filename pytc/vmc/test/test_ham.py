@@ -41,7 +41,6 @@ class TestHamiltonian(unittest.TestCase):
         self.params = (self.jastrow_params, self.linear_coeffs)
         
         key = random.PRNGKey(42)
-        # Random positions for testing
         self.n_electrons = self.mol.nelectron
         self.positions = random.normal(key, (1, self.n_electrons, 3))
         self.walker = initialize_walker_state(self.ansatz, self.positions)
@@ -123,7 +122,6 @@ class TestHamiltonian(unittest.TestCase):
             self.ansatz, self.single_walker, self.params
         )
         self.assertEqual(energy.shape, ())
-        # Walker should be passed through
         np.testing.assert_array_equal(walker.positions, self.single_walker.positions)
 
     def test_potential_matrix_values(self):
@@ -138,17 +136,14 @@ class TestHamiltonian(unittest.TestCase):
         r1 = pos[0] # (0,0,0.5)
         r2 = pos[1] # (0,0,0.9)
         
-        # Electron 1 - Nuclei
         d1_n1 = 0.5
         d1_n2 = 1.4 - 0.5 # 0.9
         v_en_1 = -1/d1_n1 - 1/d1_n2 # -2 - 1.111... = -3.111...
         
-        # Electron 2 - Nuclei
         d2_n1 = 0.9
         d2_n2 = 1.4 - 0.9 # 0.5
         v_en_2 = -1/d2_n1 - 1/d2_n2 # -1.111... - 2 = -3.111...
         
-        # Electron - Electron
         r12 = jnp.linalg.norm(r1 - r2) # 0.4
         v_ee = 1.0 / r12 # 2.5
         
@@ -192,13 +187,11 @@ class TestHamiltonian(unittest.TestCase):
         jastrow = Poly() # Zero params = identity
         ansatz = SlaterJastrow.create(mol, jastrow, [det])
         
-        # Initialize walkers with random positions from distribution
         key = random.PRNGKey(123)
         walker_batch = initialize_walkers(ansatz, 1, key=key)
         
         jastrow_params = jnp.zeros(1)
         
-        # Update walker with determinant values
         params = (jastrow_params, jnp.array([1.0]))
         # walker_batch is batched, need vmap
         batch_ansatz = jax.vmap(ansatz, in_axes=(0, None))
@@ -226,14 +219,12 @@ class TestHamiltonian(unittest.TestCase):
         energy = compute_single_walker_energy(ansatz, single_walker, jastrow_params)
         print(f"Be Local Energy at random config: {energy}")
         
-        # Check if energy is finite and roughly in range
         self.assertTrue(jnp.isfinite(energy))
         self.assertTrue(energy > -50.0 and energy < -5.0)
 
 class TestMemoryUsage(unittest.TestCase):
     def setUp(self):
         self.mol = gto.Mole()
-        # Create a slightly larger system to test memory scaling
         # Use Be atom instead of Benzene for speed/memory test
         self.mol.atom = 'Be 0 0 0'
         self.mol.basis = 'sto-3g'
@@ -255,27 +246,20 @@ class TestMemoryUsage(unittest.TestCase):
         process = psutil.Process(os.getpid())
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
         
-        # Pre-compile
         dummy_pos = jnp.zeros((self.n_electrons, 3))
         dummy_walker = initialize_walker_state(self.ansatz, dummy_pos[None, ...])
         
-        # We need to construct a single walker object from batched one for single_walker_energy
-        # But wait, usually we vmap over walkers for actual computation.
-        # hamiltonian.py functions are for single walker.
-        # Let's test vmapped version which is what matters for memory.
         
         from pytc.vmc.hamiltonian import compute_single_walker_energy
         vmapped_energy = jax.vmap(
             lambda w: compute_single_walker_energy(self.ansatz, w, self.jastrow_params)
         )
         
-        # Run with small batch to compile
         vmapped_energy(dummy_walker).block_until_ready()
         
         post_compile_memory = process.memory_info().rss / 1024 / 1024
         print(f"Memory after compilation: {post_compile_memory:.2f} MB")
         
-        # Test with larger batch size
         n_walkers = 100
         key = random.PRNGKey(123)
         positions = random.normal(key, (n_walkers, self.n_electrons, 3))
@@ -283,7 +267,6 @@ class TestMemoryUsage(unittest.TestCase):
         
         start_mem = process.memory_info().rss / 1024 / 1024
         
-        # Run computation
         energies = vmapped_energy(walkers)
         energies.block_until_ready()
         
@@ -297,7 +280,6 @@ class TestMemoryUsage(unittest.TestCase):
 
 class TestHamiltonianGrad(unittest.TestCase):
     def setUp(self):
-        # Use Be atom instead of Benzene for speed
         self.mol = gto.Mole()
         self.mol.atom = 'Be 0 0 0'
         self.mol.basis = 'sto-3g'
@@ -308,10 +290,8 @@ class TestHamiltonianGrad(unittest.TestCase):
         
         det = SlaterDet.create(self.mol, mf.mo_coeff)
         
-        # Use more realistic Jastrow for Benzene
         ncusp = NuclearCusp.create(self.mol)
         bh_new = BoysHandy.create(self.mol)
-        #my_een = NeuralEEN.create(self.mol)
         jastrow = CompositeJastrow.create([ncusp, bh_new])
         
         self.ansatz = SlaterJastrow.create(self.mol, jastrow, [det])
@@ -326,19 +306,12 @@ class TestHamiltonianGrad(unittest.TestCase):
         positions = random.normal(key, (n_walkers, self.n_electrons, 3))
         walkers = initialize_walker_state(self.ansatz, positions)
         
-        # Create loss function
-        # Pass None as static ansatz to force dynamic passing
-        # Use batched_vmap to reduce memory usage
         loss_fn = make_variance_loss(None, max_vmap_batch_size=0, use_custom_jvp=False)
         
-        # JIT compile gradient function
         print("Compiling gradient function...")
         start_time = time.time()
         grad_func = jax.jit(jax.grad(loss_fn, has_aux=True))
         
-        # Trigger compilation
-        # Trigger compilation
-        # Pass (walkers, ansatz) as batch_data
         batch_data = (walkers, self.ansatz)
         # loss_fn expects (jastrow_params, linear_coeffs)
         params = (self.jastrow_params, jnp.array([1.0]))
@@ -347,7 +320,6 @@ class TestHamiltonianGrad(unittest.TestCase):
         end_time = time.time()
         print(f"Compilation time: {end_time - start_time:.4f} s")
         
-        # Measure execution time and memory
         print("Running gradient computation...")
         process = psutil.Process(os.getpid())
         def get_memory_usage():
@@ -355,7 +327,6 @@ class TestHamiltonianGrad(unittest.TestCase):
         start_mem = get_memory_usage()
         start_time = time.time()
         
-        # Run multiple times to get average
         n_repeats = 5
         for _ in range(n_repeats):
             grads = grad_func(params, batch_data)
@@ -370,7 +341,6 @@ class TestHamiltonianGrad(unittest.TestCase):
         print(f"Gradient execution time ({n_walkers} walkers): {execution_time:.4f} s")
         print(f"Gradient memory increase: {mem_increase:.2f} MB")
         
-        # Check gradient shape and values
         # grads is (grad_jastrow, grad_linear)
         grad_jastrow = grads[0]
         
@@ -379,9 +349,6 @@ class TestHamiltonianGrad(unittest.TestCase):
         param_list = list(self.jastrow_params) if isinstance(self.jastrow_params, (list, tuple)) else [self.jastrow_params]
         
         def check_grad(g, p):
-            # If g is None (no gradient), that's okay if p is not optimizable, but here we expect gradients
-            # Actually, for some params gradient might be zero or None if not used.
-            # But let's assume valid gradient arrays.
             if g is None: return
             if hasattr(g, 'shape') and hasattr(p, 'shape'):
                 self.assertEqual(g.shape, p.shape)
@@ -396,8 +363,6 @@ class TestHamiltonianGrad(unittest.TestCase):
                 if hasattr(g_leaf, 'shape') and hasattr(p_leaf, 'shape'):
                     if g_leaf.shape != p_leaf.shape:
                         print(f"WARNING: Shape mismatch: g={g_leaf.shape}, p={p_leaf.shape}")
-                        # Skip assertion for now to allow test to pass if memory is fine
-                        # This might be due to JAX returning sparse/compressed gradients or structure mismatch
                         continue
                     check_grad(g_leaf, p_leaf)
         
@@ -484,7 +449,7 @@ class TestJastrowTermsCompositeLengthMismatch(unittest.TestCase):
         key = random.PRNGKey(17)
         walkers = initialize_walkers(ansatz, 1, key=key)
         walker_0 = jax.tree_util.tree_map(lambda x: x[0], walkers)
-        truncated_params = params[:1]  # drop the BHA entry
+        truncated_params = params[:1]
         with self.assertRaises(ValueError):
             compute_single_walker_energy(ansatz, walker_0, truncated_params)
 

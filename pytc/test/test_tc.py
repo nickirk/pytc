@@ -10,7 +10,6 @@ from pytc.tc import TC as TC_jax
 from pytc.jastrow import Poly
 from pytc import tc_helper
 
-# Enable float64 support
 jax.config.update("jax_enable_x64", True)
 
 class TestTC(unittest.TestCase):
@@ -18,16 +17,13 @@ class TestTC(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures."""
-        # Create a simple molecule
         self.mol = gto.M(atom='He 0 0 0', basis='sto-3g')
         self.mf = scf.RHF(self.mol)
         self.mf.kernel()
         
-        # Create simple Jastrow factors for both implementations
         self.params = jnp.array([1.0])
         self.jastrow_jax = Poly()  # No params in constructor
         
-        # Create numpy version of same jastrow for comparison
         class PolyNumpy:
             """Numpy version of Poly for comparison."""
             def __init__(self, params):
@@ -49,7 +45,6 @@ class TestTC(unittest.TestCase):
                 return grad
         self.jastrow_numpy = PolyNumpy(self.params)
         
-        # Create TC objects
         self.tc_jax = TC_jax.from_pyscf(self.mf, self.jastrow_jax)
         self.tc_numpy = TC_numpy(self.mf, self.jastrow_numpy)
         
@@ -62,7 +57,6 @@ class TestTC(unittest.TestCase):
         
     def test_basis_evaluation(self):
         """Test basis function evaluation on grid."""
-        # In new design, phi is pre-computed and stored in struct
         phi_jax = self.tc_jax.phi
         grad_phi_jax = self.tc_jax.grad_phi
         
@@ -108,19 +102,15 @@ class TestTC(unittest.TestCase):
 
     def test_get_2b_against_numpy(self):
         """Test two-body term calculation against numpy version."""
-        # Compute two-body correction with explicit parameter passing
         correction_jax = self.tc_jax.get_2b(self.params)
         
-        # Get standard ERI
         eri1 = tc_helper.get_eri(self.mf)
         
-        # Combine to get full effective ERI
         result_jax = eri1 + correction_jax
         
         # Numpy version returns full effective ERI
         result_numpy = self.tc_numpy.get_2b()
         
-        # Convert JAX array to numpy for comparison
         result_jax = np.asarray(result_jax)
         
         np.testing.assert_allclose(
@@ -140,7 +130,6 @@ class TestTC(unittest.TestCase):
     
     def test_mo_coeff_handling(self):
         """Test handling of molecular orbital coefficients."""
-        # Test with explicit mo_coeff
         new_mo = self.mf.mo_coeff + 0.1
         
         tc_jax_new = TC_jax.from_pyscf(self.mf, self.jastrow_jax, mo_coeff=new_mo)

@@ -9,7 +9,6 @@ from pyscf import gto
 
 from pytc.jastrow.dtn import DTN, DTNTermEE, DTNTermEN, DTNTermEEN
 
-# Enable float64 support
 jax.config.update("jax_enable_x64", True)
 
 
@@ -54,7 +53,6 @@ class TestDTN(unittest.TestCase):
         jastrow = DTN.create(self.mol)
         params = jastrow.init_params()
 
-        # Check parameter structure
         self.assertIn('rc_en_raw', params)
         self.assertIn('rc_ee_raw', params)
         self.assertIn('c_ee_raw', params)
@@ -65,7 +63,7 @@ class TestDTN(unittest.TestCase):
 
         # H2 has 1 atom type
         self.assertEqual(params['rc_en_raw'].shape, (1,))
-        self.assertEqual(params['rc_ee_raw'].shape, (1,))    # Global
+        self.assertEqual(params['rc_ee_raw'].shape, (1,))
         self.assertEqual(params['c_ee_raw'].shape, (9,))     # 9 default EE terms (global)
         self.assertEqual(params['c_en_raw'].shape, (1, 8))   # 8 default EN terms
         self.assertEqual(params['c_een_raw'].shape, (1, 13))  # 13 cusp-safe EEN terms
@@ -263,7 +261,6 @@ class TestDTNCuspPreservation(unittest.TestCase):
         mf.kernel()
 
         det = SlaterDet.create(mol, mf.mo_coeff)
-        # Mix of terms
         ee = [DTNTermEE(1, 0.5), DTNTermEE(2, 0.1)]
         en = [[DTNTermEN(2, 0.1)]]
         een = [[DTNTermEEN(2, 0, 2, 0.1)]]
@@ -273,7 +270,6 @@ class TestDTNCuspPreservation(unittest.TestCase):
         params_init = jastrow.init_params()
         linear_coeffs = jnp.ones(1)
 
-        # Run a few optimization steps
         key = random.PRNGKey(123)
         opt_results = optimize_ref_var(
             ansatz,
@@ -290,7 +286,6 @@ class TestDTNCuspPreservation(unittest.TestCase):
 
         optimized_params = opt_results['params'][-1][0]
 
-        # Verify raw parameters changed
         for key_name in ['c_ee_raw', 'c_en_raw', 'c_een_raw']:
             if optimized_params[key_name].size > 0:
                 changed = not np.allclose(
@@ -306,7 +301,6 @@ class TestDTNCuspPreservation(unittest.TestCase):
         # so it stays exactly at its initialized value.
         actual_c_ee = jnp.where(jastrow._ee_cusp_mask, 0.5, optimized_params['c_ee_raw'])
         
-        # Check that the evaluated parameter is strictly clamped to 0.5
         clamped_cusp_val = actual_c_ee[0]
         np.testing.assert_allclose(
             float(clamped_cusp_val), 0.5, atol=1e-12,

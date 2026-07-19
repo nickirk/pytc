@@ -15,7 +15,6 @@ class TestFCIDump(unittest.TestCase):
         if os.path.exists(self.filename):
             os.remove(self.filename)
 
-    # Example function to use the write_fcidump & read_fcidump function
     def test_fcidump(self):
         mf = scf.RHF(self.mol)
         mf.kernel()
