@@ -71,7 +71,6 @@ class Jastrow:
         Returns:
             Gradients of shape (batch_size_out, batch_size_in, 3)
         """
-        # Default implementation using vmap over grad_r
         @partial(jax.vmap, in_axes=(None, 0))
         def grad_fn(r1, r2):
             return self.grad_r(r1, r2, params)
@@ -92,7 +91,6 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
             
-        # Use folx for efficient forward-mode Laplacian
         return folx.forward_laplacian(scalar_fn)(r1).laplacian
     
     
@@ -125,7 +123,6 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
             
-        # Use folx for efficient forward-mode gradient and Laplacian
         fwd_lapl = folx.forward_laplacian(scalar_fn)(r1)
         grad_u = fwd_lapl.jacobian.dense_array
         lapl_u = fwd_lapl.laplacian
@@ -148,7 +145,6 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(r1, x, params).reshape(-1)[0]
             
-        # Use folx for efficient forward-mode gradient and Laplacian
         fwd_lapl = folx.forward_laplacian(scalar_fn)(r2)
         grad_u = fwd_lapl.jacobian.dense_array
         lapl_u = fwd_lapl.laplacian

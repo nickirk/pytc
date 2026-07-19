@@ -49,7 +49,6 @@ class SlaterJastrow:
             jastrow=jastrow
         )
 
-    # Compatibility method for __call__
     def __call__(self, walker, params):
         return eval_sj(self, walker, params)
 
@@ -66,7 +65,6 @@ class SlaterJastrow:
         return [jastrow_params, linear_coeffs]
 
 
-# Standalone functions
 
 def compute_jastrow_log_value(sj: SlaterJastrow, elec_coords, jastrow_params):
     """Compute Jastrow factor in log space for numerical stability.
@@ -77,11 +75,8 @@ def compute_jastrow_log_value(sj: SlaterJastrow, elec_coords, jastrow_params):
     elec_coords = jnp.asarray(elec_coords)
     n_electrons = elec_coords.shape[0]
     
-    # Create indices for unique pairs (i < j)
-    # We use triu_indices to get the upper triangle indices
     rows, cols = jnp.triu_indices(n_electrons, k=1)
     
-    # Pre-bind the compute function to avoid overhead
     compute_fn = sj.jastrow._compute
     
     def scan_body(carry, pair_idx):
@@ -92,8 +87,6 @@ def compute_jastrow_log_value(sj: SlaterJastrow, elec_coords, jastrow_params):
         val = compute_fn(r1, r2, jastrow_params)
         return carry + val, None
 
-    # Scan over all unique pairs
-    # We stack rows and cols to scan over them together
     pair_indices = jnp.stack([rows, cols], axis=1)
     
     log_j_val, _ = jax.lax.scan(scan_body, 0.0, pair_indices)

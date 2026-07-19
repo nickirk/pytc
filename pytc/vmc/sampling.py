@@ -118,7 +118,6 @@ def burn_in(ansatz,
         walkers, acceptance = mcmc_step(
             ansatz, walkers, step_size, subkey, params)
         
-        # Convert acceptance to Python float for history
         acceptance_float = float(acceptance)
         acceptance_history.append(acceptance_float)
         
@@ -126,7 +125,6 @@ def burn_in(ansatz,
             logger.info(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
             step_size *= acceptance_float / 0.5
             start_time = time.time()
-            # Periodic garbage collection
             gc.collect()
     
     logger.info("Burn-in complete.")
@@ -378,7 +376,6 @@ def sample(
     if key is None:
         key = random.PRNGKey(int(time.time()))
     
-    # ---- Multi-GPU setup ----
     mesh = None
     if is_multi_gpu():
         num_devices = n_devices()
@@ -391,7 +388,6 @@ def sample(
         print(f"Multi-GPU auto-detected: {num_devices} devices, "
               f"{n_walkers // num_devices} walkers/device")
     
-    # Initialize walkers
     if mesh is not None:
         walkers = initialize_walkers_sharded(
             ansatz, n_walkers, mesh, initial_walkers=initial_walkers, key=key
@@ -411,7 +407,6 @@ def sample(
     logger.info(f"Using importance sampling: {use_importance_sampling}")
     logger.info(f"Move type: {move_type}")
     
-    # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
             ansatz, walkers, burn_in_steps, step_size, key, params, mesh=mesh)
@@ -420,12 +415,10 @@ def sample(
             ansatz, walkers, burn_in_steps, step_size, key=key, params=params, 
             move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     
-    # Storage for collected samples
     collected_samples = []
     collected_energies = []
     step_times = []
     
-    # JIT-compile MCMC step for production run
     vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     if use_importance_sampling:
         mcmc_step = make_mcmc_step_importance(ansatz, step_size, mesh=mesh)
@@ -435,13 +428,11 @@ def sample(
             max_vmap_batch_size=max_vmap_batch_size, mesh=mesh
         )
         
-    # JIT-compile energy evaluation
     batch_local_energy = jax.jit(vmap_fn(
         lambda w, p: ansatz.local_energy(w, p)[0],
         in_axes=(0, None)
     ))
     
-    # Main sampling loop
     start_time = time.time()
     for step in range(n_steps):
         
@@ -452,7 +443,6 @@ def sample(
         acceptance_history.append(acceptance)
         
         if step % thinning == 0:
-            # Compute local energies with parameters
             energies = batch_local_energy(walkers, params)
             
             # Convert to numpy to avoid holding JAX device references
@@ -460,11 +450,9 @@ def sample(
             collected_energies.append(np.array(energies))
         
         
-        # Print progress occasionally
         if step % report_interval == 0 or step == n_steps - 1:
             step_time = time.time() - start_time
             step_times.append(step_time)
-            # Use latest computed energies if available, otherwise compute for display
             if not collected_energies and step == 0:
                  energies = batch_local_energy(walkers, params)
             
@@ -474,6 +462,5 @@ def sample(
             start_time = time.time()
             gc.collect()
     
-    # Prepare and return results
     return prepare_sampling_results(
         collected_samples, collected_energies, acceptance_history, walkers, step_times)

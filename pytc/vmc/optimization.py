@@ -58,7 +58,6 @@ def make_opt_update_step(loss_fn, optimizer):
         A JIT-compiled function with signature:
             opt_step(ansatz, params, walkers, opt_state, key) -> (params, opt_state, loss, aux_data)
     """
-    # Create value_and_grad function
     loss_and_grad = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
     
     def opt_step(ansatz, params, walkers, opt_state, key):
@@ -77,17 +76,14 @@ def make_opt_update_step(loss_fn, optimizer):
             loss: Loss value
             aux_data: Auxiliary data from loss function (e.g., energy, variance)
         """
-        # Compute loss and gradients
         # Note: loss_fn expects (params, walkers), ansatz is baked in or handled via wrapper
         (loss, aux_data), grads = loss_and_grad(params, walkers)
         
-        # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         
         return new_params, opt_state, loss, aux_data
     
-    # JIT compile the step function
     return jax.jit(opt_step)
 
 
@@ -148,16 +144,14 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
                 walkers_carry, pmove_carry = mcmc_step(ansatz, walkers_carry, subkey, params_carry)
                 return (walkers_carry, key_carry, params_carry), pmove_carry
             
-            # Run MCMC loop
             (walkers, key, _), pmoves = jax.lax.scan(
                 mcmc_scan_fn,
                 (walkers, key, params),
                 None,
                 length=n_mcmc_per_opt
             )
-            pmove = pmoves[-1]  # Use last acceptance rate
+            pmove = pmoves[-1]
             
-            # Single optimization step after MCMC
             key, subkey = random.split(key)
             params, opt_state, loss, aux_data = opt_update_step(
                 ansatz, params, walkers, opt_state, subkey
@@ -173,7 +167,6 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
                 )
                 return (params_carry, opt_state_carry, key_carry), (loss_carry, aux_data_carry)
             
-            # Run optimization loop
             (params, opt_state, key), (losses, aux_data_list) = jax.lax.scan(
                 opt_scan_fn,
                 (params, opt_state, key),
@@ -181,29 +174,22 @@ def make_training_step(mcmc_step, opt_update_step, n_mcmc_per_opt=1, n_opt_per_m
                 length=n_opt_per_mcmc
             )
             
-            # Use the last loss and aux_data from the optimization loop
             loss = losses[-1]
             aux_data = tree_map(lambda x: x[-1], aux_data_list)
             
-            # Single MCMC step after optimization
             key, subkey = random.split(key)
             walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
         
         # Pattern 3: Balanced (1 MCMC, 1 opt) - default simple case
         else:
-            # Single MCMC step
             key, subkey = random.split(key)
             walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
             
-            # Single optimization step
             key, subkey = random.split(key)
             params, opt_state, loss, aux_data = opt_update_step(
                 ansatz, params, walkers, opt_state, subkey
             )
         
-        # Try to get learning rate from opt_update_step's auxiliary output if possible
-        # but for Optax it's cleaner to just return it from here if we want to log it.
-        # However, optax.scale_by_learning_rate usually handles it within opt_state.
         
         return walkers, params, opt_state, loss, aux_data, pmove
     
@@ -225,7 +211,6 @@ def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_op
                 walkers_carry, pmove_carry = mcmc_step(ansatz, walkers_carry, subkey, params_carry)
                 return (walkers_carry, key_carry, params_carry), pmove_carry
             
-            # Run MCMC loop
             (walkers, key, _), pmoves = jax.lax.scan(
                 mcmc_scan_fn,
                 (walkers, key, params),
@@ -234,7 +219,6 @@ def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_op
             )
             pmove = pmoves[-1]
             
-            # Single optimization step
             key, subkey = random.split(key)
             params, opt_state, stats = optimizer.step(
                 params=params,
@@ -273,7 +257,6 @@ def make_second_order_training_step(mcmc_step, optimizer, n_mcmc_per_opt=1, n_op
             loss = stats['loss']
             aux_data = stats['aux']
             
-            # Single MCMC step after optimization
             key, subkey = random.split(key)
             walkers, pmove = mcmc_step(ansatz, walkers, subkey, params)
         
@@ -314,7 +297,6 @@ def optimize(
     use_importance_sampling: bool = False,
     initial_walkers=None,
     key=None,
-    # Optimization parameters
     n_opt_steps: int = 100,
     max_vmap_batch_size: int = 0,
     learning_rate: float = 0.01,
@@ -361,14 +343,12 @@ def optimize(
     if opt_kwargs is None:
         opt_kwargs = {}
         
-    # Default to average energy as cost function if none provided
     user_or_default_cost_fn = cost_fn
     if user_or_default_cost_fn is None:
         def energy_cost_fn(energies_for_cost):
             return jnp.mean(energies_for_cost)
         user_or_default_cost_fn = energy_cost_fn
     
-    # ---- Multi-GPU setup ----
     from .sharding import (
         create_mesh, replicate, initialize_walkers_sharded,
         pad_n_walkers, pad_walker, n_devices as get_n_devices,
@@ -389,7 +369,6 @@ def optimize(
         logger.info(f"Multi-GPU auto-detected: {num_devices} devices, "
               f"{n_walkers // num_devices} walkers/device")
     
-    # Initialize walkers
     if multi_gpu and mesh is not None:
         walkers = initialize_walkers_sharded(
             ansatz, n_walkers, mesh, initial_walkers=initial_walkers, key=key
@@ -400,7 +379,6 @@ def optimize(
     else:
         walkers = initialize_walkers(ansatz, n_walkers, initial_walkers, key)
 
-    # Perform burn-in with appropriate method
     if use_importance_sampling:
         walkers, acceptance_history, key, step_size = burn_in_with_importance(
             ansatz, walkers, burn_in_steps, step_size, key, params, mesh=mesh)
@@ -411,7 +389,6 @@ def optimize(
     
     logger.info("Starting optimization...")
     
-    # Initialize parameters if not provided
     if params is None:
         jastrow_params = ansatz.jastrow.init_params()
         linear_coeffs = jnp.ones(len(ansatz.dets))
@@ -420,8 +397,6 @@ def optimize(
         if not isinstance(params, (list, tuple)) or len(params) != 2:
              raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
 
-    # Create loss function using modular factory
-    # If user provides custom cost_fn, use it; otherwise use default mean energy
     internal_loss_fn = make_energy_loss(
         ansatz=ansatz,
         optimizer_type=optimizer_type,
@@ -432,10 +407,8 @@ def optimize(
         mesh=mesh
     )
 
-    # Create mask for parameter freezing
     gradient_mask = create_gradient_mask(ansatz, params, frozen_params)
 
-    # Create MCMC step function using factory
     if use_importance_sampling:
         mcmc_step = make_mcmc_step_importance(ansatz, step_size, mesh=mesh)
     else:
@@ -444,12 +417,9 @@ def optimize(
             max_vmap_batch_size=max_vmap_batch_size, mesh=mesh
         )
 
-    # Define loss function JVP for KFAC and Newton
     loss_fn_jvp = jax.value_and_grad(internal_loss_fn, argnums=0, has_aux=True)
 
-    # Create optimizer and training step using factory functions
     if optimizer_type.lower() == "newton":
-        # Newton setup
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "fisher" # Energy minimization uses Fisher
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
@@ -466,26 +436,21 @@ def optimize(
         # Newton needs explicit JIT since it doesn't handle it internally
         training_step = jax.jit(training_step)
     else:
-        # Optax setup
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         opt_state = optimizer.init(params)
         
-        # Create Optax training step - apply gradient mask in the loss function wrapper
         if gradient_mask is not None:
-            # Wrap internal_loss_fn to apply gradient masking
+            # No-op passthrough wrapper; gradient masking is not applied here
             original_loss_fn = internal_loss_fn
             def masked_loss_fn(params_inner, batch_data):
                 return original_loss_fn(params_inner, batch_data)
-            # Note: gradient masking will be applied via custom_jvp, which respects the mask
             internal_loss_fn = masked_loss_fn
         
         opt_update_step = make_opt_update_step(internal_loss_fn, optimizer)
-        # Use n_mcmc_per_opt pattern for energy optimization
         training_step = make_training_step(
             mcmc_step, opt_update_step, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
         )
 
-    # ========== MAIN LOOP (Uses JIT-compiled step) ==========
     logger.info(f"Starting optimization with {n_opt_steps} steps...")
     if adaptive_step_size:
         logger.info(f"Adaptive step-size enabled (target accept=0.5, adjust every {step_size_adjust_interval} steps)")
@@ -495,7 +460,7 @@ def optimize(
     stds = []
     acceptances = []
     params_history = []
-    step_sizes = [step_size]  # Track step_size history
+    step_sizes = [step_size]
     
     start_time = time.time()
     
@@ -510,39 +475,32 @@ def optimize(
             walkers, params, opt_state, loss, aux_data, pmove = training_step(
                 ansatz, walkers, params, opt_state, subkey
             )
-            current_lr = None # Optax handles internally, could extract from opt_state if needed
+            current_lr = None
         
-        # Materialize values
         cost_val = float(jax.device_get(loss))
         # aux_data is a namedtuple with (mean_energy, energy_std, clipped_energies, diff)
         # Extract only the first two for backward compatibility
         aux_data_materialized = jax.device_get(aux_data)
-        energy_val = float(aux_data_materialized[0])  # mean_energy
-        std_val = float(aux_data_materialized[1])     # energy_std
+        energy_val = float(aux_data_materialized[0])
+        std_val = float(aux_data_materialized[1])
         pmove_val = float(jax.device_get(pmove))
         
-        # Store history
         losses.append(cost_val)
         energies.append(energy_val)
         stds.append(std_val)
         acceptances.append(pmove_val)
         
-        # Store params (materialize to numpy)
         params_copy = tree_map(
             lambda x: np.array(jax.device_get(x)) if isinstance(x, jnp.ndarray) else x,
             params
         )
         params_history.append(params_copy)
         
-        # Adaptive step-size adjustment (similar to burn-in)
         if adaptive_step_size and (opt_step + 1) % step_size_adjust_interval == 0 and opt_step < 5*step_size_adjust_interval:
-            # Calculate mean acceptance over last interval
             recent_accept = np.mean(acceptances[-step_size_adjust_interval:])
-            # Adjust step_size to target 0.5 acceptance rate
             step_size *= recent_accept / 0.5
             step_sizes.append(step_size)
             
-            # Recreate mcmc_step with new step_size
             if use_importance_sampling:
                 mcmc_step = make_mcmc_step_importance(ansatz, step_size, mesh=mesh)
             else:
@@ -551,7 +509,6 @@ def optimize(
                     max_vmap_batch_size=max_vmap_batch_size, mesh=mesh
                 )
             
-            # Recreate training_step with new mcmc_step
             if optimizer_type.lower() in ["newton"]:
                 training_step = make_second_order_training_step(
                     mcmc_step, optimizer, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
@@ -563,8 +520,7 @@ def optimize(
                     mcmc_step, opt_update_step, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
                 )
         
-        # Print progress
-        log_frequency = 1  # Log ~100 times
+        log_frequency = 1  # Log every step
         if opt_step % log_frequency == 0 or opt_step == n_opt_steps - 1:
             lr_str = f" | LR: {current_lr:.4f}" if current_lr is not None else ""
             elapsed = time.time() - start_time
@@ -574,7 +530,6 @@ def optimize(
                   f"Accept: {pmove_val:.3f}{step_size_str}{lr_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
 
-        # Periodic save to disk
         if save_path and (opt_step + 1) % save_frequency == 0:
             current_history = {
                 "cost": np.array(losses),
@@ -610,7 +565,6 @@ def optimize_ref_var(
     burn_in_steps: int = 1000,
     initial_walkers=None,
     key=None,
-    # Optimization parameters
     n_opt_steps: int = 100,
     max_vmap_batch_size: int = 0,
     learning_rate: float = 0.01,
@@ -711,7 +665,6 @@ def optimize_ref_var(
             "or multiple optimization steps per MCMC refresh, not both at once."
         )
 
-    # ---- Multi-GPU setup ----
     from .sharding import (
         create_mesh, replicate, initialize_walkers_sharded,
         pad_n_walkers, pad_walker, n_devices as get_n_devices,
@@ -731,7 +684,6 @@ def optimize_ref_var(
         logger.info(f"Multi-GPU auto-detected: {num_devices} devices, "
               f"{n_walkers // num_devices} walkers/device")
 
-    # Initialize walkers using the reference determinant's info
     ref_det = ansatz.dets[0]
     if multi_gpu and mesh is not None:
         walkers = initialize_walkers_sharded(
@@ -743,16 +695,13 @@ def optimize_ref_var(
     else:
         walkers = initialize_walkers(ref_det, n_walkers, initial_walkers, key)
 
-    # Burn-in walkers using the initial combined parameters
     logger.info("Performing burn-in...")
     walkers, acceptance_history, key, step_size = burn_in(
         ref_det, walkers, burn_in_steps, step_size, key, params=params, 
         move_type=move_type, max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     logger.info(f"Burn-in complete. Final step size: {step_size:.4f}")
 
-    # Create loss function using modular factory
     if cost_fn is None:
-        # Use modular variance loss factory
         loss_fn = make_variance_loss(
             ansatz=ansatz,
             optimizer_type=optimizer_type,
@@ -763,22 +712,17 @@ def optimize_ref_var(
     else:
         loss_fn = cost_fn
 
-    # Create MCMC step function
     mcmc_step = make_mcmc_step(ref_det, step_size, move_type,
                                max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
 
-    # Create optimizer and training step
-    # Define loss function JVP for KFAC and Newton
     loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
 
     if optimizer_type.lower() == "newton":
-        # Newton setup
         opt_kwargs["value_and_grad_func"] = loss_fn_jvp
         opt_kwargs["curvature"] = "gauss_newton" # Variance minimization uses GN
         opt_kwargs["max_vmap_batch_size"] = max_vmap_batch_size
         opt_kwargs["mesh"] = mesh
 
-        # Add jacobian_sample_size if provided
         if jacobian_sample_size is not None:
             opt_kwargs["jacobian_sample_size"] = jacobian_sample_size
         
@@ -796,14 +740,11 @@ def optimize_ref_var(
             n_mcmc_per_opt=n_mcmc_per_opt,
             n_opt_per_mcmc=n_opt_per_mcmc,
         )
-        # Newton needs explicit JIT
         training_step = jax.jit(training_step)
     else:
-        # Optax setup
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         opt_state = optimizer.init(params)
         
-        # Create Optax training step with configurable cadence.
         opt_update_step = make_opt_update_step(loss_fn, optimizer)
         training_step = make_training_step(
             mcmc_step,
@@ -812,7 +753,6 @@ def optimize_ref_var(
             n_opt_per_mcmc=n_opt_per_mcmc,
         )
 
-    # ========== MAIN LOOP (Uses JIT-compiled step) ==========
     logger.info(f"Starting optimization with {n_opt_steps} steps...")
     
     losses = []
@@ -840,7 +780,6 @@ def optimize_ref_var(
     compilation_end = time.time()
     logger.info(f"Compilation + First Step finished in {compilation_end - compilation_start:.2f}s")
     
-    # Process first step results
     variance_val = float(jax.device_get(loss))
     energy_val, std_val = jax.device_get(aux_data)
     energy_val = float(energy_val)
@@ -883,22 +822,19 @@ def optimize_ref_var(
         pmove_val = float(jax.device_get(pmove))
 
         
-        log_frequency = 1 #max(1, n_opt_steps // 10)  # Log ~100 times
+        log_frequency = 1
         if opt_step % log_frequency == 0 or opt_step == n_opt_steps - 1:
-            # Store history
             losses.append(variance_val)
             energies.append(energy_val)
             stds.append(std_val)
             acceptances.append(pmove_val)
             
-            # Store params (materialize to numpy)
             params_copy = tree_map(
                 lambda x: np.array(jax.device_get(x)) if isinstance(x, jnp.ndarray) else x,
                 params
             )
             params_history.append(params_copy)
             
-            # Print progress
             lr_str = f" | LR: {current_lr:.4f}" if current_lr is not None else ""
             elapsed = time.time() - start_time
             logger.info(f"Step {opt_step:5d} | Var: {variance_val:.6f} | "
@@ -906,7 +842,6 @@ def optimize_ref_var(
                   f"Accept: {pmove_val:.3f}{lr_str} | Time: {elapsed:.2f}s")
             start_time = time.time()
 
-        # Periodic save to disk
         if save_path and (opt_step + 1) % save_frequency == 0:
             current_history = {
                 "cost": np.array(losses),
