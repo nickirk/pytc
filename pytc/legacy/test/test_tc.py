@@ -40,7 +40,7 @@ class TestTC(unittest.TestCase):
     def setUpClass(cls):
         """Set up a simple H2 molecule for all tests in this class."""
         cls.mol, cls.mf = get_h2_sto3g()
-        cls.jastrow = REXP([1])  # alpha = 0.5
+        cls.jastrow = REXP([1])
         cls.tc = TC(cls.mf, cls.jastrow, grid_lvl=1)  # Use coarse grid for testing
     
     def test_grid_initialization(self):
