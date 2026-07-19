@@ -1222,9 +1222,8 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
 
     # Tile-id round-robin across local devices.  We intentionally do NOT
     # pass ``device_key=lambda spec: spec[0]`` (p-block locality) here:
-    # there is no
-    # longer any locality benefit from keeping r-tiles of a given p on
-    # one device.  With ``device_key`` on, ``_round_robin_pipeline``
+    # there is no longer any locality benefit from keeping r-tiles of
+    # a given p on one device.  With ``device_key`` on, ``_round_robin_pipeline``
     # would assign the first-seen p-block to device 0, the second to
     # device 1, etc.  At small ``p_blksize`` that is fine, but at the
     # degenerate ``p_blksize=1`` the scheduler must drain all ``n_r``

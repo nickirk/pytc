@@ -670,7 +670,7 @@ def _update_amps(cc, t1, t2, eris):
     t1new +=-2*lib.einsum('lcki,lc,ka->ia', eris_ovoo, t1, t1)
     t1new +=   lib.einsum('kcli,lc,ka->ia', eris_ovoo, t1, t1)
 
-    # Pre-allocate large intermediates that fit in RAM
+    # Pre-allocate large host-side intermediates
     # Wvoov: (a, k, i, c) -> (nvir, nocc, nocc, nvir)
     Wvoov = np.zeros((nvir, nocc, nocc, nvir))
     # Wvovo: (a, k, c, i) -> (nvir, nocc, nvir, nocc)
