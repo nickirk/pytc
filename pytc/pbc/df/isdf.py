@@ -901,11 +901,31 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     if not ao_blocks:
         raise ValueError("ao_blocks must be nonempty.")
 
-    eta_chunks = [
-        pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)
-        for block in ao_blocks
-    ]
-    eta = np.concatenate(eta_chunks, axis=2)[neg]
+    # Preallocate and fill rather than concatenate. The previous form,
+    #   np.concatenate([...], axis=2)[neg]
+    # held the whole chunk list, the concatenate's full copy, and the
+    # fancy-index's full copy simultaneously -- a 3x eta transient that OOM'd
+    # a 333 build at 622 GiB before it could reach the third copy. Filling in
+    # place holds one eta plus one block.
+    #
+    # [neg] is applied per block because it commutes with the concatenation:
+    # it permutes axis 0 (k) while blocks concatenate along axis 2 (grid).
+    # Same reasoning build_pi_eta_staged relies on.
+    n_grid_total = sum(int(np.asarray(block).shape[1]) for block in ao_blocks)
+    eta = None
+    col = 0
+    for block in ao_blocks:
+        Z = pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)[neg]
+        if eta is None:
+            eta = np.empty((Z.shape[0], Z.shape[1], n_grid_total), dtype=Z.dtype)
+        eta[:, :, col:col + Z.shape[2]] = Z
+        col += int(Z.shape[2])
+        del Z
+    if col != n_grid_total:
+        raise ValueError(
+            f"eta covered {col} grid points, expected {n_grid_total} -- the AO "
+            f"block stream did not span the grid."
+        )
     return Pi, eta
 
 
