@@ -714,21 +714,17 @@ def pivoted_cholesky_batched_hermitian(
         retained = []
         factor_update_seconds = 0.0
         if blocked_projection:
-            # --- Blocked BLAS-3 projection + update (task #45): replicate the
-            # sequential per-pivot arithmetic below as three level-3 ops.
+            # The sequential per-pivot arithmetic below, as three level-3 ops:
             #   (a) pre-round-L correction: block = columns - L @ conj(L[idx]).T
-            #       (one (Ng x p) x (p x m) zGEMM against pre-round L only);
-            #   (b) round-mate orthogonalization via the within-batch Cholesky
-            #       R (R^H R = the retained sub-Gram of residual_batch, i.e. the
-            #       same factorization the sequential loop performs implicitly):
-            #       block = V R  =>  V = block R^{-1} by one triangular solve;
-            #   (c) one blocked diagonal update, diag -= sum(|V|^2, axis=1),
-            #       which sums the retained columns in the same order as the
-            #       sequential loop.
-            # local_pivots / candidate residual Gram are byte-for-byte the same,
-            # so this is a reordering of identical arithmetic; the only fp delta
-            # is R's Gram recursion vs the sequential coefficient accumulation,
-            # residual-arbitrated on any pivot tie.
+            #   (b) round-mate orthogonalization: block = V R => V = block R^-1,
+            #       R being the within-batch Cholesky (R^H R = the retained
+            #       sub-Gram, the factorization the sequential loop performs
+            #       implicitly);
+            #   (c) blocked diagonal update, diag -= sum(|V|^2, axis=1), summing
+            #       retained columns in the sequential loop's order.
+            # A reordering of identical arithmetic: local_pivots and the
+            # candidate residual Gram are byte-identical, and the only fp delta
+            # is R's Gram recursion vs sequential coefficient accumulation.
             from scipy.linalg import solve_triangular
             retained_local = []
             for local_index in local_pivots[:local_count]:
@@ -866,29 +862,14 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     eta is accumulated block-by-block so one pair_convolve call holds only
     one block of AO data. See design doc §4-§5.
 
-    q-labeling fix (task #25/C2 item 2b, 2026-07-14): Alg. 1's convolution
-    (which pair_convolve implements) and Eq. 4/5's own defining equations
-    for Pi/eta agree only up to a q<->-q relabeling (derived by dummy-
-    relabeling Alg. 1's expansion with m=-k). This is INVISIBLE at
-    self-paired q (q=neg[q]: real-valued/trivially-conjugate either way)
-    and was invisible in Pi's specific case for a second reason -- Pi's
-    symmetric X=X call makes pair_convolve's raw output satisfy
-    Pi_raw[neg[q]]=conj(Pi_raw[q]) regardless of labeling, so a plain
-    transpose relation to an external oracle (task #25/C2's Test D) LOOKED
-    clean while still carrying the SAME offset one level down: feeding
-    Pi_raw[q] into the Hermitian sandwich solve reproduces the WRONG
-    physical W at genuine-pair q (confirmed empirically: relative error
-    ~1e4 vs an external oracle, collapsing to ~1e-11 when Pi_raw[neg[q]]
-    is used instead) even though Pi_raw[q] itself "matched" the oracle's
-    own (equally offset) metric up to transpose. One bug, two faces --
-    both eta and Pi carry the identical offset; only eta's showed up as
-    an obvious VALUE mismatch, Pi's hid inside a transpose that looked
-    like a clean convention difference rather than a shared bug. Fixed
-    identically for both (not inside pair_convolve, which stays correct/
-    shared/untouched) by relabeling BOTH outputs' q-axis with neg once,
-    after construction -- every consumer (solve modes, the device
-    pipeline, apply_kernel_and_solve_device) receives the physical Pi^q/
-    eta^q and needs no compensating convention logic of its own.
+    Alg. 1's convolution and Eq. 4/5's defining equations for Pi/eta agree
+    only up to a q<->-q relabeling, so both outputs' q-axis is relabeled with
+    neg once after construction. Every consumer then receives the physical
+    Pi^q/eta^q and needs no convention logic of its own. The relabeling is
+    deliberately not inside pair_convolve, which is shared and correct as is.
+    The offset is invisible at self-paired q, and invisible in Pi against a
+    transpose-based oracle check, so it must be preserved by construction
+    rather than by test (task #25).
 
     Args:
         X: (Nk, Nip, Nao) complex128 across the canonical k-mesh.
