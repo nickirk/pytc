@@ -41,7 +41,7 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
     # Compute A^T A efficiently using the Kronecker-like structure
     gram_p = phi_piv_p.T @ phi_piv_p  # (n_fused, n_fused)
     gram_q = phi_piv_q.T @ phi_piv_q  # (n_fused, n_fused)
-    ATA = gram_p * gram_q  # Element-wise product
+    ATA = gram_p * gram_q
     
     # Compute A^T B efficiently using separable structure
     term_p = jnp.matmul(phi_piv_p.T, phi_p_batch)  # (n_fused, batch_size)
@@ -137,7 +137,6 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
         pivots = pivots.at[step].set(pivot)
         pivot_val = diag_err[pivot]
         
-        # gram_col_phi logic
         dot = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
         S_col = dot**2
         S_col = S_col.at[pivot].add(shift)
@@ -180,7 +179,6 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
         pivots = pivots.at[step].set(pivot)
         pivot_val = diag_err[pivot]
         
-        # gram_col_grad logic
         A_col = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
         B_col = jnp.zeros(n_grid)
         for c in range(3):
@@ -214,8 +212,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                    is_incore=False, save_path=None, fixed_pivots=None):
     """Perform ISDF decomposition of orbitals and their gradients.
     
-    Memory-efficient implementation using SVD-based solver to avoid
-    materializing large C matrices (n_orb² × n_fused).
+    Memory-efficient implementation using pivoted Cholesky and normal-equation
+    Cholesky solves to avoid materializing large C matrices (n_orb² × n_fused).
     
     Args:
         phi: Orbitals on grid (n_orb, n_grid)
@@ -225,8 +223,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         weights: Optional (n_grid,) array of integration weights. 
                  If provided, pivot selection is weighted by these weights.
         grid_batch_size: Number of grid points to process in each batch
-        rcond: Relative condition number cutoff for SVD pseudoinverse (default 1e-14).
-               Smaller values retain more singular values (more accurate but less stable).
+        rcond: Scales the Tikhonov jitter in prepare_normal_equations_solver
+               (default 1e-14).
         
     Returns:
         phi_piv: (N_orb, N_fused)
@@ -276,7 +274,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     # Equivalently: (sqrt(W) phi)^T (sqrt(W) phi) squared
     phi_weighted = phi * w_sqrt  # (n_orb, n_grid)
         
-    # Pre-compute diagonal for phi to calculate shift
     orb_sq = jnp.sum(phi_weighted**2, axis=0)  # Weighted orbital norms
     diag_phi = orb_sq**2
     shift_phi = 1e-12 * jnp.max(jnp.abs(diag_phi))
@@ -288,10 +285,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     # --- 2. Gradient Decomposition ---
     t0 = time.perf_counter()
     
-    # Apply weights to gradients for pivot selection
     grad_phi_weighted = grad_phi * w_sqrt[:, None]  # (n_orb, n_grid, 3)
     
-    # Pre-compute diagonal for grad to calculate shift
     A_diag = jnp.sum(phi_weighted**2, axis=0)
     B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
     diag_grad = A_diag * B_diag
@@ -311,11 +306,8 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     t1 = time.perf_counter()
     logger.info(f"Pivots fused: {pivots_phi.shape[0]} + {pivots_grad.shape[0]} -> {n_fused} in {t1 - t0:.4f} s")
 
-    # Experiment hook (Task B precision investigation): override the device-selected
-    # pivots with an externally-supplied fused-pivot set. Used to force CPU-selected
-    # pivots onto the GPU interpolation so we can isolate whether the GPU/CPU
-    # isdf_dU_err gap comes from pivot SELECTION (gap collapses) or downstream
-    # numerics (gap persists). No effect on the default path (fixed_pivots=None).
+    # Optionally override the device-selected pivots with an externally-supplied
+    # fused-pivot set; no effect on the default path (fixed_pivots=None).
     if fixed_pivots is not None:
         fp = np.asarray(fixed_pivots)
         if fp.ndim != 1 or not np.issubdtype(fp.dtype, np.integer):
@@ -341,7 +333,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     t0 = time.perf_counter()
     logger.info("Using fast normal equations solver")
 
-    # Solve for xi_phi and xi_grad
     cpu_device = jax.devices("cpu")[0]
     grid_batch_size = min(grid_batch_size, n_grid)
     n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size if grid_batch_size > 0 else 0
@@ -375,7 +366,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         phi_piv_d = phi_piv
         grad_phi_piv_d = grad_phi_piv
     
-    # Setup storage
     h5_file = None
     if is_incore:
         logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (In-core)")
@@ -389,7 +379,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         h5_file = h5py.File(save_path, 'a')
         logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
         
-        # Create/Reset datasets
         for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
             if name in h5_file: del h5_file[name]
             h5_file.create_dataset(name, shape=shape, dtype=phi.dtype)
@@ -432,7 +421,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
             # Pad batch width to a multiple of n_devices so the grid axis shards evenly.
             pad = (-bs) % n_devices if use_sharding else 0
 
-            # 1. Xi_phi
             phi_batch = phi[:, g_start:g_end]
             if pad:
                 phi_batch = jnp.pad(phi_batch, ((0, 0), (0, pad)))
@@ -445,7 +433,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                 xi_phi_batch = xi_phi_batch[:, :bs]
             xi_phi_storage[:, g_start:g_end] = np.array(xi_phi_batch)
 
-            # 2. Xi_grad
             for c in range(3):
                 grad_phi_batch_c = grad_phi[:, g_start:g_end, c]
                 if pad:
@@ -466,7 +453,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                 eta = (n_batches - batch_idx) / rate if rate > 0 else 0
                 logger.debug(f"Batch {batch_idx}/{n_batches} ({rate:.1f} batch/s, ETA: {eta:.1f}s)")
         
-        # Load into JAX CPU RAM if requested
         if is_incore:
             xi_phi = jax.device_put(xi_phi_storage[:], cpu_device)
             xi_grad = jax.device_put(xi_grad_storage[:], cpu_device)
@@ -474,7 +460,6 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
             xi_phi = None
             xi_grad = None
         
-        # Explicitly delete storage to save RAM
         if is_incore:
             del xi_phi_storage, xi_grad_storage
             gc.collect()

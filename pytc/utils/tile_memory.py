@@ -53,7 +53,7 @@ def isdf_tile_peak_bytes(Np, Nq, Nr, Ns, n_fused, *, include_d=False):
     """
     if n_fused == 0:
         return 0  # no ISDF computation — no memory allocated by this kernel
-    B = 8  # float64: 8 bytes per element
+    B = 8
     d_bytes   = int(n_fused ** 2 * B) if include_d else 0
     x_bytes   = int(Nr * Ns * n_fused * B)   # X_sliced / C_rs input
     cpq_bytes = int(Np * Nq * n_fused * B)   # C_pq panel (used twice)
