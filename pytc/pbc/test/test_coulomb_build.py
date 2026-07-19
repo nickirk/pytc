@@ -222,17 +222,10 @@ class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
 
 
 class TestBpcCachedGemmEtaReuse(unittest.TestCase):
-    """Regression for task #46 Step 2. The bpc_cached_gemm oracle caches AO
-    features in the contiguous 2-D (Ng, Nk*Nao) layout its threaded candidate
-    GEMM needs, but coulomb.build reuses that cache for eta, where build_pi_eta
-    requires the 3-D (Nk, Ng, Nao) blocks the pivot-oracle caches produce -- so
-    the raw reuse tripped `pair_convolve: X and Y must be 3-D`. The fix inverts
-    the oracle's exact pack (ao_block.transpose(1,0,2).reshape(g,-1)). Same
-    selection-only coverage gap as #47: #42/44/45 exercised the BPC selection
-    but never round-tripped its cache through the full build. Pins BOTH layers:
-    the reshape reproduces the stream_ao_blocks output EXACTLY (layout
-    equivalence, not just shape), and a full bpc_cached_gemm build round-trips
-    on diamond-111."""
+    """The bpc_cached_gemm oracle caches AO features in a 2-D (Ng, Nk*Nao)
+    layout, but build_pi_eta consumes 3-D (Nk, Ng, Nao) blocks; the reuse path
+    must invert that pack exactly. Pins both layers: the reshape reproduces the
+    stream_ao_blocks output, and a full build round-trips."""
 
     def test_reshape_recovers_stream_ao_blocks_exactly(self):
         cell = _make_cell()

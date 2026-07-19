@@ -1406,7 +1406,7 @@ def apply_kernel_and_solve_device(
     eta_q_jnp = jnp.asarray(eta_q, dtype=jnp.complex128)
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
     # Fail closed at the boundary common to BOTH the fused and eager solve
-    # paths (task #47): with jax_enable_x64 off, JAX silently downcasts the
+    # paths: with jax_enable_x64 off, JAX silently downcasts the
     # complex128 casts above to complex64, the device solve runs in single
     # precision (~1e-5 accuracy), and W is silently corrupted -- surfacing only
     # as an opaque trip of the 1e-10 machine-tier retained-solve gate below.
@@ -1827,7 +1827,7 @@ def periodic_metric_columns_from_ao(ao, indices):
     gram = np.einsum("kbm,krm->br", pivot_ao.conj(), ao, optimize=True)
     # M = |gram|^2/Nk is real, nonnegative; return float64 (not the historical
     # interface-convenience complex128) so the pivoted-Cholesky factor L it feeds
-    # is stored real (real-f64-L, task #46).
+    # is stored real.
     return (np.abs(gram) ** 2 / ao.shape[0]).T.astype(np.float64)
 
 
