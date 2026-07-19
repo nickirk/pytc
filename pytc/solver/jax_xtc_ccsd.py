@@ -93,7 +93,7 @@ def kernel_process_ovvv_block(ovvv_blk, t1, t2, tau):
 
     Implementation notes
     --------------------
-    * v3 (current): two targeted changes.
+    * v3 (current): three targeted changes.
 
       1. Materialise ``ovvv_swap`` with an ``optimization_barrier`` so
          XLA cannot re-fuse the transpose into any downstream tile
