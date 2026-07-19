@@ -328,7 +328,9 @@ def pair_convolve(X, Y, phase, *, imag_tol=1e-10):
     if phase.ndim != 2 or phase.shape != (n_k, n_k):
         raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
-    T = np.einsum("kIu,kfu->kIf", X, Y.conj(), optimize=True)  # (Nk, Nip, F)
+    # Batched GEMM, not einsum: einsum does not dispatch this contraction to BLAS
+    # and runs a serial loop (~33x slower at campaign shapes).
+    T = np.matmul(X, Y.conj().transpose(0, 2, 1))  # (Nk, Nip, F)
 
     try:
         T_R = kpt_to_spc(T, phase, imag_tol=imag_tol)
