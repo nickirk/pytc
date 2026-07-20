@@ -5,7 +5,10 @@ virtual-virtual DF contribution only; except for
 ``extract_metric_applied_vv_df_factor`` -- consumed by
 ``isdf_xtc_ccsd.RCCSD`` when building its factorized state -- it has no call
 site in the production CCSD path and does not change any default, solver
-route, or chemistry tolerance.
+route, or chemistry tolerance.  Its source model is real molecular PySCF DF:
+``with_df.loop()`` yields the already metric-applied ``cderi`` factor, not
+raw three-centre integrals, so ``B B.T`` reconstructs the molecular Coulomb
+pair metric.
 
 PyTC's source factor is ``B[a, c, Q] = (a c | Q)``.  A scalar ISDF
 collocation matrix is formed in exactly the same flattened virtual-pair order,
@@ -30,6 +33,37 @@ from numpy.typing import NDArray
 
 
 Float64Array = NDArray[np.float64]
+DEFAULT_LSTHC_RCOND = 1.0e-12
+
+
+@dataclass(frozen=True)
+class ErrorNorm:
+    """Absolute and relative Frobenius error against an exact FP64 value."""
+
+    absolute_frobenius: float
+    relative_frobenius: float
+
+
+@dataclass(frozen=True)
+class LSTHCFit:
+    """Auditable least-squares fit of the metric-applied DF factor B."""
+
+    weights: Float64Array
+    b_tilde: Float64Array
+    rcond: float
+    effective_rank: int
+    singular_values: Float64Array
+    singular_max: float
+    singular_min_kept: float
+    condition_number: float
+
+
+@dataclass(frozen=True)
+class RobustMetricSpectrum:
+    """PSD diagnostic for a robust metric, which is not PSD by construction."""
+
+    minimum_eigenvalue: float
+    negative_spectral_weight: float
 
 
 def _as_fp64(name: str, value: object, ndim: int) -> Float64Array:
@@ -41,6 +75,45 @@ def _as_fp64(name: str, value: object, ndim: int) -> Float64Array:
     if array.dtype != np.dtype(np.float64):
         raise ValueError(f"{name} must be real float64; got {array.dtype}")
     return array
+
+
+def _validate_rcond(rcond: float) -> float:
+    """Require an explicit finite least-squares truncation threshold."""
+
+    value = float(rcond)
+    if not np.isfinite(value) or value <= 0.0 or value > 1.0:
+        raise ValueError(f"rcond must be finite and in (0, 1]; got {rcond!r}")
+    return value
+
+
+def frobenius_error(reference: object, approximation: object) -> ErrorNorm:
+    """Return FP64 absolute/relative Frobenius error without a silent dtype cast."""
+
+    exact = np.asarray(reference)
+    approx = np.asarray(approximation)
+    if exact.dtype != np.dtype(np.float64) or approx.dtype != np.dtype(np.float64):
+        raise ValueError(f"reference and approximation must be float64; got {exact.dtype} and {approx.dtype}")
+    if exact.shape != approx.shape:
+        raise ValueError(f"reference and approximation shapes differ: {exact.shape} vs {approx.shape}")
+    absolute = float(np.linalg.norm(exact - approx))
+    denominator = float(np.linalg.norm(exact))
+    relative = absolute / denominator if denominator else (0.0 if absolute == 0.0 else np.inf)
+    return ErrorNorm(absolute_frobenius=absolute, relative_frobenius=relative)
+
+
+def virtual_pair_df_matrix(l_vv: object) -> Float64Array:
+    """Flatten PyTC's ``B[a,c,Q]`` in C-order pair convention.
+
+    The returned row ``a * nvir + c`` is precisely the virtual pair ``(a,c)``.
+    This is the order produced after PyTC's ``lib.unpack_tril(eris.vvL[:],
+    axis=0)`` at the DF call sites.
+    """
+
+    b = _as_fp64("l_vv", l_vv, 3)
+    nvir_a, nvir_c, _ = b.shape
+    if nvir_a != nvir_c:
+        raise ValueError(f"l_vv virtual axes must be square; got {b.shape}")
+    return b.reshape(nvir_a * nvir_c, b.shape[2])
 
 
 def extract_metric_applied_vv_df_factor(
@@ -95,26 +168,13 @@ def extract_metric_applied_vv_df_factor(
     return np.asarray(lib.unpack_tril(vv_l, axis=0), dtype=np.float64)
 
 
-def virtual_pair_df_matrix(l_vv: object) -> Float64Array:
-    """Flatten PyTC's ``B[a,c,Q]`` in C-order pair convention.
-
-    The returned row ``a * nvir + c`` is precisely the virtual pair ``(a,c)``.
-    This is the order produced after PyTC's ``lib.unpack_tril(eris.vvL[:],
-    axis=0)`` at the DF call sites.
-    """
-
-    b = _as_fp64("l_vv", l_vv, 3)
-    nvir_a, nvir_c, _ = b.shape
-    if nvir_a != nvir_c:
-        raise ValueError(f"l_vv virtual axes must be square; got {b.shape}")
-    return b.reshape(nvir_a * nvir_c, b.shape[2])
-
-
 def scalar_pair_collocation(p_virtual: object) -> Float64Array:
     """Return ``C[(a,c),mu] = P[a,mu] P[c,mu]`` in B's pair order."""
 
     p = _as_fp64("p_virtual", p_virtual, 2)
     nvir, rank = p.shape
+    if rank < 1:
+        raise ValueError("p_virtual must contain at least one selected ISDF column")
     return np.einsum("am,cm->acm", p, p, optimize=True).reshape(nvir * nvir, rank)
 
 
@@ -122,9 +182,9 @@ def fit_lsthc_pair_factor(
     b_pair: object,
     collocation: object,
     *,
-    rcond: float | None = None,
-) -> Float64Array:
-    """Fit ``B_tilde = C W`` columnwise by ordinary FP64 least squares."""
+    rcond: float = DEFAULT_LSTHC_RCOND,
+) -> LSTHCFit:
+    """Fit ``B_tilde = C W`` and retain every rank/conditioning diagnostic."""
 
     b = _as_fp64("b_pair", b_pair, 2)
     c = _as_fp64("collocation", collocation, 2)
@@ -133,8 +193,28 @@ def fit_lsthc_pair_factor(
             "b_pair and collocation must share the flattened virtual-pair axis; "
             f"got {b.shape} and {c.shape}"
         )
-    weights, _, _, _ = np.linalg.lstsq(c, b, rcond=rcond)
-    return c @ weights
+    resolved_rcond = _validate_rcond(rcond)
+    weights, _, effective_rank, singular_values = np.linalg.lstsq(
+        c, b, rcond=resolved_rcond
+    )
+    singular_values = np.asarray(singular_values, dtype=np.float64)
+    singular_max = float(singular_values[0])
+    if effective_rank:
+        singular_min_kept = float(singular_values[effective_rank - 1])
+        condition_number = singular_max / singular_min_kept
+    else:
+        singular_min_kept = 0.0
+        condition_number = np.inf
+    return LSTHCFit(
+        weights=weights,
+        b_tilde=c @ weights,
+        rcond=resolved_rcond,
+        effective_rank=int(effective_rank),
+        singular_values=singular_values,
+        singular_max=singular_max,
+        singular_min_kept=singular_min_kept,
+        condition_number=float(condition_number),
+    )
 
 
 @dataclass(frozen=True)
@@ -144,6 +224,13 @@ class RobustDFTHCModel:
     b_pair: Float64Array
     collocation: Float64Array
     b_tilde: Float64Array
+    weights: Float64Array
+    rcond: float
+    effective_rank: int
+    singular_values: Float64Array
+    singular_max: float
+    singular_min_kept: float
+    condition_number: float
     delta_b: Float64Array
     exact_metric: Float64Array
     lsthc_metric: Float64Array
@@ -155,12 +242,36 @@ class RobustDFTHCModel:
 
         return self.exact_metric - self.robust_metric
 
+    @property
+    def lsthc_metric_error(self) -> ErrorNorm:
+        """Error of the full LS-THC pair metric against exact DF."""
+
+        return frobenius_error(self.exact_metric, self.lsthc_metric)
+
+    @property
+    def robust_metric_error(self) -> ErrorNorm:
+        """Error of the robust pair metric against exact DF."""
+
+        return frobenius_error(self.exact_metric, self.robust_metric)
+
+    @property
+    def robust_metric_spectrum(self) -> RobustMetricSpectrum:
+        """Return the required indefinite-metric diagnostic for robust DF."""
+
+        symmetric_metric = 0.5 * (self.robust_metric + self.robust_metric.T)
+        eigenvalues = np.linalg.eigvalsh(symmetric_metric)
+        negative = eigenvalues[eigenvalues < 0.0]
+        return RobustMetricSpectrum(
+            minimum_eigenvalue=float(eigenvalues[0]),
+            negative_spectral_weight=float(np.abs(negative).sum()),
+        )
+
 
 def build_robust_df_thc_model(
     l_vv: object,
     p_virtual: object,
     *,
-    rcond: float | None = None,
+    rcond: float = DEFAULT_LSTHC_RCOND,
 ) -> RobustDFTHCModel:
     """Build the Phase-B oracle matrices from B[a,c,Q] and P[a,mu]."""
 
@@ -171,15 +282,22 @@ def build_robust_df_thc_model(
             "P's virtual dimension does not match L_vv; "
             f"got C {collocation.shape} and B {b_pair.shape}"
         )
-    b_tilde = fit_lsthc_pair_factor(b_pair, collocation, rcond=rcond)
-    delta_b = b_pair - b_tilde
+    fit = fit_lsthc_pair_factor(b_pair, collocation, rcond=rcond)
+    delta_b = b_pair - fit.b_tilde
     exact_metric = b_pair @ b_pair.T
-    lsthc_metric = b_tilde @ b_tilde.T
-    robust_metric = b_tilde @ b_pair.T + b_pair @ b_tilde.T - lsthc_metric
+    lsthc_metric = fit.b_tilde @ fit.b_tilde.T
+    robust_metric = fit.b_tilde @ b_pair.T + b_pair @ fit.b_tilde.T - lsthc_metric
     return RobustDFTHCModel(
         b_pair=b_pair,
         collocation=collocation,
-        b_tilde=b_tilde,
+        b_tilde=fit.b_tilde,
+        weights=fit.weights,
+        rcond=fit.rcond,
+        effective_rank=fit.effective_rank,
+        singular_values=fit.singular_values,
+        singular_max=fit.singular_max,
+        singular_min_kept=fit.singular_min_kept,
+        condition_number=fit.condition_number,
         delta_b=delta_b,
         exact_metric=exact_metric,
         lsthc_metric=lsthc_metric,
@@ -231,6 +349,18 @@ class DirectDFSandwiches:
         """The signed direct residual, equal to ``delta_delta``."""
 
         return self.exact - self.robust
+
+    @property
+    def lsthc_error(self) -> ErrorNorm:
+        """Full LS-THC direct-sandwich error against the exact DF sandwich."""
+
+        return frobenius_error(self.exact, self.lsthc)
+
+    @property
+    def robust_error(self) -> ErrorNorm:
+        """Robust direct-sandwich error against the exact DF sandwich."""
+
+        return frobenius_error(self.exact, self.robust)
 
 
 def direct_df_sandwiches(model: RobustDFTHCModel, t2: object) -> DirectDFSandwiches:
