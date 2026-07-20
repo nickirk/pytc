@@ -119,5 +119,66 @@ class FactorizedStateExecutionTest(unittest.TestCase):
             cc._contract_vvvv_t2(cc, None, eris, None)
 
 
+class PreloadSuppressionTest(unittest.TestCase):
+    """The whole-X host preload fires on the materialized parent but is
+    suppressed on the factorized subclass, with identical X content.
+
+    At the 1200-orbital deck the preload is 247 GB of host RAM the streamed
+    contraction never reads; the subclass suppresses it by construction
+    (``_preload_x_for_eris = False``) while the parent's materialized default
+    stays byte-identical.  X CONTENT is identical either way -- the store
+    bytes are the store bytes; only the backing changes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import jax
+        jax.config.update("jax_enable_x64", True)
+        import jax.numpy as jnp
+        import tempfile
+        from pytc import xtc
+        from pytc.jastrow import rexp
+        cls._tmp = tempfile.TemporaryDirectory()
+        mol = gto.M(atom="C 0 0 0; O 0 0 1.128", basis="sto-6g", verbose=0)
+        cls.mf = scf.RHF(mol).density_fit()
+        cls.mf.run()
+        cls.jastrow = rexp.REXP()
+        cls.jastrow_params = {"alpha": jnp.array([0.5])}
+        cls.xtc_obj = xtc.XTC.from_pyscf(cls.mf, cls.jastrow, grid_lvl=1)
+        n_rank = cls.xtc_obj.n_orb * 12
+        import os
+        cls.store = os.path.join(cls._tmp.name, "isdf_test.h5")
+        cls.isdf_xtc = xtc.ISDFXTC.from_xtc(
+            cls.xtc_obj, n_rank=n_rank, save_path=cls.store)
+        cls.isdf_xtc = cls.isdf_xtc.isdf(cls.jastrow_params)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_subclass_suppresses_preload_parent_keeps_it(self):
+        import h5py
+        # Parent (materialized default): the preload fires, X becomes a host
+        # numpy array in the kernels dict.
+        cc_parent = jax_xtc_ccsd.RCCSD(self.mf, self.isdf_xtc,
+                                       self.jastrow_params,
+                                       on_the_fly_vvvv=True)
+        cc_parent.ao2mo()
+        x_parent = cc_parent.xtc_obj.isdf_kernels["X"]
+        self.assertIsInstance(x_parent, np.ndarray)
+
+        # Subclass (factorized): suppression holds, X stays store-backed.
+        cc_sub = isdf_xtc_ccsd.RCCSD(self.mf, self.isdf_xtc,
+                                     self.jastrow_params,
+                                     on_the_fly_vvvv=True)
+        cc_sub.ao2mo()
+        x_sub = cc_sub.xtc_obj.isdf_kernels["X"]
+        self.assertIsInstance(x_sub, h5py.Dataset)
+
+        # X CONTENT is identical either way (the ISDF fingerprint gate).
+        np.testing.assert_array_equal(np.asarray(x_parent),
+                                      np.asarray(x_sub[:]))
+
+
 if __name__ == "__main__":
     unittest.main()

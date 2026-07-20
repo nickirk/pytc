@@ -349,9 +349,14 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # _get_delta_u_direct_tile, which slices X per tile; if X is still an
         # HDF5 dataset, those slice reads happen on the main dispatch thread
         # and serialize issue_tile, preventing multi-GPU overlap.
+        # The materialized default preloads (a real optimization there); a
+        # class whose contraction reads X panel-wise from the store (e.g. the
+        # factorized subclass) suppresses it via `_preload_x_for_eris = False`
+        # rather than paying for a full host copy it never uses.
         _kernels = xtc_obj.isdf_kernels
         _X_kernel = _kernels.get('X') if _kernels is not None else None
-        if isinstance(_X_kernel, h5py.Dataset):
+        if (isinstance(_X_kernel, h5py.Dataset)
+                and getattr(cc, "_preload_x_for_eris", True)):
             _x_gb = _X_kernel.size * 8 / 1e9
             logger.info(
                 "Preloading X into RAM before large-block build (%.2f GB) ...",

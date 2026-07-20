@@ -30,6 +30,13 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
     factorized_virtual_panel = 32
     factorized_rcond = 1.0e-12
 
+    # The contraction reads X panel-wise from its store backing, so the
+    # materialized path's whole-X host preload (xtc_ccsd._make_xtc_eris) is
+    # pure waste on this class: at the 1200-orbital deck it is 247 GB of
+    # host RAM for a copy nothing reads.  The preload is suppressed by
+    # construction; the parent's materialized default is unchanged.
+    _preload_x_for_eris = False
+
     def _factorized_state(self):
         state = getattr(self, "_isdf_factorized_state", None)
         if state is not None:
