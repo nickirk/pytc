@@ -1053,6 +1053,29 @@ class ISDFTC(TC):
                 gpu_budget_bytes = 50 * (1024 ** 3)
         gpu_budget_bytes = max(int(gpu_budget_bytes), 1)
 
+        def _log_device_bytes(tag):
+            """Residency receipt: live device bytes at a build phase boundary.
+
+            Log-only -- the kmat budget model counts named buffers, and the
+            gap between its prediction and XLA reality is exactly what these
+            lines measure.
+            """
+            try:
+                stats = jax.devices()[0].memory_stats() or {}
+                logger.info(
+                    "  compute_kmat_kernels %s: bytes_in_use=%.2f GiB, "
+                    "peak_bytes_in_use=%.2f GiB, bytes_limit=%.2f GiB",
+                    tag,
+                    (stats.get("bytes_in_use") or 0) / (1024 ** 3),
+                    (stats.get("peak_bytes_in_use") or 0) / (1024 ** 3),
+                    (stats.get("bytes_limit") or 0) / (1024 ** 3),
+                )
+            except Exception:                                  # noqa: BLE001
+                logger.info("  compute_kmat_kernels %s: device bytes unavailable",
+                            tag)
+
+        _log_device_bytes("entry")
+
         # --- Per-device peak-memory model (bytes, float64) -------------------
         # Each line item maps to a specific tensor or transient inside the
         # shard_map'd K-kernel scan. Summed they give the "fixed" footprint
@@ -1341,6 +1364,7 @@ class ISDFTC(TC):
 
         K1_accum = _make_k_sharded_zeros((n_rank_padded, n_rank, 3))
         K3_accum = _make_k_sharded_zeros((n_rank_padded, n_rank))
+        _log_device_bytes("accumulators")
 
         n_r2_tiles = (n_grid + r2_tile_size - 1) // r2_tile_size
         n_r1_blocks = (n_grid + host_grid_block_size - 1) // host_grid_block_size
@@ -1355,6 +1379,7 @@ class ISDFTC(TC):
             sh_grid_r2 = _build_g_sharded(grid_r2_np, axis=0)
             sh_weights_r2 = _build_g_sharded(weights_r2_np, axis=0)
             sh_xi_phi_r2 = _build_g_sharded(xi_phi_r2_np, axis=1)
+            _log_device_bytes(f"r2 tile {j + 1}/{n_r2_tiles} loaded")
 
             for i, g_r1_0 in enumerate(range(0, n_grid, host_grid_block_size)):
                 g_r1_1 = min(g_r1_0 + host_grid_block_size, n_grid)
@@ -1390,6 +1415,7 @@ class ISDFTC(TC):
         # Strip k-axis padding (zero by construction).
         K1_kernel = K1_kernel_padded[:n_rank]
         K3_kernel = K3_kernel_padded[:n_rank]
+        _log_device_bytes("exit")
         return {'K1_kernel': jnp.asarray(K1_kernel),
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
@@ -1547,7 +1573,8 @@ class ISDFTC(TC):
         return L_aux_out
 	
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None):
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
+             r2_tile_size=None, gpu_budget_bytes=None):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1557,6 +1584,11 @@ class ISDFTC(TC):
             save_path: Optional path to save intermediates to HDF5.
             batch_size: Batch size for computation.
             host_grid_block_size: Block size for grid batching on host.
+            r2_tile_size: Optional r2 host-loop tile size for the K1/K3 build;
+                forwarded to compute_kmat_kernels (auto-sized from the budget
+                when None).
+            gpu_budget_bytes: Optional per-device memory budget override for
+                the K1/K3 tile solver (probed live when None).
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
@@ -1593,7 +1625,10 @@ class ISDFTC(TC):
         # 1. Compute K1_kernel and K3_kernel
         logger.info("  Computing K1 and K3 kernels...")
         
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size, host_grid_block_size=host_grid_block_size)
+        kernels = self.compute_kmat_kernels(jastrow_params, batch_size,
+                                            host_grid_block_size=host_grid_block_size,
+                                            r2_tile_size=r2_tile_size,
+                                            gpu_budget_bytes=gpu_budget_bytes)
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
         

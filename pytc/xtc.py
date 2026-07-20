@@ -1076,6 +1076,8 @@ class ISDFXTC(XTC, ISDFTC):
         host_grid_block_size=None,
         x_s_panel_blocks=1,
         d_reduce_group_blocks=1,
+        r2_tile_size=None,
+        gpu_budget_bytes=None,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1089,6 +1091,10 @@ class ISDFXTC(XTC, ISDFTC):
                 together per X-kernel grid pass.
             d_reduce_group_blocks: Group size multiplier for D-kernel grid
                 blocking (`D` effective host block = group * host_grid_block_size).
+            r2_tile_size: Optional r2 host-loop tile size for the K1/K3 build,
+                forwarded to compute_kmat_kernels (auto-sized when None).
+            gpu_budget_bytes: Optional per-device memory budget override for
+                the K1/K3 tile solver (probed live when None).
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -1097,7 +1103,9 @@ class ISDFXTC(XTC, ISDFTC):
         out_path = save_path if save_path else self.save_path
         
         # 1. Compute TC kernels (K1, K3, L_aux) using base class
-        isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size, host_grid_block_size=host_grid_block_size)
+        isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
+                               host_grid_block_size=host_grid_block_size,
+                               r2_tile_size=r2_tile_size, gpu_budget_bytes=gpu_budget_bytes)
         kernels = isdf_tc.isdf_kernels
         
         # 2. Compute Delta U kernels (D, X) with orbital batching
