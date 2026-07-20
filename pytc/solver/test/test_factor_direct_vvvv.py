@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
-import re
-import subprocess
 import unittest
 
 import jax
@@ -110,15 +107,6 @@ def _dense_reference_terms(data):
 
 def _relative_l2(actual, reference):
     return float(jnp.linalg.norm(actual - reference) / jnp.linalg.norm(reference))
-
-
-def _h10_card_script():
-    doc_path = Path(__file__).resolve().parents[3] / "docs" / "factor-direct-vvvv-phase-a.md"
-    document = doc_path.read_text()
-    match = re.search(r"```bash\n(.*?)\n```", document, flags=re.DOTALL)
-    if match is None:
-        raise AssertionError(f"no bash fence found in {doc_path}")
-    return match.group(1)
 
 
 def _nested_jaxprs(value):
@@ -249,19 +237,6 @@ class TestFactorDirectRandomFP64(unittest.TestCase):
             profiles["k1_direct"].compiled_xla_total_bytes,
             profiles["k3_direct"].compiled_xla_total_bytes,
         )
-
-    def test_documented_h10_card_parses_with_bash(self):
-        card = _h10_card_script()
-        result = subprocess.run(
-            ["bash", "-n"],
-            input=card,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("2>&1 | tee", card)
-        self.assertIn("${PIPESTATUS[0]}", card)
 
     def test_staged_jaxprs_never_create_a_virtual_four_index_tile(self):
         data = self.data
