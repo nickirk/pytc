@@ -222,6 +222,8 @@ def to_numpy(result):
 def fit_panelled_lsthc_jax(p_virtual, b, *, rcond: float, virtual_panel: int):
     """JAX FP64 normal-equation LS-THC fit, retaining the oracle's panels."""
     require_float64()
+    if not np.isfinite(rcond) or not 0.0 < float(rcond) <= 1.0:
+        raise ValueError(f"rcond must be in (0, 1]; got {rcond!r}")
     p = _as_fp64_jax("p_virtual", p_virtual, 2)
     b = _as_fp64_jax("b", b, 3)
     if b.shape[:2] != (p.shape[0], p.shape[0]):
@@ -238,7 +240,9 @@ def fit_panelled_lsthc_jax(p_virtual, b, *, rcond: float, virtual_panel: int):
     order = jnp.argsort(eigenvalues)[::-1]
     eigenvalues, eigenvectors = jnp.maximum(eigenvalues[order], 0.0), eigenvectors[:, order]
     singular_values = jnp.sqrt(eigenvalues)
-    floor = float(np.sqrt(np.finfo(np.float64).eps * p.shape[1]))
+    # Match the existing panelled oracle exactly.  This is a requested dense-C
+    # threshold, not a dimension-dependent policy decision for this dispatch.
+    floor = float(np.sqrt(np.finfo(np.float64).eps))
     threshold = max(float(rcond), floor) * singular_values[0]
     keep = singular_values > threshold
     inv = jnp.where(keep, 1.0 / jnp.where(eigenvalues > 0, eigenvalues, 1.0), 0.0)

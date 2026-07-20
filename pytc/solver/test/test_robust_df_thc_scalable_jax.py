@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pytc.solver.robust_df_thc_scalable_jax import (
     direct_df_sandwiches_panelled_jax,
@@ -21,3 +22,11 @@ def test_jax_fit_and_sandwich_match_panelled_oracle():
     oracle = direct_df_sandwiches_panelled(b, oracle_fit, t2, rank_panel=2, aux_panel=3)
     actual = direct_df_sandwiches_panelled_jax(b, jax_fit, t2, rank_panel=2, aux_panel=3)
     assert np.max(np.abs(oracle.robust - np.asarray(actual.robust))) < 1e-12
+
+
+@pytest.mark.parametrize("rcond", (0.0, -1.0, 1.1, np.nan, np.inf))
+def test_jax_fit_rejects_invalid_rcond(rcond):
+    p = np.eye(2)
+    b = np.ones((2, 2, 1))
+    with pytest.raises(ValueError, match="rcond"):
+        fit_panelled_lsthc_jax(p, b, rcond=rcond, virtual_panel=1)

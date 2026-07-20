@@ -56,7 +56,11 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
 
     def _contract_vvvv_t2(self, cc, t2_jax, eris, t2new_host):
         """Instance hook called by the inherited JAX update path; no VVVV tile."""
-        del cc, eris
+        del cc
+        if eris.vvvv is not None:
+            raise RuntimeError(
+                "factorized RCCSD refuses a materialized VVVV store; select "
+                "jax_xtc_ccsd.RCCSD for the legacy materialized route")
         tc, b, fit = self._factorized_state()
         rank_panel = min(self.factorized_rank_panel, fit.p_virtual.shape[1])
         aux_panel = min(self.factorized_aux_panel, b.shape[2])
