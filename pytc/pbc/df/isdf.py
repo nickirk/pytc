@@ -1028,7 +1028,8 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
 
 
 def apply_raw_kernel_and_solve(
-    Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=1e-4, self_paired=False
+    Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=None, self_paired=False,
+    n_retained_pin=None,
 ):
     """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel to
     eta^q over the spatial grid, contract to (Nip, Nip), and solve the
@@ -1119,7 +1120,9 @@ def apply_raw_kernel_and_solve(
     if self_paired:
         kern_q = kern_q.real.astype(np.complex128)
 
-    W_q_unscaled, solve_info = hermitian_sandwich_solve(Pi_q, kern_q, rtol=rtol)
+    W_q_unscaled, solve_info = hermitian_sandwich_solve(
+        Pi_q, kern_q, rtol=rtol, n_retained_pin=n_retained_pin
+    )
     # sqrt(Ng) rescale cancels kern_q's own 1/sqrt(Ng) (Eq. 10 factor placement).
     W_q = np.sqrt(n_grid) * W_q_unscaled
     return W_q, kern_q, solve_info
@@ -1229,12 +1232,14 @@ def precompute_coulG_all_q(cell, canonical_kpts, grid_mesh):
 
 @partial(jax.jit, static_argnames=("grid_mesh", "self_paired", "retention_mode"))
 def _fused_apply_kernel_and_solve_core(
-    Pi_q, eta_q, phase_q, coulG_scaled_q, grid_mesh, rtol, self_paired, retention_mode="single"
+    Pi_q, eta_q, phase_q, coulG_scaled_q, grid_mesh, rtol, self_paired,
+    retention_mode="single", n_retained_pin=-1
 ):
     """Fully fused single-jax.jit per-q hot path: phase-multiply -> raw
     kernel apply -> conjugate -> ZGEMM -> Hermitian sandwich solve, one XLA
     graph with no host round trips. Reachable only via a provider exposing
-    fused_apply_and_solve. See design doc §6."""
+    fused_apply_and_solve. See design doc §6. n_retained_pin is a traced
+    scalar forwarded to the solve core (K >= 0 pins, K < 0 disables)."""
     n_grid = eta_q.shape[1]
     lq = eta_q * phase_q[None, :]
     v_q = _raw_kernel_apply_core(lq, coulG_scaled_q, grid_mesh)
@@ -1248,12 +1253,13 @@ def _fused_apply_kernel_and_solve_core(
     (
         W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-    ) = _hermitian_sandwich_solve_core(Pi_q, kern_q, rtol, retention_mode)
+        s_first_discarded,
+    ) = _hermitian_sandwich_solve_core(Pi_q, kern_q, rtol, retention_mode, n_retained_pin)
 
     return (
         W, kern_q, n_retained, s_max, s_min_retained,
         pi_anti_hermitian_residual, v_anti_hermitian_residual,
-        retained_solve_residual, truncation_residual,
+        retained_solve_residual, truncation_residual, s_first_discarded,
     )
 
 
@@ -1299,14 +1305,15 @@ class RawKernelProvider:
         )
 
     def fused_apply_and_solve(
-        self, q_index, Pi_q, eta_q, phase_q, rtol, self_paired, retention_mode="single"
+        self, q_index, Pi_q, eta_q, phase_q, rtol, self_paired, retention_mode="single",
+        n_retained_pin=-1
     ):
         n_kpts = self.canonical_kpts.shape[0]
         if not (0 <= q_index < n_kpts):
             raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         return _fused_apply_kernel_and_solve_core(
             Pi_q, eta_q, phase_q, self.coulG_all[q_index], self.grid_mesh, rtol, self_paired,
-            retention_mode,
+            retention_mode, n_retained_pin,
         )
 
     def provenance(self):
@@ -1348,9 +1355,9 @@ def precompute_phase_all_q(grid_coords, canonical_kpts):
 
 
 def apply_kernel_and_solve_device(
-    provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=1e-4,
+    provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=None,
     retained_solve_residual_gate=1e-10, self_paired=False, retention_mode="single",
-    kern_blocking=None,
+    kern_blocking=None, n_retained_pin=None,
 ):
     """S4 pipeline glue, device-resident, provider-agnostic: phase multiply
     -> provider.apply -> conjugate -> ZGEMM -> device Hermitian sandwich
@@ -1366,7 +1373,8 @@ def apply_kernel_and_solve_device(
             exp(-1j * grid_coords @ canonical_kpts[q_index]); callers
             looping over q should precompute via precompute_phase_all_q.
             Exactly one of grid_coords/phase_q must be given.
-        rtol: forwarded to the device sandwich solve.
+        rtol: forwarded to the device sandwich solve; None means the 1e-4
+            default, and must be None when n_retained_pin is given.
         retained_solve_residual_gate: HARD host-side gate on
             solve_info["retained_solve_residual"]; also hard-fails on
             n_retained == 0 (the jitted solve cannot raise on traced
@@ -1376,6 +1384,10 @@ def apply_kernel_and_solve_device(
         retention_mode: "single" (default) or "pairwise" -- forwarded to
             hermitian_sandwich_solve_device / the fused core. See
             hermitian_sandwich_solve's docstring for the two modes.
+        n_retained_pin: optional int K in [1, Nip], "single" mode only;
+            retain exactly the K largest-eigenvalue modes of Pi_q
+            regardless of rtol (fixed effective rank; mutually exclusive
+            with rtol).
 
     Returns:
         (W_q, kern_q, solve_info): W_q (Nip, Nip) complex128 jax array;
@@ -1384,6 +1396,24 @@ def apply_kernel_and_solve_device(
     from pytc.df.solvers import _solve_info_from_core_output, hermitian_sandwich_solve_device
 
     n_ip, n_grid = eta_q.shape
+
+    if n_retained_pin is not None:
+        if retention_mode != "single":
+            raise ValueError("n_retained_pin is only supported for retention_mode='single'.")
+        if rtol is not None:
+            raise ValueError(
+                "n_retained_pin is mutually exclusive with rtol; leave rtol=None."
+            )
+        if isinstance(n_retained_pin, bool) or not isinstance(
+            n_retained_pin, (int, np.integer)
+        ):
+            raise ValueError(
+                f"n_retained_pin must be an integer in [1, {n_ip}], got {n_retained_pin!r}."
+            )
+        n_retained_pin = int(n_retained_pin)
+        if not 1 <= n_retained_pin <= n_ip:
+            raise ValueError(f"n_retained_pin must be in [1, {n_ip}], got {n_retained_pin}.")
+    rtol_eff = 1e-4 if rtol is None else rtol
 
     if phase_q is None and grid_coords is None:
         raise ValueError("apply_kernel_and_solve_device: give one of grid_coords/phase_q.")
@@ -1436,19 +1466,25 @@ def apply_kernel_and_solve_device(
                 self_paired=self_paired, **kern_blocking),
             dtype=jnp.complex128)
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
-            Pi_q_jnp, kern_q, rtol=rtol, retention_mode=retention_mode)
+            Pi_q_jnp, kern_q,
+            rtol=None if n_retained_pin is not None else rtol_eff,
+            retention_mode=retention_mode, n_retained_pin=n_retained_pin)
     elif (fused := getattr(provider, "fused_apply_and_solve", None)) is not None:
         (
             W_q_unscaled, kern_q, n_retained, s_max, s_min_retained,
             pi_anti_hermitian_residual, v_anti_hermitian_residual,
-            retained_solve_residual, truncation_residual,
-        ) = fused(q_index, Pi_q_jnp, eta_q_jnp, phase, rtol, self_paired, retention_mode)
+            retained_solve_residual, truncation_residual, s_first_discarded,
+        ) = fused(q_index, Pi_q_jnp, eta_q_jnp, phase, rtol_eff, self_paired, retention_mode,
+                  n_retained_pin if n_retained_pin is not None else -1)
 
         solve_info = _solve_info_from_core_output(
             n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
             v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-            n_ip, W_q_unscaled.dtype, rtol, caller="apply_kernel_and_solve_device[fused]",
+            s_first_discarded, n_ip, W_q_unscaled.dtype,
+            None if n_retained_pin is not None else rtol_eff,
+            caller="apply_kernel_and_solve_device[fused]",
             retention_mode=retention_mode,
+            n_retained_pin=n_retained_pin,
         )
     else:
         lq = eta_q_jnp * phase[None, :]
@@ -1461,7 +1497,9 @@ def apply_kernel_and_solve_device(
             kern_q = kern_q.real.astype(jnp.complex128)
 
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
-            Pi_q_jnp, kern_q, rtol=rtol, retention_mode=retention_mode
+            Pi_q_jnp, kern_q,
+            rtol=None if n_retained_pin is not None else rtol_eff,
+            retention_mode=retention_mode, n_retained_pin=n_retained_pin,
         )
 
     # Host-side gate: the jitted solve cannot raise on a traced value, so
@@ -1470,7 +1508,7 @@ def apply_kernel_and_solve_device(
         raise ValueError(
             f"apply_kernel_and_solve_device: q_index={q_index} retained ZERO modes of "
             f"Pi_q in the device sandwich solve (Pi_q is non-PSD, the zero matrix, or "
-            f"rtol={rtol} is too large) -- W_q would be silently zero; refusing to "
+            f"rtol={rtol_eff} is too large) -- W_q would be silently zero; refusing to "
             f"proceed. Validate Pi_q against the NumPy oracle (hermitian_sandwich_solve) "
             f"for a precise diagnosis."
         )
@@ -1540,9 +1578,9 @@ def build_kern_q_blocked(provider, q_index, eta_q, phase, *, staging_root,
             pass
 
 
-def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4,
+def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
                            retained_solve_residual_gate=1e-10, retention_mode="single",
-                           kern_blocking=None):
+                           kern_blocking=None, n_retained_pin=None):
     """S4 orchestration: build coul_kpt (Nk, Nip, Nip) with one
     apply_kernel_and_solve_device call per unique {q, neg[q]} pair; the
     partner is set by exact conjugation (W[neg[q]] = conj(W[q]),
@@ -1556,6 +1594,11 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
         eta: (Nk, Nip, Ng) complex128.
         grid_coords: (Ng, 3).
         mesh_obj: KptsMesh (uses .neg, .n_kpts).
+        rtol: forwarded to apply_kernel_and_solve_device; None means the
+            1e-4 default, and must be None when n_retained_pin is given.
+        n_retained_pin: optional int K or length-Nk sequence of ints,
+            forwarded per-q to apply_kernel_and_solve_device; a q solved
+            via the conjugate shortcut inherits its partner's pin.
 
     Returns:
         (coul_kpt, kern_kpt, infos, n_pipeline_calls): (Nk, Nip, Nip) jax
@@ -1569,6 +1612,18 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
         raise ValueError(f"Pi.shape[0]={Pi.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
     if eta.shape[0] != n_kpts:
         raise ValueError(f"eta.shape[0]={eta.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
+
+    if n_retained_pin is None:
+        pin_per_q = None
+    elif isinstance(n_retained_pin, (list, tuple, np.ndarray)):
+        if len(n_retained_pin) != n_kpts:
+            raise ValueError(
+                f"n_retained_pin sequence must have length {n_kpts}, got "
+                f"{len(n_retained_pin)}."
+            )
+        pin_per_q = list(n_retained_pin)
+    else:
+        pin_per_q = [n_retained_pin] * n_kpts
 
     # Precompute every q's Bloch phase once: per-q constant within one build.
     phase_all = precompute_phase_all_q(grid_coords, mesh_obj.canonical_kpts)
@@ -1589,6 +1644,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=1e-4
             retained_solve_residual_gate=retained_solve_residual_gate,
             self_paired=(nq == q), retention_mode=retention_mode,
             kern_blocking=kern_blocking,
+            n_retained_pin=None if pin_per_q is None else pin_per_q[q],
         )
         coul_kpt[q] = W_q
         kern_kpt[q] = kern_q

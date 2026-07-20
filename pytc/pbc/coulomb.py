@@ -50,7 +50,7 @@ from pytc.pbc.df.reciprocal_ao_pilot import (
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
 
-def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
+def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode="jax_cached_matrix_free",
           selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
           selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
@@ -58,7 +58,8 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
           process_pipeline_allowance_bytes=None, bpc_batch_size=16,
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
-          stage_eta_root=None, stage_eta_block=4096, kern_blocking=None):
+          stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
+          n_retained_pin=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -66,10 +67,15 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         kpts: (Nk,3) absolute k-points (canonicalized internally).
         rank: requested interpolation-point rank.
         block_size: grid points per streamed AO block.
+        rtol: forwarded to the S4 Hermitian sandwich solve; None means the
+            1e-4 default, and must be None when n_retained_pin is given.
         retention_mode: "single" or "pairwise" -- forwarded to the S4
             Hermitian sandwich solve. See hermitian_sandwich_solve's
             docstring (pytc/df/solvers.py) for the two modes.
         provider_cls: KernelProvider for S4 (default RawKernelProvider).
+        n_retained_pin: optional int K or length-Nk sequence, forwarded
+            per-q to the S4 solve (fixed effective rank; mutually
+            exclusive with rtol).
 
     Returns:
         dict: mesh_obj (KptsMesh), inpv_kpt (Nk,Nip,Nao) complex128,
@@ -394,6 +400,7 @@ def build(cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
         coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
             provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
             retention_mode=retention_mode, kern_blocking=kern_blocking,
+            n_retained_pin=n_retained_pin,
         )
     finally:
         # Never strand the staging file, on success or failure.
@@ -788,11 +795,12 @@ class ISDFDF:
         rank, block_size, rtol, retention_mode: forwarded to build().
     """
 
-    def __init__(self, cell, kpts, *, rank, block_size, rtol=1e-4, retention_mode="single",
+    def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                  selection_mode="streamed", fixed_pivots=None, bpc_batch_size=16,
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
-                 stage_eta_root=None, stage_eta_block=4096, kern_blocking=None):
+                 stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
+                 n_retained_pin=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -809,6 +817,7 @@ class ISDFDF:
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
         self.kern_blocking = kern_blocking
+        self.n_retained_pin = n_retained_pin
         self._built = None
         self._ao2mo_call_count = 0
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
@@ -840,6 +849,7 @@ class ISDFDF:
                 stage_eta_root=self.stage_eta_root,
                 stage_eta_block=self.stage_eta_block,
                 kern_blocking=self.kern_blocking,
+                n_retained_pin=self.n_retained_pin,
             )
         return self._built
 

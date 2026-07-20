@@ -292,11 +292,14 @@ _RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR = 10.0
 _RETENTION_MARGINAL_COND_THRESHOLD = 1e3
 
 
-def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller):
+def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller,
+                              s_first_discarded=None, pinned=False):
     """Warn loudly when a solve's retained subspace is near the danger
     regime: flagged when the smallest retained eigenvalue is within 10x of
-    the rtol*s_max cutoff AND the retained condition number exceeds 1e3.
-    See design doc §5.
+    the retention cutoff AND the retained condition number exceeds 1e3.
+    The cutoff is rtol*s_max, or -- when pinned -- the first discarded
+    eigenvalue s_{K+1} (the spectral gap at the pin); a pinned solve with
+    nothing discarded has no edge and cannot be marginal. See design doc §5.
 
     Returns:
         (retention_marginal, cond_pi): cond_pi is None when
@@ -305,10 +308,29 @@ def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller)
     if s_min_retained is None or s_min_retained <= 0.0:
         return False, None
     cond_pi = s_max / s_min_retained
-    near_cutoff = s_min_retained < _RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR * threshold
+    if pinned:
+        if s_first_discarded is None or s_first_discarded <= 0.0:
+            return False, cond_pi
+        near_cutoff = (
+            s_min_retained < _RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR * s_first_discarded
+        )
+    else:
+        near_cutoff = (
+            s_min_retained < _RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR * threshold
+        )
     high_cond = cond_pi > _RETENTION_MARGINAL_COND_THRESHOLD
     marginal = bool(near_cutoff and high_cond)
-    if marginal:
+    if marginal and pinned:
+        logger.warning(
+            f"{caller}: retention_marginal -- pinned retention edge "
+            f"s_K={s_min_retained:.3e} is within "
+            f"{_RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR:.0f}x of the first discarded "
+            f"eigenvalue s_(K+1)={s_first_discarded:.3e} (a narrow spectral gap at "
+            f"the pin), and the retained subspace's condition number ({cond_pi:.3e}) "
+            f"exceeds {_RETENTION_MARGINAL_COND_THRESHOLD:.0e} -- the pin sits in a "
+            f"dense, ill-conditioned region of the spectrum."
+        )
+    elif marginal:
         logger.warning(
             f"{caller}: retention_marginal -- smallest retained eigenvalue "
             f"{s_min_retained:.3e} is within {_RETENTION_MARGINAL_NEAR_CUTOFF_FACTOR:.0f}x "
@@ -324,17 +346,23 @@ def _check_retention_marginal(s_max, s_min_retained, threshold, rtol, *, caller)
 def _solve_info_from_core_output(
     n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
     v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-    n, dtype, rtol, *, caller, retention_mode="single",
+    s_first_discarded, n, dtype, rtol, *, caller, retention_mode="single",
+    n_retained_pin=None,
 ):
     """Build the device-solve info dict from _hermitian_sandwich_solve_core's
     raw (traced) return values. Shared by hermitian_sandwich_solve_device and
-    apply_kernel_and_solve_device's fused path -- both wrap the same core."""
+    apply_kernel_and_solve_device's fused path -- both wrap the same core.
+    rtol is None exactly when n_retained_pin is set (mutually exclusive)."""
     n_retained_i = int(n_retained)
     s_max_f = float(s_max)
     s_min_retained_f = None if n_retained_i == 0 else float(s_min_retained)
-    threshold = rtol * s_max_f
+    s_first_discarded_f = None
+    if n_retained_pin is not None and n_retained_pin < n:
+        s_first_discarded_f = float(s_first_discarded)
+    threshold = None if rtol is None else rtol * s_max_f
     retention_marginal, cond_pi = _check_retention_marginal(
-        s_max_f, s_min_retained_f, threshold, rtol, caller=caller
+        s_max_f, s_min_retained_f, threshold, rtol, caller=caller,
+        s_first_discarded=s_first_discarded_f, pinned=n_retained_pin is not None,
     )
     return {
         "n_retained": n_retained_i,
@@ -349,6 +377,7 @@ def _solve_info_from_core_output(
         "retention_mode": retention_mode,
         "adaptive_retention_used": False,
         "target_truncation_residual": None,
+        "n_retained_pin": n_retained_pin,
         "retention_marginal": retention_marginal,
         "cond_pi_retained": cond_pi,
         "dtype": str(dtype),
@@ -357,7 +386,8 @@ def _solve_info_from_core_output(
 
 
 def hermitian_sandwich_solve(
-    Pi, V, *, rtol=1e-4, retention_mode="single", target_truncation_residual=None
+    Pi, V, *, rtol=None, retention_mode="single", target_truncation_residual=None,
+    n_retained_pin=None,
 ):
     """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V via a
     truncated pseudo-inverse of Pi. Pi and V are Hermitized on entry;
@@ -395,19 +425,25 @@ def hermitian_sandwich_solve(
     Args:
         Pi: (n,n), Hermitian PSD expected.
         V: (n,n).
-        rtol: relative spectral retention threshold (default 1e-4;
-            design doc §5 -- 1e-8 was far too loose at over-complete rank).
+        rtol: relative spectral retention threshold; None means the 1e-4
+            default (design doc §5 -- 1e-8 was far too loose at
+            over-complete rank). Must be None when n_retained_pin is given.
         retention_mode: "single" or "pairwise".
         target_truncation_residual: optional, "single" mode only; if
             given, additional modes are retained (decreasing eigenvalue
             order) until the truncation residual meets this target or
             all n modes are retained (adaptive_retention_used=True).
+        n_retained_pin: optional int K in [1, n], "single" mode only;
+            retain exactly the K largest-eigenvalue modes regardless of
+            rtol. Mutually exclusive with rtol/target_truncation_residual
+            (both must be left None).
 
     Returns:
         (W, info): info keys are n_retained, n_discarded, s_max,
         s_min_retained (None if n_retained==0), pi/v_anti_hermitian_residual,
-        retained_solve_residual, truncation_residual, rtol, retention_mode,
-        adaptive_retention_used, target_truncation_residual,
+        retained_solve_residual, truncation_residual, rtol (None when
+        pinned), retention_mode, adaptive_retention_used,
+        target_truncation_residual, n_retained_pin,
         retention_marginal, cond_pi_retained, dtype, backend ("numpy").
     """
     Pi = np.asarray(Pi)
@@ -422,16 +458,40 @@ def hermitian_sandwich_solve(
     if not np.all(np.isfinite(Pi)) or not np.all(np.isfinite(V)):
         raise ValueError("Pi and V must be finite.")
 
-    if isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
-        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
-    rtol = float(rtol)
-    if not np.isfinite(rtol) or rtol <= 0.0:
-        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
-
     if retention_mode not in ("single", "pairwise", "svd_lstsq"):
         raise ValueError(
             f"retention_mode must be 'single', 'pairwise', or 'svd_lstsq', got {retention_mode!r}."
         )
+    if n_retained_pin is not None:
+        if retention_mode != "single":
+            raise ValueError("n_retained_pin is only supported for retention_mode='single'.")
+        if rtol is not None:
+            raise ValueError(
+                "n_retained_pin is mutually exclusive with rtol; leave rtol=None."
+            )
+        if target_truncation_residual is not None:
+            raise ValueError(
+                "n_retained_pin is mutually exclusive with target_truncation_residual."
+            )
+        if isinstance(n_retained_pin, bool) or not isinstance(
+            n_retained_pin, (int, np.integer)
+        ):
+            raise ValueError(
+                f"n_retained_pin must be an integer in [1, {n}], got {n_retained_pin!r}."
+            )
+        n_retained_pin = int(n_retained_pin)
+        if not 1 <= n_retained_pin <= n:
+            raise ValueError(f"n_retained_pin must be in [1, {n}], got {n_retained_pin}.")
+    if rtol is None:
+        rtol_eff = 1e-4
+    else:
+        if isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
+            raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+        rtol_eff = float(rtol)
+        if not np.isfinite(rtol_eff) or rtol_eff <= 0.0:
+            raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+    rtol = None if n_retained_pin is not None else rtol_eff
+
     if retention_mode != "single" and target_truncation_residual is not None:
         raise ValueError("target_truncation_residual is only supported for retention_mode='single'.")
 
@@ -475,9 +535,10 @@ def hermitian_sandwich_solve(
             "Pi's largest eigenvalue is non-positive after Hermitization -- Pi does "
             "not appear to be PSD (or is the zero matrix)."
         )
-    threshold = rtol * s_max
+    threshold = rtol_eff * s_max
     v_norm = max(float(np.linalg.norm(V_herm)), tiny)
     adaptive_retention_used = False
+    s_first_discarded = None
 
     if retention_mode == "svd_lstsq":
         # fftisdf's literal lstsq formula: SVD (not eigh), rtol used as an
@@ -546,7 +607,10 @@ def hermitian_sandwich_solve(
             retained_solve_residual = 0.0
             truncation_residual = 1.0
     else:
-        n_retained = int(np.sum(eigvals > threshold))
+        if n_retained_pin is not None:
+            n_retained = n_retained_pin
+        else:
+            n_retained = int(np.sum(eigvals > threshold))
 
         def _truncation_residual(k):
             U_r = eigvecs[:, :k]
@@ -564,6 +628,8 @@ def hermitian_sandwich_solve(
         U_r = eigvecs[:, :n_retained]
         sigma_r = eigvals[:n_retained]
         s_min_retained = float(np.min(sigma_r)) if n_retained > 0 else None
+        if n_retained_pin is not None and n_retained < n:
+            s_first_discarded = float(eigvals[n_retained])
 
         if n_retained > 0:
             Pi_pinv_r = U_r @ np.diag(1.0 / sigma_r) @ U_r.conj().T
@@ -582,7 +648,8 @@ def hermitian_sandwich_solve(
             truncation_residual = 1.0
 
     retention_marginal, cond_pi = _check_retention_marginal(
-        s_max, s_min_retained, threshold, rtol, caller="hermitian_sandwich_solve"
+        s_max, s_min_retained, threshold, rtol, caller="hermitian_sandwich_solve",
+        s_first_discarded=s_first_discarded, pinned=n_retained_pin is not None,
     )
 
     info = {
@@ -598,6 +665,7 @@ def hermitian_sandwich_solve(
         "retention_mode": retention_mode,
         "adaptive_retention_used": adaptive_retention_used,
         "target_truncation_residual": target_truncation_residual,
+        "n_retained_pin": n_retained_pin,
         "retention_marginal": retention_marginal,
         "cond_pi_retained": cond_pi,
         "dtype": str(W.dtype),
@@ -607,7 +675,7 @@ def hermitian_sandwich_solve(
 
 
 @partial(jax.jit, static_argnames=("retention_mode",))
-def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single"):
+def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single", n_retained_pin=-1):
     """Fixed-shape, jitted, device-resident core of
     hermitian_sandwich_solve_device (design v2.1 sections 5+6/7).
     Reproduces hermitian_sandwich_solve's math exactly (both retention
@@ -616,6 +684,10 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single"):
     eigenbasis rather than a dynamic-size slice, which is required for a
     static-shape jax.jit graph -- masked-out modes/pairs contribute
     exactly 0, which is mathematically identical to slicing them away.
+
+    n_retained_pin: traced scalar, "single" mode only. K >= 0 retains the
+    top-K eigenmodes via a positional mask (eigenvalues are sorted
+    descending); K < 0 disables the pin (rtol thresholding applies).
     """
     n = Pi.shape[0]
     dtype = jnp.result_type(Pi.dtype, V.dtype, jnp.complex128)
@@ -638,6 +710,7 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single"):
     s_max = eigvals[0]
     threshold = rtol * s_max
     v_norm = jnp.maximum(jnp.linalg.norm(V_herm), tiny)
+    s_first_discarded = jnp.zeros((), dtype)
 
     if retention_mode == "svd_lstsq":
         # fftisdf's literal lstsq formula: SVD (not eigh), rtol used as an
@@ -699,9 +772,14 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single"):
         truncation_mass = jnp.where(pair_mask, 0.0, M)
         truncation_residual_full = jnp.linalg.norm(truncation_mass) / v_norm
     else:
-        mask = eigvals > threshold
+        K = n_retained_pin
+        pin_mask = jnp.arange(n) < jnp.maximum(K, 0)
+        mask = jnp.where(K >= 0, pin_mask, eigvals > threshold)
         n_retained = jnp.sum(mask)
         has_retained = n_retained > 0
+        s_first_discarded = jnp.where(
+            (K >= 0) & (K < n), eigvals[jnp.clip(K, 0, n - 1)], 0.0
+        )
 
         safe_eigvals = jnp.where(mask, eigvals, 1.0)
         inv_eigvals = jnp.where(mask, 1.0 / safe_eigvals, 0.0)
@@ -727,10 +805,12 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single"):
     return (
         W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
+        s_first_discarded,
     )
 
 
-def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4, retention_mode="single"):
+def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single",
+                                    n_retained_pin=None):
     """Device (JAX, fixed-shape, jitted) counterpart of
     hermitian_sandwich_solve. See design doc §5-§7.
 
@@ -740,6 +820,12 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4, retention_mode="single"
         instead of raising.
       - No adaptive-retention mode (variable iteration count does not fit
         a fixed-shape jitted graph).
+
+    rtol: None means the 1e-4 default; must be None when n_retained_pin is
+    given. n_retained_pin: optional int K in [1, n], "single" mode only --
+    retain exactly the K largest-eigenvalue modes (positional mask inside
+    the jitted core; K is a traced scalar, so changing K does not
+    recompile). Mutually exclusive with rtol.
 
     Returns:
         (W, info): W is (n,n) complex128 jax array; info has the same
@@ -757,15 +843,34 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4, retention_mode="single"
         raise ValueError(f"V must have shape {(n, n)} matching Pi, got {V_np.shape}.")
     if not np.all(np.isfinite(Pi_np)) or not np.all(np.isfinite(V_np)):
         raise ValueError("Pi and V must be finite.")
-    if isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
-        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
-    rtol = float(rtol)
-    if not np.isfinite(rtol) or rtol <= 0.0:
-        raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
     if retention_mode not in ("single", "pairwise", "svd_lstsq"):
         raise ValueError(
             f"retention_mode must be 'single', 'pairwise', or 'svd_lstsq', got {retention_mode!r}."
         )
+    if n_retained_pin is not None:
+        if retention_mode != "single":
+            raise ValueError("n_retained_pin is only supported for retention_mode='single'.")
+        if rtol is not None:
+            raise ValueError(
+                "n_retained_pin is mutually exclusive with rtol; leave rtol=None."
+            )
+        if isinstance(n_retained_pin, bool) or not isinstance(
+            n_retained_pin, (int, np.integer)
+        ):
+            raise ValueError(
+                f"n_retained_pin must be an integer in [1, {n}], got {n_retained_pin!r}."
+            )
+        n_retained_pin = int(n_retained_pin)
+        if not 1 <= n_retained_pin <= n:
+            raise ValueError(f"n_retained_pin must be in [1, {n}], got {n_retained_pin}.")
+    if rtol is None:
+        rtol_eff = 1e-4
+    else:
+        if isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
+            raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+        rtol_eff = float(rtol)
+        if not np.isfinite(rtol_eff) or rtol_eff <= 0.0:
+            raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
 
     Pi_jnp = jnp.asarray(Pi_np, dtype=jnp.complex128)
     V_jnp = jnp.asarray(V_np, dtype=jnp.complex128)
@@ -789,12 +894,19 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=1e-4, retention_mode="single"
     (
         W, n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-    ) = _hermitian_sandwich_solve_core(Pi_jnp, V_jnp, rtol, retention_mode)
+        s_first_discarded,
+    ) = _hermitian_sandwich_solve_core(
+        Pi_jnp, V_jnp, rtol_eff, retention_mode,
+        n_retained_pin if n_retained_pin is not None else -1,
+    )
 
     info = _solve_info_from_core_output(
         n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
         v_anti_hermitian_residual, retained_solve_residual, truncation_residual,
-        n, W.dtype, rtol, caller="hermitian_sandwich_solve_device",
+        s_first_discarded, n, W.dtype,
+        None if n_retained_pin is not None else rtol_eff,
+        caller="hermitian_sandwich_solve_device",
         retention_mode=retention_mode,
+        n_retained_pin=n_retained_pin,
     )
     return W, info
