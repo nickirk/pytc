@@ -1,9 +1,11 @@
 """Phase-B robust DF/THC algebra oracle.
 
 This module is deliberately standalone.  It models the *ordinary Coulomb*
-virtual-virtual DF contribution only; it has no call site in the production
-CCSD path and does not change any default, solver route, or chemistry
-tolerance.
+virtual-virtual DF contribution only; except for
+``extract_metric_applied_vv_df_factor`` -- consumed by
+``isdf_xtc_ccsd.RCCSD`` when building its factorized state -- it has no call
+site in the production CCSD path and does not change any default, solver
+route, or chemistry tolerance.
 
 PyTC's source factor is ``B[a, c, Q] = (a c | Q)``.  A scalar ISDF
 collocation matrix is formed in exactly the same flattened virtual-pair order,
@@ -39,6 +41,58 @@ def _as_fp64(name: str, value: object, ndim: int) -> Float64Array:
     if array.dtype != np.dtype(np.float64):
         raise ValueError(f"{name} must be real float64; got {array.dtype}")
     return array
+
+
+def extract_metric_applied_vv_df_factor(
+    with_df: object,
+    mo_coeff: object,
+    nocc: int,
+) -> Float64Array:
+    """Extract PySCF's metric-applied virtual DF factor in PyTC order.
+
+    Consumed by :class:`pytc.solver.isdf_xtc_ccsd.RCCSD` when it builds its
+    factorized state.  The extraction mirrors PyTC's DF construction exactly:
+    ``with_df.loop()`` supplies PySCF's metric-applied cderi blocks,
+    ``_ao2mo.nr_e2`` transforms them to the MO basis, the virtual block is
+    packed into the same ``vvL[(ac),Q]`` layout, and
+    ``lib.unpack_tril(..., axis=0)`` restores ``B[a,c,Q]``.
+
+    ``nocc`` is explicit because the orbital-space partition must not be
+    guessed from an occupation threshold.
+    """
+
+    raw_mo = np.asarray(mo_coeff)
+    if np.iscomplexobj(raw_mo):
+        raise ValueError("mo_coeff must be real; complex coefficients are not supported")
+
+    try:
+        from pyscf import lib
+        from pyscf.ao2mo import _ao2mo
+    except ImportError as exc:  # pragma: no cover - exercised by physical card
+        raise RuntimeError("PySCF is required for physical DF-factor extraction") from exc
+
+    mo = np.asarray(raw_mo, dtype=np.float64, order="F")
+    if mo.ndim != 2 or mo.shape[0] < 1 or mo.shape[1] < 2:
+        raise ValueError(f"mo_coeff must be a nonempty AO-by-MO matrix; got {mo.shape}")
+    nmo = mo.shape[1]
+    nocc = int(nocc)
+    if not 0 < nocc < nmo:
+        raise ValueError(f"nocc must leave a nonempty virtual space; got {nocc} for nmo={nmo}")
+    if not hasattr(with_df, "loop"):
+        raise ValueError("with_df must expose the PySCF metric-applied loop() API")
+
+    vv_l_blocks: list[Float64Array] = []
+    ijslice = (0, nmo, 0, nmo)
+    l_pq = None
+    for eri1 in with_df.loop():
+        l_pq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym="s2", mosym="s1", out=l_pq)
+        l_pq = np.asarray(l_pq, dtype=np.float64).reshape(-1, nmo, nmo)
+        vv_l_blocks.append(lib.pack_tril(l_pq[:, nocc:, nocc:]))
+    if not vv_l_blocks:
+        raise ValueError("with_df.loop() yielded no metric-applied cderi blocks")
+
+    vv_l = np.concatenate(vv_l_blocks, axis=0).T
+    return np.asarray(lib.unpack_tril(vv_l, axis=0), dtype=np.float64)
 
 
 def virtual_pair_df_matrix(l_vv: object) -> Float64Array:
