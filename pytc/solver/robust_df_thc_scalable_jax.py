@@ -1,32 +1,7 @@
-"""JAX/GPU port of the panelled robust-DF/THC Coulomb sandwich (task #46, Phase E).
+"""JAX FP64 port of the panelled robust-DF/THC Coulomb sandwich.
 
-WHY: at QZ the NumPy original is 783 s = 98.1% of arm-2's contraction cost
-(JID 18874875), which is why factor-direct is 16.84x faster per cycle yet 2.31x
-slower end-to-end. Porting it is the lever that converts the contraction win into
-an end-to-end win.
-
-WHAT THIS IS NOT: a rewrite. The NumPy module is the immovable parity oracle and
-stays untouched (Felix, msg bd7e6ea3). This file mirrors it kernel-for-kernel and
-panel-for-panel.
-
-PANELLING IS PRESERVED DELIBERATELY (Felix ruling, msg 435b7557). #46 isolates
-exactly ONE variable: NumPy -> JAX. Panel size is a blocking parameter and blocking
-is a fairness axis (gate 3), so a port that also changed effective panelling would
-make the rerun measure two things at once -- the same trap class as matched-blk in
-task #44. "Does different panelling go faster on 181 GB HBM" is a legitimate
-SEPARATE question with its own ledger; it is not this file's job.
-
-Consequences of that choice, stated so nobody reads them as oversights:
-  - the Python-level panel loops are retained rather than fused into one big
-    einsum. They are the structure under test.
-  - each panel's einsum is jitted; the loop itself is not unrolled into a scan,
-    because a scan would change the blocking the ledger reports.
-  - float64 is enforced. JAX defaults to float32 and would silently produce a
-    ~1e-7 "parity" result that looks plausible and is wrong -- exactly the
-    silent-wrong class this campaign keeps hitting. See require_float64().
-
-Parity target: ~1e-12 vs the NumPy oracle on CPU AND GPU, including the task-35
-panel-boundary adversarial cases, BEFORE any timing claim.
+The NumPy implementation remains the parity oracle. Panel loops and panel sizes
+are deliberately preserved so this module changes backend only.
 """
 
 from __future__ import annotations
