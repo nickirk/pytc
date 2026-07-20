@@ -10,7 +10,7 @@
 
 **Py**thon **T**rans**C**orrelation package
 
-PyTC is an open-source Python toolkit for transcorrelated electronic-structure calculations, combining JAX-accelerated Jastrow optimization, transcorrelated integral construction, scalable ISDF, and xTC-CCSD solvers with PySCF interoperability.
+PyTC is an open-source Python toolkit for transcorrelated electronic-structure calculations, combining JAX-accelerated Jastrow optimization, transcorrelated integral construction, scalable ISDF, and an xTC-CCSD solver with PySCF interoperability.
 
 Documentation: https://nickirk.github.io/pytc/
 
