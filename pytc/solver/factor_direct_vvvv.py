@@ -20,6 +20,7 @@ from typing import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 Array = jax.Array
@@ -638,6 +639,274 @@ def compiled_partial_x_right_memory(
         rank_panel_size=rank_panel_size,
     ).compile()
     return _compiled_memory_from_executable(executable)
+
+
+# ---------------------------------------------------------------------------
+# Streamed-X contraction (bounded device memory)
+#
+# ``contract_partial_x_*_t2`` device-lift the whole X factor before the panel
+# loop, which is impossible beyond a few hundred virtual orbitals.  The
+# streamed variants below keep X on its host/HDF5 backing and device_put one
+# rank panel at a time; the per-panel kernels reproduce the full-lift math
+# term for term, with the rank-panel loop hoisted to the host.  Peak device X
+# is one panel ``(nvir, nvir, rank_panel_size)``, never the full block.
+
+
+def _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size):
+    """Read one X rank panel from any backing (ndarray view or HDF5 dataset).
+
+    Returns a fresh ``(nvir, nvir, panel_size)`` float64 host array, zero-
+    padded on the rank axis when the tail panel is short so every panel
+    shares one compiled shape.  Only the requested panel is materialized --
+    slicing an HDF5 dataset reads just that selection.
+    """
+    panel = np.asarray(x_backing[nocc:, nocc:, m0:m1], dtype=np.float64)
+    short = panel_size - panel.shape[2]
+    if short:
+        panel = np.pad(panel, ((0, 0), (0, 0), (0, short)))
+    return panel
+
+
+def _validate_x_stream(t2, left_out, left_inner, x_backing, nocc):
+    _validate_t2(t2)
+    nvir = t2.shape[2]
+    if left_out.ndim != 2 or left_inner.shape != left_out.shape:
+        raise ValueError("left_out and left_inner must both have shape (nvir, rank)")
+    if left_out.shape[0] != nvir:
+        raise ValueError(f"X factors have nvir={left_out.shape[0]}, expected {nvir}")
+    rank = left_out.shape[1]
+    if getattr(x_backing, "ndim", None) != 3:
+        raise ValueError(
+            "x_backing must be a 3-D (nmo, nmo, rank) array or HDF5 dataset; "
+            f"got shape {getattr(x_backing, 'shape', None)}")
+    expected = (nvir + int(nocc), nvir + int(nocc), rank)
+    if tuple(x_backing.shape) != expected:
+        raise ValueError(f"x_backing must have shape {expected}; got {x_backing.shape}")
+    if not 0 < int(nocc) < x_backing.shape[0]:
+        raise ValueError(f"nocc must leave a nonempty virtual space; got {nocc}")
+
+
+@partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
+def _xstream_left_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
+                            occupied_pair_batch_size):
+    """One rank panel's contribution to ``P[a,m] P[c,m] X[b,d,m]``."""
+
+    n_padded_pairs, nvir, _ = t2_pairs.shape
+    n_pair_blocks = n_padded_pairs // occupied_pair_batch_size
+
+    def pair_body(pair_block, out_acc):
+        pair0 = pair_block * occupied_pair_batch_size
+        tau_block = jax.lax.dynamic_slice(
+            t2_pairs, (pair0, 0, 0),
+            (occupied_pair_batch_size, nvir, nvir))
+        # S[n,d,mu] = sum_c tau[n,c,d] P[c,mu]
+        s = jnp.einsum("ncd,cm->ndm", tau_block, inner_panel)
+        # Y[n,b,mu] = sum_d S[n,d,mu] X[b,d,mu]
+        y = jnp.einsum("ndm,bdm->nbm", s, x_panel)
+        out_block = jnp.einsum("am,nbm->nab", out_panel, y)
+        return jax.lax.dynamic_update_slice(out_acc, out_block, (pair0, 0, 0))
+
+    return jax.lax.fori_loop(
+        0, n_pair_blocks, pair_body, jnp.zeros_like(t2_pairs))
+
+
+@partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
+def _xstream_right_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
+                             occupied_pair_batch_size):
+    """One rank panel's contribution to ``X[a,c,m] P[b,m] P[d,m]``."""
+
+    n_padded_pairs, nvir, _ = t2_pairs.shape
+    n_pair_blocks = n_padded_pairs // occupied_pair_batch_size
+
+    def pair_body(pair_block, out_acc):
+        pair0 = pair_block * occupied_pair_batch_size
+        tau_block = jax.lax.dynamic_slice(
+            t2_pairs, (pair0, 0, 0),
+            (occupied_pair_batch_size, nvir, nvir))
+        # S[n,c,mu] = sum_d tau[n,c,d] P[d,mu]
+        s = jnp.einsum("ncd,dm->ncm", tau_block, inner_panel)
+        # Y[n,a,mu] = sum_c X[a,c,mu] S[n,c,mu]
+        y = jnp.einsum("acm,ncm->nam", x_panel, s)
+        out_block = jnp.einsum("nam,bm->nab", y, out_panel)
+        return jax.lax.dynamic_update_slice(out_acc, out_block, (pair0, 0, 0))
+
+    return jax.lax.fori_loop(
+        0, n_pair_blocks, pair_body, jnp.zeros_like(t2_pairs))
+
+
+def _stream_partial_x(panel_kernel, t2, left_out, left_inner, x_backing, nocc,
+                      *, occupied_pair_batch_size, rank_panel_size):
+    """Host-loop rank-panel streaming shared by the left and right X terms.
+
+    ``left_out``/``left_inner`` are the small endpoint factors (device-
+    resident); ``x_backing`` is the ``(nmo, nmo, rank)`` X factor on any
+    backing -- a NumPy array (view slicing) or an HDF5 dataset (partial
+    reads) -- and only one panel is on the device at a time.
+    """
+
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    nocc = int(nocc)
+    _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
+
+    nocc_i, nocc_j, nvir, _ = t2.shape
+    rank = left_out.shape[1]
+    n_pairs = nocc_i * nocc_j
+    n_pair_blocks = (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size
+    padded_pairs = n_pair_blocks * occupied_pair_batch_size
+    n_rank_blocks = (rank + rank_panel_size - 1) // rank_panel_size
+    padded_rank = n_rank_blocks * rank_panel_size
+
+    t2_pairs = jnp.pad(
+        jnp.asarray(t2).reshape(n_pairs, nvir, nvir),
+        ((0, padded_pairs - n_pairs), (0, 0), (0, 0)))
+    inner_padded = jnp.pad(jnp.asarray(left_inner), ((0, 0), (0, padded_rank - rank)))
+    out_padded = jnp.pad(jnp.asarray(left_out), ((0, 0), (0, padded_rank - rank)))
+
+    total = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2_pairs.dtype)
+    for rank_block in range(n_rank_blocks):
+        m0 = rank_block * rank_panel_size
+        m1 = min(m0 + rank_panel_size, rank)
+        x_panel = jax.device_put(
+            _read_x_rank_panel(x_backing, nocc, m0, m1, rank_panel_size))
+        inner_panel = inner_padded[:, m0:m0 + rank_panel_size]
+        out_panel = out_padded[:, m0:m0 + rank_panel_size]
+        total = total + panel_kernel(
+            t2_pairs, inner_panel, out_panel, x_panel,
+            occupied_pair_batch_size=occupied_pair_batch_size)
+    return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
+
+
+def contract_partial_x_left_t2_streamed(t2, left_out, left_inner, x_backing, nocc,
+                                        *, occupied_pair_batch_size=8,
+                                        rank_panel_size=128):
+    """Streamed ``P[a,m] P[c,m] X[b,d,m]``: one X rank panel on device at a time."""
+
+    return _stream_partial_x(
+        _xstream_left_panel_jit, t2, left_out, left_inner, x_backing, nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size)
+
+
+def contract_partial_x_right_t2_streamed(t2, right_out, right_inner, x_backing, nocc,
+                                         *, occupied_pair_batch_size=8,
+                                         rank_panel_size=128):
+    """Streamed ``X[a,c,m] P[b,m] P[d,m]``: one X rank panel on device at a time."""
+
+    return _stream_partial_x(
+        _xstream_right_panel_jit, t2, right_out, right_inner, x_backing, nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size)
+
+
+def contract_isdf_factor_direct_terms_t2_xstream(
+    t2: Array,
+    p: Array,
+    grad_p: Array,
+    u1: Array,
+    u3: Array,
+    d: Array,
+    x_backing,
+    nocc: int,
+    *,
+    occupied_pair_batch_size: int = 8,
+    rank_panel_size: int = 128,
+) -> Mapping[str, Array]:
+    """Factor-direct terms with X streamed panel-wise from its backing.
+
+    Identical terms and signs to
+    :func:`contract_isdf_factor_direct_terms_t2`; only the two X-consuming
+    terms change how X reaches the device.  Every other input is small and
+    device-lifted exactly as in the full-block path.
+    """
+
+    p, grad_p, u1, u3, d = map(jnp.asarray, (p, grad_p, u1, u3, d))
+    if grad_p.shape != (p.shape[0], p.shape[1], 3):
+        raise ValueError(
+            "grad_p must have shape (nvir, rank, 3); "
+            f"got {grad_p.shape} for p={p.shape}"
+        )
+    if u1.shape != (p.shape[1], p.shape[1], 3):
+        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+
+    k1_direct = _contract_k1_direct_t2_jit(
+        t2, p, grad_p, u1,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    k1_pair = _contract_k1_pair_t2_jit(
+        t2, p, grad_p, u1,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    k2_direct = _contract_k2_direct_t2_jit(
+        t2, p, grad_p, u1,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    k2_pair = _contract_k2_pair_t2_jit(
+        t2, p, grad_p, u1,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    k3_direct = contract_full_thc_t2(
+        t2, p, p, u3, p, p,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    k3_pair = contract_full_thc_pair_swapped_t2(
+        t2, p, p, u3, p, p,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    d_direct = contract_full_thc_t2(
+        t2, p, p, d, p, p,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    d_pair = contract_full_thc_pair_swapped_t2(
+        t2, p, p, d, p, p,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    x_direct = contract_partial_x_left_t2_streamed(
+        t2, p, p, x_backing, nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    x_pair = contract_partial_x_right_t2_streamed(
+        t2, p, p, x_backing, nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+
+    # Same sign assembly as contract_isdf_factor_direct_terms_t2.
+    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
+    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
+    delta_direct = d_direct - x_direct
+    delta_pair = d_pair - x_pair
+    tc = -(tc_direct + tc_pair)
+    delta_u = -(delta_direct + delta_pair)
+    final = tc + delta_u
+    return {
+        "k1_direct": k1_direct,
+        "k1_pair": k1_pair,
+        "k2_direct": k2_direct,
+        "k2_pair": k2_pair,
+        "k3_direct": k3_direct,
+        "k3_pair": k3_pair,
+        "d_direct": d_direct,
+        "d_pair": d_pair,
+        "x_direct": x_direct,
+        "x_pair": x_pair,
+        "tc_direct": tc_direct,
+        "tc_pair": tc_pair,
+        "delta_direct": delta_direct,
+        "delta_pair": delta_pair,
+        "tc": tc,
+        "delta_u": delta_u,
+        "final": final,
+    }
 
 
 def contract_isdf_factor_direct_terms_t2(

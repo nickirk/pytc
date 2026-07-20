@@ -75,11 +75,13 @@ class FactorizedStateExecutionTest(unittest.TestCase):
     def test_state_builds_and_caches(self):
         cc = self._make_cc()
         state1 = cc._factorized_state()
-        tc, b, fit = state1
+        tc, b, fit, x_backing = state1
         nvir = self.nmo - self.nocc
         self.assertEqual(tc["p"].shape, (nvir, self.rank))
         self.assertEqual(tc["grad_p"].shape, (nvir, self.rank, 3))
-        self.assertEqual(tc["x"].shape, (nvir, nvir, self.rank))
+        self.assertNotIn("x", tc)  # X stays on its backing, streamed by panels
+        self.assertIs(x_backing, cc.xtc_obj.isdf_kernels["X"])
+        self.assertEqual(x_backing.shape, (self.nmo, self.nmo, self.rank))
         self.assertEqual(b.shape[:2], (nvir, nvir))
         self.assertGreater(b.shape[2], 0)
         for name, arr in tc.items():
@@ -88,6 +90,22 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         self.assertEqual(fit.p_virtual.shape[0], nvir)
         # The lazy seam caches: a second call returns the same state object.
         self.assertIs(cc._factorized_state(), state1)
+
+    def test_hook_executes_streamed_contraction(self):
+        # Execute the hook end-to-end on the synthetic deck: the streamed
+        # factor-direct terms plus the JAX sandwich must produce a finite,
+        # nonzero t2 update.  This is the seam the 1200-orbital card relies
+        # on; identity checks alone cannot prove it runs.
+        cc = self._make_cc()
+        nvir = self.nmo - self.nocc
+        rng = np.random.default_rng(7)
+        t2_raw = rng.standard_normal((self.nocc, self.nocc, nvir, nvir))
+        t2 = 0.5 * (t2_raw + t2_raw.transpose(1, 0, 3, 2))
+        eris = types.SimpleNamespace(vvvv=None)
+        t2new = np.zeros_like(t2)
+        cc._contract_vvvv_t2(cc, t2, eris, t2new)
+        self.assertTrue(np.all(np.isfinite(t2new)))
+        self.assertGreater(np.linalg.norm(t2new), 0.0)
 
     def test_missing_kernel_fails_closed_naming_key(self):
         cc = self._make_cc(drop_kernel="K3_kernel")

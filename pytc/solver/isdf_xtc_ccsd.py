@@ -3,6 +3,12 @@
 The materialized implementation remains in :mod:`jax_xtc_ccsd`.  This class
 inherits all of its CCSD machinery and replaces only the VVVV--T2 leg through
 the narrow instance hook in that module.
+
+The X factor is never materialized in full: it stays on its host/HDF5
+backing and the contraction streams it one rank panel at a time, so device X
+residency is bounded by one panel rather than the whole ``(nvir, nvir,
+rank)`` block.  That is what makes the 1200-orbital deck fittable on a
+single GPU.
 """
 
 from __future__ import annotations
@@ -41,8 +47,12 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
             "u1": np.asarray(kernels["K1_kernel"], dtype=np.float64),
             "u3": np.asarray(kernels["K3_kernel"], dtype=np.float64),
             "d": np.asarray(kernels["D"], dtype=np.float64),
-            "x": np.asarray(kernels["X"], dtype=np.float64)[nocc:, nocc:, :],
         }
+        # X stays on its backing (a NumPy array or an HDF5 dataset): the
+        # contraction streams it one rank panel at a time, so the full block
+        # is never materialized on host or device.  Device X peak is one
+        # panel, which is what makes the 1200-orbital deck fittable.
+        x_backing = kernels["X"]
         with_df = getattr(self, "with_df", None) or self._scf.with_df
         b = robust_df_thc.extract_metric_applied_vv_df_factor(
             with_df, self.mo_coeff, nocc)
@@ -50,7 +60,7 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         fit = fit_panelled_lsthc_jax(
             tc["p"], b, rcond=self.factorized_rcond,
             virtual_panel=min(self.factorized_virtual_panel, nvir))
-        state = (tc, b, fit)
+        state = (tc, b, fit, x_backing)
         self._isdf_factorized_state = state
         return state
 
@@ -61,11 +71,12 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
             raise RuntimeError(
                 "factorized RCCSD refuses a materialized VVVV store; select "
                 "jax_xtc_ccsd.RCCSD for the legacy materialized route")
-        tc, b, fit = self._factorized_state()
+        tc, b, fit, x_backing = self._factorized_state()
         rank_panel = min(self.factorized_rank_panel, fit.p_virtual.shape[1])
         aux_panel = min(self.factorized_aux_panel, b.shape[2])
-        terms = factor_direct_vvvv.contract_isdf_factor_direct_terms_t2(
-            t2_jax, **tc, occupied_pair_batch_size=min(8, self.nocc * self.nocc),
+        terms = factor_direct_vvvv.contract_isdf_factor_direct_terms_t2_xstream(
+            t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
+            occupied_pair_batch_size=min(8, self.nocc * self.nocc),
             rank_panel_size=rank_panel)
         coulomb = direct_df_sandwiches_panelled_jax(
             b, fit, t2_jax, rank_panel=rank_panel, aux_panel=aux_panel)

@@ -361,3 +361,92 @@ class TestFactorDirectPhysicalH10(unittest.TestCase):
                     sort_keys=True,
                 )
             )
+
+
+class TestStreamedXParity(unittest.TestCase):
+    """Streamed-X contraction matches the full-block lift term for term.
+
+    The streamed path is the only route whose device X residency is one rank
+    panel, so it is the 1200-orbital path; these gates pin it to the
+    reviewed full-block math at FP64 reassociation level.  Panel boundaries
+    are the adversarial cases: rank 7 is exercised with panel sizes 2 and 3
+    (ragged tails) and 7 (single panel, the full-lift degenerate).
+    """
+
+    def setUp(self):
+        self.data = _random_inputs()          # nocc=2, nvir=5, rank=7
+        self.nocc, self.nvir, self.rank = 2, 5, 7
+        nmo = self.nocc + self.nvir
+        backing = np.zeros((nmo, nmo, self.rank), dtype=np.float64)
+        backing[self.nocc:, self.nocc:, :] = np.asarray(self.data["x"])
+        self.backing = backing
+
+    def test_left_and_right_streamed_match_full_block(self):
+        for panel in (2, 3, 7):
+            with self.subTest(rank_panel_size=panel):
+                left_full = factor_direct.contract_partial_x_left_t2(
+                    self.data["t2"], self.data["p"], self.data["p"], self.data["x"],
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                left_stream = factor_direct.contract_partial_x_left_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                self.assertLessEqual(_relative_l2(left_stream, left_full), 1e-12)
+
+                right_full = factor_direct.contract_partial_x_right_t2(
+                    self.data["t2"], self.data["p"], self.data["p"], self.data["x"],
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                right_stream = factor_direct.contract_partial_x_right_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                self.assertLessEqual(_relative_l2(right_stream, right_full), 1e-12)
+
+    def test_streamed_reads_hdf5_backing(self):
+        import h5py
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x_store.h5")
+            with h5py.File(path, "w") as fh:
+                fh.create_dataset("X", data=self.backing, dtype="f8")
+            with h5py.File(path, "r") as fh:
+                streamed = factor_direct.contract_partial_x_left_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    fh["X"], self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=3)
+        in_memory = factor_direct.contract_partial_x_left_t2_streamed(
+            self.data["t2"], self.data["p"], self.data["p"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        self.assertLessEqual(_relative_l2(streamed, in_memory), 1e-12)
+
+    def test_dispatcher_xstream_matches_full_dispatcher(self):
+        full = factor_direct.contract_isdf_factor_direct_terms_t2(
+            **self.data, occupied_pair_batch_size=2, rank_panel_size=3)
+        streamed = factor_direct.contract_isdf_factor_direct_terms_t2_xstream(
+            self.data["t2"], self.data["p"], self.data["grad_p"],
+            self.data["u1"], self.data["u3"], self.data["d"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        for name in ("x_direct", "x_pair", "delta_direct", "delta_pair",
+                     "tc", "delta_u", "final"):
+            with self.subTest(term=name):
+                self.assertLessEqual(
+                    _relative_l2(streamed[name], full[name]), 1e-12)
+
+    def test_panel_reader_pads_and_bounds(self):
+        # The panel reader is the only place host data enters the streamed
+        # path: every read must be exactly panel-shaped, and a ragged tail
+        # must be zero-padded, never shorter.
+        rank = self.rank
+        for m0, expected_width in ((0, 3), (3, 3), (6, 1)):
+            panel = factor_direct._read_x_rank_panel(
+                self.backing, self.nocc, m0, min(m0 + 3, rank), 3)
+            self.assertEqual(panel.shape, (self.nvir, self.nvir, 3))
+            np.testing.assert_array_equal(
+                panel[:, :, :expected_width],
+                self.backing[self.nocc:, self.nocc:, m0:m0 + expected_width])
+            if expected_width < 3:
+                np.testing.assert_array_equal(
+                    panel[:, :, expected_width:],
+                    np.zeros((self.nvir, self.nvir, 3 - expected_width)))
