@@ -1,6 +1,6 @@
 # PyTC
 
-Python TransCorrelation package (to be released soon...)
+Python TransCorrelation package
 
 ```{toctree}
 :maxdepth: 2
@@ -39,5 +39,5 @@ contributing
 - **Interpolative Separable Density Fitting (ISDF)** for the xTC kernel — empirical $T \propto n_{\mathrm{orb}}^{1.76}$ scaling (see plot above) pushes routine calculations past 1200 orbitals on a single B200, which is beyond what standard quantum chemistry solvers can handle.
 - **Modular Jastrow factors**: Boys-Handy, Nuclear Cusp, Neural Network (EE/EN/EEN), REXP, Polynomial, and Composite — share the same JIT-compiled evaluation path, so adding a new factor adds zero per-step overhead.
 - **VMC-based Jastrow optimization** with second-order Newton and first-order ML optimizers (Adam) — second-order steps reach the same accuracy in an order of magnitude fewer iterations than SGD.
-- **Seamless PySCF integration**: drop-in CCSD replacement that reuses existing PySCF mean-field objects, so transitioning from a standard workflow costs no extra setup time.
+- **PySCF interoperability with JAX-native CCSD**: builds on PySCF mean-field objects and molecular data, then runs xTC-CCSD with PyTC's in-house JAX solver, so transitioning from a standard workflow costs no extra setup time.
 
