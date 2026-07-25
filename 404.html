@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyTC documentation has moved</title>
+  <link rel="canonical" href="https://nickirk.github.io/pytc-docs/">
+  <meta name="robots" content="noindex">
+  <!-- No-JS fallback: send to the new site root. -->
+  <meta http-equiv="refresh" content="0; url=https://nickirk.github.io/pytc-docs/">
+  <script>
+    // Map old deep links one-to-one to the new site by rewriting ONLY the
+    // fixed "/pytc/" path prefix to "/pytc-docs/", preserving the remaining
+    // path, query string, and fragment. Because only this fixed prefix is
+    // replaced (never user-supplied host/scheme), this cannot act as an
+    // open redirect. Paths that do not start with "/pytc/" fall back to the
+    // new site root.
+    (function () {
+      var origin = "https://nickirk.github.io";
+      var oldPrefix = "/pytc/";
+      var newPrefix = "/pytc-docs/";
+      var path = window.location.pathname;
+      var rest = path.indexOf(oldPrefix) === 0 ? path.slice(oldPrefix.length) : "";
+      window.location.replace(
+        origin + newPrefix + rest + window.location.search + window.location.hash
+      );
+    })();
+  </script>
+</head>
+<body>
+  <p>This PyTC documentation page has moved to
+     <a href="https://nickirk.github.io/pytc-docs/">https://nickirk.github.io/pytc-docs/</a>.
+     Redirecting&hellip;</p>
+</body>
+</html>
