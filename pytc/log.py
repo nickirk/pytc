@@ -57,10 +57,16 @@ def get_pytc_version() -> str:
     # Fallback: try to read from pyproject.toml
     pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
     if pyproject_path.exists():
-        import tomllib
-        with open(pyproject_path, 'rb') as f:
-            data = tomllib.load(f)
-            return data.get('project', {}).get('version', 'unknown')
+        try:
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib
+            with open(pyproject_path, 'rb') as f:
+                data = tomllib.load(f)
+                return data.get('project', {}).get('version', 'unknown')
+        except Exception:
+            pass
     return 'unknown'
 
 

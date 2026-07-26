@@ -585,6 +585,78 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
     return result
 
 
+def contract_K1_minus_K2_isdf_fused(phi_p, phi_q, phi_r, phi_s,
+                                    grad_phi_p, grad_phi_q, U1,
+                                    r_block_size=128):
+    """Fused (K1 - K2) contraction that contracts the rank dimension FIRST.
+
+    The scan-loop version (``contract_K1_minus_K2_isdf_jit``) iterates over
+    rank blocks and accumulates into the full (Np, Nq, Nr, Ns) output on
+    every iteration.  For large Nr/Ns (e.g. 1179 at 1200 orbitals) the
+    accumulator is ~2.2 GB and is re-read/re-written ~168 times, making the
+    kernel memory-bound at ~0.2 FLOP/byte.
+
+    This version computes the small T[p,q,l] tensor once (full rank, no
+    blocking), then contracts T against phi_r/phi_s in r-blocks via real
+    GEMMs.  The full 4D output is written exactly once.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_fused = U1.shape[0]
+    n_rank = U1.shape[1]
+
+    # --- Step 1: compute T_K1[p,q,l] and T_K2[p,q,l] (full rank) ---
+    # T[bra,ket,l] = sum_{k,c} grad_phi_bra[bra,k,c] * U1[k,l,c] * phi_ket[ket,k]
+    # Decompose per Cartesian component c, then sum.
+    T_K1 = jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype)
+    T_K2 = jnp.zeros((Nq, Np, n_rank), dtype=phi_p.dtype)
+
+    for c in range(3):
+        U1_c = U1[:, :, c]  # (N_fused, n_rank)
+        # K1: W[p,k,l] = grad_phi_p[p,k,c] * U1[k,l,c]
+        W1 = grad_phi_p[:, :, c][:, :, None] * U1_c[None, :, :]  # (Np, N_fused, n_rank)
+        W1_2d = jnp.transpose(W1, (0, 2, 1)).reshape(Np * n_rank, N_fused)
+        T1_c = jnp.matmul(W1_2d, phi_q.T)  # (Np*n_rank, Nq)
+        T1_c = T1_c.reshape(Np, n_rank, Nq).transpose(0, 2, 1)  # (Np, Nq, n_rank)
+        T_K1 = T_K1 + T1_c
+
+        # K2: W[q,k,l] = grad_phi_q[q,k,c] * U1[k,l,c]
+        W2 = grad_phi_q[:, :, c][:, :, None] * U1_c[None, :, :]  # (Nq, N_fused, n_rank)
+        W2_2d = jnp.transpose(W2, (0, 2, 1)).reshape(Nq * n_rank, N_fused)
+        T2_c = jnp.matmul(W2_2d, phi_p.T)  # (Nq*n_rank, Np)
+        T2_c = T2_c.reshape(Nq, n_rank, Np).transpose(0, 2, 1)  # (Nq, Np, n_rank)
+        T_K2 = T_K2 + T2_c
+
+    # Combined T[p,q,l] = T_K1[p,q,l] - T_K2_T[p,q,l]
+    T_K2_T = jnp.transpose(T_K2, (1, 0, 2))  # (Np, Nq, n_rank)
+    T_combined = T_K1 - T_K2_T  # (Np, Nq, n_rank)
+
+    # --- Step 2: contract T against phi_r/phi_s in r-blocks ---
+    # result[p,q,r,s] = sum_l T[p,q,l] * phi_r[r,l] * phi_s[s,l]
+    # For each r-block:
+    #   T_r[p,q,r,l] = T[p,q,l] * phi_r[r,l]  (broadcast multiply)
+    #   result[p,q,r_block,s] = T_r_flat @ phi_s  (GEMM over l)
+    result = jnp.zeros((Np, Nq, Nr, Ns), dtype=phi_p.dtype)
+
+    for r0 in range(0, Nr, r_block_size):
+        r1 = min(r0 + r_block_size, Nr)
+        phi_r_block = phi_r[r0:r1, :]  # (R, n_rank)
+        R = r1 - r0
+        # Broadcast multiply: T_r[p,q,r,l] = T[p,q,l] * phi_r_block[r,l]
+        # T_combined: (Np, Nq, n_rank), phi_r_block: (R, n_rank)
+        # → (Np, Nq, R, n_rank) via broadcasting
+        T_r = T_combined[:, :, None, :] * phi_r_block[None, None, :, :]  # (Np, Nq, R, n_rank)
+        # Flatten to (Np*Nq*R, n_rank) for GEMM
+        T_r_flat = T_r.reshape(Np * Nq * R, n_rank)
+        # GEMM: (Np*Nq*R, n_rank) @ (n_rank, Ns) → (Np*Nq*R, Ns)
+        block_result = jnp.matmul(T_r_flat, phi_s.T)  # (Np*Nq*R, Ns)
+        # Reshape and place into output
+        block_result = block_result.reshape(Np, Nq, R, Ns)
+        result = jax.lax.dynamic_update_slice(result, block_result, (0, 0, r0, 0))
+
+    return result
+
+
 @partial(jax.jit, static_argnums=(5,))
 def contract_K1_antisym_pq_isdf_jit(phi_p, phi_r, phi_s, grad_phi_p, U1,
                                      rank_block_size=128):
@@ -642,7 +714,8 @@ def contract_K1_antisym_pq_isdf_jit(phi_p, phi_r, phi_s, grad_phi_p, U1,
 
 
 def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
-                               rank_block_size=None, gpu_max_memory_mb=None):
+                               rank_block_size=None, gpu_max_memory_mb=None,
+                               fused=False):
     """Compute (K1 - K2)[pqrs] in one pass, halving GPU peak vs separate calls.
 
     K2[pqrs] = K1[qprs] transposed, so the difference can be accumulated
@@ -660,6 +733,10 @@ def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
     grad_phi_p = grad_phi_piv[slice_p]
     grad_phi_q = grad_phi_piv[slice_q]
 
+    if fused:
+        return contract_K1_minus_K2_isdf_fused(
+            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1)
+
     if rank_block_size is None:
         from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(
@@ -672,6 +749,44 @@ def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
 
 
 @partial(jax.jit, static_argnums=(5,))
+def contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3,
+                             r_block_size=128):
+    """Fused K3 contraction that contracts the rank dimension FIRST.
+
+    Same principle as ``contract_K1_minus_K2_isdf_fused``: compute the small
+    T[p,q,l] tensor once (full rank), then contract against phi_r/phi_s in
+    r-blocks via real GEMMs.  Eliminates the scan-loop accumulator.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    N_fused = U3.shape[0]
+    n_rank = U3.shape[1]
+
+    # --- Step 1: compute T_K3[p,q,l] (full rank) ---
+    # T[p,q,l] = sum_k phi_p[p,k] * U3[k,l] * phi_q[q,k]
+    # = sum_k phi_p[p,k] * (U3[k,l] * phi_q[q,k])
+    # W[k,l,q] = U3[k,l] * phi_q[q,k]  → (N_fused, n_rank, Nq)
+    W = U3[:, :, None] * phi_q.T[:, None, :]  # (N_fused, n_rank, Nq)
+    W_flat = W.reshape(N_fused, n_rank * Nq)
+    T_flat = jnp.matmul(phi_p, W_flat)  # (Np, n_rank*Nq)
+    T_K3 = T_flat.reshape(Np, n_rank, Nq).transpose(0, 2, 1)  # (Np, Nq, n_rank)
+
+    # --- Step 2: contract T against phi_r/phi_s in r-blocks ---
+    result = jnp.zeros((Np, Nq, Nr, Ns), dtype=phi_p.dtype)
+
+    for r0 in range(0, Nr, r_block_size):
+        r1 = min(r0 + r_block_size, Nr)
+        phi_r_block = phi_r[r0:r1, :]  # (R, n_rank)
+        R = r1 - r0
+        T_r = T_K3[:, :, None, :] * phi_r_block[None, None, :, :]  # (Np, Nq, R, n_rank)
+        T_r_flat = T_r.reshape(Np * Nq * R, n_rank)
+        block_result = jnp.matmul(T_r_flat, phi_s.T)  # (Np*Nq*R, Ns)
+        block_result = block_result.reshape(Np, Nq, R, Ns)
+        result = jax.lax.dynamic_update_slice(result, block_result, (0, 0, r0, 0))
+
+    return result
+
+
 def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     """JITted version of K3 contraction.
     
@@ -895,13 +1010,14 @@ def contract_K3_isdf_streaming(phi_p, phi_q, phi_r, phi_s, U3,
 
 
 def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
-                     gpu_max_memory_mb=None):
+                     gpu_max_memory_mb=None, fused=False):
     """Contract K3 using ISDF decomposition.
     
     Args:
         rank_block_size: Override for the ISDF rank scan block size.
             If None, an adaptive size is computed.
         gpu_max_memory_mb: GPU memory budget for adaptive block sizing.
+        fused: If True, use the fused kernel (contracts rank dimension first).
     """
     if ranges is None:
         slice_p = slice_q = slice_r = slice_s = slice(None)
@@ -913,6 +1029,9 @@ def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
     phi_r = phi_piv[slice_r]
     phi_s = phi_piv[slice_s]
     
+    if fused:
+        return contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3)
+
     if rank_block_size is None:
         from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(

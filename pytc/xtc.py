@@ -1078,6 +1078,7 @@ class ISDFXTC(XTC, ISDFTC):
         d_reduce_group_blocks=1,
         r2_tile_size=None,
         gpu_budget_bytes=None,
+        x_store_chunks=None,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1095,6 +1096,15 @@ class ISDFXTC(XTC, ISDFTC):
                 forwarded to compute_kmat_kernels (auto-sized when None).
             gpu_budget_bytes: Optional per-device memory budget override for
                 the K1/K3 tile solver (probed live when None).
+            x_store_chunks: Optional explicit HDF5 chunk shape for the X
+                dataset, as a 3-tuple (orb_chunk, orb_chunk, rank_chunk).
+                When None (default), HDF5 auto-chunks — which spans the full
+                rank axis per chunk and causes ~21× read amplification when
+                the factorized RCCSD streams X panel-wise along the rank
+                axis.  Set to (orb_block_size, orb_block_size, rank_panel)
+                to align chunks with the streamed read pattern and eliminate
+                the amplification.  Byte-identical data; only the on-disk
+                layout changes.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -1140,6 +1150,7 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             x_s_panel_blocks=x_s_panel_blocks,
             d_reduce_group_blocks=d_reduce_group_blocks,
+            x_store_chunks=x_store_chunks,
         )
         kernels.update(delta_u_kernels)
         
@@ -1169,6 +1180,7 @@ class ISDFXTC(XTC, ISDFTC):
         host_grid_block_size=None,
         x_s_panel_blocks=1,
         d_reduce_group_blocks=1,
+        x_store_chunks=None,
     ):
         """Compute D, X kernels for Delta U with orbital and grid batching."""
         if L_aux is None:
@@ -1224,7 +1236,11 @@ class ISDFXTC(XTC, ISDFTC):
             if 'D' in f: del f['D']
             f.create_dataset('D', data=np.array(D))
             if 'X' in f: del f['X']
-            X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
+            if x_store_chunks is not None:
+                X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8',
+                                     chunks=x_store_chunks)
+            else:
+                X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
