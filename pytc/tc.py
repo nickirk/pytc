@@ -1000,6 +1000,7 @@ class ISDFTC(TC):
         r2_tile_size=None,
         mesh_shape=None,
         gpu_budget_bytes=None,
+        fused=False,
     ):
         """Compute K1 and K3 kernels with a 2D (k, g)-mesh + double-host-tiled
         algorithm.
@@ -1729,7 +1730,7 @@ class ISDFTC(TC):
             del chunk_np
 
     def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None,
-                            panel_layout="pr"):
+                            panel_layout="pr", fused=False):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
         global _TC_DIRECT_TILE_PROFILED
         _device_key = getattr(device, "id", "host")
@@ -1850,7 +1851,7 @@ class ISDFTC(TC):
             else:
                 k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
                     phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
-                    panel_size=k_panel)
+                    panel_size=k_panel, fused=fused)
 
             if panel_size is not None:
                 if _profile:
@@ -1859,7 +1860,7 @@ class ISDFTC(TC):
                     logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
                                  _t_k1 - _t_put)
                 k3 = kmat_jax.contract_K3_isdf_streaming(
-                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
+                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
                 if _profile:
                     jax.block_until_ready(k3)
                     _t_k3 = time.perf_counter()
@@ -1878,7 +1879,7 @@ class ISDFTC(TC):
             result_np = np.array(k12)
             del k12
             k3 = kmat_jax.contract_K3_isdf_streaming(
-                phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
+                phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
             result_np += np.asarray(k3)
             del k3
             result_np *= 0.5
@@ -1889,12 +1890,12 @@ class ISDFTC(TC):
             return jnp.asarray(result_np)
 
     def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None,
-                          panel_layout="pr"):
+                          panel_layout="pr", fused=False):
         """Assemble and symmetrize one finished TC tile."""
         panel_layout = _normalize_panel_layout(panel_layout)
         direct = self._get_tc_direct_tile(
             kernels, ranges, device=device, panel_size=panel_size,
-            panel_layout=panel_layout)
+            panel_layout=panel_layout, fused=fused)
 
         if panel_size is not None:
             slice_p, slice_q, slice_r, slice_s = ranges
@@ -1921,7 +1922,7 @@ class ISDFTC(TC):
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             tmp = self._get_tc_direct_tile(
                 kernels, ranges_T, device=device, panel_size=panel_size,
-                panel_layout=_transpose_panel_layout(panel_layout))
+                panel_layout=_transpose_panel_layout(panel_layout), fused=fused)
             return -(direct + tmp.transpose(2, 3, 0, 1))
 
         result_np = np.array(direct)
@@ -1938,7 +1939,7 @@ class ISDFTC(TC):
 
         return jnp.asarray(-result_np)
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000, fused=False):
         """Calculate TC correction terms using ISDF with multi-GPU support.
 
         Memory-optimized: computes each piece on GPU, immediately transfers
@@ -1960,11 +1961,11 @@ class ISDFTC(TC):
             ranges = (full, full, full, full)
 
         if self.isdf_kernels is None:
-            kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
+            kernels = self.compute_kmat_kernels(jastrow_params, batch_size, fused=fused)
         else:
             kernels = self.isdf_kernels
 
-        result = self._assemble_tc_tile(kernels, ranges)
+        result = self._assemble_tc_tile(kernels, ranges, fused=fused)
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
         return result

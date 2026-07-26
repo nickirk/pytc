@@ -912,27 +912,16 @@ def contract_K1_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
 def contract_K1_minus_K2_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
                                          grad_phi_p, grad_phi_q, U1,
                                          rank_block_size=128,
-                                         panel_size=None):
-    """Streaming-capable wrapper around :func:`contract_K1_minus_K2_isdf_jit`.
+                                         panel_size=None,
+                                         fused=False):
+    """Streaming-capable wrapper around :func:`contract_K1_minus_K2_isdf_jit` / fused.
 
     ``U1`` can be a device ``jax.Array`` or a host numpy ndarray.
-
-    * ``panel_size=None`` or ``panel_size >= U1.shape[1]`` → delegate to the
-      JIT once with the full K1; behaviour is bit-identical to the resident
-      fast-path.
-    * Otherwise, iterate over axis-1 (rank-column) panels of ``panel_size``;
-      each panel is ``jax.device_put`` just before its call, phi_r/phi_s
-      sliced to the matching slab, and partial contributions summed on
-      device. Axis 0 of U1 (the k axis) is untouched.
-
-    The last panel is zero-padded to ``panel_size`` so the JIT compiles once
-    for the whole loop. Zero-padded rows/columns contribute 0 to the sum.
-
-    Note: a function named ``contract_K1_minus_K2_isdf`` (without the
-    ``_streaming`` suffix) already exists as a range-based wrapper that
-    slices from a full ``phi_piv`` / ``grad_phi_piv`` — keep the names
-    distinct.
     """
+    if fused:
+        return contract_K1_minus_K2_isdf_fused(
+            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1)
+
     n_fused = U1.shape[1]
     if panel_size is None or panel_size >= n_fused:
         if isinstance(U1, np.ndarray):
@@ -986,12 +975,16 @@ def contract_K1_antisym_pq_isdf_streaming(phi_p, phi_r, phi_s, grad_phi_p, U1,
 
 def contract_K3_isdf_streaming(phi_p, phi_q, phi_r, phi_s, U3,
                                 rank_block_size=128,
-                                panel_size=None):
-    """Streaming-capable wrapper around :func:`contract_K3_isdf_jit`.
+                                panel_size=None,
+                                fused=False):
+    """Streaming-capable wrapper around :func:`contract_K3_isdf_jit` / fused.
 
     Same panel-on-axis-1 strategy as :func:`contract_K1_minus_K2_isdf`, but
     U3 is 2-D ``(n_fused, n_fused)`` with no ``c`` component axis.
     """
+    if fused:
+        return contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3)
+
     n_fused = U3.shape[1]
     if panel_size is None or panel_size >= n_fused:
         if isinstance(U3, np.ndarray):
