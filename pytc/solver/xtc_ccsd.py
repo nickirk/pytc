@@ -244,10 +244,12 @@ def _make_xtc_eris(cc, mo_coeff=None):
         (slice(None), slice(0, nocc), slice(0, nocc), slice(None)),
     )
 
+    fused = getattr(cc, 'fused', False)
+
     def _fock_worker(ranges, device):
         _ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
         with _ctx:
-            return np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+            return np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges, fused=fused))
 
     if len(_fock_devices) >= 2:
         # Genuinely independent GPUs available — dispatch the two
@@ -427,7 +429,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
             ('vooo', lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc).transpose(1, 0, 2, 3)),
         ]:
             logger.debug("Computing block %s", _blk_str)
-            _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str))
+            _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str, fused=fused))
             setattr(eris, _blk_str, _std + _tc)
 
         del Loo, Lov, Lov_reshaped
@@ -444,7 +446,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         
         def get_block(block_str):
             logger.debug(f"Computing block {block_str} for xtc")
-            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
+            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str, fused=fused))
             slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
             return eri_std_full[tuple(slices)] + tc_part
     
@@ -1729,7 +1731,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
                     tc_blk = await_read(pending_tc)
                     pending_tc = None
                 else:
-                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
+                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges, fused=fused))
 
                 # Kick off NEXT block's get_2b in background
                 next_p0 = p0 + blksize
@@ -1739,7 +1741,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
                                    slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
                     pending_tc = async_read(
                         lambda r=next_ranges: np.asarray(
-                            xtc_obj.get_2b(jastrow_params, ranges=r)))
+                            xtc_obj.get_2b(jastrow_params, ranges=r, fused=fused)))
                     pending_key = (next_p0, next_p1)
 
                 # Fuse std + tc into the slab that will be handed to the writer.

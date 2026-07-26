@@ -699,7 +699,7 @@ class XTC(TC):
         """
         return self.get_delta_h(jastrow_params, dm1, block_str, ranges, orb_block_size, batch_size)
 
-    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
+    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000, fused=False):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
         logger.debug("Starting XTC.get_2b")
@@ -711,7 +711,7 @@ class XTC(TC):
         
         # Accumulate on host to avoid holding two output-sized GPU tensors.
         # ISDFTC.get_2b already returns via host internally.
-        tc_result = super().get_2b(jastrow_params, ranges=ranges)
+        tc_result = super().get_2b(jastrow_params, ranges=ranges, fused=fused)
         result_np = np.array(tc_result)  # writable host copy
         del tc_result
         
