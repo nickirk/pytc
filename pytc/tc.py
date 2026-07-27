@@ -18,6 +18,7 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 from .utils import sharding_core
+from .utils import tile_timers as _tile_timers
 
 logger = logging.getLogger(__name__)
 
@@ -502,13 +503,18 @@ class TC:
         
         return (p, q, r, s)
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000,
+               fused=False):
         """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
         
         Args:
             jastrow_params: Parameters for the Jastrow factor
             block_str: Optional string specifying the block (e.g. 'oovv')
             ranges: Optional tuple of slices (slice_p, slice_q, slice_r, slice_s)
+            fused: Accepted for signature compatibility with
+                ``ISDFTC.get_2b`` (which ``XTC.get_2b`` forwards to
+                unconditionally); ignored here — the base exact path has no
+                rank-fused formulation.
             
         Returns:
             jnp.ndarray: The TC correction term.
@@ -1845,13 +1851,17 @@ class ISDFTC(TC):
                     phi_q      = _pad_axis(phi_q, 0, match_len)
                 # In-kernel antisymmetrisation in (p,q) — avoids
                 # materialising k12 and its transposed copy (~36 s/tile at 5z).
-                k12 = kmat_jax.contract_K1_antisym_pq_isdf_streaming(
-                    phi_p, phi_r, phi_s, grad_phi_p, u1, rbs,
-                    panel_size=k_panel)
+                with _tile_timers.term("tc_k1_antisym_pq") as _tt:
+                    k12 = kmat_jax.contract_K1_antisym_pq_isdf_streaming(
+                        phi_p, phi_r, phi_s, grad_phi_p, u1, rbs,
+                        panel_size=k_panel)
+                    _tt.sync(k12)
             else:
-                k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
-                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
-                    panel_size=k_panel, fused=fused)
+                with _tile_timers.term("tc_k1_minus_k2") as _tt:
+                    k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
+                        phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
+                        panel_size=k_panel, fused=fused)
+                    _tt.sync(k12)
 
             if panel_size is not None:
                 if _profile:
@@ -1859,8 +1869,10 @@ class ISDFTC(TC):
                     _t_k1 = time.perf_counter()
                     logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
                                  _t_k1 - _t_put)
-                k3 = kmat_jax.contract_K3_isdf_streaming(
-                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
+                with _tile_timers.term("tc_k3") as _tt:
+                    k3 = kmat_jax.contract_K3_isdf_streaming(
+                        phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
+                    _tt.sync(k3)
                 if _profile:
                     jax.block_until_ready(k3)
                     _t_k3 = time.perf_counter()
@@ -1878,8 +1890,10 @@ class ISDFTC(TC):
 
             result_np = np.array(k12)
             del k12
-            k3 = kmat_jax.contract_K3_isdf_streaming(
-                phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
+            with _tile_timers.term("tc_k3") as _tt:
+                k3 = kmat_jax.contract_K3_isdf_streaming(
+                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
+                _tt.sync(k3)
             result_np += np.asarray(k3)
             del k3
             result_np *= 0.5
