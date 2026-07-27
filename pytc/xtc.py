@@ -28,6 +28,7 @@ from .utils.tile_memory import find_max_blksize as _find_max_blksize
 from . import tc_helper
 from . import kmat as kmat_jax
 from .utils import sharding_core
+from .utils import tile_timers as _tile_timers
 
 logger = logging.getLogger(__name__)
 
@@ -2573,9 +2574,11 @@ class ISDFXTC(XTC, ISDFTC):
             )
         if _stage_timing:
             _t_stage_du0 = time.perf_counter()
-        delta_u_tile = self._assemble_delta_u_tile(
-            kernels, ranges, device=device, panel_size=panel_size,
-            panel_layout=panel_layout)
+        with _tile_timers.term("delta_u_tile") as _tt:
+            delta_u_tile = self._assemble_delta_u_tile(
+                kernels, ranges, device=device, panel_size=panel_size,
+                panel_layout=panel_layout)
+            _tt.sync(delta_u_tile)
         if _stage_timing:
             _t_stage_du1 = time.perf_counter()
             _accum_issue_stage("delta_u_assemble_s", _t_stage_du1 - _t_stage_du0)
@@ -2591,7 +2594,9 @@ class ISDFXTC(XTC, ISDFTC):
         if panel_size is not None:
             if _stage_timing:
                 _t_stage_sum0 = time.perf_counter()
-            result = tc_tile + delta_u_tile
+            with _tile_timers.term("final_sum") as _tt:
+                result = tc_tile + delta_u_tile
+                _tt.sync(result)
             if _stage_timing:
                 _t_stage_sum1 = time.perf_counter()
                 _accum_issue_stage("final_sum_s", _t_stage_sum1 - _t_stage_sum0)
