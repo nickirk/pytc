@@ -53,11 +53,12 @@ def burn_in(ansatz,
         params: Parameters for the ansatz, including jastrow and linear coefficients
         report_interval: How often to print progress (and, when
             adapt_step_size is True, how often to adapt step_size)
-        adapt_step_size: Adapt step_size every report_interval steps using
-            the acceptance over that interval. Callers that adapt step_size
-            themselves between calls (e.g. adaptive_burn_in, which adapts
-            once per chunk on the chunk-mean acceptance) pass False so the
-            two controllers don't fight.
+        adapt_step_size: Adapt step_size after each COMPLETED
+            report_interval window, using the mean acceptance over that
+            window (never before the first window completes). Callers that
+            adapt step_size themselves between calls (e.g. adaptive_burn_in,
+            which adapts once per chunk on the chunk-mean acceptance) pass
+            False so the two controllers don't fight.
     
     Returns:
         Tuple of (equilibrated_walkers, acceptance_history, new_key)
@@ -130,12 +131,12 @@ def burn_in(ansatz,
         
         if step % report_interval == 0:
             logger.info(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
-            if adapt_step_size:
-                recent = acceptance_history[-report_interval:]
-                mean_acceptance = float(np.mean(recent))
-                step_size *= float(np.clip(mean_acceptance / 0.5, 0.5, 2.0))
             start_time = time.time()
             gc.collect()
+        if adapt_step_size and (step + 1) % report_interval == 0:
+            recent = acceptance_history[-report_interval:]
+            mean_acceptance = float(np.mean(recent))
+            step_size *= float(np.clip(mean_acceptance / 0.5, 0.5, 2.0))
     
     logger.info("Burn-in complete.")
     return walkers, acceptance_history, key, step_size
@@ -220,6 +221,11 @@ def adaptive_burn_in(
     """
     if key is None:
         key = random.PRNGKey(int(time.time()))
+    if not (0.0 < acceptance_target <= 1.0):
+        raise ValueError(
+            f"acceptance_target must be a probability in (0, 1]; got "
+            f"{acceptance_target!r} (it is the divisor of the step-size "
+            f"controller and the centre of the acceptance pre-gate).")
 
     vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     batch_local_energy = jax.jit(vmap_fn(

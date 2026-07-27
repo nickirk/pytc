@@ -3,6 +3,7 @@ import unittest
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 from pyscf import gto, scf
 
@@ -112,6 +113,40 @@ class TestAdaptiveBurnIn(unittest.TestCase):
         )
         self.assertGreater(step_size, 0.0)
         self.assertLess(step_size, 100.0)
+
+    def test_no_adaptation_before_first_complete_interval(self):
+        """With n_steps < report_interval, no adaptation may fire at all --
+        in particular not at step 0 off a single acceptance sample."""
+        from pytc.vmc.sampling import burn_in
+        walkers, key = self._fresh_walkers(seed=6)
+        _, _, _, step_size = burn_in(
+            self.det, walkers, n_steps=5, step_size=0.02, key=key,
+            params=self.params, report_interval=10,
+        )
+        self.assertEqual(step_size, 0.02)
+
+    def test_first_complete_interval_uses_all_interval_samples(self):
+        """After exactly one full interval, the returned step_size must
+        equal initial * clip(mean(all interval acceptances) / 0.5)."""
+        from pytc.vmc.sampling import burn_in
+        walkers, key = self._fresh_walkers(seed=7)
+        _, acc_hist, _, step_size = burn_in(
+            self.det, walkers, n_steps=10, step_size=0.02, key=key,
+            params=self.params, report_interval=10,
+        )
+        self.assertEqual(len(acc_hist), 10)
+        expected = 0.02 * float(np.clip(np.mean(acc_hist) / 0.5, 0.5, 2.0))
+        self.assertAlmostEqual(step_size, expected, places=12)
+
+    def test_acceptance_target_zero_rejected(self):
+        """acceptance_target=0 would divide by zero in the step-size
+        controller; it must raise ValueError instead."""
+        walkers, key = self._fresh_walkers(seed=8)
+        with self.assertRaises(ValueError):
+            adaptive_burn_in(
+                self.det, self.sj, walkers, self.params, step_size=0.02,
+                key=key, chunk_size=20, max_steps=40, acceptance_target=0.0,
+            )
 
     def test_burn_in_honours_adapt_step_size_false(self):
         """burn_in with adapt_step_size=False must return the initial
