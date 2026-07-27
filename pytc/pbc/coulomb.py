@@ -40,6 +40,24 @@ SELECTOR_STORAGE = {
     "streamed": ("exact", "streamed"),
     "fixed_pivots": ("fixed", None),
 }
+# Frozen BPC policy accepted by the campaign; the only validated tuning.
+FROZEN_BPC_POLICY = {
+    "bpc_batch_size": 64,
+    "bpc_min_separation": 2.0,
+    "bpc_candidate_oversampling": 4,
+    "bpc_n_topup": 16,
+}
+# Default selector: the exact streamed oracle, valid at every system size.
+# BPC is not defaulted despite being the production algorithm. FROZEN_BPC_POLICY
+# is the only validated tuning and it is NOT size-universal -- batch_size=64
+# exceeds the candidate pool of a small cell and fails closed -- so a BPC
+# default needs a size-adaptive policy that does not exist yet. Defaulting to
+# BPC with the generic tuning would ship an untested configuration instead.
+# Cached storage additionally allocates the full complex AO feature matrix with
+# no capacity gate, so it stays an explicit opt-in until storage="auto" carries
+# one.
+DEFAULT_SELECTION_MODE = "streamed"
+
 RETIRED_SELECTION_MODES = {
     "jax_cached_matrix_free": "bpc_cached_gemm",
     "jax_translation_matrix_free": "bpc_cached_gemm",
@@ -52,7 +70,7 @@ RETIRED_SELECTION_MODES = {
 
 
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
-          provider_cls=RawKernelProvider, selection_mode="bpc_cached_gemm",
+          provider_cls=RawKernelProvider, selection_mode=None,
           fixed_pivots=None, bpc_batch_size=16,
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
@@ -85,8 +103,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         raise ValueError(
             "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
         )
+    if selection_mode is None:
+        selection_mode = "fixed_pivots" if fixed_pivots is not None else DEFAULT_SELECTION_MODE
     if fixed_pivots is not None:
-        if selection_mode != "streamed":
+        if selection_mode not in {"streamed", "fixed_pivots"}:
             raise ValueError(
                 "fixed_pivots is only compatible with exact 'streamed' "
                 "selection provenance."
@@ -638,7 +658,7 @@ class ISDFDF:
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
-                 selection_mode="bpc_cached_gemm", fixed_pivots=None, bpc_batch_size=16,
+                 selection_mode=None, fixed_pivots=None, bpc_batch_size=16,
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,

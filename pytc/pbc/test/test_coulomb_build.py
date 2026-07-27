@@ -37,46 +37,41 @@ def _make_cell():
 
 
 class TestBuild(unittest.TestCase):
-    def test_translation_mode_matches_complex_cache_end_to_end(self):
+    def test_retired_selection_mode_names_its_replacement(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
-        kwargs = dict(
-            rank=3, block_size=13, rtol=1e-8,
-            selection_peak_max_bytes=10**9,
-        )
-        cached = coulomb.build(
-            cell, kpts, selection_mode="jax_cached_matrix_free", **kwargs,
-        )
-        translated = coulomb.build(
-            cell, kpts, selection_mode="jax_translation_matrix_free", **kwargs,
-        )
-        np.testing.assert_array_equal(
-            cached["selection_provenance"]["pivot_indices"],
-            translated["selection_provenance"]["pivot_indices"],
-        )
-        self.assertEqual(
-            2 * translated["selection_provenance"]["cache_bytes"],
-            cached["selection_provenance"]["cache_bytes"],
-        )
-        self.assertEqual(
-            translated["selection_provenance"]["eta_ao_source"],
-            "blocked_reconstruction_from_translation_classes",
-        )
-        provenance = translated["selection_provenance"]
-        self.assertEqual(
-            provenance["translation_reconstruction_calls"],
-            provenance["translation_reconstruction_calls_selection"]
-            + int(np.ceil(cell.get_uniform_grids(cell.mesh).shape[0] / kwargs["block_size"])),
-        )
-        self.assertEqual(
-            provenance["translation_reconstruction_grid_points"],
-            provenance["translation_reconstruction_grid_points_selection"]
-            + cell.get_uniform_grids(cell.mesh).shape[0],
-        )
-        for key in ("inpv_kpt", "coul_kpt", "kern_kpt"):
-            np.testing.assert_allclose(
-                np.asarray(translated[key]), np.asarray(cached[key]), atol=2e-10, rtol=2e-10,
-            )
+        for retired, replacement in coulomb.RETIRED_SELECTION_MODES.items():
+            with self.assertRaises(ValueError) as ctx:
+                coulomb.build(cell, kpts, rank=3, block_size=9, selection_mode=retired)
+            self.assertIn(replacement, str(ctx.exception))
+
+    def test_retired_keyword_is_a_type_error_not_a_directive(self):
+        # Kwargs removed with the retired selectors bind-fail before any
+        # mode validation runs, so a legacy call raises TypeError rather than
+        # the directive ValueError above. Asserted so the distinction is
+        # documented rather than discovered.
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        with self.assertRaises(TypeError):
+            coulomb.build(cell, kpts, rank=3, block_size=9,
+                          selection_peak_max_bytes=1 << 30)
+
+    def test_default_is_the_size_universal_exact_oracle(self):
+        # BPC is the production algorithm but is deliberately NOT the default:
+        # FROZEN_BPC_POLICY is the only validated tuning and batch_size=64
+        # exceeds a small cell's candidate pool, so a BPC default would need a
+        # size-adaptive policy that does not exist yet.
+        self.assertEqual(coulomb.DEFAULT_SELECTION_MODE, "streamed")
+        self.assertEqual(coulomb.FROZEN_BPC_POLICY, {
+            "bpc_batch_size": 64, "bpc_min_separation": 2.0,
+            "bpc_candidate_oversampling": 4, "bpc_n_topup": 16,
+        })
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8)
+        prov = result["selection_provenance"]
+        self.assertEqual(prov["mode"], "streamed")
+        self.assertEqual((prov["selector"], prov["storage"]), ("exact", "streamed"))
 
     def test_build_produces_self_consistent_artifact(self):
         cell = _make_cell()
@@ -138,7 +133,10 @@ class TestBuild(unittest.TestCase):
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
         rank, block_size = 3, 9
 
-        result = coulomb.build(cell, kpts, rank=rank, block_size=block_size, rtol=1e-8)
+        # The manual reconstruction below drives the exact streamed oracle, so
+        # request it explicitly rather than inheriting whatever the default is.
+        result = coulomb.build(cell, kpts, rank=rank, block_size=block_size, rtol=1e-8,
+                               selection_mode="streamed")
 
         mesh_obj = canonicalize_kpts(cell, kpts)
         grid_coords = cell.get_uniform_grids(cell.mesh)
