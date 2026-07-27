@@ -1305,7 +1305,13 @@ def explicit_candidate_identity(indices):
 
 
 def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
-    """Experimental full-cache oracle with the same metric as the streamed path."""
+    """Full-cache oracle carrying the same metric as the streamed path.
+
+    Reference-only test oracle; intentionally no production caller. It is the
+    independent implementation the BPC equivalence tests measure against, so it
+    must not be inlined into those tests -- correlated implementations would
+    weaken the gate.
+    """
     kpts_np = np.asarray(kpts, dtype=np.float64)
     n_grid = len(grid_coords)
     n_kpts = len(kpts_np)
@@ -1322,7 +1328,11 @@ def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, s
 
 
 def periodic_metric_columns_from_ao(ao, indices):
-    """Exact periodic-metric columns for a bounded batch from a cached AO tensor."""
+    """Exact periodic-metric columns for a bounded batch from a cached AO tensor.
+
+    Reference-only test oracle; intentionally no production caller (see
+    build_cached_periodic_pivot_oracle).
+    """
     ao = np.asarray(ao, dtype=np.complex128)
     indices = np.asarray(indices, dtype=np.int64)
     if ao.ndim != 3 or indices.ndim != 1 or indices.size == 0:

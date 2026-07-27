@@ -368,7 +368,7 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         identity = explicit_candidate_identity(np.array([7, 2, 5], dtype=np.int64))
         self.assertEqual(identity, {"kind": "explicit_indices", "indices": [7, 2, 5]})
 
-    def test_cached_full_oracle_matches_streamed_pivots(self):
+    def test_cached_oracle_matches_streamed_pivots(self):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
         kpts = np.zeros((2, 3))
