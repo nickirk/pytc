@@ -40,7 +40,8 @@ def burn_in(ansatz,
             report_interval=100, 
             move_type="one",
             max_vmap_batch_size=0,
-            mesh=None):
+            mesh=None,
+            adapt_step_size=True):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -50,7 +51,13 @@ def burn_in(ansatz,
         step_size: Step size for MCMC proposals, std dev of Gaussian
         key: PRNG key
         params: Parameters for the ansatz, including jastrow and linear coefficients
-        report_interval: How often to print progress
+        report_interval: How often to print progress (and, when
+            adapt_step_size is True, how often to adapt step_size)
+        adapt_step_size: Adapt step_size every report_interval steps using
+            the acceptance over that interval. Callers that adapt step_size
+            themselves between calls (e.g. adaptive_burn_in, which adapts
+            once per chunk on the chunk-mean acceptance) pass False so the
+            two controllers don't fight.
     
     Returns:
         Tuple of (equilibrated_walkers, acceptance_history, new_key)
@@ -123,7 +130,10 @@ def burn_in(ansatz,
         
         if step % report_interval == 0:
             logger.info(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
-            step_size *= acceptance_float / 0.5
+            if adapt_step_size:
+                recent = acceptance_history[-report_interval:]
+                mean_acceptance = float(np.mean(recent))
+                step_size *= float(np.clip(mean_acceptance / 0.5, 0.5, 2.0))
             start_time = time.time()
             gc.collect()
     
@@ -185,8 +195,10 @@ def adaptive_burn_in(
         step_size: Initial MCMC proposal step size.
         key: PRNG key.
         move_type, max_vmap_batch_size, mesh: forwarded to burn_in.
-        chunk_size: Sweeps per chunk (one step-size adaptation and one
-                stability check per chunk).
+        chunk_size: Sweeps per chunk (one stability check per chunk, and
+                one step-size adaptation per chunk using the chunk-MEAN
+                acceptance -- burn_in's internal per-interval adaptation
+                is disabled here so the two controllers don't fight).
         max_steps: Hard cap on total sweeps; the stability criterion, not
                 the cap, should normally terminate.
         acceptance_target: Pre-gate center, matching burn_in's step-size
@@ -227,9 +239,12 @@ def adaptive_burn_in(
             ref_det, walkers, this_chunk, step_size, key, params=params,
             report_interval=chunk_size, move_type=move_type,
             max_vmap_batch_size=max_vmap_batch_size, mesh=mesh,
+            adapt_step_size=False,
         )
         total_steps += this_chunk
         chunk_acceptance = float(np.mean(acc_hist)) if acc_hist else None
+        if chunk_acceptance is not None:
+            step_size *= float(np.clip(chunk_acceptance / acceptance_target, 0.5, 2.0))
 
         record = {"steps_so_far": total_steps, "acceptance": chunk_acceptance,
                    "mean_energy": None, "variance": None}
