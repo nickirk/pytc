@@ -15,47 +15,45 @@ import jax
 import jax.numpy as jnp
 
 from pytc.pbc.df.isdf import (
-    DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
-    DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
-    JAXTranslationMatrixFreeCapacityError,
     RawKernelProvider,
-    build_cached_periodic_pivot_oracle,
     build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
     build_coul_kpt_device,
     build_periodic_pivot_oracle,
     build_pi_eta,
     build_pi_eta_staged,
-    build_translation_ao_cache,
-    build_translation_ao_representation,
-    candidate_panel_indices,
     explicit_candidate_identity,
     full_grid_candidate_identity,
-    periodic_metric_column_from_ao,
-    periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
     pivoted_cholesky_batched_hermitian,
-    periodic_metric_columns_from_ao,
-    jax_cached_matrix_free_byte_model,
-    jax_translation_matrix_free_byte_model,
-    select_jax_cached_matrix_free,
-    select_jax_translation_matrix_free,
     stream_ao_blocks,
-    stream_ao_blocks_from_translation_cache,
-)
-from pytc.pbc.df.reciprocal_ao_pilot import (
-    ReciprocalOrbitPartition,
-    select_reciprocal_same_grid,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 
 
+# Public selection surface: selector x storage. The mode strings below are the
+# flattened product and remain the accepted spelling; retired experiments map to
+# their surviving replacement so callers get a directive error, not a KeyError.
+SELECTOR_STORAGE = {
+    "bpc_cached_gemm": ("bpc", "cached"),
+    "bpc_streamed": ("bpc", "streamed"),
+    "streamed": ("exact", "streamed"),
+    "fixed_pivots": ("fixed", None),
+}
+RETIRED_SELECTION_MODES = {
+    "jax_cached_matrix_free": "bpc_cached_gemm",
+    "jax_translation_matrix_free": "bpc_cached_gemm",
+    "cached_full": "streamed",
+    "bpc_cached_full": "bpc_cached_gemm",
+    "panel_dense": "bpc_cached_gemm",
+    "panel_oracle": "bpc_cached_gemm",
+    "reciprocal_same_grid": "bpc_cached_gemm",
+}
+
+
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
-          provider_cls=RawKernelProvider, selection_mode="jax_cached_matrix_free",
-          selection_peak_max_bytes=DEFAULT_JAX_CACHED_SELECTOR_PEAK_MAX_BYTES,
-          selection_peak_safety_factor=DEFAULT_JAX_CACHED_SELECTOR_PEAK_SAFETY_FACTOR,
-          fixed_pivots=None, reciprocal_orbit_partition=None,
-          process_pipeline_allowance_bytes=None, bpc_batch_size=16,
+          provider_cls=RawKernelProvider, selection_mode="bpc_cached_gemm",
+          fixed_pivots=None, bpc_batch_size=16,
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
@@ -88,30 +86,31 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
         )
     if fixed_pivots is not None:
-        if selection_mode not in {"streamed", "cached_full"}:
+        if selection_mode != "streamed":
             raise ValueError(
-                "fixed_pivots is only compatible with exact 'streamed' or "
-                "'cached_full' selection provenance."
+                "fixed_pivots is only compatible with exact 'streamed' "
+                "selection provenance."
             )
         selection_mode = "fixed_pivots"
-    valid_selection_modes = {
-        "jax_cached_matrix_free", "jax_translation_matrix_free", "streamed", "cached_full",
-        "panel_dense", "panel_oracle", "fixed_pivots", "reciprocal_same_grid",
-        "bpc_streamed", "bpc_cached_full", "bpc_cached_gemm",
-    }
-    if selection_mode not in valid_selection_modes:
+    if selection_mode in RETIRED_SELECTION_MODES:
         raise ValueError(
-            "selection_mode must be 'jax_cached_matrix_free', "
-            "'jax_translation_matrix_free', 'streamed', 'cached_full', "
-            "'panel_dense', 'panel_oracle', 'fixed_pivots', 'reciprocal_same_grid', "
-            "'bpc_streamed', 'bpc_cached_full', or 'bpc_cached_gemm'"
+            f"selection_mode={selection_mode!r} was retired; use "
+            f"{RETIRED_SELECTION_MODES[selection_mode]!r}."
         )
+    if selection_mode not in SELECTOR_STORAGE:
+        raise ValueError(
+            "selection_mode must be one of "
+            f"{sorted(SELECTOR_STORAGE)} -- selector x storage."
+        )
+    selector, storage = SELECTOR_STORAGE[selection_mode]
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
 
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance = {
         "mode": selection_mode,
+        "selector": selector,
+        "storage": storage,
         "candidate_rule": "all_grid_points_v1",
         "candidate_count": int(grid_coords.shape[0]),
         "candidate_identity": full_grid_candidate_identity(grid_coords.shape[0]),
@@ -144,110 +143,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             "candidate_count": int(pivots.size),
             "candidate_identity": explicit_candidate_identity(pivots),
         })
-    elif selection_mode == "jax_translation_matrix_free":
-        n_ao = int(cell.nao_nr())
-        translation_representation = build_translation_ao_representation(
-            cell, mesh_obj.canonical_kpts,
-        )
-        byte_model = jax_translation_matrix_free_byte_model(
-            mesh_obj.n_kpts, translation_representation.n_classes,
-            grid_coords.shape[0], n_ao, rank,
-            ao_block_size=block_size,
-            selection_peak_max_bytes=selection_peak_max_bytes,
-            peak_safety_factor=selection_peak_safety_factor,
-        )
-        if byte_model["capacity_condition"] is not None:
-            raise JAXTranslationMatrixFreeCapacityError(
-                f"{byte_model['capacity_condition']}: selector peak with safety requires "
-                f"{byte_model['selection_peak_required_with_safety_bytes']} bytes, policy allows "
-                f"{byte_model['selection_peak_max_bytes']} bytes."
-            )
-        translation_cache = build_translation_ao_cache(
-            cell, grid_coords, block_size, translation_representation, stats=ao_stats,
-        )
-        pivots, _, n_selected, translation_provenance = (
-            select_jax_translation_matrix_free(
-                translation_cache, mesh_obj.n_kpts, rank,
-                ao_block_size=block_size,
-                selection_peak_max_bytes=selection_peak_max_bytes,
-                peak_safety_factor=selection_peak_safety_factor,
-            )
-        )
-        selection_provenance.update(translation_provenance)
-        selection_provenance.update({
-            "cache_bytes": int(translation_cache.nbytes),
-            "eta_ao_source": "blocked_reconstruction_from_translation_classes",
-            "lattice_image_count": int(
-                translation_representation.lattice_vectors.shape[0]
-            ),
-            "translation_class_count": int(translation_representation.n_classes),
-            "translation_class_sizes": [
-                int(group.size) for group in translation_representation.groups
-            ],
-            "phase_orthogonality_residual": (
-                translation_representation.phase_orthogonality_residual
-            ),
-        })
-    elif selection_mode == "jax_cached_matrix_free":
-        n_ao = int(cell.nao_nr())
-        byte_model = jax_cached_matrix_free_byte_model(
-            mesh_obj.n_kpts, grid_coords.shape[0], n_ao, rank,
-            selection_peak_max_bytes=selection_peak_max_bytes,
-            peak_safety_factor=selection_peak_safety_factor,
-        )
-        # The exact cache policy is checked before any full-grid AO allocation.
-        # select_jax_cached_matrix_free raises the named capacity condition if
-        # this record is outside policy; there is deliberately no dense/panel
-        # fallback from the production default.
-        if byte_model["capacity_condition"] is not None:
-            from pytc.pbc.df.isdf import JAXCachedMatrixFreeCapacityError
-            raise JAXCachedMatrixFreeCapacityError(
-                f"{byte_model['capacity_condition']}: selector peak with safety requires "
-                f"{byte_model['selection_peak_device_with_safety_bytes']} bytes, policy allows "
-                f"{byte_model['selection_peak_max_bytes']} bytes."
-            )
-        _, _, cached_ao = build_cached_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
-        )
-        pivots, _, n_selected, jax_provenance = select_jax_cached_matrix_free(
-            cached_ao, rank, selection_peak_max_bytes=selection_peak_max_bytes,
-            peak_safety_factor=selection_peak_safety_factor,
-        )
-        selection_provenance.update(jax_provenance)
-        selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
-        selection_provenance["eta_ao_source"] = "same_full_grid_ao_cache"
-    elif selection_mode == "reciprocal_same_grid":
-        if not isinstance(reciprocal_orbit_partition, ReciprocalOrbitPartition):
-            raise ValueError(
-                "selection_mode='reciprocal_same_grid' requires an explicit "
-                "ReciprocalOrbitPartition."
-            )
-        pivots, _, n_selected, reciprocal_provenance = select_reciprocal_same_grid(
-            cell, mesh_obj.canonical_kpts, grid_coords, rank, reciprocal_orbit_partition,
-            selection_peak_max_bytes=selection_peak_max_bytes,
-            peak_safety_factor=selection_peak_safety_factor,
-            process_pipeline_allowance_bytes=process_pipeline_allowance_bytes,
-        )
-        selection_provenance.update(reciprocal_provenance)
-        selection_provenance["cache_bytes"] = int(
-            reciprocal_provenance["persistent_seed_complex128_bytes"]
-        )
-        selection_provenance["eta_ao_source"] = "exact_streamed_pyscf_ao"
-        selector_ao_calls = int(reciprocal_provenance["pbc_eval_calls"])
-        selector_ao_grid_points = int(reciprocal_provenance["ao_grid_points"])
-    elif selection_mode == "cached_full":
-        diag, col_eval, cached_ao = build_cached_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
-        )
     elif selection_mode == "bpc_streamed":
         diag, col_batch_eval = build_periodic_batched_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
-    elif selection_mode == "bpc_cached_full":
-        diag, _, cached_ao = build_cached_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
-        )
-        col_batch_eval = lambda indices: periodic_metric_columns_from_ao(cached_ao, indices)
     elif selection_mode == "bpc_cached_gemm":
         diag, col_batch_eval, cached_ao = build_cached_periodic_bpc_gemm_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
@@ -256,17 +155,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         diag, col_eval = build_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
         )
-    if selection_mode in {
-        "jax_cached_matrix_free", "jax_translation_matrix_free", "fixed_pivots",
-        "reciprocal_same_grid",
-    }:
+    if selection_mode == "fixed_pivots":
         pass
     elif selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
-    elif selection_mode == "cached_full":
-        pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
-        selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
-    elif selection_mode in {"bpc_streamed", "bpc_cached_full", "bpc_cached_gemm"}:
+    else:
         pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
             batch_size=bpc_batch_size, min_separation=bpc_min_separation,
@@ -281,52 +174,14 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             "bpc_rounds": rounds,
             "bpc_joint_within_batch_exact_pivoting": True,
         })
-        if selection_mode in {"bpc_cached_full", "bpc_cached_gemm"}:
+        if selection_mode == "bpc_cached_gemm":
             selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
-    else:
-        candidates = candidate_panel_indices(diag, rank)
-        panel_ao = np.asarray(cell.pbc_eval_gto(
-            "GTOval", grid_coords[candidates], kpts=list(mesh_obj.canonical_kpts)
-        ), dtype=np.complex128)
-        ao_stats["pbc_eval_calls"] += 1
-        ao_stats["grid_points"] += int(candidates.size)
-        if selection_mode == "panel_dense":
-            panel_metric = periodic_metric_from_ao(panel_ao)
-            panel_pivots, _, n_selected = pivoted_cholesky_hermitian(
-                panel_metric.real.diagonal(), lambda j: panel_metric[:, j], rank=rank
-            )
-            selection_provenance["panel_bytes"] = int(panel_ao.nbytes + panel_metric.nbytes)
-        else:
-            panel_pivots, _, n_selected = pivoted_cholesky_hermitian(
-                np.sum(np.abs(panel_ao) ** 2, axis=(0, 2)) ** 2 / panel_ao.shape[0],
-                lambda j: periodic_metric_column_from_ao(panel_ao, j), rank=rank,
-            )
-            selection_provenance["panel_bytes"] = int(panel_ao.nbytes)
-        pivots = candidates[panel_pivots]
-        selection_provenance.update({
-            "candidate_rule": "top_half_effective_diag_plus_stratified_bins_v1",
-            "candidate_count": int(candidates.size),
-            "candidate_identity": explicit_candidate_identity(candidates),
-        })
 
-    if selection_mode != "reciprocal_same_grid":
-        selector_ao_calls = ao_stats["pbc_eval_calls"]
-        selector_ao_grid_points = ao_stats["grid_points"]
-    selector_translation_reconstruction_calls = ao_stats.get(
-        "translation_reconstruction_calls", 0,
-    )
-    selector_translation_reconstruction_grid_points = ao_stats.get(
-        "translation_reconstruction_grid_points", 0,
-    )
+    selector_ao_calls = ao_stats["pbc_eval_calls"]
+    selector_ao_grid_points = ao_stats["grid_points"]
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance["ao_calls_selection"] = selector_ao_calls
     selection_provenance["ao_grid_points_selection"] = selector_ao_grid_points
-    selection_provenance["translation_reconstruction_calls_selection"] = (
-        selector_translation_reconstruction_calls
-    )
-    selection_provenance["translation_reconstruction_grid_points_selection"] = (
-        selector_translation_reconstruction_grid_points
-    )
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
         dtype=np.complex128,
@@ -343,14 +198,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         diag = None
         gc.collect()
 
-    if translation_cache is not None:
-        ao_blocks_for_eta = (
-            blk for _, _, blk in stream_ao_blocks_from_translation_cache(
-                translation_cache, translation_representation.unitary_phase,
-                block_size, stats=ao_stats,
-            )
-        )
-    elif cached_ao is not None:
+    if cached_ao is not None:
         # The bpc_cached_gemm oracle caches AO features in the contiguous 2-D
         # (Ng, Nk*Nao) layout its threaded candidate GEMM needs
         # (build_cached_periodic_bpc_gemm_oracle), whereas build_pi_eta consumes
@@ -428,12 +276,6 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             "n_selected": n_selected,
             "ao_calls_through_eta": selector_ao_calls + ao_stats["pbc_eval_calls"],
             "ao_grid_points_through_eta": selector_ao_grid_points + ao_stats["grid_points"],
-            "translation_reconstruction_calls": ao_stats.get(
-                "translation_reconstruction_calls", 0,
-            ) + selector_translation_reconstruction_calls,
-            "translation_reconstruction_grid_points": ao_stats.get(
-                "translation_reconstruction_grid_points", 0,
-            ) + selector_translation_reconstruction_grid_points,
         },
     }
 
@@ -796,7 +638,7 @@ class ISDFDF:
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
-                 selection_mode="streamed", fixed_pivots=None, bpc_batch_size=16,
+                 selection_mode="bpc_cached_gemm", fixed_pivots=None, bpc_batch_size=16,
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,

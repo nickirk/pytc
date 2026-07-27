@@ -11,28 +11,16 @@ from pyscf.pbc.gto import Cell
 from scipy.linalg.lapack import zpstrf
 
 from pytc.pbc.df.isdf import (
-    build_translation_ao_cache,
-    build_translation_ao_representation,
     build_cached_periodic_pivot_oracle,
     build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
     build_periodic_pivot_oracle,
-    candidate_panel_indices,
     explicit_candidate_identity,
     full_grid_candidate_identity,
-    JAXCachedMatrixFreeCapacityError,
-    JAXTranslationMatrixFreeCapacityError,
-    TranslationAORepresentationError,
-    jax_cached_matrix_free_byte_model,
-    jax_translation_matrix_free_byte_model,
     periodic_metric_column_from_ao,
     periodic_metric_columns_from_ao,
-    periodic_metric_from_ao,
     pivoted_cholesky_hermitian,
     pivoted_cholesky_batched_hermitian,
-    select_jax_cached_matrix_free,
-    select_jax_translation_matrix_free,
-    stream_ao_blocks_from_translation_cache,
 )
 
 
@@ -402,206 +390,17 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         np.testing.assert_array_equal(cached_pivots, streamed_pivots)
         self.assertEqual(cached_stats, {"pbc_eval_calls": 3, "grid_points": 9})
 
-    def test_jax_cached_matrix_free_matches_streamed_pivots_and_rank(self):
-        cell = _SyntheticPeriodicCell()
-        grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
-        kpts = np.zeros((2, 3))
-        streamed_diag, streamed_col = build_periodic_pivot_oracle(
-            cell, kpts, grid_coords, block_size=4,
-        )
-        cache_stats = {}
-        _, _, ao_cache = build_cached_periodic_pivot_oracle(
-            cell, kpts, grid_coords, block_size=4, stats=cache_stats,
-        )
-        streamed_pivots, _, streamed_count = pivoted_cholesky_hermitian(
-            streamed_diag, streamed_col, rank=3,
-        )
-        pivots, factor, count, provenance = select_jax_cached_matrix_free(
-            ao_cache, rank=3, selection_peak_max_bytes=10**9, return_factor=True,
-        )
-        self.assertEqual(count, streamed_count)
-        np.testing.assert_array_equal(pivots, streamed_pivots)
-        self.assertEqual(factor.dtype, np.float64)
-        self.assertEqual(provenance["pivot_executor"], "jax.jit/lax.fori_loop")
-        self.assertTrue(provenance["pivot_loop_device_resident"])
-        self.assertEqual(cache_stats, {"pbc_eval_calls": 3, "grid_points": 9})
-        production_pivots, production_factor, production_count, _ = (
-            select_jax_cached_matrix_free(
-                ao_cache, rank=3, selection_peak_max_bytes=10**9,
-            )
-        )
-        self.assertIsNone(production_factor)
-        self.assertEqual(production_count, streamed_count)
-        np.testing.assert_array_equal(production_pivots, streamed_pivots)
 
-    def test_jax_cached_matrix_free_capacity_is_fail_closed_before_selection(self):
-        model = jax_cached_matrix_free_byte_model(2, 9, 3, 3, selection_peak_max_bytes=1)
-        self.assertFalse(model["within_cache_policy"])
-        self.assertEqual(
-            model["capacity_condition"],
-            "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
-        )
-        ao_cache = np.ones((2, 9, 3), dtype=np.complex128)
-        with self.assertRaisesRegex(
-            JAXCachedMatrixFreeCapacityError,
-            "JAX_CACHED_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
-        ):
-            select_jax_cached_matrix_free(ao_cache, rank=3, selection_peak_max_bytes=1)
 
-    def test_translation_cache_reconstructs_bloch_aos_and_exact_pivots(self):
-        cell = _translation_test_cell()
-        kpts = cell.make_kpts([2, 2, 2], wrap_around=False)
-        coords = cell.get_uniform_grids(cell.mesh)
-        representation = build_translation_ao_representation(cell, kpts)
-        self.assertEqual(representation.n_classes, len(kpts))
-        self.assertLess(representation.phase_orthogonality_residual, 1e-12)
 
-        stats = {}
-        cache = build_translation_ao_cache(
-            cell, coords, block_size=7, representation=representation, stats=stats,
-        )
-        reconstructed = np.concatenate([
-            block for _, _, block in stream_ao_blocks_from_translation_cache(
-                cache, representation.unitary_phase, block_size=5,
-            )
-        ], axis=1)
-        direct = np.asarray(cell.pbc_eval_gto("GTOval", coords, kpts=list(kpts)))
-        np.testing.assert_allclose(reconstructed, direct, atol=2e-12, rtol=2e-12)
 
-        streamed_diag, streamed_col = build_periodic_pivot_oracle(
-            cell, kpts, coords, block_size=7,
-        )
-        streamed_pivots, _, streamed_count = pivoted_cholesky_hermitian(
-            streamed_diag, streamed_col, rank=4,
-        )
-        pivots, factor, count, provenance = select_jax_translation_matrix_free(
-            cache, len(kpts), rank=4, selection_peak_max_bytes=10**9,
-            ao_block_size=7,
-            return_factor=True,
-        )
-        self.assertEqual(count, streamed_count)
-        np.testing.assert_array_equal(pivots, streamed_pivots)
-        self.assertEqual(factor.dtype, np.float64)
-        self.assertEqual(provenance["mode"], "jax_translation_matrix_free")
-        self.assertEqual(provenance["translation_cache_dtype"], "float64")
-        self.assertEqual(
-            stats["pbc_eval_calls"],
-            int(np.ceil(len(coords) / 7)),
-        )
-        # Drift-guard (real-f64-L, task #46): the fail-closed capacity model must
-        # size the Cholesky factor L from the factor's ACTUAL dtype itemsize, not
-        # a frozen assumption. If the factor's dtype ever changes, this asserts
-        # the capacity gate moves with it rather than silently under/over-counting
-        # (a mis-sized static gate can pass a job that then OOMs, or reject a
-        # feasible one). factor is float64 here (asserted above); the model's L
-        # term must equal n_grid * rank * that dtype's itemsize.
-        model = jax_translation_matrix_free_byte_model(
-            len(kpts), representation.n_classes, len(coords), cell.nao_nr(), 4,
-            ao_block_size=7, selection_peak_max_bytes=10**9,
-        )
-        self.assertEqual(
-            model["cholesky_real_float64_bytes"],
-            len(coords) * 4 * factor.dtype.itemsize,
-        )
 
-    def test_translation_cache_is_half_the_complex_bloch_cache(self):
-        full = jax_cached_matrix_free_byte_model(
-            4, 27, 5, 6, selection_peak_max_bytes=10**9,
-        )
-        translated = jax_translation_matrix_free_byte_model(
-            4, 4, 27, 5, 6, ao_block_size=7, selection_peak_max_bytes=10**9,
-        )
-        self.assertEqual(
-            2 * translated["translation_cache_real_float64_bytes"],
-            full["ao_cache_complex128_bytes"],
-        )
-        self.assertEqual(translated["translation_cache_to_complex_cache_ratio"], 0.5)
-        self.assertEqual(
-            translated["bounded_ao_block_complex128_bytes"], 4 * 7 * 5 * 16,
-        )
-        self.assertEqual(
-            translated["bounded_transform_block_complex128_bytes"], 4 * 7 * 5 * 16,
-        )
-        self.assertGreater(
-            translated["selection_peak_host_bytes"],
-            translated["translation_cache_real_float64_bytes"],
-        )
 
-    def test_translation_selector_capacity_is_fail_closed(self):
-        cache = np.ones((2, 3, 9), dtype=np.float64)
-        with self.assertRaisesRegex(
-            JAXTranslationMatrixFreeCapacityError,
-            "JAX_TRANSLATION_MATRIX_FREE_SELECTION_PEAK_EXCEEDS_POLICY",
-        ):
-            select_jax_translation_matrix_free(
-                cache, n_kpts=2, rank=3, ao_block_size=3,
-                selection_peak_max_bytes=1,
-            )
 
-    def test_translation_representation_rejects_mesh_without_gamma(self):
-        cell = _translation_test_cell()
-        shifted = cell.make_kpts(
-            [3, 1, 1], wrap_around=False, scaled_center=[0.17, 0.0, 0.0],
-        )
-        with self.assertRaisesRegex(
-            TranslationAORepresentationError,
-            "TRANSLATION_AO_REQUIRES_GAMMA_ORTHOGONAL_PHASE_CLASSES",
-        ):
-            build_translation_ao_representation(cell, shifted)
 
-    def test_translation_representation_rejects_nonorthogonal_gamma_mesh(self):
-        cell = _translation_test_cell()
-        nonorthogonal = np.array([[0.0, 0.0, 0.0], [0.37, 0.0, 0.0]])
-        with self.assertRaisesRegex(
-            TranslationAORepresentationError,
-            "TRANSLATION_AO_REQUIRES_GAMMA_ORTHOGONAL_PHASE_CLASSES",
-        ):
-            build_translation_ao_representation(cell, nonorthogonal)
 
-    def test_diamond_4x4x4_has_64_orthogonal_translation_classes(self):
-        cell = _translation_diamond_cell()
-        representation = build_translation_ao_representation(
-            cell, cell.make_kpts([4, 4, 4], wrap_around=False),
-        )
-        self.assertEqual(representation.lattice_vectors.shape[0], 887)
-        self.assertEqual(representation.n_classes, 64)
-        self.assertLess(representation.phase_orthogonality_residual, 1e-12)
 
-    def test_panel_metric_matches_direct_periodic_definition(self):
-        rng = np.random.default_rng(29)
-        ao = rng.normal(size=(3, 5, 2)) + 1j * rng.normal(size=(3, 5, 2))
-        metric = periodic_metric_from_ao(ao)
-        direct = np.empty((5, 5), dtype=np.complex128)
-        for r in range(5):
-            for s in range(5):
-                direct[r, s] = abs(np.vdot(ao[:, r, :], ao[:, s, :])) ** 2 / 3
-        np.testing.assert_allclose(metric, direct, atol=1e-12)
-        for column in range(5):
-            np.testing.assert_allclose(periodic_metric_column_from_ao(ao, column), direct[:, column])
 
-    def test_panel_dense_and_oracle_select_identical_pivots(self):
-        rng = np.random.default_rng(31)
-        ao = rng.normal(size=(3, 8, 3)) + 1j * rng.normal(size=(3, 8, 3))
-        metric = periodic_metric_from_ao(ao)
-        dense_pivots, _, dense_count = pivoted_cholesky_hermitian(
-            metric.real.diagonal(), lambda j: metric[:, j], rank=4,
-        )
-        oracle_pivots, _, oracle_count = pivoted_cholesky_hermitian(
-            metric.real.diagonal(), lambda j: periodic_metric_column_from_ao(ao, j), rank=4,
-        )
-        self.assertEqual(oracle_count, dense_count)
-        np.testing.assert_array_equal(oracle_pivots, dense_pivots)
-
-    def test_candidate_panel_is_unique_and_uses_higher_index_ties(self):
-        panel = candidate_panel_indices(np.ones(20), rank=3, panel_factor=4)
-        self.assertEqual(panel.size, 12)
-        self.assertEqual(len(set(panel.tolist())), panel.size)
-        self.assertEqual(panel[0], 19)
-
-    def test_candidate_panel_contract_on_nonuniform_diagonal(self):
-        diag = np.array([1., 9., 2., 8., 3., 7., 4., 6., 5., 10.])
-        panel = candidate_panel_indices(diag, rank=2, panel_factor=4)
-        np.testing.assert_array_equal(panel, np.array([9, 1, 3, 5, 7, 8, 6, 4]))
 
     def test_determinism_across_repeated_calls(self):
         rng = np.random.default_rng(26)
