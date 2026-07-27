@@ -1,6 +1,6 @@
-"""Matrix-free pivoted-Cholesky pivot selection -- model-agnostic
-(pytc/df/ package reorganization, task #8, isdf-coulomb-cuda,
-2026-07-12). Both TC's own phi/gradient decomposition
+"""Matrix-free pivoted-Cholesky pivot selection -- model-agnostic.
+
+Both TC's own phi/gradient decomposition
 (pytc.df.isdf.isdf_decompose) and the Coulomb path's sector-aware pivot
 selection (pytc.integrals.coulomb's pivot-selection section) share this
 module -- see
@@ -18,8 +18,8 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
                                         track_effective_rank=False, effective_rank_rtol=1e-6):
     """Matrix-free pivoted-Cholesky selection of grid/interpolation points
     that best span the pair-product space ``A[g,(p,q)] = factor_p[p,g] *
-    factor_q[q,g]``, without ever forming ``A`` (task #5,
-    isdf-coulomb-cuda: jastrow-independent shared primitive both the TC
+    factor_q[q,g]``, without ever forming ``A``
+    (jastrow-independent shared primitive both the TC
     pipeline and the Coulomb path import).
 
     Exploits the same algebraic identity the original TC-specific
@@ -58,13 +58,12 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         track_effective_rank: STATIC (compile-time) flag. False (default)
             compiles the legacy TC-production code path -- ramp baked
             into diag_err, no effective-rank bookkeeping, same cost as
-            Round-1's dedup fix and nothing more. True (Coulomb path
+            the untracked baseline and nothing more. True (Coulomb path
             only, via pivot_selection.select_sector_pivots) compiles the
             effective-rank-tracking path described below. The two are
             DIFFERENT XLA graphs (plain Python ``if`` on a static arg,
             not jax.lax.cond) so the False path never pays for the True
-            path's extra bookkeeping (Felix's architect ranking on
-            Alice's re-review, 2026-07-12).
+            path's extra bookkeeping.
         effective_rank_rtol: Only used when track_effective_rank=True.
             Relative tolerance (fraction of the raw diagonal's own max)
             for counting a selection as carrying real signal. Default
@@ -83,126 +82,58 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     Returns:
         (pivots, effective_rank): pivots is (n_rank,) selected grid-point
         indices, in selection order, GUARANTEED unique regardless of
-        track_effective_rank (see Round-1 fix below). effective_rank is
+        track_effective_rank (see INVARIANT (uniqueness)). effective_rank is
         a JAX scalar when track_effective_rank=True: how many of those
         selections had real numerical signal before the residual was
         numerically exhausted -- pivots[:effective_rank] is a
-        GUARANTEED-VALID prefix slice (see Round-3 fix below), steps
+        GUARANTEED-VALID prefix slice (see INVARIANT (prefix semantics)), steps
         beyond it are unique grid indices (never duplicates) but pick
         among residual-exhausted candidates rather than genuine
         interpolation-quality points. When track_effective_rank=False,
         effective_rank is not meaningful (not computed) -- callers on
         that path must not use it.
 
-    Round-1 fix (Alice, 2026-07-12): the original per-step zeroing
-    (``diag_err.at[pivot].set(0.0)`` only inside the ``is_small``
-    branch) relied on the Cholesky update's OWN arithmetic driving the
-    just-selected index's residual to exactly zero -- which
-    floating-point rounding doesn't guarantee after many iterations, so
-    once the residual was numerically exhausted, ``argmax`` could
-    re-select an EARLIER pivot instead of a fresh index (measured:
-    requesting 300 pivots on a 95-dim H2O/cc-pVDZ pair space returned
-    only 274 unique). Fixed with an explicit selected-mask instead of
-    relying on the residual reaching exact zero, so duplicates are now
-    impossible by construction -- this fix is UNCONDITIONAL (applies on
-    both the track_effective_rank True/False paths), since it's a
-    genuine correctness fix for TC's production path too, not just the
-    Coulomb path's diagnostic.
+    INVARIANT (uniqueness): selected indices are tracked with an explicit
+    mask rather than relying on the Cholesky update driving a selected
+    index's residual to exactly zero -- rounding does not guarantee that,
+    and argmax would otherwise re-select an earlier pivot. Both paths.
 
-    Round-2 fix (Alice's 1st re-review, 2026-07-12), superseded by
-    Round-3 below: an initial effective_rank implementation counted
-    ``diag_err[pivot] >= 1e-12`` against ``diag_err`` itself (shift +
-    ramp included) and used a SEPARATE parallel L_raw/raw_diag_err
-    Cholesky pair to work around the ramp contamination -- doubling
-    memory/compute on every call, including TC's production path (which
-    doesn't even use effective_rank). Superseded entirely by Round 3.
+    INVARIANT (prefix semantics): effective_rank is the length of the
+    LEADING CONTIGUOUS RUN of raw-effective selections -- ``still_effective``
+    latches False at the first selection whose raw residual falls below
+    eff_tol and never counts again. This makes ``pivots[:effective_rank]``
+    a valid prefix by definition, not a bare count of passing selections.
 
-    Round-3 fix (Alice's 2nd re-review, 2026-07-12) -- two issues:
-    (1) PREFIX-SEMANTICS BUG: Round 2's ramp (``1e-12 * arange(n_grid) *
-    max_diag``) has a total span growing with n_grid, which at large
-    n_grid can exceed effective_rank_rtol's threshold, and Round 2's
-    ``n_effective`` was a raw COUNT of how many selections individually
-    passed the raw-residual check -- not necessarily a contiguous prefix
-    of the returned pivots. Alice's synthetic repro (n_grid=1000, one
-    strong signal + one weak-but-effective signal + noise-only points
-    elsewhere) selected [0, 999, 998], reporting effective_rank=1 and
-    completely missing the real weak-but-effective signal at index 1.
-    (2) MEMORY REGRESSION: Round 2's L_raw/raw_diag_err pair doubled
-    memory/compute unconditionally, including on TC's production path.
+    INVARIANT (guard ordering): ``small_eps = min(100 * eps(dtype),
+    0.1 * effective_rank_rtol) * max_diag``. The numerical safety threshold
+    must never exceed the scientific ``eff_tol``, or effective pivots skip
+    deflation and the prefix breaks. A bare ``100 * eps`` is ~1.2e-5 in
+    float32, above the default rtol 1e-6; float64 (~2.2e-14) hides it.
+    Guards are scale-relative on the tracked path: rescaling the factors
+    leaves the row space unchanged but shifts max_diag, so an absolute
+    floor can silently disable deflation entirely. ``is_small_raw`` reuses
+    ``eff_tol`` itself.
 
-    Fixed by: (a) making effective-rank tracking a STATIC opt-in
-    (track_effective_rank) so the legacy path is bit-structurally
-    identical to Round 1 -- zero regression BY CONSTRUCTION, fixing
-    issue 2 (the parallel L_raw/raw_diag_err pair from Round 2 is kept,
-    but now only allocated on the opt-in path); (b) PREFIX-BY-
-    CONSTRUCTION accounting: effective_rank is redefined as the length
-    of the LEADING CONTIGUOUS RUN of raw-effective selections (a
-    ``still_effective`` flag latches False the instant one selection's
-    raw residual falls below eff_tol, and never counts again after
-    that), not a total count -- this makes ``pivots[:effective_rank]``
-    a valid prefix BY DEFINITION, regardless of whether a later
-    noise-level selection happens to read as effective again; (c) the
-    tie-break ramp is normalized (divided by n_grid-1) on the opt-in
-    path so its span stays ~1e-12*max_diag regardless of n_grid.
+    INVARIANT (ramp span): on the tracked path the tie-break ramp is
+    normalized by n_grid-1 so its span stays ~1e-12 * max_diag independent
+    of n_grid; an unnormalized span can exceed effective_rank_rtol at large
+    n_grid and break the prefix.
 
-    An earlier version of this fix additionally RESTRICTED pivot
-    selection itself to the raw-effective candidate pool (once
-    available) -- verified EMPIRICALLY (not assumed) that this actively
-    HURTS convergence quality on real data: on the H2O/cc-pVDZ ov-sector
-    reproduction, restricting the pool inflated effective_rank from the
-    correct 95 to 119, because the ramp's role isn't merely tie-breaking
-    -- it numerically steers the greedy Cholesky descent to a clean
-    collapse (residual -> exactly 0) at the true rank boundary, and
-    restricting candidates before that collapse completes disrupts it.
-    Selection is therefore UNRESTRICTED on both paths (always argmax
-    over the full unselected pool via the official ramped/shifted
-    diag_err) -- only the accounting differs.
+    INVARIANT (dtype): ``L``/``L_raw`` are allocated with an explicit
+    ``dtype=diag_err.dtype``; bare ``jnp.zeros`` follows JAX's ambient x64
+    flag instead of the input dtype.
 
-    Round-4 fix (Alice's 3rd re-review, 2026-07-12): the tracked branch's
-    internal numerical-safety guards (``is_small``/``is_small_raw``, used
-    to protect ``rsqrt`` from a near-zero pivot) were still ABSOLUTE
-    (``pivot_val < 1e-12``) even though effective_rank itself is defined
-    by the SCALE-RELATIVE ``eff_tol = effective_rank_rtol * max_diag`` --
-    rescaling the factor matrices by a positive constant (same
-    mathematical row space, the Gram merely scales) shifts max_diag by
-    the same factor but left the absolute guards fixed. A small enough
-    global rescale (Alice's repro: 1e-4, one-feature rank-1 factors with
-    two identical nonzero columns) pushed EVERY pivot_val below the
-    absolute 1e-12 floor, permanently disabling the Cholesky deflation
-    update entirely -- a duplicate/correlated column was then never
-    deflated after its twin was selected, and was counted as a SECOND
-    independent effective signal for an analytically rank-1 problem.
-    Fixed with two DIFFERENT scale-relative criteria (only on the
-    track_effective_rank=True path -- the legacy path's absolute 1e-12
-    is untouched, matching Felix's "bit-identical to Round 1" mandate):
-    ``is_small`` (official L, numerical-safety concern) now uses
-    ``100 * eps * max_diag`` (machine-epsilon-relative, as tight as
-    numerically defensible); ``is_small_raw`` (the L_raw diagnostic)
-    reuses ``eff_tol`` itself -- once a selection's raw residual falls
-    below eff_tol, ``still_effective`` has already latched False and no
-    further raw-track precision is scientifically needed; above that
-    threshold, the raw pivot is ALWAYS genuinely deflated regardless of
-    how small it looks in absolute terms.
+    DO NOT restrict selection to the raw-effective candidate pool. Measured
+    on the H2O/cc-pVDZ ov-sector reproduction, restricting it inflates
+    effective_rank from the correct 95 to 119: the ramp is not merely a
+    tie-break, it steers the greedy descent to a clean residual collapse at
+    the true rank boundary, and restricting candidates before that collapse
+    completes disrupts it. Selection is unrestricted on both paths (argmax
+    over the full unselected pool); only the accounting differs.
 
-    Round-5 fix (Alice's 4th re-review, 2026-07-12): Round 4's
-    ``small_eps = 100 * eps(dtype) * max_diag`` can EXCEED the
-    scientific ``eff_tol = effective_rank_rtol * max_diag`` in float32
-    (100*eps ~= 1.2e-5, larger than the default rtol=1e-6) -- a pivot
-    can be scientifically effective (raw residual >= eff_tol) while the
-    OFFICIAL L update still calls it "small" and skips deflation. The
-    test module's module-level x64 config hides this in float64 (where
-    100*eps ~= 2.2e-14, always far below any reasonable rtol), so this
-    needs an explicit float32 regression to stay caught.
-    INVARIANT: the numerical threshold must never exceed the scientific
-    one, else effective pivots skip deflation and the prefix breaks in
-    low precision. Fixed with ``small_eps = min(100*eps(dtype),
-    0.1*effective_rank_rtol) * max_diag`` -- the min() with a c=0.1
-    factor guarantees small_eps < eff_tol always, regardless of dtype
-    or rtol choice. Also fixed a related dtype-propagation gap exposed
-    while reproducing this in float32: ``L``/``L_raw`` were allocated
-    via bare ``jnp.zeros(...)`` (no explicit dtype), silently following
-    JAX's ambient x64-flag default rather than the actual input dtype --
-    now explicitly ``dtype=diag_err.dtype``.
+    COST: track_effective_rank is a STATIC argument -- the branches compile
+    to different XLA graphs, so the default False path carries none of the
+    tracked path's extra allocation or arithmetic.
     """
     n_grid = factor_p_weighted.shape[1]
     if n_rank > n_grid:
@@ -218,11 +149,10 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     max_diag = jnp.max(jnp.abs(raw_diag))
     diag_err = raw_diag + shift
 
-    # track_effective_rank is a STATIC arg (Felix's architect ranking,
-    # 2026-07-12): the two branches below compile to DIFFERENT XLA
+    # track_effective_rank is a STATIC arg: the two branches compile to DIFFERENT XLA
     # graphs at trace time (plain Python ``if``, not jax.lax.cond) --
     # when False (the default, TC's _pivoted_cholesky_phi/_grad never
-    # pass True), the compiled graph is exactly Round-1's dedup-fixed
+    # pass True), the compiled graph is exactly the untracked dedup-fixed
     # single-factor code with the ramp baked into diag_err as originally
     # designed: zero added memory/compute vs that baseline BY
     # CONSTRUCTION, not by hoping the extra work is cheap enough to not
@@ -249,8 +179,8 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         # this floor tracks it -- the absolute 1e-12 version did not,
         # and could classify EVERY pivot as "small" on a rescaled
         # problem, permanently disabling the Cholesky deflation entirely
-        # and letting duplicate/correlated signal go undetected (Alice's
-        # 3rd re-review, 2026-07-12: one-feature rank-1 factors with two
+        # and letting duplicate/correlated signal go undetected (measured:
+        # one-feature rank-1 factors with two
         # identical nonzero columns, rescaled by 1e-4, wrongly reported
         # effective_rank=2 for an analytically rank-1 problem).
         # INVARIANT: the numerical threshold must never exceed the
@@ -258,10 +188,9 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         # skipped by the official L update and never deflated -- its
         # duplicate/correlated twin then looks like fresh signal, and
         # the prefix latch closes too early, silently dropping later
-        # genuinely-independent signal (Alice's 4th re-review,
-        # 2026-07-12: 100*eps is ~1.2e-5 in float32, LARGER than the
-        # default effective_rank_rtol=1e-6 -- the x64-enabled test
-        # module hid this path entirely). min() with c=0.1 guarantees
+        # genuinely-independent signal (100*eps is ~1.2e-5 in
+        # float32, LARGER than the default effective_rank_rtol=1e-6; an
+        # x64-enabled test module hides this path entirely). min() with c=0.1 guarantees
         # small_eps < eff_tol always, regardless of dtype or rtol.
         small_eps = jnp.minimum(100.0 * jnp.finfo(diag_err.dtype).eps,
                                  0.1 * effective_rank_rtol) * max_diag
@@ -269,7 +198,7 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         # REGARDLESS of n_grid (divide by n_grid-1) -- the previous
         # unnormalized ``1e-12 * arange(n_grid)`` had a span growing with
         # n_grid that could exceed effective_rank_rtol's threshold at
-        # large n_grid (Alice's re-review, 2026-07-12). Only applied on
+        # large n_grid. Only applied on
         # this opt-in path -- the legacy path below keeps the exact
         # original formula, unchanged.
         diag_err = diag_err + ((1e-12 / jnp.maximum(n_grid - 1, 1))
@@ -290,8 +219,8 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
     if track_effective_rank:
         # Separate, UNSHIFTED/UNRAMPED raw residual + its own Cholesky
         # factor, tracked in parallel purely for the effective-rank
-        # diagnostic -- only allocated on this opt-in path (Felix's
-        # architect ranking, 2026-07-12: legacy TC callers pay nothing).
+        # diagnostic -- only allocated on this opt-in path
+        # (legacy TC callers pay nothing).
         raw_diag_err0 = raw_diag
         L_raw0 = jnp.zeros((n_grid, n_rank), dtype=diag_err.dtype)
         n_effective0 = jnp.array(0, dtype=int)
@@ -302,14 +231,14 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
              n_effective, still_effective) = state
             unselected = jnp.logical_not(selected_mask)
             # Force already-selected indices to -inf before argmax --
-            # duplicates impossible by construction (Round-1 fix).
+            # duplicates impossible by construction.
             score = jnp.where(unselected, diag_err, -jnp.inf)
             pivot = jnp.argmax(score)
             pivots = pivots.at[step].set(pivot)
             selected_mask = selected_mask.at[pivot].set(True)
             pivot_val = diag_err[pivot]
 
-            # PREFIX-BY-CONSTRUCTION (Alice's re-review, 2026-07-12):
+            # PREFIX-BY-CONSTRUCTION:
             # effective_rank is the length of the LEADING CONTIGUOUS RUN
             # of raw-effective selections, not a total count -- the
             # instant a selection's raw residual falls below eff_tol,
@@ -344,8 +273,7 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
 
             # Parallel unshifted/unramped Cholesky update (diagnostic
             # only, never fed back into selection or the L above).
-            # Latch-consistent skip criterion (Alice's re-review,
-            # 2026-07-12): once pivot_val_raw < eff_tol, still_effective
+            # Latch-consistent skip criterion: once pivot_val_raw < eff_tol, still_effective
             # has ALREADY closed (or is closing this step) and no
             # further raw update is scientifically needed. Below that,
             # the raw pivot must be genuinely divided/updated even when
@@ -381,8 +309,8 @@ def _pivoted_cholesky_pair_pivots_core(factor_p_weighted, factor_q_weighted, n_r
         unselected = jnp.logical_not(selected_mask)
         # Force already-selected indices to -inf before argmax --
         # duplicates are now impossible by construction, not dependent
-        # on the residual reaching exactly zero (Round-1 fix, kept
-        # unconditionally since it benefits TC's production path too).
+        # on the residual reaching exactly zero. Unconditional: it
+        # benefits TC's production path too.
         score = jnp.where(unselected, diag_err, -jnp.inf)
         pivot = jnp.argmax(score)
         pivots = pivots.at[step].set(pivot)

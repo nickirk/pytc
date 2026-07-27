@@ -1,9 +1,7 @@
 """Generic density-fitting/ISDF numerical machinery -- model-agnostic,
-shared by TC/xTC and the Coulomb path (pytc/df/ package reorganization,
-task #8, isdf-coulomb-cuda, 2026-07-12; see docs/design-phase1.md).
+shared by TC/xTC and the Coulomb path.
 
-This __init__ provides ONLY compatibility re-exports (Alice's migration
-spec): every name previously importable as ``pytc.df.X`` when this was
+API: this __init__ provides ONLY compatibility re-exports -- every name previously importable as ``pytc.df.X`` when this was
 a single module stays importable the same way. No substantive
 implementation lives here -- see pivots.py, solvers.py, isdf.py.
 """

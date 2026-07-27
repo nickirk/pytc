@@ -869,7 +869,7 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     deliberately not inside pair_convolve, which is shared and correct as is.
     The offset is invisible at self-paired q, and invisible in Pi against a
     transpose-based oracle check, so it must be preserved by construction
-    rather than by test (task #25).
+    rather than by test.
 
     Args:
         X: (Nk, Nip, Nao) complex128 across the canonical k-mesh.

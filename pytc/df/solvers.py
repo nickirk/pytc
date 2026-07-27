@@ -29,9 +29,8 @@ def solve_normal_equations_batch(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarray,
     not the plain transpose C^T -- an earlier version of this function used
     `.T` throughout, which is only correct for real inputs and silently
     gives a wrong (non-Hermitian, not-necessarily-PSD normal-equation
-    matrix) answer for complex ones (Alice's review, task #15 design,
-    2026-07-13: independently reproduced via an explicit dense
-    C[(p,q),mu]/B[(p,q),g] + np.linalg.lstsq oracle -- relative error ~2.0
+    matrix) answer for complex ones (measured against a dense
+    C[(p,q),mu]/B[(p,q),g] + np.linalg.lstsq oracle: relative error ~2.0
     with plain `.T`, 6.4e-10 with `.conj().T`). For real inputs `.conj()`
     is a no-op, so every existing real-valued caller (TC/xTC's own ISDF
     fitting) is bit-identically unaffected by this fix.
@@ -93,8 +92,8 @@ def _cholesky_backward_error(chol, lower, mat_reg):
     so this is a modest additional safety net against a factor that is
     finite but numerically garbage (e.g. under catastrophic cancellation
     at extreme ill-conditioning), not a substitute for the isfinite
-    check -- gap 2's REGULARIZED-solve half (Alice's task #8 review,
-    2026-07-12): this gates jitter escalation; the separate UNREGULARIZED
+    check. This is the REGULARIZED-solve half and it gates jitter
+    escalation; the separate UNREGULARIZED
     bias check lives downstream in df/fit.py's _cholesky_jitter_sandwich,
     since only that caller has the actual right-hand side M needed to
     measure it, and it must NEVER be "fixed" by more jitter here (more
@@ -119,11 +118,8 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
     positive-SEMIdefinite matrix -- the shared "Cholesky + adaptive
     diagonal jitter" primitive both TC's own fitting (via
     prepare_normal_equations_solver, now a thin wrapper around this) and
-    the Coulomb path's S-solve use (isdf-coulomb-cuda design doc §4,
-    2026-07-12: "Cholesky with adaptive diagonal jitter is the
-    production solver for S⁻¹-type applications" -- decided on measured
-    evidence, not a default; see the doc for the rcond-sweep history
-    that motivated it).
+    the Coulomb path's S-solve use -- decided on measured evidence,
+    not a default.
 
     Starts from a small base jitter (max of a diag-mean*rcond estimate
     and a PURELY matrix-relative machine-epsilon floor) and
@@ -139,21 +135,12 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
     escalation rule. "exact" additionally reconstructs L L^dagger (or
     U^dagger U) and checks its Frobenius residual against the
     regularized matrix -- a dense O(n^3) operation PER RETRY ATTEMPT,
-    which at production N_mu recreates exactly the cost problem gap 3
-    (production-scalable residual estimation) was trying to solve at
-    the fit layer; use "exact" only for small/reference-system
-    diagnostics, never at production scale (Alice's task #8 re-review,
-    2026-07-12: an earlier version of this function made the exact
-    check unconditional).
+    which at production N_mu recreates exactly the production-scalable
+    residual-estimation cost problem at the fit layer; use "exact" only
+    for small/reference-system diagnostics, never at production scale.
 
-    STATUS (Alice's re-review of commit 7064a7b, task #8 commit 3,
-    2026-07-12): this fixes gap 1 (scale-relative jitter floor) and the
-    regularized-solve half of gap 2 (backward-error gating jitter
-    escalation, now mode-gated so it doesn't reintroduce an O(n^3) cost
-    at the default production setting); the unregularized-bias check /
-    TSVD-fallback half of gap 2, plus gaps 3 (production-scalable
-    residual) and 4 (explicit same-sector), live in df/fit.py's
-    _cholesky_jitter_sandwich since they need the actual fit context
+    The unregularized-bias check and the TSVD fallback live in
+    df/fit.py's _cholesky_jitter_sandwich since they need the fit context
     this generic primitive doesn't have. This solver's provenance label
     is "unscaled_cholesky_jitter" (not "cholesky_jitter" matching the
     doc rule exactly) until row equilibration exists. Production
@@ -187,7 +174,7 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
         numpy.linalg.LinAlgError: matrix's diagonal mean is
             non-positive (not PSD -- previously masked by an absolute
             eps*max(diag_mean, 1.0) floor that injected eps-scale
-            jitter regardless of the matrix's own scale, Alice's gap 1),
+            jitter regardless of the matrix's own scale),
             or the factor never passes the requested check within
             max_jitter_tries attempts.
     """
@@ -208,7 +195,7 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
             f"matrix is not PSD, cannot form a scale-relative jitter."
         )
     eps = float(jnp.finfo(mat.dtype).eps)
-    eps_scale = eps * diag_mean  # PURELY matrix-relative -- no absolute 1.0 floor (gap 1 fix)
+    eps_scale = eps * diag_mean  # PURELY matrix-relative -- no absolute 1.0 floor
     base_jitter = max(diag_mean * rcond, eps_scale)
     eye = jnp.eye(mat.shape[0], dtype=mat.dtype)
 
@@ -260,7 +247,7 @@ def prepare_normal_equations_solver(phi_piv_p: jnp.ndarray, phi_piv_q: jnp.ndarr
             2-tuple, unchanged. True -- returns the full
             (chol, lower, jitter_used, n_tries) 4-tuple prepare_spd_cholesky
             itself produces, instead of discarding the last two (added for
-            task #15's provenance requirements -- a caller building a
+            provenance requirements -- a caller building a
             provenance-carrying artifact needs the ACTUAL jitter/retry
             facts, not just the usable factor).
     """
@@ -879,7 +866,7 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single"
         # because jax_enable_x64 is off, so the eigh/solve would run in single
         # precision (~1e-5 accuracy) and silently corrupt W -- surfacing only
         # three stages downstream as an opaque trip of the 1e-10 machine-tier
-        # retained-solve gate (task #47). A warn-only guard in front of a hard
+        # retained-solve gate. A warn-only guard in front of a hard
         # gate is incoherent; fail closed here with an actionable message.
         raise ValueError(
             f"hermitian_sandwich_solve_device: resolved dtype is {Pi_jnp.dtype}, not "

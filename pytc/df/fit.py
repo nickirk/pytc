@@ -1,6 +1,6 @@
-"""Kernel-agnostic LS-THC/ISDF core-fit algebra -- model-agnostic
-(pytc/df/ package reorganization commit 2/3, task #8, isdf-coulomb-cuda,
-2026-07-12). Felix's ruling: pair_collocation_at_pivots, compute_Z,
+"""Kernel-agnostic LS-THC/ISDF core-fit algebra -- model-agnostic.
+
+pair_collocation_at_pivots, compute_Z,
 compute_Z_cross, and reconstruct_eri_block all operate purely on (P, C)
 pair-collocation/DF-contraction matrices with zero Coulomb-specific
 content -- under the kernel-policy design (decision 001), the Poisson
@@ -10,7 +10,7 @@ What STAYS in pytc/integrals/coulomb.py: compute_C_streamed (the
 DF-B-tensor route -- MolecularDFReference policy specifically) and the
 gpu4pyscf adapter.
 
-Notation (Alice's spec, decision 001): pair-collocation matrix
+Notation: pair-collocation matrix
 A[g,a] = sqrt(w_g) phi_p(r_g) phi_q(r_g) for pair index a=(p,q);
 P[mu,a] = A[r_mu,a] (pair collocation AT the interpolation points mu
 selected by pivot selection); S = P P^dagger; with orthonormalized DF
@@ -48,9 +48,9 @@ def pair_collocation_at_pivots(factor_p_at_pivots, factor_q_at_pivots):
     formula operates on the real orbital values at the interpolation
     points, and the ERI reconstruction (compute_Z/reconstruct_eri_block)
     downstream of this P must reproduce the true (unweighted) integral
-    (Alice's task #6 review, 2026-07-12: passing weighted values here
-    instead made compute_Z's rcond default silently depend on the grid
-    quadrature's weight scale/level, a portability bug).
+    INVARIANT: P is built from RAW values. Passing weighted values here
+    makes compute_Z's rcond default silently depend on the grid
+    quadrature's weight scale/level -- a portability bug.
 
     Args:
         factor_p_at_pivots: (n_p, n_pivots) RAW (unweighted) values at
@@ -82,14 +82,13 @@ _DEFAULT_RESIDUAL_SEED = 0
 
 
 def _two_sided_residual(S_A, Z, S_B, M):
-    """Alice's solver-residual convention (task #6/#3 review, 2026-07-12):
-    the FULL two-sided residual on the actual returned Z, not a
+    """Solver-residual convention: the FULL two-sided residual on the actual returned Z, not a
     one-sided check of only the first S^-1 solve -- ``||S_A Z S_B -
     M|| / ||M||`` (same-sector: S_A=S_B=S, matches ``||S Z S -
     C C^dagger||/||C C^dagger||`` exactly). EXACT, O(n^3): forms the
     dense (n, n) products directly -- fine for reference/small-medium
     builds, but at production N_mu this is comparable to or larger than
-    the solve itself (Alice's task #8 review, 2026-07-12, gap 3); see
+    the solve itself; see
     _two_sided_residual_sampled for the O(n^2 * n_probes) alternative."""
     residual_num = float(np.linalg.norm(S_A @ Z @ S_B - M))
     residual_den = float(np.linalg.norm(M))
@@ -100,7 +99,7 @@ def _two_sided_residual_sampled(S_A, Z, S_B, M, n_probes=_DEFAULT_RESIDUAL_N_PRO
                                  seed=_DEFAULT_RESIDUAL_SEED):
     """Hutchinson stochastic-trace estimate of the same two-sided
     residual _two_sided_residual computes exactly, at O(n^2 * n_probes)
-    instead of O(n^3) (Alice's task #8 review, 2026-07-12, gap 3): for
+    instead of O(n^3). For
     A = S_A Z S_B - M, ||A||_F^2 = E[||A v||^2] for random v with
     i.i.d. mean-zero unit-variance entries (Rademacher here); average
     n_probes samples of the numerator and denominator separately and
@@ -111,7 +110,7 @@ def _two_sided_residual_sampled(S_A, Z, S_B, M, n_probes=_DEFAULT_RESIDUAL_N_PRO
     kept entirely on-device via jax.random/jnp -- an earlier version
     called np.asarray on the full dense (n, n) matrices first, forcing
     a multi-GB device->host transfer at production N_mu regardless of
-    the reduced FLOP count (Alice's re-review, 2026-07-12).
+    the reduced FLOP count.
 
     Returns (estimate, relative_standard_error): the SEM is a rough,
     first-cut uncertainty from the per-probe spread of the numerator
@@ -179,22 +178,19 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
                                residual_mode="exact",
                                residual_n_probes=_DEFAULT_RESIDUAL_N_PROBES,
                                residual_seed=_DEFAULT_RESIDUAL_SEED):
-    """S_A^-1 M S_B^-1 via pytc.df.solvers.prepare_spd_cholesky (design
-    doc §4, isdf-coulomb-cuda, 2026-07-12: "Cholesky with adaptive
-    diagonal jitter is the production solver for S^-1-type applications"
-    -- the same idiom TC's own orbital fitting uses, not a parallel
-    implementation). Jitter schedule matches the doc's adaptive rule
+    """S_A^-1 M S_B^-1 via pytc.df.solvers.prepare_spd_cholesky. Cholesky
+    with adaptive diagonal jitter is the production solver for S^-1-type
+    applications -- the same idiom TC's own orbital fitting uses, not a
+    parallel implementation. Jitter schedule matches the doc's adaptive rule
     exactly: lambda_0 = jitter_rcond * trace(S)/N_mu (default 1e-14),
     x10 growth, up to 6 retries (7 total attempts).
 
     same_sector must be passed EXPLICITLY by the caller, who already
     knows this fact from how S_A/S_B were constructed -- no longer
     inferred via a dense jnp.array_equal(S_A, S_B) comparison, which
-    synchronizes and scans the full (n, n) matrices (Alice's task #8
-    review, 2026-07-12, gap 4).
+    synchronizes and scans the full (n, n) matrices.
 
-    Two-tier acceptance (gap 2, task #8 commit 3, re-reviewed
-    2026-07-12): prepare_spd_cholesky itself gates jitter escalation on
+    Two-tier acceptance: prepare_spd_cholesky itself gates jitter escalation on
     the REGULARIZED-solve backward error via backward_error_mode (is
     the factor actually a good factorization of mat+jitter*I? -- more
     jitter can fix this; "finite_only" default keeps this O(1) at
@@ -213,19 +209,18 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     jitter_rcond=1.0 (a valid jitter *scale* but a nonsensical
     singular-value *cutoff*) made TSVD retain ZERO modes and return
     Z=0, the fallback silently making things worse instead of better
-    (Alice's re-review, 2026-07-12, independently reproduced: fallback
+    (measured: fallback
     residual 1.0 vs 8.4e-14 with TSVD's own default cutoff).
 
     When residual_mode="sampled", the fallback gate is SKIPPED entirely
     (fit_residual is still computed and reported for diagnostics) --
     the sampled estimator is not yet calibrated against the exact
     residual, so an elevated sampled value must not silently trigger a
-    solver switch off an uncharacterized false-positive rate (Alice's
-    re-review, 2026-07-12).
+    solver switch off an uncharacterized false-positive rate.
 
     Provenance labels this "unscaled_cholesky_jitter", not
     "cholesky_jitter" matching the design doc's rule exactly, since
-    there is no row equilibration yet (Felix, 2026-07-12).
+    there is no row equilibration yet.
 
     Returns (Z, provenance) -- provenance carries exactly the
     solver-level fields compute_Z/compute_Z_cross can actually observe
@@ -234,8 +229,8 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     threshold, row-scaling, fallback status); fields that need
     caller-side context (kernel policy, upstream SCF/grid provenance)
     are NOT compute_Z's to fabricate -- a higher-level build_core
-    wrapper assembles those (Alice/Felix, 2026-07-12, part of phase 1's
-    core-build contract, not deferred to CCSD step 3).
+    wrapper assembles those -- part of the core-build contract, not
+    deferred to the CCSD step.
     """
     S_A = jnp.asarray(S_A)
     S_B = jnp.asarray(S_B)
@@ -272,8 +267,7 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
         # called np.asarray on all four here unconditionally, so sampled
         # mode inherited a device->host->device round trip through
         # _two_sided_residual_sampled's own jnp.asarray -- exactly the
-        # transfer the on-device rewrite was meant to remove (Alice's
-        # second re-review, 2026-07-12).
+        # transfer the on-device rewrite was meant to remove.
         fit_residual, residual_meta = _compute_residual(
             S_A, Z, S_B, M, residual_mode, residual_n_probes, residual_seed)
     else:
@@ -345,10 +339,10 @@ def _tsvd_sandwich(S_A, S_B, M, tsvd_rcond, same_sector,
     serves as _cholesky_jitter_sandwich's automatic fallback when the
     unregularized-bias check fails there, using its OWN independent
     tsvd_rcond (never the Cholesky jitter_rcond -- see
-    _cholesky_jitter_sandwich's docstring, gap 1 re-review).
+    _cholesky_jitter_sandwich's docstring).
 
     same_sector must be passed EXPLICITLY by the caller (see
-    _cholesky_jitter_sandwich's docstring, gap 4 -- no more dense
+    _cholesky_jitter_sandwich's docstring -- no dense
     np.array_equal(S_A, S_B) inference).
     """
     S_A = np.asarray(S_A)
@@ -411,8 +405,7 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
     """Z = S^-1 C C^dagger S^-1, S = P P^dagger.
 
     Production solver is Cholesky with adaptive diagonal jitter
-    (isdf-coulomb-cuda design doc §4, 2026-07-12) -- decided on measured
-    evidence, not assumed: at production core sizes an SVD is a
+    -- decided on measured evidence, not assumed: at production core sizes an SVD is a
     GPU non-starter, pivot budgets are analytically pre-capped so S
     enters the solve at (near-)full rank by construction, and the
     apparent earlier need for delicate pinv-cutoff tuning was itself an
@@ -428,11 +421,9 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
     catastrophic failure mode -- numpy's own default pinv rcond gave
     39x relative error (nonsense) on an H2O/cc-pVDZ ov-sector test
     (n_pivots=300, n_pair=95, cond(S)~2e24), and rcond tightened much
-    past ~3e-7 made it WORSE again (readmitted noise). Alice's task #6
-    review (2026-07-12, blocker item 1) identified the root cause: P
-    should be built from RAW (unweighted) values -- weighting is a
-    pivot-SELECTION device, not part of the actual interpolation
-    formula. With that fix, S on the same test has rank EXACTLY equal
+    past ~3e-7 made it WORSE again (readmitted noise). Root cause: P
+    must be built from RAW (unweighted) values -- weighting is a
+    pivot-SELECTION device, not part of the interpolation formula. With that fix, S on the same test has rank EXACTLY equal
     to n_pair=95 (no numerical rank inflation from the weight scaling)
     and the rcond sweep becomes well-behaved.
 
@@ -486,7 +477,7 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
     M = C @ C.conj().T
     # compute_Z is always the same-sector case by construction (one P/C
     # pair fitted against itself) -- same_sector=True is a fact, not an
-    # inference (gap 4).
+    # inference.
     if solver == "cholesky_jitter":
         rcond_eff = 1e-14 if rcond is None else rcond
         return _cholesky_jitter_sandwich(S, S, M, rcond_eff, True,
@@ -559,8 +550,8 @@ def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None, solver="cholesky_jitter",
             S_B) rather than guessing -- compute_Z already covers the
             common same-sector convenience path, so pass same_sector=
             True here only when the caller genuinely knows P_A/C_A and
-            P_B/C_B come from the same pivot set (Alice's task #8 gap-4
-            re-review, 2026-07-12: a prior ``same_sector=None`` default
+            P_B/C_B come from the same pivot set (a prior
+            ``same_sector=None`` default
             fell back to a ``P_A is P_B`` identity check performed
             AFTER ``np.asarray`` conversion -- for JAX/CuPy array
             inputs, np.asarray creates a NEW host object on every call,
@@ -612,9 +603,8 @@ def reconstruct_eri_block(P_row, Z, P_col):
     a same-sector Z (square, built from one sector's own P/C) is NOT
     interchangeable with a cross-sector one (rectangular in general,
     built from both sectors' P/C together); passing mismatched P_row/
-    P_col/Z shapes will fail at the matmul (Alice's task #6 review,
-    2026-07-12 -- this docstring previously implied a same-sector Z
-    could serve any P_row/P_col pairing).
+    P_col/Z shapes will fail at the matmul: a same-sector Z does not
+    serve an arbitrary P_row/P_col pairing.
 
     Args:
         P_row: (n_pivots_A, n_pair_row) pair-collocation at sector A's

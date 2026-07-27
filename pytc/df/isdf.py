@@ -1,6 +1,5 @@
 """ISDF decomposition of orbitals and their gradients -- shared numerical
-machinery (pytc/df/ package reorganization, task #8, isdf-coulomb-cuda,
-2026-07-12): "orbital values + derivative values as two factor channels"
+machinery. Orbital values + derivative values as two factor channels
 is a generic ISDF operation used by TC and xTC alike, not TC-specific in
 the sense of belonging to a peer integral-model module."""
 import jax
