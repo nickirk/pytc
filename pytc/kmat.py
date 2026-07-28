@@ -622,6 +622,100 @@ def _fused_kb_block(Np, Nq):
     return int(min(_FUSED_KB_CAP, max(1, _FUSED_MEM_CAP_ELEMS // max(1, Np * Nq))))
 
 
+def _family_l_block(Np, Nq, n_rank, budget=_FUSED_MEM_CAP_ELEMS):
+    """l-block width for family assembly: T_lb = (Np, Nq, lb) stays under
+    ``budget`` elements (~4 GB fp64 default).  This is what lets vvoo-class
+    families (Np=Nq=nvir) run without the full (Np,Nq,n_rank) intermediate
+    that OOM'd the fused path at the 1200 deck.
+    """
+    return int(min(n_rank, max(1, budget // max(1, Np * Nq))))
+
+
+def _family_step1_k3(phi_p, phi_q, U3_lb, kb):
+    """T[p,q,l'] = sum_k phi_p[p,k] U3[k,l'] phi_q[q,k] for one l-slice,
+    summed in kb blocks along N_fused so the (Np,Nq,kb) pair-product is
+    the largest intermediate (never the full (Np,Nq,N_fused))."""
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    lb = U3_lb.shape[1]
+    T = jnp.zeros((Np, Nq, lb), dtype=phi_p.dtype)
+    for k0 in range(0, U3_lb.shape[0], kb):
+        k1 = min(k0 + kb, U3_lb.shape[0])
+        M = phi_p[:, k0:k1][:, None, :] * phi_q[:, k0:k1][None, :, :]
+        T = T + jnp.matmul(M.reshape(Np * Nq, k1 - k0),
+                           U3_lb[k0:k1]).reshape(Np, Nq, lb)
+    return T
+
+
+def family_contract_K3_isdf(phi_p, phi_q, tile_rs, U3):
+    """K3 assembly for a block family whose tiles all share the (p, q) domain.
+
+    The rank intermediate T[p,q,l] is built ONCE — U3 is read exactly once,
+    in l-blocks budgeted by ``_family_l_block`` — and every tile's output is
+    contracted from the device-resident T blocks.  The per-tile path this
+    replaces re-reads the full U3 for every tile of the family (~57 tiles
+    per family at the 1200 deck, ~3.7 GB per read).
+
+    tile_rs: list of (phi_r_i, phi_s_i) for each tile in the family.
+    Returns the list of (Np, Nq, Nr_i, Ns_i) tile outputs.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    N_fused, n_rank = U3.shape
+    lb = _family_l_block(Np, Nq, n_rank)
+    kb = _fused_kb_block(Np, Nq)
+    outs = [jnp.zeros((Np, Nq, r.shape[0], s.shape[0]), dtype=phi_p.dtype)
+            for r, s in tile_rs]
+    for l0 in range(0, n_rank, lb):
+        l1 = min(l0 + lb, n_rank)
+        U3_lb = U3[:, l0:l1]                                  # (N_fused, l)
+        T_lb = _family_step1_k3(phi_p, phi_q, U3_lb, kb)
+        for i, (phi_r_i, phi_s_i) in enumerate(tile_rs):
+            C_i = (phi_r_i[:, l0:l1][:, None, :]
+                   * phi_s_i[:, l0:l1][None, :, :])           # (Nr_i, Ns_i, l)
+            outs[i] = outs[i] + jnp.einsum('pql,rsl->pqrs', T_lb, C_i)
+    return outs
+
+
+def family_contract_K1_minus_K2_isdf(phi_p, phi_q, grad_phi_p, grad_phi_q,
+                                     tile_rs, U1):
+    """(K1 - K2) assembly for a block family whose tiles share (p, q).
+
+    Same one-read structure as ``family_contract_K3_isdf``: T_K1/T_K2 are
+    built once per l-block (three Cartesian components, U1 read once) and
+    all tiles are served from the device-resident T blocks.
+
+    tile_rs: list of (phi_r_i, phi_s_i).  Returns the list of tile outputs.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    N_fused, n_rank = U1.shape[0], U1.shape[1]
+    lb = _family_l_block(Np, Nq, n_rank)
+    kb = _fused_kb_block(Np, Nq)
+    outs = [jnp.zeros((Np, Nq, r.shape[0], s.shape[0]), dtype=phi_p.dtype)
+            for r, s in tile_rs]
+    for l0 in range(0, n_rank, lb):
+        l1 = min(l0 + lb, n_rank)
+        U1_lb = U1[:, l0:l1, :]                               # (N_fused, l, 3)
+        T1 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
+        T2 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
+        for c in range(3):
+            for k0 in range(0, N_fused, kb):
+                k1 = min(k0 + kb, N_fused)
+                uu = U1_lb[k0:k1, :, c]                       # (kb, l)
+                M1 = (grad_phi_p[:, k0:k1, c][:, None, :]
+                      * phi_q[:, k0:k1][None, :, :])          # (Np, Nq, kb)
+                M2 = (phi_p[:, k0:k1][:, None, :]
+                      * grad_phi_q[:, k0:k1, c][None, :, :])  # (Np, Nq, kb)
+                T1 = T1 + jnp.matmul(M1.reshape(Np * Nq, k1 - k0), uu
+                                     ).reshape(Np, Nq, l1 - l0)
+                T2 = T2 + jnp.matmul(M2.reshape(Np * Nq, k1 - k0), uu
+                                     ).reshape(Np, Nq, l1 - l0)
+        T_lb = T1 - T2
+        for i, (phi_r_i, phi_s_i) in enumerate(tile_rs):
+            C_i = (phi_r_i[:, l0:l1][:, None, :]
+                   * phi_s_i[:, l0:l1][None, :, :])           # (Nr_i, Ns_i, l)
+            outs[i] = outs[i] + jnp.einsum('pql,rsl->pqrs', T_lb, C_i)
+    return outs
+
+
 def _fused_r_block(Np, Nq, n_rank):
     """Pick the Step-2 r-block width R so the (Np, Nq, R, n_rank) intermediate
     stays under ``_FUSED_MEM_CAP_ELEMS`` elements.  Clamps to [1, _R_BLOCK_CAP].
