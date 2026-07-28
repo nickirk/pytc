@@ -646,6 +646,63 @@ def _family_step1_k3(phi_p, phi_q, U3_lb, kb):
     return T
 
 
+def family_step1_combined(phi_p, phi_q, grad_phi_p, grad_phi_q, U1, U3):
+    """T_c[p,q,l] = (T_K1 - T_K2 + T_K3) built ONCE over a (p, q) domain.
+
+    The (K1-K2) and K3 step-1 intermediates share the (p, q) pair-product
+    pass, so one sweep of U1 and U3 (each read exactly once, in kb blocks
+    along N_fused) produces the combined rank tensor the per-tile step-2
+    contractions are served from.  Intended for block families whose tiles
+    share (p, q); the caller is responsible for only using it on domains
+    where the full T_c fits the device (the cache in ``pytc.tc`` enforces
+    this and falls back to the per-tile scan otherwise).
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    N_fused, n_rank = U1.shape[0], U1.shape[1]
+    kb = _fused_kb_block(Np, Nq)
+    blocks = []
+    for l0 in range(0, n_rank, _family_l_block(Np, Nq, n_rank)):
+        l1 = min(l0 + _family_l_block(Np, Nq, n_rank), n_rank)
+        T1 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
+        T2 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
+        T3 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
+        for k0 in range(0, N_fused, kb):
+            k1 = min(k0 + kb, N_fused)
+            pp = phi_p[:, k0:k1]
+            qq = phi_q[:, k0:k1]
+            M_plain = pp[:, None, :] * qq[None, :, :]            # (Np, Nq, kb)
+            u3k = U3[k0:k1, l0:l1]
+            T3 = T3 + jnp.matmul(M_plain.reshape(Np * Nq, k1 - k0), u3k
+                                 ).reshape(Np, Nq, l1 - l0)
+            for c in range(3):
+                uu = U1[k0:k1, l0:l1, c]
+                M1 = grad_phi_p[:, k0:k1, c][:, None, :] * qq[None, :, :]
+                M2 = pp[:, None, :] * grad_phi_q[:, k0:k1, c][None, :, :]
+                T1 = T1 + jnp.matmul(M1.reshape(Np * Nq, k1 - k0), uu
+                                     ).reshape(Np, Nq, l1 - l0)
+                T2 = T2 + jnp.matmul(M2.reshape(Np * Nq, k1 - k0), uu
+                                     ).reshape(Np, Nq, l1 - l0)
+        blocks.append(T1 - T2 + T3)
+    if len(blocks) == 1:
+        return blocks[0]
+    return jnp.concatenate(blocks, axis=2)
+
+
+def family_step2_tile(T_c, phi_r, phi_s):
+    """out[p,q,r,s] = sum_l T_c[p,q,l] phi_r[r,l] phi_s[s,l], in l-blocks so
+    the (Nr, Ns, lb) pair-product stays small."""
+    Np, Nq, n_rank = T_c.shape
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+    lb = _family_l_block(Np, Nq, n_rank)
+    out = jnp.zeros((Np, Nq, Nr, Ns), dtype=T_c.dtype)
+    for l0 in range(0, n_rank, lb):
+        l1 = min(l0 + lb, n_rank)
+        C = (phi_r[:, l0:l1][:, None, :]
+             * phi_s[:, l0:l1][None, :, :])                     # (Nr, Ns, lb)
+        out = out + jnp.einsum('pql,rsl->pqrs', T_c[:, :, l0:l1], C)
+    return out
+
+
 def family_contract_K3_isdf(phi_p, phi_q, tile_rs, U3):
     """K3 assembly for a block family whose tiles all share the (p, q) domain.
 

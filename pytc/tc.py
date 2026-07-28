@@ -20,6 +20,57 @@ from . import kmat as kmat_jax
 from .utils import sharding_core
 from .utils import tile_timers as _tile_timers
 
+# Optional family-level TC assembly (PYTC_FAMILY_ASSEMBLY): for block
+# families whose tiles share the (p, q) orbital domain, the combined rank
+# tensor T_c = T_K1 - T_K2 + T_K3 is built once per family (each K matrix
+# read exactly once) and cached on device; per tile only the step-2
+# contraction runs.  The per-tile scan path this replaces re-reads the
+# full K matrices for EVERY tile (~57 tiles per family at the 1200 deck —
+# the measured dominant cost of the eris build).  Off by default:
+# bit-identical per-tile path.  Falls back per call when the tile is
+# antisymmetric or the domain's T_c would exceed the budget.
+_FAMILY_ASSEMBLY = os.environ.get("PYTC_FAMILY_ASSEMBLY", "").lower() in (
+    "1", "true", "yes")
+
+# Single-slot cache: at production (one GPU) a family's tiles run
+# sequentially, so one resident T_c is enough and memory stays bounded;
+# a new family's key evicts the old.  Correct (just slower) if tiles
+# interleave across families on multi-GPU.
+_FAMILY_T_CACHE = {}
+
+
+def _slice_key(s):
+    return (getattr(s, "start", None), getattr(s, "stop", None))
+
+
+def _family_direct_tile(xtc_self, kernels, phi_p, phi_q, grad_phi_p,
+                        grad_phi_q, phi_r, phi_s, u1, u3, slice_p, slice_q,
+                        device):
+    """Direct TC tile via the family T_c cache; None → caller falls back."""
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    n_rank = u3.shape[1]
+    # Safety valve: only serve domains whose T_c fits the budget (with
+    # working room); larger domains keep the per-tile scan.
+    if Np * Nq * n_rank > 4 * kmat_jax._FUSED_MEM_CAP_ELEMS:
+        return None
+    # The key must capture the PADDED row counts, not just the slices: the
+    # same (p, q) slices reach here with different panel_layout padding
+    # (e.g. "qr" pads q, "ps" pads p), and a T_c built for one padded
+    # shape is the wrong array for another.
+    key = (id(kernels), _slice_key(slice_p), _slice_key(slice_q), Np, Nq)
+    T_c = _FAMILY_T_CACHE.get(key)
+    if T_c is None:
+        _FAMILY_T_CACHE.clear()
+        with _tile_timers.term("tc_family_step1") as _tt:
+            T_c = kmat_jax.family_step1_combined(
+                phi_p, phi_q, grad_phi_p, grad_phi_q, u1, u3)
+            _tt.sync(T_c)
+        _FAMILY_T_CACHE[key] = T_c
+    with _tile_timers.term("tc_family_step2") as _tt:
+        result = kmat_jax.family_step2_tile(T_c, phi_r, phi_s)
+        _tt.sync(result)
+    return 0.5 * result
+
 logger = logging.getLogger(__name__)
 
 # Module-level cache for the fixed rank_block_size computed once per
@@ -1834,7 +1885,18 @@ class ISDFTC(TC):
         q_len_out = phi_q.shape[0]
 
         with device_ctx:
-            if slice_p == slice_q:
+            # Family-assembly path (PYTC_FAMILY_ASSEMBLY): serve the tile
+            # from the per-family T_c cache instead of re-scanning the K
+            # matrices per tile.  Antisymmetric tiles and over-budget
+            # domains fall through to the per-tile scan.
+            _fam_result = None
+            if (_FAMILY_ASSEMBLY and panel_size is not None
+                    and slice_p != slice_q):
+                _fam_result = _family_direct_tile(
+                    self, kernels, phi_p, phi_q, grad_phi_p, grad_phi_q,
+                    phi_r, phi_s, u1, u3, slice_p, slice_q, device)
+
+            if slice_p == slice_q and _fam_result is None:
                 # The antisymmetrization ``k12 - k12.T(1,0,2,3)`` requires
                 # ``phi_p.shape[0] == phi_q.shape[0]``.  Panel padding can
                 # violate that when ``nocc < panel_blk`` and the layout
@@ -1857,28 +1919,32 @@ class ISDFTC(TC):
                         panel_size=k_panel)
                     _tt.sync(k12)
             else:
-                with _tile_timers.term("tc_k1_minus_k2") as _tt:
-                    k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
-                        phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
-                        panel_size=k_panel, fused=fused)
-                    _tt.sync(k12)
+                if _fam_result is None:
+                    with _tile_timers.term("tc_k1_minus_k2") as _tt:
+                        k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
+                            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
+                            panel_size=k_panel, fused=fused)
+                        _tt.sync(k12)
 
             if panel_size is not None:
-                if _profile:
-                    jax.block_until_ready(k12)
-                    _t_k1 = time.perf_counter()
-                    logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
-                                 _t_k1 - _t_put)
-                with _tile_timers.term("tc_k3") as _tt:
-                    k3 = kmat_jax.contract_K3_isdf_streaming(
-                        phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
-                    _tt.sync(k3)
-                if _profile:
-                    jax.block_until_ready(k3)
-                    _t_k3 = time.perf_counter()
-                    logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
-                                 "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
-                result = 0.5 * (k12 + k3)
+                if _fam_result is not None:
+                    result = _fam_result
+                else:
+                    if _profile:
+                        jax.block_until_ready(k12)
+                        _t_k1 = time.perf_counter()
+                        logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
+                                     _t_k1 - _t_put)
+                    with _tile_timers.term("tc_k3") as _tt:
+                        k3 = kmat_jax.contract_K3_isdf_streaming(
+                            phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
+                        _tt.sync(k3)
+                    if _profile:
+                        jax.block_until_ready(k3)
+                        _t_k3 = time.perf_counter()
+                        logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
+                                     "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
+                    result = 0.5 * (k12 + k3)
                 # If the slice_p==slice_q branch re-padded phi_p/phi_q to
                 # equalise them, slice axes 0/1 back to the caller-expected
                 # extents so the tile matches the panel_layout convention.
