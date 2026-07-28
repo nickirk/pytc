@@ -434,8 +434,12 @@ class StagedEta:
 
     COST: the q-major layout this replaces made a flush a last-axis slice --
     Nk*Nip runs of ncols*itemsize scattered over the whole file. Measured on
-    NFS at 333 that ran ~30-40 MiB/s against ~1.9 GB/s for the same bytes
-    written contiguously.
+    NFS at the 333 geometry (155 GiB extent, 2.83 MiB stride, 64 KiB runs),
+    same node and same bytes, only the access pattern differing:
+    43.5 MiB/s q-major against 807.2 MiB/s appended whole -- 18.6x. The cost
+    tracks stride distance and file extent, not run length: sizing the probe
+    file to the bytes written shrinks the stride, the runs coalesce, and the
+    effect disappears.
     """
 
     def __init__(self, path, n_kpts, n_ip, n_grid, record_cols):
