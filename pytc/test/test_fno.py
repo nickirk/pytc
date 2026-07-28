@@ -64,7 +64,15 @@ class TestMakeFNOMoCoeff(unittest.TestCase):
 
     def test_occ_threshold_matches_n_keep(self):
         r4 = make_fno_mo_coeff(self.mf, n_keep=4)
-        thr = float(r4.no_occ[3])  # 4th-largest occupation
+        # Threshold at the MIDPOINT of the 4th and 5th occupations, not at
+        # the raw 4th-largest value: the occ_threshold call recomputes the
+        # MP2 RDM and eigensolver from scratch, and the last digits of the
+        # occupations drift with the platform BLAS/LAPACK build, so a
+        # zero-margin threshold intermittently drops the 4th NO (observed
+        # as a 3 >= 4 failure on one CI dependency set).  Any value strictly
+        # between occ[3] and occ[4] selects exactly the intended set, with
+        # half the eigengap as margin on each side.
+        thr = float(0.5 * (r4.no_occ[3] + r4.no_occ[4]))
         r_thr = make_fno_mo_coeff(self.mf, occ_threshold=thr)
         self.assertGreaterEqual(r_thr.n_keep, 4)
         np.testing.assert_allclose(np.sort(r_thr.no_occ[r_thr.kept_mask])[::-1],
