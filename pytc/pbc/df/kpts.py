@@ -249,9 +249,20 @@ def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
     return max_residual
 
 
-# Columns per k-transform tile. Nk * tile * 16 B is the complex working set the
-# GEMM touches at once; 65536 keeps it at ~8 MB for Nk=8, inside L2/L3 on the
-# production node. Larger tiles regain the strided-gather behaviour this avoids.
+# Columns per k-transform tile: Nk * tile * 16 B is the working set touched at once,
+# ~8 MB here for Nk=8.
+#
+# MEASURED, and the number is disappointing: tiling bought ~nothing at production
+# width on a 48-core node -- +2.5%/+10%/-2.8% of full-kernel rate at block widths
+# 256/1024/4096 (JID 59342200, GEMM-only control clean). The transform is not where
+# the post-GEMM time goes. At width 4096 the post-GEMM phase costs ~33 s, of which
+# this transform is at most ~3 s; the rest is ~57 GB of traffic BETWEEN the stages
+# of pair_convolve, each materialising a multi-GB temporary. Fusing that chain, not
+# tuning this constant, is what would move it.
+#
+# This value is also NOT tuned on the production machine -- a smaller tile measured
+# better on a laptop. Cache-blocking constants are machine-specific; treat it as a
+# starting point and measure on the target before trusting it.
 _SPC_TILE_COLS = 1 << 16
 
 
@@ -281,15 +292,16 @@ def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
     n_cols = flat.shape[1]
     out = np.empty((n_k, n_cols), dtype=np.float64)
 
-    # COST: the whole-array spelling of this transform contracts over k, which is
-    # the SLOWEST axis -- one output column gathers Nk inputs n_cols apart, so at
-    # the 333 eta shape the operands sit ~1 GB apart and the kernel measured
-    # 2.3 GFLOP/s regardless of block width (JIDs 59341401/59341496). Tiling the
-    # flattened axis keeps each block's Nk slices cache-resident, and folding the
-    # gate norms into the same sweep removes two further full traversals.
-    # Writing a CONTIGUOUS real result matters as much: the previous `.real`
+    # This transform contracts over k, the array's SLOWEST axis, so one output
+    # column gathers Nk inputs n_cols apart -- ~1 GB apart at the 333 eta shape.
+    # Tiling keeps each block's Nk slices resident and folds the gate norms into
+    # the same sweep, and the result is written CONTIGUOUS: the previous `.real`
     # returned a strided view, so every downstream elementwise op and matmul
     # loaded 16 bytes per 8 it used.
+    #
+    # Do not read the tiling as a fix for the stage's cost -- measured, it was
+    # worth ~nothing at production width (see _SPC_TILE_COLS). The contiguity and
+    # the dropped intermediate copies are the parts that pay here.
     sq_im = 0.0
     sq_total = 0.0
     for start in range(0, n_cols, _SPC_TILE_COLS):
