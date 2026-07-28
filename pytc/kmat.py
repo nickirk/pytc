@@ -1,8 +1,18 @@
 """JAX implementation of kinetic matrix elements."""
 from functools import partial
+import os
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+# Optional GEMM-shape experiment (PYTC_PAD_ORB_TO): pad the orbital row
+# dims of the scan kernels' inputs up to a multiple of this value before
+# the contraction and slice the output back.  Off (0/unset) by default —
+# bit-identical path.  The eris build's K1/K2/K3 GEMMs run with
+# nocc=21-row panels, far below tensor-core tile utilization; this lever
+# measures how much of their wall is GEMM-shape overhead vs memory
+# traffic (the C2-vs-C3 question).
+_PAD_ORB_TO = int(os.environ.get("PYTC_PAD_ORB_TO", "0") or "0")
 
 def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
     r"""Calculate K1 matrix: K1_{pqrs} = \sum_{i,j} w_i w_j \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
@@ -806,6 +816,25 @@ def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
         return contract_K1_minus_K2_isdf_fused(
             phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1)
 
+    if _PAD_ORB_TO > 0:
+        np0, nq0, nr0, ns0 = (phi_p.shape[0], phi_q.shape[0],
+                              phi_r.shape[0], phi_s.shape[0])
+        phi_p = _pad_orb_to_multiple(phi_p, _PAD_ORB_TO)
+        phi_q = _pad_orb_to_multiple(phi_q, _PAD_ORB_TO)
+        grad_phi_p = _pad_orb_to_multiple(grad_phi_p, _PAD_ORB_TO)
+        grad_phi_q = _pad_orb_to_multiple(grad_phi_q, _PAD_ORB_TO)
+        phi_r = _pad_orb_to_multiple(phi_r, _PAD_ORB_TO)
+        phi_s = _pad_orb_to_multiple(phi_s, _PAD_ORB_TO)
+        if rank_block_size is None:
+            from pytc.utils.gpu_memory import adaptive_rank_block_size
+            rank_block_size = adaptive_rank_block_size(
+                phi_p.shape[0], phi_q.shape[0], U1.shape[0],
+                gpu_max_memory_mb=gpu_max_memory_mb)
+        result = contract_K1_minus_K2_isdf_jit(
+            phi_p, phi_q, phi_r, phi_s,
+            grad_phi_p, grad_phi_q, U1, rank_block_size)
+        return result[:np0, :nq0, :nr0, :ns0]
+
     if rank_block_size is None:
         from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(
@@ -948,6 +977,14 @@ def _pad_axis(arr, axis, pad):
     if isinstance(arr, np.ndarray):
         return np.pad(arr, pad_width)
     return jnp.pad(arr, pad_width)
+
+
+def _pad_orb_to_multiple(a, multiple):
+    """Pad rows (axis 0) of ``a`` up to a multiple of ``multiple``; no-op
+    when already aligned.  Zero rows contribute exactly nothing to the
+    contraction, so slicing them off afterwards restores the result."""
+    rem = a.shape[0] % multiple
+    return _pad_axis(a, 0, multiple - rem) if rem else a
 
 
 def _stream_l_panels(U, phi_r, phi_s, panel_size):
@@ -1112,6 +1149,21 @@ def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
     
     if fused:
         return contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3)
+
+    if _PAD_ORB_TO > 0:
+        np0, nq0, nr0, ns0 = (phi_p.shape[0], phi_q.shape[0],
+                              phi_r.shape[0], phi_s.shape[0])
+        phi_p = _pad_orb_to_multiple(phi_p, _PAD_ORB_TO)
+        phi_q = _pad_orb_to_multiple(phi_q, _PAD_ORB_TO)
+        phi_r = _pad_orb_to_multiple(phi_r, _PAD_ORB_TO)
+        phi_s = _pad_orb_to_multiple(phi_s, _PAD_ORB_TO)
+        if rank_block_size is None:
+            from pytc.utils.gpu_memory import adaptive_rank_block_size
+            rank_block_size = adaptive_rank_block_size(
+                phi_p.shape[0], phi_q.shape[0], U3.shape[0],
+                gpu_max_memory_mb=gpu_max_memory_mb)
+        result = contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size)
+        return result[:np0, :nq0, :nr0, :ns0]
 
     if rank_block_size is None:
         from pytc.utils.gpu_memory import adaptive_rank_block_size
