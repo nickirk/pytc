@@ -39,20 +39,22 @@ from typing import Dict, Any, Optional
 from .metropolis import make_mcmc_step, make_mcmc_step_importance
 from .walker import initialize_walkers
 from .sampling import burn_in, burn_in_with_importance
-from .optimizer import create_optimizer, create_gradient_mask
+from .optimizer import apply_gradient_mask, create_gradient_mask, create_optimizer
 from .loss import make_energy_loss, make_variance_loss
 from .mcmc_utils import save_optimization_history
 
 logger = logging.getLogger(__name__)
 
 
-def make_opt_update_step(loss_fn, optimizer):
+def make_opt_update_step(loss_fn, optimizer, gradient_mask=None):
     """Factory to create a JIT-compilable optimizer step for Optax optimizers.
     
     Args:
         loss_fn: Loss function with signature (params, walkers) -> (loss, aux_data)
                  where aux_data is a tuple of auxiliary outputs
         optimizer: Optax optimizer (e.g., optax.adam)
+        gradient_mask: Optional boolean PyTree matching the parameters. Gradients
+                       at ``False`` leaves are zeroed before the optimizer update.
     
     Returns:
         A JIT-compiled function with signature:
@@ -78,8 +80,10 @@ def make_opt_update_step(loss_fn, optimizer):
         """
         # Note: loss_fn expects (params, walkers), ansatz is baked in or handled via wrapper
         (loss, aux_data), grads = loss_and_grad(params, walkers)
+        grads = apply_gradient_mask(grads, gradient_mask)
         
         updates, opt_state = optimizer.update(grads, opt_state, params)
+        updates = apply_gradient_mask(updates, gradient_mask)
         new_params = optax.apply_updates(params, updates)
         
         return new_params, opt_state, loss, aux_data
@@ -331,12 +335,20 @@ def optimize(
         learning_rate: Learning rate for optimizer
         optimizer_type: Type of optimizer ("adam", "sgd", etc.)
         opt_kwargs: Additional optimizer parameters
+        frozen_params: Jastrow indices, class names, or instance names to freeze.
+                       Supported by Optax optimizers, but not Newton.
         jastrow_params: Initial Jastrow parameters
         linear_coeffs: Initial linear coefficients
     
     Returns:
         Dictionary with optimization results and statistics
     """
+    if optimizer_type.lower() == "newton" and frozen_params:
+        raise NotImplementedError(
+            "frozen_params is not supported by the Newton optimizer; "
+            "use an Optax optimizer such as adam or sgd"
+        )
+
     if key is None:
         key = random.PRNGKey(int(time.time()))
     
@@ -439,14 +451,9 @@ def optimize(
         optimizer = create_optimizer(optimizer_type, learning_rate, opt_kwargs)
         opt_state = optimizer.init(params)
         
-        if gradient_mask is not None:
-            # No-op passthrough wrapper; gradient masking is not applied here
-            original_loss_fn = internal_loss_fn
-            def masked_loss_fn(params_inner, batch_data):
-                return original_loss_fn(params_inner, batch_data)
-            internal_loss_fn = masked_loss_fn
-        
-        opt_update_step = make_opt_update_step(internal_loss_fn, optimizer)
+        opt_update_step = make_opt_update_step(
+            internal_loss_fn, optimizer, gradient_mask=gradient_mask
+        )
         training_step = make_training_step(
             mcmc_step, opt_update_step, n_mcmc_per_opt=n_steps, n_opt_per_mcmc=1
         )
