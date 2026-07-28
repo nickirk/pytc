@@ -10,6 +10,7 @@ import numpy as np
 from pyscf.pbc.gto import Cell
 
 from pytc.pbc.df.kpts import (
+    _SPC_TILE_COLS,
     pair_convolve_device,
     KptsMesh,
     canonicalize_kpts,
@@ -373,3 +374,60 @@ class TestPairConvolveDevice(unittest.TestCase):
             pair_convolve_device(X[0], Y, phase)
         with self.assertRaises(ValueError):
             pair_convolve_device(X, Y, phase[:, :3])
+
+
+class TestKTransformTiling(unittest.TestCase):
+    """The k-transforms tile the flattened axis for cache locality. Tiling must
+    not perturb a single bit, and the result must stay contiguous -- the version
+    this replaced returned a strided `.real` view that made every downstream
+    elementwise op read 16 bytes per 8 it used."""
+
+    @staticmethod
+    def _phase(n_k):
+        w = np.exp(2j * np.pi * np.outer(np.arange(n_k), np.arange(n_k)) / n_k)
+        return w / np.sqrt(n_k)
+
+    @staticmethod
+    def _whole_array_kpt_to_spc(m, phase):
+        n_k = m.shape[0]
+        return (phase @ m.reshape(n_k, -1)).reshape((n_k,) + m.shape[1:]).real
+
+    @staticmethod
+    def _whole_array_spc_to_kpt(m, phase):
+        n_k = m.shape[0]
+        out = (phase.conj().T @ m.reshape(n_k, -1)).reshape((n_k,) + m.shape[1:])
+        return out.astype(np.complex128)
+
+    def test_bit_identical_across_tile_boundaries(self):
+        n_k = 8
+        phase = self._phase(n_k)
+        rng = np.random.default_rng(0)
+        # Straddle the boundary in both directions and land exactly on it.
+        for n_cols in (17, _SPC_TILE_COLS - 1, _SPC_TILE_COLS,
+                       _SPC_TILE_COLS + 1, 2 * _SPC_TILE_COLS + 5):
+            with self.subTest(n_cols=n_cols):
+                spc = rng.standard_normal((n_k, 3, n_cols))
+                # Round-trip from real image data so the k-space input is
+                # time-reversal symmetric and clears kpt_to_spc's gate.
+                kpt = self._whole_array_spc_to_kpt(spc, phase)
+                np.testing.assert_array_equal(
+                    kpt_to_spc(kpt, phase), self._whole_array_kpt_to_spc(kpt, phase))
+                np.testing.assert_array_equal(
+                    spc_to_kpt(spc, phase), self._whole_array_spc_to_kpt(spc, phase))
+
+    def test_results_are_contiguous(self):
+        n_k = 8
+        phase = self._phase(n_k)
+        spc = np.random.default_rng(1).standard_normal((n_k, 3, _SPC_TILE_COLS + 9))
+        kpt = self._whole_array_spc_to_kpt(spc, phase)
+        self.assertTrue(kpt_to_spc(kpt, phase).flags["C_CONTIGUOUS"])
+        self.assertTrue(spc_to_kpt(spc, phase).flags["C_CONTIGUOUS"])
+
+    def test_gate_still_fires_on_non_time_reversal_input(self):
+        n_k = 8
+        phase = self._phase(n_k)
+        rng = np.random.default_rng(2)
+        bad = (rng.standard_normal((n_k, 2, 40))
+               + 1j * rng.standard_normal((n_k, 2, 40)))
+        with self.assertRaises(ValueError):
+            kpt_to_spc(bad, phase)

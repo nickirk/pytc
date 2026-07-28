@@ -249,6 +249,12 @@ def check_time_reversal_residual(ao_at_kpts, neg, *, tol=1e-10):
     return max_residual
 
 
+# Columns per k-transform tile. Nk * tile * 16 B is the complex working set the
+# GEMM touches at once; 65536 keeps it at ~8 MB for Nk=8, inside L2/L3 on the
+# production node. Larger tiles regain the strided-gather behaviour this avoids.
+_SPC_TILE_COLS = 1 << 16
+
+
 def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
     """Unitary transform k-space -> supercell-image space:
     m_spc = (phase @ m_kpt).real. NOT a plain np.fft.ifftn reshape --
@@ -271,10 +277,34 @@ def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
         raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
     trailing_shape = m_kpt.shape[1:]
-    m_spc_complex = (phase @ m_kpt.reshape(n_k, -1)).reshape((n_k,) + trailing_shape)
+    flat = m_kpt.reshape(n_k, -1)
+    n_cols = flat.shape[1]
+    out = np.empty((n_k, n_cols), dtype=np.float64)
 
-    norm_im = float(np.linalg.norm(m_spc_complex.imag))
-    norm_total = float(np.linalg.norm(m_spc_complex))
+    # COST: the whole-array spelling of this transform contracts over k, which is
+    # the SLOWEST axis -- one output column gathers Nk inputs n_cols apart, so at
+    # the 333 eta shape the operands sit ~1 GB apart and the kernel measured
+    # 2.3 GFLOP/s regardless of block width (JIDs 59341401/59341496). Tiling the
+    # flattened axis keeps each block's Nk slices cache-resident, and folding the
+    # gate norms into the same sweep removes two further full traversals.
+    # Writing a CONTIGUOUS real result matters as much: the previous `.real`
+    # returned a strided view, so every downstream elementwise op and matmul
+    # loaded 16 bytes per 8 it used.
+    sq_im = 0.0
+    sq_total = 0.0
+    for start in range(0, n_cols, _SPC_TILE_COLS):
+        stop = min(start + _SPC_TILE_COLS, n_cols)
+        tile = phase @ flat[:, start:stop]
+        tile_im = tile.imag
+        out[:, start:stop] = tile.real
+        sq_im += float(np.vdot(tile_im, tile_im))
+        sq_total += float(np.vdot(tile, tile).real)
+
+    norm_im = math.sqrt(sq_im)
+    norm_total = math.sqrt(sq_total)
+    # INVARIANT: the gate ratio is accumulated per tile, so it can differ from the
+    # whole-array reduction by a few ULP. The returned data is unaffected -- only
+    # this comparison is, and it is a tolerance test, not an equality.
     imchk = norm_im / norm_total if norm_total > 0.0 else norm_im
     if imchk > imag_tol:
         raise ValueError(
@@ -282,7 +312,7 @@ def kpt_to_spc(m_kpt, phase, *, imag_tol=1e-10):
             f"-- m_kpt does not appear to be a valid time-reversal-symmetric collection "
             f"(m_kpt[neg[k]] should equal conj(m_kpt[k]))."
         )
-    return m_spc_complex.real
+    return out.reshape((n_k,) + trailing_shape)
 
 
 def spc_to_kpt(m_spc, phase):
@@ -297,8 +327,19 @@ def spc_to_kpt(m_spc, phase):
         raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
 
     trailing_shape = m_spc.shape[1:]
-    m_kpt = (phase.conj().T @ m_spc.reshape(n_k, -1)).reshape((n_k,) + trailing_shape)
-    return m_kpt.astype(np.complex128)
+    flat = m_spc.reshape(n_k, -1)
+    n_cols = flat.shape[1]
+    out = np.empty((n_k, n_cols), dtype=np.complex128)
+
+    # Same tiling and the same reason as kpt_to_spc. Writing into a preallocated
+    # complex128 buffer also drops the trailing astype, which copied the whole
+    # result a second time -- 8.2 GB at the 333 eta block shape -- because the
+    # matmul against a complex phase already produced complex128.
+    phase_h = phase.conj().T
+    for start in range(0, n_cols, _SPC_TILE_COLS):
+        stop = min(start + _SPC_TILE_COLS, n_cols)
+        out[:, start:stop] = phase_h @ flat[:, start:stop]
+    return out.reshape((n_k,) + trailing_shape)
 
 
 @partial(jax.jit, static_argnames=("imag_tol",))
