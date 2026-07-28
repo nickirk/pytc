@@ -527,6 +527,11 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
         "staging_block": int(staging_block),
         "write_run_bytes": int(staging_block) * np.dtype(np.complex128).itemsize,
         "write_seconds": float(write_seconds),
+        # write_seconds times the memmap slice assignment, which is a memcpy
+        # into page cache plus the final flush -- not necessarily bytes landing
+        # on disk. Treat write_gb_per_s as a relative signal for spotting stalls
+        # within a run, not as filesystem throughput; allocated-blocks-over-time
+        # (du) is the only cache-proof measure.
         "write_gb_per_s": (float(bytes_written) / 1e9 / write_seconds
                            if write_seconds > 0 else None),
         "n_flushes": int(n_flushes),
