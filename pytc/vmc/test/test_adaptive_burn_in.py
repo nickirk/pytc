@@ -3,6 +3,7 @@ import unittest
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 from pyscf import gto, scf
 
@@ -77,6 +78,101 @@ class TestAdaptiveBurnIn(unittest.TestCase):
         )
         self.assertEqual(total_steps, 60)
         self.assertTrue(all(h["mean_energy"] is None for h in history))
+
+    def test_step_size_adapts_between_chunks_on_chunk_mean(self):
+        """The between-chunk controller must pull step_size toward the
+        acceptance target from both sides: starting far apart, two runs
+        with the same seed must end closer together than they started."""
+        walkers, key = self._fresh_walkers(seed=3)
+        _, _, _, size_small, _ = adaptive_burn_in(
+            self.det, self.sj, walkers, self.params, step_size=0.01, key=key,
+            chunk_size=20, max_steps=60, acceptance_tol=0.5,
+            stability_window=2, energy_stability_atol=0.0,
+            variance_stability_rtol=0.0,
+        )
+        walkers, key = self._fresh_walkers(seed=3)
+        _, _, _, size_large, _ = adaptive_burn_in(
+            self.det, self.sj, walkers, self.params, step_size=0.5, key=key,
+            chunk_size=20, max_steps=60, acceptance_tol=0.5,
+            stability_window=2, energy_stability_atol=0.0,
+            variance_stability_rtol=0.0,
+        )
+        self.assertLess(size_large / size_small, 0.5 / 0.01)
+
+    def test_oversized_step_never_zeros_step_size(self):
+        """Regression: with a wildly oversized initial step (acceptance ~0)
+        the old unclipped single-step controller could drive step_size to
+        exactly 0, killing the chain permanently. The clipped chunk-mean
+        controller must keep it positive and shrinking."""
+        walkers, key = self._fresh_walkers(seed=4)
+        _, _, _, step_size, _ = adaptive_burn_in(
+            self.det, self.sj, walkers, self.params, step_size=100.0, key=key,
+            chunk_size=20, max_steps=60, acceptance_tol=0.5,
+            stability_window=2, energy_stability_atol=0.0,
+            variance_stability_rtol=0.0,
+        )
+        self.assertGreater(step_size, 0.0)
+        self.assertLess(step_size, 100.0)
+
+    def test_no_adaptation_before_first_complete_interval(self):
+        """With n_steps < report_interval, no adaptation may fire at all --
+        in particular not at step 0 off a single acceptance sample."""
+        from pytc.vmc.sampling import burn_in
+        walkers, key = self._fresh_walkers(seed=6)
+        _, _, _, step_size = burn_in(
+            self.det, walkers, n_steps=5, step_size=0.02, key=key,
+            params=self.params, report_interval=10,
+        )
+        self.assertEqual(step_size, 0.02)
+
+    def test_first_complete_interval_uses_all_interval_samples(self):
+        """After exactly one full interval, the returned step_size must
+        equal initial * clip(mean(all interval acceptances) / 0.5)."""
+        from pytc.vmc.sampling import burn_in
+        walkers, key = self._fresh_walkers(seed=7)
+        _, acc_hist, _, step_size = burn_in(
+            self.det, walkers, n_steps=10, step_size=0.02, key=key,
+            params=self.params, report_interval=10,
+        )
+        self.assertEqual(len(acc_hist), 10)
+        expected = 0.02 * float(np.clip(np.mean(acc_hist) / 0.5, 0.5, 2.0))
+        self.assertAlmostEqual(step_size, expected, places=12)
+
+    def test_acceptance_target_zero_rejected(self):
+        """acceptance_target=0 would divide by zero in the step-size
+        controller; it must raise ValueError instead."""
+        walkers, key = self._fresh_walkers(seed=8)
+        with self.assertRaises(ValueError):
+            adaptive_burn_in(
+                self.det, self.sj, walkers, self.params, step_size=0.02,
+                key=key, chunk_size=20, max_steps=40, acceptance_target=0.0,
+            )
+
+    def test_nonpositive_chunk_and_max_steps_rejected(self):
+        """chunk_size<=0 never advances total_steps (infinite loop) and
+        max_steps<=0 is meaningless; both must raise ValueError."""
+        walkers, key = self._fresh_walkers(seed=9)
+        with self.assertRaises(ValueError):
+            adaptive_burn_in(
+                self.det, self.sj, walkers, self.params, step_size=0.02,
+                key=key, chunk_size=0, max_steps=40,
+            )
+        with self.assertRaises(ValueError):
+            adaptive_burn_in(
+                self.det, self.sj, walkers, self.params, step_size=0.02,
+                key=key, chunk_size=20, max_steps=0,
+            )
+
+    def test_burn_in_honours_adapt_step_size_false(self):
+        """burn_in with adapt_step_size=False must return the initial
+        step_size unchanged (controller owned by the caller)."""
+        from pytc.vmc.sampling import burn_in
+        walkers, key = self._fresh_walkers(seed=5)
+        _, _, _, step_size = burn_in(
+            self.det, walkers, n_steps=10, step_size=0.02, key=key,
+            params=self.params, report_interval=5, adapt_step_size=False,
+        )
+        self.assertEqual(step_size, 0.02)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,8 @@ def burn_in(ansatz,
             report_interval=100, 
             move_type="one",
             max_vmap_batch_size=0,
-            mesh=None):
+            mesh=None,
+            adapt_step_size=True):
     """Perform burn-in steps for MCMC sampling.
     
     Args:
@@ -50,10 +51,18 @@ def burn_in(ansatz,
         step_size: Step size for MCMC proposals, std dev of Gaussian
         key: PRNG key
         params: Parameters for the ansatz, including jastrow and linear coefficients
-        report_interval: How often to print progress
+        report_interval: How often to print progress (and, when
+            adapt_step_size is True, how often to adapt step_size)
+        adapt_step_size: Adapt step_size after each COMPLETED
+            report_interval window, using the mean acceptance over that
+            window (never before the first window completes). Callers that
+            adapt step_size themselves between calls (e.g. adaptive_burn_in,
+            which adapts once per chunk on the chunk-mean acceptance) pass
+            False so the two controllers don't fight.
     
     Returns:
-        Tuple of (equilibrated_walkers, acceptance_history, new_key)
+        Tuple of (equilibrated_walkers, acceptance_history, new_key,
+        step_size) — step_size reflects any adaptation during the burn-in.
     """
     acceptance_history = []
     
@@ -123,9 +132,12 @@ def burn_in(ansatz,
         
         if step % report_interval == 0:
             logger.info(f"Burn-in step {step}/{n_steps}, acceptance: {acceptance_float:.3f}, time: {time.time() - start_time:.2f}s")
-            step_size *= acceptance_float / 0.5
             start_time = time.time()
             gc.collect()
+        if adapt_step_size and (step + 1) % report_interval == 0:
+            recent = acceptance_history[-report_interval:]
+            mean_acceptance = float(np.mean(recent))
+            step_size *= float(np.clip(mean_acceptance / 0.5, 0.5, 2.0))
     
     logger.info("Burn-in complete.")
     return walkers, acceptance_history, key, step_size
@@ -185,8 +197,10 @@ def adaptive_burn_in(
         step_size: Initial MCMC proposal step size.
         key: PRNG key.
         move_type, max_vmap_batch_size, mesh: forwarded to burn_in.
-        chunk_size: Sweeps per chunk (one step-size adaptation and one
-                stability check per chunk).
+        chunk_size: Sweeps per chunk (one stability check per chunk, and
+                one step-size adaptation per chunk using the chunk-MEAN
+                acceptance -- burn_in's internal per-interval adaptation
+                is disabled here so the two controllers don't fight).
         max_steps: Hard cap on total sweeps; the stability criterion, not
                 the cap, should normally terminate.
         acceptance_target: Pre-gate center, matching burn_in's step-size
@@ -208,6 +222,18 @@ def adaptive_burn_in(
     """
     if key is None:
         key = random.PRNGKey(int(time.time()))
+    if not (0.0 < acceptance_target <= 1.0):
+        raise ValueError(
+            f"acceptance_target must be a probability in (0, 1]; got "
+            f"{acceptance_target!r} (it is the divisor of the step-size "
+            f"controller and the centre of the acceptance pre-gate).")
+    if chunk_size <= 0:
+        raise ValueError(
+            f"chunk_size must be positive; got {chunk_size!r} (a non-positive "
+            f"chunk never advances total_steps and would loop forever).")
+    if max_steps <= 0:
+        raise ValueError(
+            f"max_steps must be positive; got {max_steps!r}.")
 
     vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     batch_local_energy = jax.jit(vmap_fn(
@@ -227,9 +253,12 @@ def adaptive_burn_in(
             ref_det, walkers, this_chunk, step_size, key, params=params,
             report_interval=chunk_size, move_type=move_type,
             max_vmap_batch_size=max_vmap_batch_size, mesh=mesh,
+            adapt_step_size=False,
         )
         total_steps += this_chunk
         chunk_acceptance = float(np.mean(acc_hist)) if acc_hist else None
+        if chunk_acceptance is not None:
+            step_size *= float(np.clip(chunk_acceptance / acceptance_target, 0.5, 2.0))
 
         record = {"steps_so_far": total_steps, "acceptance": chunk_acceptance,
                    "mean_energy": None, "variance": None}
@@ -289,7 +318,8 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
         report_interval: How often to print progress
     
     Returns:
-        Tuple of (equilibrated_walkers, acceptance_history, new_key)
+        Tuple of (equilibrated_walkers, acceptance_history, new_key,
+        time_step)
     """
     acceptance_history = []
     if n_steps <= 0:
