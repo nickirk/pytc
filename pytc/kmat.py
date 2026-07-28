@@ -591,6 +591,20 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
 _FUSED_MEM_CAP_ELEMS = 500_000_000
 # Upper cap on the Step-2 r-block width before the budget shrinks it further.
 _FUSED_R_BLOCK_CAP = 128
+# Upper cap on the Step-1 kb width (keeps the pair-product GEMM shapes sane
+# on small decks, where the budget alone would allow a full-width block).
+_FUSED_KB_CAP = 4096
+
+
+def _fused_kb_block(Np, Nq):
+    """Pick the Step-1 kb width so the (Np, Nq, kb) pair-product block stays
+    under ``_FUSED_MEM_CAP_ELEMS`` elements.  Clamps to [1, _FUSED_KB_CAP].
+
+    The (Np, Nq, N_fused) pair-product is rank-scaled and OOMs at large
+    decks (~239 GB at nvir=1179, N_fused=21467), so Step 1 sums it in kb
+    blocks along N_fused; small decks collapse to a single block.
+    """
+    return int(min(_FUSED_KB_CAP, max(1, _FUSED_MEM_CAP_ELEMS // max(1, Np * Nq))))
 
 
 def _fused_r_block(Np, Nq, n_rank):
@@ -643,19 +657,44 @@ def _contract_K1_minus_K2_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s,
 
     # --- Step 1: T_K1[p,q,l] = sum_{k,c} grad_phi_p[p,k,c] phi_q[q,k] U1[k,l,c]
     #             T_K2[p,q,l] = sum_{k,c} phi_p[p,k] grad_phi_q[q,k,c] U1[k,l,c]
-    # Contract the (p,q) orbital pair with phi FIRST -> M_c=(Np,Nq,N_fused),
-    # then GEMM over N_fused with U1[:,:,c] -> (Np*Nq, n_rank).  This never
-    # forms the (Np, N_fused, n_rank) intermediate that OOM'd (it is ~n_rank/Nq
-    # times larger), and there is no per-axis tiling loop for XLA to fuse back
-    # into a full-width op.  T_K2 is built directly in (p,q,l) order.
+    # Contract the (p,q) orbital pair with phi FIRST, but summed in kb blocks
+    # along N_fused inside a ROLLED fori_loop: the full (Np,Nq,N_fused)
+    # pair-product is rank-scaled and OOMs at large decks (~239 GB at
+    # nvir=1179, N_fused=21467), so only one (Np,Nq,kb) block is ever live
+    # and XLA cannot rematerialise the blocks into one full-width op.
+    # T_K2 is built directly in (p,q,l) order.
+    kb = _fused_kb_block(Np, Nq)
+    n_kb = (N_fused + kb - 1) // kb
+    Nf_pad = n_kb * kb
+    if Nf_pad != N_fused:
+        phi_p = jnp.pad(phi_p, ((0, 0), (0, Nf_pad - N_fused)))
+        phi_q = jnp.pad(phi_q, ((0, 0), (0, Nf_pad - N_fused)))
+        grad_phi_p = jnp.pad(grad_phi_p, ((0, 0), (0, Nf_pad - N_fused), (0, 0)))
+        grad_phi_q = jnp.pad(grad_phi_q, ((0, 0), (0, Nf_pad - N_fused), (0, 0)))
+        U1 = jnp.pad(U1, ((0, Nf_pad - N_fused), (0, 0), (0, 0)))
+
     T_K1 = jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype)
     T_K2 = jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype)
     for c in range(3):
-        U1c = U1[:, :, c]                                     # (N_fused, n_rank)
-        M1 = grad_phi_p[:, None, :, c] * phi_q[None, :, :]    # (Np, Nq, N_fused)
-        T_K1 = T_K1 + jnp.matmul(M1.reshape(Np * Nq, N_fused), U1c).reshape(Np, Nq, n_rank)
-        M2 = phi_p[:, None, :] * grad_phi_q[None, :, :, c]    # (Np, Nq, N_fused)
-        T_K2 = T_K2 + jnp.matmul(M2.reshape(Np * Nq, N_fused), U1c).reshape(Np, Nq, n_rank)
+        U1c = U1[:, :, c]                                     # (Nf_pad, n_rank)
+        gp_c = grad_phi_p[:, :, c]                            # (Np, Nf_pad)
+        gq_c = grad_phi_q[:, :, c]                            # (Nq, Nf_pad)
+
+        def step1_body(i, carry, U1c=U1c, gp_c=gp_c, gq_c=gq_c):
+            T1, T2 = carry
+            k0 = i * kb
+            pp = jax.lax.dynamic_slice(phi_p, (0, k0), (Np, kb))
+            qq = jax.lax.dynamic_slice(phi_q, (0, k0), (Nq, kb))
+            gp = jax.lax.dynamic_slice(gp_c, (0, k0), (Np, kb))
+            gq = jax.lax.dynamic_slice(gq_c, (0, k0), (Nq, kb))
+            uu = jax.lax.dynamic_slice(U1c, (k0, 0), (kb, n_rank))
+            M1 = gp[:, None, :] * qq[None, :, :]              # (Np, Nq, kb)
+            M2 = pp[:, None, :] * gq[None, :, :]              # (Np, Nq, kb)
+            T1 = T1 + jnp.matmul(M1.reshape(Np * Nq, kb), uu).reshape(Np, Nq, n_rank)
+            T2 = T2 + jnp.matmul(M2.reshape(Np * Nq, kb), uu).reshape(Np, Nq, n_rank)
+            return T1, T2
+
+        T_K1, T_K2 = jax.lax.fori_loop(0, n_kb, step1_body, (T_K1, T_K2))
     T_combined = T_K1 - T_K2                                   # (Np, Nq, n_rank)
 
     return _fused_step2_rblocked(T_combined, phi_r, phi_s, Np, Nq, Nr, Ns, n_rank)
@@ -667,17 +706,18 @@ def contract_K1_minus_K2_isdf_fused(phi_p, phi_q, phi_r, phi_s,
                                     mem_cap_elems=500_000_000):
     """Fused (K1 - K2) contraction with the ISDF rank contracted inside GEMMs.
 
-    Step 1 forms T[p,q,l] by contracting the (p,q) orbital pair with phi first
-    (intermediate (Np,Nq,N_fused)) then a GEMM over N_fused -- the old
-    (Np,N_fused,n_rank) tensor that OOM'd is never built.  Step 2 contracts T
-    against phi_r/phi_s in a rolled r-block fori_loop, writing disjoint slices
-    of the 4D output in place.
+    Step 1 forms T[p,q,l] by contracting the (p,q) orbital pair with phi
+    first, summed in kb blocks along N_fused inside a rolled fori_loop so
+    the (Np,Nq,N_fused) pair-product — itself rank-scaled, ~239 GB at
+    nvir=1179/N_fused=21467 — never exists in full.  Step 2 contracts T
+    against phi_r/phi_s in a rolled r-block fori_loop, writing disjoint
+    slices of the 4D output in place.
 
-    Memory-safe at scale by construction: no rank-scaled dense intermediate,
-    and the r-block width is budgeted via ``_FUSED_MEM_CAP_ELEMS``.  Small decks
-    collapse to a single r-block.  ``r_block_size`` / ``mem_cap_elems`` are
-    accepted for call-site compatibility; tiling is governed by the module
-    constants (kept off the jit static-arg path).
+    Memory-safe at scale by construction: every intermediate is budgeted
+    via ``_FUSED_MEM_CAP_ELEMS`` (kb and r-block widths derive from it).
+    Small decks collapse to single blocks.  ``r_block_size`` /
+    ``mem_cap_elems`` are accepted for call-site compatibility; tiling is
+    governed by the module constants (kept off the jit static-arg path).
     """
     if isinstance(U1, np.ndarray):
         U1 = jax.device_put(U1)
@@ -784,11 +824,29 @@ def _contract_K3_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s, U3):
     n_rank = U3.shape[1]
 
     # --- Step 1: T_K3[p,q,l] = sum_k phi_p[p,k] U3[k,l] phi_q[q,k] ---
-    # Contract (p,q) with phi FIRST -> M=(Np,Nq,N_fused), then GEMM over N_fused
-    # with U3 -> (Np*Nq, n_rank).  Never forms the (N_fused, n_rank, Nq) tensor
-    # that OOM'd; no tiling loop for XLA to fuse back to full width.
-    M = phi_p[:, None, :] * phi_q[None, :, :]                 # (Np, Nq, N_fused)
-    T_K3 = jnp.matmul(M.reshape(Np * Nq, N_fused), U3).reshape(Np, Nq, n_rank)
+    # Contract (p,q) with phi FIRST, summed in kb blocks along N_fused inside
+    # a ROLLED fori_loop: the full (Np, Nq, N_fused) pair-product is
+    # rank-scaled and OOMs at large decks (~239 GB at nvir=1179,
+    # N_fused=21467), so only one (Np,Nq,kb) block is ever live and XLA
+    # cannot rematerialise the blocks into one full-width op.
+    kb = _fused_kb_block(Np, Nq)
+    n_kb = (N_fused + kb - 1) // kb
+    Nf_pad = n_kb * kb
+    if Nf_pad != N_fused:
+        phi_p = jnp.pad(phi_p, ((0, 0), (0, Nf_pad - N_fused)))
+        phi_q = jnp.pad(phi_q, ((0, 0), (0, Nf_pad - N_fused)))
+        U3 = jnp.pad(U3, ((0, Nf_pad - N_fused), (0, 0)))
+
+    def step1_body(i, T):
+        k0 = i * kb
+        pp = jax.lax.dynamic_slice(phi_p, (0, k0), (Np, kb))
+        qq = jax.lax.dynamic_slice(phi_q, (0, k0), (Nq, kb))
+        uu = jax.lax.dynamic_slice(U3, (k0, 0), (kb, n_rank))
+        M = pp[:, None, :] * qq[None, :, :]                   # (Np, Nq, kb)
+        return T + jnp.matmul(M.reshape(Np * Nq, kb), uu).reshape(Np, Nq, n_rank)
+
+    T_K3 = jax.lax.fori_loop(0, n_kb, step1_body,
+                             jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype))
 
     return _fused_step2_rblocked(T_K3, phi_r, phi_s, Np, Nq, Nr, Ns, n_rank)
 
@@ -798,11 +856,12 @@ def contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3,
                              mem_cap_elems=500_000_000):
     """Fused K3 contraction with the ISDF rank contracted inside GEMMs.
 
-    Same construction as ``contract_K1_minus_K2_isdf_fused``: Step 1 contracts
-    (p,q) with phi first ((Np,Nq,N_fused)) then a GEMM over N_fused, so no
-    rank-scaled dense intermediate is formed; Step 2 is the rolled r-block
-    fori_loop.  Memory-safe by construction; small decks collapse to a single
-    r-block.
+    Same construction as ``contract_K1_minus_K2_isdf_fused``: Step 1
+    contracts (p,q) with phi first, summed in kb blocks along N_fused
+    inside a rolled fori_loop so the (Np,Nq,N_fused) pair-product — itself
+    rank-scaled, ~239 GB at nvir=1179/N_fused=21467 — never exists in
+    full; Step 2 is the rolled r-block fori_loop.  Memory-safe by
+    construction; small decks collapse to single blocks.
     """
     if isinstance(U3, np.ndarray):
         U3 = jax.device_put(U3)
