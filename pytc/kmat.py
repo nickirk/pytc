@@ -13,6 +13,11 @@ import numpy as np
 # measures how much of their wall is GEMM-shape overhead vs memory
 # traffic (the C2-vs-C3 question).
 _PAD_ORB_TO = int(os.environ.get("PYTC_PAD_ORB_TO", "0") or "0")
+if _PAD_ORB_TO > 0:
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "PYTC_PAD_ORB_TO=%d active: padding orbital rows to multiples "
+        "(GEMM-shape experiment)", _PAD_ORB_TO)
 
 def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=None, batch_size=1000):
     r"""Calculate K1 matrix: K1_{pqrs} = \sum_{i,j} w_i w_j \phi_p(i) \phi_q(i) \nabla_i u(i, j) \phi_r(j) \phi_s(j)
