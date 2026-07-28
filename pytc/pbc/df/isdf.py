@@ -486,6 +486,8 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
         eta[:, :, col0:col0 + pending_cols] = chunk
         return col0 + pending_cols, time.perf_counter() - started, chunk.nbytes
 
+    n_flushes = 0
+    stage_started = time.perf_counter()
     for block in ao_blocks:
         # [neg] commutes with the concatenation: it permutes axis 0.
         Z = pair_convolve(X, np.asarray(block), phase, imag_tol=imag_tol)[neg]
@@ -495,7 +497,17 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
             col0, dt, nb = _flush(pending, pending_cols, col0)
             write_seconds += dt
             bytes_written += nb
+            n_flushes += 1
             pending, pending_cols = [], 0
+            # Progress marker: without it this stage is silent for hours and a
+            # slow run is indistinguishable from a hung one.
+            logger.info(
+                "eta staging: %d/%d grid points (%.1f%%), %.2f GB written, "
+                "%.1f MiB/s inst, %.1f MiB/s cumulative",
+                col0, n_grid, 100.0 * col0 / n_grid, bytes_written / 1e9,
+                (nb / 2**20 / dt) if dt > 0 else float("nan"),
+                (bytes_written / 2**20 / write_seconds) if write_seconds > 0 else float("nan"),
+            )
     col0, dt, nb = _flush(pending, pending_cols, col0)
     write_seconds += dt
     bytes_written += nb
@@ -517,6 +529,8 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
         "write_seconds": float(write_seconds),
         "write_gb_per_s": (float(bytes_written) / 1e9 / write_seconds
                            if write_seconds > 0 else None),
+        "n_flushes": int(n_flushes),
+        "stage_wall_seconds": float(time.perf_counter() - stage_started),
         "free_bytes_before": int(free),
     }
     return Pi, eta, stats
