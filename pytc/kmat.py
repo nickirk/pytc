@@ -713,11 +713,12 @@ def contract_K1_minus_K2_isdf_fused(phi_p, phi_q, phi_r, phi_s,
     against phi_r/phi_s in a rolled r-block fori_loop, writing disjoint
     slices of the 4D output in place.
 
-    Memory-safe at scale by construction: every intermediate is budgeted
-    via ``_FUSED_MEM_CAP_ELEMS`` (kb and r-block widths derive from it).
-    Small decks collapse to single blocks.  ``r_block_size`` /
-    ``mem_cap_elems`` are accepted for call-site compatibility; tiling is
-    governed by the module constants (kept off the jit static-arg path).
+    Memory note: the Step-1 T carry (Np, Nq, n_rank) is NOT budgeted — it
+    scales to ~239 GB at the 1200-orbital deck (nvir=1179, N_fused=21467)
+    and OOMs there, as measured on B200/H200.  Validated only up to
+    nvir~590.  If this path is ever needed at larger decks, the T carry
+    must additionally be blocked over the rank axis (nested lb/kb rolled
+    loops feeding the 4D accumulator block by block).
     """
     if isinstance(U1, np.ndarray):
         U1 = jax.device_put(U1)
@@ -860,8 +861,14 @@ def contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3,
     contracts (p,q) with phi first, summed in kb blocks along N_fused
     inside a rolled fori_loop so the (Np,Nq,N_fused) pair-product — itself
     rank-scaled, ~239 GB at nvir=1179/N_fused=21467 — never exists in
-    full; Step 2 is the rolled r-block fori_loop.  Memory-safe by
-    construction; small decks collapse to single blocks.
+    full; Step 2 is the rolled r-block fori_loop.
+
+    Memory note: the Step-1 T carry (Np, Nq, n_rank) is NOT budgeted — it
+    scales to ~239 GB at the 1200-orbital deck (nvir=1179, N_fused=21467)
+    and OOMs there, as measured on B200.  Validated only up to nvir~590.
+    If this path is ever needed at larger decks, the T carry must
+    additionally be blocked over the rank axis (nested lb/kb rolled loops
+    feeding the 4D accumulator block by block).
     """
     if isinstance(U3, np.ndarray):
         U3 = jax.device_put(U3)
