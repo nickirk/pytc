@@ -3,10 +3,14 @@
 
 import unittest
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import numpy as np
 from pyscf.pbc.gto import Cell
 
 from pytc.pbc.df.kpts import (
+    pair_convolve_device,
     KptsMesh,
     canonicalize_kpts,
     check_time_reversal_residual,
@@ -329,3 +333,43 @@ class TestKptToSpcSpcToKpt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPairConvolveDevice(unittest.TestCase):
+    """The device path must match the numpy path and keep the same gate.
+
+    Equality is to a tolerance, not bit-exact: device reductions reorder
+    summations. The time-reversal gate is asserted on BOTH paths so the
+    device route cannot become the one that silently accepts bad input.
+    """
+
+    def _inputs(self, n_k=8, n_ip=64, n_ao=26, n_f=128):
+        rng = np.random.default_rng(0)
+        # real-valued complex128 => conj(X[k]) == X[k], satisfying the gate
+        X = rng.standard_normal((n_k, n_ip, n_ao)).astype(np.complex128)
+        Y = rng.standard_normal((n_k, n_f, n_ao)).astype(np.complex128)
+        phase = np.eye(n_k, dtype=np.complex128)
+        return X, Y, phase
+
+    def test_matches_numpy_path(self):
+        X, Y, phase = self._inputs()
+        host = pair_convolve(X, Y, phase)
+        device = pair_convolve_device(X, Y, phase)
+        self.assertEqual(host.shape, device.shape)
+        np.testing.assert_allclose(device, host, rtol=0.0, atol=1e-12)
+
+    def test_time_reversal_gate_fires_on_both_paths(self):
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((8, 32, 16)) + 1j * rng.standard_normal((8, 32, 16))
+        Y = rng.standard_normal((8, 64, 16)) + 1j * rng.standard_normal((8, 64, 16))
+        phase = np.eye(8, dtype=np.complex128)
+        for fn in (pair_convolve, pair_convolve_device):
+            with self.assertRaises(ValueError):
+                fn(X, Y, phase)
+
+    def test_rejects_malformed_shapes(self):
+        X, Y, phase = self._inputs()
+        with self.assertRaises(ValueError):
+            pair_convolve_device(X[0], Y, phase)
+        with self.assertRaises(ValueError):
+            pair_convolve_device(X, Y, phase[:, :3])

@@ -10,7 +10,10 @@ from __future__ import annotations
 import dataclasses
 import math
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+from functools import partial
 from pyscf.pbc.tools import k2gamma
 from scipy.linalg.blas import zgemm
 
@@ -296,6 +299,64 @@ def spc_to_kpt(m_spc, phase):
     trailing_shape = m_spc.shape[1:]
     m_kpt = (phase.conj().T @ m_spc.reshape(n_k, -1)).reshape((n_k,) + trailing_shape)
     return m_kpt.astype(np.complex128)
+
+
+@partial(jax.jit, static_argnames=("imag_tol",))
+def _pair_convolve_core(X, Y, phase, imag_tol):
+    """Jitted device core of pair_convolve. No validation -- the host wrapper
+    owns that -- but the time-reversal gate is kept, returned as a traced
+    scalar the wrapper raises on. Dropping it on device would make the device
+    path the only one that can silently accept a non-TR-symmetric pair.
+    """
+    T = jnp.einsum("kpa,kfa->kpf", X, jnp.conj(Y))
+    flat = T.reshape(T.shape[0], -1)
+    spc = (phase @ flat).reshape(T.shape)
+    denom = jnp.linalg.norm(spc)
+    imag_ratio = jnp.linalg.norm(spc.imag) / jnp.where(denom > 0, denom, 1.0)
+    spc_real = spc.real
+    Z_R = spc_real * spc_real
+    Z = (phase.conj().T @ Z_R.reshape(Z_R.shape[0], -1)).reshape(Z_R.shape)
+    return Z.astype(jnp.complex128), imag_ratio
+
+
+def pair_convolve_device(X, Y, phase, *, imag_tol=1e-10):
+    """pair_convolve on the device. Same contract, same gate, same result.
+
+    INVARIANT: bit-equivalence with the numpy path is not claimed -- device
+    reductions reorder summations -- so callers gate on the documented
+    tolerance, not on identity.
+    """
+    X = jnp.asarray(X, dtype=jnp.complex128)
+    Y = jnp.asarray(Y, dtype=jnp.complex128)
+    if X.dtype != jnp.complex128 or Y.dtype != jnp.complex128:
+        # Fail closed at the boundary: with jax_enable_x64 off, JAX silently
+        # truncates the complex128 cast and the whole convolve runs in single
+        # precision -- measured 5.9e-3 relative error, which would surface far
+        # downstream as an unexplained accuracy loss. Same guard, same reason,
+        # as hermitian_sandwich_solve_device.
+        raise ValueError(
+            f"pair_convolve_device: resolved dtype is {X.dtype}, not complex128 "
+            f"-- jax_enable_x64 is off, so JAX silently downcast the cast and "
+            f"this would run in single precision. Call "
+            f"jax.config.update('jax_enable_x64', True) before building."
+        )
+    n_k = X.shape[0]
+    if X.ndim != 3 or Y.ndim != 3:
+        raise ValueError("X and Y must be 3-D (Nk, ., Nao).")
+    if Y.shape[0] != n_k:
+        raise ValueError(f"X and Y must share axis 0; got {X.shape[0]} and {Y.shape[0]}.")
+    phase = jnp.asarray(phase, dtype=jnp.complex128)
+    if phase.ndim != 2 or phase.shape != (n_k, n_k):
+        raise ValueError(f"phase must have shape ({n_k},{n_k}), got {phase.shape}.")
+    Z, imag_ratio = _pair_convolve_core(X, Y, phase, float(imag_tol))
+    ratio = float(imag_ratio)
+    if ratio > float(imag_tol):
+        raise ValueError(
+            f"pair_convolve_device: ||Im(m_spc)||/||m_spc||={ratio:.3e} exceeds "
+            f"imag_tol={imag_tol:.1e} -- X/Y are not a valid time-reversal-"
+            f"symmetric pair (conj(X[neg[k]]) should equal X[k], likewise Y)."
+        )
+    return np.asarray(Z)
 
 
 def pair_convolve(X, Y, phase, *, imag_tol=1e-10):
