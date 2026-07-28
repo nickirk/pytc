@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import unittest
 
 import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -118,6 +119,62 @@ class TestGradientMask(unittest.TestCase):
     def test_newton_rejects_frozen_params_before_setup(self):
         with self.assertRaisesRegex(NotImplementedError, "Newton optimizer"):
             optimize(_ansatz(), optimizer_type="newton", frozen_params=[0])
+
+
+class TestPublicOptimizeFrozenParams(unittest.TestCase):
+    """Public-path regression for the original production defect: if the
+    gradient_mask wiring inside ``optimize()`` is removed, the Optax path
+    silently trains frozen leaves — and until this test existed, every
+    other test in this file still passed.  This test exercises the public
+    ``optimize(..., frozen_params=...)`` call end to end on a real ansatz
+    and must fail the moment that wiring is dropped."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pyscf import gto, scf
+        from pytc.ansatz.sj import SlaterJastrow
+        from pytc.ansatz.det import SlaterDet
+        from pytc.jastrow import NuclearCusp, CompositeJastrow
+        from pytc.jastrow.bha import BoysHandyAnalytical
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 1.8; H 0 0 3.6; H 0 0 5.4",
+                    basis="sto-3g", unit="Bohr", verbose=0)
+        mf = scf.RHF(mol).run()
+        det = SlaterDet.create(mol, mf.mo_coeff)
+        ncusp = NuclearCusp.create(mol, name="ncusp")
+        bha = BoysHandyAnalytical.create(mol)
+        jastrow = CompositeJastrow.create([ncusp, bha])
+        cls.sj = SlaterJastrow.create(mol, jastrow, [det])
+
+    def test_public_optimize_keeps_frozen_factor_fixed(self):
+        initial = [self.sj.jastrow.init_params(), jnp.ones(1)]
+        frozen_before = jax.tree_util.tree_map(
+            lambda x: np.asarray(x).copy(), initial[0][0])
+        result = optimize(
+            self.sj, n_walkers=16, n_steps=8, burn_in_steps=8,
+            n_opt_steps=3, learning_rate=0.05, optimizer_type="adam",
+            frozen_params=[0], params=initial, adaptive_step_size=False,
+        )
+        final = result["params"][-1]
+
+        # The frozen factor's parameters must be bitwise unchanged after
+        # real optimization steps on the public path.
+        frozen_after = jax.tree_util.tree_map(np.asarray, final[0][0])
+        for key in frozen_before:
+            np.testing.assert_array_equal(
+                frozen_after[key], frozen_before[key],
+                err_msg=f"frozen leaf {key!r} moved on the public optimize() path")
+
+        # The trainable factor and the linear coefficients must have moved
+        # (otherwise the test would also pass with optimization broken).
+        bha_moved = any(
+            not np.array_equal(np.asarray(final[0][1][k]),
+                               np.asarray(initial[0][1][k]))
+            for k in final[0][1])
+        self.assertTrue(bha_moved, "trainable Jastrow factor did not update")
+        self.assertFalse(
+            bool(np.array_equal(np.asarray(final[1]), np.asarray(initial[1]))),
+            "linear coefficients did not update")
 
 
 if __name__ == "__main__":
