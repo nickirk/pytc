@@ -148,6 +148,21 @@ class TestAdaptiveBurnIn(unittest.TestCase):
                 key=key, chunk_size=20, max_steps=40, acceptance_target=0.0,
             )
 
+    def test_nonpositive_chunk_and_max_steps_rejected(self):
+        """chunk_size<=0 never advances total_steps (infinite loop) and
+        max_steps<=0 is meaningless; both must raise ValueError."""
+        walkers, key = self._fresh_walkers(seed=9)
+        with self.assertRaises(ValueError):
+            adaptive_burn_in(
+                self.det, self.sj, walkers, self.params, step_size=0.02,
+                key=key, chunk_size=0, max_steps=40,
+            )
+        with self.assertRaises(ValueError):
+            adaptive_burn_in(
+                self.det, self.sj, walkers, self.params, step_size=0.02,
+                key=key, chunk_size=20, max_steps=0,
+            )
+
     def test_burn_in_honours_adapt_step_size_false(self):
         """burn_in with adapt_step_size=False must return the initial
         step_size unchanged (controller owned by the caller)."""

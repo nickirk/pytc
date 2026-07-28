@@ -61,7 +61,8 @@ def burn_in(ansatz,
             False so the two controllers don't fight.
     
     Returns:
-        Tuple of (equilibrated_walkers, acceptance_history, new_key)
+        Tuple of (equilibrated_walkers, acceptance_history, new_key,
+        step_size) — step_size reflects any adaptation during the burn-in.
     """
     acceptance_history = []
     
@@ -226,6 +227,13 @@ def adaptive_burn_in(
             f"acceptance_target must be a probability in (0, 1]; got "
             f"{acceptance_target!r} (it is the divisor of the step-size "
             f"controller and the centre of the acceptance pre-gate).")
+    if chunk_size <= 0:
+        raise ValueError(
+            f"chunk_size must be positive; got {chunk_size!r} (a non-positive "
+            f"chunk never advances total_steps and would loop forever).")
+    if max_steps <= 0:
+        raise ValueError(
+            f"max_steps must be positive; got {max_steps!r}.")
 
     vmap_fn = get_vmap_fn(max_vmap_batch_size=max_vmap_batch_size, mesh=mesh)
     batch_local_energy = jax.jit(vmap_fn(
@@ -310,7 +318,8 @@ def burn_in_with_importance(ansatz, walkers, n_steps, time_step, key, params, re
         report_interval: How often to print progress
     
     Returns:
-        Tuple of (equilibrated_walkers, acceptance_history, new_key)
+        Tuple of (equilibrated_walkers, acceptance_history, new_key,
+        time_step)
     """
     acceptance_history = []
     if n_steps <= 0:
