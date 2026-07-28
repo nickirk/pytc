@@ -343,9 +343,20 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
             np.asarray(in_ram["coul_kpt"]), np.asarray(staged["coul_kpt"]),
             rtol=0.0, atol=1e-10,
         )
-        # Write runs follow staging_block, not the AO block size.
+        # Grid-major: a flush is appended whole, so the contiguous run is the
+        # entire record -- Nk * Nip * staging_block elements, not one row of
+        # staging_block. Guards the property the layout exists for: the old
+        # q-major slice ran at 64 KiB per row and measured ~30-40 MiB/s on NFS.
         stats = staged["eta_staging"]
-        self.assertEqual(stats["write_run_bytes"], 4096 * 16)
+        n_kpts = len(staged["inpv_kpt"])
+        n_ip = np.asarray(staged["inpv_kpt"]).shape[1]
+        self.assertEqual(stats["layout"], "grid_major_records")
+        self.assertEqual(
+            stats["write_run_bytes"], n_kpts * n_ip * 4096 * 16,
+        )
+        self.assertGreater(stats["write_run_bytes"], 1 << 20)
+        self.assertEqual(sum(stats["record_cols"]), staged["eta_staging"]["staged_bytes"]
+                         // (n_kpts * n_ip * 16))
         self.assertGreater(stats["staged_bytes"], 0)
         self.assertIsNone(in_ram["eta_staging"])
 

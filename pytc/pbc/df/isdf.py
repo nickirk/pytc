@@ -424,6 +424,48 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     return Pi, eta
 
 
+class StagedEta:
+    """Per-q view over a grid-major staged eta file.
+
+    INVARIANT: the file holds flush records back to back, each record the
+    C-order (Nk, Nip, ncols) block for one grid range. A flush is therefore a
+    single sequential append, and one q's slab within a record is contiguous.
+    ``self[q]`` assembles the (Nip, Ng) slab the solve expects.
+
+    COST: the q-major layout this replaces made a flush a last-axis slice --
+    Nk*Nip runs of ncols*itemsize scattered over the whole file. Measured on
+    NFS at 333 that ran ~30-40 MiB/s against ~1.9 GB/s for the same bytes
+    written contiguously.
+    """
+
+    def __init__(self, path, n_kpts, n_ip, n_grid, record_cols):
+        self.path = str(path)
+        self.shape = (int(n_kpts), int(n_ip), int(n_grid))
+        self.record_cols = [int(c) for c in record_cols]
+        if sum(self.record_cols) != int(n_grid):
+            raise ValueError(
+                f"staged records cover {sum(self.record_cols)} grid points, "
+                f"expected {n_grid}."
+            )
+        self.dtype = np.complex128
+
+    def __getitem__(self, q):
+        n_kpts, n_ip, n_grid = self.shape
+        q = int(q)
+        if not 0 <= q < n_kpts:
+            raise IndexError(f"q index {q} out of range for {n_kpts} k-points.")
+        flat = np.memmap(self.path, dtype=self.dtype, mode="r")
+        out = np.empty((n_ip, n_grid), dtype=self.dtype)
+        elem, col = 0, 0
+        for ncols in self.record_cols:
+            start = elem + q * n_ip * ncols
+            out[:, col:col + ncols] = flat[start:start + n_ip * ncols].reshape(n_ip, ncols)
+            elem += n_kpts * n_ip * ncols
+            col += ncols
+        del flat
+        return out
+
+
 def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
                         staging_block=4096, imag_tol=1e-10,
                         free_bytes_safety=1.25, additional_reserve_bytes=0):
@@ -473,8 +515,11 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
     if isinstance(ao_blocks, np.ndarray):
         ao_blocks = [ao_blocks]
 
-    eta = np.memmap(staging_path, dtype=np.complex128, mode="w+",
-                    shape=(n_kpts, n_ip, n_grid))
+    # Grid-major: each flush is appended whole, so the write is sequential.
+    # The q-major layout this replaces turned every flush into a last-axis
+    # slice -- Nk*Nip small runs sprayed across the entire file.
+    handle = open(staging_path, "wb")
+    record_cols = []
     pending, pending_cols, col0 = [], 0, 0
     write_seconds, bytes_written = 0.0, 0
 
@@ -482,8 +527,10 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
         if not pending:
             return col0, 0.0, 0
         chunk = pending[0] if len(pending) == 1 else np.concatenate(pending, axis=2)
+        chunk = np.ascontiguousarray(chunk)
         started = time.perf_counter()
-        eta[:, :, col0:col0 + pending_cols] = chunk
+        chunk.tofile(handle)
+        record_cols.append(int(pending_cols))
         return col0 + pending_cols, time.perf_counter() - started, chunk.nbytes
 
     n_flushes = 0
@@ -518,20 +565,28 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
             f"block stream did not span the grid."
         )
     started = time.perf_counter()
-    eta.flush()
+    handle.flush()
+    os.fsync(handle.fileno())
+    handle.close()
     write_seconds += time.perf_counter() - started
+
+    eta = StagedEta(staging_path, n_kpts, n_ip, n_grid, record_cols)
 
     stats = {
         "staging_path": str(staging_path),
         "staged_bytes": int(bytes_written),
         "staging_block": int(staging_block),
-        "write_run_bytes": int(staging_block) * np.dtype(np.complex128).itemsize,
+        # A flush is now appended whole, so the contiguous run is the entire
+        # record, not one grid-block row.
+        "write_run_bytes": int(n_kpts) * int(n_ip) * int(staging_block)
+        * np.dtype(np.complex128).itemsize,
+        "layout": "grid_major_records",
+        "record_cols": list(record_cols),
         "write_seconds": float(write_seconds),
-        # write_seconds times the memmap slice assignment, which is a memcpy
-        # into page cache plus the final flush -- not necessarily bytes landing
-        # on disk. Treat write_gb_per_s as a relative signal for spotting stalls
-        # within a run, not as filesystem throughput; allocated-blocks-over-time
-        # (du) is the only cache-proof measure.
+        # Sequential appends plus an explicit fsync at close, so this is closer
+        # to real throughput than the memmap slice-assignment timing it
+        # replaces -- but allocated-blocks-over-time (du) remains the only
+        # cache-proof measure.
         "write_gb_per_s": (float(bytes_written) / 1e9 / write_seconds
                            if write_seconds > 0 else None),
         "n_flushes": int(n_flushes),
@@ -1121,7 +1176,10 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
     """
     n_kpts = mesh_obj.n_kpts
     Pi = np.asarray(Pi)
-    eta = np.asarray(eta)
+    # eta may be a StagedEta view over a grid-major file, which materialises
+    # one q-slab per __getitem__; asarray would collapse it to a 0-d object.
+    if not isinstance(eta, StagedEta):
+        eta = np.asarray(eta)
     if Pi.shape[0] != n_kpts:
         raise ValueError(f"Pi.shape[0]={Pi.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
     if eta.shape[0] != n_kpts:
