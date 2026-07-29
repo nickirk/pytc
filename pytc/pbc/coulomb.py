@@ -39,9 +39,21 @@ from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kp
 SELECTOR_STORAGE = {
     "bpc_cached_gemm": ("bpc", "cached"),
     "bpc_streamed": ("bpc", "streamed"),
+    "bpc_auto": ("bpc", "auto"),
     "streamed": ("exact", "streamed"),
     "fixed_pivots": ("fixed", None),
 }
+# Ceiling on the cached AO feature matrix. Cached storage allocates
+# n_grid x (Nk*nao) complex128 in one block with no gate today: 0.45 GB at
+# diamond-222, 4.3 GB at 333/Gamma, 24.3 GB at 444/Gamma. Large but not absurd,
+# which is exactly why it needs a predicted-byte decision rather than an
+# assumption in either direction.
+CACHED_AO_MAX_BYTES = 16 * 2**30
+
+
+def predicted_cached_ao_bytes(n_grid, n_kpts, n_ao):
+    """Bytes the cached AO feature matrix would allocate, before allocating it."""
+    return int(n_grid) * int(n_kpts) * int(n_ao) * 16
 # Frozen BPC policy accepted by the campaign; the only validated tuning.
 FROZEN_BPC_POLICY = {
     "bpc_batch_size": 64,
@@ -123,7 +135,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
           n_retained_pin=None, convolve_device=False, p_block_rows=None,
-          solve_backend="device", jitter_rcond=None):
+          solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -178,6 +190,29 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
 
+    # Predicted-byte gate, evaluated BEFORE the cached allocation exists.
+    cache_ceiling = CACHED_AO_MAX_BYTES if cached_ao_max_bytes is None else int(cached_ao_max_bytes)
+    predicted_cache_bytes = predicted_cached_ao_bytes(
+        grid_coords.shape[0], mesh_obj.n_kpts, cell.nao)
+    cache_gate = {
+        "predicted_cached_ao_bytes": predicted_cache_bytes,
+        "cached_ao_max_bytes": cache_ceiling,
+    }
+    if storage == "auto":
+        # 'auto' CHOOSES; it never fails, because streamed is always available.
+        storage = "cached" if predicted_cache_bytes <= cache_ceiling else "streamed"
+        selection_mode = "bpc_cached_gemm" if storage == "cached" else "bpc_streamed"
+        cache_gate["auto_resolved_to"] = storage
+    elif storage == "cached" and predicted_cache_bytes > cache_ceiling:
+        # Explicitly requested: refuse rather than OOM mid-selection.
+        raise ValueError(
+            f"selection_mode={selection_mode!r} would allocate a cached AO feature "
+            f"matrix of {predicted_cache_bytes / 2**30:.2f} GiB, above the "
+            f"{cache_ceiling / 2**30:.2f} GiB ceiling. Use 'bpc_auto' to pick "
+            f"automatically, 'bpc_streamed' to force streaming, or raise "
+            f"cached_ao_max_bytes deliberately."
+        )
+
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance = {
         "mode": selection_mode,
@@ -189,6 +224,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         "cache_bytes": 0,
         "panel_bytes": 0,
         "ao_dtype": np.dtype(np.complex128).name,
+        **cache_gate,
     }
     cached_ao = None
     translation_cache = None
@@ -232,17 +268,25 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     elif selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
     else:
+        # n_topup > rank is refused downstream. That is the ONLY size-dependent
+        # constraint in this policy -- verified by isolation: batch_size=999 and
+        # candidate_oversampling=99 both pass at rank=12, because batch_size
+        # self-limits via retain_count = min(batch_size, rank - len(pivots)).
+        # The clamp is recorded rather than silent, so a run reports what it used.
+        n_topup_eff = min(int(bpc_n_topup), int(rank))
         pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
             batch_size=bpc_batch_size, min_separation=bpc_min_separation,
             candidate_oversampling=bpc_candidate_oversampling,
-            n_topup=bpc_n_topup,
+            n_topup=n_topup_eff,
         )
         selection_provenance.update({
             "bpc_batch_size": int(bpc_batch_size),
             "bpc_min_separation_grid_units": float(bpc_min_separation),
             "bpc_candidate_oversampling": int(bpc_candidate_oversampling),
-            "bpc_n_topup": int(bpc_n_topup),
+            "bpc_n_topup_requested": int(bpc_n_topup),
+            "bpc_n_topup": n_topup_eff,
+            "bpc_n_topup_clamped_to_rank": n_topup_eff != int(bpc_n_topup),
             "bpc_rounds": rounds,
             "bpc_joint_within_batch_exact_pivoting": True,
         })
@@ -764,7 +808,7 @@ class ISDFDF:
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
                  n_retained_pin=None, convolve_device=False, p_block_rows=None,
-                 solve_backend="device", jitter_rcond=None):
+                 solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -773,6 +817,7 @@ class ISDFDF:
         self.retention_mode = retention_mode
         self.solve_backend = solve_backend
         self.jitter_rcond = jitter_rcond
+        self.cached_ao_max_bytes = cached_ao_max_bytes
         self.selection_mode = selection_mode
         self.fixed_pivots = None if fixed_pivots is None else np.asarray(fixed_pivots)
         self.bpc_batch_size = bpc_batch_size
@@ -813,6 +858,7 @@ class ISDFDF:
                 self.cell, self.kpts, rank=self.rank, block_size=self.block_size,
                 rtol=self.rtol, retention_mode=self.retention_mode,
                 solve_backend=self.solve_backend, jitter_rcond=self.jitter_rcond,
+                cached_ao_max_bytes=self.cached_ao_max_bytes,
                 selection_mode=self.selection_mode,
                 fixed_pivots=self.fixed_pivots,
                 bpc_batch_size=self.bpc_batch_size,

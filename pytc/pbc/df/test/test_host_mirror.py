@@ -21,7 +21,8 @@ from pytc.pbc.df.isdf import (
     build_coul_kpt_host,
     build_pi_eta,
 )
-from pytc.pbc.coulomb import ISDFDF, validate_option_compatibility
+from pytc.pbc.coulomb import (FROZEN_BPC_POLICY, ISDFDF, build,
+                              predicted_cached_ao_bytes, validate_option_compatibility)
 from pytc.pbc.df.kpts import canonicalize_kpts
 
 
@@ -178,6 +179,58 @@ class TestOptionsRefusedAtConstruction(unittest.TestCase):
         # and construction-time validation must not become the only gate.
         with self.assertRaises(ValueError):
             validate_option_compatibility(p_block_rows=4, stage_eta_root="/tmp")
+
+
+class TestBpcPolicyAndCacheGate(unittest.TestCase):
+    """Task #57. The task's premise was that batch_size exceeds a small cell's
+    candidate pool; isolation showed otherwise -- batch_size=999 and
+    candidate_oversampling=99 both pass at rank=12, because batch_size self-limits.
+    The only size-dependent constraint is n_topup <= rank."""
+
+    def setUp(self):
+        self.cell = _make_cell()
+        self.kpts = self.cell.make_kpts((1, 1, 1), wrap_around=False)
+
+    def _build(self, **kw):
+        return build(self.cell, self.kpts, rank=12, block_size=200, rtol=1e-6, **kw)
+
+    def test_frozen_policy_no_longer_fails_on_a_small_rank(self):
+        # The exact combination that broke 19 tests: n_topup=16 against rank=12.
+        out = self._build(selection_mode="bpc_cached_gemm", **FROZEN_BPC_POLICY)
+        prov = out["selection_provenance"]
+        self.assertEqual(prov["bpc_n_topup_requested"], 16)
+        self.assertEqual(prov["bpc_n_topup"], 12)
+        self.assertTrue(prov["bpc_n_topup_clamped_to_rank"])
+
+    def test_clamp_is_recorded_not_silent(self):
+        # A silent clamp would make two different runs look identical in provenance.
+        out = self._build(selection_mode="bpc_cached_gemm",
+                          **{**FROZEN_BPC_POLICY, "bpc_n_topup": 4})
+        prov = out["selection_provenance"]
+        self.assertEqual(prov["bpc_n_topup"], 4)
+        self.assertFalse(prov["bpc_n_topup_clamped_to_rank"])
+
+    def test_auto_picks_cached_when_it_fits_and_streamed_when_it_does_not(self):
+        big = self._build(selection_mode="bpc_auto", **FROZEN_BPC_POLICY)
+        self.assertEqual(big["selection_provenance"]["auto_resolved_to"], "cached")
+        tiny = self._build(selection_mode="bpc_auto", cached_ao_max_bytes=1024,
+                           **FROZEN_BPC_POLICY)
+        self.assertEqual(tiny["selection_provenance"]["auto_resolved_to"], "streamed")
+
+    def test_explicit_cached_over_ceiling_fails_closed(self):
+        # Refuse before allocating, rather than OOM mid-selection.
+        with self.assertRaises(ValueError):
+            self._build(selection_mode="bpc_cached_gemm", cached_ao_max_bytes=1024,
+                        **FROZEN_BPC_POLICY)
+
+    def test_predicted_bytes_matches_the_real_allocation(self):
+        # The gate is only worth having if its prediction is the actual size.
+        out = self._build(selection_mode="bpc_cached_gemm", **FROZEN_BPC_POLICY)
+        prov = out["selection_provenance"]
+        self.assertEqual(prov["predicted_cached_ao_bytes"], prov["cache_bytes"])
+        self.assertEqual(
+            prov["predicted_cached_ao_bytes"],
+            predicted_cached_ao_bytes(prov["candidate_count"], 1, self.cell.nao))
 
 
 if __name__ == "__main__":
