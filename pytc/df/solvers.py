@@ -445,9 +445,10 @@ def hermitian_sandwich_solve(
     if not np.all(np.isfinite(Pi)) or not np.all(np.isfinite(V)):
         raise ValueError("Pi and V must be finite.")
 
-    if retention_mode not in ("single", "pairwise", "svd_lstsq"):
+    if retention_mode not in ("single", "pairwise", "svd_lstsq", "cholesky_jitter"):
         raise ValueError(
-            f"retention_mode must be 'single', 'pairwise', or 'svd_lstsq', got {retention_mode!r}."
+            f"retention_mode must be 'single', 'pairwise', 'svd_lstsq', or "
+            f"'cholesky_jitter', got {retention_mode!r}."
         )
     if n_retained_pin is not None:
         if retention_mode != "single":
@@ -526,6 +527,49 @@ def hermitian_sandwich_solve(
     v_norm = max(float(np.linalg.norm(V_herm)), tiny)
     adaptive_retention_used = False
     s_first_discarded = None
+
+    if retention_mode == "cholesky_jitter":
+        # The molecular path's primitive, transplanted: REGULARISE rather than
+        # truncate. prepare_spd_cholesky's docstring already records why an SVD
+        # is "a non-starter at production core sizes"; eigh is no better --
+        # measured 52x slower than Cholesky at n=2000, and the periodic solve is
+        # ~16 h of a projected 23 h at 444/Gamma.
+        #
+        # W = Pi_reg^-1 V Pi_reg^-1 with Pi_reg = L L^H, via four triangular
+        # solves. There is no spectrum here, so n_retained and s_min_retained do
+        # not exist: this mode trades the retained-space diagnostics for the
+        # cost and must be judged on the ENERGY gate instead.
+        from scipy.linalg import solve_triangular
+
+        chol, lower, jitter_used, n_tries = prepare_spd_cholesky(
+            Pi_herm, rcond=rtol_eff)
+        L = np.asarray(chol) if lower else np.asarray(chol).conj().T
+        A = solve_triangular(L, V_herm, lower=True)
+        B = solve_triangular(L, A.conj().T, lower=True).conj().T
+        C = solve_triangular(L.conj().T, B, lower=False)
+        W = solve_triangular(L.conj().T, C.conj().T, lower=False).conj().T
+        W = (W + W.conj().T) / 2
+
+        resid = float(np.linalg.norm(Pi_herm @ W @ Pi_herm - V_herm)) / v_norm
+        info = {
+            "n_retained": None, "n_discarded": None,
+            "s_max": s_max, "s_min_retained": None,
+            "pi_anti_hermitian_residual": pi_anti_hermitian_residual,
+            "v_anti_hermitian_residual": v_anti_hermitian_residual,
+            # No truncation, so the machine-tier retained-solve residual has no
+            # analogue; this is the actual Pi W Pi vs V residual, jitter bias
+            # included.
+            "retained_solve_residual": None,
+            "truncation_residual": resid,
+            "rtol": rtol_eff, "retention_mode": retention_mode,
+            "adaptive_retention_used": False,
+            "target_truncation_residual": target_truncation_residual,
+            "n_retained_pin": None, "retention_marginal": False,
+            "cond_pi_retained": None,
+            "dtype": str(W.dtype), "backend": "numpy",
+            "jitter_used": float(jitter_used), "jitter_tries": int(n_tries),
+        }
+        return W, info
 
     if retention_mode == "svd_lstsq":
         # fftisdf's literal lstsq formula: SVD (not eigh), rtol used as an
@@ -830,9 +874,10 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single"
         raise ValueError(f"V must have shape {(n, n)} matching Pi, got {V_np.shape}.")
     if not np.all(np.isfinite(Pi_np)) or not np.all(np.isfinite(V_np)):
         raise ValueError("Pi and V must be finite.")
-    if retention_mode not in ("single", "pairwise", "svd_lstsq"):
+    if retention_mode not in ("single", "pairwise", "svd_lstsq", "cholesky_jitter"):
         raise ValueError(
-            f"retention_mode must be 'single', 'pairwise', or 'svd_lstsq', got {retention_mode!r}."
+            f"retention_mode must be 'single', 'pairwise', 'svd_lstsq', or "
+            f"'cholesky_jitter', got {retention_mode!r}."
         )
     if n_retained_pin is not None:
         if retention_mode != "single":
