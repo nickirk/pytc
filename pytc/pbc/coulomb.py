@@ -20,6 +20,7 @@ from pytc.pbc.df.isdf import (
     build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
     build_coul_kpt_device,
+    build_coul_kpt_host,
     build_periodic_pivot_oracle,
     build_pi_eta,
     build_pi_eta_staged,
@@ -76,7 +77,8 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-          n_retained_pin=None, convolve_device=False, p_block_rows=None):
+          n_retained_pin=None, convolve_device=False, p_block_rows=None,
+          solve_backend="device", jitter_rcond=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -100,6 +102,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
+    if solve_backend not in ("device", "host"):
+        raise ValueError(
+            f"solve_backend must be 'device' or 'host', got {solve_backend!r}. "
+            f"'host' is a reference path for accuracy work, not a performance path."
+        )
     if selection_mode == "fixed_pivots" and fixed_pivots is None:
         raise ValueError(
             "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
@@ -315,12 +322,36 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         provider = provider_cls(
             cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
         )
-        coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
-            provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
-            kern=kern_p_blocked,
-            retention_mode=retention_mode, kern_blocking=kern_blocking,
-            n_retained_pin=n_retained_pin,
-        )
+        if solve_backend == "host":
+            # Reference path. Exists so an accuracy question can be settled without
+            # first porting a solver to the device path; refuses the device-only
+            # levers rather than silently ignoring them, since a lever that is
+            # accepted and dropped reads as "measured, no effect".
+            for name, value in (("kern_blocking", kern_blocking),
+                                ("p_block_rows", p_block_rows)):
+                if value is not None:
+                    raise ValueError(
+                        f"solve_backend='host' does not implement {name}; it is a "
+                        f"reference path, not a performance path."
+                    )
+            coul_kpt, kern_kpt, solve_infos = build_coul_kpt_host(
+                cell, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
+                retention_mode=retention_mode, jitter_rcond=jitter_rcond,
+                n_retained_pin=n_retained_pin,
+            )
+            n_pipeline_calls = mesh_obj.n_kpts
+        else:
+            if jitter_rcond is not None:
+                raise ValueError(
+                    "jitter_rcond requires solve_backend='host'; the device path does "
+                    "not implement retention_mode='cholesky_jitter'."
+                )
+            coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
+                provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
+                kern=kern_p_blocked,
+                retention_mode=retention_mode, kern_blocking=kern_blocking,
+                n_retained_pin=n_retained_pin,
+            )
     finally:
         # Never strand the staging file, on success or failure.
         if staged_path is not None:
@@ -713,13 +744,16 @@ class ISDFDF:
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-                 n_retained_pin=None, convolve_device=False, p_block_rows=None):
+                 n_retained_pin=None, convolve_device=False, p_block_rows=None,
+                 solve_backend="device", jitter_rcond=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
         self.block_size = block_size
         self.rtol = rtol
         self.retention_mode = retention_mode
+        self.solve_backend = solve_backend
+        self.jitter_rcond = jitter_rcond
         self.selection_mode = selection_mode
         self.fixed_pivots = None if fixed_pivots is None else np.asarray(fixed_pivots)
         self.bpc_batch_size = bpc_batch_size
@@ -754,6 +788,7 @@ class ISDFDF:
             self._built = build(
                 self.cell, self.kpts, rank=self.rank, block_size=self.block_size,
                 rtol=self.rtol, retention_mode=self.retention_mode,
+                solve_backend=self.solve_backend, jitter_rcond=self.jitter_rcond,
                 selection_mode=self.selection_mode,
                 fixed_pivots=self.fixed_pivots,
                 bpc_batch_size=self.bpc_batch_size,

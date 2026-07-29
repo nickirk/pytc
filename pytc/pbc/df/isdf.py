@@ -620,7 +620,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
 
 def apply_raw_kernel_and_solve(
     Pi_q, eta_q, *, cell, q_kpt, grid_coords, grid_mesh, rtol=None, self_paired=False,
-    n_retained_pin=None,
+    n_retained_pin=None, retention_mode="single", jitter_rcond=None,
 ):
     """Apply the "raw" (bare 4pi/G^2, exx=False) periodic Coulomb kernel to
     eta^q over the spatial grid, contract to (Nip, Nip), and solve the
@@ -711,9 +711,33 @@ def apply_raw_kernel_and_solve(
     if self_paired:
         kern_q = kern_q.real.astype(np.complex128)
 
-    W_q_unscaled, solve_info = hermitian_sandwich_solve(
-        Pi_q, kern_q, rtol=rtol, n_retained_pin=n_retained_pin
-    )
+    if retention_mode == "cholesky_jitter":
+        # This mode has no spectral cutoff, so rtol is rejected rather than dropped:
+        # a caller sweeping rtol over a mode that ignores it gets identical runs and
+        # reads them as insensitivity to rtol.
+        if rtol is not None:
+            raise ValueError(
+                "rtol does not apply to retention_mode='cholesky_jitter'; pass "
+                "jitter_rcond to set the jitter scale."
+            )
+        if n_retained_pin is not None:
+            raise ValueError(
+                "n_retained_pin does not apply to retention_mode='cholesky_jitter': "
+                "the mode regularizes rather than truncating, so it has no retained set."
+            )
+        W_q_unscaled, solve_info = hermitian_sandwich_solve(
+            Pi_q, kern_q, retention_mode=retention_mode, jitter_rcond=jitter_rcond
+        )
+    else:
+        if jitter_rcond is not None:
+            raise ValueError(
+                f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
+                f"{retention_mode!r}."
+            )
+        W_q_unscaled, solve_info = hermitian_sandwich_solve(
+            Pi_q, kern_q, rtol=rtol, retention_mode=retention_mode,
+            n_retained_pin=n_retained_pin
+        )
     # sqrt(Ng) rescale cancels kern_q's own 1/sqrt(Ng) (Eq. 10 factor placement).
     W_q = np.sqrt(n_grid) * W_q_unscaled
     return W_q, kern_q, solve_info
@@ -1293,6 +1317,56 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
             done[nq] = True
 
     return jnp.stack(coul_kpt, axis=0), jnp.stack(kern_kpt, axis=0), infos, n_pipeline_calls
+
+
+def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
+                        retention_mode="single", jitter_rcond=None,
+                        n_retained_pin=None):
+    """Host reference mirror of build_coul_kpt_device.
+
+    Exists so an accuracy question can be answered without first porting a solver
+    to the device path: the device path is production, but nothing in this
+    assembly is device-specific. Reference-grade, NOT a performance path -- it
+    runs the NumPy per-q solve and materializes kern_q densely.
+
+    The conjugate shortcut, the self_paired flag at nq == q, and the per-q
+    ordering are mirrored from the device loop deliberately; if they drift apart
+    the two paths stop being comparable, which is the whole point of the mirror.
+
+    Returns:
+        (coul_kpt, kern_kpt, infos): numpy (Nk, Nip, Nip) arrays and the per-q
+        solve info dicts, matching build_coul_kpt_device's first three returns.
+    """
+    n_kpts = mesh_obj.n_kpts
+    neg = mesh_obj.neg
+    coul_kpt = [None] * n_kpts
+    kern_kpt = [None] * n_kpts
+    infos = [None] * n_kpts
+    done = [False] * n_kpts
+
+    for q in range(n_kpts):
+        if done[q]:
+            continue
+        nq = int(neg[q])
+        W_q, kern_q, info_q = apply_raw_kernel_and_solve(
+            Pi[q], eta[q], cell=cell, q_kpt=mesh_obj.canonical_kpts[q],
+            grid_coords=grid_coords, grid_mesh=cell.mesh, rtol=rtol,
+            self_paired=(nq == q), retention_mode=retention_mode,
+            jitter_rcond=jitter_rcond,
+            n_retained_pin=None if n_retained_pin is None else n_retained_pin[q],
+        )
+        coul_kpt[q] = W_q
+        kern_kpt[q] = kern_q
+        infos[q] = info_q
+        done[q] = True
+
+        if nq != q and not done[nq]:
+            coul_kpt[nq] = np.conj(W_q)
+            kern_kpt[nq] = np.conj(kern_q)
+            infos[nq] = info_q
+            done[nq] = True
+
+    return np.stack(coul_kpt, axis=0), np.stack(kern_kpt, axis=0), infos
 
 
 # ---------------------------------------------------------------------------
