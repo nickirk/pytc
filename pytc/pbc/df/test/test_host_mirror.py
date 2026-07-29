@@ -21,6 +21,7 @@ from pytc.pbc.df.isdf import (
     build_coul_kpt_host,
     build_pi_eta,
 )
+from pytc.pbc.coulomb import ISDFDF, validate_option_compatibility
 from pytc.pbc.df.kpts import canonicalize_kpts
 
 
@@ -133,6 +134,50 @@ class TestHostMirrorMatchesDevice(unittest.TestCase):
                 Pi[0], eta[0], cell=cell, q_kpt=mesh.canonical_kpts[0],
                 grid_coords=grids, grid_mesh=cell.mesh, rtol=1e-6,
                 jitter_rcond=1e-14)
+
+
+class TestOptionsRefusedAtConstruction(unittest.TestCase):
+    """The refusals existed already; what is tested here is WHERE they fire.
+
+    They previously lived only inside build(), which reaches them after pivot
+    selection, so a combination knowable in microseconds killed a production run
+    ~3 h in. These assert construction-time failure -- a test of placement, which
+    a test of the error message alone would not catch.
+    """
+
+    def setUp(self):
+        self.cell = _make_cell()
+        self.kpts = self.cell.make_kpts((1, 1, 1), wrap_around=False)
+
+    def _isdfdf(self, **kw):
+        return ISDFDF(self.cell, self.kpts, rank=12, block_size=200, **kw)
+
+    def test_incompatible_levers_raise_before_any_work(self):
+        cases = (
+            dict(p_block_rows=4, kern_blocking={"staging_root": "/tmp"}),
+            dict(p_block_rows=4, stage_eta_root="/tmp"),
+            dict(solve_backend="host", p_block_rows=4),
+            dict(solve_backend="device", jitter_rcond=1e-14),
+            dict(solve_backend="nonsense"),
+        )
+        for kw in cases:
+            with self.subTest(**kw):
+                # ISDFDF.__init__ itself must raise. If this ever regresses to
+                # raising only in build(), the failure moves hours downstream.
+                with self.assertRaises(ValueError):
+                    self._isdfdf(**kw)
+
+    def test_valid_production_shape_constructs(self):
+        # The 444 production config's shape: panel blocking alone, no staging levers.
+        df = self._isdfdf(p_block_rows=4)
+        self.assertEqual(df.p_block_rows, 4)
+        self.assertIsNone(df.kern_blocking)
+
+    def test_build_still_validates_for_direct_callers(self):
+        # build() must keep its own check: not every caller goes through ISDFDF,
+        # and construction-time validation must not become the only gate.
+        with self.assertRaises(ValueError):
+            validate_option_compatibility(p_block_rows=4, stage_eta_root="/tmp")
 
 
 if __name__ == "__main__":

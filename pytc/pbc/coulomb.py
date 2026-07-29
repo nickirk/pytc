@@ -71,6 +71,51 @@ RETIRED_SELECTION_MODES = {
 }
 
 
+def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
+                                 stage_eta_root=None, solve_backend="device",
+                                 jitter_rcond=None):
+    """Refuse statically-knowable option combinations.
+
+    Placement is the point. These checks previously lived only inside build(), which
+    reaches them AFTER pivot selection -- so a combination knowable in microseconds
+    killed a 444 production run ~3 h in. ISDFDF.__init__ calls this too, so the
+    failure is immediate.
+
+    ONE function called from both sites rather than duplicated: a second copy of a
+    refusal rule drifts, and then the two disagree about what is legal.
+    """
+    if solve_backend not in ("device", "host"):
+        raise ValueError(
+            f"solve_backend must be 'device' or 'host', got {solve_backend!r}. "
+            f"'host' is a reference path for accuracy work, not a performance path."
+        )
+    if p_block_rows is not None and kern_blocking is not None:
+        raise ValueError(
+            "p_block_rows and kern_blocking are alternative memory levers, "
+            "not composable: the panel-blocked path forms kern directly, so "
+            "kern_blocking's rq staging would never run. Choose one."
+        )
+    if p_block_rows is not None and stage_eta_root is not None:
+        raise ValueError(
+            "p_block_rows and stage_eta_root are alternative memory levers, "
+            "not composable: the panel-blocked path never materialises eta, "
+            "so there is nothing to stage. Choose one."
+        )
+    if solve_backend == "host":
+        for name, value in (("kern_blocking", kern_blocking),
+                            ("p_block_rows", p_block_rows)):
+            if value is not None:
+                raise ValueError(
+                    f"solve_backend='host' does not implement {name}; it is a "
+                    f"reference path, not a performance path."
+                )
+    elif jitter_rcond is not None:
+        raise ValueError(
+            "jitter_rcond requires solve_backend='host'; the device path does "
+            "not implement retention_mode='cholesky_jitter'."
+        )
+
+
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode=None,
           fixed_pivots=None, bpc_batch_size=16,
@@ -102,11 +147,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         < rank if the pivot metric exhausts), n_pipeline_calls,
         solve_infos (length-Nk list).
     """
-    if solve_backend not in ("device", "host"):
-        raise ValueError(
-            f"solve_backend must be 'device' or 'host', got {solve_backend!r}. "
-            f"'host' is a reference path for accuracy work, not a performance path."
-        )
+    validate_option_compatibility(
+        p_block_rows=p_block_rows, kern_blocking=kern_blocking,
+        stage_eta_root=stage_eta_root, solve_backend=solve_backend,
+        jitter_rcond=jitter_rcond)
     if selection_mode == "fixed_pivots" and fixed_pivots is None:
         raise ValueError(
             "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
@@ -276,18 +320,6 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     staged_path = None
     eta_staging_stats = None
     try:
-        if p_block_rows is not None and kern_blocking is not None:
-            raise ValueError(
-                "p_block_rows and kern_blocking are alternative memory levers, "
-                "not composable: the panel-blocked path forms kern directly, so "
-                "kern_blocking's rq staging would never run. Choose one."
-            )
-        if p_block_rows is not None and stage_eta_root is not None:
-            raise ValueError(
-                "p_block_rows and stage_eta_root are alternative memory levers, "
-                "not composable: the panel-blocked path never materialises eta, "
-                "so there is nothing to stage. Choose one."
-            )
         if p_block_rows is not None:
             # Panel-blocked: kern is built directly and eta never exists. The
             # panel knob trades storage against regeneration; Pi and kern are
@@ -327,24 +359,12 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             # first porting a solver to the device path; refuses the device-only
             # levers rather than silently ignoring them, since a lever that is
             # accepted and dropped reads as "measured, no effect".
-            for name, value in (("kern_blocking", kern_blocking),
-                                ("p_block_rows", p_block_rows)):
-                if value is not None:
-                    raise ValueError(
-                        f"solve_backend='host' does not implement {name}; it is a "
-                        f"reference path, not a performance path."
-                    )
             coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_host(
                 cell, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
                 retention_mode=retention_mode, jitter_rcond=jitter_rcond,
                 n_retained_pin=n_retained_pin,
             )
         else:
-            if jitter_rcond is not None:
-                raise ValueError(
-                    "jitter_rcond requires solve_backend='host'; the device path does "
-                    "not implement retention_mode='cholesky_jitter'."
-                )
             coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
                 provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
                 kern=kern_p_blocked,
@@ -762,6 +782,11 @@ class ISDFDF:
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
         self.convolve_device = convolve_device
         self.p_block_rows = p_block_rows
+        # Fail here, not hours later inside build() after pivot selection.
+        validate_option_compatibility(
+            p_block_rows=p_block_rows, kern_blocking=kern_blocking,
+            stage_eta_root=stage_eta_root, solve_backend=solve_backend,
+            jitter_rcond=jitter_rcond)
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
         self.kern_blocking = kern_blocking
