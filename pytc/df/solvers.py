@@ -780,9 +780,12 @@ def _cholesky_jitter_entry(Pi, V, *, jitter_rcond, rtol, n_retained_pin,
         retention_mode="cholesky_jitter",
         rtol=None,
         jitter_rcond=jitter_rcond,
-        # Names what ACTUALLY ran. Reporting the Cholesky backend beside
-        # solver='tsvd' asserted two contradictory things about one solve.
-        backend="jax_tsvd" if fell_back else "jax_cho_solve",
+        # Names the ACTUAL implementation, not the mode. Two prior labels here
+        # were false: 'jax_cho_solve' beside solver='tsvd', then 'jax_tsvd' for a
+        # fallback whose _tsvd_sandwich calls numpy.linalg.eigh. The regression
+        # for this instruments the call path instead of comparing to this string,
+        # because a hand-written label is exactly what was wrong both times.
+        backend="numpy_eigh_tsvd" if fell_back else "jax_cho_solve",
         # The helper's own string spells the molecular fit problem
         # (||S Z S - C C^dagger||). The arithmetic is identical, but the periodic
         # caller solves Pi W Pi = V, and a label naming the wrong operands is a
@@ -804,7 +807,7 @@ def hermitian_sandwich_solve(
     truncated pseudo-inverse of Pi. Pi and V are Hermitized on entry;
     their anti-Hermitian residuals are recorded. See design doc §5.
 
-    Three retention modes:
+    Four retention modes:
       "single" (default): threshold = rtol * s_max (scale-invariant).
         Mode i retained iff s_i > threshold; W's (i,j) term is nonzero
         only when BOTH i and j pass -- equivalent to Pi^+_r V Pi^+_r
@@ -856,6 +859,12 @@ def hermitian_sandwich_solve(
             retain exactly the K largest-eigenvalue modes regardless of
             rtol. Mutually exclusive with rtol/target_truncation_residual
             (both must be left None).
+
+    Note: in "cholesky_jitter" mode the shared helper emits warnings prefixed
+    "compute_Z (...)" -- it is the molecular fit helper and names its own caller.
+    They are not adapted here because doing so would mean changing the helper,
+    and compute_Z byte-identity is this stack's non-regression gate. Read those
+    prefixes as the helper's, not as evidence that compute_Z ran.
 
     Returns:
         (W, info): info keys are n_retained, n_discarded, s_max,

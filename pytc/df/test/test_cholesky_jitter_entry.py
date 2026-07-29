@@ -5,8 +5,9 @@ wrong, not to cover the happy path twice:
 
 1) The mode was benchmarked while an unconditional np.linalg.eigh ran BEFORE
    the branch was reached, so every "Cholesky" timing had silently paid for a
-   full eigendecomposition. test_cholesky_never_calls_eigh instruments both
-   eigh entry points rather than reading the source.
+   full eigendecomposition. test_cholesky_fast_path_never_calls_eigh
+   instruments both eigh entry points rather than reading the source. The
+   TSVD FALLBACK does call eigh; only the fast path is eigh-free.
 2) The device path accepted the mode, ran eig, and labelled the provenance
    "Cholesky" -- a false claim inside a data structure. Asserted still refused.
 3) An earlier revision passed the spectral rtol (1e-4) in as the jitter scale,
@@ -56,7 +57,7 @@ class TestCholeskyJitterEntry(unittest.TestCase):
                     / np.linalg.norm(self.V))
         self.assertLess(residual, 1e-12)
 
-    def test_cholesky_never_calls_eigh(self):
+    def test_cholesky_fast_path_never_calls_eigh(self):
         # The regression that motivated the whole file: dispatch used to sit
         # AFTER the unconditional eigh. Counting real calls is the only check
         # that would have caught it -- the branch itself looked correct.
@@ -111,10 +112,12 @@ class TestCholeskyJitterEntry(unittest.TestCase):
     def test_tsvd_fallback_is_reported_not_hidden(self):
         # The mode does NOT guarantee a Cholesky solve. The shared helper gates on
         # an unregularized-bias threshold and switches to TSVD when it trips, which
-        # matters twice over: TSVD is a full SVD, so it is more expensive than the
-        # eigh this mode exists to replace, and being a truncating solver it DOES
-        # report n_retained. A caller that reads retention_mode and assumes it knows
-        # which solver ran would be wrong; solver/fallback_triggered are the truth.
+        # matters twice over: the fallback runs a Hermitian eig (NOT a full SVD -- an
+        # earlier note here said SVD and was wrong about the mechanism), so it cannot
+        # be cheaper than the eigh this mode exists to replace; and being a truncating
+        # solver it DOES report n_retained. A caller reading retention_mode and
+        # assuming it knows which solver ran would be wrong; solver/fallback_triggered
+        # and the observed call path are the truth.
         _, info = hermitian_sandwich_solve(self.Pi, self.V, jitter_rcond=1e-6,
                                            retention_mode="cholesky_jitter")
         self.assertTrue(info["fallback_triggered"])
@@ -122,18 +125,37 @@ class TestCholeskyJitterEntry(unittest.TestCase):
         self.assertIn("n_retained", info)
         self.assertIn("preceding_cholesky_jitter_used", info)
 
-    def test_backend_label_names_the_solver_that_actually_ran(self):
-        # Reporting backend='jax_cho_solve' beside solver='tsvd' asserted two
-        # contradictory things about one solve.
-        _, normal = hermitian_sandwich_solve(self.Pi, self.V,
-                                             retention_mode="cholesky_jitter")
+    def test_backend_label_matches_the_observed_call_path(self):
+        # Two previous labels here were false in sequence: 'jax_cho_solve' beside
+        # solver='tsvd', then 'jax_tsvd' for a fallback that calls numpy.linalg.eigh.
+        # Both passed a test that compared the label to another hand-written label.
+        # This one instruments the real calls, so a wrong label cannot pass.
+        def run(**kw):
+            calls = []
+            real_eigh, real_svd = np.linalg.eigh, np.linalg.svd
+            np.linalg.eigh = lambda *a, **k: (calls.append("numpy.eigh"),
+                                              real_eigh(*a, **k))[1]
+            np.linalg.svd = lambda *a, **k: (calls.append("numpy.svd"),
+                                             real_svd(*a, **k))[1]
+            try:
+                _, info = hermitian_sandwich_solve(
+                    self.Pi, self.V, retention_mode="cholesky_jitter", **kw)
+            finally:
+                np.linalg.eigh, np.linalg.svd = real_eigh, real_svd
+            return calls, info
+
+        calls, normal = run()
         self.assertFalse(normal["fallback_triggered"])
+        self.assertEqual(calls, [], "fast path must not reach a dense host factorization")
         self.assertEqual(normal["backend"], "jax_cho_solve")
-        _, fell = hermitian_sandwich_solve(self.Pi, self.V, jitter_rcond=1e-6,
-                                           retention_mode="cholesky_jitter")
+
+        calls, fell = run(jitter_rcond=1e-6)
         self.assertTrue(fell["fallback_triggered"])
         self.assertEqual(fell["solver"], "tsvd")
-        self.assertEqual(fell["backend"], "jax_tsvd")
+        # The label must name what the call path shows, not the mode's nickname.
+        self.assertIn("numpy.eigh", calls)
+        self.assertNotIn("numpy.svd", calls)
+        self.assertEqual(fell["backend"], "numpy_eigh_tsvd")
 
     def test_residual_convention_names_the_periodic_operands(self):
         # The shared helper spells the molecular fit problem. The arithmetic is
