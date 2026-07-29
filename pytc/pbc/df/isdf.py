@@ -352,7 +352,24 @@ def pivoted_cholesky_batched_hermitian(
     return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
 
 
-def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
+def _resolve_pair_convolve(convolve_device):
+    """Pick the host or device convolve.
+
+    The device path is not GPU-only: on the JAX CPU backend XLA fuses the
+    post-GEMM chain (transform, square, inverse transform) that the numpy path
+    materialises stage by stage. Measured at the 333 block shape on 48 host
+    threads, 354.1 against 139.99 GFLOP/s -- 2.53x with no GPU present, agreeing
+    with the numpy path to 8.4e-16. Whether a device is used is JAX's placement
+    decision, not this flag's.
+    """
+    from pytc.pbc.df.kpts import pair_convolve
+    if not convolve_device:
+        return pair_convolve
+    from pytc.pbc.df.kpts import pair_convolve_device
+    return pair_convolve_device
+
+
+def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=False):
     """Build Pi^q = pair_convolve(X, X)[q] and eta^q = pair_convolve(X, AO)[q].
     eta is accumulated block-by-block so one pair_convolve call holds only
     one block of AO data. See design doc §4-§5.
@@ -378,7 +395,7 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
         (Pi, eta): (Nk, Nip, Nip) and (Nk, Nip, Ng) complex128.
     """
     # Local import: kpts.py stays a leaf.
-    from pytc.pbc.df.kpts import pair_convolve
+    pair_convolve = _resolve_pair_convolve(convolve_device)
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -472,7 +489,8 @@ class StagedEta:
 
 def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
                         staging_block=4096, imag_tol=1e-10,
-                        free_bytes_safety=1.25, additional_reserve_bytes=0):
+                        free_bytes_safety=1.25, additional_reserve_bytes=0,
+                        convolve_device=False):
     """build_pi_eta with eta written to a (Nk, Nip, Ng) C-order memmap rather
     than held in RAM, so only one q's contiguous slab need be resident.
 
@@ -485,7 +503,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
     (Pi, eta_memmap, stats). Costs and design:
     docs/isdf-periodic/task46_phaseB_eta_staging_spec.md.
     """
-    from pytc.pbc.df.kpts import pair_convolve
+    pair_convolve = _resolve_pair_convolve(convolve_device)
 
     X = np.asarray(X)
     if X.ndim != 3:

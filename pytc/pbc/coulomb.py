@@ -75,7 +75,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-          n_retained_pin=None):
+          n_retained_pin=None, convolve_device=False):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -257,10 +257,12 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                 additional_reserve_bytes=(
                     int(inpv_kpt.shape[1]) * int(grid_coords.shape[0]) * 16
                     if kern_blocking is not None else 0),
+                convolve_device=convolve_device,
             )
         else:
             Pi, eta = build_pi_eta(
-                inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg)
+                inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg,
+                convolve_device=convolve_device)
 
         provider = provider_cls(
             cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
@@ -662,7 +664,7 @@ class ISDFDF:
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-                 n_retained_pin=None):
+                 n_retained_pin=None, convolve_device=False):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -676,6 +678,7 @@ class ISDFDF:
         self.bpc_candidate_oversampling = bpc_candidate_oversampling
         self.bpc_n_topup = bpc_n_topup
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
+        self.convolve_device = convolve_device
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
         self.kern_blocking = kern_blocking
@@ -712,6 +715,7 @@ class ISDFDF:
                 stage_eta_block=self.stage_eta_block,
                 kern_blocking=self.kern_blocking,
                 n_retained_pin=self.n_retained_pin,
+                convolve_device=self.convolve_device,
             )
         return self._built
 

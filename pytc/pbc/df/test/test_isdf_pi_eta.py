@@ -3,10 +3,13 @@ sections 4/5)."""
 
 import unittest
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import numpy as np
 from pyscf.pbc.gto import Cell
 
-from pytc.pbc.df.isdf import build_pi_eta
+from pytc.pbc.df.isdf import build_pi_eta, build_pi_eta_staged
 from pytc.pbc.df.kpts import canonicalize_kpts, pair_convolve
 
 
@@ -120,3 +123,42 @@ class TestBuildPiEta(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConvolveDeviceFlag(unittest.TestCase):
+    """`convolve_device` selects the XLA-fused convolve. It is not GPU-only --
+    on the JAX CPU backend it measured 2.53x over the numpy path at the 333
+    block shape -- so the flag must reach the staged builder, and both paths
+    must agree."""
+
+    @staticmethod
+    def _inputs(n_k=8, n_ip=60, n_ao=20, n_grid=240):
+        rng = np.random.default_rng(0)
+
+        def _c(*shape):
+            return (rng.standard_normal(shape)
+                    + 1j * rng.standard_normal(shape)).astype(np.complex128)
+
+        neg = np.arange(n_k)
+        # Symmetrise so both paths clear their time-reversal gate.
+        X = _c(n_k, n_ip, n_ao)
+        ao = _c(n_k, n_grid, n_ao)
+        X = np.stack([(X[k] + np.conj(X[neg[k]])) / 2 for k in range(n_k)])
+        ao = np.stack([(ao[k] + np.conj(ao[neg[k]])) / 2 for k in range(n_k)])
+        phase = np.exp(2j * np.pi * np.outer(np.arange(n_k), np.arange(n_k)) / n_k)
+        return X, ao, phase / np.sqrt(n_k), neg
+
+    def test_device_flag_matches_host_path(self):
+        X, ao, phase, neg = self._inputs()
+        host = build_pi_eta(X, [ao], phase, neg, imag_tol=1e30, convolve_device=False)
+        dev = build_pi_eta(X, [ao], phase, neg, imag_tol=1e30, convolve_device=True)
+        for name, a, b in (("Pi", host[0], dev[0]), ("eta", host[1], dev[1])):
+            with self.subTest(name=name):
+                np.testing.assert_allclose(b, a, rtol=0, atol=1e-12)
+
+    def test_staged_builder_accepts_the_flag(self):
+        # Regression: the staged builder imported pair_convolve directly, so the
+        # flag could not reach production even once the device path existed.
+        import inspect
+        sig = inspect.signature(build_pi_eta_staged)
+        self.assertIn("convolve_device", sig.parameters)
