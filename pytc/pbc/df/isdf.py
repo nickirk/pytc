@@ -860,6 +860,11 @@ class RawKernelProvider:
     apply(q_index, lq) -> v_q plus provenance(). q_index resolves the
     absolute k-vector from canonical_kpts internally.
 
+    ``is_self_adjoint_per_q`` is True because the bare kernel is real and
+    diagonal in G, so lq V lq^dagger is Hermitian at fixed q. Consumers that
+    mirror a transposed block rely on this; a provider without the attribute is
+    treated as not self-adjoint.
+
     fused_apply_and_solve is an OPTIONAL fast-path hook that
     apply_kernel_and_solve_device prefers when present; providers without
     it fall back to the eager per-stage path.
@@ -868,6 +873,8 @@ class RawKernelProvider:
         canonical_kpts: (Nk, 3) float64, e.g. KptsMesh.canonical_kpts.
         grid_mesh: (3,) positive ints, real-space integration mesh.
     """
+
+    is_self_adjoint_per_q = True
     cell: object
     canonical_kpts: object
     grid_mesh: tuple
@@ -948,7 +955,7 @@ def precompute_phase_all_q(grid_coords, canonical_kpts):
 def apply_kernel_and_solve_device(
     provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=None,
     retained_solve_residual_gate=1e-10, self_paired=False, retention_mode="single",
-    kern_blocking=None, n_retained_pin=None,
+    kern_blocking=None, n_retained_pin=None, kern_q=None,
 ):
     """S4 pipeline glue, device-resident, provider-agnostic: phase multiply
     -> provider.apply -> conjugate -> ZGEMM -> device Hermitian sandwich
@@ -986,7 +993,13 @@ def apply_kernel_and_solve_device(
     """
     from pytc.df.solvers import _solve_info_from_core_output, hermitian_sandwich_solve_device
 
-    n_ip, n_grid = eta_q.shape
+    if kern_q is not None:
+        # eta is absent by construction on this path; both dimensions come from
+        # the kern and the per-q phase vector instead.
+        n_ip = int(np.asarray(kern_q).shape[0])
+        n_grid = int(np.asarray(phase_q).shape[0])
+    else:
+        n_ip, n_grid = eta_q.shape
 
     if n_retained_pin is not None:
         if retention_mode != "single":
@@ -1025,7 +1038,8 @@ def apply_kernel_and_solve_device(
             )
         phase = jnp.exp(-1j * (jnp.asarray(grid_coords_np) @ jnp.asarray(q_kpt)))
 
-    eta_q_jnp = jnp.asarray(eta_q, dtype=jnp.complex128)
+    eta_q_jnp = (None if kern_q is not None
+                 else jnp.asarray(eta_q, dtype=jnp.complex128))
     Pi_q_jnp = jnp.asarray(Pi_q, dtype=jnp.complex128)
     # Fail closed at the boundary common to BOTH the fused and eager solve
     # paths: with jax_enable_x64 off, JAX silently downcasts the
@@ -1034,7 +1048,8 @@ def apply_kernel_and_solve_device(
     # as an opaque trip of the 1e-10 machine-tier retained-solve gate below.
     # The fused path never reaches hermitian_sandwich_solve_device's guard, so
     # the check must live here.
-    if eta_q_jnp.dtype != jnp.complex128 or Pi_q_jnp.dtype != jnp.complex128:
+    if ((eta_q_jnp is not None and eta_q_jnp.dtype != jnp.complex128)
+            or Pi_q_jnp.dtype != jnp.complex128):
         raise ValueError(
             f"apply_kernel_and_solve_device: q_index={q_index} resolved to dtype "
             f"{Pi_q_jnp.dtype}, not complex128 -- jax_enable_x64 is off, so JAX "
@@ -1049,7 +1064,20 @@ def apply_kernel_and_solve_device(
 
     # Providers with a fused fast path run the whole chain as one jax.jit
     # graph; others fall back to the eager per-stage path below.
-    if kern_blocking is not None:
+    if kern_q is not None:
+        # Precomputed by a caller that already formed kern without eta (the
+        # panel-blocked builder). Routed through this same solve deliberately:
+        # a second solve path would be where the residual gate, retention mode
+        # and pin quietly diverge.
+        kern_q = jnp.asarray(kern_q, dtype=jnp.complex128)
+        if self_paired:
+            kern_q = kern_q.real.astype(jnp.complex128)
+        W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
+            Pi_q_jnp, kern_q,
+            rtol=None if n_retained_pin is not None else rtol_eff,
+            n_retained_pin=n_retained_pin,
+        )
+    elif kern_blocking is not None:
         # Bypasses the fused graph, which assumes a resident (Nip, Ng).
         kern_q = jnp.asarray(
             build_kern_q_blocked(
@@ -1170,6 +1198,7 @@ def build_kern_q_blocked(provider, q_index, eta_q, phase, *, staging_root,
 
 
 def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
+                          kern=None,
                            retained_solve_residual_gate=1e-10, retention_mode="single",
                            kern_blocking=None, n_retained_pin=None):
     """S4 orchestration: build coul_kpt (Nk, Nip, Nip) with one
@@ -1200,11 +1229,19 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
     Pi = np.asarray(Pi)
     # eta may be a StagedEta view over a grid-major file, which materialises
     # one q-slab per __getitem__; asarray would collapse it to a 0-d object.
-    if not isinstance(eta, StagedEta):
+    if kern is not None:
+        # kern was formed without eta (panel-blocked build); eta is then unused
+        # and validating it would demand an object the caller deliberately
+        # never materialised.
+        kern = np.asarray(kern)
+        if kern.shape[0] != n_kpts:
+            raise ValueError(
+                f"kern.shape[0]={kern.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
+    elif not isinstance(eta, StagedEta):
         eta = np.asarray(eta)
     if Pi.shape[0] != n_kpts:
         raise ValueError(f"Pi.shape[0]={Pi.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
-    if eta.shape[0] != n_kpts:
+    if kern is None and eta.shape[0] != n_kpts:
         raise ValueError(f"eta.shape[0]={eta.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
 
     if n_retained_pin is None:
@@ -1234,7 +1271,10 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
             continue
         nq = int(neg[q])
         W_q, kern_q, info_q = apply_kernel_and_solve_device(
-            provider, q, Pi[q], eta[q], phase_q=phase_all[q], rtol=rtol,
+            provider, q, Pi[q],
+            None if kern is not None else eta[q],
+            kern_q=None if kern is None else kern[q],
+            phase_q=phase_all[q], rtol=rtol,
             retained_solve_residual_gate=retained_solve_residual_gate,
             self_paired=(nq == q), retention_mode=retention_mode,
             kern_blocking=kern_blocking,
@@ -1767,6 +1807,11 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     # never regenerated, whatever the panel schedule does.
     Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
 
+    # The mirror needs kern Hermitian, which needs the provider self-adjoint at
+    # fixed q. Linearity and the q/-q dagger law do not imply it, so it is opt-in
+    # capability rather than assumption; without it the transposed panel is built.
+    mirror = bool(getattr(provider, "is_self_adjoint_per_q", False))
+
     rows = int(panel_rows)
     panels = [(p0, min(p0 + rows, n_ip)) for p0 in range(0, n_ip, rows)]
 
@@ -1797,16 +1842,24 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 rq_j = np.conj(np.asarray(provider.apply(q, lq_j)))
                 block = (lq_i @ rq_j.T) / np.sqrt(n_grid_total)
                 kern[q, i0:i1, j0:j1] = block
-                if j != i:
-                    # kern is Hermitian, so the mirrored panel is free. The
-                    # equivalence test against the dense path is what certifies
-                    # this rather than the algebra alone.
+                if j != i and not mirror:
+                    # No self-adjointness guarantee: compute the transposed panel
+                    # instead of mirroring it. Correct for any provider, at twice
+                    # the off-diagonal work.
+                    rq_i = np.conj(np.asarray(provider.apply(q, lq_i)))
+                    kern[q, j0:j1, i0:i1] = (lq_j @ rq_i.T) / np.sqrt(n_grid_total)
+                elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
             del eta_j
         del eta_i
 
     if self_paired is not None:
+        # The dense solve projects BOTH Pi_q and kern_q at self-paired q
+        # (isdf.py:675 and :712). Projecting only kern would hand the solve a
+        # complex Pi it would have made real.
+        Pi = np.array(Pi, dtype=np.complex128, copy=True)
         for q in range(n_kpts):
             if self_paired(q):
+                Pi[q] = Pi[q].real.astype(np.complex128)
                 kern[q] = kern[q].real.astype(np.complex128)
     return Pi, kern
