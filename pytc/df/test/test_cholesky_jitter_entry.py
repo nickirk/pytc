@@ -109,21 +109,19 @@ class TestCholeskyJitterEntry(unittest.TestCase):
                          f"regularizing solver reported truncation fields: {sorted(leaked)}")
         self.assertIsNone(info["rtol"])
 
-    def test_tsvd_fallback_is_reported_not_hidden(self):
-        # The mode does NOT guarantee a Cholesky solve. The shared helper gates on
-        # an unregularized-bias threshold and switches to TSVD when it trips, which
-        # matters twice over: the fallback runs a Hermitian eig (NOT a full SVD -- an
-        # earlier note here said SVD and was wrong about the mechanism), so it cannot
-        # be cheaper than the eigh this mode exists to replace; and being a truncating
-        # solver it DOES report n_retained. A caller reading retention_mode and
-        # assuming it knows which solver ran would be wrong; solver/fallback_triggered
-        # and the observed call path are the truth.
+    def test_high_bias_is_reported_not_acted_on(self):
+        # Was test_tsvd_fallback_is_reported_not_hidden. The automatic switch was
+        # removed on owner instruction after being measured harmful on real data;
+        # the invariant it guarded -- that a caller can SEE the bias -- still holds,
+        # so the test is converted rather than deleted.
         _, info = hermitian_sandwich_solve(self.Pi, self.V, jitter_rcond=1e-6,
                                            retention_mode="cholesky_jitter")
-        self.assertTrue(info["fallback_triggered"])
-        self.assertEqual(info["solver"], "tsvd")
-        self.assertIn("n_retained", info)
-        self.assertIn("preceding_cholesky_jitter_used", info)
+        self.assertEqual(info["solver"], "unscaled_cholesky_jitter")
+        self.assertFalse(info["fallback_triggered"])
+        self.assertGreater(info["fit_residual"], 1e-10)
+        self.assertIn("residual_warn_threshold", info)
+        # No retained-set keys: nothing truncating ran.
+        self.assertNotIn("n_retained", info)
 
     def test_backend_label_matches_the_observed_call_path(self):
         # Two previous labels here were false in sequence: 'jax_cho_solve' beside
@@ -149,13 +147,12 @@ class TestCholeskyJitterEntry(unittest.TestCase):
         self.assertEqual(calls, [], "fast path must not reach a dense host factorization")
         self.assertEqual(normal["backend"], "jax_cho_solve")
 
-        calls, fell = run(jitter_rcond=1e-6)
-        self.assertTrue(fell["fallback_triggered"])
-        self.assertEqual(fell["solver"], "tsvd")
-        # The label must name what the call path shows, not the mode's nickname.
-        self.assertIn("numpy.eigh", calls)
-        self.assertNotIn("numpy.svd", calls)
-        self.assertEqual(fell["backend"], "numpy_eigh_tsvd")
+        # With the automatic fallback gone, a high-bias case stays on Cholesky and
+        # must still reach no dense host factorization.
+        calls, high_bias = run(jitter_rcond=1e-6)
+        self.assertFalse(high_bias["fallback_triggered"])
+        self.assertEqual(high_bias["backend"], "jax_cho_solve")
+        self.assertEqual(calls, [], "Cholesky path must not reach numpy eigh/svd")
 
     def test_residual_convention_names_the_periodic_operands(self):
         # The shared helper spells the molecular fit problem. The arithmetic is
@@ -180,11 +177,9 @@ class TestCholeskyJitterEntry(unittest.TestCase):
         with self.assertLogs("pytc.df.solvers", level="WARNING") as captured:
             _, info = hermitian_sandwich_solve(Pi_rank_deficient, self.V,
                                                retention_mode="cholesky_jitter")
-        self.assertTrue(info["fallback_triggered"], "precondition: must have fallen back")
+        self.assertGreater(info["fit_residual"], 1e-10, "precondition: bias must be high")
         text = "\n".join(captured.output)
-        # Both the Cholesky rejection and the TSVD residual warning appear here.
         self.assertIn("unscaled_cholesky_jitter", text)
-        self.assertIn("(tsvd)", text)
         for line in captured.output:
             self.assertNotIn("compute_Z", line,
                              f"periodic solve emitted a warning naming compute_Z: {line}")

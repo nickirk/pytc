@@ -120,44 +120,42 @@ class TestUnregularizedBiasFallback(unittest.TestCase):
         self.P = rng.standard_normal((6, 8))
         self.C = rng.standard_normal((6, 5))
 
-    def test_large_rcond_forces_tsvd_fallback_that_actually_helps(self):
-        # jitter_rcond=1.0 -> base jitter ~= the matrix's own diagonal
-        # scale, enough regularization bias to blow well past the
-        # 1e-10 acceptance threshold regardless of the random data.
+    def test_large_rcond_reports_high_bias_without_switching_solver(self):
+        # Was test_large_rcond_forces_tsvd_fallback_that_actually_helps. The
+        # automatic TSVD fallback was removed on owner instruction 2026-07-29 after
+        # being measured harmful on real periodic data. Converted, not deleted: the
+        # bias DETECTION this guarded is still required -- only the automatic action
+        # is gone.
         Z, prov = compute_Z(self.P, self.C, rcond=1.0, solver="cholesky_jitter")
-        self.assertTrue(prov["fallback_triggered"])
-        self.assertEqual(prov["solver"], "tsvd")
-        self.assertIn("fallback_reason", prov)
-        preceding = prov["preceding_cholesky_fit_residual"]
-        self.assertGreater(preceding, 1e-10)
-        # The fallback must actually IMPROVE on the failing Cholesky
-        # attempt, not silently return a useless Z=0 by inheriting
-        # jitter_rcond=1.0 as a TSVD singular-value cutoff (round-2 bug:
-        # cutoff = 1.0 * s_max means NO singular value survives
-        # `s > cutoff`, n_retained=0, Z=0, residual=1.0).
-        self.assertLess(prov["fit_residual"], preceding)
-        self.assertLess(prov["fit_residual"], 1e-6)
-        n_retained_A, n_retained_B = prov["n_retained"]
-        self.assertGreater(n_retained_A, 0)
-        self.assertGreater(n_retained_B, 0)
-
-    def test_fallback_uses_independent_tsvd_rcond_not_jitter_rcond(self):
-        # Explicit tsvd_rcond must be honored on fallback, independent
-        # of whatever jitter_rcond triggered it.
-        Z, prov = compute_Z(
-            self.P, self.C, rcond=1.0, solver="cholesky_jitter", tsvd_rcond=1e-10)
-        self.assertTrue(prov["fallback_triggered"])
-        self.assertEqual(prov["cutoff"], 1e-10)
-        n_retained_A, _ = prov["n_retained"]
-        self.assertGreater(n_retained_A, 0)
-
-    def test_well_conditioned_default_does_not_fall_back(self):
-        Z, prov = compute_Z(self.P, self.C, solver="cholesky_jitter")
-        self.assertFalse(prov["fallback_triggered"])
         self.assertEqual(prov["solver"], "unscaled_cholesky_jitter")
-        self.assertEqual(prov["backward_error_mode"], "finite_only")
-        self.assertIsNone(prov["backward_error_tol"])
+        self.assertFalse(prov["fallback_triggered"])
+        # The caller must still be able to SEE that the fit is bad.
+        self.assertGreater(prov["fit_residual"], 1e-10)
+        self.assertIn("residual_warn_threshold", prov)
 
+    def test_jitter_scale_can_no_longer_reach_the_tsvd_cutoff(self):
+        # Was test_fallback_uses_independent_tsvd_rcond_not_jitter_rcond. The bug:
+        # the automatic fallback inherited jitter_rcond as a singular-value cutoff,
+        # so a caller-forced jitter_rcond=1.0 -- a valid jitter SCALE, a nonsensical
+        # CUTOFF -- made TSVD retain zero modes and return Z=0.
+        #
+        # With the fallback removed the bug is STRUCTURALLY unreachable: a
+        # cholesky_jitter call can no longer end up inside _tsvd_sandwich at all.
+        # That is what this now asserts.
+        #
+        # My first attempt at converting this asserted that rcond=1.0 with an
+        # EXPLICIT solver="tsvd" should still retain modes. That is false and the
+        # test caught it: on the explicit path rcond IS the cutoff, so 1.0 retaining
+        # nothing is the caller getting exactly what they asked for.
+        _, prov = compute_Z(self.P, self.C, rcond=1.0, solver="cholesky_jitter")
+        self.assertEqual(prov["solver"], "unscaled_cholesky_jitter")
+        self.assertFalse(prov["fallback_triggered"])
+        self.assertNotIn("n_retained", prov, "no truncating solver ran")
+        # And a sensible explicit TSVD cutoff still behaves.
+        _, tsvd_prov = compute_Z(self.P, self.C, solver="tsvd")
+        n_a, n_b = tsvd_prov["n_retained"]
+        self.assertGreater(n_a, 0)
+        self.assertGreater(n_b, 0)
 
 class TestResidualModes(unittest.TestCase):
     """Gap 3: residual_mode='sampled' must be an available, provenance-
@@ -188,22 +186,16 @@ class TestResidualModes(unittest.TestCase):
         self.assertGreaterEqual(prov_sampled["fit_residual"], 0.0)
         self.assertLess(prov_sampled["fit_residual"], 1e-3)
 
-    def test_sampled_mode_never_triggers_fallback_even_when_elevated(self):
-        # jitter_rcond=1.0 -> the TRUE unregularized bias is huge, so
-        # the sampled estimate should register a large value too (same
-        # underlying quantity, just noisier) -- but residual_mode=
-        # 'sampled' must never auto-trigger the TSVD fallback, unlike
-        # 'exact' on the identical inputs.
-        Z_exact, prov_exact = compute_Z(
-            self.P, self.C, rcond=1.0, residual_mode="exact")
-        Z_sampled, prov_sampled = compute_Z(
-            self.P, self.C, rcond=1.0, residual_mode="sampled")
-        self.assertTrue(prov_exact["fallback_triggered"])
-        self.assertFalse(prov_sampled["fallback_triggered"])
-        self.assertEqual(prov_sampled["solver"], "unscaled_cholesky_jitter")
-        self.assertFalse(prov_sampled["fallback_gating_applicable"])
-        self.assertGreater(prov_sampled["fit_residual"], 1e-10)
-
+    def test_no_residual_mode_switches_solver(self):
+        # Was test_sampled_mode_never_triggers_fallback_even_when_elevated. Sampled
+        # mode was exempted from fallback gating because it was uncalibrated; now NO
+        # mode switches solver, so the invariant is stronger and mode-independent.
+        for mode in ("exact", "sampled"):
+            with self.subTest(residual_mode=mode):
+                _, prov = compute_Z(self.P, self.C, rcond=1.0,
+                                    solver="cholesky_jitter", residual_mode=mode)
+                self.assertEqual(prov["solver"], "unscaled_cholesky_jitter")
+                self.assertFalse(prov["fallback_triggered"])
     def test_unknown_residual_mode_rejected(self):
         with self.assertRaises(ValueError):
             compute_Z(self.P, self.C, residual_mode="not-a-real-mode")

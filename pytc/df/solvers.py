@@ -611,39 +611,32 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     }
 
     if fit_residual > _RESIDUAL_WARN_THRESHOLD:
-        if residual_mode != "exact":
-            logger.warning(
-                f"{caller_label} (unscaled_cholesky_jitter): {residual_mode} fit residual "
-                f"{fit_residual:.3e} exceeds acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e} "
-                f"-- NOT triggering the TSVD fallback because residual_mode={residual_mode!r} "
-                f"is diagnostic-only and not yet calibrated for fallback gating; only "
-                f"residual_mode='exact' drives the automatic fallback."
-            )
-            return Z_np, provenance
+        # WARN ONLY -- no automatic solver switch. Removed on owner instruction
+        # 2026-07-29 after it was measured harmful on real periodic data: at k112
+        # rank 85 the fallback produced dE/atom 1.763e-03 with a diverged SCF,
+        # while letting Cholesky finish gave 1.513e-05 and converged. It never
+        # helped in any measured case.
+        #
+        # The reason it hurt is specific and worth keeping: _tsvd_sandwich
+        # truncates at its own machine-epsilon tsvd_rcond, which is deliberately
+        # NOT jitter_rcond (reusing that was a real bug -- a caller-forced
+        # jitter_rcond=1.0 made TSVD retain zero modes). But it is also not the
+        # caller's rtol. A caller arriving with an explicit retention policy had
+        # it silently replaced by machine epsilon, so the fallback kept exactly
+        # the near-null directions that policy exists to discard.
+        #
+        # The bias residual is still computed and reported; only the automatic
+        # action is gone. _tsvd_sandwich remains available as an explicitly
+        # selected solver.
         logger.warning(
-            f"{caller_label} (unscaled_cholesky_jitter): two-sided fit residual {fit_residual:.3e} "
-            f"exceeds acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e} (jitter_A={jitter_A:.3e}, "
-            f"tries_A={tries_A}) -- this reflects UNREGULARIZED bias, not a factorization "
-            f"failure (the regularized-solve backward error is separately gated inside "
-            f"prepare_spd_cholesky's own retry loop); more jitter cannot reduce this bias, so "
-            f"falling back to solver='tsvd' (independent tsvd_rcond={tsvd_rcond}) rather than "
-            f"escalating jitter further."
+            f"{caller_label} (unscaled_cholesky_jitter): two-sided fit residual "
+            f"{fit_residual:.3e} exceeds acceptance threshold "
+            f"{_RESIDUAL_WARN_THRESHOLD:.0e} (jitter_A={jitter_A:.3e}, "
+            f"tries_A={tries_A}, residual_mode={residual_mode!r}) -- this reflects "
+            f"UNREGULARIZED bias, not a factorization failure, and more jitter "
+            f"cannot reduce it. Reported, not acted on: select solver='tsvd' "
+            f"explicitly if truncation is wanted."
         )
-        # Propagated: fixing only this function's own prefix left the FALLBACK
-        # still announcing compute_Z, so a periodic solve emitted one truthful
-        # warning followed by a false one.
-        tsvd_Z, tsvd_provenance = _tsvd_sandwich(
-            S_A, S_B, M, tsvd_rcond, same_sector,
-            residual_mode=residual_mode, residual_n_probes=residual_n_probes,
-            residual_seed=residual_seed, caller_label=caller_label)
-        tsvd_provenance["fallback_triggered"] = True
-        tsvd_provenance["fallback_reason"] = (
-            f"unscaled_cholesky_jitter unregularized-bias residual {fit_residual:.3e} exceeded "
-            f"acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e}"
-        )
-        tsvd_provenance["preceding_cholesky_jitter_used"] = provenance["jitter_used"]
-        tsvd_provenance["preceding_cholesky_fit_residual"] = fit_residual
-        return tsvd_Z, tsvd_provenance
 
     return Z_np, provenance
 
