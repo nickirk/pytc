@@ -130,3 +130,16 @@ class TestHermitianSandwichSolveDevice(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeviceCholeskyJitterFailsClosed(unittest.TestCase):
+    """Regression: the device path ACCEPTED retention_mode='cholesky_jitter',
+    fell through to the eig branch, and returned info labelled Cholesky -- a
+    false claim inside a data structure, and worse than a missing feature
+    because it is invisible to a caller who trusts the label."""
+
+    def test_device_refuses_rather_than_mislabelling(self):
+        pi = np.eye(8, dtype=np.complex128)
+        with self.assertRaises(ValueError):
+            hermitian_sandwich_solve_device(pi, pi.copy(), rtol=1e-6,
+                                            retention_mode="cholesky_jitter")

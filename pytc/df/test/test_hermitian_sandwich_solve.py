@@ -212,3 +212,29 @@ class TestHermitianSandwichSolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCholeskyJitterFailsClosed(unittest.TestCase):
+    """The two-sided Cholesky sandwich already exists as
+    pytc/df/fit.py::_cholesky_jitter_sandwich. A second implementation in
+    solvers.py produced a parameter conflation (the spectral rtol used as the
+    jitter scale, ten orders off), an explicit inverse with no condition
+    certificate, and -- on the device path -- eig executed while the returned
+    info was labelled Cholesky. Until the shared helper is routed through, the
+    mode must be refused rather than approximated."""
+
+    def test_refuses_and_names_the_shared_helper(self):
+        pi = np.eye(8, dtype=np.complex128)
+        with self.assertRaises(ValueError) as ctx:
+            hermitian_sandwich_solve(pi, pi.copy(), rtol=1e-6,
+                                     retention_mode="cholesky_jitter")
+        # Rejecting is not enough; the message must point somewhere useful.
+        self.assertIn("_cholesky_jitter_sandwich", str(ctx.exception))
+
+    def test_supported_modes_are_unaffected(self):
+        pi = np.eye(8, dtype=np.complex128)
+        for mode in ("single", "pairwise"):
+            with self.subTest(mode=mode):
+                _, info = hermitian_sandwich_solve(pi, pi.copy(), rtol=1e-6,
+                                                   retention_mode=mode)
+                self.assertEqual(info["retention_mode"], mode)
