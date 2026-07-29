@@ -629,10 +629,13 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
             f"falling back to solver='tsvd' (independent tsvd_rcond={tsvd_rcond}) rather than "
             f"escalating jitter further."
         )
+        # Propagated: fixing only this function's own prefix left the FALLBACK
+        # still announcing compute_Z, so a periodic solve emitted one truthful
+        # warning followed by a false one.
         tsvd_Z, tsvd_provenance = _tsvd_sandwich(
             S_A, S_B, M, tsvd_rcond, same_sector,
             residual_mode=residual_mode, residual_n_probes=residual_n_probes,
-            residual_seed=residual_seed)
+            residual_seed=residual_seed, caller_label=caller_label)
         tsvd_provenance["fallback_triggered"] = True
         tsvd_provenance["fallback_reason"] = (
             f"unscaled_cholesky_jitter unregularized-bias residual {fit_residual:.3e} exceeded "
@@ -648,7 +651,8 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
 def _tsvd_sandwich(S_A, S_B, M, tsvd_rcond, same_sector,
                     residual_mode="exact",
                     residual_n_probes=_DEFAULT_RESIDUAL_N_PROBES,
-                    residual_seed=_DEFAULT_RESIDUAL_SEED):
+                    residual_seed=_DEFAULT_RESIDUAL_SEED,
+                    caller_label="compute_Z"):
     """S_A^+ M S_B^+ via an EXPLICIT truncated-SVD pseudoinverse (not
     np.linalg.pinv's black box) so the retained singular-value range can
     be reported in provenance -- the diagnostics/fallback solver mode
@@ -689,7 +693,7 @@ def _tsvd_sandwich(S_A, S_B, M, tsvd_rcond, same_sector,
         S_A, Z, S_B, M, residual_mode, residual_n_probes, residual_seed)
     if fit_residual > _RESIDUAL_WARN_THRESHOLD:
         logger.warning(
-            f"compute_Z (tsvd): two-sided fit residual {fit_residual:.3e} exceeds the "
+            f"{caller_label} (tsvd): two-sided fit residual {fit_residual:.3e} exceeds the "
             f"design-doc acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e} -- this is a "
             f"WARNING, not a hard rejection (full acceptance also requires the downstream "
             f"ERI/energy spot-check, which this function cannot see); downstream results "
@@ -812,11 +816,22 @@ def hermitian_sandwich_solve(
     are Hermitized on entry; their anti-Hermitian residuals are recorded.
     See design doc §5.
 
-    Three of the four modes below build a TRUNCATED PSEUDO-INVERSE of Pi.
-    "cholesky_jitter" does not: it REGULARIZES, and returns a DIFFERENT info
-    schema (see Returns). The returned schema depends on which solver ran,
-    which for "cholesky_jitter" is not knowable in advance -- it may fall
-    back to TSVD. Read info["solver"], never the requested mode.
+    The four modes differ in KIND, not just in tolerance, and the info schema
+    differs with them (see Returns):
+
+      - "single" builds a truncated PSEUDO-INVERSE (a retained subspace with a
+        projector). rtol is RELATIVE (rtol * s_max).
+      - "pairwise" has NO retained subspace and NO projector -- only a retained
+        PAIR SET, so it is not a pseudo-inverse. rtol is RELATIVE.
+      - "svd_lstsq" is fftisdf's own lstsq formula; rtol is ABSOLUTE, not scaled
+        by s_max, because this mode claims to BE that formula rather than to be
+        scale-invariant.
+      - "cholesky_jitter" does not truncate at all: it REGULARIZES, rejects rtol,
+        and takes jitter_rcond instead.
+
+    Which schema you get is identified by retention_mode for the three truncating
+    modes. For "cholesky_jitter" it is NOT knowable in advance -- the mode may
+    fall back to TSVD -- so there, and only there, read info["solver"].
 
     Four retention modes:
       "single" (default): threshold = rtol * s_max (scale-invariant).
@@ -851,17 +866,21 @@ def hermitian_sandwich_solve(
         instead; acceptance for this mode is the energy gate. Takes
         jitter_rcond, and REJECTS rtol.
 
-    Two residuals are reported SEPARATELY: retained_solve_residual
-    (machine-tier arithmetic sanity check, ~0 regardless of rtol) and
-    truncation_residual (controlled by rtol; reported, not gated here).
+    The three truncating modes report two residuals SEPARATELY:
+    retained_solve_residual (machine-tier arithmetic sanity check, ~0 regardless
+    of rtol) and truncation_residual (controlled by rtol; reported, not gated
+    here). "cholesky_jitter" reports NEITHER -- having no retained set, it
+    reports a single fit_residual instead.
 
     Args:
         Pi: (n,n), Hermitian PSD expected.
         V: (n,n).
-        rtol: relative spectral retention threshold; None means the 1e-4
-            default (design doc §5 -- 1e-8 was far too loose at
-            over-complete rank). Must be None when n_retained_pin is given.
-        retention_mode: "single" or "pairwise".
+        rtol: spectral retention threshold; None means the 1e-4 default
+            (design doc §5 -- 1e-8 was far too loose at over-complete rank).
+            RELATIVE (rtol * s_max) for "single"/"pairwise"; ABSOLUTE for
+            "svd_lstsq"; REJECTED by "cholesky_jitter", which has no spectral
+            cutoff. Must be None when n_retained_pin is given.
+        retention_mode: "single", "pairwise", "svd_lstsq" or "cholesky_jitter".
         target_truncation_residual: optional, "single" mode only; if
             given, additional modes are retained (decreasing eigenvalue
             order) until the truncation residual meets this target or
@@ -877,7 +896,10 @@ def hermitian_sandwich_solve(
             rtol, which this mode rejects. Rejected by the other modes.
 
     Returns:
-        (W, info). THREE POSSIBLE SCHEMAS, keyed by info["solver"]:
+        (W, info). THREE POSSIBLE SCHEMAS. The truncating modes are identified
+        by retention_mode and carry NO "solver" key -- reading info["solver"]
+        on them raises KeyError. "solver" exists only under "cholesky_jitter",
+        where it discriminates Cholesky from the TSVD fallback:
 
         Truncating modes ("single"/"pairwise"/"svd_lstsq"): n_retained,
         n_discarded, s_max, s_min_retained (None if n_retained==0),

@@ -166,6 +166,47 @@ class TestCholeskyJitterEntry(unittest.TestCase):
         self.assertEqual(info["residual_norm_convention"], "||Pi W Pi - V|| / ||V||")
         self.assertNotIn("CC", info["residual_norm_convention"])
 
+    def test_no_warning_claims_compute_Z_ran(self):
+        # The first caller-label fix covered this function's own warnings but not
+        # _tsvd_sandwich's, so a fallback emitted one truthful message followed by a
+        # false one. Captures the log rather than reading the source: the fallback
+        # path is exactly where the previous fix looked correct and was not.
+        # Rank-deficient Pi, so BOTH warnings fire: the Cholesky rejection and then
+        # _tsvd_sandwich's own residual warning. A well-conditioned Pi emits only the
+        # first, and would leave the propagation bug undetected.
+        rng = np.random.default_rng(0)
+        A = rng.standard_normal((64, 40)) + 1j * rng.standard_normal((64, 40))
+        Pi_rank_deficient = A @ A.conj().T
+        with self.assertLogs("pytc.df.solvers", level="WARNING") as captured:
+            _, info = hermitian_sandwich_solve(Pi_rank_deficient, self.V,
+                                               retention_mode="cholesky_jitter")
+        self.assertTrue(info["fallback_triggered"], "precondition: must have fallen back")
+        text = "\n".join(captured.output)
+        # Both the Cholesky rejection and the TSVD residual warning appear here.
+        self.assertIn("unscaled_cholesky_jitter", text)
+        self.assertIn("(tsvd)", text)
+        for line in captured.output:
+            self.assertNotIn("compute_Z", line,
+                             f"periodic solve emitted a warning naming compute_Z: {line}")
+            self.assertIn("hermitian_sandwich_solve", line)
+
+    def test_solver_key_exists_only_under_cholesky_jitter(self):
+        # The Returns block claimed all three schemas were "keyed by info['solver']".
+        # The truncating modes carry no such key, so following the documented
+        # instruction on the DEFAULT mode raised KeyError. Pins the discriminator
+        # actually implemented, so the doc cannot drift back.
+        for mode, kw in (("single", {"rtol": 1e-10}),
+                         ("pairwise", {"rtol": 1e-10}),
+                         ("svd_lstsq", {"rtol": 1e-8})):
+            with self.subTest(mode=mode):
+                _, info = hermitian_sandwich_solve(self.Pi, self.V,
+                                                   retention_mode=mode, **kw)
+                self.assertNotIn("solver", info)
+                self.assertEqual(info["retention_mode"], mode)
+        _, chol = hermitian_sandwich_solve(self.Pi, self.V,
+                                           retention_mode="cholesky_jitter")
+        self.assertIn("solver", chol)
+
     def test_rejects_rtol(self):
         with self.assertRaises(ValueError) as ctx:
             hermitian_sandwich_solve(self.Pi, self.V, rtol=1e-6,
