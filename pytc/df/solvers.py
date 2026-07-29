@@ -1126,7 +1126,10 @@ def hermitian_sandwich_solve(
             s_first_discarded = float(eigvals[n_retained])
 
         if n_retained > 0:
-            Pi_pinv_r = U_r @ np.diag(1.0 / sigma_r) @ U_r.conj().T
+            # Column scaling, not a GEMM: U_r @ diag(d) scales column j by d[j],
+            # which broadcasting does with the same multiplications and none of the
+            # n*k*k accumulation.
+            Pi_pinv_r = (U_r * (1.0 / sigma_r)[None, :]) @ U_r.conj().T
             W = Pi_pinv_r @ V_herm @ Pi_pinv_r
             W = (W + W.conj().T) / 2
             proj_r = U_r @ U_r.conj().T
@@ -1135,7 +1138,11 @@ def hermitian_sandwich_solve(
             retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
                 float(np.linalg.norm(retained_target)), tiny
             )
-            truncation_residual = _truncation_residual(n_retained)
+            # _truncation_residual(n_retained) recomputes U_r @ U_r^H and
+            # proj @ V @ proj -- both already in hand as proj_r and retained_target.
+            # Three n^3-class GEMMs, ~0.8 h each at 444, for values we hold. The
+            # helper stays: the adaptive-retention loop above calls it at varying k.
+            truncation_residual = float(np.linalg.norm(V_herm - retained_target)) / v_norm
         else:
             W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
             retained_solve_residual = 0.0
