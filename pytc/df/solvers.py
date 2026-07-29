@@ -770,11 +770,24 @@ def _cholesky_jitter_entry(Pi, V, *, jitter_rcond, rtol, n_retained_pin,
         Pi_herm, Pi_herm, V_herm, jitter_rcond, same_sector=True)
 
     info = dict(provenance)
+    fell_back = bool(provenance.get("fallback_triggered", False))
+    if not fell_back:
+        # The helper reports this as None for a solver that has no singular values.
+        # Emitting the key anyway is exactly the placeholder this mode promises not
+        # to produce; on the TSVD fallback it is a real range and stays.
+        info.pop("retained_singular_value_range", None)
     info.update(
         retention_mode="cholesky_jitter",
         rtol=None,
         jitter_rcond=jitter_rcond,
-        backend="jax_cho_solve",
+        # Names what ACTUALLY ran. Reporting the Cholesky backend beside
+        # solver='tsvd' asserted two contradictory things about one solve.
+        backend="jax_tsvd" if fell_back else "jax_cho_solve",
+        # The helper's own string spells the molecular fit problem
+        # (||S Z S - C C^dagger||). The arithmetic is identical, but the periodic
+        # caller solves Pi W Pi = V, and a label naming the wrong operands is a
+        # false statement about which quantity was measured.
+        residual_norm_convention="||Pi W Pi - V|| / ||V||",
         pi_anti_hermitian_residual=float(np.linalg.norm(Pi - Pi.conj().T))
         / max(float(np.linalg.norm(Pi)), tiny),
         v_anti_hermitian_residual=float(np.linalg.norm(V - V.conj().T))

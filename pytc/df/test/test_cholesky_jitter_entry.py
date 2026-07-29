@@ -32,6 +32,9 @@ _RETAINED_MODE_KEYS = frozenset({
     "truncation_residual", "retained_solve_residual", "cond_pi_retained",
     "retention_marginal", "adaptive_retention_used", "n_retained_pin",
     "target_truncation_residual",
+    # Was missing from this set while the docstring claimed no retained fields
+    # are emitted; the helper returns it as None and it leaked through review.
+    "retained_singular_value_range",
 })
 
 
@@ -118,6 +121,28 @@ class TestCholeskyJitterEntry(unittest.TestCase):
         self.assertEqual(info["solver"], "tsvd")
         self.assertIn("n_retained", info)
         self.assertIn("preceding_cholesky_jitter_used", info)
+
+    def test_backend_label_names_the_solver_that_actually_ran(self):
+        # Reporting backend='jax_cho_solve' beside solver='tsvd' asserted two
+        # contradictory things about one solve.
+        _, normal = hermitian_sandwich_solve(self.Pi, self.V,
+                                             retention_mode="cholesky_jitter")
+        self.assertFalse(normal["fallback_triggered"])
+        self.assertEqual(normal["backend"], "jax_cho_solve")
+        _, fell = hermitian_sandwich_solve(self.Pi, self.V, jitter_rcond=1e-6,
+                                           retention_mode="cholesky_jitter")
+        self.assertTrue(fell["fallback_triggered"])
+        self.assertEqual(fell["solver"], "tsvd")
+        self.assertEqual(fell["backend"], "jax_tsvd")
+
+    def test_residual_convention_names_the_periodic_operands(self):
+        # The shared helper spells the molecular fit problem. The arithmetic is
+        # the same; the label named the wrong operands, which is a false claim
+        # about which quantity was measured.
+        _, info = hermitian_sandwich_solve(self.Pi, self.V,
+                                           retention_mode="cholesky_jitter")
+        self.assertEqual(info["residual_norm_convention"], "||Pi W Pi - V|| / ||V||")
+        self.assertNotIn("CC", info["residual_norm_convention"])
 
     def test_rejects_rtol(self):
         with self.assertRaises(ValueError) as ctx:
