@@ -889,10 +889,10 @@ def hermitian_sandwich_solve(
             rtol, which this mode rejects. Rejected by the other modes.
 
     Returns:
-        (W, info). THREE POSSIBLE SCHEMAS. The truncating modes are identified
-        by retention_mode and carry NO "solver" key -- reading info["solver"]
-        on them raises KeyError. "solver" exists only under "cholesky_jitter",
-        where it discriminates Cholesky from the TSVD fallback:
+        (W, info). TWO SCHEMAS. The truncating modes are identified by
+        retention_mode and carry NO "solver" key -- reading info["solver"] on
+        them raises KeyError. "solver" exists only under "cholesky_jitter",
+        where it is always "unscaled_cholesky_jitter":
 
         Truncating modes ("single"/"pairwise"/"svd_lstsq"): n_retained,
         n_discarded, s_max, s_min_retained (None if n_retained==0),
@@ -909,13 +909,13 @@ def hermitian_sandwich_solve(
         row_scaling, dtype, jitter_rcond, backend ("jax_cho_solve"),
         pi/v_anti_hermitian_residual.
 
-        "cholesky_jitter" that FELL BACK, solver="tsvd": the helper's
-        unregularized-bias gate rejected the Cholesky result. Adds n_retained,
-        retained_singular_value_range, fallback_reason,
-        preceding_cholesky_fit_residual/jitter_used; backend is
-        "numpy_eigh_tsvd" because _tsvd_sandwich runs numpy.linalg.eigh. Its
-        cutoff is tsvd_rcond, which is NOT this function's rtol -- the fallback
-        does not inherit the caller's truncation policy.
+        There is no third schema. The automatic TSVD fallback was removed
+        (owner instruction, measured harmful on real periodic data), so
+        "cholesky_jitter" cannot return solver="tsvd" -- fallback_triggered is
+        reported and is always False. A high unregularized bias is warned about
+        and left in fit_residual for the caller to act on; _tsvd_sandwich is
+        still reachable by selecting solver="tsvd" explicitly, which is a
+        different entry point with its own cutoff.
     """
     Pi = np.asarray(Pi)
     V = np.asarray(V)
