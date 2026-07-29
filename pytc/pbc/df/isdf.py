@@ -1697,6 +1697,14 @@ def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
     Off-diagonal work holds TWO eta panels, so that term carries a factor 2.
     ``Pi`` and ``kern`` are each (Nk, Nip, Nip) and are resident for the whole
     call; at large Nip they dominate and no panel knob reduces them.
+
+    NOT AN UPPER BOUND. Measured against tracemalloc at Nk=2, Nip=48, Ng=3375,
+    the ratio of real peak to this model ran 0.89 / 1.23 / 1.25 at panel_rows
+    48 / 16 / 8: it over-predicts for a single panel and UNDER-predicts by about
+    a quarter once panels are small, because per-pair GEMM outputs and the
+    provider's own temporaries are not counted. **A fail-closed preflight must
+    apply a safety factor** -- 1.25, matching ``free_bytes_safety`` on the
+    staging path -- rather than treating this as a bound.
     """
     c16 = 16
     panels = 2 * int(n_kpts) * int(panel_rows) * int(n_grid) * c16
