@@ -12,8 +12,12 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from pyscf.pbc.gto import Cell
 
+import gc
+import weakref
+
 from pytc.pbc.df.isdf import (
     RawKernelProvider,
+    p_blocked_peak_bytes,
     apply_raw_kernel_and_solve,
     build_pi_eta,
     build_pi_kern_p_blocked,
@@ -208,3 +212,89 @@ class TestPBlockedKern(unittest.TestCase):
                     build_pi_kern_p_blocked(X, lambda: [ao], mesh_obj.phase,
                                             mesh_obj.neg, provider, grids,
                                             panel_rows=bad)
+
+
+class TestPBlockedStorageContract(unittest.TestCase):
+    """The storage claims, tested directly. Equivalence tests certify arithmetic
+    and say nothing about memory -- which is how an earlier revision that made
+    peak memory WORSE passed the whole suite."""
+
+    def _fixture(self, n_ip=6, n_blocks=4):
+        cell = _make_cell()
+        rng = np.random.default_rng(11)
+        mesh_obj = canonicalize_kpts(cell, cell.make_kpts([2, 1, 1], wrap_around=False))
+        grids = cell.get_uniform_grids(cell.mesh)
+        X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
+        ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg,
+                                   (grids.shape[0], cell.nao))
+        # Split the AO array into several genuine blocks along the grid axis.
+        edges = np.linspace(0, grids.shape[0], n_blocks + 1).astype(int)
+        chunks = [np.ascontiguousarray(ao[:, a:b, :]) for a, b in zip(edges, edges[1:])]
+        provider = RawKernelProvider(cell=cell, canonical_kpts=mesh_obj.canonical_kpts,
+                                     grid_mesh=cell.mesh)
+        return cell, mesh_obj, grids, X, chunks, provider
+
+    def test_only_one_ao_block_is_live_at_a_time(self):
+        cell, mesh_obj, grids, X, chunks, provider = self._fixture()
+        seen = []
+
+        def factory():
+            def gen():
+                for chunk in chunks:
+                    block = np.array(chunk)      # a fresh object per yield
+                    ref = weakref.ref(block)
+                    # Everything handed over earlier must already be collectable.
+                    gc.collect()
+                    alive = [r for r in seen if r() is not None]
+                    if alive:
+                        raise AssertionError(
+                            f"{len(alive)} earlier AO block(s) still live")
+                    seen.append(ref)
+                    yield block
+                    del block
+            return gen()
+
+        n_ip, panel_rows = 6, 2
+        build_pi_kern_p_blocked(X, factory, mesh_obj.phase, mesh_obj.neg,
+                                provider, grids, panel_rows=panel_rows)
+        # Every block of every panel build passed through, and none outlived its
+        # successor's creation -- which the loop above asserts as it goes.
+        n_panels = -(-n_ip // panel_rows)
+        n_builds = n_panels * (n_panels + 1) // 2
+        self.assertEqual(len(seen), n_builds * len(chunks))
+
+    def test_factory_call_count_is_the_triangular_schedule(self):
+        cell, mesh_obj, grids, X, chunks, provider = self._fixture()
+        calls = {"n": 0}
+
+        def factory():
+            calls["n"] += 1
+            return iter(chunks)
+
+        for panel_rows, n_panels in ((6, 1), (3, 2), (2, 3), (1, 6)):
+            calls["n"] = 0
+            build_pi_kern_p_blocked(X, factory, mesh_obj.phase, mesh_obj.neg,
+                                    provider, grids, panel_rows=panel_rows)
+            # P(P+1)/2 panel builds -- a superpanel schedule, NOT a resident cache.
+            self.assertEqual(calls["n"], n_panels * (n_panels + 1) // 2,
+                             f"panel_rows={panel_rows}")
+
+    def test_byte_model_names_the_floor_no_knob_can_reach(self):
+        # Synthetic 444/k222 shape: asserted, never allocated.
+        big = dict(n_kpts=8, n_ip=37120, n_grid=438948, ao_block_cols=4096, n_ao=3712)
+        wide = p_blocked_peak_bytes(panel_rows=37120, **big)
+        narrow = p_blocked_peak_bytes(panel_rows=2000, **big)
+        # The knob moves the eta term and only the eta term.
+        self.assertLess(narrow["eta_panels"], wide["eta_panels"] / 15)
+        for term in ("Pi", "kern", "grid_phases", "one_ao_block"):
+            self.assertEqual(narrow[term], wide[term], term)
+        # Pi + kern are irreducible here and already exceed a 300 GB target.
+        floor = narrow["Pi"] + narrow["kern"]
+        self.assertGreater(floor, 300e9)
+        self.assertGreater(narrow["total"], floor)
+
+    def test_streamed_eta_rejects_a_grid_width_mismatch(self):
+        cell, mesh_obj, grids, X, chunks, provider = self._fixture()
+        with self.assertRaises(ValueError):
+            build_pi_kern_p_blocked(X, lambda: iter(chunks[:-1]), mesh_obj.phase,
+                                    mesh_obj.neg, provider, grids, panel_rows=3)

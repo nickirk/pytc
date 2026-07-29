@@ -1646,29 +1646,98 @@ def stage_eta_recompute_tile(X, ao_block_source, phase, neg, q_slice=None):
     return Pi, eta
 
 
+def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
+                         ao_block_cols, n_ao):
+    """Honest peak-byte model for build_pi_kern_p_blocked.
+
+    Counts every resident term, not just the panels -- the omission that made an
+    earlier docstring describe an algorithm that had not been written. Returns a
+    dict so a caller can see which term dominates rather than a single number.
+
+    Off-diagonal work holds TWO eta panels, so that term carries a factor 2.
+    ``Pi`` and ``kern`` are each (Nk, Nip, Nip) and are resident for the whole
+    call; at large Nip they dominate and no panel knob reduces them.
+    """
+    c16 = 16
+    panels = 2 * int(n_kpts) * int(panel_rows) * int(n_grid) * c16
+    square = int(n_kpts) * int(n_ip) * int(n_ip) * c16
+    terms = {
+        "eta_panels": panels,
+        "Pi": square,
+        "kern": square,
+        "grid_phases": int(n_kpts) * int(n_grid) * c16,
+        # lq_i, lq_j and rq_j for one q at a time.
+        "per_q_temporaries": 3 * int(panel_rows) * int(n_grid) * c16,
+        "one_ao_block": int(n_kpts) * int(ao_block_cols) * int(n_ao) * c16,
+    }
+    terms["total"] = sum(terms.values())
+    return terms
+
+
+def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
+                       imag_tol=1e-10, convolve_device=False, on_block=None):
+    """eta for a slab of pivot rows, holding one AO block at a time.
+
+    ``build_pi_eta`` cannot be reused here: it does ``list(ao_blocks)`` to learn
+    the total grid width before allocating, which materialises the entire AO
+    stream. Taking ``n_grid`` from the caller removes that need, so the stream
+    stays a stream -- the difference between reducing peak memory and increasing
+    it. It also skips ``Pi``, which the panel loop builds once and would
+    otherwise recompute and discard per panel.
+
+    ``on_block`` is called with each block index for instrumentation; the tests
+    use it to assert that only one block is ever live.
+    """
+    X_rows = np.asarray(X_rows)
+    n_kpts, n_rows = int(X_rows.shape[0]), int(X_rows.shape[1])
+    pair_convolve = _resolve_pair_convolve(convolve_device)
+    eta = np.empty((n_kpts, n_rows, int(n_grid)), dtype=np.complex128)
+    col = 0
+    index = 0
+    # NOT enumerate(): CPython reuses its result tuple, which keeps the previously
+    # yielded block alive for one extra iteration. That retention is invisible to
+    # any equivalence test and defeats the point of streaming.
+    for block in ao_blocks:
+        Z = pair_convolve(X_rows, np.asarray(block), phase, imag_tol=imag_tol)[neg]
+        width = int(Z.shape[2])
+        if col + width > int(n_grid):
+            raise ValueError(
+                f"AO blocks span more than n_grid={int(n_grid)} columns.")
+        eta[:, :, col:col + width] = Z
+        col += width
+        if on_block is not None:
+            on_block(index)
+        index += 1
+        del Z, block
+    if col != int(n_grid):
+        raise ValueError(
+            f"AO blocks spanned {col} columns, expected n_grid={int(n_grid)}.")
+    return eta
+
+
 def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
                             panel_rows, imag_tol=1e-10,
-                            convolve_device=False, self_paired=None):
-    """kern for every q without holding a full eta. PROTOTYPE -- see LIMITS.
+                            convolve_device=False, self_paired=None,
+                            on_block=None):
+    """kern for every q without holding a full eta.
+
+    AO blocks are streamed one at a time via ``_eta_rows_streamed``; the residency
+    is asserted by test, not assumed.
 
     The interpolation-point axis is a pure batch axis from the AO evaluation
     through the Coulomb apply; only the final ``kern = lq rq^T`` couples P with
     P'. So a panel of pivot rows can be built, have the kernel applied, and be
     discarded.
 
-    LIMITS (independent review of f2aff84, task #66) -- do not wire this into
-    ``build``/``ISDFDF`` until they are addressed:
+    REMAINING LIMITS (independent review of f2aff84, task #66) -- still not wired
+    into ``build``/``ISDFDF``:
 
-    * **It does not stream the AO blocks.** ``build_pi_eta`` materialises its
-      whole input (``list(ao_blocks)``), so each panel build holds the entire AO
-      array. On the streaming path this makes peak memory WORSE than the dense
-      path, which is the opposite of the intent. Fixing it needs an eta-only
-      helper that preallocates from a known Ng and consumes blocks one at a time.
-    * **Peak is roughly two panels, not one**, because off-diagonal work holds
-      ``eta_i`` and ``eta_j`` at once -- and the honest figure additionally
-      includes ``Pi``, ``kern`` (Nk, Nip, Nip), the provider's FFT temporaries
-      and the per-q phase operands. There is no fail-closed byte model yet.
+    * **Peak is two panels, not one**, because off-diagonal work holds ``eta_i``
+      and ``eta_j`` at once. ``p_blocked_peak_bytes`` models every resident term.
+      **``Pi`` and ``kern`` are each (Nk, Nip, Nip) and no panel knob reduces
+      them** -- at 444/k222 that pair alone is 353 GB, so the knob cannot take
+      this configuration under a 300 GB target however far it is turned.
     * **``panel_rows`` is a schedule knob, not a resident cache.** The loop keeps
       one outer panel and regenerates the inner one; it does not retain c panels.
       A real cache would cost ``(c+1)b`` and update c block rows per sweep.
@@ -1702,34 +1771,31 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     panels = [(p0, min(p0 + rows, n_ip)) for p0 in range(0, n_ip, rows)]
 
     def _eta_panel(p0, p1):
-        """eta rows [p0:p1) for every q. One AO sweep; cost is proportional to
-        the rows, not to Nip -- this is what makes panelling non-redundant."""
-        blocks = ao_block_factory()
-        _, eta_rows = build_pi_eta(X[:, p0:p1, :], blocks, phase, neg,
-                                   imag_tol=imag_tol,
-                                   convolve_device=convolve_device)
-        return np.asarray(eta_rows)
+        """eta rows [p0:p1) for every q, one AO block resident at a time."""
+        return _eta_rows_streamed(
+            X[:, p0:p1, :], ao_block_factory(), phase, neg, n_grid_total,
+            imag_tol=imag_tol, convolve_device=convolve_device,
+            on_block=on_block)
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     q_kpts = np.asarray(provider.canonical_kpts, dtype=np.float64)
-    n_grid = None
-    kern = None
+    # Known up front, so eta slabs preallocate and the AO stream is never listed.
+    n_grid_total = int(grid_coords.shape[0])
+    gphases = np.exp(-1j * (grid_coords @ q_kpts.T)).T          # (Nk, Ng)
+    kern = np.zeros((n_kpts, n_ip, n_ip), dtype=np.complex128)
     for i, (i0, i1) in enumerate(panels):
         eta_i = _eta_panel(i0, i1)
-        if kern is None:
-            n_grid = int(eta_i.shape[2])
-            kern = np.zeros((n_kpts, n_ip, n_ip), dtype=np.complex128)
         for j in range(i, len(panels)):
             j0, j1 = panels[j]
             eta_j = eta_i if j == i else _eta_panel(j0, j1)
             for q in range(n_kpts):
                 # Same per-q grid phase the dense path applies before the
                 # Coulomb kernel; omitting it silently yields the wrong kern.
-                gphase = np.exp(-1j * (grid_coords @ q_kpts[q]))
+                gphase = gphases[q]
                 lq_i = np.asarray(eta_i[q], dtype=np.complex128) * gphase[None, :]
                 lq_j = np.asarray(eta_j[q], dtype=np.complex128) * gphase[None, :]
                 rq_j = np.conj(np.asarray(provider.apply(q, lq_j)))
-                block = (lq_i @ rq_j.T) / np.sqrt(n_grid)
+                block = (lq_i @ rq_j.T) / np.sqrt(n_grid_total)
                 kern[q, i0:i1, j0:j1] = block
                 if j != i:
                     # kern is Hermitian, so the mirrored panel is free. The
