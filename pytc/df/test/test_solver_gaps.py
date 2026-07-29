@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pytc.df.solvers import prepare_spd_cholesky
-from pytc.df import fit
+from pytc.df import fit, solvers
 from pytc.df.fit import compute_Z, compute_Z_cross
 
 
@@ -217,13 +217,19 @@ class TestResidualModes(unittest.TestCase):
         # jnp.asarray. Spy on the estimator to verify it now receives
         # jax arrays directly, never np.ndarray.
         captured = {}
-        original = fit._two_sided_residual_sampled
+        # The estimator and its caller now both live in df/solvers.py (the
+        # sandwich was lifted there so the periodic core and the molecular fit
+        # share one implementation). Patching df.fit no longer intercepts the
+        # call: the caller resolves the name in its own module. The behaviour
+        # under test is unchanged -- compute_Z's outputs and provenance are
+        # byte-identical across the lift -- only the patch target moved.
+        original = solvers._two_sided_residual_sampled
 
         def spy(S_A, Z, S_B, M, **kwargs):
             captured["args"] = (S_A, Z, S_B, M)
             return original(S_A, Z, S_B, M, **kwargs)
 
-        with patch.object(fit, "_two_sided_residual_sampled", side_effect=spy):
+        with patch.object(solvers, "_two_sided_residual_sampled", side_effect=spy):
             compute_Z(self.P, self.C, residual_mode="sampled")
 
         self.assertIn("args", captured)
