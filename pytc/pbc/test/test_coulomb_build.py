@@ -56,22 +56,31 @@ class TestBuild(unittest.TestCase):
             coulomb.build(cell, kpts, rank=3, block_size=9,
                           selection_peak_max_bytes=1 << 30)
 
-    def test_default_is_the_size_universal_exact_oracle(self):
-        # BPC is the production algorithm but is deliberately NOT the default:
-        # FROZEN_BPC_POLICY is the only validated tuning and batch_size=64
-        # exceeds a small cell's candidate pool, so a BPC default would need a
-        # size-adaptive policy that does not exist yet.
-        self.assertEqual(coulomb.DEFAULT_SELECTION_MODE, "streamed")
+    def test_default_is_bpc_with_the_frozen_policy_and_gated_storage(self):
+        # Promoted 2026-07-29 on owner instruction. This test previously asserted
+        # the opposite and is UPDATED rather than deleted: it guards the reasons the
+        # default may move, not the value. Both blockers had to be answered first --
+        # n_topup=16 is now clamped to rank (it was refused at rank<16), and storage
+        # is chosen on predicted bytes rather than allocating uncapped.
+        self.assertEqual(coulomb.DEFAULT_SELECTION_MODE, "bpc_auto")
         self.assertEqual(coulomb.FROZEN_BPC_POLICY, {
             "bpc_batch_size": 64, "bpc_min_separation": 2.0,
             "bpc_candidate_oversampling": 4, "bpc_n_topup": 16,
         })
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        # rank=3 is far below n_topup=16: exactly the combination that used to raise.
         result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8)
         prov = result["selection_provenance"]
-        self.assertEqual(prov["mode"], "streamed")
-        self.assertEqual((prov["selector"], prov["storage"]), ("exact", "streamed"))
+        self.assertEqual(prov["selector"], "bpc")
+        self.assertIn(prov["storage"], ("cached", "streamed"))
+        self.assertEqual(prov["auto_resolved_to"], prov["storage"])
+        # The tuning must travel with the mode; defaulting one without the other
+        # ships a configuration nothing validated.
+        self.assertEqual(prov["bpc_batch_size"], 64)
+        self.assertEqual(prov["bpc_n_topup_requested"], 16)
+        self.assertEqual(prov["bpc_n_topup"], 3)
+        self.assertTrue(prov["bpc_n_topup_clamped_to_rank"])
 
     def test_build_produces_self_consistent_artifact(self):
         cell = _make_cell()

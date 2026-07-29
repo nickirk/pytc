@@ -61,16 +61,18 @@ FROZEN_BPC_POLICY = {
     "bpc_candidate_oversampling": 4,
     "bpc_n_topup": 16,
 }
-# Default selector: the exact streamed oracle, valid at every system size.
-# BPC is not defaulted despite being the production algorithm. FROZEN_BPC_POLICY
-# is the only validated tuning and it is NOT size-universal -- batch_size=64
-# exceeds the candidate pool of a small cell and fails closed -- so a BPC
-# default needs a size-adaptive policy that does not exist yet. Defaulting to
-# BPC with the generic tuning would ship an untested configuration instead.
-# Cached storage additionally allocates the full complex AO feature matrix with
-# no capacity gate, so it stays an explicit opt-in until storage="auto" carries
-# one.
-DEFAULT_SELECTION_MODE = "streamed"
+# Default selector: BPC with the frozen policy, storage chosen by predicted bytes.
+# Promoted 2026-07-29 on owner instruction, after the two blockers were removed.
+# It was previously held at the exact streamed oracle because FROZEN_BPC_POLICY is the
+# only validated tuning and was not size-universal (n_topup=16 refused at rank<16), and
+# because cached storage allocated the full AO feature matrix with no capacity gate.
+# n_topup is now clamped to rank and recorded, and bpc_auto picks cached vs streamed on
+# predicted bytes, so both objections are answered rather than waived.
+#
+# The TUNING moves with the mode deliberately. Defaulting BPC while leaving the generic
+# batch=16/oversampling=1/topup=0 values would ship a configuration nothing has validated
+# -- which is the failure the previous comment existed to prevent.
+DEFAULT_SELECTION_MODE = "bpc_auto"
 
 RETIRED_SELECTION_MODES = {
     "jax_cached_matrix_free": "bpc_cached_gemm",
@@ -130,9 +132,11 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
 
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode=None,
-          fixed_pivots=None, bpc_batch_size=16,
-          bpc_min_separation=2.0, bpc_candidate_oversampling=1,
-          bpc_n_topup=0, reuse_ao_cache_for_eta=True,
+          fixed_pivots=None,
+          bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
+          bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
+          bpc_candidate_oversampling=FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
+          bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"], reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
           n_retained_pin=None, convolve_device=False, p_block_rows=None,
           solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
@@ -348,7 +352,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         Stats are collected on the first sweep only; later sweeps re-evaluate the
         same AOs and would double-count."""
         if cached_ao is not None:
-            return iter(ao_blocks_for_eta)
+            # ONE block containing every grid point. ao_blocks_for_eta is a single
+            # (Nk, Ngrid, Nao) array here, so iter() over it would yield Nk slices
+            # of shape (Ngrid, Nao) -- 2-D, which pair_convolve rejects. Latent
+            # until BPC+cached became the default and the panel path could reach it.
+            return iter([ao_blocks_for_eta])
         first = not _ao_sweeps
         _ao_sweeps.append(1)
         return (
@@ -803,9 +811,11 @@ class ISDFDF:
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
-                 selection_mode=None, fixed_pivots=None, bpc_batch_size=16,
-                 bpc_min_separation=2.0, bpc_candidate_oversampling=1,
-                 bpc_n_topup=0, reuse_ao_cache_for_eta=True,
+                 selection_mode=None, fixed_pivots=None,
+                 bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
+                 bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
+                 bpc_candidate_oversampling=FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
+                 bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"], reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
                  n_retained_pin=None, convolve_device=False, p_block_rows=None,
                  solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
