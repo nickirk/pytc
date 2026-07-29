@@ -6,10 +6,18 @@ fftisdf comparison in test_v2_reference_replay.py.
 
 import unittest
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import numpy as np
 from pyscf.pbc.gto import Cell
 
-from pytc.pbc.df.isdf import apply_raw_kernel_and_solve, build_pi_eta
+from pytc.pbc.df.isdf import (
+    RawKernelProvider,
+    apply_raw_kernel_and_solve,
+    build_pi_eta,
+    build_pi_kern_p_blocked,
+)
 from pytc.pbc.df.kpts import canonicalize_kpts
 
 
@@ -139,3 +147,61 @@ class TestApplyRawKernelAndSolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPBlockedKern(unittest.TestCase):
+    """kern built panel-by-panel over the interpolation-point axis, never
+    materialising eta. The panel schedule and the Hermitian mirror are certified
+    against the dense path rather than against the algebra."""
+
+    def _fixture(self, n_ip=6, kmesh=(2, 1, 1), seed=7):
+        cell = _make_cell()
+        rng = np.random.default_rng(seed)
+        mesh_obj = canonicalize_kpts(cell, cell.make_kpts(list(kmesh), wrap_around=False))
+        grids = cell.get_uniform_grids(cell.mesh)
+        X = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg, (n_ip, cell.nao))
+        ao = _tr_symmetric_fixture(rng, mesh_obj.n_kpts, mesh_obj.neg,
+                                   (grids.shape[0], cell.nao))
+        provider = RawKernelProvider(cell=cell, canonical_kpts=mesh_obj.canonical_kpts,
+                                     grid_mesh=cell.mesh)
+        return cell, mesh_obj, grids, X, ao, provider
+
+    @staticmethod
+    def _dense_kern(mesh_obj, grids, eta, provider, n_ip):
+        kern = np.zeros((mesh_obj.n_kpts, n_ip, n_ip), dtype=np.complex128)
+        n_grid = grids.shape[0]
+        for q in range(mesh_obj.n_kpts):
+            gphase = np.exp(-1j * (grids @ np.asarray(mesh_obj.canonical_kpts)[q]))
+            lq = np.asarray(eta[q]) * gphase[None, :]
+            rq = np.conj(np.asarray(provider.apply(q, lq)))
+            kern[q] = (lq @ rq.T) / np.sqrt(n_grid)
+        return kern
+
+    def test_every_panel_schedule_reproduces_the_dense_kern(self):
+        n_ip = 6
+        cell, mesh_obj, grids, X, ao, provider = self._fixture(n_ip=n_ip)
+        _, eta = build_pi_eta(X, ao, mesh_obj.phase, mesh_obj.neg)
+        want = self._dense_kern(mesh_obj, grids, eta, provider, n_ip)
+        # One panel (no blocking) through to one row per panel (maximum blocking).
+        for pivot_block, n_resident in ((6, 1), (3, 1), (2, 1), (1, 1), (2, 2), (1, 3)):
+            with self.subTest(pivot_block=pivot_block, n_resident=n_resident):
+                _, got = build_pi_kern_p_blocked(
+                    X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
+                    pivot_block=pivot_block, n_resident=n_resident)
+                np.testing.assert_allclose(got, want, rtol=0, atol=1e-12)
+
+    def test_pi_is_unaffected_by_the_panel_schedule(self):
+        cell, mesh_obj, grids, X, ao, provider = self._fixture()
+        want, _ = build_pi_eta(X, ao, mesh_obj.phase, mesh_obj.neg)
+        got, _ = build_pi_kern_p_blocked(
+            X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
+            pivot_block=2, n_resident=1)
+        np.testing.assert_array_equal(got, want)
+
+    def test_rejects_a_nonpositive_knob(self):
+        cell, mesh_obj, grids, X, ao, provider = self._fixture()
+        for bad in (dict(pivot_block=0, n_resident=1), dict(pivot_block=2, n_resident=0)):
+            with self.subTest(**bad):
+                with self.assertRaises(ValueError):
+                    build_pi_kern_p_blocked(X, lambda: [ao], mesh_obj.phase,
+                                            mesh_obj.neg, provider, grids, **bad)

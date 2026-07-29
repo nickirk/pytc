@@ -1644,3 +1644,87 @@ def stage_eta_recompute_tile(X, ao_block_source, phase, neg, q_slice=None):
     if q_slice is not None:
         return Pi[q_slice], eta[q_slice]
     return Pi, eta
+
+
+def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
+                            grid_coords, *,
+                            pivot_block, n_resident=1, imag_tol=1e-10,
+                            convolve_device=False, self_paired=None):
+    """kern for every q without ever materialising eta.
+
+    The interpolation-point axis is a pure batch axis from the AO evaluation all
+    the way through the Coulomb apply -- only the final ``kern = lq rq^T``
+    couples P with P'. So a panel of pivot rows can be built, have the kernel
+    applied, and be discarded. A GEMM needs both operands, so one pass would
+    still require a full side; holding ``n_resident`` panels instead trades
+    storage for regeneration:
+
+        peak ~ (n_resident * pivot_block / Nip) * |eta|
+        cost ~ (1 + n_panels / 2) full builds        [Hermitian halves the pairs]
+
+    ``ao_block_factory`` must return a FRESH iterable per call: each panel needs
+    its own sweep of the AO stream.
+
+    Args:
+        pivot_block: rows per panel. With n_resident, this is the storage knob.
+        self_paired: optional callable q -> bool, matching the dense path's
+            real-projection at self-paired q.
+
+    Returns (Pi, kern) with kern (Nk, Nip, Nip) complex128.
+    """
+    X = np.asarray(X)
+    n_kpts, n_ip = int(X.shape[0]), int(X.shape[1])
+    if int(pivot_block) <= 0 or int(n_resident) <= 0:
+        raise ValueError("pivot_block and n_resident must be positive.")
+    pair_convolve = _resolve_pair_convolve(convolve_device)
+
+    # Pi needs no AO stream -- it is X against itself -- so it is built once and
+    # never regenerated, whatever the panel schedule does.
+    Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
+
+    rows = int(pivot_block) * int(n_resident)
+    panels = [(p0, min(p0 + rows, n_ip)) for p0 in range(0, n_ip, rows)]
+
+    def _eta_panel(p0, p1):
+        """eta rows [p0:p1) for every q. One AO sweep; cost is proportional to
+        the rows, not to Nip -- this is what makes panelling non-redundant."""
+        blocks = ao_block_factory()
+        _, eta_rows = build_pi_eta(X[:, p0:p1, :], blocks, phase, neg,
+                                   imag_tol=imag_tol,
+                                   convolve_device=convolve_device)
+        return np.asarray(eta_rows)
+
+    grid_coords = np.asarray(grid_coords, dtype=np.float64)
+    q_kpts = np.asarray(provider.canonical_kpts, dtype=np.float64)
+    n_grid = None
+    kern = None
+    for i, (i0, i1) in enumerate(panels):
+        eta_i = _eta_panel(i0, i1)
+        if kern is None:
+            n_grid = int(eta_i.shape[2])
+            kern = np.zeros((n_kpts, n_ip, n_ip), dtype=np.complex128)
+        for j in range(i, len(panels)):
+            j0, j1 = panels[j]
+            eta_j = eta_i if j == i else _eta_panel(j0, j1)
+            for q in range(n_kpts):
+                # Same per-q grid phase the dense path applies before the
+                # Coulomb kernel; omitting it silently yields the wrong kern.
+                gphase = np.exp(-1j * (grid_coords @ q_kpts[q]))
+                lq_i = np.asarray(eta_i[q], dtype=np.complex128) * gphase[None, :]
+                lq_j = np.asarray(eta_j[q], dtype=np.complex128) * gphase[None, :]
+                rq_j = np.conj(np.asarray(provider.apply(q, lq_j)))
+                block = (lq_i @ rq_j.T) / np.sqrt(n_grid)
+                kern[q, i0:i1, j0:j1] = block
+                if j != i:
+                    # kern is Hermitian, so the mirrored panel is free. The
+                    # equivalence test against the dense path is what certifies
+                    # this rather than the algebra alone.
+                    kern[q, j0:j1, i0:i1] = np.conj(block).T
+            del eta_j
+        del eta_i
+
+    if self_paired is not None:
+        for q in range(n_kpts):
+            if self_paired(q):
+                kern[q] = kern[q].real.astype(np.complex128)
+    return Pi, kern
