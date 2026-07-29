@@ -539,15 +539,25 @@ def hermitian_sandwich_solve(
         # solves. There is no spectrum here, so n_retained and s_min_retained do
         # not exist: this mode trades the retained-space diagnostics for the
         # cost and must be judged on the ENERGY gate instead.
-        from scipy.linalg import solve_triangular
+        # Explicit inverse from the Cholesky factor, then two GEMMs -- not four
+        # triangular solves. Same algebra (agreement 3.4e-15), but trsm measured
+        # ~22 GFLOP/s against GEMM's several hundred, so at n=800 this is 212 ms
+        # against 371 ms. Inverting explicitly is only defensible because the
+        # jitter has already made the matrix well conditioned; on a raw Pi it
+        # would not be.
+        from scipy.linalg.lapack import zpotri
 
         chol, lower, jitter_used, n_tries = prepare_spd_cholesky(
             Pi_herm, rcond=rtol_eff)
         L = np.asarray(chol) if lower else np.asarray(chol).conj().T
-        A = solve_triangular(L, V_herm, lower=True)
-        B = solve_triangular(L, A.conj().T, lower=True).conj().T
-        C = solve_triangular(L.conj().T, B, lower=False)
-        W = solve_triangular(L.conj().T, C.conj().T, lower=False).conj().T
+        pi_inv, potri_info = zpotri(L, lower=1)
+        if potri_info != 0:
+            raise np.linalg.LinAlgError(
+                f"zpotri failed with info={potri_info} after a Cholesky that "
+                f"succeeded; the regularised matrix is not invertible.")
+        # zpotri returns only the lower triangle.
+        pi_inv = np.tril(pi_inv) + np.tril(pi_inv, -1).conj().T
+        W = pi_inv @ V_herm @ pi_inv
         W = (W + W.conj().T) / 2
 
         resid = float(np.linalg.norm(Pi_herm @ W @ Pi_herm - V_herm)) / v_norm
