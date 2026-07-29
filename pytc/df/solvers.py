@@ -493,7 +493,8 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
                                backward_error_tol=_CHOLESKY_BACKWARD_ERROR_TOL,
                                residual_mode="exact",
                                residual_n_probes=_DEFAULT_RESIDUAL_N_PROBES,
-                               residual_seed=_DEFAULT_RESIDUAL_SEED):
+                               residual_seed=_DEFAULT_RESIDUAL_SEED,
+                               caller_label="compute_Z"):
     """S_A^-1 M S_B^-1 via pytc.df.solvers.prepare_spd_cholesky. Cholesky
     with adaptive diagonal jitter is the production solver for S^-1-type
     applications -- the same idiom TC's own orbital fitting uses, not a
@@ -553,7 +554,7 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     M = jnp.asarray(M)
     if S_A.dtype in (jnp.float32, jnp.complex64):
         logger.warning(
-            f"compute_Z (unscaled_cholesky_jitter): resolved dtype is {S_A.dtype} -- JAX "
+            f"{caller_label} (unscaled_cholesky_jitter): resolved dtype is {S_A.dtype} -- JAX "
             f"defaults to float32 SILENTLY unless the caller has enabled "
             f"jax.config.update('jax_enable_x64', True), downcasting float64 numpy inputs "
             f"without any error. Measured impact on the H2O/cc-pVDZ ov-sector checkpoint: "
@@ -612,7 +613,7 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     if fit_residual > _RESIDUAL_WARN_THRESHOLD:
         if residual_mode != "exact":
             logger.warning(
-                f"compute_Z (unscaled_cholesky_jitter): {residual_mode} fit residual "
+                f"{caller_label} (unscaled_cholesky_jitter): {residual_mode} fit residual "
                 f"{fit_residual:.3e} exceeds acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e} "
                 f"-- NOT triggering the TSVD fallback because residual_mode={residual_mode!r} "
                 f"is diagnostic-only and not yet calibrated for fallback gating; only "
@@ -620,7 +621,7 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
             )
             return Z_np, provenance
         logger.warning(
-            f"compute_Z (unscaled_cholesky_jitter): two-sided fit residual {fit_residual:.3e} "
+            f"{caller_label} (unscaled_cholesky_jitter): two-sided fit residual {fit_residual:.3e} "
             f"exceeds acceptance threshold {_RESIDUAL_WARN_THRESHOLD:.0e} (jitter_A={jitter_A:.3e}, "
             f"tries_A={tries_A}) -- this reflects UNREGULARIZED bias, not a factorization "
             f"failure (the regularized-solve backward error is separately gated inside "
@@ -766,8 +767,12 @@ def _cholesky_jitter_entry(Pi, V, *, jitter_rcond, rtol, n_retained_pin,
                                    np.asarray(V).dtype, np.complex128)).tiny
     Pi_herm = (Pi + Pi.conj().T) / 2
     V_herm = (V + V.conj().T) / 2
+    # Named so the warnings do not claim compute_Z ran. Defaulting the parameter to
+    # "compute_Z" keeps every molecular message byte-identical; a note telling readers
+    # to reinterpret a false label is not a fix.
     W, provenance = _cholesky_jitter_sandwich(
-        Pi_herm, Pi_herm, V_herm, jitter_rcond, same_sector=True)
+        Pi_herm, Pi_herm, V_herm, jitter_rcond, same_sector=True,
+        caller_label="hermitian_sandwich_solve")
 
     info = dict(provenance)
     fell_back = bool(provenance.get("fallback_triggered", False))
@@ -803,9 +808,15 @@ def hermitian_sandwich_solve(
     Pi, V, *, rtol=None, retention_mode="single", target_truncation_residual=None,
     n_retained_pin=None, jitter_rcond=None,
 ):
-    """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V via a
-    truncated pseudo-inverse of Pi. Pi and V are Hermitized on entry;
-    their anti-Hermitian residuals are recorded. See design doc §5.
+    """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V. Pi and V
+    are Hermitized on entry; their anti-Hermitian residuals are recorded.
+    See design doc §5.
+
+    Three of the four modes below build a TRUNCATED PSEUDO-INVERSE of Pi.
+    "cholesky_jitter" does not: it REGULARIZES, and returns a DIFFERENT info
+    schema (see Returns). The returned schema depends on which solver ran,
+    which for "cholesky_jitter" is not knowable in advance -- it may fall
+    back to TSVD. Read info["solver"], never the requested mode.
 
     Four retention modes:
       "single" (default): threshold = rtol * s_max (scale-invariant).
@@ -860,19 +871,36 @@ def hermitian_sandwich_solve(
             rtol. Mutually exclusive with rtol/target_truncation_residual
             (both must be left None).
 
-    Note: in "cholesky_jitter" mode the shared helper emits warnings prefixed
-    "compute_Z (...)" -- it is the molecular fit helper and names its own caller.
-    They are not adapted here because doing so would mean changing the helper,
-    and compute_Z byte-identity is this stack's non-regression gate. Read those
-    prefixes as the helper's, not as evidence that compute_Z ran.
+    Args (cholesky_jitter only):
+        jitter_rcond: jitter SCALE, lambda_0 = jitter_rcond * trace(Pi)/n,
+            default 1e-14. NOT a spectral cutoff and NOT interchangeable with
+            rtol, which this mode rejects. Rejected by the other modes.
 
     Returns:
-        (W, info): info keys are n_retained, n_discarded, s_max,
-        s_min_retained (None if n_retained==0), pi/v_anti_hermitian_residual,
-        retained_solve_residual, truncation_residual, rtol (None when
-        pinned), retention_mode, adaptive_retention_used,
-        target_truncation_residual, n_retained_pin,
+        (W, info). THREE POSSIBLE SCHEMAS, keyed by info["solver"]:
+
+        Truncating modes ("single"/"pairwise"/"svd_lstsq"): n_retained,
+        n_discarded, s_max, s_min_retained (None if n_retained==0),
+        pi/v_anti_hermitian_residual, retained_solve_residual,
+        truncation_residual, rtol (None when pinned), retention_mode,
+        adaptive_retention_used, target_truncation_residual, n_retained_pin,
         retention_marginal, cond_pi_retained, dtype, backend ("numpy").
+
+        "cholesky_jitter", solver="unscaled_cholesky_jitter": NONE of the
+        retained-set keys above exist -- there is no spectrum, so a caller
+        gating on retained_solve_residual raises rather than gating on a
+        fabricated value. Instead: jitter_used, n_tries, cutoff, fit_residual,
+        residual_norm_convention, backward_error_mode/tol, fallback_triggered,
+        row_scaling, dtype, jitter_rcond, backend ("jax_cho_solve"),
+        pi/v_anti_hermitian_residual.
+
+        "cholesky_jitter" that FELL BACK, solver="tsvd": the helper's
+        unregularized-bias gate rejected the Cholesky result. Adds n_retained,
+        retained_singular_value_range, fallback_reason,
+        preceding_cholesky_fit_residual/jitter_used; backend is
+        "numpy_eigh_tsvd" because _tsvd_sandwich runs numpy.linalg.eigh. Its
+        cutoff is tsvd_rcond, which is NOT this function's rtol -- the fallback
+        does not inherit the caller's truncation policy.
     """
     Pi = np.asarray(Pi)
     V = np.asarray(V)
