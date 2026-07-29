@@ -1106,10 +1106,18 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
     panel_size = max(nocc, panel_blk)
     acc_lock   = threading.Lock() if writer is None else None
 
+    # Panel-major ordering: all of one panel's tiles across blocks are
+    # scheduled together.  The family T_c cache's hit pattern depends on it
+    # — one block's transpose ranges_T is often another block's direct
+    # (p, q) domain (e.g. oovv's symmetrization partner is vvoo's tile of
+    # the same panel), and keeping those adjacent lets the small LRU hold
+    # the shared T_c instead of rebuilding it per tile.  Multi-GPU
+    # pipelines may still interleave panels across devices; hits degrade
+    # gracefully to rebuilds.
     tile_specs = [
         (blk, i0, min(i0 + panel_blk, nvir))
-        for blk in blocks
         for i0 in range(0, nvir, panel_blk)
+        for blk in blocks
     ]
 
     # --- Per-stage consume timers ---------------------------------------

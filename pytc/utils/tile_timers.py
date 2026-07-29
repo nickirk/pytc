@@ -44,9 +44,20 @@ _JSON_PATH = os.environ.get("PYTC_TILE_TIMERS_JSON") or None
 
 _STATE = {
     "terms": {},          # name -> [total_s, count]
+    "counters": {},       # name -> int
     "lock": threading.Lock(),
     "atexit_registered": False,
 }
+
+
+def incr(name: str, n: int = 1):
+    """Increment a named counter (e.g. cache hits/misses).  Cheap always;
+    reported alongside the timed terms in the exit dump."""
+    with _STATE["lock"]:
+        _STATE["counters"][name] = _STATE["counters"].get(name, 0) + n
+        if _ENABLED and not _STATE["atexit_registered"]:
+            atexit.register(_dump_at_exit)
+            _STATE["atexit_registered"] = True
 
 
 def enabled() -> bool:
@@ -103,9 +114,16 @@ def report() -> dict:
         }
 
 
+def counters() -> dict:
+    """Snapshot of plain counters (e.g. cache hits/misses)."""
+    with _STATE["lock"]:
+        return dict(_STATE["counters"])
+
+
 def _dump_at_exit():
     rep = report()
-    if not rep:
+    cts = counters()
+    if not rep and not cts:
         return
     grand = sum(v["total_s"] for v in rep.values())
     for name, v in rep.items():
@@ -114,9 +132,12 @@ def _dump_at_exit():
             name, v["total_s"], v["count"], v["mean_s"],
             100.0 * v["total_s"] / grand if grand else 0.0,
         )
-    logger.info("tile_timers: %-24s %10.3fs total", "ALL_TRACKED", grand)
+    if rep:
+        logger.info("tile_timers: %-24s %10.3fs total", "ALL_TRACKED", grand)
+    for name, n in sorted(cts.items()):
+        logger.info("tile_timers: counter %-20s %d", name, n)
     if _JSON_PATH:
-        payload = {"terms": rep, "total_tracked_s": grand}
+        payload = {"terms": rep, "counters": cts, "total_tracked_s": grand}
         try:
             with open(_JSON_PATH, "w") as f:
                 json.dump(payload, f, indent=2)
@@ -129,3 +150,4 @@ def _dump_at_exit():
 def _reset_for_tests():
     with _STATE["lock"]:
         _STATE["terms"].clear()
+        _STATE["counters"].clear()

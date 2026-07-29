@@ -1,6 +1,7 @@
 """JAX implementation of Transcorrelated method."""
 
 import contextlib
+import collections
 import threading
 import weakref
 from typing import Any
@@ -32,11 +33,39 @@ from .utils import tile_timers as _tile_timers
 _FAMILY_ASSEMBLY = os.environ.get("PYTC_FAMILY_ASSEMBLY", "").lower() in (
     "1", "true", "yes")
 
-# Single-slot cache: at production (one GPU) a family's tiles run
-# sequentially, so one resident T_c is enough and memory stays bounded;
-# a new family's key evicts the old.  Correct (just slower) if tiles
-# interleave across families on multi-GPU.
-_FAMILY_T_CACHE = {}
+# Small LRU cache for family T_c tensors.  Replaces the original
+# single-slot cache so that block families whose family keys coincide
+# (e.g. one family's transpose ranges_T is exactly another family's
+# direct (p, q) domain) can actually hit: the medium pipeline runs its
+# tiles in panel-major order, so the few T_c's live within one panel
+# window stay resident.  Capacity is in entries, not bytes — the caller's
+# budget valve already keeps each T_c ≤ ~4×_FUSED_MEM_CAP_ELEMS; with the
+# panel-major access pattern 4-8 slots cover the working set (~13-17 GB
+# at the 1200 deck).  Multi-GPU pipelines interleave panels across
+# devices and will thrash more, but stay correct (each miss just
+# rebuilds).  Hit/miss counts feed the tile_timers receipts.
+_FAMILY_T_CACHE = collections.OrderedDict()
+_FAMILY_CACHE_SLOTS = int(os.environ.get("PYTC_FAMILY_CACHE_SLOTS", "8") or "8")
+_FAMILY_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def _family_cache_get(key):
+    T_c = _FAMILY_T_CACHE.get(key)
+    if T_c is not None:
+        _FAMILY_T_CACHE.move_to_end(key)
+        _FAMILY_CACHE_STATS["hits"] += 1
+        _tile_timers.incr("tc_family_cache_hit")
+    else:
+        _FAMILY_CACHE_STATS["misses"] += 1
+        _tile_timers.incr("tc_family_cache_miss")
+    return T_c
+
+
+def _family_cache_put(key, T_c):
+    _FAMILY_T_CACHE[key] = T_c
+    _FAMILY_T_CACHE.move_to_end(key)
+    while len(_FAMILY_T_CACHE) > _FAMILY_CACHE_SLOTS:
+        _FAMILY_T_CACHE.popitem(last=False)
 
 
 def _slice_key(s):
@@ -58,14 +87,13 @@ def _family_direct_tile(xtc_self, kernels, phi_p, phi_q, grad_phi_p,
     # (e.g. "qr" pads q, "ps" pads p), and a T_c built for one padded
     # shape is the wrong array for another.
     key = (id(kernels), _slice_key(slice_p), _slice_key(slice_q), Np, Nq)
-    T_c = _FAMILY_T_CACHE.get(key)
+    T_c = _family_cache_get(key)
     if T_c is None:
-        _FAMILY_T_CACHE.clear()
         with _tile_timers.term("tc_family_step1") as _tt:
             T_c = kmat_jax.family_step1_combined(
                 phi_p, phi_q, grad_phi_p, grad_phi_q, u1, u3)
             _tt.sync(T_c)
-        _FAMILY_T_CACHE[key] = T_c
+        _family_cache_put(key, T_c)
     with _tile_timers.term("tc_family_step2") as _tt:
         result = kmat_jax.family_step2_tile(T_c, phi_r, phi_s)
         _tt.sync(result)
