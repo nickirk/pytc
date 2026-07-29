@@ -1648,41 +1648,57 @@ def stage_eta_recompute_tile(X, ao_block_source, phase, neg, q_slice=None):
 
 def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
-                            pivot_block, n_resident=1, imag_tol=1e-10,
+                            panel_rows, imag_tol=1e-10,
                             convolve_device=False, self_paired=None):
-    """kern for every q without ever materialising eta.
+    """kern for every q without holding a full eta. PROTOTYPE -- see LIMITS.
 
-    The interpolation-point axis is a pure batch axis from the AO evaluation all
-    the way through the Coulomb apply -- only the final ``kern = lq rq^T``
-    couples P with P'. So a panel of pivot rows can be built, have the kernel
-    applied, and be discarded. A GEMM needs both operands, so one pass would
-    still require a full side; holding ``n_resident`` panels instead trades
-    storage for regeneration:
+    The interpolation-point axis is a pure batch axis from the AO evaluation
+    through the Coulomb apply; only the final ``kern = lq rq^T`` couples P with
+    P'. So a panel of pivot rows can be built, have the kernel applied, and be
+    discarded.
 
-        peak ~ (n_resident * pivot_block / Nip) * |eta|
-        cost ~ (1 + n_panels / 2) full builds        [Hermitian halves the pairs]
+    LIMITS (independent review of f2aff84, task #66) -- do not wire this into
+    ``build``/``ISDFDF`` until they are addressed:
 
-    ``ao_block_factory`` must return a FRESH iterable per call: each panel needs
-    its own sweep of the AO stream.
+    * **It does not stream the AO blocks.** ``build_pi_eta`` materialises its
+      whole input (``list(ao_blocks)``), so each panel build holds the entire AO
+      array. On the streaming path this makes peak memory WORSE than the dense
+      path, which is the opposite of the intent. Fixing it needs an eta-only
+      helper that preallocates from a known Ng and consumes blocks one at a time.
+    * **Peak is roughly two panels, not one**, because off-diagonal work holds
+      ``eta_i`` and ``eta_j`` at once -- and the honest figure additionally
+      includes ``Pi``, ``kern`` (Nk, Nip, Nip), the provider's FFT temporaries
+      and the per-q phase operands. There is no fail-closed byte model yet.
+    * **``panel_rows`` is a schedule knob, not a resident cache.** The loop keeps
+      one outer panel and regenerates the inner one; it does not retain c panels.
+      A real cache would cost ``(c+1)b`` and update c block rows per sweep.
+    * **The Hermitian mirror assumes a self-adjoint provider.** It is certified
+      against ``RawKernelProvider`` only; linearity plus the q/-q dagger law does
+      not imply self-adjointness within one q.
+    * **``self_paired`` projects ``kern`` but not ``Pi``.** The dense solve
+      projects both, so the caller must project ``Pi`` or treat this as pre-solve.
 
-    Args:
-        pivot_block: rows per panel. With n_resident, this is the storage knob.
-        self_paired: optional callable q -> bool, matching the dense path's
-            real-projection at self-paired q.
+    COST: with P panels the schedule performs P(P+1)/2 panel builds, i.e.
+    ``(P+1)/2`` full-build equivalents -- 1x at P=1. Unequal final panels need a
+    row-weighted count.
+
+    ``ao_block_factory`` must return a FRESH iterable per call.
 
     Returns (Pi, kern) with kern (Nk, Nip, Nip) complex128.
     """
     X = np.asarray(X)
     n_kpts, n_ip = int(X.shape[0]), int(X.shape[1])
-    if int(pivot_block) <= 0 or int(n_resident) <= 0:
-        raise ValueError("pivot_block and n_resident must be positive.")
+    if isinstance(panel_rows, bool) or not isinstance(panel_rows, (int, np.integer)):
+        raise ValueError(f"panel_rows must be an integer, got {type(panel_rows)}.")
+    if int(panel_rows) <= 0:
+        raise ValueError(f"panel_rows must be positive, got {panel_rows}.")
     pair_convolve = _resolve_pair_convolve(convolve_device)
 
     # Pi needs no AO stream -- it is X against itself -- so it is built once and
     # never regenerated, whatever the panel schedule does.
     Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
 
-    rows = int(pivot_block) * int(n_resident)
+    rows = int(panel_rows)
     panels = [(p0, min(p0 + rows, n_ip)) for p0 in range(0, n_ip, rows)]
 
     def _eta_panel(p0, p1):

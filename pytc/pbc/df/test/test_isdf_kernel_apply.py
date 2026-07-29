@@ -183,11 +183,11 @@ class TestPBlockedKern(unittest.TestCase):
         _, eta = build_pi_eta(X, ao, mesh_obj.phase, mesh_obj.neg)
         want = self._dense_kern(mesh_obj, grids, eta, provider, n_ip)
         # One panel (no blocking) through to one row per panel (maximum blocking).
-        for pivot_block, n_resident in ((6, 1), (3, 1), (2, 1), (1, 1), (2, 2), (1, 3)):
-            with self.subTest(pivot_block=pivot_block, n_resident=n_resident):
+        for panel_rows in (6, 3, 2, 1):
+            with self.subTest(panel_rows=panel_rows):
                 _, got = build_pi_kern_p_blocked(
                     X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
-                    pivot_block=pivot_block, n_resident=n_resident)
+                    panel_rows=panel_rows)
                 np.testing.assert_allclose(got, want, rtol=0, atol=1e-12)
 
     def test_pi_is_unaffected_by_the_panel_schedule(self):
@@ -195,13 +195,16 @@ class TestPBlockedKern(unittest.TestCase):
         want, _ = build_pi_eta(X, ao, mesh_obj.phase, mesh_obj.neg)
         got, _ = build_pi_kern_p_blocked(
             X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
-            pivot_block=2, n_resident=1)
+            panel_rows=2)
         np.testing.assert_array_equal(got, want)
 
-    def test_rejects_a_nonpositive_knob(self):
+    def test_rejects_a_malformed_knob(self):
         cell, mesh_obj, grids, X, ao, provider = self._fixture()
-        for bad in (dict(pivot_block=0, n_resident=1), dict(pivot_block=2, n_resident=0)):
-            with self.subTest(**bad):
+        # True is an int in Python and 1.9 truncates silently; both were accepted
+        # before review.
+        for bad in (0, -1, True, 1.9):
+            with self.subTest(panel_rows=bad):
                 with self.assertRaises(ValueError):
                     build_pi_kern_p_blocked(X, lambda: [ao], mesh_obj.phase,
-                                            mesh_obj.neg, provider, grids, **bad)
+                                            mesh_obj.neg, provider, grids,
+                                            panel_rows=bad)
