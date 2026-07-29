@@ -409,3 +409,34 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPanelBlockedBuildPath(unittest.TestCase):
+    """build() selecting the panel-blocked path, which forms kern without ever
+    materialising eta. The default path passing says nothing about this one, so
+    it is exercised end to end and compared against it."""
+
+    def test_panel_blocked_matches_the_default_path(self):
+        # Without x64 both paths run in complex64 and would agree with each
+        # other while both being wrong -- the comparison would prove nothing.
+        self.assertTrue(jax.config.jax_enable_x64)
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        common = dict(rank=4, block_size=9, rtol=1e-8)
+        want = coulomb.build(cell, kpts, **common)
+        # Several panels, so the off-diagonal pair work and the AO re-sweep both
+        # actually run -- one panel would exercise neither.
+        got = coulomb.build(cell, kpts, p_block_rows=2, **common)
+        for key in ("coul_kpt", "kern_kpt"):
+            with self.subTest(key=key):
+                np.testing.assert_allclose(
+                    np.asarray(got[key]), np.asarray(want[key]), rtol=0, atol=1e-10)
+
+    def test_panel_blocked_agrees_across_panel_sizes(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        common = dict(rank=4, block_size=9, rtol=1e-8)
+        one = coulomb.build(cell, kpts, p_block_rows=4, **common)
+        many = coulomb.build(cell, kpts, p_block_rows=1, **common)
+        np.testing.assert_allclose(np.asarray(many["coul_kpt"]),
+                                   np.asarray(one["coul_kpt"]), rtol=0, atol=1e-10)

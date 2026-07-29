@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 
 from pytc.pbc.df.isdf import (
+    build_pi_kern_p_blocked,
     RawKernelProvider,
     build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
@@ -75,7 +76,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           bpc_min_separation=2.0, bpc_candidate_oversampling=1,
           bpc_n_topup=0, reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-          n_retained_pin=None, convolve_device=False):
+          n_retained_pin=None, convolve_device=False, p_block_rows=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -240,13 +241,48 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                 cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
             )
         )
+
+    # One sweep counts stats; later sweeps re-evaluate the same AOs.
+    _ao_sweeps = []
+
+    def _ao_block_factory():
+        """A FRESH iterable per call, which the panel-blocked build needs: each
+        panel takes its own sweep. The single-use generator above cannot serve
+        it -- a second panel would silently see an exhausted iterator.
+
+        Stats are collected on the first sweep only; later sweeps re-evaluate the
+        same AOs and would double-count."""
+        if cached_ao is not None:
+            return iter(ao_blocks_for_eta)
+        first = not _ao_sweeps
+        _ao_sweeps.append(1)
+        return (
+            blk for _, _, blk in stream_ao_blocks(
+                cell, mesh_obj.canonical_kpts, grid_coords, block_size,
+                stats=ao_stats if first else None,
+            )
+        )
     # With stage_eta_root set, eta is staged to a memmap: per-q reads off a
     # C-order file are contiguous, so only one q is resident. None keeps in-RAM.
     eta = None
+    kern_p_blocked = None
     staged_path = None
     eta_staging_stats = None
     try:
-        if stage_eta_root is not None:
+        if p_block_rows is not None:
+            # Panel-blocked: kern is built directly and eta never exists. The
+            # panel knob trades storage against regeneration; Pi and kern are
+            # untouched by it (see p_blocked_peak_bytes).
+            neg_arr = np.asarray(mesh_obj.neg)
+            Pi, kern_p_blocked = build_pi_kern_p_blocked(
+                inpv_kpt, _ao_block_factory, mesh_obj.phase, mesh_obj.neg,
+                provider_cls(cell=cell, canonical_kpts=mesh_obj.canonical_kpts,
+                             grid_mesh=cell.mesh),
+                grid_coords, panel_rows=int(p_block_rows),
+                convolve_device=convolve_device,
+                self_paired=lambda q: int(neg_arr[q]) == q,
+            )
+        elif stage_eta_root is not None:
             staged_path = os.path.join(
                 stage_eta_root, f"isdf_eta_stage_{os.getpid()}.dat")
             Pi, eta, eta_staging_stats = build_pi_eta_staged(
@@ -269,6 +305,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         )
         coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(
             provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
+            kern=kern_p_blocked,
             retention_mode=retention_mode, kern_blocking=kern_blocking,
             n_retained_pin=n_retained_pin,
         )
@@ -664,7 +701,7 @@ class ISDFDF:
                  bpc_min_separation=2.0, bpc_candidate_oversampling=1,
                  bpc_n_topup=0, reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-                 n_retained_pin=None, convolve_device=False):
+                 n_retained_pin=None, convolve_device=False, p_block_rows=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
         self.rank = rank
@@ -679,6 +716,7 @@ class ISDFDF:
         self.bpc_n_topup = bpc_n_topup
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
         self.convolve_device = convolve_device
+        self.p_block_rows = p_block_rows
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
         self.kern_blocking = kern_blocking
@@ -716,6 +754,7 @@ class ISDFDF:
                 kern_blocking=self.kern_blocking,
                 n_retained_pin=self.n_retained_pin,
                 convolve_device=self.convolve_device,
+                p_block_rows=self.p_block_rows,
             )
         return self._built
 
