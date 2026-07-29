@@ -334,12 +334,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                         f"solve_backend='host' does not implement {name}; it is a "
                         f"reference path, not a performance path."
                     )
-            coul_kpt, kern_kpt, solve_infos = build_coul_kpt_host(
+            coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_host(
                 cell, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
                 retention_mode=retention_mode, jitter_rcond=jitter_rcond,
                 n_retained_pin=n_retained_pin,
             )
-            n_pipeline_calls = mesh_obj.n_kpts
         else:
             if jitter_rcond is not None:
                 raise ValueError(

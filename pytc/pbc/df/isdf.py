@@ -1334,15 +1334,32 @@ def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
     the two paths stop being comparable, which is the whole point of the mirror.
 
     Returns:
-        (coul_kpt, kern_kpt, infos): numpy (Nk, Nip, Nip) arrays and the per-q
-        solve info dicts, matching build_coul_kpt_device's first three returns.
+        (coul_kpt, kern_kpt, infos, n_pipeline_calls): matching
+        build_coul_kpt_device's return signature.
     """
     n_kpts = mesh_obj.n_kpts
     neg = mesh_obj.neg
+    # Normalized exactly as build_coul_kpt_device does. A scalar pin is documented
+    # as valid and previously raised TypeError here on the first subscript.
+    if n_retained_pin is None:
+        pin_per_q = None
+    elif isinstance(n_retained_pin, (list, tuple, np.ndarray)):
+        if len(n_retained_pin) != n_kpts:
+            raise ValueError(
+                f"n_retained_pin sequence must have length {n_kpts}, got "
+                f"{len(n_retained_pin)}."
+            )
+        pin_per_q = list(n_retained_pin)
+    else:
+        pin_per_q = [n_retained_pin] * n_kpts
+
     coul_kpt = [None] * n_kpts
     kern_kpt = [None] * n_kpts
     infos = [None] * n_kpts
     done = [False] * n_kpts
+    # Counted, not assumed: the conjugate shortcut solves one q per {q, neg[q]}
+    # pair, so a hard-coded n_kpts overstates the work at any mesh with pairs.
+    n_pipeline_calls = 0
 
     for q in range(n_kpts):
         if done[q]:
@@ -1353,12 +1370,13 @@ def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
             grid_coords=grid_coords, grid_mesh=cell.mesh, rtol=rtol,
             self_paired=(nq == q), retention_mode=retention_mode,
             jitter_rcond=jitter_rcond,
-            n_retained_pin=None if n_retained_pin is None else n_retained_pin[q],
+            n_retained_pin=None if pin_per_q is None else pin_per_q[q],
         )
         coul_kpt[q] = W_q
         kern_kpt[q] = kern_q
         infos[q] = info_q
         done[q] = True
+        n_pipeline_calls += 1
 
         if nq != q and not done[nq]:
             coul_kpt[nq] = np.conj(W_q)
@@ -1366,7 +1384,8 @@ def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
             infos[nq] = info_q
             done[nq] = True
 
-    return np.stack(coul_kpt, axis=0), np.stack(kern_kpt, axis=0), infos
+    return (np.stack(coul_kpt, axis=0), np.stack(kern_kpt, axis=0), infos,
+            n_pipeline_calls)
 
 
 # ---------------------------------------------------------------------------

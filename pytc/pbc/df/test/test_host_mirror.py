@@ -75,10 +75,11 @@ class TestHostMirrorMatchesDevice(unittest.TestCase):
                 cell, mesh, grids, Pi, eta = _setup(kmesh)
                 provider = RawKernelProvider(
                     cell=cell, canonical_kpts=mesh.canonical_kpts, grid_mesh=cell.mesh)
-                coul_d, kern_d, _, _ = build_coul_kpt_device(
+                coul_d, kern_d, _, n_calls_d = build_coul_kpt_device(
                     provider, Pi, eta, grids, mesh, rtol=1e-6)
-                coul_h, kern_h, infos = build_coul_kpt_host(
+                coul_h, kern_h, infos, n_calls_h = build_coul_kpt_host(
                     cell, Pi, eta, grids, mesh, rtol=1e-6)
+                self.assertEqual(n_calls_h, n_calls_d)
                 np.testing.assert_allclose(np.asarray(coul_d), coul_h, atol=1e-12)
                 np.testing.assert_allclose(np.asarray(kern_d), kern_h, atol=1e-11)
                 self.assertEqual(len(infos), mesh.n_kpts)
@@ -87,12 +88,35 @@ class TestHostMirrorMatchesDevice(unittest.TestCase):
     def test_cholesky_jitter_runs_where_the_device_path_refuses(self):
         # The reason the mirror exists: this mode has no device implementation.
         cell, mesh, grids, Pi, eta = _setup((1, 1, 1))
-        coul, _, infos = build_coul_kpt_host(
+        coul, _, infos, _ = build_coul_kpt_host(
             cell, Pi, eta, grids, mesh, retention_mode="cholesky_jitter")
         self.assertEqual(coul.shape[0], mesh.n_kpts)
         self.assertTrue(np.all(np.isfinite(coul)))
         for info in infos:
             self.assertIn(info["solver"], ("unscaled_cholesky_jitter", "tsvd"))
+
+    def test_scalar_and_sequence_n_retained_pin_both_work(self):
+        # A scalar pin is documented as valid and raised TypeError on the first
+        # subscript, because the host loop indexed it without normalizing.
+        cell, mesh, grids, Pi, eta = _setup((1, 1, 3))
+        coul_scalar, _, _, _ = build_coul_kpt_host(
+            cell, Pi, eta, grids, mesh, n_retained_pin=2)
+        coul_seq, _, _, _ = build_coul_kpt_host(
+            cell, Pi, eta, grids, mesh, n_retained_pin=[2] * mesh.n_kpts)
+        np.testing.assert_allclose(coul_scalar, coul_seq, atol=1e-14)
+        with self.assertRaises(ValueError):
+            build_coul_kpt_host(cell, Pi, eta, grids, mesh, n_retained_pin=[2])
+
+    def test_pipeline_calls_counts_the_conjugate_shortcut(self):
+        # 1x1x3 has one q/-q pair, so the pipeline runs twice, not three times.
+        # This was hard-coded to Nk, overstating the work at every paired mesh.
+        cell, mesh, grids, Pi, eta = _setup((1, 1, 3))
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh.canonical_kpts, grid_mesh=cell.mesh)
+        _, _, _, n_dev = build_coul_kpt_device(provider, Pi, eta, grids, mesh, rtol=1e-6)
+        _, _, _, n_host = build_coul_kpt_host(cell, Pi, eta, grids, mesh, rtol=1e-6)
+        self.assertEqual(n_host, n_dev)
+        self.assertLess(n_host, mesh.n_kpts)
 
     def test_rtol_is_rejected_rather_than_ignored_in_cholesky_mode(self):
         # A caller sweeping rtol over a mode that ignores it would get identical
