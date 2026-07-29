@@ -269,6 +269,18 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     staged_path = None
     eta_staging_stats = None
     try:
+        if p_block_rows is not None and kern_blocking is not None:
+            raise ValueError(
+                "p_block_rows and kern_blocking are alternative memory levers, "
+                "not composable: the panel-blocked path forms kern directly, so "
+                "kern_blocking's rq staging would never run. Choose one."
+            )
+        if p_block_rows is not None and stage_eta_root is not None:
+            raise ValueError(
+                "p_block_rows and stage_eta_root are alternative memory levers, "
+                "not composable: the panel-blocked path never materialises eta, "
+                "so there is nothing to stage. Choose one."
+            )
         if p_block_rows is not None:
             # Panel-blocked: kern is built directly and eta never exists. The
             # panel knob trades storage against regeneration; Pi and kern are

@@ -432,6 +432,19 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
                 np.testing.assert_allclose(
                     np.asarray(got[key]), np.asarray(want[key]), rtol=0, atol=1e-10)
 
+    def test_incompatible_memory_levers_are_refused(self):
+        # Both are memory levers but they are alternatives: the panel path forms
+        # kern directly, so the other two would silently do nothing. Accepting
+        # the combination would let a caller believe two levers were active.
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        common = dict(rank=4, block_size=9, rtol=1e-8, p_block_rows=2)
+        with self.assertRaises(ValueError):
+            coulomb.build(cell, kpts, kern_blocking=dict(
+                staging_root="/tmp", row_block=2, grid_chunk=8), **common)
+        with self.assertRaises(ValueError):
+            coulomb.build(cell, kpts, stage_eta_root="/tmp", **common)
+
     def test_panel_blocked_agrees_across_panel_sizes(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
