@@ -376,6 +376,13 @@ _RESIDUAL_WARN_THRESHOLD = 1e-10  # design doc v1.1 §4: acceptance = 1e-10 fit 
 _RESIDUAL_NORM_CONVENTION_SAME = "||S Z S - C C^dagger|| / ||C C^dagger||"
 _RESIDUAL_NORM_CONVENTION_CROSS = "||S_A Z_AB S_B - C_A C_B^dagger|| / ||C_A C_B^dagger||"
 _CHOLESKY_JITTER_MAX_TRIES = 7  # design doc v1.1 §4: up to 6 retries (1 initial + 6)
+# Jitter SCALE (lambda_0 = _DEFAULT_JITTER_RCOND * trace(S)/N). Deliberately NOT
+# reachable from hermitian_sandwich_solve's spectral `rtol`: an earlier revision
+# passed rtol (1e-4) in as the jitter scale, which is the exact conflation
+# _cholesky_jitter_sandwich's docstring already records for tsvd_rcond. The two
+# are different quantities with different units and differ by ten orders of
+# magnitude at their defaults.
+_DEFAULT_JITTER_RCOND = 1e-14
 _DEFAULT_RESIDUAL_N_PROBES = 32
 _DEFAULT_RESIDUAL_SEED = 0
 
@@ -706,9 +713,79 @@ def _tsvd_sandwich(S_A, S_B, M, tsvd_rcond, same_sector,
 
 
 
+def _cholesky_jitter_entry(Pi, V, *, jitter_rcond, rtol, n_retained_pin,
+                           target_truncation_residual):
+    """Route Pi W Pi = V through the shared _cholesky_jitter_sandwich.
+
+    Pi appears on BOTH sides, so this is the same_sector case: one
+    factorization, reused. Regularizes instead of truncating, so there is no
+    spectrum and therefore no n_retained, s_min_retained, truncation_residual
+    or retained_solve_residual. Those keys are ABSENT rather than filled with
+    placeholders -- a caller gating on retained_solve_residual should raise
+    KeyError here, not silently gate on a fabricated number. Acceptance for
+    this mode is the energy gate.
+    """
+    if rtol is not None:
+        raise ValueError(
+            "rtol does not apply to retention_mode='cholesky_jitter': it is a "
+            "spectral truncation threshold and this mode does not truncate. Pass "
+            "jitter_rcond to set the jitter scale (default "
+            f"{_DEFAULT_JITTER_RCOND:g}); the two differ by ten orders of magnitude "
+            "at their defaults and are not interchangeable."
+        )
+    for name, value in (("n_retained_pin", n_retained_pin),
+                        ("target_truncation_residual", target_truncation_residual)):
+        if value is not None:
+            raise ValueError(
+                f"{name} does not apply to retention_mode='cholesky_jitter': the "
+                f"mode regularizes rather than truncating, so it has no retained set."
+            )
+    if jitter_rcond is None:
+        jitter_rcond = _DEFAULT_JITTER_RCOND
+    elif isinstance(jitter_rcond, bool) or not isinstance(jitter_rcond, (int, float)):
+        raise ValueError(f"jitter_rcond must be a finite positive float, got {jitter_rcond!r}.")
+    else:
+        jitter_rcond = float(jitter_rcond)
+        if not np.isfinite(jitter_rcond) or jitter_rcond <= 0.0:
+            raise ValueError(f"jitter_rcond must be a finite positive float, got {jitter_rcond!r}.")
+
+    # Checks the RESOLVED dtype rather than jax.config, because the failure mode
+    # is the silent downcast itself: c128 in with x64 disabled yields c64 here.
+    # The shared helper only warns, since compute_Z's contract predates this; a
+    # production periodic solve has no reason to accept the ~25x precision loss.
+    resolved = jnp.asarray(Pi).dtype
+    if resolved in (jnp.float32, jnp.complex64):
+        raise ValueError(
+            f"retention_mode='cholesky_jitter' resolved Pi to {resolved}. If Pi was "
+            f"float64/complex128, JAX downcast it because x64 is disabled: call "
+            f"jax.config.update('jax_enable_x64', True) before solving. Refusing "
+            f"rather than warning -- single precision costs ~25x accuracy here."
+        )
+
+    tiny = np.finfo(np.result_type(np.asarray(Pi).dtype,
+                                   np.asarray(V).dtype, np.complex128)).tiny
+    Pi_herm = (Pi + Pi.conj().T) / 2
+    V_herm = (V + V.conj().T) / 2
+    W, provenance = _cholesky_jitter_sandwich(
+        Pi_herm, Pi_herm, V_herm, jitter_rcond, same_sector=True)
+
+    info = dict(provenance)
+    info.update(
+        retention_mode="cholesky_jitter",
+        rtol=None,
+        jitter_rcond=jitter_rcond,
+        backend="jax_cho_solve",
+        pi_anti_hermitian_residual=float(np.linalg.norm(Pi - Pi.conj().T))
+        / max(float(np.linalg.norm(Pi)), tiny),
+        v_anti_hermitian_residual=float(np.linalg.norm(V - V.conj().T))
+        / max(float(np.linalg.norm(V)), tiny),
+    )
+    return np.asarray(W), info
+
+
 def hermitian_sandwich_solve(
     Pi, V, *, rtol=None, retention_mode="single", target_truncation_residual=None,
-    n_retained_pin=None,
+    n_retained_pin=None, jitter_rcond=None,
 ):
     """Two-sided Hermitian sandwich solve for W in Pi W Pi ~= V via a
     truncated pseudo-inverse of Pi. Pi and V are Hermitized on entry;
@@ -738,6 +815,14 @@ def hermitian_sandwich_solve(
         (relerr ~1e-11) -- this mode ports that same computation so
         pytc's own pipeline reaches the same accuracy without depending
         on the external reference at runtime.
+
+      "cholesky_jitter": does NOT truncate -- routes to the shared
+        _cholesky_jitter_sandwich (Cholesky with adaptive diagonal
+        jitter, same_sector). Having no spectrum, it returns none of
+        n_retained/s_min_retained/truncation_residual/
+        retained_solve_residual, and reports the helper's fit_residual
+        instead; acceptance for this mode is the energy gate. Takes
+        jitter_rcond, and REJECTS rtol.
 
     Two residuals are reported SEPARATELY: retained_solve_residual
     (machine-tier arithmetic sanity check, ~0 regardless of rtol) and
@@ -779,15 +864,25 @@ def hermitian_sandwich_solve(
     if not np.all(np.isfinite(Pi)) or not np.all(np.isfinite(V)):
         raise ValueError("Pi and V must be finite.")
 
-    if retention_mode not in ("single", "pairwise", "svd_lstsq"):
+    if retention_mode not in ("single", "pairwise", "svd_lstsq", "cholesky_jitter"):
         raise ValueError(
-            f"retention_mode must be 'single', 'pairwise' or 'svd_lstsq', "
-            f"got {retention_mode!r}. 'cholesky_jitter' is NOT available here: the\n"
-            f"two-sided Cholesky sandwich already exists as\n"
-            f"pytc/df/fit.py::_cholesky_jitter_sandwich, and a second implementation\n"
-            f"in this module produced a parameter conflation, a missing condition\n"
-            f"certificate and a device path that silently ran eig while reporting\n"
-            f"Cholesky. Route through the shared helper instead."
+            f"retention_mode must be 'single', 'pairwise', 'svd_lstsq' or "
+            f"'cholesky_jitter', got {retention_mode!r}."
+        )
+    # Dispatched BEFORE the eigh below, which is unconditional: an earlier revision
+    # placed this branch after it, so every "Cholesky" timing on this path had in
+    # fact paid for a full eigendecomposition first.
+    if retention_mode == "cholesky_jitter":
+        return _cholesky_jitter_entry(
+            Pi, V, jitter_rcond=jitter_rcond, rtol=rtol,
+            n_retained_pin=n_retained_pin,
+            target_truncation_residual=target_truncation_residual,
+        )
+    if jitter_rcond is not None:
+        raise ValueError(
+            f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
+            f"retention_mode={retention_mode!r}. The truncating modes are controlled "
+            f"by rtol, a spectral cutoff, which is not a jitter scale."
         )
     if n_retained_pin is not None:
         if retention_mode != "single":
@@ -1173,12 +1268,11 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single"
     if retention_mode not in ("single", "pairwise", "svd_lstsq"):
         raise ValueError(
             f"retention_mode must be 'single', 'pairwise' or 'svd_lstsq', "
-            f"got {retention_mode!r}. 'cholesky_jitter' is NOT available here: the\n"
-            f"two-sided Cholesky sandwich already exists as\n"
-            f"pytc/df/fit.py::_cholesky_jitter_sandwich, and a second implementation\n"
-            f"in this module produced a parameter conflation, a missing condition\n"
-            f"certificate and a device path that silently ran eig while reporting\n"
-            f"Cholesky. Route through the shared helper instead."
+            f"got {retention_mode!r}. 'cholesky_jitter' is NOT available on the\n"
+            f"DEVICE path: this path once accepted it, ran eig, and returned info\n"
+            f"labelled Cholesky. The host hermitian_sandwich_solve supports it by\n"
+            f"delegating to _cholesky_jitter_sandwich in this module; routing the\n"
+            f"device path through the same helper is separate, unstarted work."
         )
     if n_retained_pin is not None:
         if retention_mode != "single":

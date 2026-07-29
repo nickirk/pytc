@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from pytc.df.solvers import hermitian_sandwich_solve
+from pytc.df.solvers import hermitian_sandwich_solve, hermitian_sandwich_solve_device
 
 
 def _random_hermitian_psd(rng, n, rank=None, dtype=np.complex128):
@@ -215,21 +215,40 @@ if __name__ == "__main__":
 
 
 class TestCholeskyJitterFailsClosed(unittest.TestCase):
-    """The two-sided Cholesky sandwich already exists as
-    pytc/df/fit.py::_cholesky_jitter_sandwich. A second implementation in
-    solvers.py produced a parameter conflation (the spectral rtol used as the
-    jitter scale, ten orders off), an explicit inverse with no condition
-    certificate, and -- on the device path -- eig executed while the returned
-    info was labelled Cholesky. Until the shared helper is routed through, the
-    mode must be refused rather than approximated."""
+    """A second in-module implementation of the two-sided Cholesky sandwich
+    produced a parameter conflation (the spectral rtol used as the jitter scale,
+    ten orders off), an explicit inverse with no condition certificate, and -- on
+    the device path -- eig executed while the returned info was labelled Cholesky.
+    The original guard here refused the mode outright "until the shared helper is
+    routed through". The host path now IS routed through _cholesky_jitter_sandwich,
+    so the guard becomes: it must delegate rather than reimplement, and the device
+    path (not yet routed) must still refuse. Deleting the class instead would drop
+    the only check that the device path has not quietly grown a second copy."""
 
-    def test_refuses_and_names_the_shared_helper(self):
+    def test_host_delegates_to_the_shared_helper(self):
+        pi = np.eye(8, dtype=np.complex128)
+        _, info = hermitian_sandwich_solve(pi, pi.copy(),
+                                           retention_mode="cholesky_jitter")
+        # The helper's own provenance label. A reimplementation would have to
+        # forge this string to pass, which is the point.
+        self.assertEqual(info["solver"], "unscaled_cholesky_jitter")
+        self.assertIn("jitter_used", info)
+
+    def test_rtol_is_still_rejected_by_name(self):
+        # The conflation that motivated the original refusal: rtol must not reach
+        # the jitter scale. It is now rejected explicitly rather than by refusing
+        # the whole mode.
         pi = np.eye(8, dtype=np.complex128)
         with self.assertRaises(ValueError) as ctx:
             hermitian_sandwich_solve(pi, pi.copy(), rtol=1e-6,
                                      retention_mode="cholesky_jitter")
-        # Rejecting is not enough; the message must point somewhere useful.
-        self.assertIn("_cholesky_jitter_sandwich", str(ctx.exception))
+        self.assertIn("jitter_rcond", str(ctx.exception))
+
+    def test_device_path_still_refuses(self):
+        pi = np.eye(8, dtype=np.complex128)
+        with self.assertRaises(ValueError):
+            hermitian_sandwich_solve_device(pi, pi.copy(), rtol=1e-6,
+                                            retention_mode="cholesky_jitter")
 
     def test_supported_modes_are_unaffected(self):
         pi = np.eye(8, dtype=np.complex128)
