@@ -95,7 +95,10 @@ class TestHostMirrorMatchesDevice(unittest.TestCase):
         self.assertEqual(coul.shape[0], mesh.n_kpts)
         self.assertTrue(np.all(np.isfinite(coul)))
         for info in infos:
-            self.assertIn(info["solver"], ("unscaled_cholesky_jitter", "tsvd"))
+            # "tsvd" was accepted here while the fallback existed. It cannot occur
+            # now, and leaving it in the tuple would let a resurrected fallback pass.
+            self.assertEqual(info["solver"], "unscaled_cholesky_jitter")
+            self.assertFalse(info["fallback_triggered"])
 
     def test_scalar_and_sequence_n_retained_pin_both_work(self):
         # A scalar pin is documented as valid and raised TypeError on the first
@@ -179,6 +182,39 @@ class TestOptionsRefusedAtConstruction(unittest.TestCase):
         # and construction-time validation must not become the only gate.
         with self.assertRaises(ValueError):
             validate_option_compatibility(p_block_rows=4, stage_eta_root="/tmp")
+
+
+class TestStaticallyInvalidConfigsRefusedAtConstruction(unittest.TestCase):
+    """Review found three statically invalid configurations that constructed fine and
+    failed only after pivot selection: (device, cholesky_jitter, jitter=None),
+    (host, single, jitter_rcond set), and (host, cholesky_jitter, rtol set). The
+    first validator took neither retention_mode nor rtol -- fixing placement for
+    SOME options and not others is not a fix. These pin the exact placements."""
+
+    def setUp(self):
+        self.cell = _make_cell()
+        self.kpts = self.cell.make_kpts((1, 1, 1), wrap_around=False)
+
+    def test_the_three_placements_fail_at_construction(self):
+        cases = (
+            dict(solve_backend="device", retention_mode="cholesky_jitter"),
+            dict(solve_backend="host", retention_mode="single", jitter_rcond=1e-14),
+            dict(solve_backend="host", retention_mode="cholesky_jitter", rtol=1e-6),
+            dict(solve_backend="host", retention_mode="cholesky_jitter", n_retained_pin=3),
+        )
+        for kw in cases:
+            with self.subTest(**kw):
+                with self.assertRaises(ValueError):
+                    ISDFDF(self.cell, self.kpts, rank=12, block_size=200, **kw)
+
+    def test_bpc_n_topup_rejects_bool_and_float_before_coercion(self):
+        # int() accepts True as 1 and 3.7 as 3, then the clamp records the coerced
+        # value as though the caller had asked for it.
+        for bad in (True, 3.7):
+            with self.subTest(bpc_n_topup=bad):
+                with self.assertRaises(ValueError):
+                    build(self.cell, self.kpts, rank=12, block_size=200, rtol=1e-6,
+                          selection_mode="bpc_streamed", bpc_n_topup=bad)
 
 
 class TestCholeskyBiasPolicyPrecondition(unittest.TestCase):

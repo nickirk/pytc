@@ -549,6 +549,16 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     wrapper assembles those -- part of the core-build contract, not
     deferred to the CCSD step.
     """
+    # REJECTED, not ignored. tsvd_rcond only ever fed the automatic fallback; with
+    # that gone it has no effect, and silently accepting a caller's singular-value
+    # cutoff while doing nothing with it is worse than refusing it. Callers wanting
+    # truncation should select solver="tsvd" explicitly, where the cutoff is live.
+    if tsvd_rcond is not None:
+        raise ValueError(
+            "tsvd_rcond has no effect on the Cholesky path: the automatic TSVD "
+            "fallback was removed, so nothing consumes a singular-value cutoff "
+            "here. Select solver='tsvd' explicitly if truncation is wanted."
+        )
     S_A = jnp.asarray(S_A)
     S_B = jnp.asarray(S_B)
     M = jnp.asarray(M)
@@ -606,7 +616,6 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
         "residual_warn_threshold": _RESIDUAL_WARN_THRESHOLD,
         "row_scaling": "identity",
         "fallback_triggered": False,
-        "fallback_gating_applicable": residual_mode == "exact",
         **residual_meta,
     }
 
@@ -794,22 +803,23 @@ def _cholesky_jitter_entry(Pi, V, *, jitter_rcond, rtol, n_retained_pin,
         caller_label="hermitian_sandwich_solve")
 
     info = dict(provenance)
-    fell_back = bool(provenance.get("fallback_triggered", False))
-    if not fell_back:
-        # The helper reports this as None for a solver that has no singular values.
-        # Emitting the key anyway is exactly the placeholder this mode promises not
-        # to produce; on the TSVD fallback it is a real range and stays.
-        info.pop("retained_singular_value_range", None)
+    # No fallback exists, so there is no branch: the solver is always Cholesky and
+    # there is never a singular-value range. Keeping an `if fell_back` here would be
+    # unreachable code implying a second outcome that cannot occur.
+    if provenance.get("fallback_triggered", False):
+        raise AssertionError(
+            "cholesky_jitter reported fallback_triggered=True, but the automatic "
+            "TSVD fallback was removed. Provenance and control flow disagree."
+        )
+    info.pop("retained_singular_value_range", None)
     info.update(
         retention_mode="cholesky_jitter",
         rtol=None,
         jitter_rcond=jitter_rcond,
-        # Names the ACTUAL implementation, not the mode. Two prior labels here
-        # were false: 'jax_cho_solve' beside solver='tsvd', then 'jax_tsvd' for a
-        # fallback whose _tsvd_sandwich calls numpy.linalg.eigh. The regression
-        # for this instruments the call path instead of comparing to this string,
-        # because a hand-written label is exactly what was wrong both times.
-        backend="numpy_eigh_tsvd" if fell_back else "jax_cho_solve",
+        # One outcome, one label. Two prior labels here were false in sequence;
+        # the regression instruments np.linalg.eigh/svd rather than comparing this
+        # string to another hand-written string.
+        backend="jax_cho_solve",
         # The helper's own string spells the molecular fit problem
         # (||S Z S - C C^dagger||). The arithmetic is identical, but the periodic
         # caller solves Pi W Pi = V, and a label naming the wrong operands is a

@@ -202,6 +202,57 @@ class TestCholeskyJitterEntry(unittest.TestCase):
                                            retention_mode="cholesky_jitter")
         self.assertIn("solver", chol)
 
+    def test_tsvd_sandwich_is_never_called_by_either_cholesky_entry(self):
+        """Instrument the call, do not trust the label.
+
+        Review asked for this explicitly: labels have been wrong twice on this path,
+        so 'no fallback' must be established by observing that _tsvd_sandwich does
+        not execute. Covers both entries -- the periodic solve and molecular
+        compute_Z -- and includes a positive control so an empty list cannot be
+        vacuous.
+        """
+        from pytc.df import fit as fit_mod
+        calls = []
+        real = solvers._tsvd_sandwich
+
+        def spy(*a, **kw):
+            calls.append("tsvd_sandwich")
+            return real(*a, **kw)
+
+        solvers._tsvd_sandwich = spy
+        fit_mod._tsvd_sandwich = spy
+        try:
+            # Rank-deficient Pi: high bias, i.e. exactly the case that used to fall back.
+            rng = np.random.default_rng(0)
+            A = rng.standard_normal((64, 40)) + 1j * rng.standard_normal((64, 40))
+            Pi_def = A @ A.conj().T
+            _, info = hermitian_sandwich_solve(Pi_def, self.V,
+                                               retention_mode="cholesky_jitter")
+            self.assertGreater(info["fit_residual"], 1e-10, "precondition: bias high")
+            self.assertEqual(calls, [], "periodic Cholesky entry reached _tsvd_sandwich")
+
+            # Molecular entry, forced to the same high-bias regime.
+            P = Pi_def
+            C = rng.standard_normal((64, 80)) + 1j * rng.standard_normal((64, 80))
+            _, prov = fit_mod.compute_Z(P, C, rcond=1.0, solver="cholesky_jitter")
+            self.assertEqual(prov["solver"], "unscaled_cholesky_jitter")
+            self.assertEqual(calls, [], "compute_Z Cholesky path reached _tsvd_sandwich")
+
+            # Positive control: the spy DOES fire when TSVD is selected explicitly,
+            # so the two empty assertions above mean "not called", not "never patched".
+            fit_mod.compute_Z(P, C, solver="tsvd")
+            self.assertEqual(calls, ["tsvd_sandwich"])
+        finally:
+            solvers._tsvd_sandwich = real
+            fit_mod._tsvd_sandwich = real
+
+    def test_tsvd_rcond_is_rejected_not_ignored(self):
+        # It was silently accepted and inert: None and 0.9 gave byte-identical Z.
+        with self.assertRaises(ValueError) as ctx:
+            solvers._cholesky_jitter_sandwich(self.Pi, self.Pi, self.V, 1e-14,
+                                              True, tsvd_rcond=0.9)
+        self.assertIn("no effect", str(ctx.exception))
+
     def test_rejects_rtol(self):
         with self.assertRaises(ValueError) as ctx:
             hermitian_sandwich_solve(self.Pi, self.V, rtol=1e-6,

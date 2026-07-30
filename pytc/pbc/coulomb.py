@@ -87,7 +87,9 @@ RETIRED_SELECTION_MODES = {
 
 def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
                                  stage_eta_root=None, solve_backend="device",
-                                 jitter_rcond=None):
+                                 jitter_rcond=None, retention_mode="single",
+                                 rtol=None, n_retained_pin=None,
+                                 target_truncation_residual=None):
     """Refuse statically-knowable option combinations.
 
     Placement is the point. These checks previously lived only inside build(), which
@@ -128,6 +130,34 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
             "jitter_rcond requires solve_backend='host'; the device path does "
             "not implement retention_mode='cholesky_jitter'."
         )
+    # These were statically knowable and yet failed only after pivot selection,
+    # because the first version of this validator took neither retention_mode nor
+    # rtol. Fixing placement for SOME options and not others is not a fix.
+    if retention_mode == "cholesky_jitter":
+        if solve_backend != "host":
+            raise ValueError(
+                f"retention_mode='cholesky_jitter' requires solve_backend='host'; "
+                f"the device path refuses the mode. Got {solve_backend!r}."
+            )
+        if rtol is not None:
+            raise ValueError(
+                "rtol does not apply to retention_mode='cholesky_jitter': it is a "
+                "spectral truncation threshold and this mode does not truncate. "
+                "Pass jitter_rcond instead."
+            )
+        for name, value in (("n_retained_pin", n_retained_pin),
+                            ("target_truncation_residual", target_truncation_residual)):
+            if value is not None:
+                raise ValueError(
+                    f"{name} does not apply to retention_mode='cholesky_jitter': "
+                    f"the mode regularizes rather than truncating, so it has no "
+                    f"retained set."
+                )
+    elif jitter_rcond is not None:
+        raise ValueError(
+            f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
+            f"{retention_mode!r}."
+        )
 
 
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
@@ -166,7 +196,9 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     validate_option_compatibility(
         p_block_rows=p_block_rows, kern_blocking=kern_blocking,
         stage_eta_root=stage_eta_root, solve_backend=solve_backend,
-        jitter_rcond=jitter_rcond)
+        jitter_rcond=jitter_rcond, retention_mode=retention_mode, rtol=rtol,
+        n_retained_pin=n_retained_pin,
+        target_truncation_residual=None)
     if selection_mode == "fixed_pivots" and fixed_pivots is None:
         raise ValueError(
             "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
@@ -277,6 +309,15 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         # candidate_oversampling=99 both pass at rank=12, because batch_size
         # self-limits via retain_count = min(batch_size, rank - len(pivots)).
         # The clamp is recorded rather than silent, so a run reports what it used.
+        # Validate BEFORE converting. int() silently accepts True as 1 and 3.7 as 3,
+        # and the clamp then records the coerced value as though it had been asked for.
+        if isinstance(bpc_n_topup, bool) or not isinstance(bpc_n_topup, (int, np.integer)):
+            raise ValueError(
+                f"bpc_n_topup must be a non-negative integer, got "
+                f"{bpc_n_topup!r} of type {type(bpc_n_topup).__name__}."
+            )
+        if int(bpc_n_topup) < 0:
+            raise ValueError(f"bpc_n_topup must be non-negative, got {bpc_n_topup}.")
         n_topup_eff = min(int(bpc_n_topup), int(rank))
         pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
@@ -841,7 +882,8 @@ class ISDFDF:
         validate_option_compatibility(
             p_block_rows=p_block_rows, kern_blocking=kern_blocking,
             stage_eta_root=stage_eta_root, solve_backend=solve_backend,
-            jitter_rcond=jitter_rcond)
+            jitter_rcond=jitter_rcond, retention_mode=retention_mode, rtol=rtol,
+            n_retained_pin=n_retained_pin)
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
         self.kern_blocking = kern_blocking

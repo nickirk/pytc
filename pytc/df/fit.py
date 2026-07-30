@@ -174,8 +174,9 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
     # inference.
     if solver == "cholesky_jitter":
         rcond_eff = 1e-14 if rcond is None else rcond
+        # tsvd_rcond is NOT forwarded: the Cholesky path rejects it now that the
+        # automatic fallback is gone. It remains live for solver="tsvd".
         return _cholesky_jitter_sandwich(S, S, M, rcond_eff, True,
-                                          tsvd_rcond=tsvd_rcond,
                                           backward_error_mode=backward_error_mode,
                                           backward_error_tol=backward_error_tol,
                                           residual_mode=residual_mode,
@@ -268,8 +269,8 @@ def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None, solver="cholesky_jitter",
     M = C_A @ C_B.conj().T
     if solver == "cholesky_jitter":
         rcond_eff = 1e-14 if rcond is None else rcond
+        # See compute_Z: not forwarded, the Cholesky path rejects it.
         return _cholesky_jitter_sandwich(S_A, S_B, M, rcond_eff, same_sector,
-                                          tsvd_rcond=tsvd_rcond,
                                           backward_error_mode=backward_error_mode,
                                           backward_error_tol=backward_error_tol,
                                           residual_mode=residual_mode,
