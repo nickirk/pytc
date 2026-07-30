@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+import os
 import time
 from typing import Callable, Mapping
 
@@ -797,6 +798,53 @@ def contract_partial_x_right_t2_streamed(t2, right_out, right_inner, x_backing, 
 
     return _stream_partial_x(
         _xstream_right_panel_jit, t2, right_out, right_inner, x_backing, nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size)
+
+
+# Default device-residency cap for the full-lift X path (~24 GiB).  The
+# streamed path exists for decks whose X_vv cannot live on the GPU (the
+# 1200-orbital deck's 247 GB); at smaller decks the full-lift path is
+# dramatically faster (one compiled rank scan instead of ~2x51 host-driven
+# panel kernels per cycle), so when X fits there is no reason to stream.
+_X_FULL_LIFT_CAP_BYTES = int(
+    float(os.environ.get("PYTC_X_FULL_LIFT_CAP_GB", "24")) * 1024 ** 3)
+
+
+def contract_isdf_factor_direct_terms_t2_auto(
+    t2: Array,
+    p: Array,
+    grad_p: Array,
+    u1: Array,
+    u3: Array,
+    d: Array,
+    x_backing,
+    nocc: int,
+    *,
+    occupied_pair_batch_size: int = 8,
+    rank_panel_size: int = 128,
+    cap_bytes: int = _X_FULL_LIFT_CAP_BYTES,
+) -> Mapping[str, Array]:
+    """Size-conditional X path: full-lift when X_vv fits the cap, else streamed.
+
+    The full-lift path (whole X_vv device-lifted, one compiled rank scan) is
+    the fast path whenever the block fits; the streamed path is the
+    memory-necessity fallback for decks whose X_vv exceeds the cap.  Which
+    path was taken is recorded in the tile_timers counters
+    (``fd_x_full_lift`` / ``fd_x_streamed``) so receipts show it.
+    """
+    nvir = x_backing.shape[0] - int(nocc)
+    x_bytes = nvir * nvir * x_backing.shape[2] * 8
+    if x_bytes <= cap_bytes:
+        _tile_timers.incr("fd_x_full_lift")
+        x_full = np.asarray(x_backing[int(nocc):, int(nocc):, :], dtype=np.float64)
+        return contract_isdf_factor_direct_terms_t2(
+            t2, p, grad_p, u1, u3, d, x_full,
+            occupied_pair_batch_size=occupied_pair_batch_size,
+            rank_panel_size=rank_panel_size)
+    _tile_timers.incr("fd_x_streamed")
+    return contract_isdf_factor_direct_terms_t2_xstream(
+        t2, p, grad_p, u1, u3, d, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size)
 

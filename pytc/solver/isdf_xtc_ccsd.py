@@ -83,7 +83,7 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         rank_panel = min(self.factorized_rank_panel, fit.p_virtual.shape[1])
         aux_panel = min(self.factorized_aux_panel, b.shape[2])
         with _tile_timers.term("fd_isdf_terms") as _tt:
-            terms = factor_direct_vvvv.contract_isdf_factor_direct_terms_t2_xstream(
+            terms = factor_direct_vvvv.contract_isdf_factor_direct_terms_t2_auto(
                 t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
                 occupied_pair_batch_size=min(8, self.nocc * self.nocc),
                 rank_panel_size=rank_panel)
