@@ -151,9 +151,16 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
             (O(n^2 * residual_n_probes) on-device Hutchinson estimate --
             diagnostic-only. NEITHER mode drives a solver switch any
             more -- nothing does. The sampled estimator is NOT
-            decision-grade: measured bias ~+9% that does NOT vanish with
-            probe count, so it must never stand in for an acceptance
-            gate. See _two_sided_residual_sampled's docstring.
+            decision-grade at tested probe counts: measured relative
+            bias ~+9% across 128-512 probes on ONE calibration matrix,
+            while the spread fell as 1/sqrt(m) as expected. That is
+            enough to bar it from standing in for an acceptance gate.
+            It is NOT evidence of non-vanishing asymptotic bias -- for
+            i.i.d. Rademacher probes the sampled numerator and
+            denominator converge, so their square-root ratio converges
+            to the exact residual by continuity, and any finite-sample
+            ratio/Jensen bias must decay. See
+            _two_sided_residual_sampled's docstring.
         residual_n_probes, residual_seed: forwarded to the sampled
             estimator when residual_mode="sampled"; ignored otherwise.
 
