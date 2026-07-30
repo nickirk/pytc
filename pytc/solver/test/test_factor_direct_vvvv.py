@@ -547,8 +547,49 @@ class TestTieredXAuto(unittest.TestCase):
             occupied_pair_batch_size=2, rank_panel_size=3)
         self.assertEqual(_relative_l2(right_pipe, right_stream), 0.0)
 
+    def test_pipelined_retries_at_half_panel_on_device_oom(self):
+        # Regression cover for the v4 1200 run (JID 20609700): the measured
+        # panel budget cannot see BFC fragmentation, so a prefetch
+        # ``device_put`` can still OOM; the loop must restart at half the
+        # panel width and produce the same result.
+        from unittest import mock
+        os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(1200 / 1024 ** 3)  # width 6
+        real_device_put = jax.device_put
+        calls = {"n": 0}
 
-class TestMemoryMeasurement(unittest.TestCase):
+        def fail_first(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise jax.errors.JaxRuntimeError(
+                    "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 1B.")
+            return real_device_put(*args, **kwargs)
+
+        with mock.patch.object(jax, "device_put", side_effect=fail_first):
+            result = factor_direct.contract_partial_x_left_t2_pipelined(
+                self.data["t2"], self.data["p"], self.data["p"],
+                self.backing, self.nocc,
+                occupied_pair_batch_size=2, rank_panel_size=3)
+        reference = factor_direct.contract_partial_x_left_t2(
+            self.data["t2"], self.data["p"], self.data["p"], self.data["x"],
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        self.assertLessEqual(_relative_l2(result, reference), 1e-12)
+        self.assertGreaterEqual(calls["n"], 2)  # the retry really re-ran
+
+    def test_pipelined_reraises_non_oom_jax_error(self):
+        # Only device-OOM errors trigger the halving retry; anything else
+        # must propagate unchanged.
+        from unittest import mock
+        os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(1200 / 1024 ** 3)
+
+        def fail_always(*args, **kwargs):
+            raise jax.errors.JaxRuntimeError("INTERNAL: something else broke")
+
+        with mock.patch.object(jax, "device_put", side_effect=fail_always):
+            with self.assertRaises(jax.errors.JaxRuntimeError):
+                factor_direct.contract_partial_x_left_t2_pipelined(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=3)
     """The tier gate's memory measurements, including their fallback paths.
 
     Regression cover for the 1200 validation OOM: the gate measured node

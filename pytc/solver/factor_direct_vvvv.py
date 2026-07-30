@@ -966,12 +966,17 @@ def _pipelined_x_panel_size(nvir, rank, working_set_bytes, *,
                             rank_panel_size, panel_budget_bytes=None):
     """Rank width of one pipelined X panel, a multiple of ``rank_panel_size``.
 
-    The per-panel budget is half the measured free device memory after the
-    t2/accumulator working set and a 4 GiB safety reserve; the other half is
-    the in-flight prefetch buffer.  ``PYTC_X_PANEL_BUDGET_GB`` -- read here,
-    at call time -- overrides the computed budget for benchmarking.  When
-    device memory is unmeasurable (CPU backend) and no override is given,
-    the width falls back to today's ``rank_panel_size``.
+    The per-panel budget is one THIRD of the measured free device memory
+    after the t2/accumulator working set and a 4 GiB safety reserve: one
+    share for the resident panel, one for the in-flight prefetch buffer,
+    and one left unallocated as slack for kernel temporaries and BFC
+    fragmentation -- the previous two-share split left ~2 GiB of headroom
+    and the prefetch ``device_put`` OOM'd at 1200 (JID 20609700) even
+    though the measured free memory covered both panels on paper.
+    ``PYTC_X_PANEL_BUDGET_GB`` -- read here, at call time -- overrides the
+    computed budget for benchmarking.  When device memory is unmeasurable
+    (CPU backend) and no override is given, the width falls back to
+    today's ``rank_panel_size``.
     """
 
     override_gb = os.environ.get("PYTC_X_PANEL_BUDGET_GB")
@@ -984,7 +989,7 @@ def _pipelined_x_panel_size(nvir, rank, working_set_bytes, *,
         if free_device is None:
             return rank_panel_size
         reserve = working_set_bytes + 4 * 1024 ** 3
-        budget = max(0, int((0.9 * free_device - reserve) // 2))
+        budget = max(0, int((0.9 * free_device - reserve) // 3))
     width = budget // (nvir * nvir * 8)
     if width < rank_panel_size:
         _logger.warning(
@@ -1052,6 +1057,11 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
     into ``panel_source`` and is accepted for symmetry with
     :func:`_stream_partial_x`; callers validate with
     :func:`_validate_x_stream`.
+
+    If a panel ``device_put`` or kernel dispatch raises a device
+    out-of-memory error anyway (the free-memory measurement cannot see BFC
+    fragmentation), the whole loop retries from scratch at half the panel
+    width, halving again on each failure down to ``rank_panel_size``.
     """
 
     if occupied_pair_batch_size < 1 or rank_panel_size < 1:
@@ -1069,44 +1079,59 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
     panel_size = _pipelined_x_panel_size(
         nvir, rank, working_set,
         rank_panel_size=rank_panel_size, panel_budget_bytes=panel_budget_bytes)
-    n_blocks = (rank + panel_size - 1) // panel_size
-    panel_padded_rank = n_blocks * panel_size
-    _logger.info(
-        "X stream panels: panel_size=%d n_blocks=%d rank=%d "
-        "(panel budget measured at call time)",
-        panel_size, n_blocks, rank)
 
     t2_pairs = jnp.pad(
         jnp.asarray(t2).reshape(n_pairs, nvir, nvir),
         ((0, padded_pairs - n_pairs), (0, 0), (0, 0)))
-    inner_padded = jnp.pad(jnp.asarray(left_inner), ((0, 0), (0, panel_padded_rank - rank)))
-    out_padded = jnp.pad(jnp.asarray(left_out), ((0, 0), (0, panel_padded_rank - rank)))
 
-    def panel_read(k):
-        m0 = k * panel_size
-        return async_read(panel_source, m0, min(m0 + panel_size, rank), panel_size)
+    while True:
+        n_blocks = (rank + panel_size - 1) // panel_size
+        panel_padded_rank = n_blocks * panel_size
+        _logger.info(
+            "X stream panels: panel_size=%d n_blocks=%d rank=%d "
+            "(panel budget measured at call time)",
+            panel_size, n_blocks, rank)
 
-    total = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2_pairs.dtype)
-    future = panel_read(0)
-    x_dev = jax.device_put(await_read(future))
-    if n_blocks > 1:
-        future = panel_read(1)
-    for k in range(n_blocks):
-        m0 = k * panel_size
-        total = total + panel_kernel(
-            t2_pairs,
-            inner_padded[:, m0:m0 + panel_size],
-            out_padded[:, m0:m0 + panel_size],
-            x_dev,
-            occupied_pair_batch_size=occupied_pair_batch_size)
-        if k + 1 < n_blocks:
-            # Awaiting the prefetch after dispatching kernel k lets the H2D
-            # transfer overlap the kernel's async execution.
-            x_next = jax.device_put(await_read(future))
-            if k + 2 < n_blocks:
-                future = panel_read(k + 2)
-            x_dev = x_next
-    return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
+        inner_padded = jnp.pad(jnp.asarray(left_inner), ((0, 0), (0, panel_padded_rank - rank)))
+        out_padded = jnp.pad(jnp.asarray(left_out), ((0, 0), (0, panel_padded_rank - rank)))
+
+        def panel_read(k):
+            m0 = k * panel_size
+            return async_read(panel_source, m0, min(m0 + panel_size, rank), panel_size)
+
+        try:
+            total = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2_pairs.dtype)
+            future = panel_read(0)
+            x_dev = jax.device_put(await_read(future))
+            if n_blocks > 1:
+                future = panel_read(1)
+            for k in range(n_blocks):
+                m0 = k * panel_size
+                total = total + panel_kernel(
+                    t2_pairs,
+                    inner_padded[:, m0:m0 + panel_size],
+                    out_padded[:, m0:m0 + panel_size],
+                    x_dev,
+                    occupied_pair_batch_size=occupied_pair_batch_size)
+                if k + 1 < n_blocks:
+                    # Awaiting the prefetch after dispatching kernel k lets
+                    # the H2D transfer overlap the kernel's async execution.
+                    x_next = jax.device_put(await_read(future))
+                    if k + 2 < n_blocks:
+                        future = panel_read(k + 2)
+                    x_dev = x_next
+        except jax.errors.JaxRuntimeError as exc:
+            smaller = (panel_size // 2 // rank_panel_size) * rank_panel_size
+            msg = str(exc)
+            if (("RESOURCE_EXHAUSTED" not in msg and "Out of memory" not in msg)
+                    or smaller < rank_panel_size or smaller == panel_size):
+                raise
+            _logger.warning(
+                "X stream device OOM at panel_size=%d; retrying at %d",
+                panel_size, smaller)
+            panel_size = smaller
+            continue
+        return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
 def contract_partial_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
