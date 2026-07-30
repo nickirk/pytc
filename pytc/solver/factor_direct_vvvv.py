@@ -656,7 +656,9 @@ def compiled_partial_x_right_memory(
 # streamed variants below keep X on its host/HDF5 backing and device_put one
 # rank panel at a time; the per-panel kernels reproduce the full-lift math
 # term for term, with the rank-panel loop hoisted to the host.  Peak device X
-# is one panel ``(nvir, nvir, rank_panel_size)``, never the full block.
+# is one panel, never the full block.  Panels are transposed rank-leading
+# ``(panel, nvir, nvir)`` on the host before upload so the panel kernels
+# lower to cuBLAS-native batched GEMMs with no device-side panel transpose.
 
 
 def _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size):
@@ -696,7 +698,16 @@ def _validate_x_stream(t2, left_out, left_inner, x_backing, nocc):
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
 def _xstream_left_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
                             occupied_pair_batch_size):
-    """One rank panel's contribution to ``P[a,m] P[c,m] X[b,d,m]``."""
+    """One rank panel's contribution to ``P[a,m] P[c,m] X[b,d,m]``.
+
+    ``x_panel`` arrives rank-LEADING, ``(panel, nvir, nvir)`` (transposed on
+    the host inside the prefetch/read path, where the copy is free-ish and
+    overlapped).  With the rank axis leading, every einsum below lowers to a
+    cuBLAS-native (strided-)batched GEMM; the previous ``(nvir, nvir, panel)``
+    layout made XLA materialize a physical ``(nvir*nvir, panel)`` transpose
+    of the whole panel on device, whose autotuning buffers OOM'd the BFC
+    allocator at 1200-orbital shapes (JID 20557914).
+    """
 
     n_padded_pairs, nvir, _ = t2_pairs.shape
     n_pair_blocks = n_padded_pairs // occupied_pair_batch_size
@@ -706,11 +717,11 @@ def _xstream_left_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
         tau_block = jax.lax.dynamic_slice(
             t2_pairs, (pair0, 0, 0),
             (occupied_pair_batch_size, nvir, nvir))
-        # S[n,d,mu] = sum_c tau[n,c,d] P[c,mu]
-        s = jnp.einsum("ncd,cm->ndm", tau_block, inner_panel)
-        # Y[n,b,mu] = sum_d S[n,d,mu] X[b,d,mu]
-        y = jnp.einsum("ndm,bdm->nbm", s, x_panel)
-        out_block = jnp.einsum("am,nbm->nab", out_panel, y)
+        # S[mu,n,d] = sum_c P[c,mu] tau[n,c,d]
+        s = jnp.einsum("cm,ncd->mnd", inner_panel, tau_block)
+        # Y[mu,n,b] = sum_d S[mu,n,d] X[mu,b,d]
+        y = jnp.einsum("mnd,mbd->mnb", s, x_panel)
+        out_block = jnp.einsum("am,mnb->nab", out_panel, y)
         return jax.lax.dynamic_update_slice(out_acc, out_block, (pair0, 0, 0))
 
     return jax.lax.fori_loop(
@@ -720,7 +731,11 @@ def _xstream_left_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
 def _xstream_right_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
                              occupied_pair_batch_size):
-    """One rank panel's contribution to ``X[a,c,m] P[b,m] P[d,m]``."""
+    """One rank panel's contribution to ``X[a,c,m] P[b,m] P[d,m]``.
+
+    ``x_panel`` is rank-leading ``(panel, nvir, nvir)``; see
+    :func:`_xstream_left_panel_jit` for why.
+    """
 
     n_padded_pairs, nvir, _ = t2_pairs.shape
     n_pair_blocks = n_padded_pairs // occupied_pair_batch_size
@@ -730,11 +745,11 @@ def _xstream_right_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
         tau_block = jax.lax.dynamic_slice(
             t2_pairs, (pair0, 0, 0),
             (occupied_pair_batch_size, nvir, nvir))
-        # S[n,c,mu] = sum_d tau[n,c,d] P[d,mu]
-        s = jnp.einsum("ncd,dm->ncm", tau_block, inner_panel)
-        # Y[n,a,mu] = sum_c X[a,c,mu] S[n,c,mu]
-        y = jnp.einsum("acm,ncm->nam", x_panel, s)
-        out_block = jnp.einsum("nam,bm->nab", y, out_panel)
+        # S[mu,n,c] = sum_d P[d,mu] tau[n,c,d]
+        s = jnp.einsum("dm,ncd->mnc", inner_panel, tau_block)
+        # Y[mu,n,a] = sum_c X[mu,a,c] S[mu,n,c]
+        y = jnp.einsum("mac,mnc->mna", x_panel, s)
+        out_block = jnp.einsum("bm,mna->nab", out_panel, y)
         return jax.lax.dynamic_update_slice(out_acc, out_block, (pair0, 0, 0))
 
     return jax.lax.fori_loop(
@@ -748,7 +763,10 @@ def _stream_partial_x(panel_kernel, t2, left_out, left_inner, x_backing, nocc,
     ``left_out``/``left_inner`` are the small endpoint factors (device-
     resident); ``x_backing`` is the ``(nmo, nmo, rank)`` X factor on any
     backing -- a NumPy array (view slicing) or an HDF5 dataset (partial
-    reads) -- and only one panel is on the device at a time.
+    reads) -- and only one panel is on the device at a time.  Panels are
+    transposed rank-leading ``(panel, nvir, nvir)`` on the host before
+    upload; the panel kernels require that layout (see
+    :func:`_xstream_left_panel_jit`).
     """
 
     if occupied_pair_batch_size < 1 or rank_panel_size < 1:
@@ -774,8 +792,9 @@ def _stream_partial_x(panel_kernel, t2, left_out, left_inner, x_backing, nocc,
     for rank_block in range(n_rank_blocks):
         m0 = rank_block * rank_panel_size
         m1 = min(m0 + rank_panel_size, rank)
-        x_panel = jax.device_put(
-            _read_x_rank_panel(x_backing, nocc, m0, m1, rank_panel_size))
+        x_panel = jax.device_put(np.ascontiguousarray(
+            _read_x_rank_panel(x_backing, nocc, m0, m1, rank_panel_size)
+            .transpose(2, 0, 1)))
         inner_panel = inner_padded[:, m0:m0 + rank_panel_size]
         out_panel = out_padded[:, m0:m0 + rank_panel_size]
         total = total + panel_kernel(
@@ -981,13 +1000,15 @@ def _pipelined_x_panel_size(nvir, rank, working_set_bytes, *,
 def _x_backing_panel_source(x_backing, nocc):
     """Panel source that reads straight from the X backing (tier 3).
 
-    The contiguous copy happens inside the prefetch thread, overlapped with
-    the current panel's kernel.
+    Returns rank-leading ``(panel, nvir, nvir)`` panels -- the layout the
+    panel kernels consume.  The transpose + contiguous copy happens inside
+    the prefetch thread, overlapped with the current panel's kernel.
     """
 
     def read_panel(m0, m1, panel_size):
         return np.ascontiguousarray(
-            _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size))
+            _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size)
+            .transpose(2, 0, 1))
 
     return read_panel
 
@@ -996,15 +1017,17 @@ def _x_host_panel_source(x_host):
     """Panel source that slices a host-resident ``(nvir, nvir, rank)`` X (tier 2).
 
     A rank-axis slice of the C-order host block is strided, so each panel is
-    copied contiguous in the prefetch thread; the rank tail is zero-padded
-    exactly like :func:`_read_x_rank_panel`.
+    transposed rank-leading ``(panel, nvir, nvir)`` and copied contiguous in
+    the prefetch thread; the rank tail is zero-padded exactly like
+    :func:`_read_x_rank_panel`.
     """
 
     def read_panel(m0, m1, panel_size):
-        panel = np.ascontiguousarray(x_host[:, :, m0:m1])
-        short = panel_size - panel.shape[2]
+        panel = np.ascontiguousarray(
+            x_host[:, :, m0:m1].transpose(2, 0, 1))
+        short = panel_size - panel.shape[0]
         if short:
-            panel = np.pad(panel, ((0, 0), (0, 0), (0, short)))
+            panel = np.pad(panel, ((0, short), (0, 0), (0, 0)))
         return panel
 
     return read_panel
@@ -1022,8 +1045,8 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
     :func:`async_read`) before the current panel's kernel, so its H2D
     ``device_put`` overlaps compute (JAX async dispatch).
 
-    ``panel_source(m0, m1, panel_size)`` returns one contiguous
-    ``(nvir, nvir, panel_size)`` float64 host panel, zero-padded on the rank
+    ``panel_source(m0, m1, panel_size)`` returns one contiguous rank-leading
+    ``(panel_size, nvir, nvir)`` float64 host panel, zero-padded on the rank
     tail exactly like :func:`_read_x_rank_panel`; every panel shares one
     shape, so each term compiles exactly once.  ``nocc`` is already baked
     into ``panel_source`` and is accepted for symmetry with
@@ -1048,6 +1071,10 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
         rank_panel_size=rank_panel_size, panel_budget_bytes=panel_budget_bytes)
     n_blocks = (rank + panel_size - 1) // panel_size
     panel_padded_rank = n_blocks * panel_size
+    _logger.info(
+        "X stream panels: panel_size=%d n_blocks=%d rank=%d "
+        "(panel budget measured at call time)",
+        panel_size, n_blocks, rank)
 
     t2_pairs = jnp.pad(
         jnp.asarray(t2).reshape(n_pairs, nvir, nvir),
