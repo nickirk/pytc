@@ -853,15 +853,24 @@ def _measure_free_device_bytes():
     return None
 
 
-def _cgroup_memory_available_bytes(root="/sys/fs/cgroup"):
-    """Available bytes under the enclosing cgroup memory limit, or None.
+def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
+                                   proc_cgroup="/proc/self/cgroup"):
+    """Available bytes under the most restrictive enclosing cgroup limit, or None.
 
     A SLURM job's ``--mem`` cap is enforced by the cgroup OOM killer, so
     node-wide RAM (psutil) overstates what a tier-2 host lift may use.
-    Reads cgroup v2 (``memory.max``/``memory.current``) then v1
-    (``memory.limit_in_bytes``/``memory.usage_in_bytes``); returns None
-    when no cgroup files are readable (e.g. macOS, non-cgroup hosts).
-    ``root`` exists for tests.
+    The limit lives on the job's OWN cgroup (e.g.
+    ``.../slurmstepd.scope/job_<id>/``), not at the hierarchy root -- an
+    earlier version of this helper read only the root, found it
+    unlimited, and admitted a 238.7 GB lift into a 256 GB job.  This
+    version discovers the process's cgroup(s) from ``/proc/self/cgroup``
+    and walks each path UP to the root, taking the minimum of
+    ``limit - current`` over every level that sets one (cgroup v2
+    ``memory.max``/``memory.current``; v1
+    ``memory.limit_in_bytes``/``memory.usage_in_bytes``).  Returns None
+    when no limited level is found (e.g. macOS, non-cgroup hosts) and
+    logs every level it inspected so the tier line is auditable.
+    ``root``/``proc_cgroup`` exist for tests.
     """
 
     def _read(path):
@@ -871,21 +880,51 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup"):
         except OSError:
             return None
 
-    max_v = _read(os.path.join(root, "memory.max"))
-    cur_v = _read(os.path.join(root, "memory.current"))
-    if max_v is not None and cur_v is not None and max_v != "max":
-        try:
-            return int(max_v) - int(cur_v)
-        except ValueError:
-            return None
-    lim_v = _read(os.path.join(root, "memory", "memory.limit_in_bytes"))
-    use_v = _read(os.path.join(root, "memory", "memory.usage_in_bytes"))
-    if lim_v is not None and use_v is not None:
-        try:
-            return int(lim_v) - int(use_v)
-        except ValueError:
-            return None
-    return None
+    try:
+        with open(proc_cgroup) as fh:
+            entries = fh.read()
+    except OSError:
+        entries = ""
+
+    candidates = []
+    for line in entries.splitlines():
+        parts = line.split(":")
+        if len(parts) != 3:
+            continue
+        _, controllers, rel = parts
+        rel = rel.lstrip("/")
+        if controllers == "":  # cgroup v2 unified hierarchy
+            candidates.append(os.path.join(root, rel) if rel else root)
+        elif "memory" in controllers.split(","):  # v1 memory controller
+            base = os.path.join(root, "memory")
+            candidates.append(os.path.join(base, rel) if rel else base)
+    if not candidates:  # unparseable / missing: fall back to the roots
+        candidates = [root, os.path.join(root, "memory")]
+
+    best = None
+    for cand in candidates:
+        path = os.path.normpath(cand)
+        while True:
+            max_v = _read(os.path.join(path, "memory.max"))
+            cur_v = _read(os.path.join(path, "memory.current"))
+            if max_v is None:  # try the v1 file names at this level
+                max_v = _read(os.path.join(path, "memory.limit_in_bytes"))
+                cur_v = _read(os.path.join(path, "memory.usage_in_bytes"))
+            if max_v is not None and cur_v is not None and max_v != "max":
+                try:
+                    limit, current = int(max_v), int(cur_v)
+                except ValueError:
+                    limit = None
+                if limit is not None and limit < 1 << 60:  # v1 "unlimited" is ~2^63
+                    remaining = limit - current
+                    _logger.info("cgroup memory limit at %s: %d bytes remaining", path, remaining)
+                    best = remaining if best is None else min(best, remaining)
+            if path == os.path.normpath(root) or path == os.path.dirname(path):
+                break
+            path = os.path.dirname(path)
+    if best is None:
+        _logger.info("no cgroup memory limit found; host measurement is node-wide")
+    return best
 
 
 def _measure_free_host_bytes():

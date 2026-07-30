@@ -592,6 +592,71 @@ class TestMemoryMeasurement(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self.assertIsNone(factor_direct._cgroup_memory_available_bytes(root))
 
+    def _make_v2_tree(self, root, levels):
+        # levels: dict of relative cgroup dir -> (memory.max, memory.current)
+        for rel, (max_v, cur_v) in levels.items():
+            d = os.path.join(root, rel) if rel else root
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "memory.max"), "w") as fh:
+                fh.write(f"{max_v}\n")
+            with open(os.path.join(d, "memory.current"), "w") as fh:
+                fh.write(f"{cur_v}\n")
+
+    def _make_proc_cgroup(self, path, rel, controllers=""):
+        with open(path, "w") as fh:
+            fh.write(f"0::{controllers}/{rel}\n" if controllers else f"0::/{rel}\n")
+
+    def test_job_cgroup_discovered_via_proc_self_cgroup(self):
+        # The SLURM layout from the bouchet diagnostic: the limit lives at
+        # the "user" level ONE UP from the leaf /proc/self/cgroup path.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile("w", delete=False) as proc:
+            rel = "system.slice/slurmstepd.scope/job_1/step_0/user/task_0"
+            parent = os.path.dirname(rel)
+            self._make_v2_tree(root, {
+                rel: ("max", 1000),
+                parent: (274877906944, 1867776),   # the 256 GiB SLURM cap
+                os.path.dirname(parent): ("max", 1000),
+            })
+            self._make_proc_cgroup(proc.name, rel)
+            self.assertEqual(
+                factor_direct._cgroup_memory_available_bytes(
+                    root, proc_cgroup=proc.name),
+                274877906944 - 1867776)
+
+    def test_most_restrictive_ancestor_wins(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile("w", delete=False) as proc:
+            rel = "a/b/c"
+            self._make_v2_tree(root, {
+                rel: (10_000, 0),
+                "a/b": (5_000, 1_000),   # tighter: 4000 remaining
+                "a": (8_000, 0),
+            })
+            self._make_proc_cgroup(proc.name, rel)
+            self.assertEqual(
+                factor_direct._cgroup_memory_available_bytes(
+                    root, proc_cgroup=proc.name), 4_000)
+
+    def test_v1_sentinel_treated_as_unlimited(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile("w", delete=False) as proc:
+            d = os.path.join(root, "memory", "job")
+            os.makedirs(d)
+            sentinel = 9223372036854771712  # v1 "no limit" value
+            with open(os.path.join(d, "memory.limit_in_bytes"), "w") as fh:
+                fh.write(f"{sentinel}\n")
+            with open(os.path.join(d, "memory.usage_in_bytes"), "w") as fh:
+                fh.write("1000\n")
+            with open(proc.name, "w") as fh:
+                fh.write("2:memory:/job\n")
+            self.assertIsNone(
+                factor_direct._cgroup_memory_available_bytes(
+                    root, proc_cgroup=proc.name))
+
     def test_free_host_capped_by_cgroup(self):
         # With a cgroup tighter than node RAM, the host measurement must
         # report the cgroup remainder (the tier-2 lift is killed by the
