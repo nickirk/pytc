@@ -195,6 +195,60 @@ class TestPBlockedKern(unittest.TestCase):
                     panel_rows=panel_rows)
                 np.testing.assert_allclose(got, want, rtol=0, atol=1e-12)
 
+    def test_panel_progress_is_reported_by_default_and_counts_every_build(self):
+        """The COST note promises P(P+1)/2 panel builds; a silent loop cannot be
+        extrapolated, which is what made a 19 h production run unpriceable. Assert
+        the count MECHANICALLY against the documented formula at several schedules,
+        and assert the log fires with no hook supplied -- the real omission was a
+        caller that passed none."""
+        n_ip = 6
+        cell, mesh_obj, grids, X, ao, provider = self._fixture(n_ip=n_ip)
+        for panel_rows, n_panels in ((6, 1), (3, 2), (2, 3), (1, 6)):
+            with self.subTest(panel_rows=panel_rows):
+                want_builds = n_panels * (n_panels + 1) // 2
+                seen = []
+                with self.assertLogs("pytc.pbc.df.isdf", level="INFO") as cm:
+                    build_pi_kern_p_blocked(
+                        X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider,
+                        grids, panel_rows=panel_rows,
+                        on_panel=lambda d, t, e: seen.append((d, t, e)))
+                lines = [m for m in cm.output if "p_blocked: panel build" in m]
+                # Documented formula, not a hand-copied number.
+                self.assertEqual(len(lines), want_builds)
+                self.assertEqual([d for d, _, _ in seen],
+                                 list(range(1, want_builds + 1)))
+                self.assertTrue(all(t == want_builds for _, t, _ in seen))
+                # Elapsed must be non-decreasing: a projection built on it is
+                # meaningless if the clock is read wrong.
+                el = [e for _, _, e in seen]
+                self.assertEqual(el, sorted(el))
+                self.assertIn(f"/{want_builds} ", lines[0])
+
+    def test_panel_progress_needs_no_callback(self):
+        """Positive control for the test above: with on_panel omitted entirely the
+        log must STILL fire. If this passes while the hook-based assertions are the
+        only thing checked, the default-on behaviour was never covered."""
+        cell, mesh_obj, grids, X, ao, provider = self._fixture(n_ip=4)
+        with self.assertLogs("pytc.pbc.df.isdf", level="INFO") as cm:
+            build_pi_kern_p_blocked(
+                X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
+                panel_rows=2)
+        # 2 panels -> 2*3/2 = 3 builds.
+        self.assertEqual(
+            len([m for m in cm.output if "p_blocked: panel build" in m]), 3)
+
+    def test_panel_progress_does_not_change_kern(self):
+        """Instrumentation must be numerically inert: same panel_rows, with and
+        without a hook, must agree BIT-for-bit -- not to a tolerance."""
+        cell, mesh_obj, grids, X, ao, provider = self._fixture(n_ip=6)
+        _, bare = build_pi_kern_p_blocked(
+            X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
+            panel_rows=2)
+        _, hooked = build_pi_kern_p_blocked(
+            X, lambda: [ao], mesh_obj.phase, mesh_obj.neg, provider, grids,
+            panel_rows=2, on_panel=lambda *a: None)
+        self.assertTrue(np.array_equal(bare, hooked))
+
     def test_pi_is_unaffected_by_the_panel_schedule(self):
         cell, mesh_obj, grids, X, ao, provider = self._fixture()
         want, _ = build_pi_eta(X, ao, mesh_obj.phase, mesh_obj.neg)

@@ -1860,7 +1860,7 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
                             panel_rows, imag_tol=1e-10,
                             convolve_device=False, self_paired=None,
-                            on_block=None):
+                            on_block=None, on_panel=None):
     """kern for every q without holding a full eta.
 
     AO blocks are streamed one at a time via ``_eta_rows_streamed``; the residency
@@ -1892,6 +1892,14 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     ``(P+1)/2`` full-build equivalents -- 1x at P=1. Unequal final panels need a
     row-weighted count.
 
+    PROGRESS: because that cost is set by ``panel_rows`` and is invisible from
+    outside, the loop logs every panel build at INFO with the running mean and a
+    projected loop total, so a run is priceable from its first minutes instead of
+    only in hindsight. ``on_panel(builds_done, n_panel_builds, elapsed_s)`` is the
+    structured form for a caller that wants to bank the rate; the log line is
+    emitted whether or not it is supplied, since the omission being fixed here was
+    a caller that passed no hook.
+
     ``ao_block_factory`` must return a FRESH iterable per call.
 
     Returns (Pi, kern) with kern (Nk, Nip, Nip) complex128.
@@ -1915,13 +1923,38 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
 
     rows = int(panel_rows)
     panels = [(p0, min(p0 + rows, n_ip)) for p0 in range(0, n_ip, rows)]
+    # Progress is reported by DEFAULT, not only when a caller opts in. The COST
+    # note above is the whole reason: the schedule performs P(P+1)/2 panel builds,
+    # so wall time is set by a knob whose price cannot be read from the outside.
+    # A production run spent 18.9 h in this loop and printed nothing between the
+    # enclosing stage markers, which made progress unmeasurable and the panel_rows
+    # choice unpriceable -- the projected total below is the number that was missing.
+    n_panel_builds = len(panels) * (len(panels) + 1) // 2
+    builds_done = 0
+    loop_started = time.perf_counter()
 
     def _eta_panel(p0, p1):
         """eta rows [p0:p1) for every q, one AO block resident at a time."""
-        return _eta_rows_streamed(
+        nonlocal builds_done
+        out = _eta_rows_streamed(
             X[:, p0:p1, :], ao_block_factory(), phase, neg, n_grid_total,
             imag_tol=imag_tol, convolve_device=convolve_device,
             on_block=on_block)
+        builds_done += 1
+        elapsed = time.perf_counter() - loop_started
+        # Mean rather than instantaneous: panel builds are equal-sized except for a
+        # short final panel, so the mean is the honest extrapolator. Unequal final
+        # panels make this slightly pessimistic, never optimistic.
+        mean_s = elapsed / builds_done
+        logger.info(
+            "p_blocked: panel build %d/%d rows[%d:%d] elapsed %.1fs "
+            "mean %.1fs/build projected_loop_total %.1fs",
+            builds_done, n_panel_builds, p0, p1, elapsed, mean_s,
+            mean_s * n_panel_builds,
+        )
+        if on_panel is not None:
+            on_panel(builds_done, n_panel_builds, elapsed)
+        return out
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     q_kpts = np.asarray(provider.canonical_kpts, dtype=np.float64)
