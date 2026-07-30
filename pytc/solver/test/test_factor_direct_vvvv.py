@@ -660,13 +660,26 @@ class TestMemoryMeasurement(unittest.TestCase):
     def test_free_host_capped_by_cgroup(self):
         # With a cgroup tighter than node RAM, the host measurement must
         # report the cgroup remainder (the tier-2 lift is killed by the
-        # cgroup OOM killer, not by node exhaustion).
-        measured = factor_direct._measure_free_host_bytes()
-        cgroup = factor_direct._cgroup_memory_available_bytes()
-        import psutil
-        node_avail = int(psutil.virtual_memory().available)
-        self.assertEqual(measured, min(node_avail, cgroup) if cgroup is not None
-                         else node_avail)
+        # cgroup OOM killer, not by node exhaustion).  psutil and the
+        # cgroup probe are stubbed with fixed values: the live
+        # node-available figure drifts between calls and made this test
+        # flaky.
+        import sys
+        import types
+        import unittest.mock as mock
+        fake_psutil = types.SimpleNamespace(
+            virtual_memory=lambda: types.SimpleNamespace(available=10_000))
+        real_cgroup = factor_direct._cgroup_memory_available_bytes
+        try:
+            with mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
+                factor_direct._cgroup_memory_available_bytes = lambda **_: 4_000
+                self.assertEqual(factor_direct._measure_free_host_bytes(), 4_000)
+                factor_direct._cgroup_memory_available_bytes = lambda **_: 50_000
+                self.assertEqual(factor_direct._measure_free_host_bytes(), 10_000)
+                factor_direct._cgroup_memory_available_bytes = lambda **_: None
+                self.assertEqual(factor_direct._measure_free_host_bytes(), 10_000)
+        finally:
+            factor_direct._cgroup_memory_available_bytes = real_cgroup
 
     def test_device_stats_fallback_keys(self):
         # bytes_available missing but limit/in_use present -> difference.
