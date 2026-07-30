@@ -1893,12 +1893,23 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     row-weighted count.
 
     PROGRESS: because that cost is set by ``panel_rows`` and is invisible from
-    outside, the loop logs every panel build at INFO with the running mean and a
-    projected loop total, so a run is priceable from its first minutes instead of
-    only in hindsight. ``on_panel(builds_done, n_panel_builds, elapsed_s)`` is the
-    structured form for a caller that wants to bank the rate; the log line is
-    emitted whether or not it is supplied, since the omission being fixed here was
-    a caller that passed no hook.
+    outside, each COMPLETED ``(i,j)`` pair is logged at INFO with the count and the
+    elapsed loop time. ``on_panel(pairs_done, n_pairs, elapsed_s)`` is the
+    structured form; the log fires whether or not it is supplied, since the
+    omission being fixed here was a caller that passed no hook.
+
+    The count advances only after a pair's kernel block is written, and the clock
+    starts after the fixed setup, so reported elapsed covers exactly the completed
+    work -- it neither omits the current pair's kernel term nor amortises an
+    allocation cost over a growing denominator.
+
+    NO projected total is reported, deliberately. Extrapolating a mean over this
+    schedule is not sound without diagonal/off-diagonal and short-panel weights:
+    with ``mirror`` False the off-diagonal branch does twice the diagonal work and
+    the mix shifts as ``i`` grows, and the final panel is short. A progress figure
+    that licenses killing a run must err pessimistically, and an unweighted mean
+    does not. Callers wanting a projection should calibrate against measured pairs
+    and state an uncertainty band.
 
     ``ao_block_factory`` must return a FRESH iterable per call.
 
@@ -1923,38 +1934,30 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
 
     rows = int(panel_rows)
     panels = [(p0, min(p0 + rows, n_ip)) for p0 in range(0, n_ip, rows)]
-    # Progress is reported by DEFAULT, not only when a caller opts in. The COST
-    # note above is the whole reason: the schedule performs P(P+1)/2 panel builds,
-    # so wall time is set by a knob whose price cannot be read from the outside.
-    # A production run spent 18.9 h in this loop and printed nothing between the
-    # enclosing stage markers, which made progress unmeasurable and the panel_rows
-    # choice unpriceable -- the projected total below is the number that was missing.
-    n_panel_builds = len(panels) * (len(panels) + 1) // 2
-    builds_done = 0
-    loop_started = time.perf_counter()
+    # Progress is reported by DEFAULT, not only when a caller opts in: a production
+    # run spent 18.9 h in this loop and printed nothing between the enclosing stage
+    # markers, so the panel_rows price could not be read from outside. The unit is a
+    # COMPLETED (i,j) pair, counted after its kernel block, so reported elapsed
+    # covers only finished work.
+    #
+    # Deliberately NO projected total. An earlier revision extrapolated a mean over
+    # panel builds and was wrong in the unsafe direction: the count advanced at the
+    # eta build, before that pair's kernel work, so every line omitted a kernel term
+    # -- at the first line the whole of it. Against a deterministic P=2 model the
+    # projections read 3.0/4.5/6.0 for an actual 7.0, still short at the last line.
+    # An honest projection needs diagonal/off-diagonal and short-panel weights or
+    # measured calibration with an uncertainty band; until then this reports what
+    # HAPPENED and the caller does its own arithmetic. Progress that licenses a kill
+    # decision has to be right in the pessimistic direction, and this was not.
+    n_pairs = len(panels) * (len(panels) + 1) // 2
+    pairs_done = 0
 
     def _eta_panel(p0, p1):
         """eta rows [p0:p1) for every q, one AO block resident at a time."""
-        nonlocal builds_done
-        out = _eta_rows_streamed(
+        return _eta_rows_streamed(
             X[:, p0:p1, :], ao_block_factory(), phase, neg, n_grid_total,
             imag_tol=imag_tol, convolve_device=convolve_device,
             on_block=on_block)
-        builds_done += 1
-        elapsed = time.perf_counter() - loop_started
-        # Mean rather than instantaneous: panel builds are equal-sized except for a
-        # short final panel, so the mean is the honest extrapolator. Unequal final
-        # panels make this slightly pessimistic, never optimistic.
-        mean_s = elapsed / builds_done
-        logger.info(
-            "p_blocked: panel build %d/%d rows[%d:%d] elapsed %.1fs "
-            "mean %.1fs/build projected_loop_total %.1fs",
-            builds_done, n_panel_builds, p0, p1, elapsed, mean_s,
-            mean_s * n_panel_builds,
-        )
-        if on_panel is not None:
-            on_panel(builds_done, n_panel_builds, elapsed)
-        return out
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     q_kpts = np.asarray(provider.canonical_kpts, dtype=np.float64)
@@ -1962,6 +1965,9 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     n_grid_total = int(grid_coords.shape[0])
     gphases = np.exp(-1j * (grid_coords @ q_kpts.T)).T          # (Nk, Ng)
     kern = np.zeros((n_kpts, n_ip, n_ip), dtype=np.complex128)
+    # After the fixed setup above, so elapsed is loop work and not an allocation
+    # term amortised over a growing denominator.
+    loop_started = time.perf_counter()
     for i, (i0, i1) in enumerate(panels):
         eta_i = _eta_panel(i0, i1)
         for j in range(i, len(panels)):
@@ -1985,6 +1991,18 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
             del eta_j
+            # Counted HERE: the pair's kernel work is finished, so elapsed contains
+            # it. Advancing at the eta build instead is what made the previous
+            # revision optimistic.
+            pairs_done += 1
+            elapsed = time.perf_counter() - loop_started
+            logger.info(
+                "p_blocked: pair %d/%d done (i=%d rows[%d:%d], j=%d rows[%d:%d]) "
+                "elapsed %.1fs",
+                pairs_done, n_pairs, i, i0, i1, j, j0, j1, elapsed,
+            )
+            if on_panel is not None:
+                on_panel(pairs_done, n_pairs, elapsed)
         del eta_i
 
     if self_paired is not None:
