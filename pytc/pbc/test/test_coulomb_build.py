@@ -37,6 +37,49 @@ def _make_cell():
 
 
 class TestBuild(unittest.TestCase):
+    def test_on_selection_fires_once_before_the_build_and_enables_resume(self):
+        """The hook exists so hours of selection survive an interruption. Assert
+        the property that matters -- what it hands back is sufficient to resume --
+        rather than merely that it was called."""
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        seen = []
+        result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8,
+                               on_selection=lambda p, prov: seen.append((p, prov)))
+        self.assertEqual(len(seen), 1)
+        pivots, prov = seen[0]
+        # Sufficient to resume: identical to what the completed build reports.
+        self.assertEqual(pivots.tolist(),
+                         result["selection_provenance"]["pivot_indices"])
+        self.assertIn("mode", prov)
+        # Handed a copy, so a caller mutating it cannot corrupt the build.
+        pivots[0] = -12345
+        self.assertNotEqual(result["selection_provenance"]["pivot_indices"][0], -12345)
+
+        # The round trip is the point: feeding it back reproduces the build.
+        resumed = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8,
+                                fixed_pivots=np.asarray(
+                                    result["selection_provenance"]["pivot_indices"]))
+        np.testing.assert_allclose(resumed["coul_kpt"], result["coul_kpt"],
+                                   rtol=0, atol=1e-12)
+
+    def test_on_selection_failure_does_not_take_the_build_with_it(self):
+        """A checkpoint that raises must cost the checkpoint, not the run. The
+        build is hours of work; the callback is a file write."""
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+
+        def boom(pivots, prov):
+            raise RuntimeError("scratch filesystem full")
+
+        with self.assertLogs("pytc.pbc.coulomb", level="WARNING") as cm:
+            result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8,
+                                   on_selection=boom)
+        self.assertTrue(any("scratch filesystem full" in m for m in cm.output))
+        # Recorded, not silent: a later reader can tell the pivots were not saved.
+        self.assertIn("on_selection_error",
+                      result["selection_provenance"])
+
     def test_retired_selection_mode_names_its_replacement(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)

@@ -7,6 +7,7 @@ See design doc §2, §4, §7-§8.
 from __future__ import annotations
 
 import gc
+import logging
 import os
 
 import numpy as np
@@ -31,6 +32,8 @@ from pytc.pbc.df.isdf import (
     stream_ao_blocks,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
+
+logger = logging.getLogger(__name__)
 
 
 # Public selection surface: selector x storage. The mode strings below are the
@@ -162,7 +165,7 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
 
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode=None,
-          fixed_pivots=None,
+          fixed_pivots=None, on_selection=None,
           bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
           bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
           bpc_candidate_oversampling=FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
@@ -177,6 +180,13 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         kpts: (Nk,3) absolute k-points (canonicalized internally).
         rank: requested interpolation-point rank.
         block_size: grid points per streamed AO block.
+        on_selection: optional callable invoked immediately after pivot
+            selection with ``(pivots, selection_provenance)``. Exists so a
+            caller can persist pivots at the moment they are produced;
+            without it they are unreachable until the entire build returns,
+            so any interruption after selection discards hours of work. Feed
+            what it receives back through ``fixed_pivots`` to resume. A raising
+            callback is logged and recorded in the provenance, not propagated.
         rtol: forwarded to the S4 Hermitian sandwich solve; None means the
             1e-4 default, and must be None when n_retained_pin is given.
         retention_mode: "single" or "pairwise" -- forwarded to the S4
@@ -343,6 +353,25 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance["ao_calls_selection"] = selector_ao_calls
     selection_provenance["ao_grid_points_selection"] = selector_ao_grid_points
+
+    # Selection is complete here, and its result is otherwise unreachable until
+    # the whole call returns -- by which point the build and solve have also run.
+    # A stage costing hours whose output only escapes at the end of the enclosing
+    # call is unrecoverable by construction: any cancellation, OOM or wall-timeout
+    # downstream discards it, and the retry pays for it again. The hook gives the
+    # pivots an exit at the moment they exist, so a caller can checkpoint them and
+    # resume through fixed_pivots. A raising callback must not corrupt the build,
+    # so it is contained and reported rather than propagated.
+    if on_selection is not None:
+        try:
+            on_selection(np.array(pivots, copy=True), dict(selection_provenance))
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(
+                "on_selection callback raised %r; the build continues, but the "
+                "pivots were NOT checkpointed and a retry will repeat selection.",
+                exc,
+            )
+            selection_provenance["on_selection_error"] = repr(exc)
     inpv_kpt = np.asarray(
         cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
         dtype=np.complex128,
