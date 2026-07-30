@@ -246,12 +246,41 @@ class TestCholeskyJitterEntry(unittest.TestCase):
             solvers._tsvd_sandwich = real
             fit_mod._tsvd_sandwich = real
 
-    def test_tsvd_rcond_is_rejected_not_ignored(self):
-        # It was silently accepted and inert: None and 0.9 gave byte-identical Z.
-        with self.assertRaises(ValueError) as ctx:
+    def test_tsvd_rcond_is_rejected_at_BOTH_PUBLIC_ENTRIES(self):
+        """The private helper is not the boundary that matters.
+
+        A previous corrective made the private helper reject this and then stopped
+        forwarding it -- so the rejection became unreachable and both public APIs
+        went on silently accepting an inert value. Pinning the PUBLIC entries is
+        the fix; the helper check alone was theatre.
+
+        Also verified inert everywhere, not just on Cholesky: with solver="tsvd",
+        tsvd_rcond=0.9 and None both reported cutoff=None and identical retention,
+        while rcond=0.9 reported cutoff=0.9. My claim that it stayed "live for
+        solver='tsvd'" was false.
+        """
+        from pytc.df import fit as fit_mod
+        rng = np.random.default_rng(0)
+        n, m = 24, 40
+        A = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+        P = A @ A.conj().T + n * np.eye(n)
+        C = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
+        for solver in ("cholesky_jitter", "tsvd"):
+            with self.subTest(entry="compute_Z", solver=solver):
+                with self.assertRaises(ValueError) as ctx:
+                    fit_mod.compute_Z(P, C, solver=solver, tsvd_rcond=0.9)
+                self.assertIn("no effect anywhere", str(ctx.exception))
+            with self.subTest(entry="compute_Z_cross", solver=solver):
+                with self.assertRaises(ValueError):
+                    fit_mod.compute_Z_cross(P, C, P, C, solver=solver, tsvd_rcond=0.9)
+        # rcond IS the live TSVD cutoff -- control proving the refusal above is not
+        # simply rejecting all cutoffs.
+        _, prov = fit_mod.compute_Z(P, C, solver="tsvd", rcond=0.9)
+        self.assertEqual(prov["cutoff"], 0.9)
+        # And the private helper still refuses, so neither layer relies on the other.
+        with self.assertRaises(ValueError):
             solvers._cholesky_jitter_sandwich(self.Pi, self.Pi, self.V, 1e-14,
                                               True, tsvd_rcond=0.9)
-        self.assertIn("no effect", str(ctx.exception))
 
     def test_rejects_rtol(self):
         with self.assertRaises(ValueError) as ctx:

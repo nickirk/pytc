@@ -139,9 +139,11 @@ def prepare_spd_cholesky(matrix: jnp.ndarray, rcond: float = 1e-14,
     residual-estimation cost problem at the fit layer; use "exact" only
     for small/reference-system diagnostics, never at production scale.
 
-    The unregularized-bias check and the TSVD fallback live in
-    df/fit.py's _cholesky_jitter_sandwich since they need the fit context
-    this generic primitive doesn't have. This solver's provenance label
+    The unregularized-bias check lives in _cholesky_jitter_sandwich, which
+    has the fit context this generic primitive lacks. There is no TSVD
+    fallback any more: it was removed 2026-07-29 after being measured
+    harmful on real periodic data, so a failed bias check is reported and
+    not acted on. This solver's provenance label
     is "unscaled_cholesky_jitter" (not "cholesky_jitter" matching the
     doc rule exactly) until row equilibration exists. Production
     default is declared only after the task-#3-mandated benchmark at
@@ -425,9 +427,12 @@ def _two_sided_residual_sampled(S_A, Z, S_B, M, n_probes=_DEFAULT_RESIDUAL_N_PRO
     count/variance tradeoff at production N_mu (~25k) hasn't been
     characterized against the exact residual on real data -- this is a
     first cut at the right asymptotic complexity AND device placement.
-    Diagnostic-only: unlike the exact residual, this NEVER drives the
-    automatic TSVD fallback (see _cholesky_jitter_sandwich) until that
-    validation exists. Use residual_mode="exact" for anything
+    Diagnostic-only, and NOT decision-grade. No residual mode drives a
+    solver switch any more -- the automatic TSVD fallback was removed. The
+    calibration gap is now quantified rather than merely warned about:
+    measured bias is ~+9% and does NOT vanish with probe count (spread
+    falls as 1/sqrt(m), the bias does not), so this must never stand in
+    for an acceptance gate. Use residual_mode="exact" for anything
     decision-grade.
     """
     if n_probes < 1:
@@ -657,12 +662,15 @@ def _tsvd_sandwich(S_A, S_B, M, tsvd_rcond, same_sector,
                     caller_label="compute_Z"):
     """S_A^+ M S_B^+ via an EXPLICIT truncated-SVD pseudoinverse (not
     np.linalg.pinv's black box) so the retained singular-value range can
-    be reported in provenance -- the diagnostics/fallback solver mode
-    per design doc §4 (production default is cholesky_jitter). Also
-    serves as _cholesky_jitter_sandwich's automatic fallback when the
-    unregularized-bias check fails there, using its OWN independent
-    tsvd_rcond (never the Cholesky jitter_rcond -- see
-    _cholesky_jitter_sandwich's docstring).
+    be reported in provenance -- the EXPLICITLY selected diagnostic solver
+    per design doc §4 (production default is cholesky_jitter).
+
+    NO LONGER a fallback. It was _cholesky_jitter_sandwich's automatic
+    corrective action until 2026-07-29; that was removed after being
+    measured harmful on real periodic data, and this function is now
+    reachable only by a caller choosing solver="tsvd". Its cutoff comes
+    from that caller's rcond; the old tsvd_rcond parameter affected
+    nothing and is refused at the public boundary.
 
     same_sector must be passed EXPLICITLY by the caller (see
     _cholesky_jitter_sandwich's docstring -- no dense

@@ -105,7 +105,8 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
     apparent earlier need for delicate pinv-cutoff tuning was itself an
     artifact of a since-fixed bug (weighted, not raw, values in P --
     see pair_collocation_at_pivots's docstring). solver="tsvd" is kept
-    as the small/medium-system diagnostic oracle and fallback -- an
+    as the small/medium-system diagnostic oracle, explicitly selected and
+    no longer reachable as an automatic fallback -- an
     EXPLICIT truncated-SVD pseudoinverse (not np.linalg.pinv's black
     box) so the retained singular-value range can be reported.
 
@@ -132,26 +133,27 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
             (None uses a machine-epsilon-scaled default, matching
             numpy's own pinv convention).
         solver: "cholesky_jitter" (default, production) or "tsvd"
-            (diagnostic/fallback).
-        tsvd_rcond: INDEPENDENT singular-value cutoff used only if
-            solver="cholesky_jitter" triggers an automatic fallback to
-            TSVD (see _cholesky_jitter_sandwich's docstring for why this
-            must NOT reuse rcond -- they are different quantities:
-            jitter scale vs. singular-value cutoff). None (default)
-            uses TSVD's own machine-epsilon-scaled default. Ignored
-            when solver="tsvd" is requested directly -- there, rcond
-            itself is the cutoff, unchanged from before.
+            (explicitly selected diagnostic oracle -- NOT a fallback;
+            there is no automatic switch).
+        tsvd_rcond: REFUSED -- a non-None value raises. It configured
+            the automatic TSVD fallback, removed 2026-07-29 after being
+            measured harmful on real periodic data. It affects NEITHER
+            solver: explicit solver="tsvd" takes its cutoff from rcond.
+            Kept in the signature only so existing callers get a
+            directive error rather than a TypeError.
         backward_error_mode, backward_error_tol: forwarded to
             prepare_spd_cholesky when solver="cholesky_jitter" -- see
             its docstring. Default "finite_only" is production-safe
             (O(1)); "exact" is a dense O(n^3)-per-retry reference/
             small-system diagnostic.
         residual_mode: "exact" (default, O(n^3) dense two-sided
-            residual, drives the automatic TSVD fallback) or "sampled"
+            residual) or "sampled"
             (O(n^2 * residual_n_probes) on-device Hutchinson estimate --
-            diagnostic-only, NEVER drives the fallback, NOT yet
-            validated for decision-grade use, see
-            _two_sided_residual_sampled's docstring).
+            diagnostic-only. NEITHER mode drives a solver switch any
+            more -- nothing does. The sampled estimator is NOT
+            decision-grade: measured bias ~+9% that does NOT vanish with
+            probe count, so it must never stand in for an acceptance
+            gate. See _two_sided_residual_sampled's docstring.
         residual_n_probes, residual_seed: forwarded to the sampled
             estimator when residual_mode="sampled"; ignored otherwise.
 
@@ -160,7 +162,8 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
         dict with the solver-level fields from design doc §4 this
         function can observe directly (solver, jitter/cutoff + retry
         history or retained singular-value range, backward-error mode,
-        fit residual, row-scaling, fallback status, residual_mode).
+        fit residual, row-scaling, residual_mode). fallback_triggered is
+        retained for schema stability and is ALWAYS False.
         Fields needing caller-side context (kernel policy, upstream
         SCF/grid provenance, pivot-index hashes) are NOT fabricated
         here -- assemble those at the call site that actually has them.
@@ -169,13 +172,23 @@ def compute_Z(P, C, rcond=None, solver="cholesky_jitter",
     C = np.asarray(C)
     S = P @ P.conj().T
     M = C @ C.conj().T
+    # REFUSED at the PUBLIC boundary. The previous corrective made the private
+    # helper reject this and then stopped forwarding it -- so the rejection became
+    # unreachable and the public API went on silently accepting a value that does
+    # nothing. Verified inert EVERYWHERE, not only on the Cholesky path: with
+    # solver="tsvd", tsvd_rcond=0.9 and None both report cutoff=None and retain the
+    # same modes, while rcond=0.9 reports cutoff=0.9. `rcond` IS the TSVD cutoff.
+    if tsvd_rcond is not None:
+        raise ValueError(
+            "tsvd_rcond has no effect anywhere and is refused. The automatic TSVD "
+            "fallback it once configured was removed, and explicit solver='tsvd' "
+            "takes its cutoff from rcond, not tsvd_rcond. Pass rcond instead."
+        )
     # compute_Z is always the same-sector case by construction (one P/C
     # pair fitted against itself) -- same_sector=True is a fact, not an
     # inference.
     if solver == "cholesky_jitter":
         rcond_eff = 1e-14 if rcond is None else rcond
-        # tsvd_rcond is NOT forwarded: the Cholesky path rejects it now that the
-        # automatic fallback is gone. It remains live for solver="tsvd".
         return _cholesky_jitter_sandwich(S, S, M, rcond_eff, True,
                                           backward_error_mode=backward_error_mode,
                                           backward_error_tol=backward_error_tol,
@@ -267,9 +280,20 @@ def compute_Z_cross(P_A, C_A, P_B, C_B, rcond=None, solver="cholesky_jitter",
     S_A = P_A @ P_A.conj().T
     S_B = P_B @ P_B.conj().T
     M = C_A @ C_B.conj().T
+    # REFUSED at the PUBLIC boundary. The previous corrective made the private
+    # helper reject this and then stopped forwarding it -- so the rejection became
+    # unreachable and the public API went on silently accepting a value that does
+    # nothing. Verified inert EVERYWHERE, not only on the Cholesky path: with
+    # solver="tsvd", tsvd_rcond=0.9 and None both report cutoff=None and retain the
+    # same modes, while rcond=0.9 reports cutoff=0.9. `rcond` IS the TSVD cutoff.
+    if tsvd_rcond is not None:
+        raise ValueError(
+            "tsvd_rcond has no effect anywhere and is refused. The automatic TSVD "
+            "fallback it once configured was removed, and explicit solver='tsvd' "
+            "takes its cutoff from rcond, not tsvd_rcond. Pass rcond instead."
+        )
     if solver == "cholesky_jitter":
         rcond_eff = 1e-14 if rcond is None else rcond
-        # See compute_Z: not forwarded, the Cholesky path rejects it.
         return _cholesky_jitter_sandwich(S_A, S_B, M, rcond_eff, same_sector,
                                           backward_error_mode=backward_error_mode,
                                           backward_error_tol=backward_error_tol,
