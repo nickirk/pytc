@@ -1,9 +1,16 @@
 """Regression tests for Alice's 4 solver-implementation gaps, TWO
 review rounds (task #8 commit 3, isdf-coulomb-cuda, 2026-07-12):
 1) jitter floor not scale-relative, 2) adaptive acceptance rule not
-implemented (regularized backward-error gate + unregularized-bias ->
-TSVD fallback), 3) O(n^3) residual not production-scalable (sampled
+implemented (regularized backward-error gate + unregularized-bias
+detection), 3) O(n^3) residual not production-scalable (sampled
 mode), 4) O(n^2) same-sector detection via dense array_equal.
+
+SUPERSEDED 2026-07-29: gap 2's corrective action was an automatic TSVD
+fallback. It was measured harmful on real periodic data and REMOVED, so
+the bias check now warns and proceeds. The tests below were converted
+rather than deleted -- bias DETECTION is still required, and the
+jitter-scale-as-cutoff bug of 1b is now structurally unreachable rather
+than merely avoided. Read the fallback history here as history.
 
 Round-2 findings on the first fix (commit 7064a7b), all covered here:
 1b) the automatic TSVD fallback reused the Cholesky jitter_rcond as the
@@ -102,14 +109,17 @@ class TestBackwardErrorMode(unittest.TestCase):
 
 
 class TestUnregularizedBiasFallback(unittest.TestCase):
-    """Gap 2 (unregularized half): an unregularized-bias fit residual
-    over threshold must trigger an automatic solver='tsvd' fallback
-    (never more jitter, which only increases the bias) -- previously
-    this was warn-only with no corrective action. Round-2 fix: the
-    fallback must use its OWN independent tsvd_rcond, not the Cholesky
-    jitter_rcond -- reusing it made TSVD retain zero modes (Z=0) for a
-    caller-forced jitter_rcond=1.0, i.e. the fallback made the result
-    WORSE than the failing Cholesky attempt, not better."""
+    """Gap 2 (unregularized half), AS IT NOW STANDS: an unregularized-bias
+    fit residual over threshold must be DETECTED and reported. It must not
+    trigger more jitter, which only increases the bias, and it no longer
+    triggers a solver switch either -- the automatic TSVD fallback was
+    removed 2026-07-29 after being measured harmful on real data.
+
+    The 1b round-2 bug (the fallback reusing jitter_rcond as a
+    singular-value cutoff, retaining zero modes and returning Z=0 for a
+    caller-forced jitter_rcond=1.0) is now unreachable by construction
+    rather than avoided by parameter hygiene: there is no fallback to
+    inherit anything, and tsvd_rcond is refused at the public boundary."""
 
     def setUp(self):
         rng = np.random.default_rng(0)
@@ -160,10 +170,14 @@ class TestUnregularizedBiasFallback(unittest.TestCase):
 class TestResidualModes(unittest.TestCase):
     """Gap 3: residual_mode='sampled' must be an available, provenance-
     documented O(n^2 * n_probes) on-device alternative to the exact
-    O(n^3) two-sided residual, without changing the returned Z, and
-    must NEVER drive the automatic TSVD fallback (diagnostic-only,
-    uncalibrated) -- round-2 fix: only residual_mode='exact' gates the
-    fallback."""
+    O(n^3) two-sided residual, without changing the returned Z.
+
+    The round-2 requirement was that sampled mode must never drive the
+    automatic fallback. That is now vacuous and therefore stronger: NO
+    mode drives a solver switch, because the fallback is gone. Sampled
+    remains diagnostic-only -- measured relative bias ~+9% across
+    128-512 probes on one calibration matrix, which disqualifies
+    decision-grade use at those probe counts."""
 
     def setUp(self):
         rng = np.random.default_rng(1)

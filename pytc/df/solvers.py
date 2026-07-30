@@ -429,10 +429,16 @@ def _two_sided_residual_sampled(S_A, Z, S_B, M, n_probes=_DEFAULT_RESIDUAL_N_PRO
     first cut at the right asymptotic complexity AND device placement.
     Diagnostic-only, and NOT decision-grade. No residual mode drives a
     solver switch any more -- the automatic TSVD fallback was removed. The
-    calibration gap is now quantified rather than merely warned about:
-    measured bias is ~+9% and does NOT vanish with probe count (spread
-    falls as 1/sqrt(m), the bias does not), so this must never stand in
-    for an acceptance gate. Use residual_mode="exact" for anything
+    calibration gap is quantified rather than merely warned about:
+    measured relative bias was ~+9% across 128-512 probes on ONE
+    calibration matrix, while the spread fell as 1/sqrt(m) as expected.
+    That is enough to disqualify decision-grade use at those probe
+    counts. It is NOT evidence that the bias fails to vanish
+    asymptotically -- for i.i.d. Rademacher probes the sampled numerator
+    and denominator converge to ||A||_F^2 and ||M||_F^2, so their
+    square-root ratio converges to the exact residual by continuity, and
+    any finite-sample ratio/Jensen bias must therefore decay. Claiming
+    otherwise from four probe counts on one matrix overstated the data. Use residual_mode="exact" for anything
     decision-grade.
     """
     if n_probes < 1:
@@ -521,24 +527,30 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     This function separately checks the UNREGULARIZED bias on the real
     right-hand side M (is Z actually a good fit to the true,
     unregularized problem? -- more jitter CANNOT fix this, since jitter
-    is exactly what causes the bias) and, if residual_mode="exact" and
-    that check fails, falls back to solver="tsvd" rather than
-    escalating jitter further -- previously this was warn-only with no
-    corrective action. The fallback uses tsvd_rcond (an INDEPENDENT
-    singular-value cutoff, default None -> TSVD's own machine-epsilon-
-    scaled default), never jitter_rcond -- an earlier version reused
-    jitter_rcond as the TSVD cutoff, which for a caller-forced
-    jitter_rcond=1.0 (a valid jitter *scale* but a nonsensical
-    singular-value *cutoff*) made TSVD retain ZERO modes and return
-    Z=0, the fallback silently making things worse instead of better
-    (measured: fallback
-    residual 1.0 vs 8.4e-14 with TSVD's own default cutoff).
+    is exactly what causes the bias). When that check fails it WARNS and
+    PROCEEDS. There is no automatic corrective action and no solver
+    switch, in any residual_mode.
 
-    When residual_mode="sampled", the fallback gate is SKIPPED entirely
-    (fit_residual is still computed and reported for diagnostics) --
-    the sampled estimator is not yet calibrated against the exact
-    residual, so an elevated sampled value must not silently trigger a
-    solver switch off an uncharacterized false-positive rate.
+    HISTORY, because the removed design is the reason several parameters
+    look the way they do. Until 2026-07-29 a failed bias check fell back
+    to solver="tsvd", configured by a separate tsvd_rcond cutoff that
+    deliberately did NOT reuse jitter_rcond (an earlier version did, and
+    a caller-forced jitter_rcond=1.0 -- a valid jitter *scale* but a
+    nonsensical singular-value *cutoff* -- made TSVD retain ZERO modes
+    and return Z=0: fallback residual 1.0 against 8.4e-14 with TSVD's
+    own default). That fallback was then measured harmful on real
+    periodic data -- at k112 rank 85 it produced dE/atom 1.763e-03 with
+    a diverged SCF where letting Cholesky finish gave 1.513e-05 and
+    converged -- so it was removed on owner instruction. tsvd_rcond
+    consequently affects nothing and is REFUSED at the public boundary.
+
+    Bias-policy status: warning-only is NOT a defensible production
+    acceptance rule by itself. It is tolerable at present only because
+    this mode cannot run a configuration needing the production memory
+    lever; see _cholesky_jitter_entry for the three refusals that
+    enforce that, and treat settling the policy (fail-closed versus a
+    calibrated guard band, decided against measured energy) as a
+    prerequisite for the device path.
 
     Provenance labels this "unscaled_cholesky_jitter", not
     "cholesky_jitter" matching the design doc's rule exactly, since
@@ -548,7 +560,8 @@ def _cholesky_jitter_sandwich(S_A, S_B, M, jitter_rcond, same_sector,
     solver-level fields compute_Z/compute_Z_cross can actually observe
     (solver, jitter/retries, backward-error mode/tolerance, dtype,
     two-sided fit residual + its norm convention + acceptance
-    threshold, row-scaling, fallback status); fields that need
+    threshold, row-scaling; fallback_triggered is retained for schema
+    stability and is ALWAYS False); fields that need
     caller-side context (kernel policy, upstream SCF/grid provenance)
     are NOT compute_Z's to fabricate -- a higher-level build_core
     wrapper assembles those -- part of the core-build contract, not
