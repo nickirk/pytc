@@ -828,21 +828,68 @@ def _measure_free_device_bytes():
 
     GPU backends report ``bytes_available``/``bytes_limit`` via
     ``Device.memory_stats()``; the CPU backend returns None there, in which
-    case the tier gates treat device capacity as unknown.
+    case the tier gates treat device capacity as unknown.  Older jaxlib
+    builds omit ``bytes_available``, so fall back to
+    ``bytes_limit - bytes_in_use``; when no combination yields a value the
+    raw stats are logged so the next run shows exactly what the device
+    reported (a null measurement once silently forced the minimum panel
+    width on a B200).
     """
 
     try:
         stats = jax.local_devices()[0].memory_stats()
-    except Exception:
+    except Exception as exc:
+        _logger.info("device memory_stats() raised %r; treating as unmeasurable", exc)
         return None
     if not stats:
         return None
     available = stats.get("bytes_available")
-    return int(available) if available is not None else None
+    if available is not None:
+        return int(available)
+    limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
+    if limit is not None and in_use is not None:
+        return int(limit) - int(in_use)
+    _logger.info("device memory_stats() lacks usable keys: %s", dict(stats))
+    return None
+
+
+def _cgroup_memory_available_bytes(root="/sys/fs/cgroup"):
+    """Available bytes under the enclosing cgroup memory limit, or None.
+
+    A SLURM job's ``--mem`` cap is enforced by the cgroup OOM killer, so
+    node-wide RAM (psutil) overstates what a tier-2 host lift may use.
+    Reads cgroup v2 (``memory.max``/``memory.current``) then v1
+    (``memory.limit_in_bytes``/``memory.usage_in_bytes``); returns None
+    when no cgroup files are readable (e.g. macOS, non-cgroup hosts).
+    ``root`` exists for tests.
+    """
+
+    def _read(path):
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+
+    max_v = _read(os.path.join(root, "memory.max"))
+    cur_v = _read(os.path.join(root, "memory.current"))
+    if max_v is not None and cur_v is not None and max_v != "max":
+        try:
+            return int(max_v) - int(cur_v)
+        except ValueError:
+            return None
+    lim_v = _read(os.path.join(root, "memory", "memory.limit_in_bytes"))
+    use_v = _read(os.path.join(root, "memory", "memory.usage_in_bytes"))
+    if lim_v is not None and use_v is not None:
+        try:
+            return int(lim_v) - int(use_v)
+        except ValueError:
+            return None
+    return None
 
 
 def _measure_free_host_bytes():
-    """Measured available host RAM in bytes.
+    """Measured available host RAM in bytes, capped by any cgroup limit.
 
     psutil is imported lazily: it is a de-facto project dependency (used in
     ``pytc/legacy/kmat.py``) but not declared in ``pyproject.toml``, so a
@@ -850,7 +897,11 @@ def _measure_free_host_bytes():
     """
 
     import psutil
-    return int(psutil.virtual_memory().available)
+    available = int(psutil.virtual_memory().available)
+    cgroup = _cgroup_memory_available_bytes()
+    if cgroup is not None:
+        available = min(available, cgroup)
+    return available
 
 
 def _pipelined_x_panel_size(nvir, rank, working_set_bytes, *,

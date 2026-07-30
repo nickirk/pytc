@@ -546,3 +546,78 @@ class TestTieredXAuto(unittest.TestCase):
             self.backing, self.nocc,
             occupied_pair_batch_size=2, rank_panel_size=3)
         self.assertEqual(_relative_l2(right_pipe, right_stream), 0.0)
+
+
+class TestMemoryMeasurement(unittest.TestCase):
+    """The tier gate's memory measurements, including their fallback paths.
+
+    Regression cover for the 1200 validation OOM: the gate measured node
+    RAM (psutil) while the job's real cap was the SLURM cgroup ``--mem``
+    limit, and a device stats dict without ``bytes_available`` forced the
+    minimum panel width on a GPU job.
+    """
+
+    def test_cgroup_v2_parsing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "memory.max"), "w") as fh:
+                fh.write("1000\n")
+            with open(os.path.join(root, "memory.current"), "w") as fh:
+                fh.write("250\n")
+            self.assertEqual(
+                factor_direct._cgroup_memory_available_bytes(root), 750)
+
+    def test_cgroup_v2_unlimited_falls_through_to_none(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "memory.max"), "w") as fh:
+                fh.write("max\n")
+            with open(os.path.join(root, "memory.current"), "w") as fh:
+                fh.write("250\n")
+            self.assertIsNone(factor_direct._cgroup_memory_available_bytes(root))
+
+    def test_cgroup_v1_parsing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            os.mkdir(os.path.join(root, "memory"))
+            with open(os.path.join(root, "memory", "memory.limit_in_bytes"), "w") as fh:
+                fh.write("2048\n")
+            with open(os.path.join(root, "memory", "memory.usage_in_bytes"), "w") as fh:
+                fh.write("48\n")
+            self.assertEqual(
+                factor_direct._cgroup_memory_available_bytes(root), 2000)
+
+    def test_cgroup_missing_returns_none(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(factor_direct._cgroup_memory_available_bytes(root))
+
+    def test_free_host_capped_by_cgroup(self):
+        # With a cgroup tighter than node RAM, the host measurement must
+        # report the cgroup remainder (the tier-2 lift is killed by the
+        # cgroup OOM killer, not by node exhaustion).
+        measured = factor_direct._measure_free_host_bytes()
+        cgroup = factor_direct._cgroup_memory_available_bytes()
+        import psutil
+        node_avail = int(psutil.virtual_memory().available)
+        self.assertEqual(measured, min(node_avail, cgroup) if cgroup is not None
+                         else node_avail)
+
+    def test_device_stats_fallback_keys(self):
+        # bytes_available missing but limit/in_use present -> difference.
+        class _FakeDevice:
+            def __init__(self, stats):
+                self._stats = stats
+            def memory_stats(self):
+                return self._stats
+        real_local_devices = jax.local_devices
+        try:
+            jax.local_devices = lambda: [_FakeDevice(
+                {"bytes_limit": 1000, "bytes_in_use": 300})]
+            self.assertEqual(factor_direct._measure_free_device_bytes(), 700)
+            jax.local_devices = lambda: [_FakeDevice({"some_other_key": 1})]
+            self.assertIsNone(factor_direct._measure_free_device_bytes())
+            jax.local_devices = lambda: [_FakeDevice(None)]
+            self.assertIsNone(factor_direct._measure_free_device_bytes())
+        finally:
+            jax.local_devices = real_local_devices
