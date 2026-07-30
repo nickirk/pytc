@@ -160,7 +160,7 @@ python -m unittest discover -v
 
 ## Publications
 
-*No publications yet. This section will be updated when papers using pytc are published.*
+- **Interpolative Separable Density-Fitting for Transcorrelated Hamiltonians** — Ke Liao, Yifan Cheng, Werner Dobrautz, Tianyu Zhu, and Ali Alavi. [arXiv:2607.17314 (2026)](https://arxiv.org/abs/2607.17314)
 
 ## Contributing
 
