@@ -1178,16 +1178,30 @@ def hermitian_sandwich_solve(
             Pi_pinv_r = (U_r * (1.0 / sigma_r)[None, :]) @ U_r.conj().T
             W = Pi_pinv_r @ V_herm @ Pi_pinv_r
             W = (W + W.conj().T) / 2
+            # ||proj_r V proj_r||_F == ||U_r^H V U_r||_F exactly, because U_r has
+            # orthonormal columns. So the denominator needs the k x k reduced block,
+            # not the dense n x n projection: 2 n^3 of GEMM becomes n^2 k + n k^2,
+            # and proj_r is no longer needed for it at all. Verified exact to
+            # 8.8e-16 / 2.5e-15 on truncating fixtures.
+            M_r = U_r.conj().T @ V_herm @ U_r
+            retained_target_norm = float(np.linalg.norm(M_r))
             proj_r = U_r @ U_r.conj().T
-            retained_target = proj_r @ V_herm @ proj_r
             retained_solve = proj_r @ (Pi_herm @ W @ Pi_herm - V_herm) @ proj_r
             retained_solve_residual = float(np.linalg.norm(retained_solve)) / max(
-                float(np.linalg.norm(retained_target)), tiny
+                retained_target_norm, tiny
             )
-            # _truncation_residual(n_retained) recomputes U_r @ U_r^H and
-            # proj @ V @ proj -- both already in hand as proj_r and retained_target.
-            # Three n^3-class GEMMs, ~0.8 h each at 444, for values we hold. The
-            # helper stays: the adaptive-retention loop above calls it at varying k.
+            # NOT computed by Frobenius orthogonality. ||V - proj V proj||^2 ==
+            # ||V||^2 - ||M_r||^2 is exact in exact arithmetic and costs no GEMM,
+            # but in f64 it is catastrophic cancellation whenever retention is
+            # near-full: the difference is ~eps*||V||^2 and the sqrt turns that into
+            # ||V||*sqrt(eps), so the relative residual FLOORS at ~1.5e-8 instead of
+            # ~1e-16. Measured: two full-retention tests returned 2.0e-8 and 2.6e-8
+            # where they require <1e-10 and <1e-12. Half the digits, lost exactly in
+            # the regime that matters.
+            #
+            # The dense projection is kept for this reason. It is the one place the
+            # reduced form is not a safe substitute.
+            retained_target = proj_r @ V_herm @ proj_r
             truncation_residual = float(np.linalg.norm(V_herm - retained_target)) / v_norm
         else:
             W = np.zeros((n, n), dtype=np.result_type(Pi_herm.dtype, V_herm.dtype))
