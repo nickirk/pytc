@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+import logging
 import os
 import time
 from typing import Callable, Mapping
@@ -24,9 +25,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from pytc.utils import tile_timers as _tile_timers
+from pytc.utils.prefetch import async_read, await_read
 
 
 Array = jax.Array
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -802,6 +806,222 @@ def contract_partial_x_right_t2_streamed(t2, right_out, right_inner, x_backing, 
         rank_panel_size=rank_panel_size)
 
 
+# ---------------------------------------------------------------------------
+# Pipelined X panel streaming (tiers 2/3)
+#
+# At the 1200-orbital deck the design variable is launch count, not transfer
+# volume: the 128-wide panel loop above pays ~2.5 s of pure dispatch per
+# launch, so a cycle burns its time in ~2x167 small launches.  The pipelined
+# loop below sizes each panel to the measured device working set (a cycle
+# then needs ~5 launches) and double-buffers the next panel's host read +
+# H2D transfer behind the current panel's kernel.
+#
+# NOTE on parity: the panel kernels reduce over the rank axis inside each
+# panel and the host loop accumulates across panels, so widening the panels
+# regroups the reduction -- pipelined results are mathematically identical
+# to the 128-panel streamed path but NOT bitwise identical; expect FP64
+# reassociation-level agreement (relative L2 <= 1e-12), not 0.0.
+
+
+def _measure_free_device_bytes():
+    """Measured free bytes on the first local device, or None when unmeasurable.
+
+    GPU backends report ``bytes_available``/``bytes_limit`` via
+    ``Device.memory_stats()``; the CPU backend returns None there, in which
+    case the tier gates treat device capacity as unknown.
+    """
+
+    try:
+        stats = jax.local_devices()[0].memory_stats()
+    except Exception:
+        return None
+    if not stats:
+        return None
+    available = stats.get("bytes_available")
+    return int(available) if available is not None else None
+
+
+def _measure_free_host_bytes():
+    """Measured available host RAM in bytes.
+
+    psutil is imported lazily: it is a de-facto project dependency (used in
+    ``pytc/legacy/kmat.py``) but not declared in ``pyproject.toml``, so a
+    top-level import here would make this module unimportable without it.
+    """
+
+    import psutil
+    return int(psutil.virtual_memory().available)
+
+
+def _pipelined_x_panel_size(nvir, rank, working_set_bytes, *,
+                            rank_panel_size, panel_budget_bytes=None):
+    """Rank width of one pipelined X panel, a multiple of ``rank_panel_size``.
+
+    The per-panel budget is half the measured free device memory after the
+    t2/accumulator working set and a 4 GiB safety reserve; the other half is
+    the in-flight prefetch buffer.  ``PYTC_X_PANEL_BUDGET_GB`` -- read here,
+    at call time -- overrides the computed budget for benchmarking.  When
+    device memory is unmeasurable (CPU backend) and no override is given,
+    the width falls back to today's ``rank_panel_size``.
+    """
+
+    override_gb = os.environ.get("PYTC_X_PANEL_BUDGET_GB")
+    if override_gb is not None:
+        budget = int(float(override_gb) * 1024 ** 3)
+    elif panel_budget_bytes is not None:
+        budget = panel_budget_bytes
+    else:
+        free_device = _measure_free_device_bytes()
+        if free_device is None:
+            return rank_panel_size
+        reserve = working_set_bytes + 4 * 1024 ** 3
+        budget = max(0, int((0.9 * free_device - reserve) // 2))
+    width = budget // (nvir * nvir * 8)
+    if width < rank_panel_size:
+        _logger.warning(
+            "X panel budget %d bytes fits fewer than %d rank columns; "
+            "falling back to rank_panel_size=%d",
+            budget, rank_panel_size, rank_panel_size)
+        return rank_panel_size
+    padded_rank = ((rank + rank_panel_size - 1) // rank_panel_size) * rank_panel_size
+    width = min(width, padded_rank)
+    return (width // rank_panel_size) * rank_panel_size
+
+
+def _x_backing_panel_source(x_backing, nocc):
+    """Panel source that reads straight from the X backing (tier 3).
+
+    The contiguous copy happens inside the prefetch thread, overlapped with
+    the current panel's kernel.
+    """
+
+    def read_panel(m0, m1, panel_size):
+        return np.ascontiguousarray(
+            _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size))
+
+    return read_panel
+
+
+def _x_host_panel_source(x_host):
+    """Panel source that slices a host-resident ``(nvir, nvir, rank)`` X (tier 2).
+
+    A rank-axis slice of the C-order host block is strided, so each panel is
+    copied contiguous in the prefetch thread; the rank tail is zero-padded
+    exactly like :func:`_read_x_rank_panel`.
+    """
+
+    def read_panel(m0, m1, panel_size):
+        panel = np.ascontiguousarray(x_host[:, :, m0:m1])
+        short = panel_size - panel.shape[2]
+        if short:
+            panel = np.pad(panel, ((0, 0), (0, 0), (0, short)))
+        return panel
+
+    return read_panel
+
+
+def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
+                                panel_source, nocc, *,
+                                occupied_pair_batch_size, rank_panel_size,
+                                panel_budget_bytes=None):
+    """Working-set X panel loop with double-buffered async prefetch.
+
+    Same math, padding, and accumulation semantics as
+    :func:`_stream_partial_x`, but the panel width is sized from the measured
+    device working set and the next panel's host read is issued (via
+    :func:`async_read`) before the current panel's kernel, so its H2D
+    ``device_put`` overlaps compute (JAX async dispatch).
+
+    ``panel_source(m0, m1, panel_size)`` returns one contiguous
+    ``(nvir, nvir, panel_size)`` float64 host panel, zero-padded on the rank
+    tail exactly like :func:`_read_x_rank_panel`; every panel shares one
+    shape, so each term compiles exactly once.  ``nocc`` is already baked
+    into ``panel_source`` and is accepted for symmetry with
+    :func:`_stream_partial_x`; callers validate with
+    :func:`_validate_x_stream`.
+    """
+
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    del nocc
+    _validate_t2(t2)
+
+    nocc_i, nocc_j, nvir, _ = t2.shape
+    rank = left_out.shape[1]
+    n_pairs = nocc_i * nocc_j
+    n_pair_blocks = (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size
+    padded_pairs = n_pair_blocks * occupied_pair_batch_size
+
+    working_set = 3 * padded_pairs * nvir * nvir * 8
+    panel_size = _pipelined_x_panel_size(
+        nvir, rank, working_set,
+        rank_panel_size=rank_panel_size, panel_budget_bytes=panel_budget_bytes)
+    n_blocks = (rank + panel_size - 1) // panel_size
+    panel_padded_rank = n_blocks * panel_size
+
+    t2_pairs = jnp.pad(
+        jnp.asarray(t2).reshape(n_pairs, nvir, nvir),
+        ((0, padded_pairs - n_pairs), (0, 0), (0, 0)))
+    inner_padded = jnp.pad(jnp.asarray(left_inner), ((0, 0), (0, panel_padded_rank - rank)))
+    out_padded = jnp.pad(jnp.asarray(left_out), ((0, 0), (0, panel_padded_rank - rank)))
+
+    def panel_read(k):
+        m0 = k * panel_size
+        return async_read(panel_source, m0, min(m0 + panel_size, rank), panel_size)
+
+    total = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2_pairs.dtype)
+    future = panel_read(0)
+    x_dev = jax.device_put(await_read(future))
+    if n_blocks > 1:
+        future = panel_read(1)
+    for k in range(n_blocks):
+        m0 = k * panel_size
+        total = total + panel_kernel(
+            t2_pairs,
+            inner_padded[:, m0:m0 + panel_size],
+            out_padded[:, m0:m0 + panel_size],
+            x_dev,
+            occupied_pair_batch_size=occupied_pair_batch_size)
+        if k + 1 < n_blocks:
+            # Awaiting the prefetch after dispatching kernel k lets the H2D
+            # transfer overlap the kernel's async execution.
+            x_next = jax.device_put(await_read(future))
+            if k + 2 < n_blocks:
+                future = panel_read(k + 2)
+            x_dev = x_next
+    return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
+
+
+def contract_partial_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
+                                         *, occupied_pair_batch_size=8,
+                                         rank_panel_size=128,
+                                         panel_budget_bytes=None):
+    """Pipelined ``P[a,m] P[c,m] X[b,d,m]``: working-set panels, prefetched."""
+
+    _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
+    return _stream_partial_x_pipelined(
+        _xstream_left_panel_jit, t2, left_out, left_inner,
+        _x_backing_panel_source(x_backing, nocc), nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+        panel_budget_bytes=panel_budget_bytes)
+
+
+def contract_partial_x_right_t2_pipelined(t2, right_out, right_inner, x_backing, nocc,
+                                          *, occupied_pair_batch_size=8,
+                                          rank_panel_size=128,
+                                          panel_budget_bytes=None):
+    """Pipelined ``X[a,c,m] P[b,m] P[d,m]``: working-set panels, prefetched."""
+
+    _validate_x_stream(t2, right_out, right_inner, x_backing, nocc)
+    return _stream_partial_x_pipelined(
+        _xstream_right_panel_jit, t2, right_out, right_inner,
+        _x_backing_panel_source(x_backing, nocc), nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+        panel_budget_bytes=panel_budget_bytes)
+
+
 # Default device-residency cap for the full-lift X path (~24 GiB).  The
 # streamed path exists for decks whose X_vv cannot live on the GPU (the
 # 1200-orbital deck's 247 GB); at smaller decks the full-lift path is
@@ -825,28 +1045,78 @@ def contract_isdf_factor_direct_terms_t2_auto(
     rank_panel_size: int = 128,
     cap_bytes: int = _X_FULL_LIFT_CAP_BYTES,
 ) -> Mapping[str, Array]:
-    """Size-conditional X path: full-lift when X_vv fits the cap, else streamed.
+    """Three-tier X path, selected on measured free memory.
 
-    The full-lift path (whole X_vv device-lifted, one compiled rank scan) is
-    the fast path whenever the block fits; the streamed path is the
-    memory-necessity fallback for decks whose X_vv exceeds the cap.  Which
-    path was taken is recorded in the tile_timers counters
-    (``fd_x_full_lift`` / ``fd_x_streamed``) so receipts show it.
+    * Tier 1 (``fd_x_tier1_full_lift``): X_vv fits the device-residency cap
+      AND at most half the measured free device memory -- the full-lift path
+      (whole block device-lifted, one compiled rank scan), the fast path
+      whenever the block fits.
+    * Tier 2 (``fd_x_tier2_host_resident``): X_vv fails the device gate but
+      fits in half the measured free host RAM -- X_vv is lifted to host RAM
+      once, then contracted by the pipelined panel loop with panel reads as
+      host-array slices (the 1200-orbital deck's 247 GB fits a node's RAM).
+    * Tier 3 (``fd_x_tier3_stream``): otherwise -- the same pipelined loop
+      with panel reads from the backing (HDF5 dataset or ndarray).
+
+    Tiers 2/3 share the working-set panel loop: the panel width comes from
+    the measured device working set and the next panel's read + H2D transfer
+    is prefetched behind the current kernel.  The gate uses only measured
+    free memory plus the cap; ``PYTC_X_FORCE_TIER`` = 1|2|3 (read at call
+    time) pins the tier for tests and benchmarking, and
+    ``PYTC_X_PANEL_BUDGET_GB`` pins the per-panel budget.  Which tier fired
+    is recorded in the tile_timers counters so receipts show it.
     """
-    nvir = x_backing.shape[0] - int(nocc)
-    x_bytes = nvir * nvir * x_backing.shape[2] * 8
-    if x_bytes <= cap_bytes:
-        _tile_timers.incr("fd_x_full_lift")
-        x_full = np.asarray(x_backing[int(nocc):, int(nocc):, :], dtype=np.float64)
+    nocc = int(nocc)
+    nvir = x_backing.shape[0] - nocc
+    rank = x_backing.shape[2]
+    x_bytes = nvir * nvir * rank * 8
+
+    force = os.environ.get("PYTC_X_FORCE_TIER")
+    free_device = _measure_free_device_bytes()
+    free_host = _measure_free_host_bytes()
+    if force in ("1", "2", "3"):
+        tier = int(force)
+    elif x_bytes <= cap_bytes and (
+            free_device is None or x_bytes <= 0.5 * free_device):
+        tier = 1
+    elif free_host is not None and x_bytes <= 0.5 * free_host:
+        tier = 2
+    else:
+        tier = 3
+
+    panel_size = None
+    if tier != 1:
+        n_pairs = t2.shape[0] * t2.shape[1]
+        n_pair_blocks = (
+            (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size)
+        working_set = 3 * n_pair_blocks * occupied_pair_batch_size * nvir * nvir * 8
+        panel_size = _pipelined_x_panel_size(
+            nvir, rank, working_set, rank_panel_size=rank_panel_size)
+    _logger.info(
+        "X tier selection: tier=%d x_bytes=%d free_device_bytes=%s "
+        "free_host_bytes=%s panel_size=%s",
+        tier, x_bytes, free_device, free_host, panel_size)
+
+    if tier == 1:
+        _tile_timers.incr("fd_x_tier1_full_lift")
+        x_full = np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64)
         return contract_isdf_factor_direct_terms_t2(
             t2, p, grad_p, u1, u3, d, x_full,
             occupied_pair_batch_size=occupied_pair_batch_size,
             rank_panel_size=rank_panel_size)
-    _tile_timers.incr("fd_x_streamed")
+    if tier == 2:
+        _tile_timers.incr("fd_x_tier2_host_resident")
+        x_host = np.ascontiguousarray(
+            np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64))
+        panel_source = _x_host_panel_source(x_host)
+    else:
+        _tile_timers.incr("fd_x_tier3_stream")
+        panel_source = _x_backing_panel_source(x_backing, nocc)
     return contract_isdf_factor_direct_terms_t2_xstream(
         t2, p, grad_p, u1, u3, d, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size)
+        rank_panel_size=rank_panel_size,
+        panel_source=panel_source)
 
 
 def contract_isdf_factor_direct_terms_t2_xstream(
@@ -861,6 +1131,8 @@ def contract_isdf_factor_direct_terms_t2_xstream(
     *,
     occupied_pair_batch_size: int = 8,
     rank_panel_size: int = 128,
+    panel_source=None,
+    panel_budget_bytes=None,
 ) -> Mapping[str, Array]:
     """Factor-direct terms with X streamed panel-wise from its backing.
 
@@ -868,6 +1140,11 @@ def contract_isdf_factor_direct_terms_t2_xstream(
     :func:`contract_isdf_factor_direct_terms_t2`; only the two X-consuming
     terms change how X reaches the device.  Every other input is small and
     device-lifted exactly as in the full-block path.
+
+    With ``panel_source=None`` the X terms use the legacy 128-wide panel
+    loop; with a panel source (see :func:`_x_host_panel_source` /
+    :func:`_x_backing_panel_source`) they use the pipelined working-set
+    panel loop -- tiers 2/3 of :func:`contract_isdf_factor_direct_terms_t2_auto`.
     """
 
     p, grad_p, u1, u3, d = map(jnp.asarray, (p, grad_p, u1, u3, d))
@@ -903,10 +1180,19 @@ def contract_isdf_factor_direct_terms_t2_xstream(
                       t2, p, p, d, p, p, **_kw)
     d_pair = _timed("fd_d_pair", contract_full_thc_pair_swapped_t2,
                     t2, p, p, d, p, p, **_kw)
-    x_direct = _timed("fd_x_left", contract_partial_x_left_t2_streamed,
-                      t2, p, p, x_backing, nocc, **_kw)
-    x_pair = _timed("fd_x_right", contract_partial_x_right_t2_streamed,
-                    t2, p, p, x_backing, nocc, **_kw)
+    if panel_source is None:
+        x_direct = _timed("fd_x_left", contract_partial_x_left_t2_streamed,
+                          t2, p, p, x_backing, nocc, **_kw)
+        x_pair = _timed("fd_x_right", contract_partial_x_right_t2_streamed,
+                        t2, p, p, x_backing, nocc, **_kw)
+    else:
+        _validate_x_stream(t2, p, p, x_backing, nocc)
+        x_direct = _timed("fd_x_left", _stream_partial_x_pipelined,
+                          _xstream_left_panel_jit, t2, p, p, panel_source, nocc,
+                          panel_budget_bytes=panel_budget_bytes, **_kw)
+        x_pair = _timed("fd_x_right", _stream_partial_x_pipelined,
+                        _xstream_right_panel_jit, t2, p, p, panel_source, nocc,
+                        panel_budget_bytes=panel_budget_bytes, **_kw)
 
     # Same sign assembly as contract_isdf_factor_direct_terms_t2.
     tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)

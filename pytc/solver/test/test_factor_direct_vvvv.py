@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pytc.solver import factor_direct_vvvv as factor_direct
+from pytc.utils import tile_timers as _tile_timers
 
 
 def _random_inputs(*, nocc: int = 2, nvir: int = 5, rank: int = 7):
@@ -450,3 +451,98 @@ class TestStreamedXParity(unittest.TestCase):
                 np.testing.assert_array_equal(
                     panel[:, :, expected_width:],
                     np.zeros((self.nvir, self.nvir, 3 - expected_width)))
+
+
+class TestTieredXAuto(unittest.TestCase):
+    """Three-tier auto dispatcher: forced tiers match the full-lift math.
+
+    Tiers 2/3 regroup the rank reduction (working-set panels instead of the
+    full-lift compiled rank scan), so agreement with the full-lift reference
+    is at FP64 reassociation level (relative L2 <= 1e-12), not bitwise.
+    The env pins are read at call time inside the functions, so each test
+    sets and restores them.
+    """
+
+    _ENV_PINS = ("PYTC_X_FORCE_TIER", "PYTC_X_PANEL_BUDGET_GB")
+
+    def setUp(self):
+        self.data = _random_inputs()          # nocc=2, nvir=5, rank=7
+        self.nocc, self.nvir, self.rank = 2, 5, 7
+        nmo = self.nocc + self.nvir
+        backing = np.zeros((nmo, nmo, self.rank), dtype=np.float64)
+        backing[self.nocc:, self.nocc:, :] = np.asarray(self.data["x"])
+        self.backing = backing
+        self.reference = factor_direct.contract_isdf_factor_direct_terms_t2(
+            **self.data, occupied_pair_batch_size=2, rank_panel_size=3)
+        self._saved_env = {name: os.environ.get(name) for name in self._ENV_PINS}
+
+    def tearDown(self):
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _run_auto(self, tier):
+        # The panel budget pins a width of 6 rank columns (6 * 5 * 5 * 8 =
+        # 1200 bytes), so the pipelined loop runs two panels over rank 7:
+        # one full and one ragged, at a width != rank_panel_size=3.
+        os.environ["PYTC_X_FORCE_TIER"] = str(tier)
+        os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(1200 / 1024 ** 3)
+        counters_before = dict(_tile_timers._STATE["counters"])
+        terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+            self.data["t2"], self.data["p"], self.data["grad_p"],
+            self.data["u1"], self.data["u3"], self.data["d"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        counters_after = _tile_timers._STATE["counters"]
+        fired = {
+            name: counters_after.get(name, 0) - counters_before.get(name, 0)
+            for name in counters_after
+        }
+        return terms, fired
+
+    def _assert_terms_match(self, actual, expected, tol=1e-12):
+        self.assertEqual(set(expected), set(actual))
+        for name, ref in expected.items():
+            with self.subTest(term=name):
+                self.assertLessEqual(_relative_l2(actual[name], ref), tol)
+
+    def test_forced_tier2_host_resident_matches_full_lift(self):
+        terms, fired = self._run_auto(2)
+        self.assertEqual(fired.get("fd_x_tier2_host_resident", 0), 1)
+        self._assert_terms_match(terms, self.reference)
+
+    def test_forced_tier3_stream_matches_full_lift(self):
+        terms, fired = self._run_auto(3)
+        self.assertEqual(fired.get("fd_x_tier3_stream", 0), 1)
+        self._assert_terms_match(terms, self.reference)
+
+    def test_forced_tier2_matches_tier3(self):
+        tier2, _ = self._run_auto(2)
+        tier3, _ = self._run_auto(3)
+        self._assert_terms_match(tier2, tier3)
+
+    def test_pipelined_wrappers_bitwise_match_streamed_at_same_panel_width(self):
+        # A tiny budget forces panel_size == rank_panel_size, so the
+        # pipelined loop groups the rank reduction exactly like the streamed
+        # path and must reproduce it bitwise.
+        os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(8 / 1024 ** 3)
+        left_stream = factor_direct.contract_partial_x_left_t2_streamed(
+            self.data["t2"], self.data["p"], self.data["p"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        left_pipe = factor_direct.contract_partial_x_left_t2_pipelined(
+            self.data["t2"], self.data["p"], self.data["p"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        self.assertEqual(_relative_l2(left_pipe, left_stream), 0.0)
+        right_stream = factor_direct.contract_partial_x_right_t2_streamed(
+            self.data["t2"], self.data["p"], self.data["p"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        right_pipe = factor_direct.contract_partial_x_right_t2_pipelined(
+            self.data["t2"], self.data["p"], self.data["p"],
+            self.backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        self.assertEqual(_relative_l2(right_pipe, right_stream), 0.0)
