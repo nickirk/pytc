@@ -715,6 +715,28 @@ def _cholesky_jitter_entry(Pi, V, *, jitter_rcond, rtol, n_retained_pin,
                            target_truncation_residual):
     """Route Pi W Pi = V through the shared _cholesky_jitter_sandwich.
 
+    INTERIM BIAS POLICY, and its precondition. When the unregularized bias
+    exceeds _RESIDUAL_WARN_THRESHOLD this warns and proceeds -- nothing fails.
+    Warning-only is NOT a defensible production policy on its own: a log line
+    nobody reads is indistinguishable from no check. It is acceptable here ONLY
+    because the mode is confined to the host reference path, which structurally
+    cannot run a configuration needing the production memory lever:
+
+      device + cholesky_jitter        -> refused (device has no such mode)
+      host   + p_block_rows          -> refused (host is reference-grade)
+      host   + cholesky + p_block    -> refused (both of the above)
+
+    So this mode cannot execute any P-blocked run. Precisely stated: it is not
+    unreachable from "production" in the abstract -- a small run needing no
+    panel blocking could use it -- it is unreachable from any configuration
+    that needs P-blocking, which is every run large enough for the bias to
+    matter at scale.
+
+    THEREFORE: settling the bias policy (fail-closed vs a calibrated guard
+    band, decided against measured energy) is a PREREQUISITE for implementing
+    the device path, not a follow-up to it. Removing either refusal above
+    without settling it would turn warning-only into silent acceptance.
+
     Pi appears on BOTH sides, so this is the same_sector case: one
     factorization, reused. Regularizes instead of truncating, so there is no
     spectrum and therefore no n_retained, s_min_retained, truncation_residual

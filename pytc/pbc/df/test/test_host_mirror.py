@@ -181,6 +181,42 @@ class TestOptionsRefusedAtConstruction(unittest.TestCase):
             validate_option_compatibility(p_block_rows=4, stage_eta_root="/tmp")
 
 
+class TestCholeskyBiasPolicyPrecondition(unittest.TestCase):
+    """The interim bias policy is warning-only, which is defensible ONLY while the
+    mode cannot run a P-blocked configuration. That confinement is currently a
+    consequence of three separate refusals rather than a stated rule, so it could
+    be removed by accident. These tests make it a contract: if any of them starts
+    failing, warning-only has silently become acceptance and the bias policy must
+    be settled first.
+    """
+
+    def setUp(self):
+        self.cell = _make_cell()
+        self.kpts = self.cell.make_kpts((1, 1, 1), wrap_around=False)
+
+    def _isdfdf(self, **kw):
+        return ISDFDF(self.cell, self.kpts, rank=12, block_size=200, **kw)
+
+    def test_cholesky_cannot_run_a_p_blocked_configuration(self):
+        # The three refusals that together confine the mode to the reference path.
+        for kw in (dict(solve_backend="device", retention_mode="cholesky_jitter",
+                        jitter_rcond=1e-14),
+                   dict(solve_backend="host", p_block_rows=4),
+                   dict(solve_backend="host", retention_mode="cholesky_jitter",
+                        p_block_rows=4)):
+            with self.subTest(**kw):
+                with self.assertRaises(ValueError):
+                    self._isdfdf(**kw)
+
+    def test_the_reference_path_itself_is_reachable(self):
+        # Control: the refusals above must not be vacuous. Without the production
+        # lever the mode is available, which is what makes it a reference path
+        # rather than dead code.
+        df = self._isdfdf(solve_backend="host", retention_mode="cholesky_jitter")
+        self.assertEqual(df.retention_mode, "cholesky_jitter")
+        self.assertIsNone(df.p_block_rows)
+
+
 class TestBpcPolicyAndCacheGate(unittest.TestCase):
     """Task #57. The task's premise was that batch_size exceeds a small cell's
     candidate pool; isolation showed otherwise -- batch_size=999 and
