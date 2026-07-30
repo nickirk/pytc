@@ -20,6 +20,7 @@ from pytc.solver.robust_df_thc_scalable_jax import (
     direct_df_sandwiches_panelled_jax,
     fit_panelled_lsthc_jax,
 )
+from pytc.utils import tile_timers as _tile_timers
 
 
 class RCCSD(jax_xtc_ccsd.RCCSD):
@@ -81,10 +82,14 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         tc, b, fit, x_backing = self._factorized_state()
         rank_panel = min(self.factorized_rank_panel, fit.p_virtual.shape[1])
         aux_panel = min(self.factorized_aux_panel, b.shape[2])
-        terms = factor_direct_vvvv.contract_isdf_factor_direct_terms_t2_xstream(
-            t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
-            occupied_pair_batch_size=min(8, self.nocc * self.nocc),
-            rank_panel_size=rank_panel)
-        coulomb = direct_df_sandwiches_panelled_jax(
-            b, fit, t2_jax, rank_panel=rank_panel, aux_panel=aux_panel)
+        with _tile_timers.term("fd_isdf_terms") as _tt:
+            terms = factor_direct_vvvv.contract_isdf_factor_direct_terms_t2_xstream(
+                t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
+                occupied_pair_batch_size=min(8, self.nocc * self.nocc),
+                rank_panel_size=rank_panel)
+            _tt.sync(terms["final"])
+        with _tile_timers.term("fd_coulomb_sandwich") as _tt:
+            coulomb = direct_df_sandwiches_panelled_jax(
+                b, fit, t2_jax, rank_panel=rank_panel, aux_panel=aux_panel)
+            _tt.sync(coulomb.robust)
         t2new_host += np.asarray(terms["final"] + coulomb.robust, dtype=np.float64)

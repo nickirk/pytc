@@ -22,6 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from pytc.utils import tile_timers as _tile_timers
+
 
 Array = jax.Array
 
@@ -829,56 +831,34 @@ def contract_isdf_factor_direct_terms_t2_xstream(
     if u1.shape != (p.shape[1], p.shape[1], 3):
         raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
 
-    k1_direct = _contract_k1_direct_t2_jit(
-        t2, p, grad_p, u1,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    k1_pair = _contract_k1_pair_t2_jit(
-        t2, p, grad_p, u1,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    k2_direct = _contract_k2_direct_t2_jit(
-        t2, p, grad_p, u1,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    k2_pair = _contract_k2_pair_t2_jit(
-        t2, p, grad_p, u1,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    k3_direct = contract_full_thc_t2(
-        t2, p, p, u3, p, p,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    k3_pair = contract_full_thc_pair_swapped_t2(
-        t2, p, p, u3, p, p,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    d_direct = contract_full_thc_t2(
-        t2, p, p, d, p, p,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    d_pair = contract_full_thc_pair_swapped_t2(
-        t2, p, p, d, p, p,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    x_direct = contract_partial_x_left_t2_streamed(
-        t2, p, p, x_backing, nocc,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
-    x_pair = contract_partial_x_right_t2_streamed(
-        t2, p, p, x_backing, nocc,
-        occupied_pair_batch_size=occupied_pair_batch_size,
-        rank_panel_size=rank_panel_size,
-    )
+    def _timed(name, fn, *args, **kwargs):
+        with _tile_timers.term(name) as _tt:
+            out = fn(*args, **kwargs)
+            _tt.sync(out)
+        return out
+
+    _kw = dict(occupied_pair_batch_size=occupied_pair_batch_size,
+               rank_panel_size=rank_panel_size)
+    k1_direct = _timed("fd_k1_direct", _contract_k1_direct_t2_jit,
+                       t2, p, grad_p, u1, **_kw)
+    k1_pair = _timed("fd_k1_pair", _contract_k1_pair_t2_jit,
+                     t2, p, grad_p, u1, **_kw)
+    k2_direct = _timed("fd_k2_direct", _contract_k2_direct_t2_jit,
+                       t2, p, grad_p, u1, **_kw)
+    k2_pair = _timed("fd_k2_pair", _contract_k2_pair_t2_jit,
+                     t2, p, grad_p, u1, **_kw)
+    k3_direct = _timed("fd_k3_direct", contract_full_thc_t2,
+                       t2, p, p, u3, p, p, **_kw)
+    k3_pair = _timed("fd_k3_pair", contract_full_thc_pair_swapped_t2,
+                     t2, p, p, u3, p, p, **_kw)
+    d_direct = _timed("fd_d_direct", contract_full_thc_t2,
+                      t2, p, p, d, p, p, **_kw)
+    d_pair = _timed("fd_d_pair", contract_full_thc_pair_swapped_t2,
+                    t2, p, p, d, p, p, **_kw)
+    x_direct = _timed("fd_x_left", contract_partial_x_left_t2_streamed,
+                      t2, p, p, x_backing, nocc, **_kw)
+    x_pair = _timed("fd_x_right", contract_partial_x_right_t2_streamed,
+                    t2, p, p, x_backing, nocc, **_kw)
 
     # Same sign assembly as contract_isdf_factor_direct_terms_t2.
     tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)

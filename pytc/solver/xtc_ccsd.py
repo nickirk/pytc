@@ -1693,6 +1693,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
     vvvv shape: (a, b, c, d) = (nvir, nvir, nvir, nvir).
     We iterate over the first index 'a' in blocks to limit memory usage.
     """
+    fused = getattr(cc, 'fused', False)
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
