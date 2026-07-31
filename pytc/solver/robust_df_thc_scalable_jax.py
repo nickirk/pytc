@@ -6,6 +6,8 @@ are deliberately preserved so this module changes backend only.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -79,10 +81,24 @@ def _exact_panel(b_panel, t2):
 
 
 def exact_df_panelled(b, t2, aux_panel: int):
-    """Exact current-DF sandwich, panelled over the auxiliary axis."""
+    """Exact current-DF sandwich, panelled over the auxiliary axis.
+
+    The ``(nocc^2, nvir, nvir, q)`` intermediate inside :func:`_exact_panel`
+    costs ``nocc^2 * nvir^2 * q * 8`` bytes -- ~4.9 GiB per aux column at the
+    1200 deck, so the caller's ``aux_panel=32`` would demand ~157 GiB.  The
+    panel step is therefore clamped so the intermediate stays under
+    ``PYTC_EXACT_PANEL_CAP_GB`` (default 8 GiB, read at call time); at q=1
+    the GEMM shapes are unchanged (the batch is the occupied-pair axis, not
+    q), so the clamp costs no efficiency.  Small decks are unaffected.
+    """
+
+    per_q = (t2.shape[0] * t2.shape[1] * t2.shape[2] * t2.shape[3]
+             * np.dtype(np.float64).itemsize)
+    cap = int(float(os.environ.get("PYTC_EXACT_PANEL_CAP_GB", "8")) * 1024 ** 3)
+    q_step = max(1, min(int(aux_panel), cap // max(per_q, 1)))
     out = jnp.zeros_like(t2)
-    for q0 in range(0, b.shape[2], aux_panel):
-        q1 = min(q0 + aux_panel, b.shape[2])
+    for q0 in range(0, b.shape[2], q_step):
+        q1 = min(q0 + q_step, b.shape[2])
         out = out + _exact_panel(b[:, :, q0:q1], t2)
     return out
 
