@@ -48,6 +48,24 @@ def _as_fp64_jax(name: str, value: object, ndim: int):
     return array
 
 
+def _as_fp64_host(name: str, value: object, ndim: int):
+    """FP64 as a HOST array -- for operands the panel loops only ever slice.
+
+    A wholesale ``jnp.asarray`` of the full 3-index B block allocates the
+    entire tensor on device (21.4 GiB at the 1200 deck) even though every
+    consumer reads it one aux panel at a time; at cycle time, with the
+    X-term working set still resident, that single allocation is what OOM'd
+    JID 20633292.  Kept on the host, each ``b[:, :, q0:q1]`` panel slice is
+    uploaded by the jitted panel kernel that receives it, so peak device
+    cost is one panel, not the whole block.
+    """
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}D array; got {array.ndim}D "
+                         f"{array.shape}")
+    return array
+
+
 # ---------------------------------------------------------------- kernels ---
 # Each jitted body is ONE panel's arithmetic, matching the oracle's einsum
 # subscripts exactly. Subscripts are copied verbatim from the NumPy source: they
@@ -159,9 +177,13 @@ def direct_df_sandwiches_panelled_jax(b, fit, t2, *, rank_panel: int,
 
     `fit` is the oracle's ScalableLSTHCFit (or anything exposing .p_virtual/.y),
     so the caller does not have to know which backend produced it.
+
+    `b` is deliberately kept HOST-resident (see :func:`_as_fp64_host`): the
+    panel loops below only read aux-axis slices, so uploading the whole
+    block would cost its full size in device memory for no benefit.
     """
     require_float64()
-    b_j = _as_fp64_jax("b", b, 3)
+    b_h = _as_fp64_host("b", b, 3)
     t2_j = _as_fp64_jax("t2", t2, 4)
     p_j = _as_fp64_jax("p_virtual", fit.p_virtual, 2)
     y_j = _as_fp64_jax("y", fit.y, 2)
@@ -169,20 +191,20 @@ def direct_df_sandwiches_panelled_jax(b, fit, t2, *, rank_panel: int,
     nvir = t2_j.shape[2]
     if t2_j.shape[2:] != (nvir, nvir):
         raise ValueError(f"t2 virtual axes must be square; got {t2_j.shape}")
-    if b_j.shape[:2] != (nvir, nvir):
-        raise ValueError(f"B virtual dimensions do not match t2: {b_j.shape} vs "
+    if b_h.shape[:2] != (nvir, nvir):
+        raise ValueError(f"B virtual dimensions do not match t2: {b_h.shape} vs "
                          f"{t2_j.shape}")
-    if p_j.shape[0] != nvir or y_j.shape != (p_j.shape[1], b_j.shape[2]):
+    if p_j.shape[0] != nvir or y_j.shape != (p_j.shape[1], b_h.shape[2]):
         raise ValueError("implicit fit dimensions do not match B and t2")
     # Panel bounds mirror the oracle's _positive_panel exactly.
     for name, size, upper in (("rank_panel", rank_panel, p_j.shape[1]),
-                              ("aux_panel", aux_panel, b_j.shape[2])):
+                              ("aux_panel", aux_panel, b_h.shape[2])):
         if not 1 <= int(size) <= upper:
             raise ValueError(f"{name} must be in [1, {upper}]; got {size}")
 
-    exact = exact_df_panelled(b_j, t2_j, int(aux_panel))
+    exact = exact_df_panelled(b_h, t2_j, int(aux_panel))
     fit_left, df_left = partial_thc_crosses_panelled(
-        b_j, p_j, y_j, t2_j, int(rank_panel), int(aux_panel))
+        b_h, p_j, y_j, t2_j, int(rank_panel), int(aux_panel))
     full = full_thc_panelled(p_j, y_j, t2_j, int(rank_panel), int(aux_panel))
     return ScalableDirectSandwichesJax(exact, fit_left, df_left, full)
 

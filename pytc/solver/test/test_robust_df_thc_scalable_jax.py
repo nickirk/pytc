@@ -30,3 +30,28 @@ def test_jax_fit_rejects_invalid_rcond(rcond):
     b = np.ones((2, 2, 1))
     with pytest.raises(ValueError, match="rcond"):
         fit_panelled_lsthc_jax(p, b, rcond=rcond, virtual_panel=1)
+
+
+def test_sandwich_keeps_b_host_resident(monkeypatch):
+    # Regression cover for the 1200 cycle-1 OOM (JID 20633292): the full
+    # 3-index B block must never be cast onto the device wholesale -- the
+    # panel loops consume it one aux slice at a time from the host.
+    import pytc.solver.robust_df_thc_scalable_jax as mod
+
+    uploaded = []
+    real = mod._as_fp64_jax
+
+    def recording(name, value, ndim):
+        uploaded.append(name)
+        return real(name, value, ndim)
+
+    monkeypatch.setattr(mod, "_as_fp64_jax", recording)
+    rng = np.random.default_rng(7)
+    p = rng.normal(size=(4, 3))
+    b = rng.normal(size=(4, 4, 5))
+    t2 = rng.normal(size=(2, 2, 4, 4))
+    jax_fit = fit_panelled_lsthc_jax(p, b, rcond=1e-12, virtual_panel=2)
+    uploaded.clear()
+    direct_df_sandwiches_panelled_jax(b, jax_fit, t2, rank_panel=2, aux_panel=3)
+    assert "b" not in uploaded
+    assert {"t2", "p_virtual", "y"} <= set(uploaded)
