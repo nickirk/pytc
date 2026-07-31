@@ -15,6 +15,7 @@ converted artifact exactly like the original store.
 from __future__ import annotations
 
 import argparse
+import os
 
 import h5py
 import numpy as np
@@ -70,9 +71,15 @@ def convert_store_to_rank_major(src, dst, *, x_dataset="X", row_block=8):
     datasets and file attributes are copied verbatim; only ``x_dataset``
     changes layout (and gains the ``x_layout=rank_major`` attribute the
     solver's layout detection reads).
+
+    Writes go to ``<dst>.tmp`` and are atomically renamed into place, so a
+    killed or timed-out conversion never leaves a corrupt partial file at
+    the production path (JID 20771447 timed out at 82% and left exactly
+    that trap).
     """
 
-    with h5py.File(src, "r") as src_f, h5py.File(dst, "w") as dst_f:
+    tmp = f"{dst}.tmp"
+    with h5py.File(src, "r") as src_f, h5py.File(tmp, "w") as dst_f:
         for key, val in src_f.attrs.items():
             dst_f.attrs[key] = val
         for key in src_f:
@@ -80,6 +87,7 @@ def convert_store_to_rank_major(src, dst, *, x_dataset="X", row_block=8):
                 _convert_x_dataset(src_f, dst_f, x_dataset, row_block)
             else:
                 src_f.copy(key, dst_f)
+    os.replace(tmp, dst)
     return dst
 
 
