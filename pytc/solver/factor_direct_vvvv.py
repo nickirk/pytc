@@ -667,13 +667,63 @@ def _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size):
     Returns a fresh ``(nvir, nvir, panel_size)`` float64 host array, zero-
     padded on the rank axis when the tail panel is short so every panel
     shares one compiled shape.  Only the requested panel is materialized --
-    slicing an HDF5 dataset reads just that selection.
+    slicing an HDF5 dataset reads just that selection.  INNERMOST-layout
+    backings only; rank-major backings use :func:`_read_x_rank_panel_major`.
     """
     panel = np.asarray(x_backing[nocc:, nocc:, m0:m1], dtype=np.float64)
     short = panel_size - panel.shape[2]
     if short:
         panel = np.pad(panel, ((0, 0), (0, 0), (0, short)))
     return panel
+
+
+def _read_x_rank_panel_major(x_backing, nocc, m0, m1, panel_size):
+    """Rank-major twin of :func:`_read_x_rank_panel`, returning rank-leading
+    ``(panel_size, nvir, nvir)`` panels -- already the layout the panel
+    kernels consume, and one CONTIGUOUS disk read per panel instead of
+    ~nmo^2 strided chunks.  Zero-pads the rank tail on axis 0.
+    """
+    panel = np.ascontiguousarray(x_backing[m0:m1, nocc:, nocc:], dtype=np.float64)
+    short = panel_size - panel.shape[0]
+    if short:
+        panel = np.pad(panel, ((0, short), (0, 0), (0, 0)))
+    return panel
+
+
+def _x_backing_layout(x_backing, nocc, nvir, rank):
+    """Detect an X backing's axis layout: ``"innermost"`` or ``"rank_major"``.
+
+    ``"innermost"`` is the historical store layout ``(nmo, nmo, rank)``;
+    ``"rank_major"`` is ``(rank, nmo, nmo)``, where a rank panel is one
+    contiguous block instead of ~nmo^2 strided chunks (the tier-3 read
+    floor at 1200: ~103 MiB/s strided vs multi-GiB/s sequential).  An HDF5
+    backing may declare the layout explicitly via an ``x_layout`` attribute
+    (the converter writes it); otherwise the two are told apart by which
+    axis pair is square.  Shapes with nmo == rank are genuinely ambiguous
+    and fall back to ``"innermost"`` (the historical default) -- rank-major
+    stores with nmo == rank MUST carry the attribute.
+    """
+
+    attrs = getattr(x_backing, "attrs", None)
+    declared = attrs.get("x_layout") if attrs is not None else None
+    if declared is not None:
+        declared = declared.decode() if isinstance(declared, bytes) else str(declared)
+        if declared not in ("innermost", "rank_major"):
+            raise ValueError(f"unrecognized x_layout attribute: {declared!r}")
+        return declared
+    shape = tuple(getattr(x_backing, "shape", ()))
+    nmo = nvir + int(nocc)
+    if len(shape) != 3:
+        raise ValueError(
+            "x_backing must be a 3-D array or HDF5 dataset, either "
+            f"(nmo, nmo, rank) or (rank, nmo, nmo); got shape {shape}")
+    if shape == (nmo, nmo, rank):
+        return "innermost"
+    if shape == (rank, nmo, nmo):
+        return "rank_major"
+    raise ValueError(
+        f"x_backing must have shape ({nmo}, {nmo}, {rank}) or "
+        f"({rank}, {nmo}, {nmo}); got {shape}")
 
 
 def _validate_x_stream(t2, left_out, left_inner, x_backing, nocc):
@@ -684,15 +734,10 @@ def _validate_x_stream(t2, left_out, left_inner, x_backing, nocc):
     if left_out.shape[0] != nvir:
         raise ValueError(f"X factors have nvir={left_out.shape[0]}, expected {nvir}")
     rank = left_out.shape[1]
-    if getattr(x_backing, "ndim", None) != 3:
-        raise ValueError(
-            "x_backing must be a 3-D (nmo, nmo, rank) array or HDF5 dataset; "
-            f"got shape {getattr(x_backing, 'shape', None)}")
-    expected = (nvir + int(nocc), nvir + int(nocc), rank)
-    if tuple(x_backing.shape) != expected:
-        raise ValueError(f"x_backing must have shape {expected}; got {x_backing.shape}")
-    if not 0 < int(nocc) < x_backing.shape[0]:
+    layout = _x_backing_layout(x_backing, nocc, nvir, rank)
+    if int(nocc) < 1 or nvir < 1:
         raise ValueError(f"nocc must leave a nonempty virtual space; got {nocc}")
+    return layout
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
@@ -772,7 +817,7 @@ def _stream_partial_x(panel_kernel, t2, left_out, left_inner, x_backing, nocc,
     if occupied_pair_batch_size < 1 or rank_panel_size < 1:
         raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
     nocc = int(nocc)
-    _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
+    layout = _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
 
     nocc_i, nocc_j, nvir, _ = t2.shape
     rank = left_out.shape[1]
@@ -788,13 +833,20 @@ def _stream_partial_x(panel_kernel, t2, left_out, left_inner, x_backing, nocc,
     inner_padded = jnp.pad(jnp.asarray(left_inner), ((0, 0), (0, padded_rank - rank)))
     out_padded = jnp.pad(jnp.asarray(left_out), ((0, 0), (0, padded_rank - rank)))
 
+    if layout == "rank_major":
+        def read_panel(m0, m1):
+            return _read_x_rank_panel_major(x_backing, nocc, m0, m1, rank_panel_size)
+    else:
+        def read_panel(m0, m1):
+            return np.ascontiguousarray(
+                _read_x_rank_panel(x_backing, nocc, m0, m1, rank_panel_size)
+                .transpose(2, 0, 1))
+
     total = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2_pairs.dtype)
     for rank_block in range(n_rank_blocks):
         m0 = rank_block * rank_panel_size
         m1 = min(m0 + rank_panel_size, rank)
-        x_panel = jax.device_put(np.ascontiguousarray(
-            _read_x_rank_panel(x_backing, nocc, m0, m1, rank_panel_size)
-            .transpose(2, 0, 1)))
+        x_panel = jax.device_put(read_panel(m0, m1))
         inner_panel = inner_padded[:, m0:m0 + rank_panel_size]
         out_panel = out_padded[:, m0:m0 + rank_panel_size]
         total = total + panel_kernel(
@@ -1002,38 +1054,52 @@ def _pipelined_x_panel_size(nvir, rank, working_set_bytes, *,
     return (width // rank_panel_size) * rank_panel_size
 
 
-def _x_backing_panel_source(x_backing, nocc):
+def _x_backing_panel_source(x_backing, nocc, layout="innermost"):
     """Panel source that reads straight from the X backing (tier 3).
 
     Returns rank-leading ``(panel, nvir, nvir)`` panels -- the layout the
-    panel kernels consume.  The transpose + contiguous copy happens inside
-    the prefetch thread, overlapped with the current panel's kernel.
+    panel kernels consume.  Innermost-layout backings are transposed inside
+    the prefetch thread (the copy overlaps the current kernel); rank-major
+    backings already store panels in this exact shape, so a panel read is
+    one contiguous block with no transpose at all.
     """
 
-    def read_panel(m0, m1, panel_size):
-        return np.ascontiguousarray(
-            _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size)
-            .transpose(2, 0, 1))
+    if layout == "rank_major":
+        def read_panel(m0, m1, panel_size):
+            return _read_x_rank_panel_major(x_backing, nocc, m0, m1, panel_size)
+    else:
+        def read_panel(m0, m1, panel_size):
+            return np.ascontiguousarray(
+                _read_x_rank_panel(x_backing, nocc, m0, m1, panel_size)
+                .transpose(2, 0, 1))
 
     return read_panel
 
 
-def _x_host_panel_source(x_host):
-    """Panel source that slices a host-resident ``(nvir, nvir, rank)`` X (tier 2).
+def _x_host_panel_source(x_host, layout="innermost"):
+    """Panel source that slices a host-resident X (tier 2).
 
-    A rank-axis slice of the C-order host block is strided, so each panel is
-    transposed rank-leading ``(panel, nvir, nvir)`` and copied contiguous in
-    the prefetch thread; the rank tail is zero-padded exactly like
-    :func:`_read_x_rank_panel`.
+    ``x_host`` is ``(nvir, nvir, rank)`` for innermost layout or
+    ``(rank, nvir, nvir)`` for rank-major.  Either way each panel is copied
+    contiguous rank-leading ``(panel, nvir, nvir)`` in the prefetch thread;
+    the rank tail is zero-padded exactly like :func:`_read_x_rank_panel`.
     """
 
-    def read_panel(m0, m1, panel_size):
-        panel = np.ascontiguousarray(
-            x_host[:, :, m0:m1].transpose(2, 0, 1))
-        short = panel_size - panel.shape[0]
-        if short:
-            panel = np.pad(panel, ((0, short), (0, 0), (0, 0)))
-        return panel
+    if layout == "rank_major":
+        def read_panel(m0, m1, panel_size):
+            panel = np.ascontiguousarray(x_host[m0:m1])
+            short = panel_size - panel.shape[0]
+            if short:
+                panel = np.pad(panel, ((0, short), (0, 0), (0, 0)))
+            return panel
+    else:
+        def read_panel(m0, m1, panel_size):
+            panel = np.ascontiguousarray(
+                x_host[:, :, m0:m1].transpose(2, 0, 1))
+            short = panel_size - panel.shape[0]
+            if short:
+                panel = np.pad(panel, ((0, short), (0, 0), (0, 0)))
+            return panel
 
     return read_panel
 
@@ -1140,10 +1206,10 @@ def contract_partial_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, no
                                          panel_budget_bytes=None):
     """Pipelined ``P[a,m] P[c,m] X[b,d,m]``: working-set panels, prefetched."""
 
-    _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
+    layout = _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
     return _stream_partial_x_pipelined(
         _xstream_left_panel_jit, t2, left_out, left_inner,
-        _x_backing_panel_source(x_backing, nocc), nocc,
+        _x_backing_panel_source(x_backing, nocc, layout), nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_budget_bytes=panel_budget_bytes)
@@ -1155,10 +1221,10 @@ def contract_partial_x_right_t2_pipelined(t2, right_out, right_inner, x_backing,
                                           panel_budget_bytes=None):
     """Pipelined ``X[a,c,m] P[b,m] P[d,m]``: working-set panels, prefetched."""
 
-    _validate_x_stream(t2, right_out, right_inner, x_backing, nocc)
+    layout = _validate_x_stream(t2, right_out, right_inner, x_backing, nocc)
     return _stream_partial_x_pipelined(
         _xstream_right_panel_jit, t2, right_out, right_inner,
-        _x_backing_panel_source(x_backing, nocc), nocc,
+        _x_backing_panel_source(x_backing, nocc, layout), nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_budget_bytes=panel_budget_bytes)
@@ -1209,8 +1275,15 @@ def contract_isdf_factor_direct_terms_t2_auto(
     is recorded in the tile_timers counters so receipts show it.
     """
     nocc = int(nocc)
-    nvir = x_backing.shape[0] - nocc
-    rank = x_backing.shape[2]
+    nvir_guess = t2.shape[2]
+    rank_guess = p.shape[1]
+    layout = _x_backing_layout(x_backing, nocc, nvir_guess, rank_guess)
+    if layout == "rank_major":
+        rank = x_backing.shape[0]
+        nvir = x_backing.shape[1] - nocc
+    else:
+        nvir = x_backing.shape[0] - nocc
+        rank = x_backing.shape[2]
     x_bytes = nvir * nvir * rank * 8
 
     force = os.environ.get("PYTC_X_FORCE_TIER")
@@ -1236,24 +1309,33 @@ def contract_isdf_factor_direct_terms_t2_auto(
             nvir, rank, working_set, rank_panel_size=rank_panel_size)
     _logger.info(
         "X tier selection: tier=%d x_bytes=%d free_device_bytes=%s "
-        "free_host_bytes=%s panel_size=%s",
-        tier, x_bytes, free_device, free_host, panel_size)
+        "free_host_bytes=%s panel_size=%s layout=%s",
+        tier, x_bytes, free_device, free_host, panel_size, layout)
 
     if tier == 1:
         _tile_timers.incr("fd_x_tier1_full_lift")
-        x_full = np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64)
+        if layout == "rank_major":
+            x_full = np.ascontiguousarray(
+                np.asarray(x_backing[:, nocc:, nocc:], dtype=np.float64)
+                .transpose(1, 2, 0))
+        else:
+            x_full = np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64)
         return contract_isdf_factor_direct_terms_t2(
             t2, p, grad_p, u1, u3, d, x_full,
             occupied_pair_batch_size=occupied_pair_batch_size,
             rank_panel_size=rank_panel_size)
     if tier == 2:
         _tile_timers.incr("fd_x_tier2_host_resident")
-        x_host = np.ascontiguousarray(
-            np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64))
-        panel_source = _x_host_panel_source(x_host)
+        if layout == "rank_major":
+            x_host = np.ascontiguousarray(
+                np.asarray(x_backing[:, nocc:, nocc:], dtype=np.float64))
+        else:
+            x_host = np.ascontiguousarray(
+                np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64))
+        panel_source = _x_host_panel_source(x_host, layout)
     else:
         _tile_timers.incr("fd_x_tier3_stream")
-        panel_source = _x_backing_panel_source(x_backing, nocc)
+        panel_source = _x_backing_panel_source(x_backing, nocc, layout)
     return contract_isdf_factor_direct_terms_t2_xstream(
         t2, p, grad_p, u1, u3, d, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,

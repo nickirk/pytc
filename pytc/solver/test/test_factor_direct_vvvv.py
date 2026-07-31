@@ -590,6 +590,9 @@ class TestTieredXAuto(unittest.TestCase):
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=3)
+
+
+class TestMemoryMeasurement(unittest.TestCase):
     """The tier gate's memory measurements, including their fallback paths.
 
     Regression cover for the 1200 validation OOM: the gate measured node
@@ -740,3 +743,119 @@ class TestTieredXAuto(unittest.TestCase):
             self.assertIsNone(factor_direct._measure_free_device_bytes())
         finally:
             jax.local_devices = real_local_devices
+
+
+class TestRankMajorXLayout(unittest.TestCase):
+    """Rank-major X backings ``(rank, nmo, nmo)``: same math, contiguous panels.
+
+    The toy sizes use rank=8 with nmo=7 so the two layouts are
+    shape-distinguishable; the nmo == rank case must be rejected, not
+    guessed.
+    """
+
+    def setUp(self):
+        self.data = _random_inputs(rank=8)     # nocc=2, nvir=5, rank=8
+        self.nocc, self.nvir, self.rank = 2, 5, 8
+        nmo = self.nocc + self.nvir
+        backing = np.zeros((nmo, nmo, self.rank), dtype=np.float64)
+        backing[self.nocc:, self.nocc:, :] = np.asarray(self.data["x"])
+        self.backing = backing
+        self.backing_rm = np.ascontiguousarray(backing.transpose(2, 0, 1))
+        self._saved_env = {name: os.environ.get(name)
+                           for name in ("PYTC_X_FORCE_TIER", "PYTC_X_PANEL_BUDGET_GB")}
+
+    def tearDown(self):
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def test_layout_detection(self):
+        self.assertEqual(
+            factor_direct._x_backing_layout(self.backing, 2, 5, 8), "innermost")
+        self.assertEqual(
+            factor_direct._x_backing_layout(self.backing_rm, 2, 5, 8), "rank_major")
+        # nmo == rank is shape-ambiguous: falls back to the historical
+        # innermost default unless an x_layout attribute declares otherwise.
+        self.assertEqual(
+            factor_direct._x_backing_layout(np.zeros((7, 7, 7)), 2, 5, 7), "innermost")
+        with self.assertRaises(ValueError):
+            factor_direct._x_backing_layout(np.zeros((9, 7, 7)), 2, 5, 8)
+
+    def test_layout_attribute_wins_over_ambiguous_shape(self):
+        import h5py
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.h5")
+            with h5py.File(path, "w") as fh:
+                ds = fh.create_dataset("X", data=np.zeros((7, 7, 7)), dtype="f8")
+                ds.attrs["x_layout"] = "rank_major"
+            with h5py.File(path, "r") as fh:
+                self.assertEqual(
+                    factor_direct._x_backing_layout(fh["X"], 2, 5, 7), "rank_major")
+
+    def test_panel_reader_major_pads_and_bounds(self):
+        for m0, expected_width in ((0, 3), (3, 3), (6, 2)):
+            panel = factor_direct._read_x_rank_panel_major(
+                self.backing_rm, self.nocc, m0, min(m0 + 3, self.rank), 3)
+            self.assertEqual(panel.shape, (3, self.nvir, self.nvir))
+            np.testing.assert_array_equal(
+                panel[:expected_width],
+                self.backing_rm[m0:m0 + expected_width, self.nocc:, self.nocc:])
+            if expected_width < 3:
+                np.testing.assert_array_equal(
+                    panel[expected_width:],
+                    np.zeros((3 - expected_width, self.nvir, self.nvir)))
+
+    def test_streamed_rank_major_matches_innermost_bitwise(self):
+        # Same panel boundaries, same kernels, same panel content: the two
+        # layouts must agree bitwise, not just at reassociation level.
+        for panel in (2, 3, 7):
+            with self.subTest(rank_panel_size=panel):
+                left_im = factor_direct.contract_partial_x_left_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                left_rm = factor_direct.contract_partial_x_left_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing_rm, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                self.assertEqual(_relative_l2(left_rm, left_im), 0.0)
+                right_im = factor_direct.contract_partial_x_right_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                right_rm = factor_direct.contract_partial_x_right_t2_streamed(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.backing_rm, self.nocc,
+                    occupied_pair_batch_size=2, rank_panel_size=panel)
+                self.assertEqual(_relative_l2(right_rm, right_im), 0.0)
+
+    def _run_auto(self, backing, tier):
+        os.environ["PYTC_X_FORCE_TIER"] = str(tier)
+        os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(1200 / 1024 ** 3)
+        counters_before = dict(_tile_timers._STATE["counters"])
+        terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+            self.data["t2"], self.data["p"], self.data["grad_p"],
+            self.data["u1"], self.data["u3"], self.data["d"],
+            backing, self.nocc,
+            occupied_pair_batch_size=2, rank_panel_size=3)
+        counters_after = _tile_timers._STATE["counters"]
+        fired = {name: counters_after.get(name, 0) - counters_before.get(name, 0)
+                 for name in counters_after}
+        return terms, fired
+
+    def test_auto_tiers_rank_major_match_innermost(self):
+        reference = factor_direct.contract_isdf_factor_direct_terms_t2(
+            **self.data, occupied_pair_batch_size=2, rank_panel_size=3)
+        for tier, counter in ((1, "fd_x_tier1_full_lift"),
+                              (2, "fd_x_tier2_host_resident"),
+                              (3, "fd_x_tier3_stream")):
+            with self.subTest(tier=tier):
+                terms, fired = self._run_auto(self.backing_rm, tier)
+                self.assertEqual(fired.get(counter, 0), 1)
+                self.assertEqual(set(reference), set(terms))
+                for name, ref in reference.items():
+                    with self.subTest(term=name):
+                        self.assertLessEqual(_relative_l2(terms[name], ref), 1e-12)
