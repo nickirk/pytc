@@ -36,26 +36,51 @@ def convert_x_to_rank_major(src, dst, *, dataset="X", row_block=8):
     src_f = h5py.File(src, "r") if close_src else src
     dst_f = h5py.File(dst, "w") if close_dst else dst
     try:
-        x_in = src_f[dataset]
-        if x_in.ndim != 3 or x_in.shape[0] != x_in.shape[1]:
-            raise ValueError(
-                f"source dataset {dataset!r} must be (nmo, nmo, rank); "
-                f"got {x_in.shape}")
-        nmo, _, rank = x_in.shape
-        x_out = dst_f.create_dataset(dataset, shape=(rank, nmo, nmo),
-                                     dtype=np.float64)
-        x_out.attrs["x_layout"] = "rank_major"
-        for j0 in range(0, nmo, int(row_block)):
-            j1 = min(j0 + int(row_block), nmo)
-            slab = np.asarray(x_in[j0:j1, :, :], dtype=np.float64)
-            x_out[:, j0:j1, :] = np.ascontiguousarray(
-                slab.transpose(2, 0, 1))
+        _convert_x_dataset(src_f, dst_f, dataset, row_block)
         return dst
     finally:
         if close_src:
             src_f.close()
         if close_dst:
             dst_f.close()
+
+
+def _convert_x_dataset(src_f, dst_f, dataset, row_block):
+    x_in = src_f[dataset]
+    if x_in.ndim != 3 or x_in.shape[0] != x_in.shape[1]:
+        raise ValueError(
+            f"source dataset {dataset!r} must be (nmo, nmo, rank); "
+            f"got {x_in.shape}")
+    nmo, _, rank = x_in.shape
+    x_out = dst_f.create_dataset(dataset, shape=(rank, nmo, nmo),
+                                 dtype=np.float64)
+    x_out.attrs["x_layout"] = "rank_major"
+    for j0 in range(0, nmo, int(row_block)):
+        j1 = min(j0 + int(row_block), nmo)
+        slab = np.asarray(x_in[j0:j1, :, :], dtype=np.float64)
+        x_out[:, j0:j1, :] = np.ascontiguousarray(
+            slab.transpose(2, 0, 1))
+
+
+def convert_store_to_rank_major(src, dst, *, x_dataset="X", row_block=8):
+    """Whole-store conversion: every dataset copied, X converted rank-major.
+
+    The ISDF store carries more than X (K1/K3/D kernels, metadata); a
+    store the driver can actually load needs all of it.  Top-level
+    datasets and file attributes are copied verbatim; only ``x_dataset``
+    changes layout (and gains the ``x_layout=rank_major`` attribute the
+    solver's layout detection reads).
+    """
+
+    with h5py.File(src, "r") as src_f, h5py.File(dst, "w") as dst_f:
+        for key, val in src_f.attrs.items():
+            dst_f.attrs[key] = val
+        for key in src_f:
+            if key == x_dataset:
+                _convert_x_dataset(src_f, dst_f, x_dataset, row_block)
+            else:
+                src_f.copy(key, dst_f)
+    return dst
 
 
 def main(argv=None):
@@ -66,9 +91,16 @@ def main(argv=None):
                         help="dataset name in both files (default: X)")
     parser.add_argument("--row-block", type=int, default=8,
                         help="nmo rows converted per slab (default: 8)")
+    parser.add_argument("--whole-store", action="store_true",
+                        help="copy all datasets/attrs, converting only "
+                             "--dataset (a driver-loadable store)")
     args = parser.parse_args(argv)
-    convert_x_to_rank_major(args.src, args.dst, dataset=args.dataset,
-                            row_block=args.row_block)
+    if args.whole_store:
+        convert_store_to_rank_major(args.src, args.dst, x_dataset=args.dataset,
+                                    row_block=args.row_block)
+    else:
+        convert_x_to_rank_major(args.src, args.dst, dataset=args.dataset,
+                                row_block=args.row_block)
 
 
 if __name__ == "__main__":
