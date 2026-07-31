@@ -87,9 +87,14 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
                 t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
                 occupied_pair_batch_size=min(8, self.nocc * self.nocc),
                 rank_panel_size=rank_panel)
-            _tt.sync(terms["final"])
+            final = terms["final"]
+            # The remaining term tensors (~30 GB at the 1200 deck) are
+            # diagnostics; holding them through the sandwich OOM'd the exact
+            # panel (JID 20691188).  Only "final" is consumed below.
+            del terms
+            _tt.sync(final)
         with _tile_timers.term("fd_coulomb_sandwich") as _tt:
             coulomb = direct_df_sandwiches_panelled_jax(
                 b, fit, t2_jax, rank_panel=rank_panel, aux_panel=aux_panel)
             _tt.sync(coulomb.robust)
-        t2new_host += np.asarray(terms["final"] + coulomb.robust, dtype=np.float64)
+        t2new_host += np.asarray(final + coulomb.robust, dtype=np.float64)

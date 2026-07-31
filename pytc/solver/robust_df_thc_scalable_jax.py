@@ -75,18 +75,33 @@ def _as_fp64_host(name: str, value: object, ndim: int):
 # encode the (a,c,b,d) source ordering that the RCCSD pair swaps depend on, and
 # "simplifying" them is how a port silently breaks pair-swap symmetry.
 
-@jax.jit
-def _exact_panel(b_panel, t2):
+@partial(jax.jit, donate_argnums=(0,))
+def _exact_accumulate(out, b_panel, t2):
+    """out + one aux panel's exact sandwich, donating the accumulator.
+
+    The plain ``out = out + _exact_panel(...)`` keeps three
+    ``(nocc, nocc, nvir, nvir)`` buffers live per panel (out, panel result,
+    sum); with donation the accumulator's buffer is reused, which matters
+    at the 1200 deck where each is ~5 GiB (JID 20691188 OOM'd here).
+    """
     right = jnp.einsum("ijcd,bdq->ijcbq", t2, b_panel)
-    return jnp.einsum("acq,ijcbq->ijab", b_panel, right)
+    return out + jnp.einsum("acq,ijcbq->ijab", b_panel, right)
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _acc_into(acc, block):
+    """acc + block with the accumulator's buffer donated (see above)."""
+
+    return acc + block
 
 
 def exact_df_panelled(b, t2, aux_panel: int):
     """Exact current-DF sandwich, panelled over the auxiliary axis.
 
-    The ``(nocc^2, nvir, nvir, q)`` intermediate inside :func:`_exact_panel`
-    costs ``nocc^2 * nvir^2 * q * 8`` bytes -- ~4.9 GiB per aux column at the
-    1200 deck, so the caller's ``aux_panel=32`` would demand ~157 GiB.  The
+    The ``(nocc^2, nvir, nvir, q)`` intermediate inside
+    :func:`_exact_accumulate` costs ``nocc^2 * nvir^2 * q * 8`` bytes --
+    ~4.9 GiB per aux column at the 1200 deck, so the caller's
+    ``aux_panel=32`` would demand ~157 GiB.  The
     panel step is therefore clamped so the intermediate stays under
     ``PYTC_EXACT_PANEL_CAP_GB`` (default 8 GiB, read at call time); at q=1
     the GEMM shapes are unchanged (the batch is the occupied-pair axis, not
@@ -100,7 +115,7 @@ def exact_df_panelled(b, t2, aux_panel: int):
     out = jnp.zeros_like(t2)
     for q0 in range(0, b.shape[2], q_step):
         q1 = min(q0 + q_step, b.shape[2])
-        out = out + _exact_panel(b[:, :, q0:q1], t2)
+        out = _exact_accumulate(out, b[:, :, q0:q1], t2)
     return out
 
 
@@ -213,8 +228,8 @@ def partial_thc_crosses_panelled(b, p_virtual, y, t2, rank_panel: int,
             occupied_pair_batch_size=occupied_pair_batch_size)
         fit_left, df_left = _cross_panel(
             p_panel, endpoint_t, tau_left_t, tau_right_t)
-        fit_left_df_right = fit_left_df_right + fit_left
-        df_left_fit_right = df_left_fit_right + df_left
+        fit_left_df_right = _acc_into(fit_left_df_right, fit_left)
+        df_left_fit_right = _acc_into(df_left_fit_right, df_left)
     return (fit_left_df_right[:n_pairs].reshape(t2.shape),
             df_left_fit_right[:n_pairs].reshape(t2.shape))
 
@@ -253,7 +268,7 @@ def full_thc_panelled(p_virtual, y, t2, rank_panel: int, aux_panel: int):
             for q0 in range(0, y.shape[1], aux_panel):
                 q1 = min(q0 + aux_panel, y.shape[1])
                 rank_metric = rank_metric + y[m0:m1, q0:q1] @ y[n0:n1, q0:q1].T
-            out = out + _full_thc_block(p_m, p_n, tau_m_t, rank_metric)
+            out = _acc_into(out, _full_thc_block(p_m, p_n, tau_m_t, rank_metric))
     return out[:n_pairs].reshape(t2.shape)
 
 
