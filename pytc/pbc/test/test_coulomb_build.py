@@ -526,6 +526,44 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
                         np.asarray(explicit["kern_kpt"]),
                         np.asarray(mirrored["kern_kpt"]), rtol=0, atol=1e-13)
 
+    def test_panel_blocked_uses_a_providers_fused_right_factor(self):
+        # Proves the fused hook is actually TAKEN, not merely present: legacy
+        # apply() raises, so any result at all means the panel loop went through
+        # apply_right_factor. Without this, a provider could ship a fused method
+        # that is silently never called and nothing would notice.
+        #
+        # The fused method here computes the reference formula, so the kern must
+        # match the fallback path exactly -- this isolates "is the hook wired"
+        # from "is the fused arithmetic right", which is a separate gate.
+        self.assertTrue(jax.config.jax_enable_x64)
+
+        class _FusedOnly(coulomb.RawKernelProvider):
+            def apply(self, q, lq):                      # noqa: D102
+                raise AssertionError(
+                    "legacy apply() must not be called when the provider "
+                    "implements apply_right_factor")
+
+            def apply_right_factor(self, q, eta_q, gphase):
+                lq = eta_q * gphase[None, :]
+                rq = np.conj(np.asarray(
+                    coulomb.RawKernelProvider.apply(self, q, lq)))
+                rq *= gphase[None, :]
+                return rq
+
+        cell = _make_cell()
+        for kmesh in ([1, 1, 1], [1, 1, 2]):
+            kpts = cell.make_kpts(kmesh, wrap_around=False)
+            for panel in (1, 2, 3):
+                with self.subTest(kmesh=tuple(kmesh), p_block_rows=panel):
+                    common = dict(rank=4, block_size=9, rtol=1e-8,
+                                  p_block_rows=panel)
+                    fallback = coulomb.build(cell, kpts, **common)
+                    fused = coulomb.build(cell, kpts, provider_cls=_FusedOnly,
+                                          **common)
+                    np.testing.assert_allclose(
+                        np.asarray(fused["kern_kpt"]),
+                        np.asarray(fallback["kern_kpt"]), rtol=0, atol=1e-13)
+
     def test_panel_blocked_agrees_across_panel_sizes(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)

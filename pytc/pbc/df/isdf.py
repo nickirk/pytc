@@ -1856,6 +1856,33 @@ def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
     return eta
 
 
+def _right_factor(provider, q, eta_q, gphase):
+    """The right factor of one panel pair: conj(apply(q, eta*g)) * g.
+
+    ONE semantic operation, so the phase/conjugation convention lives in a single
+    place rather than being duplicated across the mirror branches -- a convention
+    error here would otherwise have to be made identically twice to be caught.
+
+    The trailing phase is what lets the caller pass ``eta`` itself as the LEFT
+    operand: gphase multiplies along the grid axis that both factors share, so
+        (eta_i*g) @ conj(apply(eta_j*g)).T  ==  eta_i @ (conj(apply(eta_j*g))*g).T
+    exactly. No ``lq_i``-shaped array is built anywhere in the common path.
+
+    A provider may implement ``apply_right_factor(q, eta, phase)`` to fuse the
+    whole sequence device-side; this is the generic fallback that composes it
+    from ``apply``. The two are gated against each other rather than assumed
+    equivalent: fusion is free to reassociate, so they are held to a numerical
+    bound, not to bitwise identity.
+    """
+    fused = getattr(provider, "apply_right_factor", None)
+    if fused is not None:
+        return np.asarray(fused(q, eta_q, gphase))
+    lq = eta_q * gphase[None, :]
+    rq = np.conj(np.asarray(provider.apply(q, lq)))
+    rq *= gphase[None, :]
+    return rq
+
+
 def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
                             panel_rows, imag_tol=1e-10,
@@ -1991,24 +2018,19 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
                 eta_jq = eta_iq if j == i else np.asarray(
                     eta_j[q], dtype=np.complex128)
-                lq_j = eta_jq * gphase[None, :]
-                rq_j = np.conj(np.asarray(provider.apply(q, lq_j)))
-                rq_j *= gphase[None, :]          # fold the i-side phase
+                rq_j = _right_factor(provider, q, eta_jq, gphase)
                 block = (eta_iq @ rq_j.T) / np.sqrt(n_grid_total)
                 kern[q, i0:i1, j0:j1] = block
                 if j != i and not mirror:
                     # No self-adjointness guarantee: compute the transposed panel
                     # instead of mirroring it. Correct for any provider, at twice
-                    # the off-diagonal work. lq_i is built ONLY here, because
-                    # provider.apply genuinely needs it materialised.
-                    lq_i = eta_iq * gphase[None, :]
-                    rq_i = np.conj(np.asarray(provider.apply(q, lq_i)))
-                    rq_i *= gphase[None, :]
+                    # the off-diagonal work.
+                    rq_i = _right_factor(provider, q, eta_iq, gphase)
                     kern[q, j0:j1, i0:i1] = (eta_jq @ rq_i.T) / np.sqrt(n_grid_total)
-                    del lq_i, rq_i
+                    del rq_i
                 elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
-                del lq_j, rq_j
+                del rq_j
             del eta_j
             # Counted HERE: the pair's kernel work is finished, so elapsed contains
             # it. Advancing at the eta build instead is what made the previous
