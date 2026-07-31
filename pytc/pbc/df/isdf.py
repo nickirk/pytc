@@ -1976,20 +1976,39 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
             for q in range(n_kpts):
                 # Same per-q grid phase the dense path applies before the
                 # Coulomb kernel; omitting it silently yields the wrong kern.
+                #
+                # The i-side phase is folded into the RIGHT factor rather than
+                # materialised on the left. gphase multiplies along the GRID
+                # axis, which both sides share, so
+                #     (eta_i*g) @ conj(apply(eta_j*g)).T
+                #   = eta_i @ (conj(apply(eta_j*g)) * g).T
+                # exactly. The left operand is then eta_i itself and no `lq_i`
+                # array exists: it was previously rebuilt once per (i,j,q) while
+                # depending only on (i,q) -- 94% redundant at 444 (32 needed,
+                # 528 built), at 8.2 GB each. The fold costs one in-place
+                # multiply on an array already allocated for this pair.
                 gphase = gphases[q]
-                lq_i = np.asarray(eta_i[q], dtype=np.complex128) * gphase[None, :]
-                lq_j = np.asarray(eta_j[q], dtype=np.complex128) * gphase[None, :]
+                eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
+                eta_jq = eta_iq if j == i else np.asarray(
+                    eta_j[q], dtype=np.complex128)
+                lq_j = eta_jq * gphase[None, :]
                 rq_j = np.conj(np.asarray(provider.apply(q, lq_j)))
-                block = (lq_i @ rq_j.T) / np.sqrt(n_grid_total)
+                rq_j *= gphase[None, :]          # fold the i-side phase
+                block = (eta_iq @ rq_j.T) / np.sqrt(n_grid_total)
                 kern[q, i0:i1, j0:j1] = block
                 if j != i and not mirror:
                     # No self-adjointness guarantee: compute the transposed panel
                     # instead of mirroring it. Correct for any provider, at twice
-                    # the off-diagonal work.
+                    # the off-diagonal work. lq_i is built ONLY here, because
+                    # provider.apply genuinely needs it materialised.
+                    lq_i = eta_iq * gphase[None, :]
                     rq_i = np.conj(np.asarray(provider.apply(q, lq_i)))
-                    kern[q, j0:j1, i0:i1] = (lq_j @ rq_i.T) / np.sqrt(n_grid_total)
+                    rq_i *= gphase[None, :]
+                    kern[q, j0:j1, i0:i1] = (eta_jq @ rq_i.T) / np.sqrt(n_grid_total)
+                    del lq_i, rq_i
                 elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
+                del lq_j, rq_j
             del eta_j
             # Counted HERE: the pair's kernel work is finished, so elapsed contains
             # it. Advancing at the eta build instead is what made the previous

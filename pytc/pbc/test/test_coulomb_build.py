@@ -497,6 +497,35 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
         with self.assertRaises(ValueError):
             coulomb.build(cell, kpts, stage_eta_root="/tmp", **common)
 
+    def test_panel_blocked_non_mirror_branch_agrees_with_the_mirror(self):
+        # The `not mirror` branch had NO coverage: is_self_adjoint_per_q is True
+        # on the only provider, so nothing exercised the path that computes the
+        # transposed panel explicitly instead of mirroring it. Task #81 changed
+        # that branch (lq_i is now built lazily, only where apply() needs it
+        # materialised), so it needs a test rather than an argument.
+        #
+        # The provider below IS self-adjoint but does not declare it, so both
+        # paths must produce the same kern: computing the transpose explicitly
+        # and mirroring it are then two routes to one answer.
+        self.assertTrue(jax.config.jax_enable_x64)
+
+        class _UndeclaredSelfAdjoint(coulomb.RawKernelProvider):
+            is_self_adjoint_per_q = False
+
+        cell = _make_cell()
+        for kmesh in ([1, 1, 1], [1, 1, 2]):
+            kpts = cell.make_kpts(kmesh, wrap_around=False)
+            for panel in (1, 2, 3):        # 3 leaves a ragged final panel
+                with self.subTest(kmesh=tuple(kmesh), p_block_rows=panel):
+                    common = dict(rank=4, block_size=9, rtol=1e-8,
+                                  p_block_rows=panel)
+                    mirrored = coulomb.build(cell, kpts, **common)
+                    explicit = coulomb.build(
+                        cell, kpts, provider_cls=_UndeclaredSelfAdjoint, **common)
+                    np.testing.assert_allclose(
+                        np.asarray(explicit["kern_kpt"]),
+                        np.asarray(mirrored["kern_kpt"]), rtol=0, atol=1e-13)
+
     def test_panel_blocked_agrees_across_panel_sizes(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
