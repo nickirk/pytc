@@ -7,6 +7,7 @@ are deliberately preserved so this module changes backend only.
 from __future__ import annotations
 
 import os
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -105,18 +106,73 @@ def exact_df_panelled(b, t2, aux_panel: int):
 
 @jax.jit
 def _endpoint_panel(b_q, y_mq):
-    return jnp.einsum("bdq,mq->bdm", b_q, y_mq)
+    # (m, b, d): rank-leading so the cross kernels get batch-leading GEMMs.
+    return jnp.einsum("mq,bdq->mbd", y_mq, b_q)
+
+
+@partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
+def _t2_left_contract_pairs_jit(t2_pairs, factor_panel, *,
+                                occupied_pair_batch_size):
+    """tau_t[m, n, d] = sum_c t2_pairs[n, c, d] F[c, m], pair-blocked.
+
+    The whole-t2 ``ijcd,cm->ijmd`` einsum contracts the MIDDLE axis of the
+    (i,j,c,d) block, which makes XLA materialize a physical
+    (nvir, nocc^2, nvir) transpose of the full t2 -- its autotune buffers
+    fail at 1200-orbital shapes (JID 20664283, NOT_FOUND in _cross_panel).
+    Blocking the pair axis like the K/D-term kernels keeps every temporary
+    at one pair block, and producing the rank axis leading makes every
+    downstream GEMM batch-leading (cuBLAS-native, no transposes at all in
+    the lowered HLO).  ``t2_pairs`` is the pair-flattened, pair-padded t2.
+    """
+
+    n_padded_pairs, nvir, _ = t2_pairs.shape
+    n_rank = factor_panel.shape[1]
+    n_pair_blocks = n_padded_pairs // occupied_pair_batch_size
+
+    def pair_body(pair_block, acc):
+        pair0 = pair_block * occupied_pair_batch_size
+        tau = jax.lax.dynamic_slice(
+            t2_pairs, (pair0, 0, 0),
+            (occupied_pair_batch_size, nvir, nvir))
+        block = jnp.einsum("cm,ncd->mnd", factor_panel, tau)
+        return jax.lax.dynamic_update_slice(acc, block, (0, pair0, 0))
+
+    return jax.lax.fori_loop(
+        0, n_pair_blocks, pair_body,
+        jnp.zeros((n_rank, n_padded_pairs, nvir), dtype=t2_pairs.dtype))
+
+
+@partial(jax.jit, static_argnames=("occupied_pair_batch_size",))
+def _t2_right_contract_pairs_jit(t2_pairs, factor_panel, *,
+                                 occupied_pair_batch_size):
+    """tau_t[m, n, c] = sum_d t2_pairs[n, c, d] F[d, m]; see the left twin."""
+
+    n_padded_pairs, nvir, _ = t2_pairs.shape
+    n_rank = factor_panel.shape[1]
+    n_pair_blocks = n_padded_pairs // occupied_pair_batch_size
+
+    def pair_body(pair_block, acc):
+        pair0 = pair_block * occupied_pair_batch_size
+        tau = jax.lax.dynamic_slice(
+            t2_pairs, (pair0, 0, 0),
+            (occupied_pair_batch_size, nvir, nvir))
+        block = jnp.einsum("dm,ncd->mnc", factor_panel, tau)
+        return jax.lax.dynamic_update_slice(acc, block, (0, pair0, 0))
+
+    return jax.lax.fori_loop(
+        0, n_pair_blocks, pair_body,
+        jnp.zeros((n_rank, n_padded_pairs, nvir), dtype=t2_pairs.dtype))
 
 
 @jax.jit
-def _cross_panel(p_panel, endpoint, t2):
-    tau_left = jnp.einsum("ijcd,cm->ijmd", t2, p_panel)
-    right = jnp.einsum("ijmd,bdm->ijmb", tau_left, endpoint)
-    fit_left = jnp.einsum("am,ijmb->ijab", p_panel, right)
-
-    tau_right = jnp.einsum("ijcd,dm->ijcm", t2, p_panel)
-    left = jnp.einsum("acm,ijcm->ijam", endpoint, tau_right)
-    df_left = jnp.einsum("bm,ijam->ijab", p_panel, left)
+def _cross_panel(p_panel, endpoint_t, tau_left_t, tau_right_t):
+    # All rank axes (m) leading: every dot is batch-leading both sides.
+    # tau_left_t[m,i j,d] / endpoint_t[m,b,d] -> right_t[m,ij,b]
+    right_t = jnp.einsum("mnd,mbd->mnb", tau_left_t, endpoint_t)
+    fit_left = jnp.einsum("am,mnb->nab", p_panel, right_t)
+    # endpoint_t[m,a,c] / tau_right_t[m,ij,c] -> left_t[m,ij,a]
+    left_t = jnp.einsum("mac,mnc->mna", endpoint_t, tau_right_t)
+    df_left = jnp.einsum("bm,mna->nab", p_panel, left_t)
     return fit_left, df_left
 
 
@@ -124,41 +180,72 @@ def partial_thc_crosses_panelled(b, p_virtual, y, t2, rank_panel: int,
                                  aux_panel: int):
     """Both partial-THC crosses with a precontracted DF endpoint.
 
-    The endpoint D[b,d,m] is accumulated over aux panels BEFORE the occupied-pair
-    contractions, so no (ij,m,b,Qp) intermediate is ever retained -- that property
-    is the point of the panelled formulation and is preserved here.
+    The endpoint D[m,b,d] is accumulated over aux panels BEFORE the
+    occupied-pair contractions, so no (ij,m,b,Qp) intermediate is ever
+    retained -- that property is the point of the panelled formulation and
+    is preserved here.  t2 enters only through pair-blocked slices (see
+    :func:`_t2_left_contract_pairs_jit` for why).
     """
-    fit_left_df_right = jnp.zeros_like(t2)
-    df_left_fit_right = jnp.zeros_like(t2)
+    nocc_i, nocc_j, nvir, _ = t2.shape
+    n_pairs = nocc_i * nocc_j
+    occupied_pair_batch_size = 8
+    n_pair_blocks = (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size
+    padded_pairs = n_pair_blocks * occupied_pair_batch_size
+    t2_pairs = jnp.pad(
+        jnp.asarray(t2).reshape(n_pairs, nvir, nvir),
+        ((0, padded_pairs - n_pairs), (0, 0), (0, 0)))
+    fit_left_df_right = jnp.zeros((padded_pairs, nvir, nvir), dtype=jnp.float64)
+    df_left_fit_right = jnp.zeros((padded_pairs, nvir, nvir), dtype=jnp.float64)
     for m0 in range(0, p_virtual.shape[1], rank_panel):
         m1 = min(m0 + rank_panel, p_virtual.shape[1])
         p_panel = p_virtual[:, m0:m1]
-        endpoint = jnp.zeros((b.shape[0], b.shape[1], m1 - m0), dtype=jnp.float64)
+        endpoint_t = jnp.zeros((m1 - m0, b.shape[0], b.shape[1]),
+                               dtype=jnp.float64)
         for q0 in range(0, b.shape[2], aux_panel):
             q1 = min(q0 + aux_panel, b.shape[2])
-            endpoint = endpoint + _endpoint_panel(b[:, :, q0:q1], y[m0:m1, q0:q1])
-        fit_left, df_left = _cross_panel(p_panel, endpoint, t2)
+            endpoint_t = endpoint_t + _endpoint_panel(
+                b[:, :, q0:q1], y[m0:m1, q0:q1])
+        tau_left_t = _t2_left_contract_pairs_jit(
+            t2_pairs, p_panel,
+            occupied_pair_batch_size=occupied_pair_batch_size)
+        tau_right_t = _t2_right_contract_pairs_jit(
+            t2_pairs, p_panel,
+            occupied_pair_batch_size=occupied_pair_batch_size)
+        fit_left, df_left = _cross_panel(
+            p_panel, endpoint_t, tau_left_t, tau_right_t)
         fit_left_df_right = fit_left_df_right + fit_left
         df_left_fit_right = df_left_fit_right + df_left
-    return fit_left_df_right, df_left_fit_right
+    return (fit_left_df_right[:n_pairs].reshape(t2.shape),
+            df_left_fit_right[:n_pairs].reshape(t2.shape))
 
 
 @jax.jit
-def _full_thc_block(p_m, p_n, tau_m, rank_metric):
-    tau_mn = jnp.einsum("ijmd,dn->ijmn", tau_m, p_n)
-    weighted = tau_mn * rank_metric[None, None]
-    right = jnp.einsum("ijmn,bn->ijmb", weighted, p_n)
-    return jnp.einsum("am,ijmb->ijab", p_m, right)
+def _full_thc_block(p_m, p_n, tau_m_t, rank_metric):
+    # tau_m_t[m, ij, d]; rank axis leading throughout (see the crosses).
+    tau_mn = jnp.einsum("mjd,dn->mjn", tau_m_t, p_n)
+    weighted = tau_mn * rank_metric[:, None, :]
+    right_t = jnp.einsum("mjn,bn->mjb", weighted, p_n)
+    return jnp.einsum("am,mjb->jab", p_m, right_t)
 
 
 def full_thc_panelled(p_virtual, y, t2, rank_panel: int, aux_panel: int):
     """B_tilde[a,c,Q] B_tilde[b,d,Q] t2[ij,c,d] without ever forming B_tilde."""
-    out = jnp.zeros_like(t2)
+    nocc_i, nocc_j, nvir, _ = t2.shape
+    n_pairs = nocc_i * nocc_j
+    occupied_pair_batch_size = 8
+    n_pair_blocks = (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size
+    padded_pairs = n_pair_blocks * occupied_pair_batch_size
+    t2_pairs = jnp.pad(
+        jnp.asarray(t2).reshape(n_pairs, nvir, nvir),
+        ((0, padded_pairs - n_pairs), (0, 0), (0, 0)))
+    out = jnp.zeros((padded_pairs, nvir, nvir), dtype=jnp.float64)
     n_rank = p_virtual.shape[1]
     for m0 in range(0, n_rank, rank_panel):
         m1 = min(m0 + rank_panel, n_rank)
         p_m = p_virtual[:, m0:m1]
-        tau_m = jnp.einsum("ijcd,cm->ijmd", t2, p_m)
+        tau_m_t = _t2_left_contract_pairs_jit(
+            t2_pairs, p_m,
+            occupied_pair_batch_size=occupied_pair_batch_size)
         for n0 in range(0, n_rank, rank_panel):
             n1 = min(n0 + rank_panel, n_rank)
             p_n = p_virtual[:, n0:n1]
@@ -166,8 +253,8 @@ def full_thc_panelled(p_virtual, y, t2, rank_panel: int, aux_panel: int):
             for q0 in range(0, y.shape[1], aux_panel):
                 q1 = min(q0 + aux_panel, y.shape[1])
                 rank_metric = rank_metric + y[m0:m1, q0:q1] @ y[n0:n1, q0:q1].T
-            out = out + _full_thc_block(p_m, p_n, tau_m, rank_metric)
-    return out
+            out = out + _full_thc_block(p_m, p_n, tau_m_t, rank_metric)
+    return out[:n_pairs].reshape(t2.shape)
 
 
 # ------------------------------------------------------------ entry point ---
