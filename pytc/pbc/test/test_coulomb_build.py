@@ -2,6 +2,9 @@
 tiny real cell vs a from-scratch stage-by-stage reconstruction.
 get_k/get_j structural tests live in test_coulomb_get_k_get_j.py."""
 
+import dataclasses
+import itertools
+import json
 import os
 import unittest
 from unittest import mock
@@ -52,6 +55,176 @@ class _MissingNormalizationProvider(RawKernelProvider):
         return provenance
 
 
+class _UnserializableProvider(RawKernelProvider):
+    def provenance(self):
+        return {**super().provenance(), "opaque": object()}
+
+
+class TestBuildPlan(unittest.TestCase):
+    @staticmethod
+    def _resolve(**overrides):
+        options = dict(
+            n_grid=10,
+            n_kpts=2,
+            n_ao=3,
+            rank=3,
+            block_size=9,
+            provider_cls=RawKernelProvider,
+            provider_details={
+                "normalization": "unit_test",
+                "grid_mesh": np.asarray([1, 2, 3], dtype=np.int64),
+            },
+            selection_mode="streamed",
+        )
+        options.update(overrides)
+        return coulomb.resolve_build_plan(**options)
+
+    def test_route_matrix_accepts_exactly_the_static_legal_combinations(self):
+        """Exhaust the independent route switches without doing AO work."""
+        custom_provider = type("_CustomProvider", (RawKernelProvider,), {})
+        values = itertools.product(
+            ("device", "host"),
+            (False, True),  # panel blocking
+            (False, True),  # eta staging
+            (False, True),  # kernel blocking
+            ("single", "cholesky_jitter"),
+            (False, True),  # jitter_rcond
+            (False, True),  # custom provider
+            (False, True),  # rtol
+            (False, True),  # retained-rank pin
+        )
+        checked = 0
+        for (backend, panel, staged, kern_blocked, retention, jitter,
+             custom, with_rtol, pin) in values:
+            with self.subTest(
+                backend=backend, panel=panel, staged=staged,
+                kern_blocked=kern_blocked, retention=retention,
+                jitter=jitter, custom=custom, rtol=with_rtol, pin=pin,
+            ):
+                legal = not (panel and kern_blocked)
+                legal &= not (panel and staged)
+                legal &= not (backend == "host" and (panel or kern_blocked))
+                legal &= not (backend == "host" and custom)
+                legal &= not (backend == "device" and jitter)
+                if retention == "cholesky_jitter":
+                    legal &= backend == "host" and not with_rtol and not pin
+                else:
+                    legal &= not jitter
+
+                kwargs = dict(
+                    solve_backend=backend,
+                    p_block_rows=2 if panel else None,
+                    stage_eta_root="stage" if staged else None,
+                    kern_blocking={"row_block": 2} if kern_blocked else None,
+                    retention_mode=retention,
+                    jitter_rcond=1e-12 if jitter else None,
+                    provider_cls=custom_provider if custom else RawKernelProvider,
+                    rtol=1e-6 if with_rtol else None,
+                    n_retained_pin=2 if pin else None,
+                )
+                if not legal:
+                    with self.assertRaises(ValueError):
+                        self._resolve(**kwargs)
+                    checked += 1
+                    continue
+
+                plan = self._resolve(**kwargs)
+                resolved = plan.to_dict()["resolved"]
+                self.assertEqual(resolved["solve_backend"], backend)
+                self.assertEqual(resolved["retention_mode"], retention)
+                self.assertEqual(
+                    resolved["eta_strategy"],
+                    "panel_blocked" if panel else (
+                        "staged" if staged else "resident_streamed"
+                    ),
+                )
+                self.assertEqual(
+                    resolved["kernel_strategy"],
+                    "panel_precomputed" if panel else (
+                        "grid_blocked" if kern_blocked else "dense"
+                    ),
+                )
+                # The numpy array in provider provenance must be normalized at
+                # the plan boundary, before an expensive build can complete.
+                json.dumps(plan.to_dict())
+                checked += 1
+        self.assertEqual(checked, 512)
+
+    def test_selection_matrix_resolves_or_rejects_every_public_mode(self):
+        predicted = coulomb.predicted_cached_ao_bytes(10, 2, 3)
+        modes = (
+            None,
+            "bpc_auto",
+            "bpc_cached_gemm",
+            "bpc_streamed",
+            "streamed",
+            "fixed_pivots",
+            next(iter(coulomb.RETIRED_SELECTION_MODES)),
+            "not_a_mode",
+        )
+        for mode, fixed, over_ceiling in itertools.product(
+            modes, (False, True), (False, True)
+        ):
+            with self.subTest(mode=mode, fixed=fixed, over=over_ceiling):
+                ceiling = predicted - 1 if over_ceiling else predicted
+                legal = mode not in coulomb.RETIRED_SELECTION_MODES
+                legal &= mode in coulomb.SELECTOR_STORAGE or mode is None
+                legal &= not (mode == "fixed_pivots" and not fixed)
+                legal &= not (
+                    fixed and mode not in (None, "streamed", "fixed_pivots")
+                )
+                effective = "fixed_pivots" if fixed else (
+                    coulomb.DEFAULT_SELECTION_MODE if mode is None else mode
+                )
+                legal &= not (
+                    effective == "bpc_cached_gemm" and over_ceiling
+                )
+                kwargs = dict(
+                    selection_mode=mode,
+                    fixed_pivots=np.asarray([0, 1, 2]) if fixed else None,
+                    cached_ao_max_bytes=ceiling,
+                )
+                if not legal:
+                    with self.assertRaises(ValueError):
+                        self._resolve(**kwargs)
+                    continue
+
+                plan = self._resolve(**kwargs)
+                record = plan.to_dict()
+                self.assertEqual(record["requested"]["selection_mode"], mode)
+                if fixed:
+                    expected_mode, expected_storage = "fixed_pivots", None
+                elif effective == "bpc_auto":
+                    expected_mode = (
+                        "bpc_streamed" if over_ceiling else "bpc_cached_gemm"
+                    )
+                    expected_storage = "streamed" if over_ceiling else "cached"
+                else:
+                    expected_mode = effective
+                    expected_storage = coulomb.SELECTOR_STORAGE[effective][1]
+                self.assertEqual(
+                    record["resolved"]["selection_mode"], expected_mode
+                )
+                self.assertEqual(record["resolved"]["storage"], expected_storage)
+
+    def test_plan_is_deeply_immutable_and_returns_fresh_json_values(self):
+        details = {"normalization": "unit_test", "nested": {"mesh": [1, 2, 3]}}
+        plan = self._resolve(provider_details=details)
+        details["nested"]["mesh"][0] = 999
+        self.assertEqual(
+            plan.to_dict()["resolved"]["provider"]["details"]["nested"]["mesh"],
+            [1, 2, 3],
+        )
+        first = plan.to_dict()
+        first["resolved"]["provider"]["details"]["nested"]["mesh"][0] = 888
+        self.assertEqual(
+            plan.to_dict()["resolved"]["provider"]["details"]["nested"]["mesh"],
+            [1, 2, 3],
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            plan._resolved_json = "{}"
+
+
 class TestBuild(unittest.TestCase):
     def test_build_records_exact_provider_and_normalization_provenance(self):
         cell = _make_cell()
@@ -86,6 +259,26 @@ class TestBuild(unittest.TestCase):
             host_provider["details"]["normalization"],
             "vol_over_ng_inside_provider",
         )
+        # The complete requested/resolved plan must survive direct artifact
+        # persistence, including the provider's normalized grid_mesh value.
+        self.assertEqual(
+            json.loads(json.dumps(device["build_plan"])), device["build_plan"]
+        )
+        self.assertEqual(
+            device["build_plan"]["resolved"]["provider"], device_provider
+        )
+        self.assertEqual(
+            device["build_plan"]["requested"]["selection_mode"], None
+        )
+        self.assertEqual(device["build_plan"]["requested"]["rank"], 3)
+        self.assertEqual(device["build_plan"]["requested"]["block_size"], 9)
+        self.assertEqual(
+            device["build_plan"]["resolved"]["bpc_policy"]["n_topup"], 3
+        )
+        self.assertIn(
+            device["build_plan"]["resolved"]["selection_mode"],
+            ("bpc_cached_gemm", "bpc_streamed"),
+        )
 
     def test_missing_provider_normalization_is_rejected_before_ao_work(self):
         cell = _make_cell()
@@ -97,6 +290,18 @@ class TestBuild(unittest.TestCase):
                 coulomb.build(
                     cell, kpts, rank=3, block_size=9,
                     provider_cls=_MissingNormalizationProvider,
+                )
+
+    def test_unserializable_plan_value_is_rejected_before_ao_work(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 1], wrap_around=False)
+        with mock.patch.object(
+            cell, "pbc_eval_gto", side_effect=AssertionError("AO work must not start")
+        ):
+            with self.assertRaisesRegex(TypeError, "non-JSON value"):
+                coulomb.build(
+                    cell, kpts, rank=3, block_size=9,
+                    provider_cls=_UnserializableProvider,
                 )
 
     def test_on_selection_fires_once_before_the_build_and_enables_resume(self):

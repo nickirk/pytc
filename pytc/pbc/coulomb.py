@@ -6,9 +6,12 @@ See design doc §2, §4, §7-§8.
 
 from __future__ import annotations
 
+import dataclasses
 import gc
+import json
 import logging
 import os
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -57,6 +60,56 @@ CACHED_AO_MAX_BYTES = 16 * 2**30
 def predicted_cached_ao_bytes(n_grid, n_kpts, n_ao):
     """Bytes the cached AO feature matrix would allocate, before allocating it."""
     return int(n_grid) * int(n_kpts) * int(n_ao) * 16
+
+
+def _jsonable(value, *, path="value"):
+    """Return a JSON-native copy or refuse an unrecordable plan value."""
+    if value is None or isinstance(value, (bool, str, int, float)):
+        return value
+    if isinstance(value, np.generic):
+        return _jsonable(value.item(), path=path)
+    if isinstance(value, np.ndarray):
+        return _jsonable(value.tolist(), path=path)
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if isinstance(value, Mapping):
+        out = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"{path} contains non-string JSON object key {key!r}."
+                )
+            out[key] = _jsonable(item, path=f"{path}.{key}")
+        return out
+    if isinstance(value, (list, tuple)):
+        return [
+            _jsonable(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"{path} contains non-JSON value of type {type(value).__name__}."
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class PeriodicBuildPlan:
+    """Immutable, JSON-serializable resolution of one periodic build request.
+
+    Requested and resolved trees are captured as canonical JSON text so freezing
+    the dataclass also freezes every nested option and provider detail.
+    ``to_dict`` returns fresh containers suitable for artifact persistence.
+    """
+
+    schema_version: int
+    _requested_json: str
+    _resolved_json: str
+
+    def to_dict(self):
+        return {
+            "schema_version": self.schema_version,
+            "requested": json.loads(self._requested_json),
+            "resolved": json.loads(self._resolved_json),
+        }
 # Frozen BPC policy accepted by the campaign; the only validated tuning.
 FROZEN_BPC_POLICY = {
     "bpc_batch_size": 64,
@@ -171,6 +224,279 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
         )
 
 
+def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
+                       provider_cls, provider_details, selection_mode=None,
+                       fixed_pivots=None,
+                       bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
+                       bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
+                       bpc_candidate_oversampling=
+                       FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
+                       bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"],
+                       cached_ao_max_bytes=None,
+                       reuse_ao_cache_for_eta=True, stage_eta_root=None,
+                       stage_eta_block=4096, kern_blocking=None,
+                       convolve_device=False,
+                       p_block_rows=None, solve_backend="device",
+                       retention_mode="single", rtol=None,
+                       n_retained_pin=None, jitter_rcond=None,
+                       target_truncation_residual=None):
+    """Resolve and validate every static execution route before AO evaluation."""
+    validate_option_compatibility(
+        p_block_rows=p_block_rows,
+        kern_blocking=kern_blocking,
+        stage_eta_root=stage_eta_root,
+        solve_backend=solve_backend,
+        jitter_rcond=jitter_rcond,
+        retention_mode=retention_mode,
+        rtol=rtol,
+        n_retained_pin=n_retained_pin,
+        target_truncation_residual=target_truncation_residual,
+        provider_cls=provider_cls,
+    )
+    for name, value in (("n_grid", n_grid), ("n_kpts", n_kpts),
+                        ("n_ao", n_ao), ("rank", rank),
+                        ("block_size", block_size)):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+        if int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+    if int(rank) > int(n_grid):
+        raise ValueError(
+            f"rank={rank} cannot exceed the n_grid={n_grid} candidate count."
+        )
+    if isinstance(stage_eta_block, bool) or not isinstance(
+        stage_eta_block, (int, np.integer)
+    ) or int(stage_eta_block) <= 0:
+        raise ValueError(
+            f"stage_eta_block must be a positive integer, got {stage_eta_block!r}."
+        )
+    if p_block_rows is not None:
+        if isinstance(p_block_rows, bool) or not isinstance(
+            p_block_rows, (int, np.integer)
+        ):
+            raise ValueError(
+                f"p_block_rows must be a positive integer, got {p_block_rows!r}."
+            )
+        if int(p_block_rows) <= 0:
+            raise ValueError(
+                f"p_block_rows must be a positive integer, got {p_block_rows!r}."
+            )
+
+    requested_mode = selection_mode
+    fixed_pivots_provided = fixed_pivots is not None
+    if selection_mode == "fixed_pivots" and not fixed_pivots_provided:
+        raise ValueError(
+            "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
+        )
+    if selection_mode is None:
+        selection_mode = (
+            "fixed_pivots" if fixed_pivots_provided else DEFAULT_SELECTION_MODE
+        )
+    if fixed_pivots_provided:
+        if selection_mode not in {"streamed", "fixed_pivots"}:
+            raise ValueError(
+                "fixed_pivots is only compatible with exact 'streamed' "
+                "selection provenance."
+            )
+        selection_mode = "fixed_pivots"
+    if selection_mode in RETIRED_SELECTION_MODES:
+        raise ValueError(
+            f"selection_mode={selection_mode!r} was retired; use "
+            f"{RETIRED_SELECTION_MODES[selection_mode]!r}."
+        )
+    if selection_mode not in SELECTOR_STORAGE:
+        raise ValueError(
+            "selection_mode must be one of "
+            f"{sorted(SELECTOR_STORAGE)} -- selector x storage."
+        )
+    selector, storage_requested = SELECTOR_STORAGE[selection_mode]
+    storage_resolved = storage_requested
+
+    fixed_pivots_native = None
+    if fixed_pivots_provided:
+        pivots = np.asarray(fixed_pivots)
+        if pivots.ndim != 1 or not np.issubdtype(pivots.dtype, np.integer):
+            raise ValueError("fixed_pivots must be a one-dimensional integer array.")
+        pivots = pivots.astype(np.int64, copy=False)
+        if pivots.size != int(rank):
+            raise ValueError(
+                f"fixed_pivots must contain exactly rank={rank} entries, "
+                f"got {pivots.size}."
+            )
+        if np.any(pivots < 0) or np.any(pivots >= int(n_grid)):
+            raise ValueError("fixed_pivots contains an out-of-range grid index.")
+        if np.unique(pivots).size != pivots.size:
+            raise ValueError("fixed_pivots must be unique.")
+        fixed_pivots_native = pivots.tolist()
+
+    bpc_policy_resolved = None
+    if selector == "bpc":
+        integer_options = (
+            ("bpc_batch_size", bpc_batch_size, False),
+            ("bpc_candidate_oversampling", bpc_candidate_oversampling, False),
+            ("bpc_n_topup", bpc_n_topup, True),
+        )
+        for name, value, allow_zero in integer_options:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{name} must be an integer, got {value!r}.")
+            if int(value) < (0 if allow_zero else 1):
+                qualifier = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be {qualifier}, got {value!r}.")
+        if isinstance(bpc_min_separation, bool) or not isinstance(
+            bpc_min_separation, (int, float, np.integer, np.floating)
+        ) or not np.isfinite(bpc_min_separation) or float(bpc_min_separation) < 0:
+            raise ValueError(
+                "bpc_min_separation must be finite and non-negative, got "
+                f"{bpc_min_separation!r}."
+            )
+        n_topup_resolved = min(int(bpc_n_topup), int(rank))
+        bpc_policy_resolved = {
+            "batch_size": int(bpc_batch_size),
+            "min_separation": float(bpc_min_separation),
+            "candidate_oversampling": int(bpc_candidate_oversampling),
+            "n_topup_requested": int(bpc_n_topup),
+            "n_topup": n_topup_resolved,
+            "n_topup_clamped_to_rank": n_topup_resolved != int(bpc_n_topup),
+        }
+
+    if cached_ao_max_bytes is not None:
+        if isinstance(cached_ao_max_bytes, bool) or not isinstance(
+            cached_ao_max_bytes, (int, np.integer)
+        ):
+            raise ValueError(
+                "cached_ao_max_bytes must be a non-negative integer or None, "
+                f"got {cached_ao_max_bytes!r}."
+            )
+        if int(cached_ao_max_bytes) < 0:
+            raise ValueError(
+                "cached_ao_max_bytes must be a non-negative integer or None, "
+                f"got {cached_ao_max_bytes!r}."
+            )
+    cache_ceiling = (
+        CACHED_AO_MAX_BYTES
+        if cached_ao_max_bytes is None
+        else int(cached_ao_max_bytes)
+    )
+    predicted_cache_bytes = predicted_cached_ao_bytes(n_grid, n_kpts, n_ao)
+    if storage_resolved == "auto":
+        storage_resolved = (
+            "cached" if predicted_cache_bytes <= cache_ceiling else "streamed"
+        )
+        selection_mode = (
+            "bpc_cached_gemm" if storage_resolved == "cached" else "bpc_streamed"
+        )
+    elif storage_resolved == "cached" and predicted_cache_bytes > cache_ceiling:
+        raise ValueError(
+            f"selection_mode={selection_mode!r} would allocate a cached AO feature "
+            f"matrix of {predicted_cache_bytes / 2**30:.2f} GiB, above the "
+            f"{cache_ceiling / 2**30:.2f} GiB ceiling. Use 'bpc_auto' to pick "
+            f"automatically, 'bpc_streamed' to force streaming, or raise "
+            f"cached_ao_max_bytes deliberately."
+        )
+
+    if not isinstance(provider_details, Mapping):
+        raise ValueError("provider provenance() must return a mapping.")
+    provider_details_native = _jsonable(
+        provider_details, path="provider provenance"
+    )
+    if not provider_details_native.get("normalization"):
+        provider_name = f"{provider_cls.__module__}.{provider_cls.__qualname__}"
+        raise ValueError(
+            f"provider {provider_name} provenance must include a non-empty "
+            "'normalization' value."
+        )
+    provider_name = f"{provider_cls.__module__}.{provider_cls.__qualname__}"
+
+    if p_block_rows is not None:
+        eta_strategy = "panel_blocked"
+        kernel_strategy = "panel_precomputed"
+    elif stage_eta_root is not None:
+        eta_strategy = "staged"
+        kernel_strategy = "grid_blocked" if kern_blocking is not None else "dense"
+    else:
+        eta_strategy = (
+            "resident_cached"
+            if reuse_ao_cache_for_eta and storage_resolved == "cached"
+            else "resident_streamed"
+        )
+        kernel_strategy = "grid_blocked" if kern_blocking is not None else "dense"
+
+    requested_config = _jsonable({
+        "n_grid": int(n_grid),
+        "n_kpts": int(n_kpts),
+        "n_ao": int(n_ao),
+        "rank": int(rank),
+        "block_size": int(block_size),
+        "selection_mode": requested_mode,
+        "fixed_pivots": fixed_pivots_native,
+        "bpc_batch_size": bpc_batch_size,
+        "bpc_min_separation": bpc_min_separation,
+        "bpc_candidate_oversampling": bpc_candidate_oversampling,
+        "bpc_n_topup": bpc_n_topup,
+        "cached_ao_max_bytes": cached_ao_max_bytes,
+        "reuse_ao_cache_for_eta": reuse_ao_cache_for_eta,
+        "stage_eta_root": stage_eta_root,
+        "stage_eta_block": stage_eta_block,
+        "kern_blocking": kern_blocking,
+        "convolve_device": convolve_device,
+        "p_block_rows": p_block_rows,
+        "solve_backend": solve_backend,
+        "retention_mode": retention_mode,
+        "rtol": rtol,
+        "n_retained_pin": n_retained_pin,
+        "jitter_rcond": jitter_rcond,
+        "target_truncation_residual": target_truncation_residual,
+        "provider_class": provider_name,
+    }, path="requested build configuration")
+    resolved_config = {
+        **requested_config,
+        "selection_mode": selection_mode,
+        "selection_mode_requested": requested_mode,
+        "selector": selector,
+        "storage_requested": storage_requested,
+        "storage": storage_resolved,
+        "bpc_policy": bpc_policy_resolved,
+        "bpc_batch_size": (
+            None if bpc_policy_resolved is None
+            else bpc_policy_resolved["batch_size"]
+        ),
+        "bpc_min_separation": (
+            None if bpc_policy_resolved is None
+            else bpc_policy_resolved["min_separation"]
+        ),
+        "bpc_candidate_oversampling": (
+            None if bpc_policy_resolved is None
+            else bpc_policy_resolved["candidate_oversampling"]
+        ),
+        "bpc_n_topup": (
+            None if bpc_policy_resolved is None
+            else bpc_policy_resolved["n_topup"]
+        ),
+        "predicted_cached_ao_bytes": predicted_cache_bytes,
+        "cached_ao_max_bytes": cache_ceiling,
+        "eta_strategy": eta_strategy,
+        "kernel_strategy": kernel_strategy,
+        "solve_backend": solve_backend,
+        "retention_mode": retention_mode,
+        "provider": {
+            "provider_class": provider_name,
+            "details": provider_details_native,
+        },
+    }
+    requested_config_json = json.dumps(
+        requested_config, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    resolved_config_json = json.dumps(
+        resolved_config, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+
+    return PeriodicBuildPlan(
+        schema_version=1,
+        _requested_json=requested_config_json,
+        _resolved_json=resolved_config_json,
+    )
+
+
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           provider_cls=RawKernelProvider, selection_mode=None,
           fixed_pivots=None, on_selection=None,
@@ -209,7 +535,8 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         dict: mesh_obj (KptsMesh), inpv_kpt (Nk,Nip,Nao) complex128,
         coul_kpt / kern_kpt (Nk,Nip,Nip) complex128, n_selected (may be
         < rank if the pivot metric exhausts), n_pipeline_calls,
-        solve_infos (length-Nk list), and kernel_provider provenance.
+        solve_infos (length-Nk list), immutable-plan requested/resolved
+        provenance, and kernel_provider provenance.
     """
     validate_option_compatibility(
         p_block_rows=p_block_rows, kern_blocking=kern_blocking,
@@ -217,30 +544,6 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         jitter_rcond=jitter_rcond, retention_mode=retention_mode, rtol=rtol,
         n_retained_pin=n_retained_pin,
         target_truncation_residual=None, provider_cls=provider_cls)
-    if selection_mode == "fixed_pivots" and fixed_pivots is None:
-        raise ValueError(
-            "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
-        )
-    if selection_mode is None:
-        selection_mode = "fixed_pivots" if fixed_pivots is not None else DEFAULT_SELECTION_MODE
-    if fixed_pivots is not None:
-        if selection_mode not in {"streamed", "fixed_pivots"}:
-            raise ValueError(
-                "fixed_pivots is only compatible with exact 'streamed' "
-                "selection provenance."
-            )
-        selection_mode = "fixed_pivots"
-    if selection_mode in RETIRED_SELECTION_MODES:
-        raise ValueError(
-            f"selection_mode={selection_mode!r} was retired; use "
-            f"{RETIRED_SELECTION_MODES[selection_mode]!r}."
-        )
-    if selection_mode not in SELECTOR_STORAGE:
-        raise ValueError(
-            "selection_mode must be one of "
-            f"{sorted(SELECTOR_STORAGE)} -- selector x storage."
-        )
-    selector, storage = SELECTOR_STORAGE[selection_mode]
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
     provider = provider_cls(
@@ -252,39 +555,45 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             f"provider {type(provider).__module__}.{type(provider).__qualname__} "
             "must expose provenance()."
         )
-    provider_details = dict(provenance_fn())
-    if not provider_details.get("normalization"):
-        raise ValueError(
-            f"provider {type(provider).__module__}.{type(provider).__qualname__} "
-            "provenance must include a non-empty 'normalization' value."
-        )
-    provider_provenance = {
-        "provider_class": f"{type(provider).__module__}.{type(provider).__qualname__}",
-        "details": provider_details,
-    }
-
-    # Predicted-byte gate, evaluated BEFORE the cached allocation exists.
-    cache_ceiling = CACHED_AO_MAX_BYTES if cached_ao_max_bytes is None else int(cached_ao_max_bytes)
-    predicted_cache_bytes = predicted_cached_ao_bytes(
-        grid_coords.shape[0], mesh_obj.n_kpts, cell.nao)
+    plan = resolve_build_plan(
+        n_grid=grid_coords.shape[0],
+        n_kpts=mesh_obj.n_kpts,
+        n_ao=cell.nao_nr(),
+        rank=rank,
+        block_size=block_size,
+        provider_cls=type(provider),
+        provider_details=provenance_fn(),
+        selection_mode=selection_mode,
+        fixed_pivots=fixed_pivots,
+        bpc_batch_size=bpc_batch_size,
+        bpc_min_separation=bpc_min_separation,
+        bpc_candidate_oversampling=bpc_candidate_oversampling,
+        bpc_n_topup=bpc_n_topup,
+        cached_ao_max_bytes=cached_ao_max_bytes,
+        reuse_ao_cache_for_eta=reuse_ao_cache_for_eta,
+        stage_eta_root=stage_eta_root,
+        stage_eta_block=stage_eta_block,
+        kern_blocking=kern_blocking,
+        convolve_device=convolve_device,
+        p_block_rows=p_block_rows,
+        solve_backend=solve_backend,
+        retention_mode=retention_mode,
+        rtol=rtol,
+        n_retained_pin=n_retained_pin,
+        jitter_rcond=jitter_rcond,
+    )
+    plan_record = plan.to_dict()
+    resolved_plan = plan_record["resolved"]
+    selection_mode = resolved_plan["selection_mode"]
+    selector = resolved_plan["selector"]
+    storage = resolved_plan["storage"]
+    provider_provenance = resolved_plan["provider"]
     cache_gate = {
-        "predicted_cached_ao_bytes": predicted_cache_bytes,
-        "cached_ao_max_bytes": cache_ceiling,
+        "predicted_cached_ao_bytes": resolved_plan["predicted_cached_ao_bytes"],
+        "cached_ao_max_bytes": resolved_plan["cached_ao_max_bytes"],
     }
-    if storage == "auto":
-        # 'auto' CHOOSES; it never fails, because streamed is always available.
-        storage = "cached" if predicted_cache_bytes <= cache_ceiling else "streamed"
-        selection_mode = "bpc_cached_gemm" if storage == "cached" else "bpc_streamed"
+    if resolved_plan["storage_requested"] == "auto":
         cache_gate["auto_resolved_to"] = storage
-    elif storage == "cached" and predicted_cache_bytes > cache_ceiling:
-        # Explicitly requested: refuse rather than OOM mid-selection.
-        raise ValueError(
-            f"selection_mode={selection_mode!r} would allocate a cached AO feature "
-            f"matrix of {predicted_cache_bytes / 2**30:.2f} GiB, above the "
-            f"{cache_ceiling / 2**30:.2f} GiB ceiling. Use 'bpc_auto' to pick "
-            f"automatically, 'bpc_streamed' to force streaming, or raise "
-            f"cached_ao_max_bytes deliberately."
-        )
 
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance = {
@@ -341,34 +650,24 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     elif selection_mode == "streamed":
         pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
     else:
-        # n_topup > rank is refused downstream. That is the ONLY size-dependent
-        # constraint in this policy -- verified by isolation: batch_size=999 and
-        # candidate_oversampling=99 both pass at rank=12, because batch_size
-        # self-limits via retain_count = min(batch_size, rank - len(pivots)).
-        # The clamp is recorded rather than silent, so a run reports what it used.
-        # Validate BEFORE converting. int() silently accepts True as 1 and 3.7 as 3,
-        # and the clamp then records the coerced value as though it had been asked for.
-        if isinstance(bpc_n_topup, bool) or not isinstance(bpc_n_topup, (int, np.integer)):
-            raise ValueError(
-                f"bpc_n_topup must be a non-negative integer, got "
-                f"{bpc_n_topup!r} of type {type(bpc_n_topup).__name__}."
-            )
-        if int(bpc_n_topup) < 0:
-            raise ValueError(f"bpc_n_topup must be non-negative, got {bpc_n_topup}.")
-        n_topup_eff = min(int(bpc_n_topup), int(rank))
+        # The plan validates and resolves all BPC tuning before AO evaluation.
+        bpc_policy = resolved_plan["bpc_policy"]
+        n_topup_eff = bpc_policy["n_topup"]
         pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
-            batch_size=bpc_batch_size, min_separation=bpc_min_separation,
-            candidate_oversampling=bpc_candidate_oversampling,
+            batch_size=bpc_policy["batch_size"],
+            min_separation=bpc_policy["min_separation"],
+            candidate_oversampling=bpc_policy["candidate_oversampling"],
             n_topup=n_topup_eff,
         )
         selection_provenance.update({
-            "bpc_batch_size": int(bpc_batch_size),
-            "bpc_min_separation_grid_units": float(bpc_min_separation),
-            "bpc_candidate_oversampling": int(bpc_candidate_oversampling),
-            "bpc_n_topup_requested": int(bpc_n_topup),
+            "bpc_batch_size": bpc_policy["batch_size"],
+            "bpc_min_separation_grid_units": bpc_policy["min_separation"],
+            "bpc_candidate_oversampling": bpc_policy["candidate_oversampling"],
+            "bpc_n_topup_requested": bpc_policy["n_topup_requested"],
             "bpc_n_topup": n_topup_eff,
-            "bpc_n_topup_clamped_to_rank": n_topup_eff != int(bpc_n_topup),
+            "bpc_n_topup_clamped_to_rank":
+                bpc_policy["n_topup_clamped_to_rank"],
             "bpc_rounds": rounds,
             "bpc_joint_within_batch_exact_pivoting": True,
         })
@@ -536,6 +835,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         "solve_infos": solve_infos,
         "eta_staging": eta_staging_stats,
         "ao_tr_residual": ao_tr_residual,
+        "build_plan": plan_record,
         "kernel_provider": provider_provenance,
         "selection_provenance": {
             **selection_provenance,
