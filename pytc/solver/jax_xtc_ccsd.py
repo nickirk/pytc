@@ -873,7 +873,7 @@ def _update_amps(cc, t1, t2, eris):
     logger.debug(f"Phase 7: freed ERIs/accumulators before VVVV")
 
     # --- VVVV Contraction ---
-    _contract_vvvv_t2(cc, tau_jax, eris, t2new_host)
+    getattr(cc, "_contract_vvvv_t2", _contract_vvvv_t2)(cc, tau_jax, eris, t2new_host)
     
     eia = mo_e_o[:,None] - mo_e_v
     eijab = eia[:, None, :, None] + eia[None, :, None, :]
