@@ -91,6 +91,46 @@ def convert_store_to_rank_major(src, dst, *, x_dataset="X", row_block=8):
     return dst
 
 
+def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
+    """Append a rank-major copy of X to an existing store, in place.
+
+    The store keeps ``x_dataset`` (innermost) untouched for legacy
+    consumers (eris build, fingerprint manifest); the factorized
+    contraction reads ``out_dataset`` instead when present (see
+    ``isdf_xtc_ccsd._factorized_state``).  The two layout families want
+    opposite axis orders -- (r,s)-tiles are cheap on innermost, rank
+    panels only on rank-major -- and carrying both is cheaper than
+    rewriting every eris-side consumer (JID 20803176 crashed in
+    ``get_delta_h`` on a rank-major-only store).  If ``out_dataset``
+    already exists it is shape/attr-verified and kept, so re-running is
+    cheap.
+    """
+
+    with h5py.File(store, "r+") as fh:
+        x_in = fh[x_dataset]
+        if x_in.ndim != 3 or x_in.shape[0] != x_in.shape[1]:
+            raise ValueError(
+                f"{x_dataset!r} must be (nmo, nmo, rank); got {x_in.shape}")
+        nmo, _, rank = x_in.shape
+        if out_dataset in fh:
+            x_rm = fh[out_dataset]
+            if (tuple(x_rm.shape) != (rank, nmo, nmo)
+                    or x_rm.attrs.get("x_layout") != "rank_major"):
+                raise ValueError(
+                    f"{out_dataset!r} exists but is not a valid rank-major X: "
+                    f"shape {x_rm.shape}, attrs {dict(x_rm.attrs)}")
+            return store
+        x_out = fh.create_dataset(out_dataset, shape=(rank, nmo, nmo),
+                                  dtype=np.float64)
+        x_out.attrs["x_layout"] = "rank_major"
+        for j0 in range(0, nmo, int(row_block)):
+            j1 = min(j0 + int(row_block), nmo)
+            slab = np.asarray(x_in[j0:j1, :, :], dtype=np.float64)
+            x_out[:, j0:j1, :] = np.ascontiguousarray(
+                slab.transpose(2, 0, 1))
+    return store
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("src", help="source store path (rank-innermost X)")
@@ -102,8 +142,14 @@ def main(argv=None):
     parser.add_argument("--whole-store", action="store_true",
                         help="copy all datasets/attrs, converting only "
                              "--dataset (a driver-loadable store)")
+    parser.add_argument("--add-rank-major", action="store_true",
+                        help="append X_rm (rank-major) to the src store IN "
+                             "PLACE, leaving X innermost untouched")
     args = parser.parse_args(argv)
-    if args.whole_store:
+    if args.add_rank_major:
+        add_rank_major(args.src, x_dataset=args.dataset,
+                       row_block=args.row_block)
+    elif args.whole_store:
         convert_store_to_rank_major(args.src, args.dst, x_dataset=args.dataset,
                                     row_block=args.row_block)
     else:

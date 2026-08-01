@@ -59,8 +59,11 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         # X stays on its backing (a NumPy array or an HDF5 dataset): the
         # contraction streams it one rank panel at a time, so the full block
         # is never materialized on host or device.  Device X peak is one
-        # panel, which is what makes the 1200-orbital deck fittable.
-        x_backing = kernels["X"]
+        # panel, which is what makes the 1200-orbital deck fittable.  When
+        # the store carries a rank-major twin (X_rm, panel-contiguous reads
+        # -- measured ~42x cold at the 1200 deck vs the strided innermost
+        # gather), the contraction uses it; legacy consumers keep X.
+        x_backing = kernels.get("X_rm", kernels["X"])
         with_df = getattr(self, "with_df", None) or self._scf.with_df
         b = robust_df_thc.extract_metric_applied_vv_df_factor(
             with_df, self.mo_coeff, nocc)

@@ -1133,11 +1133,18 @@ class ISDFXTC(XTC, ISDFTC):
                         kernels['X'] = f['X'][:]
                         f.close()
                     else:
-                        # Stream X from file. 
-                        # Return the dataset object directly. 
+                        # Stream X from file.
+                        # Return the dataset object directly.
                         # Do NOT close 'f' here; the dataset object keeps the file open.
                         logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
                         kernels['X'] = f['X']
+                        # Rank-major twin (panel-contiguous) when the store
+                        # carries it: the factorized contraction prefers it
+                        # (see isdf_xtc_ccsd._factorized_state); legacy
+                        # consumers keep using kernels['X'] untouched.
+                        if 'X_rm' in f:
+                            logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
+                            kernels['X_rm'] = f['X_rm']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
                     return self.replace(isdf_kernels=kernels, save_path=out_path)
             except (IOError, KeyError) as e:

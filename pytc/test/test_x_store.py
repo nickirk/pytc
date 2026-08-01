@@ -9,7 +9,8 @@ import unittest
 import h5py
 import numpy as np
 
-from pytc.utils.x_store import convert_store_to_rank_major, convert_x_to_rank_major
+from pytc.utils.x_store import (add_rank_major, convert_store_to_rank_major,
+    convert_x_to_rank_major)
 
 
 class TestConvertXToRankMajor(unittest.TestCase):
@@ -58,6 +59,30 @@ class TestConvertXToRankMajor(unittest.TestCase):
                 self.assertEqual(fh["X"].attrs["x_layout"], "rank_major")
                 np.testing.assert_array_equal(np.asarray(fh["K1_kernel"]), k1)
                 np.testing.assert_array_equal(np.asarray(fh["D"]), d)
+
+    def test_add_rank_major_in_place(self):
+        rng = np.random.default_rng(7)
+        x = rng.normal(size=(7, 7, 8))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "store.h5")
+            with h5py.File(path, "w") as fh:
+                fh.create_dataset("X", data=x, dtype="f8")
+                fh.create_dataset("D", data=np.ones((8, 8)), dtype="f8")
+            add_rank_major(path, row_block=3)
+            with h5py.File(path, "r") as fh:
+                # X untouched, X_rm appended and correct.
+                np.testing.assert_array_equal(np.asarray(fh["X"]), x)
+                np.testing.assert_array_equal(np.asarray(fh["X_rm"]),
+                                              x.transpose(2, 0, 1))
+                self.assertEqual(fh["X_rm"].attrs["x_layout"], "rank_major")
+            # Idempotent: a second run verifies and keeps.
+            add_rank_major(path, row_block=3)
+            # A corrupt X_rm is rejected, not silently kept.
+            with h5py.File(path, "r+") as fh:
+                del fh["X_rm"]
+                fh.create_dataset("X_rm", data=np.zeros((3, 3, 3)), dtype="f8")
+            with self.assertRaises(ValueError):
+                add_rank_major(path)
 
 
 if __name__ == "__main__":

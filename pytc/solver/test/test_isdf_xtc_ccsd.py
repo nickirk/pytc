@@ -91,6 +91,23 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         # The lazy seam caches: a second call returns the same state object.
         self.assertIs(cc._factorized_state(), state1)
 
+    def test_state_prefers_rank_major_x_rm_when_present(self):
+        # Stores carrying the rank-major twin serve the contraction from
+        # X_rm (panel-contiguous reads); X stays for legacy consumers.
+        cc = self._make_cc()
+        x_rm = np.ascontiguousarray(
+            np.asarray(cc.xtc_obj.isdf_kernels["X"]).transpose(2, 0, 1))
+        cc.xtc_obj.isdf_kernels["X_rm"] = x_rm
+        _, _, _, x_backing = cc._factorized_state()
+        self.assertIs(x_backing, x_rm)
+        self.assertEqual(x_backing.shape, (self.rank, self.nmo, self.nmo))
+        # And the layout detector agrees with the preference.
+        from pytc.solver import factor_direct_vvvv
+        self.assertEqual(
+            factor_direct_vvvv._x_backing_layout(
+                x_rm, self.nocc, self.nmo - self.nocc, self.rank),
+            "rank_major")
+
     def test_hook_executes_streamed_contraction(self):
         # Execute the hook end-to-end on the synthetic deck: the streamed
         # factor-direct terms plus the JAX sandwich must produce a finite,
