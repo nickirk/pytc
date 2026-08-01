@@ -1099,6 +1099,7 @@ def apply_kernel_and_solve_device(
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
             Pi_q_jnp, kern_q,
             rtol=None if n_retained_pin is not None else rtol_eff,
+            retention_mode=retention_mode,
             n_retained_pin=n_retained_pin,
         )
     elif kern_blocking is not None:

@@ -7,6 +7,7 @@
   path vs NumPy oracle <=1e-12" sub-gate).
 """
 
+import tempfile
 import unittest
 
 import jax
@@ -431,6 +432,52 @@ class TestFusedPathMatchesUnfusedPath(unittest.TestCase):
                 info_fused["retained_solve_residual"], info_unfused["retained_solve_residual"],
                 places=10,
             )
+
+    def test_requested_retention_mode_is_realized_on_every_solve_path(self):
+        cell, mesh_obj, grids, Pi, eta = self._setup([1, 1, 1])
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+        )
+        unfused_provider = _UnfusedOnlyProviderWrapper(provider)
+        phase = precompute_phase_all_q(grids, mesh_obj.canonical_kpts)[0]
+        _, precomputed_kern, _ = apply_kernel_and_solve_device(
+            provider, 0, Pi[0], eta[0], phase_q=phase, retention_mode="single",
+        )
+
+        with tempfile.TemporaryDirectory() as staging_root:
+            paths = {
+                "device_fused": lambda mode: apply_kernel_and_solve_device(
+                    provider, 0, Pi[0], eta[0], phase_q=phase,
+                    retention_mode=mode,
+                )[2],
+                "device_dense": lambda mode: apply_kernel_and_solve_device(
+                    unfused_provider, 0, Pi[0], eta[0], phase_q=phase,
+                    retention_mode=mode,
+                )[2],
+                "device_grid_blocked": lambda mode: apply_kernel_and_solve_device(
+                    unfused_provider, 0, Pi[0], eta[0], phase_q=phase,
+                    retention_mode=mode,
+                    kern_blocking={
+                        "staging_root": staging_root,
+                        "row_block": 2,
+                        "grid_chunk": 7,
+                    },
+                )[2],
+                "device_precomputed_kern": lambda mode: apply_kernel_and_solve_device(
+                    provider, 0, Pi[0], None, phase_q=phase,
+                    retention_mode=mode, kern_q=precomputed_kern,
+                )[2],
+                "host_dense": lambda mode: apply_raw_kernel_and_solve(
+                    Pi[0], eta[0], cell=cell,
+                    q_kpt=mesh_obj.canonical_kpts[0], grid_coords=grids,
+                    grid_mesh=cell.mesh, retention_mode=mode,
+                )[2],
+            }
+            for requested in ("single", "pairwise", "svd_lstsq"):
+                for path, run in paths.items():
+                    with self.subTest(path=path, retention_mode=requested):
+                        info = run(requested)
+                        self.assertEqual(info["retention_mode"], requested)
 
 
 class TestBuildCoulKptDevice(unittest.TestCase):

@@ -484,6 +484,21 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
                 np.testing.assert_allclose(
                     np.asarray(got[key]), np.asarray(want[key]), rtol=0, atol=1e-10)
 
+    def test_panel_blocked_preserves_requested_retention_mode(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        for requested in ("single", "pairwise", "svd_lstsq"):
+            with self.subTest(retention_mode=requested):
+                built = coulomb.build(
+                    cell, kpts, rank=4, block_size=9, p_block_rows=2,
+                    retention_mode=requested,
+                )
+                self.assertTrue(built["solve_infos"])
+                self.assertTrue(all(
+                    info["retention_mode"] == requested
+                    for info in built["solve_infos"]
+                ))
+
     def test_incompatible_memory_levers_are_refused(self):
         # Both are memory levers but they are alternatives: the panel path forms
         # kern directly, so the other two would silently do nothing. Accepting
