@@ -1856,6 +1856,9 @@ def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
     return eta
 
 
+_RIGHT_FACTOR_PATH_LOGGED = False
+
+
 def _right_factor(provider, q, eta_q, gphase):
     """The right factor of one panel pair: conj(apply(q, eta*g)) * g.
 
@@ -1874,7 +1877,18 @@ def _right_factor(provider, q, eta_q, gphase):
     equivalent: fusion is free to reassociate, so they are held to a numerical
     bound, not to bitwise identity.
     """
+    # ENGAGEMENT RECEIPT. A lever that "did nothing" is indistinguishable from a
+    # lever that never fired, so WHICH path ran is logged rather than inferred
+    # from a timing. Logged once per process, not per pair. Yesterday a
+    # monkeypatch silently targeted the wrong namespace and recorded nothing;
+    # this is the cheap guard against reading that as "no effect".
+    global _RIGHT_FACTOR_PATH_LOGGED
     fused = getattr(provider, "apply_right_factor", None)
+    if not _RIGHT_FACTOR_PATH_LOGGED:
+        logger.info("right_factor: %s path active (provider=%s)",
+                    "FUSED" if fused is not None else "FALLBACK",
+                    type(provider).__name__)
+        _RIGHT_FACTOR_PATH_LOGGED = True
     if fused is not None:
         return np.asarray(fused(q, eta_q, gphase))
     lq = eta_q * gphase[None, :]
