@@ -84,6 +84,37 @@ class TestConvertXToRankMajor(unittest.TestCase):
             with self.assertRaises(ValueError):
                 add_rank_major(path)
 
+    def test_integrity_guards(self):
+        rng = np.random.default_rng(7)
+        x = rng.normal(size=(7, 7, 8))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "store.h5")
+            with h5py.File(path, "w") as fh:
+                ds = fh.create_dataset("X", data=x, dtype="f8")
+                ds.attrs["build_meta"] = "toy-build"
+            # Invalid row_block is rejected, no silent zero-write.
+            with self.assertRaises(ValueError):
+                add_rank_major(path, row_block=0)
+            with self.assertRaises(ValueError):
+                convert_x_to_rank_major(path, os.path.join(tmp, "o.h5"),
+                                        row_block=-2)
+            # Source X attrs are preserved; no stray temp dataset remains.
+            add_rank_major(path, row_block=3)
+            with h5py.File(path, "r") as fh:
+                self.assertEqual(fh["X_rm"].attrs["build_meta"], "toy-build")
+                self.assertEqual(fh["X_rm"].attrs["x_layout"], "rank_major")
+                self.assertNotIn("X_rm.tmp", fh)
+            # A leftover temp from an interrupted run is cleaned on retry.
+            with h5py.File(path, "r+") as fh:
+                del fh["X_rm"]
+                fh.create_dataset("X_rm.tmp", data=np.zeros((2, 2, 2)),
+                                  dtype="f8")
+            add_rank_major(path, row_block=3)
+            with h5py.File(path, "r") as fh:
+                np.testing.assert_array_equal(np.asarray(fh["X_rm"]),
+                                              x.transpose(2, 0, 1))
+                self.assertNotIn("X_rm.tmp", fh)
+
 
 if __name__ == "__main__":
     unittest.main()

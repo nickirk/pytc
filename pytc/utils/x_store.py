@@ -46,15 +46,19 @@ def convert_x_to_rank_major(src, dst, *, dataset="X", row_block=8):
             dst_f.close()
 
 
-def _convert_x_dataset(src_f, dst_f, dataset, row_block):
+def _convert_x_dataset(src_f, dst_f, dataset, row_block, out_name=None):
+    if int(row_block) < 1:
+        raise ValueError(f"row_block must be >= 1; got {row_block}")
     x_in = src_f[dataset]
     if x_in.ndim != 3 or x_in.shape[0] != x_in.shape[1]:
         raise ValueError(
             f"source dataset {dataset!r} must be (nmo, nmo, rank); "
             f"got {x_in.shape}")
     nmo, _, rank = x_in.shape
-    x_out = dst_f.create_dataset(dataset, shape=(rank, nmo, nmo),
-                                 dtype=np.float64)
+    x_out = dst_f.create_dataset(out_name or dataset,
+                                 shape=(rank, nmo, nmo), dtype=np.float64)
+    for key, val in x_in.attrs.items():
+        x_out.attrs[key] = val
     x_out.attrs["x_layout"] = "rank_major"
     for j0 in range(0, nmo, int(row_block)):
         j1 = min(j0 + int(row_block), nmo)
@@ -120,21 +124,22 @@ def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
                     f"{out_dataset!r} exists but is not a valid rank-major X: "
                     f"shape {x_rm.shape}, attrs {dict(x_rm.attrs)}")
             return store
-        x_out = fh.create_dataset(out_dataset, shape=(rank, nmo, nmo),
-                                  dtype=np.float64)
-        x_out.attrs["x_layout"] = "rank_major"
-        for j0 in range(0, nmo, int(row_block)):
-            j1 = min(j0 + int(row_block), nmo)
-            slab = np.asarray(x_in[j0:j1, :, :], dtype=np.float64)
-            x_out[:, j0:j1, :] = np.ascontiguousarray(
-                slab.transpose(2, 0, 1))
+        # Write to a temp dataset and rename into place: an interrupted
+        # conversion must never leave a correctly-shaped but partially
+        # written X_rm behind (review finding).
+        tmp_name = out_dataset + ".tmp"
+        if tmp_name in fh:
+            del fh[tmp_name]
+        _convert_x_dataset(fh, fh, x_dataset, row_block, out_name=tmp_name)
+        fh.move(tmp_name, out_dataset)
     return store
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("src", help="source store path (rank-innermost X)")
-    parser.add_argument("dst", help="destination path (rank-major X)")
+    parser.add_argument("dst", nargs="?", default=None,
+                        help="destination path (not used by --add-rank-major)")
     parser.add_argument("--dataset", default="X",
                         help="dataset name in both files (default: X)")
     parser.add_argument("--row-block", type=int, default=8,
@@ -149,12 +154,17 @@ def main(argv=None):
     if args.add_rank_major:
         add_rank_major(args.src, x_dataset=args.dataset,
                        row_block=args.row_block)
-    elif args.whole_store:
-        convert_store_to_rank_major(args.src, args.dst, x_dataset=args.dataset,
-                                    row_block=args.row_block)
     else:
-        convert_x_to_rank_major(args.src, args.dst, dataset=args.dataset,
-                                row_block=args.row_block)
+        if args.dst is None:
+            parser.error("dst is required unless --add-rank-major is given")
+        if args.whole_store:
+            convert_store_to_rank_major(
+                args.src, args.dst, x_dataset=args.dataset,
+                row_block=args.row_block)
+        else:
+            convert_x_to_rank_major(
+                args.src, args.dst, dataset=args.dataset,
+                row_block=args.row_block)
 
 
 if __name__ == "__main__":

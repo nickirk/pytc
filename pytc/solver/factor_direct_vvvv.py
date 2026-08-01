@@ -1001,16 +1001,20 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
 def _measure_free_host_bytes():
     """Measured available host RAM in bytes, capped by any cgroup limit.
 
-    psutil is imported lazily: it is a de-facto project dependency (used in
-    ``pytc/legacy/kmat.py``) but not declared in ``pyproject.toml``, so a
-    top-level import here would make this module unimportable without it.
+    psutil is imported lazily and treated as OPTIONAL: when it is absent
+    the cgroup measurement alone answers, and when neither source exists
+    the gate falls through safely (never admits on an unknown capacity).
     """
 
-    import psutil
-    available = int(psutil.virtual_memory().available)
+    try:
+        import psutil
+    except ImportError:
+        available = None
+    else:
+        available = int(psutil.virtual_memory().available)
     cgroup = _cgroup_memory_available_bytes()
     if cgroup is not None:
-        available = min(available, cgroup)
+        available = cgroup if available is None else min(available, cgroup)
     return available
 
 
@@ -1287,17 +1291,21 @@ def contract_isdf_factor_direct_terms_t2_auto(
     x_bytes = nvir * nvir * rank * 8
 
     force = os.environ.get("PYTC_X_FORCE_TIER")
-    free_device = _measure_free_device_bytes()
-    free_host = _measure_free_host_bytes()
     if force in ("1", "2", "3"):
+        # Forced tiers need no probes (and must not require psutil).
         tier = int(force)
-    elif x_bytes <= cap_bytes and (
-            free_device is None or x_bytes <= 0.5 * free_device):
-        tier = 1
-    elif free_host is not None and x_bytes <= 0.5 * free_host:
-        tier = 2
+        free_device = free_host = None
     else:
-        tier = 3
+        free_device = _measure_free_device_bytes()
+        free_host = _measure_free_host_bytes()
+        # Fail closed: a tier is only chosen on a MEASURED capacity.
+        if (x_bytes <= cap_bytes and free_device is not None
+                and x_bytes <= 0.5 * free_device):
+            tier = 1
+        elif free_host is not None and x_bytes <= 0.5 * free_host:
+            tier = 2
+        else:
+            tier = 3
 
     panel_size = None
     if tier != 1:

@@ -591,6 +591,67 @@ class TestTieredXAuto(unittest.TestCase):
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=3)
 
+    def test_forced_tier_skips_host_probe(self):
+        # Forced tiers must not require psutil (or any probe) at all.
+        from unittest import mock
+        with mock.patch.object(factor_direct, "_measure_free_host_bytes",
+                               side_effect=AssertionError("probed")):
+            terms, fired = self._run_auto(2)
+        self.assertEqual(fired.get("fd_x_tier2_host_resident", 0), 1)
+        self.assertIn("final", terms)
+
+    def test_missing_psutil_does_not_break_dispatch(self):
+        # psutil is optional: forced and auto dispatch both work without it.
+        import sys
+        from unittest import mock
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            terms, _ = self._run_auto(2)
+            self.assertIn("final", terms)
+            os.environ.pop("PYTC_X_FORCE_TIER", None)
+            terms2 = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+                self.data["t2"], self.data["p"], self.data["grad_p"],
+                self.data["u1"], self.data["u3"], self.data["d"],
+                self.backing, self.nocc,
+                occupied_pair_batch_size=2, rank_panel_size=3)
+            self.assertIn("final", terms2)
+
+    def test_unknown_device_stats_refuse_tier1(self):
+        # Fail closed: unmeasurable device memory cannot admit a full lift.
+        from unittest import mock
+        os.environ.pop("PYTC_X_FORCE_TIER", None)
+        counters_before = dict(_tile_timers._STATE["counters"])
+        with mock.patch.object(
+                factor_direct, "_measure_free_device_bytes", return_value=None):
+            terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+                self.data["t2"], self.data["p"], self.data["grad_p"],
+                self.data["u1"], self.data["u3"], self.data["d"],
+                self.backing, self.nocc,
+                occupied_pair_batch_size=2, rank_panel_size=3)
+        counters_after = _tile_timers._STATE["counters"]
+        self.assertEqual(
+            counters_after.get("fd_x_tier1_full_lift", 0)
+            - counters_before.get("fd_x_tier1_full_lift", 0), 0)
+        self.assertIn("final", terms)
+
+    def test_unknown_host_and_device_select_tier3(self):
+        from unittest import mock
+        os.environ.pop("PYTC_X_FORCE_TIER", None)
+        counters_before = dict(_tile_timers._STATE["counters"])
+        with mock.patch.object(
+                factor_direct, "_measure_free_device_bytes", return_value=None), \
+             mock.patch.object(
+                factor_direct, "_measure_free_host_bytes", return_value=None):
+            terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+                self.data["t2"], self.data["p"], self.data["grad_p"],
+                self.data["u1"], self.data["u3"], self.data["d"],
+                self.backing, self.nocc,
+                occupied_pair_batch_size=2, rank_panel_size=3)
+        counters_after = _tile_timers._STATE["counters"]
+        self.assertEqual(
+            counters_after.get("fd_x_tier3_stream", 0)
+            - counters_before.get("fd_x_tier3_stream", 0), 1)
+        self.assertIn("final", terms)
+
 
 class TestMemoryMeasurement(unittest.TestCase):
     """The tier gate's memory measurements, including their fallback paths.

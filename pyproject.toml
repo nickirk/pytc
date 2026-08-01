@@ -29,6 +29,8 @@ dependencies = [
     "folx>=0.2.22",
 
     "pyscf",
+    "h5py",
+    "psutil",
 ]
 
 classifiers = [
