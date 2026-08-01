@@ -4,6 +4,7 @@ get_k/get_j structural tests live in test_coulomb_get_k_get_j.py."""
 
 import os
 import unittest
+from unittest import mock
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -36,7 +37,68 @@ def _make_cell():
     return cell
 
 
+class _AlternateRawProvider(RawKernelProvider):
+    def provenance(self):
+        return {
+            **super().provenance(),
+            "kernel_name": "alternate_raw_test",
+        }
+
+
+class _MissingNormalizationProvider(RawKernelProvider):
+    def provenance(self):
+        provenance = super().provenance()
+        provenance.pop("normalization")
+        return provenance
+
+
 class TestBuild(unittest.TestCase):
+    def test_build_records_exact_provider_and_normalization_provenance(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 1], wrap_around=False)
+        device = coulomb.build(
+            cell, kpts, rank=3, block_size=9,
+            provider_cls=_AlternateRawProvider,
+        )
+        host = coulomb.build(
+            cell, kpts, rank=3, block_size=9, solve_backend="host",
+        )
+
+        device_provider = device["kernel_provider"]
+        self.assertEqual(
+            device_provider["provider_class"],
+            f"{_AlternateRawProvider.__module__}.{_AlternateRawProvider.__qualname__}",
+        )
+        self.assertEqual(
+            device_provider["details"]["kernel_name"], "alternate_raw_test"
+        )
+        self.assertEqual(
+            device_provider["details"]["normalization"],
+            "vol_over_ng_inside_provider",
+        )
+
+        host_provider = host["kernel_provider"]
+        self.assertEqual(
+            host_provider["provider_class"],
+            f"{RawKernelProvider.__module__}.{RawKernelProvider.__qualname__}",
+        )
+        self.assertEqual(
+            host_provider["details"]["normalization"],
+            "vol_over_ng_inside_provider",
+        )
+
+    def test_missing_provider_normalization_is_rejected_before_ao_work(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 1], wrap_around=False)
+        with mock.patch.object(
+            cell, "pbc_eval_gto", side_effect=AssertionError("AO work must not start")
+        ):
+            with self.assertRaisesRegex(ValueError, "non-empty 'normalization'"):
+                coulomb.build(
+                    cell, kpts, rank=3, block_size=9,
+                    provider_cls=_MissingNormalizationProvider,
+                )
+
     def test_on_selection_fires_once_before_the_build_and_enables_resume(self):
         """The hook exists so hours of selection survive an interruption. Assert
         the property that matters -- what it hands back is sufficient to resume --

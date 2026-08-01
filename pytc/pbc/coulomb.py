@@ -92,7 +92,8 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
                                  stage_eta_root=None, solve_backend="device",
                                  jitter_rcond=None, retention_mode="single",
                                  rtol=None, n_retained_pin=None,
-                                 target_truncation_residual=None):
+                                 target_truncation_residual=None,
+                                 provider_cls=RawKernelProvider):
     """Refuse statically-knowable option combinations.
 
     Placement is the point. These checks previously lived only inside build(), which
@@ -121,6 +122,13 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
             "so there is nothing to stage. Choose one."
         )
     if solve_backend == "host":
+        if provider_cls is not RawKernelProvider:
+            raise ValueError(
+                "solve_backend='host' implements only the exact "
+                "RawKernelProvider semantics; a custom provider would be ignored "
+                "by the host reference solve. Use solve_backend='device' or "
+                "provider_cls=RawKernelProvider."
+            )
         for name, value in (("kern_blocking", kern_blocking),
                             ("p_block_rows", p_block_rows)):
             if value is not None:
@@ -201,14 +209,14 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         dict: mesh_obj (KptsMesh), inpv_kpt (Nk,Nip,Nao) complex128,
         coul_kpt / kern_kpt (Nk,Nip,Nip) complex128, n_selected (may be
         < rank if the pivot metric exhausts), n_pipeline_calls,
-        solve_infos (length-Nk list).
+        solve_infos (length-Nk list), and kernel_provider provenance.
     """
     validate_option_compatibility(
         p_block_rows=p_block_rows, kern_blocking=kern_blocking,
         stage_eta_root=stage_eta_root, solve_backend=solve_backend,
         jitter_rcond=jitter_rcond, retention_mode=retention_mode, rtol=rtol,
         n_retained_pin=n_retained_pin,
-        target_truncation_residual=None)
+        target_truncation_residual=None, provider_cls=provider_cls)
     if selection_mode == "fixed_pivots" and fixed_pivots is None:
         raise ValueError(
             "selection_mode='fixed_pivots' requires an explicit fixed_pivots array."
@@ -235,6 +243,25 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     selector, storage = SELECTOR_STORAGE[selection_mode]
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
+    provider = provider_cls(
+        cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
+    )
+    provenance_fn = getattr(provider, "provenance", None)
+    if provenance_fn is None:
+        raise ValueError(
+            f"provider {type(provider).__module__}.{type(provider).__qualname__} "
+            "must expose provenance()."
+        )
+    provider_details = dict(provenance_fn())
+    if not provider_details.get("normalization"):
+        raise ValueError(
+            f"provider {type(provider).__module__}.{type(provider).__qualname__} "
+            "provenance must include a non-empty 'normalization' value."
+        )
+    provider_provenance = {
+        "provider_class": f"{type(provider).__module__}.{type(provider).__qualname__}",
+        "details": provider_details,
+    }
 
     # Predicted-byte gate, evaluated BEFORE the cached allocation exists.
     cache_ceiling = CACHED_AO_MAX_BYTES if cached_ao_max_bytes is None else int(cached_ao_max_bytes)
@@ -449,8 +476,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             neg_arr = np.asarray(mesh_obj.neg)
             Pi, kern_p_blocked = build_pi_kern_p_blocked(
                 inpv_kpt, _ao_block_factory, mesh_obj.phase, mesh_obj.neg,
-                provider_cls(cell=cell, canonical_kpts=mesh_obj.canonical_kpts,
-                             grid_mesh=cell.mesh),
+                provider,
                 grid_coords, panel_rows=int(p_block_rows),
                 convolve_device=convolve_device,
                 self_paired=lambda q: int(neg_arr[q]) == q,
@@ -473,9 +499,6 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                 inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg,
                 convolve_device=convolve_device)
 
-        provider = provider_cls(
-            cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
-        )
         if solve_backend == "host":
             # Reference path. Exists so an accuracy question can be settled without
             # first porting a solver to the device path; refuses the device-only
@@ -513,6 +536,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         "solve_infos": solve_infos,
         "eta_staging": eta_staging_stats,
         "ao_tr_residual": ao_tr_residual,
+        "kernel_provider": provider_provenance,
         "selection_provenance": {
             **selection_provenance,
             "pivot_indices": pivots.tolist(),

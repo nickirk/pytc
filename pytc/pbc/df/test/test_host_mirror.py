@@ -8,6 +8,7 @@ implementation. These tests are what make the mirror usable as evidence.
 """
 
 import unittest
+from unittest import mock
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -170,6 +171,20 @@ class TestOptionsRefusedAtConstruction(unittest.TestCase):
                 # raising only in build(), the failure moves hours downstream.
                 with self.assertRaises(ValueError):
                     self._isdfdf(**kw)
+
+    def test_host_rejects_custom_provider_before_mesh_or_ao_work(self):
+        class _CustomProvider(RawKernelProvider):
+            pass
+
+        with mock.patch(
+            "pytc.pbc.coulomb.canonicalize_kpts",
+            side_effect=AssertionError("mesh work must not start"),
+        ):
+            with self.assertRaisesRegex(ValueError, "custom provider would be ignored"):
+                build(
+                    self.cell, self.kpts, rank=12, block_size=200,
+                    solve_backend="host", provider_cls=_CustomProvider,
+                )
 
     def test_valid_production_shape_constructs(self):
         # The 444 production config's shape: panel blocking alone, no staging levers.
