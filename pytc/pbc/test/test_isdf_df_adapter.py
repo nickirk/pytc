@@ -176,6 +176,20 @@ class TestISDFDFStructure(unittest.TestCase):
             vk_shuffled, vk_canonical[order], atol=1e-11, rtol=1e-11
         )
 
+        # nset == nk is the adversarial shape: permuting axis 0 would pass the
+        # length check while silently reordering density sets instead of k-points.
+        dm_sets = np.stack((dm, 0.5 * dm, -0.25 * dm), axis=0)
+        _, vk_sets_canonical = adapter.get_jk(
+            dm_sets, with_j=False, with_k=True, exxdiv=None
+        )
+        _, vk_sets_shuffled = shuffled.get_jk(
+            dm_sets[:, order], with_j=False, with_k=True, exxdiv=None
+        )
+        np.testing.assert_allclose(
+            vk_sets_shuffled, vk_sets_canonical[:, order],
+            atol=1e-11, rtol=1e-11,
+        )
+
         wrapped_kpts = cell.make_kpts([1, 1, 3], wrap_around=True)
         wrapped_mesh = canonicalize_kpts(cell, wrapped_kpts)
         wrapped = ISDFDF(
