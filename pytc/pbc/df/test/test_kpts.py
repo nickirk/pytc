@@ -104,6 +104,35 @@ class TestCanonicalizeKpts(unittest.TestCase):
         for i, orig_idx in enumerate(order):
             self.assertEqual(mesh_shuf.permutation[i], mesh_ref.permutation[orig_idx])
 
+    def test_transport_round_trip_on_arbitrary_axis(self):
+        cell = _make_cell()
+        canonical_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        mesh = canonicalize_kpts(cell, canonical_kpts[[2, 0, 1]])
+        canonical = np.arange(18).reshape(2, 3, 3)
+        caller = mesh.from_canonical(canonical, axis=1)
+        np.testing.assert_array_equal(mesh.to_canonical(caller, axis=1), canonical)
+        with self.assertRaises(ValueError):
+            mesh.to_canonical(np.zeros((2, 4)), axis=1)
+
+    def test_subset_indices_accept_wrap_gauge_and_repetitions(self):
+        cell = _make_cell()
+        canonical_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        wrapped_kpts = cell.make_kpts([1, 1, 3], wrap_around=True)
+        mesh = canonicalize_kpts(cell, canonical_kpts)
+        wrapped_mesh = canonicalize_kpts(cell, wrapped_kpts)
+        query_positions = [2, 0, 2, 1]
+        indices = mesh.canonical_indices(cell, wrapped_kpts[query_positions])
+        np.testing.assert_array_equal(
+            indices, wrapped_mesh.permutation[query_positions]
+        )
+
+    def test_subset_indices_reject_point_outside_mesh(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        mesh = canonicalize_kpts(cell, kpts)
+        with self.assertRaises(ValueError):
+            mesh.canonical_indices(cell, kpts[:1] + np.array([[0.013, 0.021, 0.034]]))
+
     def test_gamma_present_at_canonical_index_zero(self):
         cell = _make_cell()
         kpts = cell.make_kpts([2, 2, 2], wrap_around=False)

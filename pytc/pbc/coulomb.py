@@ -972,16 +972,11 @@ class ISDFDF:
         if kpts.shape != (4, 3):
             raise ValueError("kpts must have shape (4, 3).")
         built = self.build()
-        canonical = built["mesh_obj"].canonical_kpts
-        indices = []
-        for kpt in kpts:
-            matches = np.flatnonzero(np.all(np.isclose(canonical, kpt, atol=1e-8), axis=1))
-            if matches.size != 1:
-                raise ValueError("ao2mo kpts must belong uniquely to this adapter's canonical mesh.")
-            indices.append(int(matches[0]))
+        mesh_obj = built["mesh_obj"]
+        indices = mesh_obj.canonical_indices(self.cell, kpts).tolist()
         from pytc.pbc.df.kpts import build_kconserv
 
-        kconserv = build_kconserv(self.cell, canonical)
+        kconserv = build_kconserv(self.cell, mesh_obj.canonical_kpts)
         eri, k4 = get_mo_eri(
             built["inpv_kpt"], built["coul_kpt"], kconserv, mo_coeffs,
             indices[0], indices[1], indices[2],
@@ -1019,8 +1014,12 @@ class ISDFDF:
             vj = get_j_kpts(self._core_df, dm_kpts, kpts=kpts)
         if with_k:
             built = self.build()
-            vk = get_k(
-                dm_kpts, built["inpv_kpt"], built["coul_kpt"], built["mesh_obj"].phase,
-                exxdiv=exxdiv, cell=self.cell, kpts=kpts, neg=built["mesh_obj"].neg,
+            mesh_obj = built["mesh_obj"]
+            dm_canonical = mesh_obj.to_canonical(dm_kpts, axis=-3)
+            vk_canonical = get_k(
+                dm_canonical, built["inpv_kpt"], built["coul_kpt"], mesh_obj.phase,
+                exxdiv=exxdiv, cell=self.cell, kpts=mesh_obj.canonical_kpts,
+                neg=mesh_obj.neg,
             )
+            vk = mesh_obj.from_canonical(vk_canonical, axis=-3)
         return vj, vk

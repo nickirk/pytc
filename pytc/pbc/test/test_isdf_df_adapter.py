@@ -33,6 +33,15 @@ def _make_cell():
 
 
 class TestISDFDFStructure(unittest.TestCase):
+    def _fixed_pivots(self, cell, kpts, rank=3):
+        mesh_obj = canonicalize_kpts(cell, kpts)
+        grid_coords = cell.get_uniform_grids(cell.mesh)
+        diagonal, column = build_periodic_pivot_oracle(
+            cell, mesh_obj.canonical_kpts, grid_coords, block_size=13,
+        )
+        pivots, _, _ = pivoted_cholesky_hermitian(diagonal, column, rank=rank)
+        return pivots
+
     def test_build_forwards_bpc_selection_configuration(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
@@ -131,6 +140,87 @@ class TestISDFDFStructure(unittest.TestCase):
         self.assertEqual(expected_k4, k4)
         self.assertEqual(actual.shape, (expected.size,))
         np.testing.assert_allclose(actual.reshape(expected.shape), expected, atol=1e-11, rtol=1e-11)
+
+    def test_get_jk_preserves_shuffled_and_wrapped_caller_order(self):
+        cell = _make_cell()
+        canonical_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        pivots = self._fixed_pivots(cell, canonical_kpts)
+        adapter = ISDFDF(
+            cell, canonical_kpts, rank=3, block_size=13, rtol=1e-4,
+            fixed_pivots=pivots,
+        )
+
+        rng = np.random.default_rng(18)
+        dm = np.empty((3, cell.nao, cell.nao), dtype=np.complex128)
+        real = rng.normal(size=(cell.nao, cell.nao))
+        dm[0] = real + real.T
+        z = rng.normal(size=(cell.nao, cell.nao)) + 1j * rng.normal(
+            size=(cell.nao, cell.nao)
+        )
+        dm[1] = z + z.conj().T
+        dm[2] = dm[1].conj()
+        _, vk_canonical = adapter.get_jk(
+            dm, with_j=False, with_k=True, exxdiv=None
+        )
+
+        order = np.array([2, 0, 1])
+        shuffled_kpts = canonical_kpts[order]
+        shuffled = ISDFDF(
+            cell, shuffled_kpts, rank=3, block_size=13, rtol=1e-4,
+            fixed_pivots=pivots,
+        )
+        _, vk_shuffled = shuffled.get_jk(
+            dm[order], with_j=False, with_k=True, exxdiv=None
+        )
+        np.testing.assert_allclose(
+            vk_shuffled, vk_canonical[order], atol=1e-11, rtol=1e-11
+        )
+
+        wrapped_kpts = cell.make_kpts([1, 1, 3], wrap_around=True)
+        wrapped_mesh = canonicalize_kpts(cell, wrapped_kpts)
+        wrapped = ISDFDF(
+            cell, wrapped_kpts, rank=3, block_size=13, rtol=1e-4,
+            fixed_pivots=pivots,
+        )
+        dm_wrapped = wrapped_mesh.from_canonical(dm)
+        _, vk_wrapped = wrapped.get_jk(
+            dm_wrapped, with_j=False, with_k=True, exxdiv=None
+        )
+        np.testing.assert_allclose(
+            vk_wrapped, wrapped_mesh.from_canonical(vk_canonical),
+            atol=1e-11, rtol=1e-11,
+        )
+
+    def test_ao2mo_accepts_wrap_around_gauge(self):
+        cell = _make_cell()
+        canonical_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        pivots = self._fixed_pivots(cell, canonical_kpts)
+        adapter = ISDFDF(
+            cell, canonical_kpts, rank=3, block_size=13, rtol=1e-4,
+            fixed_pivots=pivots,
+        )
+        built = adapter.build()
+        mesh_obj = built["mesh_obj"]
+        kconserv = build_kconserv(cell, mesh_obj.canonical_kpts)
+        k1, k2, k3 = 2, 0, 1
+        k4 = int(kconserv[k1, k2, k3])
+        mo_coeffs = [
+            np.eye(cell.nao, dtype=np.complex128)
+            for _ in range(4)
+        ]
+        expected, _ = get_mo_eri(
+            built["inpv_kpt"], built["coul_kpt"], kconserv, mo_coeffs,
+            k1, k2, k3,
+        )
+
+        wrapped_kpts = cell.make_kpts([1, 1, 3], wrap_around=True)
+        wrapped_mesh = canonicalize_kpts(cell, wrapped_kpts)
+        wrapped_by_canonical = wrapped_mesh.to_canonical(wrapped_kpts)
+        quartet = wrapped_by_canonical[[k1, k2, k3, k4]]
+        actual = adapter.ao2mo(mo_coeffs, quartet, compact=False)
+        np.testing.assert_allclose(
+            actual.reshape(expected.shape), expected, atol=1e-11, rtol=1e-11
+        )
 
 
 class TestISDFDFRealKrhf(unittest.TestCase):

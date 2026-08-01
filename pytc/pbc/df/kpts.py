@@ -166,6 +166,71 @@ class KptsMesh:
         object.__setattr__(self, "ktol", float(self.ktol))
         object.__setattr__(self, "phase", _readonly_copy(phase))
 
+    def _normalize_k_axis(self, values, axis):
+        values = np.asarray(values)
+        if values.ndim == 0:
+            raise ValueError("k-point-indexed values must have at least one dimension.")
+        if isinstance(axis, bool) or not isinstance(axis, (int, np.integer)):
+            raise ValueError(f"axis must be an integer, got {axis!r}.")
+        axis = int(axis)
+        if not -values.ndim <= axis < values.ndim:
+            raise ValueError(
+                f"axis={axis} is out of range for values with ndim={values.ndim}."
+            )
+        axis %= values.ndim
+        if values.shape[axis] != self.n_kpts:
+            raise ValueError(
+                f"values.shape[{axis}]={values.shape[axis]} does not match "
+                f"n_kpts={self.n_kpts}."
+            )
+        return values, axis
+
+    def to_canonical(self, values, *, axis=0):
+        """Reorder a k-indexed caller array into canonical mesh order.
+
+        ``permutation[i]`` is the canonical index of caller entry ``i``, so
+        canonical entry ``c`` is caller entry ``argsort(permutation)[c]``.
+        """
+        values, axis = self._normalize_k_axis(values, axis)
+        return np.take(values, np.argsort(self.permutation), axis=axis)
+
+    def from_canonical(self, values, *, axis=0):
+        """Reorder a canonical k-indexed array back into caller order."""
+        values, axis = self._normalize_k_axis(values, axis)
+        return np.take(values, self.permutation, axis=axis)
+
+    def canonical_indices(self, cell, kpts):
+        """Map absolute k-points to canonical indices, modulo reciprocal G.
+
+        Unlike ``permutation``, this accepts a subset and repeated points, as
+        required by momentum-conserving four-k-point AO/MO integral requests.
+        """
+        kpts = np.asarray(kpts, dtype=np.float64)
+        if kpts.ndim != 2 or kpts.shape[1] != 3:
+            raise ValueError(f"kpts must have shape (n,3), got {kpts.shape}.")
+        if not np.all(np.isfinite(kpts)):
+            raise ValueError("kpts must be finite.")
+
+        query = _fold_fractional(cell.get_scaled_kpts(kpts), self.ktol)
+        reference = _fold_fractional(
+            cell.get_scaled_kpts(self.canonical_kpts), self.ktol
+        )
+        indices = np.empty(kpts.shape[0], dtype=np.int64)
+        for i, point in enumerate(query):
+            diff = reference - point
+            diff -= np.round(diff)
+            distances = np.linalg.norm(diff, axis=1)
+            matches = np.flatnonzero(distances <= self.ktol)
+            if matches.size != 1:
+                closest = float(np.min(distances))
+                raise ValueError(
+                    f"k-point {i} does not match exactly one canonical mesh point "
+                    f"within ktol={self.ktol} (matches={matches.size}, closest "
+                    f"distance={closest:.3e})."
+                )
+            indices[i] = int(matches[0])
+        return indices
+
 
 def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
     """Canonicalize a (n_kpts,3) absolute k-point array (any order/gauge)
