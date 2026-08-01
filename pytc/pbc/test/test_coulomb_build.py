@@ -87,29 +87,39 @@ class TestBuildPlan(unittest.TestCase):
             (False, True),  # panel blocking
             (False, True),  # eta staging
             (False, True),  # kernel blocking
-            ("single", "cholesky_jitter"),
+            (*coulomb.RETENTION_MODES, "not_a_mode"),
             (False, True),  # jitter_rcond
             (False, True),  # custom provider
             (False, True),  # rtol
             (False, True),  # retained-rank pin
+            (False, True),  # adaptive residual target
         )
         checked = 0
         for (backend, panel, staged, kern_blocked, retention, jitter,
-             custom, with_rtol, pin) in values:
+             custom, with_rtol, pin, target) in values:
             with self.subTest(
                 backend=backend, panel=panel, staged=staged,
                 kern_blocked=kern_blocked, retention=retention,
                 jitter=jitter, custom=custom, rtol=with_rtol, pin=pin,
+                target=target,
             ):
-                legal = not (panel and kern_blocked)
+                legal = retention in coulomb.RETENTION_MODES
+                legal &= not (panel and kern_blocked)
                 legal &= not (panel and staged)
                 legal &= not (backend == "host" and (panel or kern_blocked))
                 legal &= not (backend == "host" and custom)
                 legal &= not (backend == "device" and jitter)
                 if retention == "cholesky_jitter":
-                    legal &= backend == "host" and not with_rtol and not pin
+                    legal &= (
+                        backend == "host" and not with_rtol and not pin
+                        and not target
+                    )
                 else:
                     legal &= not jitter
+                if retention != "single":
+                    legal &= not pin and not target
+                if pin:
+                    legal &= not with_rtol and not target
 
                 kwargs = dict(
                     solve_backend=backend,
@@ -121,6 +131,7 @@ class TestBuildPlan(unittest.TestCase):
                     provider_cls=custom_provider if custom else RawKernelProvider,
                     rtol=1e-6 if with_rtol else None,
                     n_retained_pin=2 if pin else None,
+                    target_truncation_residual=1e-3 if target else None,
                 )
                 if not legal:
                     with self.assertRaises(ValueError):
@@ -148,7 +159,42 @@ class TestBuildPlan(unittest.TestCase):
                 # the plan boundary, before an expensive build can complete.
                 json.dumps(plan.to_dict())
                 checked += 1
-        self.assertEqual(checked, 512)
+        self.assertEqual(checked, 2560)
+
+    def test_retained_rank_pin_is_normalized_and_validated_pre_ao(self):
+        for pin, expected in (
+            (2, 2),
+            ([1, 2], [1, 2]),
+            (np.asarray([2, 3], dtype=np.int32), [2, 3]),
+        ):
+            with self.subTest(pin=repr(pin)):
+                resolved = self._resolve(n_retained_pin=pin).to_dict()["resolved"]
+                self.assertEqual(resolved["n_retained_pin"], expected)
+
+        for pin in (True, 0, 4, [1], [1, 4], [1.0, 2.0]):
+            with self.subTest(invalid_pin=repr(pin)):
+                with self.assertRaises(ValueError):
+                    self._resolve(n_retained_pin=pin)
+
+    def test_invalid_retention_routes_refuse_before_mesh_or_ao(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        invalid = (
+            {"retention_mode": "not_a_mode"},
+            {"retention_mode": "pairwise", "n_retained_pin": 2},
+            {"retention_mode": "svd_lstsq", "n_retained_pin": 2},
+        )
+        with mock.patch.object(
+            coulomb, "canonicalize_kpts",
+            side_effect=AssertionError("mesh construction was reached"),
+        ):
+            for kwargs in invalid:
+                with self.subTest(**kwargs):
+                    with self.assertRaises(ValueError):
+                        coulomb.build(
+                            cell, kpts, rank=3, block_size=9,
+                            selection_mode="streamed", **kwargs,
+                        )
 
     def test_selection_matrix_resolves_or_rejects_every_public_mode(self):
         predicted = coulomb.predicted_cached_ao_bytes(10, 2, 3)

@@ -130,6 +130,8 @@ FROZEN_BPC_POLICY = {
 # -- which is the failure the previous comment existed to prevent.
 DEFAULT_SELECTION_MODE = "bpc_auto"
 
+RETENTION_MODES = ("single", "pairwise", "svd_lstsq", "cholesky_jitter")
+
 RETIRED_SELECTION_MODES = {
     "jax_cached_matrix_free": "bpc_cached_gemm",
     "jax_translation_matrix_free": "bpc_cached_gemm",
@@ -161,6 +163,11 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
         raise ValueError(
             f"solve_backend must be 'device' or 'host', got {solve_backend!r}. "
             f"'host' is a reference path for accuracy work, not a performance path."
+        )
+    if retention_mode not in RETENTION_MODES:
+        raise ValueError(
+            f"retention_mode must be one of {RETENTION_MODES}, got "
+            f"{retention_mode!r}."
         )
     if p_block_rows is not None and kern_blocking is not None:
         raise ValueError(
@@ -217,11 +224,54 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
                     f"the mode regularizes rather than truncating, so it has no "
                     f"retained set."
                 )
+        if jitter_rcond is not None:
+            if isinstance(jitter_rcond, bool) or not isinstance(
+                jitter_rcond, (int, float, np.integer, np.floating)
+            ) or not np.isfinite(jitter_rcond) or float(jitter_rcond) <= 0:
+                raise ValueError(
+                    "jitter_rcond must be a finite positive float, got "
+                    f"{jitter_rcond!r}."
+                )
     elif jitter_rcond is not None:
         raise ValueError(
             f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
             f"{retention_mode!r}."
         )
+    if retention_mode != "cholesky_jitter" and rtol is not None:
+        if isinstance(rtol, bool) or not isinstance(
+            rtol, (int, float, np.integer, np.floating)
+        ) or not np.isfinite(rtol) or float(rtol) <= 0:
+            raise ValueError(f"rtol must be a finite positive float, got {rtol!r}.")
+    if retention_mode != "single" and n_retained_pin is not None:
+        raise ValueError(
+            "n_retained_pin is only supported for retention_mode='single'."
+        )
+    if retention_mode != "single" and target_truncation_residual is not None:
+        raise ValueError(
+            "target_truncation_residual is only supported for "
+            "retention_mode='single'."
+        )
+    if n_retained_pin is not None:
+        if rtol is not None:
+            raise ValueError(
+                "n_retained_pin is mutually exclusive with rtol; leave rtol=None."
+            )
+        if target_truncation_residual is not None:
+            raise ValueError(
+                "n_retained_pin is mutually exclusive with "
+                "target_truncation_residual."
+            )
+    if target_truncation_residual is not None:
+        if isinstance(target_truncation_residual, bool) or not isinstance(
+            target_truncation_residual,
+            (int, float, np.integer, np.floating),
+        ) or not np.isfinite(target_truncation_residual) or float(
+            target_truncation_residual
+        ) < 0:
+            raise ValueError(
+                "target_truncation_residual must be None or a finite "
+                f"non-negative float, got {target_truncation_residual!r}."
+            )
 
 
 def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
@@ -281,6 +331,47 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
             raise ValueError(
                 f"p_block_rows must be a positive integer, got {p_block_rows!r}."
             )
+
+    n_retained_pin_resolved = None
+    if n_retained_pin is not None:
+        if isinstance(n_retained_pin, (list, tuple, np.ndarray)):
+            pins = np.asarray(n_retained_pin)
+            if pins.ndim != 1 or pins.size != int(n_kpts):
+                raise ValueError(
+                    f"n_retained_pin sequence must have length {n_kpts}, got "
+                    f"shape {pins.shape}."
+                )
+            if not np.issubdtype(pins.dtype, np.integer):
+                raise ValueError("n_retained_pin entries must be integers.")
+            if np.any(pins < 1) or np.any(pins > int(rank)):
+                raise ValueError(
+                    f"n_retained_pin entries must be in [1, {rank}]."
+                )
+            n_retained_pin_resolved = pins.astype(np.int64, copy=False).tolist()
+        else:
+            if isinstance(n_retained_pin, bool) or not isinstance(
+                n_retained_pin, (int, np.integer)
+            ):
+                raise ValueError(
+                    f"n_retained_pin must be an integer in [1, {rank}] or a "
+                    f"length-{n_kpts} integer sequence, got {n_retained_pin!r}."
+                )
+            pin = int(n_retained_pin)
+            if not 1 <= pin <= int(rank):
+                raise ValueError(
+                    f"n_retained_pin must be in [1, {rank}], got {pin}."
+                )
+            n_retained_pin_resolved = pin
+
+    rtol_resolved = None if rtol is None else float(rtol)
+    jitter_rcond_resolved = (
+        None if jitter_rcond is None else float(jitter_rcond)
+    )
+    target_truncation_residual_resolved = (
+        None
+        if target_truncation_residual is None
+        else float(target_truncation_residual)
+    )
 
     requested_mode = selection_mode
     fixed_pivots_provided = fixed_pivots is not None
@@ -478,6 +569,10 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         "kernel_strategy": kernel_strategy,
         "solve_backend": solve_backend,
         "retention_mode": retention_mode,
+        "rtol": rtol_resolved,
+        "n_retained_pin": n_retained_pin_resolved,
+        "jitter_rcond": jitter_rcond_resolved,
+        "target_truncation_residual": target_truncation_residual_resolved,
         "provider": {
             "provider_class": provider_name,
             "details": provider_details_native,
@@ -523,9 +618,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             callback is logged and recorded in the provenance, not propagated.
         rtol: forwarded to the S4 Hermitian sandwich solve; None means the
             1e-4 default, and must be None when n_retained_pin is given.
-        retention_mode: "single" or "pairwise" -- forwarded to the S4
-            Hermitian sandwich solve. See hermitian_sandwich_solve's
-            docstring (pytc/df/solvers.py) for the two modes.
+        retention_mode: "single", "pairwise", "svd_lstsq", or
+            "cholesky_jitter" -- forwarded to the S4 Hermitian sandwich
+            solve. See hermitian_sandwich_solve's docstring
+            (pytc/df/solvers.py) for their contracts.
         provider_cls: KernelProvider for S4 (default RawKernelProvider).
         n_retained_pin: optional int K or length-Nk sequence, forwarded
             per-q to the S4 solve (fixed effective rank; mutually
@@ -584,9 +680,23 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
     )
     plan_record = plan.to_dict()
     resolved_plan = plan_record["resolved"]
+    rank = resolved_plan["rank"]
+    block_size = resolved_plan["block_size"]
     selection_mode = resolved_plan["selection_mode"]
     selector = resolved_plan["selector"]
     storage = resolved_plan["storage"]
+    fixed_pivots = resolved_plan["fixed_pivots"]
+    reuse_ao_cache_for_eta = resolved_plan["reuse_ao_cache_for_eta"]
+    stage_eta_root = resolved_plan["stage_eta_root"]
+    stage_eta_block = resolved_plan["stage_eta_block"]
+    kern_blocking = resolved_plan["kern_blocking"]
+    convolve_device = resolved_plan["convolve_device"]
+    p_block_rows = resolved_plan["p_block_rows"]
+    solve_backend = resolved_plan["solve_backend"]
+    retention_mode = resolved_plan["retention_mode"]
+    rtol = resolved_plan["rtol"]
+    n_retained_pin = resolved_plan["n_retained_pin"]
+    jitter_rcond = resolved_plan["jitter_rcond"]
     provider_provenance = resolved_plan["provider"]
     cache_gate = {
         "predicted_cached_ao_bytes": resolved_plan["predicted_cached_ao_bytes"],
