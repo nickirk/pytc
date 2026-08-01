@@ -16,25 +16,20 @@ class TestTCSCF(unittest.TestCase):
             basis='sto-3g',
             verbose=0
         )
-        # Simple Jastrow
         #self.jastrow = BoysHandy.create(self.mol)
 
         self.jastrow = REXP()
-        # Initialize with some parameters
         self.params = self.jastrow.init_params(alpha=0.9)
         # Set some non-zero parameters to ensure TC terms are active
-        # e.g. set 'b' or 'd' if possible, or rely on default init
         
     def test_init(self):
         tc_scf = TCSCF(self.mol, self.jastrow, self.params)
         self.assertIsNotNone(tc_scf.tc_obj)
-        # Check if TC object is in AO basis (phi shape should match nao)
         self.assertEqual(tc_scf.tc_obj.phi.shape[0], self.mol.nao_nr())
 
     def test_hcore(self):
         tc_scf = TCSCF(self.mol, self.jastrow, self.params)
         hcore = tc_scf.get_hcore()
-        # Should be same shape as nao
         nao = self.mol.nao_nr()
         self.assertEqual(hcore.shape, (nao, nao))
         
@@ -58,21 +53,17 @@ class TestTCSCF(unittest.TestCase):
         
         print(f"TC-SCF Energy: {e_tot}")
         
-        # Compare with standard HF
         mf = scf.RHF(self.mol)
         e_hf = mf.kernel()
         print(f"HF Energy: {e_hf}")
         
-        # TC energy should be different
         self.assertNotAlmostEqual(e_tot, e_hf)
         self.assertTrue(np.isfinite(e_tot))
         
-        # Compare with standard HF
         mf = scf.RHF(self.mol)
         e_hf = mf.kernel()
         print(f"HF Energy: {e_hf}")
         
-        # TC energy should be different (likely lower if Jastrow is good, or just different)
         self.assertNotAlmostEqual(e_tot, e_hf)
 
 if __name__ == "__main__":

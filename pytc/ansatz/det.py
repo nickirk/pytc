@@ -44,25 +44,20 @@ class SlaterDet:
             mol_gto = MolGTO_Spherical.create(mol)
             eval_ao_func = eval_ao_spherical
     
-        # Detect if mo_coeff is restricted or unrestricted
         if isinstance(mo_coeff, (list, tuple)):
             # mo_coeff[0] = alpha, mo_coeff[1] = beta
             mo_coeff_alpha = mo_coeff[0]
             mo_coeff_beta = mo_coeff[1]
         else:
-            # Single set of coefficients, treat as RHF
             mo_coeff_alpha = mo_coeff
             mo_coeff_beta = mo_coeff
     
-        # Default occupied orbitals (HF reference)
         alpha_occ = list(range(n_alpha)) 
         beta_occ = list(range(n_beta))  
 
-        # Apply excitations if specified
         if excitations is not None:
             alpha_exc, beta_exc = excitations
             
-            # Handle alpha excitations
             if alpha_exc and len(alpha_exc) == 2:
                 from_idx, to_idx = alpha_exc
                 if len(from_idx) != len(to_idx):
@@ -76,7 +71,6 @@ class SlaterDet:
                     alpha_occ.append(a)  
                 alpha_occ.sort()
                 
-            # Handle beta excitations
             if beta_exc and len(beta_exc) == 2:
                 from_idx, to_idx = beta_exc
                 if len(from_idx) != len(to_idx):
@@ -90,7 +84,6 @@ class SlaterDet:
                     beta_occ.append(a)  
                 beta_occ.sort()
 
-        # Extract occupied MO coefficients
         mo_coeff_alpha_occ = jnp.array(mo_coeff_alpha[:, alpha_occ])
         mo_coeff_beta_occ = jnp.array(mo_coeff_beta[:, beta_occ])
 
@@ -154,7 +147,6 @@ def eval_det_value(det: SlaterDet, walker):
     positions = walker.positions
     is_batched = positions.ndim == 3
     
-    # Evaluate AOs for all electrons
     ao_vals = det.eval_ao_func(det.mol_gto, positions, deriv=0) 
     
     ao_alpha, ao_beta = _split_spin(det, ao_vals, is_batched)
@@ -267,9 +259,6 @@ def eval_det_matrix(det: SlaterDet, coords):
     
     return slater_up, slater_down
 
-# =====================================================================
-# Sherman-Morrison rank-1 update functions for single-electron moves
-# =====================================================================
 
 def eval_single_electron_ao(det: SlaterDet, pos_single):
     """Evaluate AOs (value, gradient, laplacian) for a single electron position.
@@ -368,11 +357,9 @@ def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
     """
     n_alpha = det.n_alpha
 
-    # Evaluate AOs at the new electron position
     new_pos = walker.positions[electron_idx]
     ao_val, ao_grad, ao_lap = eval_single_electron_ao(det, new_pos)
 
-    # Determine spin and local row index
     is_alpha = electron_idx < n_alpha
     local_idx = jnp.where(is_alpha, electron_idx, electron_idx - n_alpha)
 
@@ -382,7 +369,6 @@ def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
     new_row_dn, new_grad_row_dn, new_lap_row_dn = compute_new_row(
         det, ao_val, ao_grad, ao_lap, is_alpha=False)
 
-    # Det ratio for affected spin channel
     ratio_up = jnp.where(
         is_alpha,
         compute_det_ratio_from_row(new_row_up, walker.inv_up, local_idx),
@@ -391,7 +377,6 @@ def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
         is_alpha, 1.0,
         compute_det_ratio_from_row(new_row_dn, walker.inv_down, local_idx))
 
-    # Sherman-Morrison inverse update
     old_row_up = walker.slater_up[local_idx]
     inv_up_new = jnp.where(
         is_alpha,
@@ -404,14 +389,12 @@ def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
         update_inverse_sherman_morrison(
             walker.inv_down, new_row_dn, old_row_dn, local_idx, ratio_dn))
 
-    # Update Slater matrix row
     slater_up_new = jnp.where(
         is_alpha, walker.slater_up.at[local_idx].set(new_row_up), walker.slater_up)
     slater_dn_new = jnp.where(
         is_alpha, walker.slater_down,
         walker.slater_down.at[local_idx].set(new_row_dn))
 
-    # Update gradient and laplacian rows
     grad_up_new = jnp.where(
         is_alpha, walker.grad_up.at[local_idx].set(new_grad_row_up), walker.grad_up)
     grad_dn_new = jnp.where(
@@ -423,7 +406,6 @@ def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
         is_alpha, walker.lap_down,
         walker.lap_down.at[local_idx].set(new_lap_row_dn))
 
-    # Update log-determinant and sign
     sign_up_old, logdet_up_old = walker.det_up
     sign_dn_old, logdet_dn_old = walker.det_down
 
@@ -452,7 +434,6 @@ def rank1_update_one_electron(det: SlaterDet, walker, electron_idx):
     return total_ratio, det_logabs_new, det_sign_new, updated_walker
 
 
-# Aliases for compatibility
 value_and_grad = eval_det_value_and_grad
 grad = eval_det_grad
 laplacian = eval_det_laplacian

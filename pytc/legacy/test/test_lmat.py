@@ -48,7 +48,6 @@ class TestLmat(unittest.TestCase):
         cls.n_orb = cls.mf.mo_coeff.shape[1]
         cls.jastrow = SimpleJastrow([0.5])  # alpha = 0.5
         
-        # Set up grid points for testing
         from pyscf import dft
         grids = dft.gen_grid.Grids(cls.mol)
         grids.level = 1  # Use coarse grid for testing
@@ -56,13 +55,11 @@ class TestLmat(unittest.TestCase):
         cls.grid_points = grids.coords  # Shape: (N_grid, 3)
         cls.weights = grids.weights
         
-        # Prepare basis functions on grid with correct shapes
         ao = dft.numint.eval_ao(cls.mol, cls.grid_points, deriv=1)
         cls.rho = np.dot(ao[0], cls.mf.mo_coeff).T  # Shape: (N_orb, N_grid)
         cls.nabla_rho = np.dot(ao[1:4].transpose(1,0,2), 
                               cls.mf.mo_coeff).transpose(2,0,1)  # Shape: (N_orb, N_grid, 3)
         
-        # Prepare paired indices for testing
         cls.rho_paired = np.einsum('in,jn->ijn', 
                                   cls.rho, 
                                   cls.rho).reshape(-1, len(cls.weights))
@@ -71,7 +68,6 @@ class TestLmat(unittest.TestCase):
                                         cls.nabla_rho, 
                                         cls.rho).reshape(-1, len(cls.weights), 3)
         
-        # Pre-compute u_gradients for all tests
         cls.u_gradients = cls.jastrow.grad(cls.grid_points)
     
     def test_v_vector_shape(self):
@@ -88,10 +84,8 @@ class TestLmat(unittest.TestCase):
     
     def test_l_matrix_shape(self):
         """Test if L matrix computation returns correct shape."""
-        # Get Jastrow gradients and compute V vectors
         v_bra = lmat.calc_v_vector(self.rho_paired, self.jastrow, self.grid_points, self.weights)
         
-        # Compute L matrix
         l_mat = lmat.calc_L(
             self.rho_paired,
             v_bra,
@@ -104,17 +98,14 @@ class TestLmat(unittest.TestCase):
     @unittest.skip("Failing numerically, lmat.py is deprecated")
     def test_l_matrix_symmetry(self):
         """Test symmetry properties of L matrix elements."""
-        # Get Jastrow gradients and compute V vectors
         v_bra = lmat.calc_v_vector(self.rho_paired, self.jastrow, self.grid_points, self.weights)
         
-        # Get symmetric L matrix
         l_mat = lmat.calc_L_symmetric(
             self.rho_paired,
             v_bra,
             self.weights
         )
         
-        # Test permutation symmetry
         l_tensor = l_mat.reshape((self.n_orb**2,)*3)
         for p in range(self.n_orb):
             for q in range(self.n_orb):
@@ -127,11 +118,7 @@ class TestLmat(unittest.TestCase):
     
     def test_calc_v_vector(self):
         """Test the calc_v_vector function for correct output."""
-        # Prepare test data with correct shapes
-        # Note: mocking Jastrow object for this specific test might be needed if we want to validte exact values
-        # For now, validting execution with real objects in other tests should be sufficient.
         pass
-        # ...rest of assertions remain the same...
 
 
 if __name__ == '__main__':

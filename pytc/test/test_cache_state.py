@@ -160,7 +160,6 @@ class TestSyncRejectsWrongBasis(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         try:
             cache_path = os.path.join(tmp.name, "cache.h5")
-            # Save 321g state.
             save_orbital_state_to_cache(
                 cache_path,
                 mo_coeff=mf_a.mo_coeff,

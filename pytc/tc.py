@@ -158,7 +158,7 @@ def _panel_blk_overrides():
 # code paths sharing the same ISDFTC instance can both benefit from a
 # single upload.  Keys are ``(id(self), device_id)`` for fast lookup.
 #
-# Lifecycle (Codex P1 fix)
+# Lifecycle
 # ------------------------
 # Without explicit cleanup the cache leaks both ways:
 #   1. Memory: an ISDFTC instance that is GC'd leaves its multi-GB
@@ -363,13 +363,11 @@ def trim_panel(tc, panel_layout, actual_a, actual_b):
 
 def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_factor, ranges, batch_size):
     """Compute K terms for one device shard."""
-    # Helper to calculate size from tuple (start, stop, step)
     def get_size(r, size):
         start, stop, step = slice(*r).indices(size)
         return (stop - start + (step - 1)) // step
     
     n_orb = phi.shape[0]
-    # Unpack ranges (p, q, r, s) tuples
     t_p, t_q, t_r, t_s = ranges
     
     Np = get_size(t_p, n_orb)
@@ -378,7 +376,6 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
     Ns = get_size(t_s, n_orb)
     
     # Compute K1 (nabla on p)
-    # Convert tuples back to slices for kmat functions
     slices = tuple(slice(*r) for r in ranges)
     
     k1_raw = kmat_jax.calc_K1(
@@ -395,7 +392,6 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
         # If p and q ranges are identical, K2 is just K1 with p,q swapped
         k2 = k1.transpose(1, 0, 2, 3)
     else:
-        # Must compute explicitly: swap p and q
         ranges_k2 = (slices[1], slices[0], slices[2], slices[3])
         k2_raw = kmat_jax.calc_K1(
             phi, grad_phi,
@@ -407,7 +403,6 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
         # Result is (Nq, Np, Nr, Ns), transpose to (Np, Nq, Nr, Ns)
         k2 = k2_raw.reshape(Nq, Np, Nr, Ns).transpose(1, 0, 2, 3)
         
-    # Compute K3
     k3_raw = kmat_jax.calc_K3(
         phi, jastrow_factor, jastrow_params,
         grid, weights,
@@ -416,10 +411,8 @@ def _compute_2b_shard(phi, grad_phi, grid, weights, jastrow_params, jastrow_fact
     )
     k3 = k3_raw.reshape(Np, Nq, Nr, Ns)
     
-    # Combine: 0.5 * (K1 - K2 + K3)
     result_local = 0.5 * (k1 - k2 + k3)
     
-    # Sum results across devices
     result_sum = jax.lax.psum(result_local, axis_name='devices')
     
     return result_sum
@@ -480,8 +473,6 @@ class TC:
         grid_points = jnp.asarray(grids.coords)
         weights = jnp.asarray(grids.weights)
 
-        # Evaluate basis on grid
-        # Use PySCF to evaluate AOs with numpy arrays
         logger.info(f"TC: Evaluating basis on grid")
         start_time = time.perf_counter()
         ao = dft.numint.eval_ao(mol, grids.coords, deriv=1)
@@ -608,7 +599,6 @@ class TC:
         devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
 
-        # Pad grid axis to be divisible by n_devices
         remainder = n_grid % n_devices
         padding = (n_devices - remainder) if remainder != 0 else 0
         if padding > 0:
@@ -659,15 +649,11 @@ class TC:
         # Convert slices to hashable tuples for static closure args
         ranges_tuple = tuple((s.start, s.stop, s.step) for s in ranges)
 
-        # Compute main block: 0.5 * (K1 - K2 + K3)
         result = _run_sharded(ranges_tuple)
         
-        # Add transpose block: (r, s, p, q)
-        # Check if ranges imply symmetry
         slice_p, slice_q, slice_r, slice_s = ranges
         
         if slice_p == slice_r and slice_q == slice_s:
-            # Symmetric block (e.g. 'oooo'), just add transpose of result
             result += result.transpose(2, 3, 0, 1)
         else:
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
@@ -727,8 +713,7 @@ class TC:
                 start = chunk_idx * batch_size
                 end = jnp.minimum(start + batch_size, N_grid)
                 
-                # Using dynamic_slice
-                slice_len = batch_size # Fixed size slice
+                slice_len = batch_size
                 r2_chunk = jax.lax.dynamic_slice(self.grid_points, (start, 0), (slice_len, 3))
                 w_chunk = jax.lax.dynamic_slice(self.weights, (start,), (slice_len,))
                 density_chunk = jax.lax.dynamic_slice(density_g, (start,), (slice_len,))
@@ -746,8 +731,6 @@ class TC:
             W_batch, _ = jax.lax.scan(inner_scan, jnp.zeros((r_batch.shape[0], 3)), jnp.arange(n_chunks))
             return W_batch
 
-        # Compute W for all grid points
-        # Scan over r_batch
         n_batches = (N_grid + batch_size - 1) // batch_size
         
         # Pad grid arrays to be divisible by batch_size to avoid slicing issues
@@ -765,7 +748,6 @@ class TC:
         def compute_W_batch_padded(r_batch, grid_p, weights_p, density_p):
             def inner_scan_p(carry, chunk_idx):
                 start = chunk_idx * batch_size
-                # Fixed size slice on padded arrays
                 r2_chunk = jax.lax.dynamic_slice(grid_p, (start, 0), (batch_size, 3))
                 w_chunk = jax.lax.dynamic_slice(weights_p, (start,), (batch_size,))
                 density_chunk = jax.lax.dynamic_slice(density_p, (start,), (batch_size,))
@@ -781,13 +763,12 @@ class TC:
 
         def outer_scan(carry, batch_idx):
             start = batch_idx * batch_size
-            # Slice from padded grid
             r_batch = jax.lax.dynamic_slice(grid_padded, (start, 0), (batch_size, 3))
             W_batch = compute_W_batch_padded(r_batch, grid_padded, weights_padded, density_g_padded)
             return carry, W_batch 
             
         _, W_all = jax.lax.scan(outer_scan, None, jnp.arange(n_batches))
-        W_all = W_all.reshape(-1, 3)[:N_grid] # Flatten and trim padding if any
+        W_all = W_all.reshape(-1, 3)[:N_grid]
         
         # 3. Compute V_3b_direct(r) = |W(r)|^2
         V_3b_g = jnp.sum(W_all**2, axis=1) # (N_grid,)
@@ -812,7 +793,6 @@ class TC:
         Returns:
             Fock matrix contribution (N, N)
         """
-        # 1. Compute density on grid
         density_g = jnp.einsum('mg,ng,mn->g', self.phi, self.phi, dm1)
         
         # 2. Compute W(r) on grid using full broadcasting
@@ -831,7 +811,6 @@ class TC:
         # 3. Compute V_3b_direct(r) = |W(r)|^2
         V_3b_g = jnp.sum(W_all**2, axis=1) # (N_grid,)
         
-        # 4. Integrate to get Fock matrix elements
         weighted_phi = self.phi * (self.weights * V_3b_g)[None, :]
         F_3b = jnp.dot(weighted_phi, self.phi.T)
         
@@ -886,7 +865,6 @@ class ISDFTC(TC):
             _get_gpu_free_bytes,
         )
 
-        # Determine streaming decision on the most-constrained local device.
         streaming = False
         k_stream_panel = None
         kernels = getattr(self, "isdf_kernels", None)
@@ -1050,7 +1028,6 @@ class ISDFTC(TC):
         if n_rank is None:
             n_rank = tc_obj.grid_points.shape[0] // 4
             
-        # Perform ISDF decomposition
         logger.info("ISDFTC.from_tc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
@@ -1266,7 +1243,6 @@ class ISDFTC(TC):
         rep_sharding = NamedSharding(mesh, P())
         device_grid = np.asarray(mesh.devices)
 
-        # Pad n_rank so it's a multiple of m_k.
         n_rank_padded = ((n_rank + m_k - 1) // m_k) * m_k
         pad_k = n_rank_padded - n_rank
 
@@ -1512,11 +1488,9 @@ class ISDFTC(TC):
         n_grid = self.grid_points.shape[0]
         n_rank = self.phi_isdf.shape[1]
         
-        # If host_grid_block_size is None, process the whole grid in one block
         if host_grid_block_size is None:
             host_grid_block_size = n_grid
             
-        # Initialize L_aux on host or HDF5
         L_aux_out = None
         f_out = None
         if save_path:
@@ -1526,7 +1500,6 @@ class ISDFTC(TC):
         else:
             L_aux_out = np.zeros((n_rank, n_grid, 3))
             
-        # Open xi_phi dataset if needed
         xi_phi_ds = None
         f_xi = None
         if self.xi_phi is None and self.save_path:
@@ -1555,7 +1528,6 @@ class ISDFTC(TC):
             n_int = grid_int.shape[0]
             n_batches = (n_int + batch_size - 1) // batch_size
             
-            # Pad integration grid for scan
             pad_int = n_batches * batch_size - n_int
             if pad_int > 0:
                 grid_int = jnp.pad(grid_int, ((0, pad_int), (0, 0)))
@@ -1576,7 +1548,6 @@ class ISDFTC(TC):
             return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
 
         try:
-            # Outer loop: Evaluation blocks (r)
             for r0 in range(0, n_grid, host_grid_block_size):
                 r1 = min(r0 + host_grid_block_size, n_grid)
                 n_eval = r1 - r0
@@ -1593,7 +1564,6 @@ class ISDFTC(TC):
                 
                 res_rep_accum = None
                 
-                # Inner loop: Integration blocks (g)
                 # Also controlled by host_grid_block_size to limit peak memory of inputs
                 from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
@@ -1616,14 +1586,12 @@ class ISDFTC(TC):
 
                 pending_int = None
                 for g0 in range(0, n_grid, host_grid_block_size):
-                    # Fetch prepared data (prefetched or inline)
                     if pending_int is not None:
                         grid_int_chunk, weights_int_chunk, xi_phi_chunk = await_read(pending_int)
                         pending_int = None
                     else:
                         grid_int_chunk, weights_int_chunk, xi_phi_chunk = _prepare_Laux_int_block(g0)
                             
-                    # Compute partial update
                     res_partial = sharded_compute(
                         sharded_grid_eval, params_rep, grid_int_chunk, weights_int_chunk, xi_phi_chunk
                     )
@@ -1638,7 +1606,6 @@ class ISDFTC(TC):
                     else:
                         res_rep_accum += res_partial
                     
-                    # Explicitly free memory
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
                 
                 res_block = res_rep_accum[:, :n_eval, :]
@@ -1679,7 +1646,6 @@ class ISDFTC(TC):
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
-        # Use save_path if provided, otherwise use self.save_path
         out_path = save_path if save_path else self.save_path
         
         kernels = {}
@@ -1708,7 +1674,6 @@ class ISDFTC(TC):
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 
-        # 1. Compute K1_kernel and K3_kernel
         logger.info("  Computing K1 and K3 kernels...")
         
         kernels = self.compute_kmat_kernels(jastrow_params, batch_size,
@@ -1718,7 +1683,6 @@ class ISDFTC(TC):
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
         
-        # 2. Compute L_aux
         logger.info("  Computing L_aux...")
         L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
         
@@ -1738,10 +1702,9 @@ class ISDFTC(TC):
         if out_path and not self.is_incore:
             with h5py.File(out_path, 'a') as f:
                 for k, v in kernels.items():
-                    if k == 'L_aux': continue # Already saved
+                    if k == 'L_aux': continue
                     if k in f: del f[k]
                     f.create_dataset(k, data=np.array(v))
-                # Basics are already saved by isdf_decompose, but let's ensure they are there
                 if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
@@ -1768,7 +1731,6 @@ class ISDFTC(TC):
         """
         slice_r_T, slice_s_T, slice_p_T, slice_q_T = ranges_T
 
-        # Determine start/stop for the first axis of the transpose block
         nmo = self.phi_isdf.shape[0]
         r_start = slice_r_T.start if slice_r_T.start is not None else 0
         r_stop = slice_r_T.stop if slice_r_T.stop is not None else nmo
@@ -1777,7 +1739,6 @@ class ISDFTC(TC):
         # Use fixed rank_block_size to avoid JIT recompilation.
         rbs = self._get_fixed_rank_block_size()
 
-        # Determine chunk boundaries
         chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
         cache_getter = getattr(self, "_get_isdf_device_cache", None)
         cache = (
@@ -1794,7 +1755,6 @@ class ISDFTC(TC):
             sub_slice_r = slice(r_start + i0, r_start + i1)
             sub_ranges = (sub_slice_r, slice_s_T, slice_p_T, slice_q_T)
 
-            # K1-K2 sub-chunk on GPU
             with device_ctx:
                 if sub_slice_r == slice_s_T:
                     tmp = kmat_jax.contract_K1_isdf(
@@ -1804,7 +1764,6 @@ class ISDFTC(TC):
                     tmp = kmat_jax.contract_K1_minus_K2_isdf(
                         phi_full, grad_full, u1, sub_ranges, rank_block_size=rbs)
 
-                # K3 sub-chunk on GPU
                 tmp = tmp + kmat_jax.contract_K3_isdf(
                     phi_full, u3, sub_ranges, rank_block_size=rbs)
 
@@ -2060,10 +2019,7 @@ class ISDFTC(TC):
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
         # Full-tensor fallback: when no block/ranges requested, build the
-        # entire (n_orb, n_orb, n_orb, n_orb) TC correction.  Prior to the
-        # ec4a6ea refactor this was handled inline; the extraction of
-        # ``_assemble_tc_tile`` dropped the fallback, so without it callers
-        # like ``get_2b_fock(T=None)`` crash on ``ranges=None``.
+        # entire (n_orb, n_orb, n_orb, n_orb) TC correction.
         if ranges is None:
             full = slice(None)
             ranges = (full, full, full, full)
@@ -2089,7 +2045,6 @@ class ISDFTC(TC):
             L_aux: Optional precomputed auxiliary potential (N_aux, N_grid, 3).
                    If None, it will be computed on the fly.
         """
-        # 1. Check cache / Compute L_aux
         if L_aux is None:
             if self.isdf_kernels is not None and 'L_aux' in self.isdf_kernels:
                 L_aux = self.isdf_kernels['L_aux']
@@ -2107,7 +2062,6 @@ class ISDFTC(TC):
         # rho_pivots: (N_aux,)
         W_g = jnp.einsum('a,agc->gc', rho_pivots, L_aux)
         
-        # 4. Compute V_3b
         V_3b_g = jnp.sum(W_g**2, axis=1)
         
         # 5. Integrate Fock matrix using ISDF

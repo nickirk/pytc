@@ -151,8 +151,6 @@ class TestXTCCCSDLargeBlocks(unittest.TestCase):
 
     def test_large_block_datasets_are_chunked(self):
         # Each tile is written as ``[:, :, r0:r1, :]`` with r-extent
-        # equal to ``panel_blk``.  Commit 5366fed aligned the axis-2
-        # HDF5 chunk size with ``panel_blk`` (rather than ``nocc``)
         # so every slab write lands on chunk boundaries — eliminating
         # the read-modify-write tax HDF5 was paying when the previous
         # ``nocc``-aligned chunks straddled tile boundaries.

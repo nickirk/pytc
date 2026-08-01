@@ -175,7 +175,6 @@ def _read_X_slice(X, slice_r, slice_s):
         _X_HDF5_CACHE[key] = data
         return data
         
-    # In-memory array: just slice directly.
     return X[slice_r, slice_s]
 
 
@@ -302,14 +301,11 @@ class XTC(TC):
     @classmethod
     def from_pyscf(cls, mf, jastrow_factor, mo_coeff=None, grid_lvl=2, grid_chunk_size=None):
         """Initialize XTC object from PySCF mean-field object."""
-        # Create base TC object
         tc_obj = super().from_pyscf(mf, jastrow_factor, mo_coeff, grid_lvl, grid_chunk_size)
         
-        # Extract additional fields
         mo_occ = jnp.asarray(mf.mo_occ)
         energy_nuc = mf.energy_nuc()
         
-        # Return XTC object with all fields
         return cls(
             grid_points=tc_obj.grid_points,
             weights=tc_obj.weights,
@@ -346,21 +342,18 @@ class XTC(TC):
         """
         n_orb, n_grid = phi.shape
         
-        # Extract relevant phi blocks
         phi_rows = phi[slice_rows]  # (N_rows, N_grid)
         phi_cols = phi[slice_cols]  # (N_cols, N_grid)
         
         n_rows = phi_rows.shape[0]
         n_cols = phi_cols.shape[0]
         
-        # Pad grid for r2 scan
         padded_size = ((n_grid + batch_size - 1) // batch_size) * batch_size
         padded_grid = jnp.pad(self.grid_points, ((0, padded_size - n_grid), (0, 0)))
         padded_weights = jnp.pad(weights, (0, padded_size - n_grid))
         padded_phi_rows = jnp.pad(phi_rows, ((0, 0), (0, padded_size - n_grid)))
         padded_phi_cols = jnp.pad(phi_cols, ((0, 0), (0, padded_size - n_grid)))
         
-        # Reshape for scanning
         r2_batches = padded_grid.reshape(-1, batch_size, 3)
         weights_batches = padded_weights.reshape(-1, batch_size)
         phi_rows_batches = padded_phi_rows.reshape(n_rows, -1, batch_size)
@@ -418,14 +411,9 @@ class XTC(TC):
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
-        # Check if dm1 is diagonal (for debugging/verification outside JIT)
-        # is_diagonal = jnp.allclose(dm1, jnp.diag(jnp.diagonal(dm1)))
-        # if not is_diagonal:
-        #     raise ValueError("Non-diagonal density matrix for XTC calculation is not supported.")
         
         n_occ_vec = jnp.diagonal(dm1)
         
-        # Pad grid to be divisible by n_devices
         remainder = n_grid % n_devices
         if remainder != 0:
             padding = n_devices - remainder
@@ -450,7 +438,6 @@ class XTC(TC):
             lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
         )
         
-        # Define ranges
         if ranges is None:
             full_slice = slice(None)
             ranges = (full_slice, full_slice, full_slice, full_slice)
@@ -458,10 +445,8 @@ class XTC(TC):
         slice_p, slice_q, slice_r, slice_s = ranges
         slice_occ = slice(0, self.nocc) if self.nocc is not None else slice(None)
         
-        # Slice n_occ_vec to match slice_occ
         n_occ_vec_active = n_occ_vec[slice_occ]
         
-        # Helper to get size
         def get_size(s, size):
             start, stop, step = s.indices(size)
             return (stop - start + (step - 1)) // step
@@ -485,7 +470,6 @@ class XTC(TC):
                 weights_r1_batched = weights_r1
                 phi_r1_batched = phi_r1
                 
-            # Reshape for scanning
             r1_batches = grid_r1_batched.reshape(-1, batch_size, 3)
             weights_batches = weights_r1_batched.reshape(-1, batch_size)
             phi_batches = phi_r1_batched.reshape(self.n_orb, -1, batch_size)
@@ -494,7 +478,6 @@ class XTC(TC):
             def scan_body(carry, args):
                 r1_batch, w_batch, phi_batch = args
                 
-                # Current batch size (might be padded)
                 curr_batch_size = r1_batch.shape[0]
                 
                 # --- Compute V blocks ---
@@ -508,15 +491,12 @@ class XTC(TC):
                 # But _calc_v_block returns (rows, cols, batch, 3)
                 # So V_ji = V_ij.swapaxes(0, 1)
                 
-                # 1. V_occ_occ (for W)
                 V_occ_occ = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                               slice_occ, slice_occ, batch_size)
                 
-                # 2. V_pq
                 V_pq = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                          slice_p, slice_q, batch_size)
                 
-                # 3. V_rs
                 V_rs = self._calc_v_block(r1_batch, self.phi, self.weights, jastrow_params, 
                                          slice_r, slice_s, batch_size)
                 
@@ -545,7 +525,6 @@ class XTC(TC):
                 # Wbar = 2 * sum_k phi_{kk} n_k
                 # phi_batch: (N_orb, batch)
                 phi_occ = phi_batch[slice_occ] # (Nocc, batch)
-                # phi_{kk} is just phi_occ * phi_occ? No, phi_{kk}(r) = |phi_k(r)|^2
                 phi_kk = phi_occ * phi_occ
                 # Wbar: (batch,)
                 Wbar = 2 * jnp.einsum('i,ib->b', n_occ_vec_active, phi_kk)
@@ -579,10 +558,8 @@ class XTC(TC):
                 # --- Block (r, s) Terms ---
                 # Symmetric to (p, q)
                 
-                # Zbar_{rs}
                 Zbar_rs = jnp.einsum('i,irbd,isbd->rsb', n_occ_vec_active, V_occ_r, V_occ_s)
                 
-                # G_{rs}
                 phi_r = phi_batch[slice_r]
                 phi_s = phi_batch[slice_s]
                 phi_kr = jnp.einsum('ib,rb->irb', phi_occ, phi_r)
@@ -591,11 +568,9 @@ class XTC(TC):
                 G_rs = jnp.einsum('i,irb,isbd->rsbd', n_occ_vec_active, phi_kr, V_occ_s) + \
                        jnp.einsum('i,isb,irbd->rsbd', n_occ_vec_active, phi_ks, V_occ_r)
                        
-                # A_{rs}
                 Vbar_rs = jnp.einsum('bd,rsbd->rsb', W, V_rs)
                 A_rs = Vbar_rs - Zbar_rs
                 
-                # B_{rs}
                 B_rs = 0.5 * Wbar[None, None, :, None] * V_rs - G_rs
                 
                 # --- Combine Terms ---
@@ -603,7 +578,6 @@ class XTC(TC):
                 # term1 = phi_{pq} * A_{rs}
                 # phi_{pq} = phi_p * phi_q
                 phi_pq = jnp.einsum('pb,qb->pqb', phi_p, phi_q)
-                # Weighted phi_pq for integration
                 phi_pq_w = phi_pq * w_batch[None, None, :]
                 
                 # term1: (Np, Nq, Nr, Ns)
@@ -614,7 +588,6 @@ class XTC(TC):
                 # V_{pq}: (Np, Nq, batch, 3)
                 # B_{rs}: (Nr, Ns, batch, 3)
                 # term2: (Np, Nq, Nr, Ns)
-                # We can weight V_pq
                 V_pq_w = V_pq * w_batch[None, None, :, None]
                 term2 = jnp.einsum('pqbd,rsbd->pqrs', V_pq_w, B_rs)
                 
@@ -627,7 +600,6 @@ class XTC(TC):
                 V_rs_w = V_rs * w_batch[None, None, :, None]
                 term2_sym = jnp.einsum('rsbd,pqbd->pqrs', V_rs_w, B_pq)
                 
-                # Total for this batch
                 contrib = term1 + term2 + term1_sym + term2_sym
                 
                 return carry + contrib, None
@@ -664,7 +636,6 @@ class XTC(TC):
             ranges = self._get_block_ranges(block_str)
             
         if ranges is None:
-            # Default to full matrix if no ranges specified
             ranges = (slice(None), slice(None), slice(None), slice(None))
             
         slice_p, slice_q, slice_r, slice_s = ranges
@@ -769,31 +740,25 @@ class XTC(TC):
         
         eris = rccsd._ChemistsERIs(mycc)
         
-        # Get standard integrals from helper
         eri_std = tc_helper.get_eri(mf, self.mo_coeff)
         h1e_std = tc_helper.get_hcore(mf, self.mo_coeff)
         
-        # Get corrections
         # Force concrete value computation
         const = np.asarray(self.get_const(jastrow_params))
         h1e_corr = np.asarray(self.get_1b(jastrow_params))
         h2e_corr = np.asarray(self.get_2b(jastrow_params))
         
-        # Combine
         h1e = h1e_std + h1e_corr
         h2e = eri_std + h2e_corr
         
-        # Now use the concrete NumPy arrays
         eris.e_core = np.float64(const)
         eris.fock = h1e.copy()
         
-        # Modify fock matrix
         fock_modification = (2 * np.einsum('pqii->pq', h2e[:,:,:nocc,:nocc]) - 
                            np.einsum('piiq->pq', h2e[:,:nocc,:nocc,:]))
         eris.fock += fock_modification
         eris.mo_energy = np.diag(eris.fock).copy()
         
-        # Store ERI blocks
         eris.oooo = h2e[:nocc,:nocc,:nocc,:nocc].copy()
         eris.ovoo = h2e[:nocc,nocc:,:nocc,:nocc].copy()
         eris.ooov = h2e[:nocc,:nocc,:nocc,nocc:].copy()
@@ -829,12 +794,10 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     # Term 1 & 4: T_D = sum_{a,d} (phi_p*phi_q)_a * D[a,d] * (phi_r*phi_s)_d
     # Scan over blocks of d (second index of D)
     
-    # Pad D
     padded_rank_D = ((N_rank_D + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width_D = padded_rank_D - N_rank_D
     D_padded = jnp.pad(D, ((0, 0), (0, pad_width_D)))
     
-    # Pad phi_r and phi_s (associated with index d)
     phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width_D)))
     phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width_D)))
     
@@ -864,7 +827,6 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
         # C_rs[r, s, d_local]
         C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :]
         
-        # Contract
         contribution = jnp.einsum('pqd,rsd->pqrs', V_block, C_rs)
         return carry + contribution, None
 
@@ -874,13 +836,11 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     # Term 2 & 3: T_X = - sum_c (phi_p*phi_q)_c * X[r,s,c]
     # Scan over blocks of c (rank index of X)
     
-    # Pad X
     padded_rank_X = ((N_rank_X + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width_X = padded_rank_X - N_rank_X
     # X is (Nr, Ns, c)
     X_padded = jnp.pad(X_sliced, ((0,0), (0,0), (0, pad_width_X)))
     
-    # Pad phi_p and phi_q (associated with index c/a)
     phi_p_padded = jnp.pad(phi_p, ((0, 0), (0, pad_width_X)))
     phi_q_padded = jnp.pad(phi_q, ((0, 0), (0, pad_width_X)))
     
@@ -1110,17 +1070,13 @@ class ISDFXTC(XTC, ISDFTC):
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
-        # Use save_path if provided, otherwise use self.save_path
         out_path = save_path if save_path else self.save_path
         
-        # 1. Compute TC kernels (K1, K3, L_aux) using base class
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
                                r2_tile_size=r2_tile_size, gpu_budget_bytes=gpu_budget_bytes)
         kernels = isdf_tc.isdf_kernels
         
-        # 2. Compute Delta U kernels (D, X) with orbital batching
-        # Check if D and X already exist in HDF5
         if out_path and os.path.exists(out_path):
             try:
                 f = h5py.File(out_path, 'r')
@@ -1133,8 +1089,6 @@ class ISDFXTC(XTC, ISDFTC):
                         kernels['X'] = f['X'][:]
                         f.close()
                     else:
-                        # Stream X from file.
-                        # Return the dataset object directly.
                         # Do NOT close 'f' here; the dataset object keeps the file open.
                         logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
                         kernels['X'] = f['X']
@@ -1167,7 +1121,6 @@ class ISDFXTC(XTC, ISDFTC):
         if 'L_aux' in kernels:
             del kernels['L_aux']
         
-        # Persistence for other kernels (phi_isdf, etc.) if out_path provided
         if out_path:
             with h5py.File(out_path, 'a') as f:
                 if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
@@ -1207,7 +1160,6 @@ class ISDFXTC(XTC, ISDFTC):
         sqrt_dm1 = jnp.sqrt(jnp.maximum(dm1_diag, 0.0))  # Ensure non-negative
         L_Q = self.phi_isdf.T * sqrt_dm1[None, :]  # (N_rank, n_orb)
         
-        # 1. Compute D kernel
         logger.info("Computing D kernel...")
         D = self._compute_D_kernel(
             jastrow_params,
@@ -1218,7 +1170,6 @@ class ISDFXTC(XTC, ISDFTC):
             d_reduce_group_blocks=d_reduce_group_blocks,
         )
         
-        # 2. Compute X kernel with orbital batching
         logger.info("Computing X kernel...")
         
         if save_path:
@@ -1235,7 +1186,7 @@ class ISDFXTC(XTC, ISDFTC):
                         ds_name = L_aux.name
                         if L_aux.file: L_aux.file.close()
                         f = h5py.File(save_path, 'a')
-                        L_aux = f[ds_name] # Re-bind L_aux
+                        L_aux = f[ds_name]
                 except Exception as e:
                     logger.warning(f"  Could not check L_aux file path: {e}")
             
@@ -1288,7 +1239,6 @@ class ISDFXTC(XTC, ISDFTC):
                     off1 = s1 - s_panel0
                     X_block_np = X_panel_np[:, off0:off1, :]
                     X[r0:r1, s0:s1, :] = X_block_np
-                    # Fill symmetric block (only if not diagonal).
                     if r0 != s0:
                         X[s0:s1, r0:r1, :] = X_block_np.transpose(1, 0, 2)
 
@@ -1415,10 +1365,8 @@ class ISDFXTC(XTC, ISDFTC):
         phi_isdf = self.phi_isdf
         n_orb = self.n_orb
         
-        # Initialize D on host
         D = np.zeros((n_rank, n_rank))
         
-        # Open xi_phi dataset if needed
         xi_phi_ds = None
         f_xi = None
         if self.xi_phi is None and self.save_path:
@@ -1490,7 +1438,6 @@ class ISDFXTC(XTC, ISDFTC):
                 D += np.asarray(D_rep)
                 t_host_accumulate += time.perf_counter() - t_accum_start
                 
-                # Explicitly clear memory
                 del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, D_rep
                 gc.collect()
                 
@@ -1542,13 +1489,11 @@ class ISDFXTC(XTC, ISDFTC):
         phi_isdf = self.phi_isdf
         n_orb = self.n_orb
         
-        # Initialize X block on host
         slice_p, slice_q, slice_r, slice_s = ranges
         Nr = self.phi_isdf[slice_r].shape[0]
         Ns = self.phi_isdf[slice_s].shape[0]
         X = np.zeros((Nr, Ns, n_rank))
         
-        # Open xi_phi dataset if needed
         xi_phi_ds = None
         f_xi = None
         if self.xi_phi is None and self.save_path:
@@ -1620,7 +1565,6 @@ class ISDFXTC(XTC, ISDFTC):
                 X += np.asarray(X_rep)
                 t_host_accumulate += time.perf_counter() - t_accum_start
                 
-                # Explicitly clear memory
                 del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, X_rep
                 gc.collect()
                 
@@ -1649,7 +1593,6 @@ class ISDFXTC(XTC, ISDFTC):
         N_rank = phi.shape[1]
         N_shard = grid_points.shape[0]
         
-        # Pad grid for scanning
         padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
         weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
         xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
@@ -1664,7 +1607,6 @@ class ISDFXTC(XTC, ISDFTC):
             
             G_flat = G_batch.reshape(N_rank, -1)
             
-            # D1 part
             H = jnp.einsum('b,bik->ik', Gb, G_batch)
             V = jnp.einsum('ik,dik->di', H, G_batch)
             # D1_update = einsum('i,ai,di->ad') but use matmul to avoid large intermediate
@@ -1672,7 +1614,6 @@ class ISDFXTC(XTC, ISDFTC):
             xi_w = xi_batch * w_batch[None, :]  # (N_rank, batch)
             D1_update = jnp.matmul(xi_w, V.T)
             
-            # D4 part
             w_tilde = w_batch * jnp.einsum('b,bi->i', Gb, xi_batch)
             G_weighted = G_batch * w_tilde[None, :, None]
             G_weighted_flat = G_weighted.reshape(N_rank, -1)
@@ -1700,7 +1641,6 @@ class ISDFXTC(XTC, ISDFTC):
         Nr = phi_r.shape[0]
         Ns = phi_s.shape[0]
         
-        # Pad grid for scanning
         padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
         weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
         xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
@@ -1718,7 +1658,6 @@ class ISDFXTC(XTC, ISDFTC):
             
             num_chunks = (Na + chunk_size - 1) // chunk_size
             
-            # Pad dimensions to be multiples of chunk_size
             pad_len = num_chunks * chunk_size - Na
             if pad_len > 0:
                 phi_p = jnp.pad(phi, ((0,0), (0, pad_len)))
@@ -1759,13 +1698,11 @@ class ISDFXTC(XTC, ISDFTC):
             for k in range(3):
                 G_k_T = G_batch[:, :, k].T  # (batch, N_rank)
                 
-                # Projections for G_k
                 P_r_G = compute_proj(phi_r, G_k_T, L_Q)
                 P_s_G = compute_proj(phi_s, G_k_T, L_Q)
                 
                 # Reconstruct X contributions using low-rank outer products
                 # Original: YZ_k = (phi_r_G_Q) @ (phi_s_G).T = (P_r_G @ L_Q.T) @ (P_s_G @ L_Q.T).T
-                # Wait, original was: YZ_k = einsum('bra,bsa->brs', tmp_r_G_Q, phi_s_G)
                 # where tmp_r_G_Q = (phi_r * G) @ L_Q @ L_Q.T = P_r_G @ L_Q.T
                 # and phi_s_G = phi_s * G
                 # So YZ_k = (P_r_G @ L_Q.T) @ (phi_s * G).T
@@ -1906,7 +1843,6 @@ class ISDFXTC(XTC, ISDFTC):
         P_phi = jnp.linalg.multi_dot([phi.T, dm1, phi])
         phi_tilde = jnp.dot(dm1, phi)
 
-        # Check if X is HDF5 dataset
         is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File))
         
         wc = jnp.zeros((phi.shape[1],)) # (N_rank,)
@@ -1915,7 +1851,7 @@ class ISDFXTC(XTC, ISDFTC):
         if is_hdf5:
             # Process strictly in chunks to respect memory
             logger.debug("Streaming X in chunks from HDF5")
-            chunk_size = orb_block_size # Adjust based on memory
+            chunk_size = orb_block_size
             from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
 
             pending_h = None
@@ -1945,13 +1881,11 @@ class ISDFXTC(XTC, ISDFTC):
             wc = jnp.einsum('rsc,rs->c', X, dm1)
             Y_all = jnp.einsum('rqc,rc->qc', X, phi_tilde)
         
-        # Sliced inputs
         phi_p = phi[slice_p]
         phi_q = phi[slice_q]
         Y_p = Y_all[slice_p]
         Y_q = Y_all[slice_q]
         
-        # J terms
         D_sym = D + D.T
         tmp_a = jnp.dot(D_sym, Gb)
         J_D_total = jnp.dot(phi_p * tmp_a[None, :], phi_q.T)
@@ -1969,7 +1903,6 @@ class ISDFXTC(XTC, ISDFTC):
             
             J_X_sym_blocks = []
             
-            # Iterate p in chunks relative to result
             from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
             pending_jx = None
             for i in range(0, Np, orb_block_size):
@@ -1978,7 +1911,6 @@ class ISDFXTC(XTC, ISDFTC):
                 p_abs_stop = start_p + i_end * step_p
                 p_abs_slice = slice(p_abs_start, p_abs_stop, step_p)
                 
-                # Load X block (prefetched or inline)
                 if pending_jx is not None:
                     X_chunk = await_read(pending_jx)
                     pending_jx = None
@@ -2018,7 +1950,6 @@ class ISDFXTC(XTC, ISDFTC):
         
         slice_p, slice_q, slice_r, slice_s = ranges
         
-        # Helper to get length and indices
         def get_info(sl, total):
             if isinstance(sl, slice):
                 idx = np.arange(*sl.indices(total))
@@ -2027,7 +1958,6 @@ class ISDFXTC(XTC, ISDFTC):
             return len(idx), idx
 
         Np, _ = get_info(slice_p, self.n_orb)
-        # Check size of X_sliced vs available GPU memory
         from pytc.utils.gpu_memory import adaptive_rank_block_size, _get_gpu_free_bytes
         Nq, _ = get_info(slice_q, self.n_orb)
         Nr, r_idx = get_info(slice_r, self.n_orb)
@@ -2060,7 +1990,7 @@ class ISDFXTC(XTC, ISDFTC):
             _estimate_delta_u_contraction_bytes(Np, Nq, Nr, Ns, N_rank)
         )
         
-        # Threshold: use 80% of actually free GPU memory (not budget).
+        # Threshold: use half of actually free GPU memory (not budget).
         # This is more accurate than the budget-based estimate since it
         # accounts for pre-allocated tensors (phi_isdf, etc.).
         threshold_bytes = int(gpu_free_bytes * 0.5)
@@ -2108,7 +2038,6 @@ class ISDFXTC(XTC, ISDFTC):
             r_idx_np = np.asarray(r_idx)
             s_idx_np = np.asarray(s_idx)
         
-        # Pre-allocate result on host memory
         result = np.zeros((Np, Nq, Nr, Ns), dtype=np.float64)
         
         # Choose chunk size to keep TOTAL memory (X_chunk + 3× carry) under budget.
@@ -2126,7 +2055,6 @@ class ISDFXTC(XTC, ISDFTC):
         target_bytes = max(threshold_bytes - d_size_bytes, 1)
         
         if Nr >= Ns:
-            # Chunk over r
             per_r_unit_bytes = int(2 * Ns * N_rank * 8 + 3 * Np * Nq * Ns * 8)
             max_Nr_chunk = max(1, int(target_bytes / max(per_r_unit_bytes, 1))) if per_r_unit_bytes > 0 else Nr
             orb_chunk_size = min(max_Nr_chunk, Nr)
@@ -2153,7 +2081,6 @@ class ISDFXTC(XTC, ISDFTC):
                     xc_np = np.pad(xc_np, ((0, pad), (0, 0), (0, 0)))
                 return pr_np, xc_np, alen
 
-            # Pre-compute first chunk synchronously
             phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(0)
             chunk_timer = time.perf_counter()
 
@@ -2163,12 +2090,10 @@ class ISDFXTC(XTC, ISDFTC):
                     f"  Starting delta_U chunk r[{i}:{i+orb_chunk_size}] "
                     f"(idx={chunk_id}, prepped_len={actual_len}, Np={Np}, Nq={Nq}, Ns={Ns})"
                 )
-                # Use the already-prepared arrays
                 cur_phi_r = jnp.asarray(phi_r_chunk)
                 cur_X = jnp.asarray(X_chunk)
                 cur_actual = actual_len
 
-                # Start JIT computation on GPU
                 res_chunk = _contract_delta_U_kernels_jit(
                     D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs)
 
@@ -2188,7 +2113,6 @@ class ISDFXTC(XTC, ISDFTC):
 
                 gc.collect()
         else:
-            # Chunk over s
             per_s_unit_bytes = int(2 * Nr * N_rank * 8 + 3 * Np * Nq * Nr * 8)
             max_Ns_chunk = max(1, int(target_bytes / max(per_s_unit_bytes, 1))) if per_s_unit_bytes > 0 else Ns
             orb_chunk_size = min(max_Ns_chunk, Ns)
@@ -2215,7 +2139,6 @@ class ISDFXTC(XTC, ISDFTC):
                     xc_np = np.pad(xc_np, ((0, 0), (0, pad), (0, 0)))
                 return ps_np, xc_np, alen
 
-            # Pre-compute first chunk synchronously
             phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(0)
             chunk_timer = time.perf_counter()
 
@@ -2229,7 +2152,6 @@ class ISDFXTC(XTC, ISDFTC):
                 cur_X = X_chunk
                 cur_actual = actual_len
 
-                # Start JIT computation on GPU
                 cur_phi_s = jnp.asarray(cur_phi_s)
                 cur_X = jnp.asarray(cur_X)
                 res_chunk = _contract_delta_U_kernels_jit(
@@ -2304,9 +2226,7 @@ class ISDFXTC(XTC, ISDFTC):
         # Safety factor on top of the analytical peak estimate. 0.7 leaves
         # ~43 % head-room for XLA workspace / BFC fragmentation on top of
         # the estimate (which already counts D, X_sliced, C_pq × 2, C_rs,
-        # and 2 × out). 0.5 (the prior value) gave 2× head-room, which
-        # was too conservative — it refused tiles that in practice fit
-        # by a few GiB once the D double-count bug was removed.
+        # and 2 × out).
         threshold_bytes = int(_get_device_free_bytes(device) * 0.7)
         if total_needed_bytes >= threshold_bytes:
             raise RuntimeError(
@@ -2337,10 +2257,7 @@ class ISDFXTC(XTC, ISDFTC):
             # Pad ``X_sliced`` on host (NumPy) so the multi-GB slab does
             # NOT get materialised on the JAX default device (typically
             # GPU 0) before being copied to the actual target device.
-            # The earlier ``_pad_axis`` path used ``jnp.pad(jnp.asarray(arr))``
-            # which placed the padded result on whichever device was
-            # default at that moment — causing transient OOM / imbalance
-            # on GPU 0 in multi-GPU runs.  Keeping ``X_sliced`` as a
+            # Keeping ``X_sliced`` as a
             # NumPy array until the explicit ``jax.device_put`` below
             # gives a single, correctly-targeted host→device copy.
             if isinstance(X_sliced, np.ndarray):

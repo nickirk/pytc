@@ -7,7 +7,6 @@ import jax.scipy.sparse.linalg as spla
 import optax
 import folx
 from jax.tree_util import tree_map
-from jax.lax import stop_gradient
 import jax.flatten_util
 
 logger = logging.getLogger(__name__)
@@ -27,7 +26,7 @@ class NewtonOptimizer:
     - "cg": Conjugate Gradient (iterative, matrix-free)
     - "exact" or "cholesky": Exact matrix inversion
     """
-    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0):
+    def __init__(self, value_and_grad_func, learning_rate, damping=1e-3, maxiter=100, curvature_type="fisher", max_vmap_batch_size=0, solver="exact", solve_kwargs=None, jacobian_sample_size=0, clip_multiplier=5.0, jac_row_clip_multiplier=0.0, max_delta_norm=None, mesh=None):
         self.value_and_grad_func = value_and_grad_func
         self.learning_rate = learning_rate
         self.damping = damping
@@ -38,6 +37,17 @@ class NewtonOptimizer:
         self.solve_kwargs = solve_kwargs if solve_kwargs is not None else {}
         self.jacobian_sample_size = jacobian_sample_size
         self.clip_multiplier = clip_multiplier
+        # Opt-in hardening against huge-but-finite Jacobian rows from
+        # near-nodal walkers: jac_row_clip_multiplier rescales outlier rows;
+        # max_delta_norm is a trust-region radius RELATIVE to
+        # max(1, ||params||). Both OFF by default (0/None) to preserve the
+        # numerics of existing calculations; enable explicitly for runs that
+        # chain many sub-optimizations.
+        self.jac_row_clip_multiplier = jac_row_clip_multiplier
+        self.max_delta_norm = max_delta_norm
+        # Thread one Mesh instance through so _get_vmap uses the same mesh
+        # as walker init/MCMC instead of re-deriving one when mesh=None.
+        self.mesh = mesh
 
     def _get_vmap(self):
         """Return the appropriate vmap implementation.
@@ -45,12 +55,12 @@ class NewtonOptimizer:
         Automatically detects multi-GPU environments via get_vmap_fn.
         """
         from .sharding import get_vmap_fn
-        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size)
+        return get_vmap_fn(max_vmap_batch_size=self.max_vmap_batch_size, mesh=self.mesh)
 
     def _get_unbatched_vmap(self):
         """Return a per-batch vmap without nested folx batching."""
         from .sharding import get_vmap_fn
-        return get_vmap_fn(max_vmap_batch_size=0)
+        return get_vmap_fn(max_vmap_batch_size=0, mesh=self.mesh)
 
     def _get_effective_batch_size(self, n_walkers: int) -> int:
         """Return a batch size compatible with the current execution mode."""
@@ -106,13 +116,53 @@ class NewtonOptimizer:
             axis=1,
         )
 
+    @staticmethod
+    def _clip_jacobian_rows(jac_mat, clip_multiplier, mask=None):
+        """Clip each walker's Jacobian row to at most
+        ``clip_multiplier * median(row_norm)`` (over the unmasked rows),
+        rescaling the whole row down (direction preserved) rather than
+        clamping individual entries -- same spirit as the existing
+        energy MAD-clipping, applied to row *scale* so a single
+        near-nodal walker's huge-but-finite row can't dominate
+        ``sum_jte``/``sum_jtj``. Median (not mean) since it is itself
+        robust to the exact walkers this is meant to guard against.
+        Statistics are computed within the same batch/set being clipped
+        (no extra Jacobian pass) -- cheap, at the cost of being a local
+        rather than a whole-walker-population estimate.
+        """
+        if clip_multiplier is None or clip_multiplier <= 0:
+            return jac_mat
+        # Defense-in-depth: callers are expected to have already excluded
+        # non-finite rows (finite-masking happens before this is called in
+        # NewtonOptimizer.step), but guard here too -- an Inf row gives
+        # row_norm=inf, and threshold/inf=0, so scale*row = 0*inf = NaN
+        # without this, silently manufacturing a NaN from the clip itself
+        # rather than the walker that was already broken.
+        finite_row = jnp.all(jnp.isfinite(jac_mat), axis=1)
+        jac_mat = jnp.where(finite_row[:, None], jac_mat, 0.0)
+        row_norm = jnp.linalg.norm(jac_mat, axis=1)
+        if mask is not None:
+            mask = mask & finite_row
+        else:
+            mask = finite_row
+        # Masked (padding/non-finite) rows are already zero; excluding
+        # them from the median keeps the threshold meaningful.
+        valid_norm = jnp.where(mask, row_norm, jnp.nan)
+        median_norm = jnp.nanmedian(valid_norm)
+        threshold = clip_multiplier * median_norm
+        # If every row is masked/non-finite, nanmedian is NaN and the clip
+        # would itself manufacture NaNs; fall back to "no clipping" and let
+        # the finite-masking above (rows already zeroed) carry the batch.
+        threshold = jnp.where(jnp.isfinite(threshold), threshold, jnp.inf)
+        scale = jnp.minimum(1.0, threshold / jnp.maximum(row_norm, 1e-300))
+        return jac_mat * scale[:, None]
+
     def init(self, params, rng, batch):
         return jnp.array(0, dtype=jnp.int32)  # step count
 
     def step(self, params, state, rng, batch, global_step_int=None):
         walkers, ansatz = batch
         
-        # 2. Define MVP or Solve Exact
         if self.solver == "exact" or self.solver == "cholesky":
             # Exact inversion: (M + lambda I) delta = -g
             
@@ -129,17 +179,18 @@ class NewtonOptimizer:
                 vmap_fn = self._get_vmap()
                 jac = vmap_fn(single_log_psi_grad, in_axes=(0, None))(walkers, params)
                 
-                # Flatten params structure for linear algebra
                 jac_flat, params_treedef = jax.tree_util.tree_flatten(jac)
                 jac_mat = jnp.concatenate([jnp.reshape(leaf, (walkers.shape[0], -1)) for leaf in jac_flat], axis=1)
                 
-                # Center the Jacobian (Covariance)
                 jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
                 
                 # S = 1/N * J.T @ J
                 n_walkers = walkers.shape[0]
                 curvature_mat = (jac_centered.T @ jac_centered) / n_walkers
-                
+                # Finite-masking/row-clipping (below) is gauss_newton-specific;
+                # no dropped-walker tracking on this path.
+                n_dropped = jnp.array(0, dtype=jnp.int32)
+
             elif self.curvature_type == "gauss_newton":
                 # GN: G = 2/M * J_centered.T @ J_centered
                 # J_i = d(E_L(w_i))/dp
@@ -162,7 +213,6 @@ class NewtonOptimizer:
                 
                 n_walkers_total = walkers.shape[0]
                 
-                # Sub-sample walkers for the Jacobian if requested
                 if self.jacobian_sample_size > 0 and self.jacobian_sample_size < n_walkers_total:
                     sample_size = self.jacobian_sample_size
                     # In multi-device mode, shard_map requires the sharded axis
@@ -173,7 +223,6 @@ class NewtonOptimizer:
                         if sample_size % ndev != 0:
                             sample_size = max(ndev, (sample_size // ndev) * ndev)
                         sample_size = min(sample_size, n_walkers_total)
-                    # Use rng to select a random subset of walker indices
                     indices = jax.random.choice(rng, n_walkers_total,
                                                 shape=(sample_size,), replace=False)
                     indices = jnp.sort(indices).astype(jnp.int32)  # sort for deterministic gather
@@ -204,20 +253,45 @@ class NewtonOptimizer:
                             single_local_energy,
                             in_axes=(0, None),
                         )(batch_walkers, params)
+                        # A walker can be genuinely non-finite (not just huge) --
+                        # e.g. a near-nodal walker whose updated params push some
+                        # Jastrow term into a mathematically undefined regime.
+                        # Clipping downstream can only rescale huge-but-finite
+                        # values; a NaN/inf must be excluded here instead, same
+                        # treatment as a padding row, or it silently poisons
+                        # every accumulated sum it touches regardless of clipping.
+                        batch_mask = batch_mask & jnp.isfinite(energies_batch)
                         return jnp.where(batch_mask, energies_batch, 0.0)
 
                     def masked_energy_jacobian_batch(batch_walkers, batch_mask, clip_lo, clip_hi):
+                        orig_mask = batch_mask
                         energies_batch, jac_batch = batch_vmap_fn(
                             single_local_energy_and_grad,
                             in_axes=(0, None),
                         )(batch_walkers, params)
+                        jac_mat_batch = self._flatten_jacobian(jac_batch, batch_size)
+                        # See masked_energy_batch: exclude genuinely non-finite
+                        # walkers (energy OR any jacobian component) before any
+                        # clipping runs, so nanmedian in _clip_jacobian_rows can't
+                        # confuse "real broken walker" with "intentional padding
+                        # sentinel", and NaN can't survive a finite rescale.
+                        batch_mask = (
+                            orig_mask
+                            & jnp.isfinite(energies_batch)
+                            & jnp.all(jnp.isfinite(jac_mat_batch), axis=1)
+                        )
                         energies_batch = jnp.where(batch_mask, energies_batch, 0.0)
                         if clip_lo is not None and clip_hi is not None:
                             clipped = jnp.clip(energies_batch, clip_lo, clip_hi)
                             energies_batch = jnp.where(batch_mask, clipped, 0.0)
-                        jac_mat_batch = self._flatten_jacobian(jac_batch, batch_size)
                         jac_mat_batch = jnp.where(batch_mask[:, None], jac_mat_batch, 0.0)
-                        return energies_batch, jac_mat_batch
+                        jac_mat_batch = self._clip_jacobian_rows(
+                            jac_mat_batch, self.jac_row_clip_multiplier, mask=batch_mask
+                        )
+                        # Walkers dropped for non-finiteness specifically, not
+                        # counting padding rows (which orig_mask already excludes).
+                        n_dropped_batch = jnp.sum((~batch_mask) & orig_mask).astype(jnp.int32)
+                        return energies_batch, jac_mat_batch, n_dropped_batch
 
                     clip_lo = None
                     clip_hi = None
@@ -260,12 +334,13 @@ class NewtonOptimizer:
                         jnp.zeros_like(params_vec),
                         jnp.zeros_like(params_vec),
                         jnp.zeros((params_vec.shape[0], params_vec.shape[0]), dtype=param_dtype),
+                        jnp.array(0, dtype=jnp.int32),
                     )
 
                     def stats_scan_body(carry, xs):
-                        sum_e, sum_e2, sum_j, sum_jte, sum_jtj = carry
+                        sum_e, sum_e2, sum_j, sum_jte, sum_jtj, n_dropped = carry
                         batch_walkers, batch_mask = xs
-                        energies_batch, jac_mat_batch = masked_energy_jacobian_batch(
+                        energies_batch, jac_mat_batch, n_dropped_batch = masked_energy_jacobian_batch(
                             batch_walkers,
                             batch_mask,
                             clip_lo,
@@ -276,66 +351,90 @@ class NewtonOptimizer:
                         sum_j = sum_j + jnp.sum(jac_mat_batch, axis=0)
                         sum_jte = sum_jte + jac_mat_batch.T @ energies_batch
                         sum_jtj = sum_jtj + jac_mat_batch.T @ jac_mat_batch
-                        return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), None
+                        n_dropped = n_dropped + n_dropped_batch
+                        return (sum_e, sum_e2, sum_j, sum_jte, sum_jtj, n_dropped), None
 
-                    (sum_e, sum_e2, sum_j, sum_jte, sum_jtj), _ = jax.lax.scan(
+                    (sum_e, sum_e2, sum_j, sum_jte, sum_jtj, n_dropped), _ = jax.lax.scan(
                         stats_scan_body,
                         init_carry,
                         (batched_walkers, batched_mask),
                     )
 
-                    e_mean = sum_e / n_walkers
-                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_walkers - e_mean**2, 0.0))
-                    mean_j = sum_j / n_walkers
-                    loss = (sum_e2 - n_walkers * e_mean**2) / (n_walkers - 1)
+                    # Dropped (non-finite) walkers contribute zeros to every
+                    # sum above; dividing by the full n_walkers would treat
+                    # them as real zero-energy/zero-Jacobian samples and bias
+                    # the step. Use the valid count (floored to avoid /0).
+                    n_valid = jnp.maximum(n_walkers - n_dropped, 2)
+                    e_mean = sum_e / n_valid
+                    e_std = jnp.sqrt(jnp.maximum(sum_e2 / n_valid - e_mean**2, 0.0))
+                    mean_j = sum_j / n_valid
+                    loss = (sum_e2 - n_valid * e_mean**2) / (n_valid - 1)
                     aux_data = (e_mean, e_std)
-                    grads_vec = (2.0 / (n_walkers - 1)) * (
-                        sum_jte - n_walkers * mean_j * e_mean
+                    grads_vec = (2.0 / (n_valid - 1)) * (
+                        sum_jte - n_valid * mean_j * e_mean
                     )
-                    curvature_mat = (2.0 / n_walkers) * (
-                        sum_jtj - n_walkers * jnp.outer(mean_j, mean_j)
+                    curvature_mat = (2.0 / n_valid) * (
+                        sum_jtj - n_valid * jnp.outer(mean_j, mean_j)
                     )
                 else:
-                    # Compute energies and Jacobian for (sub-sampled) walkers
                     vmap_fn = self._get_vmap()
                     energies, jac = vmap_fn(
                         single_local_energy_and_grad,
                         in_axes=(0, None)
                     )(sub_walkers, params)
 
+                    jac_mat = self._flatten_jacobian(jac, n_walkers)
+                    # Exclude genuinely non-finite walkers (energy OR any
+                    # jacobian component) BEFORE computing any clip statistics --
+                    # a NaN/inf energy would otherwise poison e_mean_raw/
+                    # e_std_raw themselves, and clipping can only rescale
+                    # huge-but-finite values, not NaN/inf. Same treatment as a
+                    # padding row in the batched path (zero + excluded from
+                    # stats, n_walkers denominator unchanged).
+                    finite_mask = jnp.isfinite(energies) & jnp.all(jnp.isfinite(jac_mat), axis=1)
+                    n_dropped = jnp.sum(~finite_mask)
+                    if n_dropped.dtype != jnp.int32:
+                        n_dropped = n_dropped.astype(jnp.int32)
+                    energies = jnp.where(finite_mask, energies, 0.0)
+                    jac_mat = jnp.where(finite_mask[:, None], jac_mat, 0.0)
+
                     # Clip energies to suppress outliers.  The gradient is
                     # 2/(M-1) * J^T @ (E - mean(E)), so clipping energies
                     # naturally limits the influence of extreme walkers.
                     if self.clip_multiplier > 0:
-                        e_mean_raw = jnp.mean(energies)
-                        e_std_raw = jnp.mean(jnp.abs(energies - e_mean_raw))
-                        energies = jnp.clip(
+                        e_mean_raw = jnp.sum(energies) / jnp.maximum(jnp.sum(finite_mask), 1)
+                        e_std_raw = jnp.sum(jnp.where(finite_mask, jnp.abs(energies - e_mean_raw), 0.0)) / jnp.maximum(jnp.sum(finite_mask), 1)
+                        clipped = jnp.clip(
                             energies,
                             e_mean_raw - self.clip_multiplier * e_std_raw,
                             e_mean_raw + self.clip_multiplier * e_std_raw,
                         )
+                        energies = jnp.where(finite_mask, clipped, 0.0)
 
-                    jac_mat = self._flatten_jacobian(jac, n_walkers)
+                    jac_mat = self._clip_jacobian_rows(jac_mat, self.jac_row_clip_multiplier, mask=finite_mask)
 
-                    # Compute variance loss and auxiliary data analytically from energies
-                    e_mean = jnp.mean(energies)
-                    e_std = jnp.std(energies)
-                    energy_diff = energies - e_mean
-                    loss = jnp.sum(energy_diff**2) / (n_walkers - 1)
+                    # Compute variance loss and auxiliary data analytically
+                    # from energies. Dropped walkers were zeroed above, so
+                    # denominators use the valid count and centered
+                    # quantities are re-masked to keep dropped rows at zero.
+                    n_valid = jnp.maximum(jnp.sum(finite_mask), 2)
+                    e_mean = jnp.sum(energies) / n_valid
+                    energy_diff = jnp.where(finite_mask, energies - e_mean, 0.0)
+                    e_std = jnp.sqrt(jnp.sum(energy_diff**2) / n_valid)
+                    loss = jnp.sum(energy_diff**2) / (n_valid - 1)
                     aux_data = (e_mean, e_std)
 
                     # Compute variance gradient analytically:
                     # grad_variance = 2/(M-1) * J^T @ (E - mean(E))
-                    grads_vec = (2.0 / (n_walkers - 1)) * (jac_mat.T @ energy_diff)
+                    grads_vec = (2.0 / (n_valid - 1)) * (jac_mat.T @ energy_diff)
 
-                    # Center the Jacobian for curvature matrix
-                    jac_centered = jac_mat - jnp.mean(jac_mat, axis=0, keepdims=True)
-                    curvature_mat = (2.0 / n_walkers) * (jac_centered.T @ jac_centered)
+                    mean_jac = jnp.sum(jac_mat, axis=0, keepdims=True) / n_valid
+                    jac_centered = jnp.where(finite_mask[:, None], jac_mat - mean_jac, 0.0)
+                    curvature_mat = (2.0 / n_valid) * (jac_centered.T @ jac_centered)
             
             else:
                 raise ValueError(f"Unknown curvature type: {self.curvature_type}")
             
-            # Add damping
             curvature_mat = curvature_mat + self.damping * jnp.eye(curvature_mat.shape[0])
             
             # Flatten gradients to match matrix (for fisher, grads are pytree; for gauss_newton, already flat)
@@ -345,31 +444,36 @@ class NewtonOptimizer:
                 # gauss_newton: grads_vec is already flat, need unravel_fn
                 _, unravel_fn = jax.flatten_util.ravel_pytree(params)
             
-            # Solve linear system
             # (M + lambda I) delta = -g
-            # Use provided solve_kwargs or default to assume_a='pos'
             solve_kwargs = self.solve_kwargs.copy()
             if "assume_a" not in solve_kwargs:
                 solve_kwargs["assume_a"] = "pos"
                 
             delta_vec = jax.scipy.linalg.solve(curvature_mat, -grads_vec, **solve_kwargs)
-            
-            # Unflatten delta to match params structure
+
+            # Trust-region cap (opt-in): rescale the whole step (direction
+            # preserved) when a near-flat curvature direction yields a huge
+            # but finite step; the bound is relative to max(1, ||params||)
+            # so it tracks the parameter scale.
+            if self.max_delta_norm is not None and self.max_delta_norm > 0:
+                params_vec_for_scale, _ = jax.flatten_util.ravel_pytree(params)
+                trust_radius = self.max_delta_norm * jnp.maximum(1.0, jnp.linalg.norm(params_vec_for_scale))
+                delta_norm = jnp.linalg.norm(delta_vec)
+                delta_scale = jnp.minimum(1.0, trust_radius / jnp.maximum(delta_norm, 1e-300))
+                delta_vec = delta_vec * delta_scale
+
             delta = unravel_fn(delta_vec)
-            
-            # Update
+
             lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
             new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
-            
-            return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr}
 
-        # CG Solver: need loss + grads from value_and_grad_func
+            return new_params, state + 1, {"loss": loss, "aux": aux_data, "lr": lr, "n_dropped_walkers": n_dropped}
+
         (loss, aux_data), grads = self.value_and_grad_func(params, batch)
         
         if self.curvature_type == "fisher":
             # SR: S = Cov(grad_log_psi)
             
-            # Helper for single walker log_psi
             def single_log_psi(w, p):
                 return ansatz(w, p)[0][1]
 
@@ -393,7 +497,6 @@ class NewtonOptimizer:
                 
                 per_walker_grads = vmap_fn(compute_vjp)(walkers, w_centered)
                 
-                # Sum over walkers
                 u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
                 
                 # S = 1/N * J.T @ (J @ v centered)
@@ -403,7 +506,6 @@ class NewtonOptimizer:
         elif self.curvature_type == "gauss_newton":
             # GN: G = 2/N * J.T @ J
             
-            # Helper for single walker local energy
             def single_local_energy(w, p):
                 return ansatz.local_energy(w, p)[0]
 
@@ -425,7 +527,6 @@ class NewtonOptimizer:
                 
                 per_walker_grads = vmap_fn(compute_vjp)(walkers, w_centered)
                 
-                # Sum over walkers
                 u = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_walker_grads)
                 
                 n_walkers = walkers.shape[0]
@@ -434,13 +535,10 @@ class NewtonOptimizer:
         else:
             raise ValueError(f"Unknown curvature type: {self.curvature_type}")
 
-        # Add damping
         def damped_mvp(v):
             mvp_val = mvp(v)
             return jax.tree_util.tree_map(lambda x, y: x + self.damping * y, mvp_val, v)
 
-        # 3. Solve (S + lambda I) delta = -g
-        # RHS is -grads
         rhs = jax.tree_util.tree_map(lambda x: -x, grads)
         
         delta, info = spla.cg(
@@ -449,7 +547,6 @@ class NewtonOptimizer:
             maxiter=self.maxiter
         )
         
-        # 4. Update
         lr = self.learning_rate(state) if callable(self.learning_rate) else self.learning_rate
         new_params = jax.tree_util.tree_map(lambda p, d: p + lr * d, params, delta)
         
@@ -471,7 +568,6 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
     
     merged_kwargs = {**opt_kwargs}
     
-    # Define a default schedule if learning_rate is a float
     if not callable(learning_rate):
         def schedule_lr(step):
             decay_rate = merged_kwargs.get("decay_rate", 1.0)
@@ -507,7 +603,6 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
         if "value_and_grad_func" not in merged_kwargs:
             raise ValueError("Newton optimizer requires value_and_grad_func in opt_kwargs")
             
-        # For Newton, wrap the schedule with a minimum value
         min_lr = merged_kwargs.get("min_learning_rate", 0.01)
         
         def newton_schedule(step):
@@ -525,12 +620,15 @@ def create_optimizer(optimizer_type, learning_rate, opt_kwargs=None):
             solve_kwargs=merged_kwargs.get("solve_kwargs", None),
             jacobian_sample_size=merged_kwargs.get("jacobian_sample_size", 0),
             clip_multiplier=merged_kwargs.get("clip_multiplier", 5.0),
+            jac_row_clip_multiplier=merged_kwargs.get("jac_row_clip_multiplier", 0.0),
+            max_delta_norm=merged_kwargs.get("max_delta_norm", None),
+            mesh=merged_kwargs.get("mesh", None),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
 def create_gradient_mask(ansatz, params, frozen_params):
-    """Create a gradient mask PyTree for the combined params structure.
+    """Create a trainable-leaf mask for the combined parameter PyTree.
     
     Assumes params = [jastrow_params, linear_coeffs]. The mask is applied
     only to the jastrow_params part based on frozen_params identifiers.
@@ -543,11 +641,12 @@ def create_gradient_mask(ansatz, params, frozen_params):
                        for Jastrow factors whose parameters should be frozen.
 
     Returns:
-        A PyTree with the same structure as params, where frozen parameters
-        are wrapped with `jax.lax.stop_gradient`.
+        A boolean PyTree with the same structure as params. ``False`` leaves
+        are frozen and ``True`` leaves remain trainable. Returns ``None``
+        when no parameters are frozen.
     """
     if not frozen_params:
-        return params  # No freezing requested, return params unchanged
+        return None
 
     if not isinstance(params, (list, tuple)) or len(params) != 2:
         raise ValueError("`params` must be a list or tuple: [jastrow_params, linear_coeffs]")
@@ -558,29 +657,48 @@ def create_gradient_mask(ansatz, params, frozen_params):
     logger.info(f"Creating gradient mask for frozen Jastrow parameters: {frozen_params}")
     jastrows = ansatz.jastrow.jastrows
     if not isinstance(jastrow_params, (list, tuple)) or len(jastrow_params) != len(jastrows):
-        raise TypeError(f"Jastrow params structure (length {len(jastrow_params)}) does not match jastrows (length {len(jastrows)})")
+        raise TypeError(
+            f"Jastrow params structure (length {len(jastrow_params)}) does not "
+            f"match jastrows (length {len(jastrows)})"
+        )
 
-    # Deep copy the parameters to avoid modifying the input
-    masked_jastrow_params = []
+    frozen_indices = set()
+    for identifier in frozen_params:
+        if isinstance(identifier, bool) or not isinstance(identifier, (int, str)):
+            raise TypeError("frozen_params identifiers must be integer indices or strings")
+
+        if isinstance(identifier, int):
+            matches = [identifier] if 0 <= identifier < len(jastrows) else []
+        else:
+            matches = [
+                i
+                for i, jastrow in enumerate(jastrows)
+                if identifier
+                in (jastrow.__class__.__name__, getattr(jastrow, "name", None))
+            ]
+        if not matches:
+            raise ValueError(f"Unknown frozen Jastrow parameter: {identifier!r}")
+        frozen_indices.update(matches)
+
+    jastrow_mask_leaves = []
     for i, (param_pytree, jastrow) in enumerate(zip(jastrow_params, jastrows)):
-        should_freeze = False
-        for fp in frozen_params:
-            if isinstance(fp, int) and fp == i:
-                should_freeze = True
-                break
-            elif isinstance(fp, str):
-                if fp == jastrow.__class__.__name__ or fp == getattr(jastrow, 'name', None):
-                    should_freeze = True
-                    break
-        
+        should_freeze = i in frozen_indices
         if should_freeze:
-            # Apply stop_gradient to all leaves in the frozen parameter PyTree
-            param_pytree = tree_map(stop_gradient, param_pytree)
-            logger.info(f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, name={getattr(jastrow, 'name', None)}")
-        masked_jastrow_params.append(param_pytree)
+            logger.info(
+                f"  Freezing Jastrow {i}: type={jastrow.__class__.__name__}, "
+                f"name={getattr(jastrow, 'name', None)}"
+            )
+        jastrow_mask_leaves.append(
+            tree_map(lambda _: not should_freeze, param_pytree)
+        )
 
-    # Return the masked parameters
-    return [masked_jastrow_params, linear_coeffs]
+    jastrow_mask = (
+        tuple(jastrow_mask_leaves)
+        if isinstance(jastrow_params, tuple)
+        else jastrow_mask_leaves
+    )
+    mask = (jastrow_mask, tree_map(lambda _: True, linear_coeffs))
+    return mask if isinstance(params, tuple) else list(mask)
 
 def apply_gradient_mask(grads, mask):
     """Apply gradient mask to gradients to freeze parameters.
@@ -596,10 +714,10 @@ def apply_gradient_mask(grads, mask):
     if mask is None:
         return grads
         
-    def _apply_mask(g, m):
-        # If m is already stop_gradient'd, zero out the gradient
-        if isinstance(m, type(stop_gradient(m))):
-            return jnp.zeros_like(g)
-        return g
-        
-    return tree_map(_apply_mask, grads, mask)
+    return tree_map(
+        lambda gradient, trainable: jnp.where(
+            trainable, gradient, jnp.zeros_like(gradient)
+        ),
+        grads,
+        mask,
+    )

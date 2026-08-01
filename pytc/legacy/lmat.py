@@ -27,11 +27,9 @@ def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=3
     N_grid = len(grid_points)
     result = np.zeros((rho_paired.shape[0], N_grid, 3))
     
-    # Weight the rho for r₂ integration once
     weighted_rho = rho_paired * weights[None, :]  # (Nb^2, N_grid)
     
     logging.info(f"Starting v_vector calculation with {N_grid} grid points in batches of {batch_size}")
-    # Process grid points in batches
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
         progress = i_end / N_grid * 100
@@ -39,11 +37,8 @@ def calc_v_vector(rho_paired, jastrow_factor, grid_points, weights, batch_size=3
         
         batch_points = grid_points[i:i_end]
         
-        # Get Jastrow gradients for this batch
-        # TODO: This step is not using multiple threads.
         u_grad_batch = jastrow_factor.grad(batch_points, grid_points)  # (batch, N_grid, 3)
         
-        # Process each spatial component separately using np.dot
         for c in range(3):
             # Extract the c-th component: (batch, N_grid)
             u_grad_c = u_grad_batch[..., c]
@@ -70,7 +65,6 @@ def calc_L(rho_paired, v_bra, weights, v_ket=None):
     if v_ket is None:
         v_ket = v_bra
     
-    # Multiply by weights and rho_paired
     result = einsum('in,jnd,knd,n->ijk', rho_paired, v_bra, v_ket, weights)
     
     return result
@@ -90,14 +84,12 @@ def calc_L_symmetric(rho_paired, v_bra, weights, v_ket=None):
         containing the symmetrized L matrix elements
         
     """
-    # First compute the base L matrix
     l_mat = calc_L(rho_paired, v_bra, weights, v_ket)
     
     # Reshape for permutations (assuming Nb*Nb = N²)
     N = rho_paired.shape[0]
     l_mat = l_mat.reshape(N, N, N)
     
-    # Add permutations
     l_sym = (
         l_mat +  # Original
         l_mat.transpose(0, 2, 1) +  # Permute second and third electron

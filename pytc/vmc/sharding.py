@@ -57,9 +57,6 @@ if shard_map is not None:
     except Exception:
         pass
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
 
 def n_devices() -> int:
     """Number of local devices available to this process."""
@@ -71,9 +68,6 @@ def is_multi_gpu() -> bool:
     return sharding_core.is_multi_device()
 
 
-# ---------------------------------------------------------------------------
-# Mesh creation
-# ---------------------------------------------------------------------------
 
 def create_mesh(devices=None, axis_name: str = "walkers"):
     """Create a 1-D device mesh for walker-parallel sharding.
@@ -92,9 +86,6 @@ def create_mesh(devices=None, axis_name: str = "walkers"):
     return sharding_core.create_1d_mesh(devices=devices, axis_name=axis_name)
 
 
-# ---------------------------------------------------------------------------
-# Sharding helpers
-# ---------------------------------------------------------------------------
 
 def get_walker_sharding(mesh: Mesh, axis_name: str = "walkers"):
     """NamedSharding that partitions the leading (walker) dimension."""
@@ -122,9 +113,6 @@ def replicate(pytree, mesh: Mesh):
     return jax.device_put(pytree, sharding)
 
 
-# ---------------------------------------------------------------------------
-# Padding
-# ---------------------------------------------------------------------------
 
 def pad_n_walkers(n_walkers: int, n_devices: int) -> int:
     """Return the smallest multiple of *n_devices* >= *n_walkers*."""
@@ -143,18 +131,16 @@ def pad_walker(walker, target_n_walkers: int):
     """
     current = walker.positions.shape[0]
     if current >= target_n_walkers:
-        return walker, current  # no padding needed
+        return walker, current
 
     pad_count = target_n_walkers - current
 
     def _pad_leaf(x):
         if x.ndim == 0:
             return x
-        # Repeat the first element `pad_count` times
         tile = jnp.repeat(x[:1], pad_count, axis=0)
         return jnp.concatenate([x, tile], axis=0)
 
-    # Handle tuple fields (det_up, det_down) via tree_map
     padded = jax.tree_util.tree_map(_pad_leaf, walker)
     return padded, current  # return original count for later un-padding
 
@@ -242,9 +228,6 @@ def initialize_walkers_sharded(ansatz, n_walkers: int, mesh: Mesh, initial_walke
     return _assemble_sharded_from_local_pytrees(local_walkers, mesh, axis_name="walkers")
 
 
-# ---------------------------------------------------------------------------
-# Multi-GPU aware vmap selection
-# ---------------------------------------------------------------------------
 
 def sharded_batched_vmap(fn, max_batch_size, mesh=None, in_axes=0, out_axes=0):
     """A version of folx.batched_vmap that works across multiple devices.
@@ -264,7 +247,6 @@ def sharded_batched_vmap(fn, max_batch_size, mesh=None, in_axes=0, out_axes=0):
     if mesh is None:
         mesh = create_mesh()
 
-    # Determine sharding specs based on in_axes/out_axes
     # We assume 'walkers' is the axis name
     def _axis_to_spec(ax):
         if ax == 0: return P("walkers")
@@ -280,7 +262,6 @@ def sharded_batched_vmap(fn, max_batch_size, mesh=None, in_axes=0, out_axes=0):
     else:
         out_specs = _axis_to_spec(out_axes)
 
-    # The inner function used by shard_map
     def local_batched_fn(*args, **kwargs):
         return folx.batched_vmap(
             fn, max_batch_size=max_batch_size,
@@ -305,7 +286,6 @@ def shard_vmap(fn, mesh=None, in_axes=0, out_axes=0):
     if mesh is None:
         mesh = create_mesh()
 
-    # Determine sharding specs based on in_axes/out_axes
     def _axis_to_spec(ax):
         if ax == 0: return P("walkers")
         return P(None)

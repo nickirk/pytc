@@ -21,8 +21,8 @@ class XTC(TC):
             grid_lvl: Grid level for numerical integration
         """
         super().__init__(mf, jastrow_factor, mo_coeff, grid_lvl)
-        self._delta_U = None  # Cache for delta_U
-        self._delta_h = None  # Cache for delta_h
+        self._delta_U = None
+        self._delta_h = None
     
     def get_delta_U(self, dm1=None):
         """Get or compute delta_U with caching."""
@@ -30,13 +30,10 @@ class XTC(TC):
             if dm1 is None:
                 dm1 = self._get_mf_dm()
             
-            # Get orbital values on grid
             rho, _ = self._get_intermediates()
             rho_paired = einsum('in,jn->ijn', rho, rho).reshape(-1, rho.shape[1])
             
-            # Check if ISDF results are available
             if self._isdf_results is not None:
-                # Use ISDF method
                 self._delta_U = self._calc_delta_U_isdf(
                     self._isdf_results['C_rho'],
                     self._isdf_results['xi_rho'],
@@ -45,7 +42,6 @@ class XTC(TC):
                     self.weights
                 )
             else:
-                # Use original method
                 v_vector = self._calc_v_vector(rho_paired)
                 self._delta_U = self._calc_delta_U(v_vector, rho_paired, dm1)
         
@@ -82,11 +78,9 @@ class XTC(TC):
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
-        # Get core Hamiltonian and transform to MO basis
         h1e = self.mf.get_hcore()
         h1e = reduce(np.dot, (self.mo_coeff.T, h1e, self.mo_coeff))
         
-        # Add delta_h using cached value
         h1e += self.get_delta_h(dm1)
         
         return h1e
@@ -96,10 +90,8 @@ class XTC(TC):
         if dm1 is None:
             dm1 = self._get_mf_dm()
         
-        # Get TC's two-body contribution
         result = super().get_2b()
         
-        # Add cached delta_U
         result += self.get_delta_U(dm1)
         return result
         
@@ -120,11 +112,10 @@ class XTC(TC):
         δh^q_p = -1/2 * (δU^{qs}_{pr} - δU^{sq}_{pr}) * γ^r_s
         """
         if delta_U is None:
-            delta_U = self._calc_delta_U()  # To be implemented
+            delta_U = self._calc_delta_U()
         if dm1 is None:
             dm1 = self._get_mf_dm()
             
-        # Calculate δh using einstein summation
         term1 = 2*einsum('qpsr,rs->qp', delta_U, dm1)
         term2 = einsum('spqr,rs->qp', delta_U, dm1)
         delta_h = -0.5 * (term1 - term2)
@@ -166,29 +157,22 @@ class XTC(TC):
             dm1 = self._get_mf_dm()
             
         if v_vector is None or rho_paired is None:
-            # Get orbital values on grid
             rho, _ = self._get_intermediates()
             
-            # Prepare paired indices
             rho_paired = np.einsum('in,jn->ijn', rho, rho).reshape(-1, len(self.weights))
             
-            # Compute V vector with batched processing
             v_vector = self._calc_v_vector(rho_paired)
             
-        # Reshape inputs
         V, rho = self._validate_and_reshape(v_vector, rho_paired)
         nb = V.shape[0]
         n_grid = V.shape[2]
 
-        # weight the rho using self.weights
         rho_weighted = rho * self.weights[None, None, :]
-        # Calculate intermediates
         W = 2*einsum('utix,tu->ix', V, dm1)  # (N_grid, 3)
         Vbar = einsum('ix,srix->sri', W, V)  # (nb, nb, N_grid)
         
         X = einsum('stix,tu->suix', V, dm1)  # (nb, nb, N_grid, 3)
         
-        # Compute Zbar using parallel processing with progress tracking
         Zbar = _parallel_over_i(
             lambda i: _process_Zbar_i(i, V, X),
             output_shape=(nb, nb, n_grid),
@@ -199,7 +183,6 @@ class XTC(TC):
         Wbar = 2*einsum('uti,tu->i', rho_weighted, dm1)  # (N_grid,)
         Y = einsum('urix,tu->trix', V, dm1)  # (nb, nb, N_grid, 3)
 
-        # Compute G using parallel processing with progress tracking
         G = _parallel_over_i(
             lambda i: _process_G_i(i, rho_weighted, X, Y),
             output_shape=(nb, nb, n_grid, 3),
@@ -207,19 +190,14 @@ class XTC(TC):
             desc="Computing G tensor"
         )
 
-        #G = (einsum('uri,suix->srix', rho_weighted, X) + 
-        #     einsum('trix,sti->srix', Y, rho_weighted))  # (Nb, Nb, N_grid, 3)
         
-        # Compute A and B using Zbar instead for A
         A = Vbar - Zbar  # (Nb, Nb, N_grid, 3)
         B = 0.5 * Wbar[None, None, :, None] * V - G  # (Nb, Nb, N_grid, 3)
         
-        # Final contraction
         term1 = einsum('qpi,sri->qpsr', rho_weighted, A)
         term2 = einsum('qpix,srix->qpsr', V, B)
         
         result = -(term1 + term2)
-        # Add permutation of two electrons
         final = result + result.transpose(2,3,0,1)
         
         end_time = time.time()
@@ -250,18 +228,13 @@ class XTC(TC):
         if batch_size is None:
             batch_size = _get_safe_batch_size(N_grid, Nb**2)
         
-        # Initialize accumulator for M tensor
         M = np.zeros((N_rank, N_rank, N_rank))
-        #weighted_xi_rho = xi_rho * weights[None, :]
-        #G = np.zeros((N_rank, N_grid, 3))
         
-        # Process r2 points in batches
         from pytc.utils.prefetch import async_read, await_read
         pending_grad = None
         for i in range(0, N_grid, batch_size):
             i_end = min(i + batch_size, N_grid)
             
-            # Get Jastrow gradients (prefetched or inline)
             if pending_grad is not None:
                 u_grad_batch = await_read(pending_grad)
                 pending_grad = None
@@ -279,10 +252,8 @@ class XTC(TC):
                 pending_grad = async_read(
                     lambda _s=next_i, _e=next_end: jastrow_factor.grad(grid_points[_s:_e], grid_points))
         
-            # Compute weighted xi_rho for the chunk
             weighted_xi = xi_rho[:,i:i_end] * weights[None, i:i_end]  # (Nr, chunk_size)
         
-            # Contract to get chunk contribution
             M += einsum('ai,bdi->abd', weighted_xi, K)
         
         # Step 3: Form G(b) = C_rho(t,u,b) * dm(t,u)
@@ -294,7 +265,6 @@ class XTC(TC):
         # Step 5: Form T(p,q,d) = C_rho(p,q,a) * GM(a,d)
         T = einsum('pqa,ad->pqd', C_rho, GM)  # (Nb, Nb, N_rank)
         
-        # Step 6: Final contraction for term1
         term1 = 2 * einsum('pqd,rsd->pqrs', T, C_rho)  # (Nb, Nb, Nb, Nb)
         
         # Term 2: -C_rho(p,q,a)C_rho(r,u,b)C_rho(t,s,c)dm(t,u)M(a,b,c)
@@ -307,25 +277,20 @@ class XTC(TC):
         # Step 3: Q(r,s,a) = T(u,s,a,b)C_rho(r,u,b)
         Q = einsum('usab,rub->rsa', T, C_rho)  # (Nb, Nb, N_rank)
         
-        # Step 4: Final contraction for term2
         term2 = -einsum('pqa,rsa->pqrs', C_rho, Q)  # (Nb, Nb, Nb, Nb)
         
-        #term 3
         # T(u,s,a,b) = M(b,a,c)L(u,s,c)
         Mt = M + M.transpose(2,1,0)
         T = einsum('cab,usc->usab', Mt, L)  # (Nb, Nb, N_rank, N_rank)
         # Step 3: Q(r,s,a) = T(u,s,a,b)C_rho(r,u,b)
         Q = einsum('usab,rub->rsa', T, C_rho)  # (Nb, Nb, N_rank)
         term3 = -einsum('pqa,rsa->pqrs', C_rho, Q)  # (Nb, Nb, Nb, Nb)
-        # Term 4
         term4 = einsum('b,bac->ac', Gb, M)  # (N_rank, N_rank)
         term4 = einsum('ac,pqa->pqc', term4, C_rho)  # (Nb, Nb, N_rank)
         term4 = einsum('pqc,rsc->pqrs', term4, C_rho)  # (Nb, Nb, Nb, Nb)
         
-        # Combine terms
         result = term1 + term2 + term3 + term4
         
-        # Add permutation of two electrons
         final = result + result.transpose(2,3,0,1)
         
         return -final
@@ -348,7 +313,6 @@ class XTC(TC):
 
         eris.mo_energy = np.diag(eris.fock).copy()
         
-        # Slice the full ERI tensor into required blocks
         eris.oooo = h2e[:nocc,:nocc,:nocc,:nocc].copy()
         eris.ovoo = h2e[:nocc,nocc:,:nocc,:nocc].copy()
         eris.ooov = h2e[:nocc,:nocc,:nocc,nocc:].copy()
@@ -378,24 +342,20 @@ class XTC(TC):
         N_grid = len(self.grid_points)
         result = np.zeros((rho_paired.shape[0], N_grid, 3))
         
-        # Weight the rho for r₂ integration once
         weighted_rho = rho_paired * self.weights[None, :]  # (Nb^2, N_grid)
         
-        # Process grid points in batches
         from pytc.utils.prefetch import async_read, await_read
         pending_grad = None
         for i in range(0, N_grid, batch_size):
             i_end = min(i + batch_size, N_grid)
             batch_points = self.grid_points[i:i_end]
             
-            # Get Jastrow gradients (prefetched or inline)
             if pending_grad is not None:
                 u_grad_batch = await_read(pending_grad)
                 pending_grad = None
             else:
                 u_grad_batch = self.jastrow_factor.grad(batch_points, self.grid_points)
             
-            # Process each spatial component separately using np.dot
             for c in range(3):
                 u_grad_c = u_grad_batch[..., c]
                 result[:, i:i_end, c] = np.dot(weighted_rho, u_grad_c.T)
@@ -426,13 +386,11 @@ def _parallel_over_i(process_i_func, output_shape, n_i, desc=None):
     result = np.zeros(output_shape)
     
     with ThreadPoolExecutor() as executor:
-        # Submit all tasks
         futures = {
             executor.submit(process_i_func, i): i 
             for i in range(n_i)
         }
         
-        # Process results as they complete with logging
         completed_count = 0
         total_tasks = len(futures)
         for future in as_completed(futures):

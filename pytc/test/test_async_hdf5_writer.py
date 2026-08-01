@@ -205,7 +205,6 @@ class TestAsyncHDF5Writer(unittest.TestCase):
         # Single-threaded serial execution → saturation near 1.0.
         self.assertGreater(s["saturation"], 0.80)
         self.assertLessEqual(s["saturation"], 1.0 + 1e-9)
-        # Bandwidth numbers should be positive and finite.
         self.assertGreater(s["busy_throughput_GBps"], 0.0)
         self.assertGreater(s["effective_throughput_GBps"], 0.0)
         # And busy_BW should be >= effective_BW by construction.

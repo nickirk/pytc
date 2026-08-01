@@ -153,7 +153,6 @@ class PrefetchIterator(Generic[K, V]):
         if n == 0:
             return
 
-        # Submit initial prefetch window
         futures: list[Future[V]] = []
         submit_idx = 0
         for _ in range(min(self._depth, n)):
@@ -161,10 +160,8 @@ class PrefetchIterator(Generic[K, V]):
             submit_idx += 1
 
         for i in range(n):
-            # Await the current block
             value = futures.pop(0).result()
 
-            # Submit the next prefetch (if any keys remain)
             if submit_idx < n:
                 futures.append(
                     self._pool.submit(self._load_fn, keys[submit_idx])

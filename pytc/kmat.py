@@ -42,7 +42,6 @@ def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights,
         Np = Nq = Nr = Ns = n_orb
     else:
         slice_p, slice_q, slice_r, slice_s = ranges
-        # Helper to get size from slice
         def get_size(s, size):
             start, stop, step = s.indices(size)
             return (stop - start + (step - 1)) // step
@@ -51,7 +50,6 @@ def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights,
         Nr = get_size(slice_r, n_orb)
         Ns = get_size(slice_s, n_orb)
 
-    # Slice input arrays
     phi_p = phi[slice_p]
     phi_q = phi[slice_q]
     phi_r = phi[slice_r]
@@ -59,15 +57,12 @@ def calc_K1(phi, grad_phi, jastrow_factor, jastrow_params, grid_points, weights,
     
     grad_phi_p = grad_phi[slice_p]
     
-    # Pad grid to multiple of batch_size
     padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
     padded_grid = jnp.pad(grid_points, ((0, padded_size - N_grid), (0, 0)))
     
-    # Reshape for scanning
     batched_grid = padded_grid.reshape(-1, batch_size, 3)
     
     # Prepare outer scan inputs (ket side: r, s)
-    # We need phi_r and phi_s for the outer loop (r2 integration)
     padded_phi_r = jnp.pad(phi_r, ((0, 0), (0, padded_size - N_grid)))
     padded_phi_s = jnp.pad(phi_s, ((0, 0), (0, padded_size - N_grid)))
     padded_weights_r2 = jnp.pad(weights, ((0, padded_size - N_grid),))
@@ -143,7 +138,6 @@ def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=No
         Np = Nq = Nr = Ns = n_orb
     else:
         slice_p, slice_q, slice_r, slice_s = ranges
-        # Helper to get size from slice
         def get_size(s, size):
             start, stop, step = s.indices(size)
             return (stop - start + (step - 1)) // step
@@ -152,19 +146,16 @@ def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=No
         Nr = get_size(slice_r, n_orb)
         Ns = get_size(slice_s, n_orb)
 
-    # Slice input arrays
     phi_p = phi[slice_p]
     phi_q = phi[slice_q]
     phi_r = phi[slice_r]
     phi_s = phi[slice_s]
     
-    # Pad grid to multiple of batch_size
     padded_size = ((N_grid + batch_size - 1) // batch_size) * batch_size
     padded_grid = jnp.pad(grid_points, ((0, padded_size - N_grid), (0, 0)))
     
     batched_grid = padded_grid.reshape(-1, batch_size, 3)
     
-    # Prepare inputs for outer scan (over r2 batches, ket side: r, s)
     padded_phi_r = jnp.pad(phi_r, ((0, 0), (0, padded_size - N_grid)))
     padded_phi_s = jnp.pad(phi_s, ((0, 0), (0, padded_size - N_grid)))
     padded_weights_r2 = jnp.pad(weights, ((0, padded_size - N_grid),))
@@ -182,17 +173,14 @@ def calc_K3(phi, jastrow_factor, jastrow_params, grid_points, weights, ranges=No
         def inner_scan(inner_carry, inner_args):
             r1_batch, phi_p_batch, phi_q_batch, weights_batch_r1 = inner_args
             
-            # Compute phi_paired for this batch of r1
             phi_paired_batch_r1 = jnp.einsum('pn,qn->pqn', phi_p_batch, phi_q_batch).reshape(Np*Nq, -1)
             
-            # Compute gradients
             grads = jastrow_factor.grad_r_batch(r1_batch, r2_batch, jastrow_params) # (inner_bs, batch_size, 3)
             u_grad_squared = jnp.sum(grads**2, axis=-1) # (inner_bs, batch_size)
             
             # Weight: w(r1) * w(r2) * |grad u|^2
             weighted_u2 = u_grad_squared * weights_batch_r1[:, None] * w_batch_r2[None, :]
             
-            # Contract with phi(r1): dot(weighted_u2, phi(r1).T)
             term = jnp.dot(phi_paired_batch_r1, weighted_u2)
             return inner_carry + term, None
 
@@ -249,14 +237,12 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
     n_fused_r1 = xi_grad_r1.shape[0]
     n_fused_r2 = xi_phi_r2.shape[0]
 
-    # Pad grids for scanning
     def get_padded_size(n):
         return ((n + batch_size - 1) // batch_size) * batch_size
 
     padded_size_r1 = get_padded_size(N_grid_r1)
     padded_size_r2 = get_padded_size(N_grid_r2)
 
-    # Pad arrays (on host if they are large)
     if padded_size_r1 > N_grid_r1:
         grid_r1_padded = jnp.pad(grid_r1, ((0, padded_size_r1 - N_grid_r1), (0, 0)))
         weights_r1_padded = jnp.pad(weights_r1, ((0, padded_size_r1 - N_grid_r1),))
@@ -275,13 +261,11 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
     n_batches_r2 = padded_size_r2 // batch_size
 
     def outer_scan(carry, i_batch_r2):
-        # Slice r2 batch from host
         r2_batch = jax.lax.dynamic_slice(grid_r2_padded, (i_batch_r2 * batch_size, 0), (batch_size, 3))
         w2_batch = jax.lax.dynamic_slice(weights_r2_padded, (i_batch_r2 * batch_size,), (batch_size,))
         xi_phi_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused_r2, batch_size))
 
         def inner_scan(inner_carry, i_batch_r1):
-            # Slice r1 batch from host
             r1_batch = jax.lax.dynamic_slice(grid_r1_padded, (i_batch_r1 * batch_size, 0), (batch_size, 3))
             w1_batch = jax.lax.dynamic_slice(weights_r1_padded, (i_batch_r1 * batch_size,), (batch_size,))
             xi_grad_batch = jax.lax.dynamic_slice(xi_grad_r1_padded, (0, i_batch_r1 * batch_size, 0), (n_fused_r1, batch_size, 3))
@@ -297,7 +281,6 @@ def calc_K1_kernel(xi_grad_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor
 
             return inner_carry + G1_batch, None
 
-        # Inner scan over r1 batches
         G1_init = jnp.zeros((n_fused_r1, batch_size, 3))
         G1, _ = jax.lax.scan(inner_scan, G1_init, jnp.arange(n_batches_r1))
 
@@ -341,14 +324,12 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     n_fused_r1 = xi_phi_r1.shape[0]
     n_fused_r2 = xi_phi_r2.shape[0]
 
-    # Pad grids for scanning
     def get_padded_size(n):
         return ((n + batch_size - 1) // batch_size) * batch_size
 
     padded_size_r1 = get_padded_size(N_grid_r1)
     padded_size_r2 = get_padded_size(N_grid_r2)
 
-    # Pad arrays
     if padded_size_r1 > N_grid_r1:
         grid_r1_padded = jnp.pad(grid_r1, ((0, padded_size_r1 - N_grid_r1), (0, 0)))
         weights_r1_padded = jnp.pad(weights_r1, ((0, padded_size_r1 - N_grid_r1),))
@@ -367,13 +348,11 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     n_batches_r2 = padded_size_r2 // batch_size
 
     def outer_scan(carry, i_batch_r2):
-        # Slice r2 batch from host
         r2_batch = jax.lax.dynamic_slice(grid_r2_padded, (i_batch_r2 * batch_size, 0), (batch_size, 3))
         w2_batch = jax.lax.dynamic_slice(weights_r2_padded, (i_batch_r2 * batch_size,), (batch_size,))
         xi_phi_r2_batch = jax.lax.dynamic_slice(xi_phi_r2_padded, (0, i_batch_r2 * batch_size), (n_fused_r2, batch_size))
 
         def inner_scan(inner_carry, i_batch_r1):
-            # Slice r1 batch from host
             r1_batch = jax.lax.dynamic_slice(grid_r1_padded, (i_batch_r1 * batch_size, 0), (batch_size, 3))
             w1_batch = jax.lax.dynamic_slice(weights_r1_padded, (i_batch_r1 * batch_size,), (batch_size,))
             xi_phi_r1_batch = jax.lax.dynamic_slice(xi_phi_r1_padded, (0, i_batch_r1 * batch_size), (n_fused_r1, batch_size))
@@ -392,7 +371,6 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
 
             return inner_carry + G3_batch, None
 
-        # Inner scan over r1 batches
         G3_init = jnp.zeros((n_fused_r1, batch_size))
         G3, _ = jax.lax.scan(inner_scan, G3_init, jnp.arange(n_batches_r1))
 
@@ -426,26 +404,20 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_
     # C_phi_{rs, l} = phi_{r,l} phi_{s,l}
     C_phi = jnp.einsum('rl,sl->rsl', phi_r, phi_s)
     
-    # Define dimensions first
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
     N_fused = U1.shape[0]
     
-    # We iterate over blocks of l.
     n_rank = U1.shape[1]
     
-    # Pad rank dimension to multiple of block size
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width = padded_rank - n_rank
     
-    # Pad U1 along axis 1 (l index)
     U1_padded = jnp.pad(U1, ((0, 0), (0, pad_width), (0, 0)))
     
-    # Pad phi_r and phi_s along axis 1 (l index)
     phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width)))
     phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width)))
     
-    # Reshape for scan: (n_blocks, block_size, ...)
     n_blocks = padded_rank // rank_block_size
     
     # U1: (N_fused, n_blocks, block, 3) -> (n_blocks, N_fused, block, 3)
@@ -459,7 +431,6 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_
     def scan_l_block(carry, args):
         U1_block, phi_r_block, phi_s_block = args
         # 1. Compute T_block[p, q, l_local]
-        # Sum over spatial component c
         def process_component(T_acc, c):
             U1_slice = U1_block[:, :, c] # (N_fused, block)
             
@@ -473,7 +444,6 @@ def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_
             W_perm = jnp.transpose(W, (0, 2, 1))
             W_2d = W_perm.reshape(Np*rank_block_size, N_fused)
             
-            # T_flat = W_2d @ phi_q.T
             T_flat = jnp.matmul(W_2d, phi_q.T) # (Np*block, Nq)
             
             # Reshape back to (Np, block, Nq) -> (Np, Nq, block)
@@ -548,7 +518,6 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
     N_fused = U1.shape[0]
     n_rank = U1.shape[1]
 
-    # Pad rank dimension
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width = padded_rank - n_rank
     U1_padded = jnp.pad(U1, ((0, 0), (0, pad_width), (0, 0)))
@@ -586,7 +555,6 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
         T_K2 = _compute_T_block(grad_phi_q, phi_p, U1_block, Nq, Np)
         T_K2_T = jnp.transpose(T_K2, (1, 0, 2))  # (Np, Nq, block)
 
-        # Combined T
         T_combined = T_K1 - T_K2_T  # (Np, Nq, block)
 
         # C_rs[r, s, l']
@@ -1077,20 +1045,16 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
     # streaming passes a panel of axis-1 columns.
     n_rank = U3.shape[1]
 
-    # Pad rank dimension (axis 1) to a multiple of rank_block_size.
     padded_rank = ((n_rank + rank_block_size - 1) // rank_block_size) * rank_block_size
     pad_width = padded_rank - n_rank
 
-    # Pad U3 along axis 1 (l index)
     U3_padded = jnp.pad(U3, ((0, 0), (0, pad_width)))
     
-    # Pad phi_r and phi_s
     phi_r_padded = jnp.pad(phi_r, ((0, 0), (0, pad_width)))
     phi_s_padded = jnp.pad(phi_s, ((0, 0), (0, pad_width)))
     
     n_blocks = padded_rank // rank_block_size
     
-    # Reshape for scan
     # U3: (N_fused, n_blocks, block) -> (n_blocks, N_fused, block)
     U3_scannable = U3_padded.reshape(N_fused, n_blocks, rank_block_size).transpose(1, 0, 2)
     
@@ -1114,7 +1078,6 @@ def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
         # 2. Form C_rs[r, s, l_local]
         C_rs = phi_r_block[:, None, :] * phi_s_block[None, :, :] # (Nr, Ns, block)
         
-        # 3. Contract
         contribution = jnp.einsum('pql,rsl->pqrs', T_block, C_rs)
         
         return carry + contribution, None

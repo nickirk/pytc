@@ -36,7 +36,6 @@ def get_git_commit(repo_path: Optional[Path] = None) -> str:
             check=True
         )
         commit_hash = result.stdout.strip()
-        # Return short form (first 7 characters)
         return commit_hash[:7]
     except (subprocess.CalledProcessError, FileNotFoundError):
         return 'unknown'
@@ -54,7 +53,6 @@ def get_pytc_version() -> str:
     except PackageNotFoundError:
         pass
 
-    # Fallback: try to read from pyproject.toml
     pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
     if pyproject_path.exists():
         try:
@@ -117,17 +115,14 @@ def get_device_info() -> Dict[str, any]:
         info['device_count'] = len(devices)
 
         if devices:
-            # Get device kind from first device
             device_kind = devices[0].device_kind
             info['device_type'] = device_kind.lower()
 
-            # Get details for each device
             for dev in devices:
                 dev_info = {
                     'id': dev.id,
                     'kind': dev.device_kind,
                 }
-                # Try to get memory info
                 try:
                     stats = dev.memory_stats()
                     if stats:
@@ -154,25 +149,21 @@ def log_startup_info():
     - dependency versions
     - device information
     """
-    # Get info
     pytc_version = get_pytc_version()
     git_commit = get_git_commit()
     deps = get_dependency_versions()
     device_info = get_device_info()
 
-    # Log pytc info
     logger.info("=" * 60)
     logger.info("pytc startup information")
     logger.info("=" * 60)
     logger.info(f"pytc version: {pytc_version}")
     logger.info(f"git commit: {git_commit}")
 
-    # Log dependency versions
     logger.info("Dependency versions:")
     for pkg, version in deps.items():
         logger.info(f"  {pkg}: {version}")
 
-    # Log device information
     logger.info("Device information:")
     logger.info(f"  Device type: {device_info['device_type']}")
     logger.info(f"  Device count: {device_info['device_count']}")

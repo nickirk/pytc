@@ -320,7 +320,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
             f"nocc={cls.nocc} nvir={cls.nvir}"
         )
 
-    # ---------- helpers -------------------------------------------------
 
     def _ovov_ranges(self):
         """ovov single-tile ranges: ``slice_p==slice_r``, ``slice_q==slice_s``."""
@@ -343,7 +342,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
             return padded[:p_len, :q_len, :r_len, :s_len]
         if layout == "qr":
             return padded[:p_len, :q_len, :r_len, :s_len]
-        # "ps"
         return padded[:p_len, :q_len, :r_len, :s_len]
 
     def _padded_tile_shape(self, layout, p_len, q_len, r_len, s_len, ps):
@@ -351,9 +349,8 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
             return (ps,    q_len, ps,    s_len)
         if layout == "qr":
             return (p_len, ps,    ps,    s_len)
-        return     (ps,    q_len, r_len, ps)   # "ps"
+        return     (ps,    q_len, r_len, ps)
 
-    # ---------- _assemble_tc_tile shortcut ------------------------------
 
     def _check_assemble_tc_tile_all_layouts(self, ranges, tag):
         p_len = ranges[0].stop - ranges[0].start
@@ -387,7 +384,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
     def test_assemble_tc_tile_vovo_single_tile_all_layouts(self):
         self._check_assemble_tc_tile_all_layouts(self._vovo_ranges(), "vovo")
 
-    # ---------- _assemble_delta_u_tile shortcut -------------------------
 
     def _check_assemble_delta_u_tile_all_layouts(self, ranges, tag):
         p_len = ranges[0].stop - ranges[0].start
@@ -426,7 +422,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
         self._check_assemble_delta_u_tile_all_layouts(
             self._vovo_ranges(), "vovo")
 
-    # ---------- End-to-end _assemble_2b_tile (TC + ΔU together) --------
 
     def test_assemble_2b_tile_ovov_single_tile_all_layouts(self):
         ranges = self._ovov_ranges()
