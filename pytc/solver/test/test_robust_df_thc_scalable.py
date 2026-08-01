@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pytc.solver import robust_df_thc
+from pytc.df import thc as robust_df_thc
 from pytc.solver.test.robust_df_thc_h10_fingerprint import (
     canonical_array_fingerprint,
 )

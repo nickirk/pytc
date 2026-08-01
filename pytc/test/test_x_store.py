@@ -9,7 +9,7 @@ import unittest
 import h5py
 import numpy as np
 
-from pytc.utils.x_store import (add_rank_major, convert_store_to_rank_major,
+from pytc.df.thc import (add_rank_major, convert_store_to_rank_major,
     convert_x_to_rank_major)
 
 

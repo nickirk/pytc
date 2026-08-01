@@ -102,7 +102,7 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         self.assertIs(x_backing, x_rm)
         self.assertEqual(x_backing.shape, (self.rank, self.nmo, self.nmo))
         # And the layout detector agrees with the preference.
-        from pytc.solver import factor_direct_vvvv
+        from pytc.solver import isdf_xtc_ccsd as factor_direct_vvvv
         self.assertEqual(
             factor_direct_vvvv._x_backing_layout(
                 x_rm, self.nocc, self.nmo - self.nocc, self.rank),

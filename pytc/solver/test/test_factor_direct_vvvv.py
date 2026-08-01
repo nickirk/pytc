@@ -15,7 +15,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-from pytc.solver import factor_direct_vvvv as factor_direct
+from pytc.solver import isdf_xtc_ccsd as factor_direct
 from pytc.utils import tile_timers as _tile_timers
 
 

@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from pytc.solver.robust_df_thc_scalable_jax import (
+from pytc.df.thc import (
     direct_df_sandwiches_panelled_jax,
     fit_panelled_lsthc_jax,
 )
@@ -43,7 +43,7 @@ class TestJaxFitAndSandwich(unittest.TestCase):
         # The full 3-index B block must never be cast onto the device
         # wholesale -- the panel loops read it one aux slice at a time
         # from the host (the 1200 cycle-1 OOM regression cover).
-        import pytc.solver.robust_df_thc_scalable_jax as mod
+        import pytc.df.thc as mod
 
         uploaded = []
         real = mod._as_fp64_jax

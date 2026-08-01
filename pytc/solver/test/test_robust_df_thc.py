@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from pytc.solver import robust_df_thc
+from pytc.df import thc as robust_df_thc
 
 
 class TestRobustDFTHCOracle(unittest.TestCase):
