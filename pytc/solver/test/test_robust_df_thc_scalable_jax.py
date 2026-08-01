@@ -3,8 +3,8 @@ import unittest
 import numpy as np
 
 from pytc.df.thc import (
-    direct_df_sandwiches_panelled_jax,
-    fit_panelled_lsthc_jax,
+    df_sandwiches_jax,
+    fit_lsthc_jax,
 )
 from pytc.solver.test.robust_df_thc_scalable import (
     direct_df_sandwiches_panelled,
@@ -20,12 +20,12 @@ class TestJaxFitAndSandwich(unittest.TestCase):
         b = rng.normal(size=(4, 4, 5))
         t2 = rng.normal(size=(2, 2, 4, 4))
         oracle_fit = fit_panelled_lsthc(p, b, rcond=1e-12, virtual_panel=2)
-        jax_fit = fit_panelled_lsthc_jax(p, b, rcond=1e-12, virtual_panel=2)
+        jax_fit = fit_lsthc_jax(p, b, rcond=1e-12, virtual_panel=2)
         self.assertLess(
             np.max(np.abs(oracle_fit.y - np.asarray(jax_fit.y))), 1e-12)
         oracle = direct_df_sandwiches_panelled(
             b, oracle_fit, t2, rank_panel=2, aux_panel=3)
-        actual = direct_df_sandwiches_panelled_jax(
+        actual = df_sandwiches_jax(
             b, jax_fit, t2, rank_panel=2, aux_panel=3)
         self.assertLess(
             np.max(np.abs(oracle.robust - np.asarray(actual.robust))), 1e-12)
@@ -36,7 +36,7 @@ class TestJaxFitAndSandwich(unittest.TestCase):
         for rcond in (0.0, -1.0, 1.1, np.nan, np.inf):
             with self.subTest(rcond=rcond):
                 with self.assertRaisesRegex(ValueError, "rcond"):
-                    fit_panelled_lsthc_jax(
+                    fit_lsthc_jax(
                         p, b, rcond=rcond, virtual_panel=1)
 
     def test_sandwich_keeps_b_host_resident(self):
@@ -58,10 +58,10 @@ class TestJaxFitAndSandwich(unittest.TestCase):
             p = rng.normal(size=(4, 3))
             b = rng.normal(size=(4, 4, 5))
             t2 = rng.normal(size=(2, 2, 4, 4))
-            jax_fit = fit_panelled_lsthc_jax(
+            jax_fit = fit_lsthc_jax(
                 p, b, rcond=1e-12, virtual_panel=2)
             uploaded.clear()
-            direct_df_sandwiches_panelled_jax(
+            df_sandwiches_jax(
                 b, jax_fit, t2, rank_panel=2, aux_panel=3)
         finally:
             mod._as_fp64_jax = real
@@ -76,12 +76,12 @@ class TestJaxFitAndSandwich(unittest.TestCase):
         p = rng.normal(size=(4, 3))
         b = rng.normal(size=(4, 4, 5))
         t2 = rng.normal(size=(2, 2, 4, 4))
-        jax_fit = fit_panelled_lsthc_jax(p, b, rcond=1e-12, virtual_panel=2)
-        wide = direct_df_sandwiches_panelled_jax(
+        jax_fit = fit_lsthc_jax(p, b, rcond=1e-12, virtual_panel=2)
+        wide = df_sandwiches_jax(
             b, jax_fit, t2, rank_panel=2, aux_panel=3)
         os.environ["PYTC_EXACT_PANEL_CAP_GB"] = str(512 / 1024 ** 3)
         try:
-            clamped = direct_df_sandwiches_panelled_jax(
+            clamped = df_sandwiches_jax(
                 b, jax_fit, t2, rank_panel=2, aux_panel=3)
         finally:
             del os.environ["PYTC_EXACT_PANEL_CAP_GB"]

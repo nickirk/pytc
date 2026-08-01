@@ -144,7 +144,7 @@ class TestFactorDirectRandomFP64(unittest.TestCase):
     def setUp(self):
         self.data = _random_inputs()
         self.reference = _dense_reference_terms(self.data)
-        self.actual = factor_direct.contract_isdf_factor_direct_terms_t2(
+        self.actual = factor_direct.contract_terms_t2(
             **self.data,
             occupied_pair_batch_size=2,
             rank_panel_size=3,
@@ -248,11 +248,11 @@ class TestFactorDirectRandomFP64(unittest.TestCase):
                 t2, data["p"], data["p"], data["u3"], data["p"], data["p"],
                 occupied_pair_batch_size=2, rank_panel_size=3,
             ),
-            lambda t2: factor_direct.contract_partial_x_left_t2(
+            lambda t2: factor_direct.contract_x_left_t2(
                 t2, data["p"], data["p"], data["x"],
                 occupied_pair_batch_size=2, rank_panel_size=3,
             ),
-            lambda t2: factor_direct.contract_partial_x_right_t2(
+            lambda t2: factor_direct.contract_x_right_t2(
                 t2, data["p"], data["p"], data["x"],
                 occupied_pair_batch_size=2, rank_panel_size=3,
             ),
@@ -313,7 +313,7 @@ class TestFactorDirectPhysicalH10(unittest.TestCase):
             d=jnp.asarray(kernels["D"]),
             x=jnp.asarray(kernels["X"])[virtual, virtual],
         )
-        actual = factor_direct.contract_isdf_factor_direct_terms_t2(
+        actual = factor_direct.contract_terms_t2(
             **data, occupied_pair_batch_size=2, rank_panel_size=8,
         )
         reference = _dense_reference_terms(data)
@@ -385,19 +385,19 @@ class TestStreamedXParity(unittest.TestCase):
     def test_left_and_right_streamed_match_full_block(self):
         for panel in (2, 3, 7):
             with self.subTest(rank_panel_size=panel):
-                left_full = factor_direct.contract_partial_x_left_t2(
+                left_full = factor_direct.contract_x_left_t2(
                     self.data["t2"], self.data["p"], self.data["p"], self.data["x"],
                     occupied_pair_batch_size=2, rank_panel_size=panel)
-                left_stream = factor_direct.contract_partial_x_left_t2_streamed(
+                left_stream = factor_direct.contract_x_left_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=panel)
                 self.assertLessEqual(_relative_l2(left_stream, left_full), 1e-12)
 
-                right_full = factor_direct.contract_partial_x_right_t2(
+                right_full = factor_direct.contract_x_right_t2(
                     self.data["t2"], self.data["p"], self.data["p"], self.data["x"],
                     occupied_pair_batch_size=2, rank_panel_size=panel)
-                right_stream = factor_direct.contract_partial_x_right_t2_streamed(
+                right_stream = factor_direct.contract_x_right_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=panel)
@@ -411,20 +411,20 @@ class TestStreamedXParity(unittest.TestCase):
             with h5py.File(path, "w") as fh:
                 fh.create_dataset("X", data=self.backing, dtype="f8")
             with h5py.File(path, "r") as fh:
-                streamed = factor_direct.contract_partial_x_left_t2_streamed(
+                streamed = factor_direct.contract_x_left_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     fh["X"], self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=3)
-        in_memory = factor_direct.contract_partial_x_left_t2_streamed(
+        in_memory = factor_direct.contract_x_left_t2_streamed(
             self.data["t2"], self.data["p"], self.data["p"],
             self.backing, self.nocc,
             occupied_pair_batch_size=2, rank_panel_size=3)
         self.assertLessEqual(_relative_l2(streamed, in_memory), 1e-12)
 
     def test_dispatcher_xstream_matches_full_dispatcher(self):
-        full = factor_direct.contract_isdf_factor_direct_terms_t2(
+        full = factor_direct.contract_terms_t2(
             **self.data, occupied_pair_batch_size=2, rank_panel_size=3)
-        streamed = factor_direct.contract_isdf_factor_direct_terms_t2_xstream(
+        streamed = factor_direct.contract_terms_t2_xstream(
             self.data["t2"], self.data["p"], self.data["grad_p"],
             self.data["u1"], self.data["u3"], self.data["d"],
             self.backing, self.nocc,
@@ -472,7 +472,7 @@ class TestTieredXAuto(unittest.TestCase):
         backing = np.zeros((nmo, nmo, self.rank), dtype=np.float64)
         backing[self.nocc:, self.nocc:, :] = np.asarray(self.data["x"])
         self.backing = backing
-        self.reference = factor_direct.contract_isdf_factor_direct_terms_t2(
+        self.reference = factor_direct.contract_terms_t2(
             **self.data, occupied_pair_batch_size=2, rank_panel_size=3)
         self._saved_env = {name: os.environ.get(name) for name in self._ENV_PINS}
 
@@ -490,7 +490,7 @@ class TestTieredXAuto(unittest.TestCase):
         os.environ["PYTC_X_FORCE_TIER"] = str(tier)
         os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(1200 / 1024 ** 3)
         counters_before = dict(_tile_timers._STATE["counters"])
-        terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+        terms = factor_direct.contract_terms_t2_auto(
             self.data["t2"], self.data["p"], self.data["grad_p"],
             self.data["u1"], self.data["u3"], self.data["d"],
             self.backing, self.nocc,
@@ -528,20 +528,20 @@ class TestTieredXAuto(unittest.TestCase):
         # pipelined loop groups the rank reduction exactly like the streamed
         # path and must reproduce it bitwise.
         os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(8 / 1024 ** 3)
-        left_stream = factor_direct.contract_partial_x_left_t2_streamed(
+        left_stream = factor_direct.contract_x_left_t2_streamed(
             self.data["t2"], self.data["p"], self.data["p"],
             self.backing, self.nocc,
             occupied_pair_batch_size=2, rank_panel_size=3)
-        left_pipe = factor_direct.contract_partial_x_left_t2_pipelined(
+        left_pipe = factor_direct.contract_x_left_t2_pipelined(
             self.data["t2"], self.data["p"], self.data["p"],
             self.backing, self.nocc,
             occupied_pair_batch_size=2, rank_panel_size=3)
         self.assertEqual(_relative_l2(left_pipe, left_stream), 0.0)
-        right_stream = factor_direct.contract_partial_x_right_t2_streamed(
+        right_stream = factor_direct.contract_x_right_t2_streamed(
             self.data["t2"], self.data["p"], self.data["p"],
             self.backing, self.nocc,
             occupied_pair_batch_size=2, rank_panel_size=3)
-        right_pipe = factor_direct.contract_partial_x_right_t2_pipelined(
+        right_pipe = factor_direct.contract_x_right_t2_pipelined(
             self.data["t2"], self.data["p"], self.data["p"],
             self.backing, self.nocc,
             occupied_pair_batch_size=2, rank_panel_size=3)
@@ -565,11 +565,11 @@ class TestTieredXAuto(unittest.TestCase):
             return real_device_put(*args, **kwargs)
 
         with mock.patch.object(jax, "device_put", side_effect=fail_first):
-            result = factor_direct.contract_partial_x_left_t2_pipelined(
+            result = factor_direct.contract_x_left_t2_pipelined(
                 self.data["t2"], self.data["p"], self.data["p"],
                 self.backing, self.nocc,
                 occupied_pair_batch_size=2, rank_panel_size=3)
-        reference = factor_direct.contract_partial_x_left_t2(
+        reference = factor_direct.contract_x_left_t2(
             self.data["t2"], self.data["p"], self.data["p"], self.data["x"],
             occupied_pair_batch_size=2, rank_panel_size=3)
         self.assertLessEqual(_relative_l2(result, reference), 1e-12)
@@ -586,7 +586,7 @@ class TestTieredXAuto(unittest.TestCase):
 
         with mock.patch.object(jax, "device_put", side_effect=fail_always):
             with self.assertRaises(jax.errors.JaxRuntimeError):
-                factor_direct.contract_partial_x_left_t2_pipelined(
+                factor_direct.contract_x_left_t2_pipelined(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=3)
@@ -608,7 +608,7 @@ class TestTieredXAuto(unittest.TestCase):
             terms, _ = self._run_auto(2)
             self.assertIn("final", terms)
             os.environ.pop("PYTC_X_FORCE_TIER", None)
-            terms2 = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+            terms2 = factor_direct.contract_terms_t2_auto(
                 self.data["t2"], self.data["p"], self.data["grad_p"],
                 self.data["u1"], self.data["u3"], self.data["d"],
                 self.backing, self.nocc,
@@ -622,7 +622,7 @@ class TestTieredXAuto(unittest.TestCase):
         counters_before = dict(_tile_timers._STATE["counters"])
         with mock.patch.object(
                 factor_direct, "_measure_free_device_bytes", return_value=None):
-            terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+            terms = factor_direct.contract_terms_t2_auto(
                 self.data["t2"], self.data["p"], self.data["grad_p"],
                 self.data["u1"], self.data["u3"], self.data["d"],
                 self.backing, self.nocc,
@@ -641,7 +641,7 @@ class TestTieredXAuto(unittest.TestCase):
                 factor_direct, "_measure_free_device_bytes", return_value=None), \
              mock.patch.object(
                 factor_direct, "_measure_free_host_bytes", return_value=None):
-            terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+            terms = factor_direct.contract_terms_t2_auto(
                 self.data["t2"], self.data["p"], self.data["grad_p"],
                 self.data["u1"], self.data["u3"], self.data["d"],
                 self.backing, self.nocc,
@@ -874,20 +874,20 @@ class TestRankMajorXLayout(unittest.TestCase):
         # layouts must agree bitwise, not just at reassociation level.
         for panel in (2, 3, 7):
             with self.subTest(rank_panel_size=panel):
-                left_im = factor_direct.contract_partial_x_left_t2_streamed(
+                left_im = factor_direct.contract_x_left_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=panel)
-                left_rm = factor_direct.contract_partial_x_left_t2_streamed(
+                left_rm = factor_direct.contract_x_left_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing_rm, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=panel)
                 self.assertEqual(_relative_l2(left_rm, left_im), 0.0)
-                right_im = factor_direct.contract_partial_x_right_t2_streamed(
+                right_im = factor_direct.contract_x_right_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=panel)
-                right_rm = factor_direct.contract_partial_x_right_t2_streamed(
+                right_rm = factor_direct.contract_x_right_t2_streamed(
                     self.data["t2"], self.data["p"], self.data["p"],
                     self.backing_rm, self.nocc,
                     occupied_pair_batch_size=2, rank_panel_size=panel)
@@ -897,7 +897,7 @@ class TestRankMajorXLayout(unittest.TestCase):
         os.environ["PYTC_X_FORCE_TIER"] = str(tier)
         os.environ["PYTC_X_PANEL_BUDGET_GB"] = str(1200 / 1024 ** 3)
         counters_before = dict(_tile_timers._STATE["counters"])
-        terms = factor_direct.contract_isdf_factor_direct_terms_t2_auto(
+        terms = factor_direct.contract_terms_t2_auto(
             self.data["t2"], self.data["p"], self.data["grad_p"],
             self.data["u1"], self.data["u3"], self.data["d"],
             backing, self.nocc,
@@ -908,7 +908,7 @@ class TestRankMajorXLayout(unittest.TestCase):
         return terms, fired
 
     def test_auto_tiers_rank_major_match_innermost(self):
-        reference = factor_direct.contract_isdf_factor_direct_terms_t2(
+        reference = factor_direct.contract_terms_t2(
             **self.data, occupied_pair_batch_size=2, rank_panel_size=3)
         for tier, counter in ((1, "fd_x_tier1_full_lift"),
                               (2, "fd_x_tier2_host_resident"),

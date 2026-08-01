@@ -1,7 +1,7 @@
 """DF/THC algebra: NumPy oracle, JAX production path, and X-store layouts.
 
 The NumPy section is the reference oracle (and provides
-``extract_metric_applied_vv_df_factor`` for the solver's factorized state).
+``extract_vv_df_factor`` for the solver's factorized state).
 The JAX section is the production implementation of the same panelled
 algebra.  The X-store section converts ISDF X factors between the
 rank-innermost store layout ``(nmo, nmo, rank)`` and the rank-major layout
@@ -22,12 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from numpy.typing import NDArray
 
-# ================= NumPy oracle (was solver/robust_df_thc.py) =================
-
-from dataclasses import dataclass
-
-import numpy as np
-from numpy.typing import NDArray
+# ---------------- NumPy oracle ----------------
 
 
 Float64Array = NDArray[np.float64]
@@ -114,7 +109,7 @@ def virtual_pair_df_matrix(l_vv: object) -> Float64Array:
     return b.reshape(nvir_a * nvir_c, b.shape[2])
 
 
-def extract_metric_applied_vv_df_factor(
+def extract_vv_df_factor(
     with_df: object,
     mo_coeff: object,
     nocc: int,
@@ -387,7 +382,7 @@ def direct_df_sandwiches(model: RobustDFTHCModel, t2: object) -> DirectDFSandwic
         delta_delta=delta_delta,
     )
 
-# ================= JAX production path (was solver/robust_df_thc_scalable_jax.py) =================
+# ---------------- JAX production path ----------------
 
 
 # JAX is float32 by default. Enabling x64 must happen before any array is created;
@@ -657,7 +652,7 @@ class ScalableDirectSandwichesJax:
         self.robust = fit_left_df_right + df_left_fit_right - full_thc
 
 
-def direct_df_sandwiches_panelled_jax(b, fit, t2, *, rank_panel: int,
+def df_sandwiches_jax(b, fit, t2, *, rank_panel: int,
                                       aux_panel: int):
     """JAX port of the oracle's entry point. Same signature, same panel semantics.
 
@@ -702,7 +697,7 @@ def to_numpy(result):
                          "full_thc", "robust")}
 
 
-def fit_panelled_lsthc_jax(p_virtual, b, *, rcond: float, virtual_panel: int):
+def fit_lsthc_jax(p_virtual, b, *, rcond: float, virtual_panel: int):
     """JAX FP64 normal-equation LS-THC fit, retaining the oracle's panels."""
     require_float64()
     if not np.isfinite(rcond) or not 0.0 < float(rcond) <= 1.0:
@@ -733,7 +728,7 @@ def fit_panelled_lsthc_jax(p_virtual, b, *, rcond: float, virtual_panel: int):
     return SimpleNamespace(p_virtual=p, y=y, gram=gram, cross=cross,
                            rcond=float(rcond), resolved_rcond=max(float(rcond), floor))
 
-# ================= X-store layouts (was utils/x_store.py) =================
+# ---------------- X-store layouts ----------------
 
 
 
@@ -836,7 +831,7 @@ def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
             return store
         # Write to a temp dataset and rename into place: an interrupted
         # conversion must never leave a correctly-shaped but partially
-        # written X_rm behind (review finding).
+        # written X_rm behind.
         tmp_name = out_dataset + ".tmp"
         if tmp_name in fh:
             del fh[tmp_name]

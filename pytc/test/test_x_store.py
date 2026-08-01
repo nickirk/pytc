@@ -1,4 +1,4 @@
-"""Tests for pytc.utils.x_store (rank-innermost -> rank-major conversion)."""
+"""Tests for the X-store layout helpers in pytc.df.thc."""
 
 from __future__ import annotations
 

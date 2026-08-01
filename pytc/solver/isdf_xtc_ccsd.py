@@ -28,8 +28,8 @@ import numpy as np
 
 from pytc.df import thc
 from pytc.df.thc import (
-    direct_df_sandwiches_panelled_jax,
-    fit_panelled_lsthc_jax,
+    df_sandwiches_jax,
+    fit_lsthc_jax,
 )
 from pytc.solver import jax_xtc_ccsd
 from pytc.utils import tile_timers as _tile_timers
@@ -82,10 +82,10 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         # gather), the contraction uses it; legacy consumers keep X.
         x_backing = kernels.get("X_rm", kernels["X"])
         with_df = getattr(self, "with_df", None) or self._scf.with_df
-        b = thc.extract_metric_applied_vv_df_factor(
+        b = thc.extract_vv_df_factor(
             with_df, self.mo_coeff, nocc)
         nvir = tc["p"].shape[0]
-        fit = fit_panelled_lsthc_jax(
+        fit = fit_lsthc_jax(
             tc["p"], b, rcond=self.factorized_rcond,
             virtual_panel=min(self.factorized_virtual_panel, nvir))
         state = (tc, b, fit, x_backing)
@@ -103,7 +103,7 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         rank_panel = min(self.factorized_rank_panel, fit.p_virtual.shape[1])
         aux_panel = min(self.factorized_aux_panel, b.shape[2])
         with _tile_timers.term("fd_isdf_terms") as _tt:
-            terms = contract_isdf_factor_direct_terms_t2_auto(
+            terms = contract_terms_t2_auto(
                 t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
                 occupied_pair_batch_size=min(8, self.nocc * self.nocc),
                 rank_panel_size=rank_panel)
@@ -114,7 +114,7 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
             del terms
             _tt.sync(final)
         with _tile_timers.term("fd_coulomb_sandwich") as _tt:
-            coulomb = direct_df_sandwiches_panelled_jax(
+            coulomb = df_sandwiches_jax(
                 b, fit, t2_jax, rank_panel=rank_panel, aux_panel=aux_panel)
             _tt.sync(coulomb.robust)
         t2new_host += np.asarray(final + coulomb.robust, dtype=np.float64)
@@ -530,7 +530,7 @@ def _validate_x(t2: Array, left_out: Array, left_inner: Array, x: Array) -> None
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
-def _contract_partial_x_left_t2_jit(
+def _contract_x_left_t2_jit(
     t2: Array,
     left_out: Array,
     left_inner: Array,
@@ -591,7 +591,7 @@ def _contract_partial_x_left_t2_jit(
     return result[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
-def contract_partial_x_left_t2(
+def contract_x_left_t2(
     t2: Array,
     left_out: Array,
     left_inner: Array,
@@ -606,7 +606,7 @@ def contract_partial_x_left_t2(
         raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
     arrays = tuple(map(jnp.asarray, (t2, left_out, left_inner, x)))
     _validate_x(*arrays)
-    return _contract_partial_x_left_t2_jit(
+    return _contract_x_left_t2_jit(
         *arrays,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
@@ -628,7 +628,7 @@ def compiled_partial_x_left_memory(
         raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
     arrays = tuple(map(jnp.asarray, (t2, left_out, left_inner, x)))
     _validate_x(*arrays)
-    executable = _contract_partial_x_left_t2_jit.lower(
+    executable = _contract_x_left_t2_jit.lower(
         *arrays,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
@@ -637,7 +637,7 @@ def compiled_partial_x_left_memory(
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
-def _contract_partial_x_right_t2_jit(
+def _contract_x_right_t2_jit(
     t2: Array,
     right_out: Array,
     right_inner: Array,
@@ -698,7 +698,7 @@ def _contract_partial_x_right_t2_jit(
     return result[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
-def contract_partial_x_right_t2(
+def contract_x_right_t2(
     t2: Array,
     right_out: Array,
     right_inner: Array,
@@ -713,7 +713,7 @@ def contract_partial_x_right_t2(
         raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
     arrays = tuple(map(jnp.asarray, (t2, right_out, right_inner, x)))
     _validate_x(*arrays)
-    return _contract_partial_x_right_t2_jit(
+    return _contract_x_right_t2_jit(
         *arrays,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
@@ -735,7 +735,7 @@ def compiled_partial_x_right_memory(
         raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
     arrays = tuple(map(jnp.asarray, (t2, right_out, right_inner, x)))
     _validate_x(*arrays)
-    executable = _contract_partial_x_right_t2_jit.lower(
+    executable = _contract_x_right_t2_jit.lower(
         *arrays,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
@@ -746,7 +746,7 @@ def compiled_partial_x_right_memory(
 # ---------------------------------------------------------------------------
 # Streamed-X contraction (bounded device memory)
 #
-# ``contract_partial_x_*_t2`` device-lift the whole X factor before the panel
+# ``contract_x_*_t2`` device-lift the whole X factor before the panel
 # loop, which is impossible beyond a few hundred virtual orbitals.  The
 # streamed variants below keep X on its host/HDF5 backing and device_put one
 # rank panel at a time; the per-panel kernels reproduce the full-lift math
@@ -950,7 +950,7 @@ def _stream_partial_x(panel_kernel, t2, left_out, left_inner, x_backing, nocc,
     return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
-def contract_partial_x_left_t2_streamed(t2, left_out, left_inner, x_backing, nocc,
+def contract_x_left_t2_streamed(t2, left_out, left_inner, x_backing, nocc,
                                         *, occupied_pair_batch_size=8,
                                         rank_panel_size=128):
     """Streamed ``P[a,m] P[c,m] X[b,d,m]``: one X rank panel on device at a time."""
@@ -961,7 +961,7 @@ def contract_partial_x_left_t2_streamed(t2, left_out, left_inner, x_backing, noc
         rank_panel_size=rank_panel_size)
 
 
-def contract_partial_x_right_t2_streamed(t2, right_out, right_inner, x_backing, nocc,
+def contract_x_right_t2_streamed(t2, right_out, right_inner, x_backing, nocc,
                                          *, occupied_pair_batch_size=8,
                                          rank_panel_size=128):
     """Streamed ``X[a,c,m] P[b,m] P[d,m]``: one X rank panel on device at a time."""
@@ -1026,10 +1026,8 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
     A SLURM job's ``--mem`` cap is enforced by the cgroup OOM killer, so
     node-wide RAM (psutil) overstates what a tier-2 host lift may use.
     The limit lives on the job's OWN cgroup (e.g.
-    ``.../slurmstepd.scope/job_<id>/``), not at the hierarchy root -- an
-    earlier version of this helper read only the root, found it
-    unlimited, and admitted a 238.7 GB lift into a 256 GB job.  This
-    version discovers the process's cgroup(s) from ``/proc/self/cgroup``
+    ``.../slurmstepd.scope/job_<id>/``), not at the hierarchy root.
+    Discovers the process's cgroup(s) from ``/proc/self/cgroup``
     and walks each path UP to the root, taking the minimum of
     ``limit - current`` over every level that sets one (cgroup v2
     ``memory.max``/``memory.current``; v1
@@ -1294,7 +1292,7 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
         return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
-def contract_partial_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
+def contract_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
                                          *, occupied_pair_batch_size=8,
                                          rank_panel_size=128,
                                          panel_budget_bytes=None):
@@ -1309,7 +1307,7 @@ def contract_partial_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, no
         panel_budget_bytes=panel_budget_bytes)
 
 
-def contract_partial_x_right_t2_pipelined(t2, right_out, right_inner, x_backing, nocc,
+def contract_x_right_t2_pipelined(t2, right_out, right_inner, x_backing, nocc,
                                           *, occupied_pair_batch_size=8,
                                           rank_panel_size=128,
                                           panel_budget_bytes=None):
@@ -1333,7 +1331,7 @@ _X_FULL_LIFT_CAP_BYTES = int(
     float(os.environ.get("PYTC_X_FULL_LIFT_CAP_GB", "24")) * 1024 ** 3)
 
 
-def contract_isdf_factor_direct_terms_t2_auto(
+def contract_terms_t2_auto(
     t2: Array,
     p: Array,
     grad_p: Array,
@@ -1418,7 +1416,7 @@ def contract_isdf_factor_direct_terms_t2_auto(
                 .transpose(1, 2, 0))
         else:
             x_full = np.asarray(x_backing[nocc:, nocc:, :], dtype=np.float64)
-        return contract_isdf_factor_direct_terms_t2(
+        return contract_terms_t2(
             t2, p, grad_p, u1, u3, d, x_full,
             occupied_pair_batch_size=occupied_pair_batch_size,
             rank_panel_size=rank_panel_size)
@@ -1434,14 +1432,14 @@ def contract_isdf_factor_direct_terms_t2_auto(
     else:
         _tile_timers.incr("fd_x_tier3_stream")
         panel_source = _x_backing_panel_source(x_backing, nocc, layout)
-    return contract_isdf_factor_direct_terms_t2_xstream(
+    return contract_terms_t2_xstream(
         t2, p, grad_p, u1, u3, d, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_source=panel_source)
 
 
-def contract_isdf_factor_direct_terms_t2_xstream(
+def contract_terms_t2_xstream(
     t2: Array,
     p: Array,
     grad_p: Array,
@@ -1459,14 +1457,14 @@ def contract_isdf_factor_direct_terms_t2_xstream(
     """Factor-direct terms with X streamed panel-wise from its backing.
 
     Identical terms and signs to
-    :func:`contract_isdf_factor_direct_terms_t2`; only the two X-consuming
+    :func:`contract_terms_t2`; only the two X-consuming
     terms change how X reaches the device.  Every other input is small and
     device-lifted exactly as in the full-block path.
 
     With ``panel_source=None`` the X terms use the legacy 128-wide panel
     loop; with a panel source (see :func:`_x_host_panel_source` /
     :func:`_x_backing_panel_source`) they use the pipelined working-set
-    panel loop -- tiers 2/3 of :func:`contract_isdf_factor_direct_terms_t2_auto`.
+    panel loop -- tiers 2/3 of :func:`contract_terms_t2_auto`.
     """
 
     p, grad_p, u1, u3, d = map(jnp.asarray, (p, grad_p, u1, u3, d))
@@ -1503,9 +1501,9 @@ def contract_isdf_factor_direct_terms_t2_xstream(
     d_pair = _timed("fd_d_pair", contract_full_thc_pair_swapped_t2,
                     t2, p, p, d, p, p, **_kw)
     if panel_source is None:
-        x_direct = _timed("fd_x_left", contract_partial_x_left_t2_streamed,
+        x_direct = _timed("fd_x_left", contract_x_left_t2_streamed,
                           t2, p, p, x_backing, nocc, **_kw)
-        x_pair = _timed("fd_x_right", contract_partial_x_right_t2_streamed,
+        x_pair = _timed("fd_x_right", contract_x_right_t2_streamed,
                         t2, p, p, x_backing, nocc, **_kw)
     else:
         _validate_x_stream(t2, p, p, x_backing, nocc)
@@ -1516,7 +1514,7 @@ def contract_isdf_factor_direct_terms_t2_xstream(
                         _xstream_right_panel_jit, t2, p, p, panel_source, nocc,
                         panel_budget_bytes=panel_budget_bytes, **_kw)
 
-    # Same sign assembly as contract_isdf_factor_direct_terms_t2.
+    # Same sign assembly as contract_terms_t2.
     tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
     tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
     delta_direct = d_direct - x_direct
@@ -1545,7 +1543,7 @@ def contract_isdf_factor_direct_terms_t2_xstream(
     }
 
 
-def contract_isdf_factor_direct_terms_t2(
+def contract_terms_t2(
     t2: Array,
     p: Array,
     grad_p: Array,
@@ -1623,12 +1621,12 @@ def contract_isdf_factor_direct_terms_t2(
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
-    x_direct = contract_partial_x_left_t2(
+    x_direct = contract_x_left_t2(
         t2, p, p, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
-    x_pair = contract_partial_x_right_t2(
+    x_pair = contract_x_right_t2(
         t2, p, p, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
@@ -1710,7 +1708,7 @@ def profile_isdf_factor_direct_terms_t2(
     peak; the card labels any ``nvidia-smi`` sample accordingly.
     """
 
-    terms = contract_isdf_factor_direct_terms_t2(
+    terms = contract_terms_t2(
         t2, p, grad_p, u1, u3, d, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
@@ -1861,7 +1859,7 @@ def profile_isdf_factor_direct_terms_t2(
             full_memories["d_pair"],
         ),
         "x_direct": (
-            lambda: contract_partial_x_left_t2(
+            lambda: contract_x_left_t2(
                 t2, p, p, x,
                 occupied_pair_batch_size=occupied_pair_batch_size,
                 rank_panel_size=rank_panel_size,
@@ -1870,7 +1868,7 @@ def profile_isdf_factor_direct_terms_t2(
             x_memories["x_direct"],
         ),
         "x_pair": (
-            lambda: contract_partial_x_right_t2(
+            lambda: contract_x_right_t2(
                 t2, p, p, x,
                 occupied_pair_batch_size=occupied_pair_batch_size,
                 rank_panel_size=rank_panel_size,
