@@ -1514,7 +1514,8 @@ class ISDFTC(TC):
         return L_aux_out
 	
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None):
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
+             r2_tile_size=None, gpu_budget_bytes=None):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1524,6 +1525,9 @@ class ISDFTC(TC):
             save_path: Optional path to save intermediates to HDF5.
             batch_size: Batch size for computation.
             host_grid_block_size: Block size for grid batching on host.
+            r2_tile_size: Optional r2-grid tile size for kernel assembly.
+            gpu_budget_bytes: Optional device-memory budget in bytes for kernel
+                assembly.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
@@ -1558,7 +1562,10 @@ class ISDFTC(TC):
 
         logger.info("  Computing K1 and K3 kernels...")
         
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size, host_grid_block_size=host_grid_block_size)
+        kernels = self.compute_kmat_kernels(jastrow_params, batch_size,
+                                            host_grid_block_size=host_grid_block_size,
+                                            r2_tile_size=r2_tile_size,
+                                            gpu_budget_bytes=gpu_budget_bytes)
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
         

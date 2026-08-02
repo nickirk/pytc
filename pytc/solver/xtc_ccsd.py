@@ -335,7 +335,12 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # and serialize issue_tile, preventing multi-GPU overlap.
         _kernels = xtc_obj.isdf_kernels
         _X_kernel = _kernels.get('X') if _kernels is not None else None
-        if isinstance(_X_kernel, h5py.Dataset):
+        # A class whose contraction reads X panel-wise from the store (the
+        # factorized subclass) suppresses the preload via
+        # `_preload_x_for_eris = False` instead of paying for a full host
+        # copy it never uses.
+        if (isinstance(_X_kernel, h5py.Dataset)
+                and getattr(cc, "_preload_x_for_eris", True)):
             _x_gb = _X_kernel.size * 8 / 1e9
             logger.info(
                 "Preloading X into RAM before large-block build (%.2f GB) ...",

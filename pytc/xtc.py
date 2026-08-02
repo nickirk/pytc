@@ -1036,6 +1036,8 @@ class ISDFXTC(XTC, ISDFTC):
         host_grid_block_size=None,
         x_s_panel_blocks=1,
         d_reduce_group_blocks=1,
+        r2_tile_size=None,
+        gpu_budget_bytes=None,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1049,16 +1051,23 @@ class ISDFXTC(XTC, ISDFTC):
                 together per X-kernel grid pass.
             d_reduce_group_blocks: Group size multiplier for D-kernel grid
                 blocking (`D` effective host block = group * host_grid_block_size).
+            r2_tile_size: Optional r2-grid tile size for kernel assembly.
+            gpu_budget_bytes: Optional device-memory budget in bytes for kernel
+                assembly.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
         
-        isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size, host_grid_block_size=host_grid_block_size)
+        isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
+                               host_grid_block_size=host_grid_block_size,
+                               r2_tile_size=r2_tile_size, gpu_budget_bytes=gpu_budget_bytes)
         kernels = isdf_tc.isdf_kernels
         
         if out_path and os.path.exists(out_path):
+            f = None
+            keep_open = False
             try:
                 f = h5py.File(out_path, 'r')
                 if 'D' in f and 'X' in f:
@@ -1068,15 +1077,25 @@ class ISDFXTC(XTC, ISDFTC):
                     if self.is_incore:
                         logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
                         kernels['X'] = f['X'][:]
-                        f.close()
                     else:
-                        # Do NOT close 'f' here; the dataset object keeps the file open.
+                        # Keep the file open only when its datasets escape for
+                        # out-of-core streaming.
                         logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
                         kernels['X'] = f['X']
+                        # Rank-major twin (panel-contiguous) when the store
+                        # carries it; the factorized contraction prefers it.
+                        if 'X_rm' in f:
+                            logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
+                            kernels['X_rm'] = f['X_rm']
                     logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    return self.replace(isdf_kernels=kernels, save_path=out_path)
+                    result = self.replace(isdf_kernels=kernels, save_path=out_path)
+                    keep_open = not self.is_incore
+                    return result
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
+            finally:
+                if f is not None and not keep_open:
+                    f.close()
 
         # Pass L_aux to avoid redundant calculation
         delta_u_kernels = self.compute_delta_u_kernels(
@@ -1167,6 +1186,7 @@ class ISDFXTC(XTC, ISDFTC):
             if 'D' in f: del f['D']
             f.create_dataset('D', data=np.array(D))
             if 'X' in f: del f['X']
+            if 'X_rm' in f: del f['X_rm']  # stale twin once X is rewritten
             X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')

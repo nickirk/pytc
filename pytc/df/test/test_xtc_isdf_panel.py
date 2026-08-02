@@ -1,11 +1,16 @@
 import unittest
 from unittest import mock
+import os
+import tempfile
+
+import h5py
 import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 
 from pytc.jastrow.rexp import REXP
+from pytc.tc import ISDFTC
 from pytc.xtc import XTC, ISDFXTC
 
 
@@ -72,6 +77,37 @@ class TestISDFXTCPanelization(unittest.TestCase):
             atol=1e-9,
             rtol=1e-9,
         )
+
+    def test_incomplete_kernel_store_closes_read_handle(self):
+        fd, path = tempfile.mkstemp(suffix=".h5")
+        os.close(fd)
+        try:
+            with h5py.File(path, "w") as store:
+                store.create_dataset("D", data=np.zeros((1, 1)))
+
+            opened_reads = []
+            real_file = h5py.File
+
+            def tracking_file(name, mode="r", *args, **kwargs):
+                handle = real_file(name, mode, *args, **kwargs)
+                if mode == "r":
+                    opened_reads.append(handle)
+                return handle
+
+            base = self.isdf_xtc.replace(isdf_kernels={})
+            with mock.patch.object(ISDFTC, "isdf", return_value=base):
+                with mock.patch.object(
+                    ISDFXTC,
+                    "compute_delta_u_kernels",
+                    return_value={"D": np.zeros((1, 1)), "X": np.zeros((1, 1, 1))},
+                ):
+                    with mock.patch("pytc.xtc.h5py.File", side_effect=tracking_file):
+                        self.isdf_xtc.isdf(self.jparams, save_path=path)
+
+            self.assertEqual(len(opened_reads), 1)
+            self.assertFalse(opened_reads[0].id.valid)
+        finally:
+            os.remove(path)
 
     def test_delta_u_tile_assembly_matches_public_api(self):
         kernels = self.isdf_xtc.compute_delta_u_kernels(
