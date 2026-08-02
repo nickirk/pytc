@@ -10,7 +10,6 @@ rank-innermost store layout ``(nmo, nmo, rank)`` and the rank-major layout
 
 from __future__ import annotations
 
-import argparse
 import os
 from dataclasses import dataclass
 from functools import partial
@@ -863,39 +862,3 @@ def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
         fh[tmp_name].attrs["x_source_stamp"] = _x_source_stamp(x_in)
         fh.move(tmp_name, out_dataset)
     return store
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("src", help="source store path (rank-innermost X)")
-    parser.add_argument("dst", nargs="?", default=None,
-                        help="destination path (not used by --add-rank-major)")
-    parser.add_argument("--dataset", default="X",
-                        help="dataset name in both files (default: X)")
-    parser.add_argument("--row-block", type=int, default=8,
-                        help="nmo rows converted per slab (default: 8)")
-    parser.add_argument("--whole-store", action="store_true",
-                        help="copy all datasets/attrs, converting only "
-                             "--dataset (a driver-loadable store)")
-    parser.add_argument("--add-rank-major", action="store_true",
-                        help="append X_rm (rank-major) to the src store IN "
-                             "PLACE, leaving X innermost untouched")
-    args = parser.parse_args(argv)
-    if args.add_rank_major:
-        add_rank_major(args.src, x_dataset=args.dataset,
-                       row_block=args.row_block)
-    else:
-        if args.dst is None:
-            parser.error("dst is required unless --add-rank-major is given")
-        if args.whole_store:
-            convert_store_to_rank_major(
-                args.src, args.dst, x_dataset=args.dataset,
-                row_block=args.row_block)
-        else:
-            convert_x_to_rank_major(
-                args.src, args.dst, dataset=args.dataset,
-                row_block=args.row_block)
-
-
-if __name__ == "__main__":
-    main()

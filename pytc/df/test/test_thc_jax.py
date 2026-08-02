@@ -6,7 +6,7 @@ from pytc.df.thc import (
     df_sandwiches_jax,
     fit_lsthc_jax,
 )
-from pytc.solver.test.thc_scalable_oracle import (
+from pytc.df.test._thc_oracle import (
     direct_df_sandwiches_panelled,
     fit_panelled_lsthc,
 )

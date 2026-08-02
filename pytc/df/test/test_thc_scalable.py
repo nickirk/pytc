@@ -8,16 +8,16 @@ from pathlib import Path
 import numpy as np
 
 from pytc.df import thc
-from pytc.solver.test.thc_h10_fingerprint import (
+from pytc.df.test._thc_fingerprint import (
     canonical_array_fingerprint,
 )
-from pytc.solver.test.thc_scalable_oracle import (
+from pytc.df.test._thc_oracle import (
     NORMAL_EQUATION_RESOLUTION_RCOND,
     direct_df_sandwiches_panelled,
     fit_panelled_lsthc,
     phase_c_shape_flop_memory_ledger,
 )
-import pytc.solver.test.thc_scalable_oracle as scalable_module
+import pytc.df.test._thc_oracle as scalable_module
 
 
 class TestPanelledRobustDFTHCOracle(unittest.TestCase):

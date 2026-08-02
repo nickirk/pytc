@@ -511,18 +511,68 @@ def contract_full_thc_pair_swapped_t2(
     )
 
 
-def _validate_x(t2: Array, left_out: Array, left_inner: Array, x: Array) -> None:
+def _validate_x_factors(
+    t2: Array, out_factor: Array, inner_factor: Array
+) -> int:
     _validate_t2(t2)
     nvir = t2.shape[2]
-    if left_out.ndim != 2 or left_inner.shape != left_out.shape:
-        raise ValueError("left_out and left_inner must both have shape (nvir, rank)")
-    if left_out.shape[0] != nvir:
-        raise ValueError(f"X factors have nvir={left_out.shape[0]}, expected {nvir}")
-    if x.shape != (nvir, nvir, left_out.shape[1]):
+    if out_factor.ndim != 2 or inner_factor.shape != out_factor.shape:
+        raise ValueError("X endpoint factors must both have shape (nvir, rank)")
+    if out_factor.shape[0] != nvir:
+        raise ValueError(f"X factors have nvir={out_factor.shape[0]}, expected {nvir}")
+    return nvir
+
+
+def _validate_x(t2: Array, out_factor: Array, inner_factor: Array, x: Array) -> None:
+    nvir = _validate_x_factors(t2, out_factor, inner_factor)
+    if x.shape != (nvir, nvir, out_factor.shape[1]):
         raise ValueError(
             "x must have shape (nvir, nvir, rank); "
-            f"got {x.shape}, expected {(nvir, nvir, left_out.shape[1])}"
+            f"got {x.shape}, expected {(nvir, nvir, out_factor.shape[1])}"
         )
+
+
+def _contract_partial_x(
+    kernel,
+    t2: Array,
+    out_factor: Array,
+    inner_factor: Array,
+    x: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> Array:
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    arrays = tuple(map(jnp.asarray, (t2, out_factor, inner_factor, x)))
+    _validate_x(*arrays)
+    return kernel(
+        *arrays,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+
+
+def _compiled_partial_x_memory(
+    kernel,
+    t2: Array,
+    out_factor: Array,
+    inner_factor: Array,
+    x: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> CompiledXLAMemory:
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    arrays = tuple(map(jnp.asarray, (t2, out_factor, inner_factor, x)))
+    _validate_x(*arrays)
+    executable = kernel.lower(
+        *arrays,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    ).compile()
+    return _compiled_memory_from_executable(executable)
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
@@ -598,12 +648,8 @@ def contract_x_left_t2(
 ) -> Array:
     """Contract ``P[a,m] P[c,m] X[b,d,m]`` without a V^4 tile."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, left_out, left_inner, x)))
-    _validate_x(*arrays)
-    return _contract_x_left_t2_jit(
-        *arrays,
+    return _contract_partial_x(
+        _contract_x_left_t2_jit, t2, left_out, left_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
@@ -620,16 +666,11 @@ def compiled_partial_x_left_memory(
 ) -> CompiledXLAMemory:
     """Return XLA accounting for ``P[a,m] P[c,m] X[b,d,m]``."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, left_out, left_inner, x)))
-    _validate_x(*arrays)
-    executable = _contract_x_left_t2_jit.lower(
-        *arrays,
+    return _compiled_partial_x_memory(
+        _contract_x_left_t2_jit, t2, left_out, left_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
-    ).compile()
-    return _compiled_memory_from_executable(executable)
+    )
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
@@ -705,12 +746,8 @@ def contract_x_right_t2(
 ) -> Array:
     """Contract ``X[a,c,m] P[b,m] P[d,m]`` without a V^4 tile."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, right_out, right_inner, x)))
-    _validate_x(*arrays)
-    return _contract_x_right_t2_jit(
-        *arrays,
+    return _contract_partial_x(
+        _contract_x_right_t2_jit, t2, right_out, right_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
@@ -727,16 +764,11 @@ def compiled_partial_x_right_memory(
 ) -> CompiledXLAMemory:
     """Return XLA accounting for ``X[a,c,m] P[b,m] P[d,m]``."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, right_out, right_inner, x)))
-    _validate_x(*arrays)
-    executable = _contract_x_right_t2_jit.lower(
-        *arrays,
+    return _compiled_partial_x_memory(
+        _contract_x_right_t2_jit, t2, right_out, right_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
-    ).compile()
-    return _compiled_memory_from_executable(executable)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -817,12 +849,7 @@ def _x_backing_layout(x_backing, nocc, nvir, rank):
 
 
 def _validate_x_stream(t2, left_out, left_inner, x_backing, nocc):
-    _validate_t2(t2)
-    nvir = t2.shape[2]
-    if left_out.ndim != 2 or left_inner.shape != left_out.shape:
-        raise ValueError("left_out and left_inner must both have shape (nvir, rank)")
-    if left_out.shape[0] != nvir:
-        raise ValueError(f"X factors have nvir={left_out.shape[0]}, expected {nvir}")
+    nvir = _validate_x_factors(t2, left_out, left_inner)
     rank = left_out.shape[1]
     layout = _x_backing_layout(x_backing, nocc, nvir, rank)
     if int(nocc) < 1 or nvir < 1:
@@ -1287,31 +1314,40 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
         return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
-def contract_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
-                                         *, occupied_pair_batch_size=8,
-                                         rank_panel_size=128,
-                                         panel_budget_bytes=None):
-    """Pipelined ``P[a,m] P[c,m] X[b,d,m]``: working-set panels, prefetched."""
-
-    layout = _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
+def _contract_x_t2_pipelined(
+    panel_kernel, t2, out_factor, inner_factor, x_backing, nocc, *,
+    occupied_pair_batch_size, rank_panel_size, panel_budget_bytes,
+):
+    layout = _validate_x_stream(t2, out_factor, inner_factor, x_backing, nocc)
     return _stream_partial_x_pipelined(
-        _xstream_left_panel_jit, t2, left_out, left_inner,
+        panel_kernel, t2, out_factor, inner_factor,
         _x_backing_panel_source(x_backing, nocc, layout), nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_budget_bytes=panel_budget_bytes)
 
 
+def contract_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
+                                 *, occupied_pair_batch_size=8,
+                                 rank_panel_size=128,
+                                 panel_budget_bytes=None):
+    """Pipelined ``P[a,m] P[c,m] X[b,d,m]``: working-set panels, prefetched."""
+
+    return _contract_x_t2_pipelined(
+        _xstream_left_panel_jit, t2, left_out, left_inner, x_backing, nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+        panel_budget_bytes=panel_budget_bytes)
+
+
 def contract_x_right_t2_pipelined(t2, right_out, right_inner, x_backing, nocc,
-                                          *, occupied_pair_batch_size=8,
-                                          rank_panel_size=128,
-                                          panel_budget_bytes=None):
+                                  *, occupied_pair_batch_size=8,
+                                  rank_panel_size=128,
+                                  panel_budget_bytes=None):
     """Pipelined ``X[a,c,m] P[b,m] P[d,m]``: working-set panels, prefetched."""
 
-    layout = _validate_x_stream(t2, right_out, right_inner, x_backing, nocc)
-    return _stream_partial_x_pipelined(
-        _xstream_right_panel_jit, t2, right_out, right_inner,
-        _x_backing_panel_source(x_backing, nocc, layout), nocc,
+    return _contract_x_t2_pipelined(
+        _xstream_right_panel_jit, t2, right_out, right_inner, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_budget_bytes=panel_budget_bytes)
@@ -1323,6 +1359,48 @@ def contract_x_right_t2_pipelined(t2, right_out, right_inner, x_backing, nocc,
 # instead of many host-driven panel kernels).
 _X_FULL_LIFT_CAP_BYTES = int(
     float(os.environ.get("PYTC_X_FULL_LIFT_CAP_GB", "24")) * 1024 ** 3)
+
+
+def _validate_term_factors(p, grad_p, u1, u3, d, *extra):
+    arrays = tuple(map(jnp.asarray, (p, grad_p, u1, u3, d, *extra)))
+    p, grad_p, u1 = arrays[:3]
+    if grad_p.shape != (p.shape[0], p.shape[1], 3):
+        raise ValueError(
+            "grad_p must have shape (nvir, rank, 3); "
+            f"got {grad_p.shape} for p={p.shape}"
+        )
+    if u1.shape != (p.shape[1], p.shape[1], 3):
+        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+    return arrays
+
+
+def _assemble_terms(terms: Mapping[str, Array]) -> Mapping[str, Array]:
+    k1_direct = terms["k1_direct"]
+    k1_pair = terms["k1_pair"]
+    k2_direct = terms["k2_direct"]
+    k2_pair = terms["k2_pair"]
+    k3_direct = terms["k3_direct"]
+    k3_pair = terms["k3_pair"]
+    d_direct = terms["d_direct"]
+    d_pair = terms["d_pair"]
+    x_direct = terms["x_direct"]
+    x_pair = terms["x_pair"]
+    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
+    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
+    delta_direct = d_direct - x_direct
+    delta_pair = d_pair - x_pair
+    tc = -(tc_direct + tc_pair)
+    delta_u = -(delta_direct + delta_pair)
+    return {
+        **terms,
+        "tc_direct": tc_direct,
+        "tc_pair": tc_pair,
+        "delta_direct": delta_direct,
+        "delta_pair": delta_pair,
+        "tc": tc,
+        "delta_u": delta_u,
+        "final": tc + delta_u,
+    }
 
 
 def contract_terms_t2_auto(
@@ -1461,14 +1539,7 @@ def contract_terms_t2_xstream(
     panel loop -- tiers 2/3 of :func:`contract_terms_t2_auto`.
     """
 
-    p, grad_p, u1, u3, d = map(jnp.asarray, (p, grad_p, u1, u3, d))
-    if grad_p.shape != (p.shape[0], p.shape[1], 3):
-        raise ValueError(
-            "grad_p must have shape (nvir, rank, 3); "
-            f"got {grad_p.shape} for p={p.shape}"
-        )
-    if u1.shape != (p.shape[1], p.shape[1], 3):
-        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+    p, grad_p, u1, u3, d = _validate_term_factors(p, grad_p, u1, u3, d)
 
     def _timed(name, fn, *args, **kwargs):
         with _tile_timers.term(name) as _tt:
@@ -1508,15 +1579,7 @@ def contract_terms_t2_xstream(
                         _xstream_right_panel_jit, t2, p, p, panel_source, nocc,
                         panel_budget_bytes=panel_budget_bytes, **_kw)
 
-    # Same sign assembly as contract_terms_t2.
-    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
-    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
-    delta_direct = d_direct - x_direct
-    delta_pair = d_pair - x_pair
-    tc = -(tc_direct + tc_pair)
-    delta_u = -(delta_direct + delta_pair)
-    final = tc + delta_u
-    return {
+    return _assemble_terms({
         "k1_direct": k1_direct,
         "k1_pair": k1_pair,
         "k2_direct": k2_direct,
@@ -1527,14 +1590,7 @@ def contract_terms_t2_xstream(
         "d_pair": d_pair,
         "x_direct": x_direct,
         "x_pair": x_pair,
-        "tc_direct": tc_direct,
-        "tc_pair": tc_pair,
-        "delta_direct": delta_direct,
-        "delta_pair": delta_pair,
-        "tc": tc,
-        "delta_u": delta_u,
-        "final": final,
-    }
+    })
 
 
 def contract_terms_t2(
@@ -1562,14 +1618,9 @@ def contract_terms_t2(
     crossed-DF scope and is deliberately not changed here.
     """
 
-    p, grad_p, u1, u3, d, x = map(jnp.asarray, (p, grad_p, u1, u3, d, x))
-    if grad_p.shape != (p.shape[0], p.shape[1], 3):
-        raise ValueError(
-            "grad_p must have shape (nvir, rank, 3); "
-            f"got {grad_p.shape} for p={p.shape}"
-        )
-    if u1.shape != (p.shape[1], p.shape[1], 3):
-        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+    p, grad_p, u1, u3, d, x = _validate_term_factors(
+        p, grad_p, u1, u3, d, x
+    )
 
     # Each Cartesian K1/K2 sum is deliberately one compiled executable. This
     # makes its XLA memory accounting a true per-term record rather than a
@@ -1626,14 +1677,7 @@ def contract_terms_t2(
         rank_panel_size=rank_panel_size,
     )
 
-    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
-    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
-    delta_direct = d_direct - x_direct
-    delta_pair = d_pair - x_pair
-    tc = -(tc_direct + tc_pair)
-    delta_u = -(delta_direct + delta_pair)
-    final = tc + delta_u
-    return {
+    return _assemble_terms({
         "k1_direct": k1_direct,
         "k1_pair": k1_pair,
         "k2_direct": k2_direct,
@@ -1644,14 +1688,7 @@ def contract_terms_t2(
         "d_pair": d_pair,
         "x_direct": x_direct,
         "x_pair": x_pair,
-        "tc_direct": tc_direct,
-        "tc_pair": tc_pair,
-        "delta_direct": delta_direct,
-        "delta_pair": delta_pair,
-        "tc": tc,
-        "delta_u": delta_u,
-        "final": final,
-    }
+    })
 
 
 def _profile_call(
