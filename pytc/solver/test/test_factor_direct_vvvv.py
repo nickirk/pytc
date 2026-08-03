@@ -697,7 +697,7 @@ class TestMemoryMeasurement(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self.assertIsNone(factor_direct._cgroup_memory_available_bytes(root))
 
-    def _make_v2_tree(self, root, levels):
+    def _make_v2_tree(self, root, levels, stats=None):
         # levels: dict of relative cgroup dir -> (memory.max, memory.current)
         for rel, (max_v, cur_v) in levels.items():
             d = os.path.join(root, rel) if rel else root
@@ -706,10 +706,63 @@ class TestMemoryMeasurement(unittest.TestCase):
                 fh.write(f"{max_v}\n")
             with open(os.path.join(d, "memory.current"), "w") as fh:
                 fh.write(f"{cur_v}\n")
+            inactive_file = (stats or {}).get(rel, 0)
+            with open(os.path.join(d, "memory.stat"), "w") as fh:
+                fh.write(f"anon 1\ninactive_file {inactive_file}\nactive_file 1\n")
 
     def _make_proc_cgroup(self, path, rel, controllers=""):
         with open(path, "w") as fh:
             fh.write(f"0::{controllers}/{rel}\n" if controllers else f"0::/{rel}\n")
+
+    def test_inactive_file_counts_as_reclaimable(self):
+        # Page cache in memory.current must not understate admissible lift:
+        # inactive_file is reclaimable and is added back.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            self._make_v2_tree(root, {"": (1 << 40, (1 << 40) - (10 << 30))},
+                               stats={"": 700 << 30})
+            self.assertEqual(
+                factor_direct._cgroup_memory_available_bytes(root),
+                (10 << 30) + (700 << 30))
+
+    def test_inactive_file_admits_tier2_at_1024g(self):
+        # The production scenario: limit 1024G, current near-limit from a
+        # hot store's page cache.  Limit-minus-current reads ~27 GB (tier 3),
+        # but with the cache reclaimable the gate sees hundreds of GB.
+        import tempfile
+        gib = 1024 ** 3
+        limit = 1024 * gib
+        current = 997 * gib
+        inactive = 700 * gib
+        with tempfile.TemporaryDirectory() as root:
+            self._make_v2_tree(root, {"": (limit, current)},
+                               stats={"": inactive})
+            remaining = factor_direct._cgroup_memory_available_bytes(root)
+        self.assertEqual(remaining, limit - current + inactive)
+        self.assertGreater(remaining, 2 * 238720081176)
+
+    def test_inactive_file_keeps_tier3_at_256g(self):
+        # At a 256G cap with mostly-process usage, the cache add-back must
+        # NOT flip the decision: tier 3 must stay selected.
+        import tempfile
+        gib = 1024 ** 3
+        with tempfile.TemporaryDirectory() as root:
+            self._make_v2_tree(root, {"": (256 * gib, 235 * gib)},
+                               stats={"": 50 * gib})
+            remaining = factor_direct._cgroup_memory_available_bytes(root)
+        self.assertEqual(remaining, 256 * gib - 235 * gib + 50 * gib)
+        self.assertLess(remaining * 2, 238720081176)
+
+    def test_missing_memory_stat_adds_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            d = root
+            with open(os.path.join(d, "memory.max"), "w") as fh:
+                fh.write("1000\n")
+            with open(os.path.join(d, "memory.current"), "w") as fh:
+                fh.write("250\n")
+            self.assertEqual(
+                factor_direct._cgroup_memory_available_bytes(root), 750)
 
     def test_job_cgroup_discovered_via_proc_self_cgroup(self):
         # The SLURM layout from the bouchet diagnostic: the limit lives at

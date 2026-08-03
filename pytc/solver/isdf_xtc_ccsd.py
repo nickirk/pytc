@@ -1035,6 +1035,13 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
     when no limited level is found (e.g. macOS, non-cgroup hosts) and
     logs every level it inspected so the tier line is auditable.
     ``root``/``proc_cgroup`` exist for tests.
+
+    ``memory.current`` counts the resident page cache, so
+    ``limit - current`` understates what a lift may use when the job
+    holds a large hot store: cache is reclaimable.  Each level's
+    ``memory.stat`` ``inactive_file`` (the kernel's first eviction
+    target) is added back, capped by ``current``; the INFO line logs the
+    breakdown.
     """
 
     def _read(path):
@@ -1043,6 +1050,19 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
                 return fh.read().strip()
         except OSError:
             return None
+
+    def _read_stat_inactive_file(path):
+        stat = _read(os.path.join(path, "memory.stat"))
+        if stat is None:
+            return 0
+        for line in stat.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "inactive_file":
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    return 0
+        return 0
 
     try:
         with open(proc_cgroup) as fh:
@@ -1080,8 +1100,12 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
                 except ValueError:
                     limit = None
                 if limit is not None and limit < 1 << 60:  # v1 "unlimited" is ~2^63
-                    remaining = limit - current
-                    _logger.info("cgroup memory limit at %s: %d bytes remaining", path, remaining)
+                    inactive_file = min(_read_stat_inactive_file(path), current)
+                    remaining = limit - current + inactive_file
+                    _logger.info(
+                        "cgroup memory limit at %s: %d bytes remaining "
+                        "(limit %d, current %d, inactive_file %d)",
+                        path, remaining, limit, current, inactive_file)
                     best = remaining if best is None else min(best, remaining)
             if path == os.path.normpath(root) or path == os.path.dirname(path):
                 break
