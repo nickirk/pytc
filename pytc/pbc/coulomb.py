@@ -35,6 +35,7 @@ from pytc.pbc.df.isdf import (
     stream_ao_blocks,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
+from pytc.pbc.fft_mesh import describe_fft_mesh
 
 logger = logging.getLogger(__name__)
 
@@ -642,6 +643,9 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         target_truncation_residual=None, provider_cls=provider_cls)
     mesh_obj = canonicalize_kpts(cell, kpts)
     grid_coords = cell.get_uniform_grids(cell.mesh)
+    fft_mesh_advice = describe_fft_mesh(cell.mesh)
+    if fft_mesh_advice is not None:
+        logger.warning("%s", fft_mesh_advice)
     provider = provider_cls(
         cell=cell, canonical_kpts=mesh_obj.canonical_kpts, grid_mesh=cell.mesh
     )
