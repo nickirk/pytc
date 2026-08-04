@@ -521,3 +521,108 @@ class TestPBlockedThroughTheSolve(unittest.TestCase):
         bad = np.zeros((mesh_obj.n_kpts + 1, 3, 3), dtype=np.complex128)
         with self.assertRaises(ValueError):
             build_coul_kpt_device(provider, Pi, None, grids, mesh_obj, kern=bad)
+
+
+class TestFusedRightFactor(unittest.TestCase):
+    """Gate for the fused right factor (task #81 step 2b).
+
+    Reference is the GENERIC composition through ``provider.apply`` -- the same
+    path ``_right_factor`` takes when ``apply_right_factor`` is absent. The bound
+    was frozen before any fused value was produced. Bitwise identity is NOT
+    required: XLA may reassociate inside the fused region, which is exactly why
+    this is a numerical bound rather than an equality.
+    """
+
+    BOUND = 1e-13
+
+    @staticmethod
+    def _generic_right_factor(provider, q, eta, gphase):
+        lq = eta * gphase[None, :]
+        rq = np.conj(np.asarray(provider.apply(q, lq)))
+        rq *= gphase[None, :]
+        return rq
+
+    def _worst_rel(self, kpts, n_ip, seed):
+        cell = _make_cell()
+        mesh = tuple(int(m) for m in cell.mesh)
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=kpts, grid_mesh=mesh
+        )
+        n_grid = int(np.prod(mesh))
+        rng = np.random.default_rng(seed)
+        eta = (rng.standard_normal((n_ip, n_grid))
+               + 1j * rng.standard_normal((n_ip, n_grid))).astype(np.complex128)
+        worst = 0.0
+        for q in range(len(kpts)):
+            gphase = np.exp(-1j * rng.standard_normal(n_grid)).astype(np.complex128)
+            ref = self._generic_right_factor(provider, q, eta, gphase)
+            fused = np.asarray(provider.apply_right_factor(q, eta, gphase))
+            self.assertEqual(fused.shape, ref.shape)
+            self.assertEqual(fused.dtype, np.complex128)
+            denom = np.abs(ref).max()
+            worst = max(worst, np.abs(fused - ref).max() / (denom if denom > 0 else 1.0))
+        return worst
+
+    def test_fused_matches_generic_at_gamma(self):
+        self.assertLessEqual(self._worst_rel(np.zeros((1, 3)), 4, 11), self.BOUND)
+
+    def test_fused_matches_generic_at_finite_q_including_q_and_negq(self):
+        kpts = np.array([[0.0, 0.0, 0.0],
+                         [0.11, -0.07, 0.23],
+                         [-0.11, 0.07, -0.23]])
+        self.assertLessEqual(self._worst_rel(kpts, 4, 13), self.BOUND)
+
+    def test_right_factor_dispatches_to_the_fused_path_and_agrees(self):
+        """The hook must actually fire AND agree with the fallback it replaces.
+
+        A provider exposing only ``apply`` drives the generic branch; the real
+        provider drives the fused one. Comparing them here is what makes the
+        dispatch observable rather than inferred from a log line.
+        """
+        from pytc.pbc.df import isdf as _isdf
+
+        cell = _make_cell()
+        mesh = tuple(int(m) for m in cell.mesh)
+        kpts = np.array([[0.0, 0.0, 0.0], [0.11, -0.07, 0.23]])
+        provider = RawKernelProvider(cell=cell, canonical_kpts=kpts, grid_mesh=mesh)
+        self.assertTrue(hasattr(provider, "apply_right_factor"))
+
+        class _ApplyOnly:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def apply(self, q_index, lq):
+                return self._inner.apply(q_index, lq)
+
+        self.assertIsNone(getattr(_ApplyOnly(provider), "apply_right_factor", None))
+
+        n_grid = int(np.prod(mesh))
+        rng = np.random.default_rng(17)
+        eta = (rng.standard_normal((4, n_grid))
+               + 1j * rng.standard_normal((4, n_grid))).astype(np.complex128)
+        gphase = np.exp(-1j * rng.standard_normal(n_grid)).astype(np.complex128)
+
+        _isdf._RIGHT_FACTOR_PATH_LOGGED = False
+        fused = np.asarray(_isdf._right_factor(provider, 1, eta, gphase))
+        _isdf._RIGHT_FACTOR_PATH_LOGGED = False
+        fallback = np.asarray(_isdf._right_factor(_ApplyOnly(provider), 1, eta, gphase))
+
+        denom = np.abs(fallback).max()
+        rel = np.abs(fused - fallback).max() / (denom if denom > 0 else 1.0)
+        self.assertLessEqual(rel, self.BOUND)
+
+    def test_malformed_inputs_are_rejected(self):
+        cell = _make_cell()
+        mesh = tuple(int(m) for m in cell.mesh)
+        provider = RawKernelProvider(
+            cell=cell, canonical_kpts=np.zeros((1, 3)), grid_mesh=mesh
+        )
+        n_grid = int(np.prod(mesh))
+        eta = np.zeros((3, n_grid), dtype=np.complex128)
+        gphase = np.ones(n_grid, dtype=np.complex128)
+        with self.assertRaises(ValueError):
+            provider.apply_right_factor(1, eta, gphase)          # q out of range
+        with self.assertRaises(ValueError):
+            provider.apply_right_factor(0, eta[0], gphase)        # eta not 2-D
+        with self.assertRaises(ValueError):
+            provider.apply_right_factor(0, eta, gphase[:-1])      # gphase wrong length

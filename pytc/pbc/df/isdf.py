@@ -770,6 +770,28 @@ def _raw_kernel_apply_core(lq, coulG_scaled, grid_mesh):
     return rq_mesh.reshape(n_ip, -1)
 
 
+@partial(jax.jit, static_argnames=("grid_mesh",))
+def _raw_right_factor_core(eta, coulG_scaled, gphase, grid_mesh):
+    """Jitted core of ``right_q(eta) = conj(apply(q, eta*g)) * g``.
+
+    The whole sequence in one traced function so the phase multiply fuses into
+    the transform rather than materialising ``lq = eta*g`` as a separate array.
+    That temporary is the point: in the P-blocked loop it is panel-sized and was
+    rebuilt per pair, so removing it is the saving, not the transform itself.
+
+    Numerically this is NOT required to match the unfused composition bitwise --
+    XLA may reassociate across the fused region. The pre-registered gate holds it
+    to a c128 bound against the generic ``apply``-composed path instead.
+    """
+    n_ip = eta.shape[0]
+    lq_mesh = (eta * gphase[None, :]).reshape((n_ip,) + grid_mesh)
+    wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
+    vq_mesh = jnp.asarray(coulG_scaled, dtype=eta.dtype).reshape(grid_mesh)
+    vq_mesh = wq_mesh * vq_mesh[None, :, :, :]
+    rq_mesh = jnp.fft.ifftn(vq_mesh, axes=(1, 2, 3))
+    return jnp.conj(rq_mesh.reshape(n_ip, -1)) * gphase[None, :]
+
+
 def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
     """Host-side wrapper: validate, compute coulG(q)*vol/Ng via pyscf (not
     jittable), dispatch to the jitted core.
@@ -924,6 +946,29 @@ class RawKernelProvider:
             raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         return raw_kernel_apply(
             lq, cell=self.cell, q_kpt=self.canonical_kpts[q_index], grid_mesh=self.grid_mesh
+        )
+
+    def apply_right_factor(self, q_index, eta_q, gphase):
+        """Fused ``conj(apply(q, eta*g)) * g`` — the optional hook _right_factor prefers.
+
+        Uses the per-q ``coulG_all`` precomputed in __post_init__, so unlike
+        ``apply`` this needs no host pyscf call and the whole sequence stays in
+        one traced region. Providers without this method fall back to the generic
+        composition, which is the reference the fused path is gated against.
+        """
+        n_kpts = self.canonical_kpts.shape[0]
+        if not (0 <= q_index < n_kpts):
+            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+        eta_j = jnp.asarray(eta_q, dtype=jnp.complex128)
+        if eta_j.ndim != 2:
+            raise ValueError(f"eta_q must be 2-D (Nip, Ng), got shape {eta_j.shape}.")
+        gphase_j = jnp.asarray(gphase, dtype=jnp.complex128)
+        if gphase_j.shape != (eta_j.shape[1],):
+            raise ValueError(
+                f"gphase must have shape (Ng,)={(eta_j.shape[1],)}, got {gphase_j.shape}."
+            )
+        return _raw_right_factor_core(
+            eta_j, self.coulG_all[q_index], gphase_j, self.grid_mesh
         )
 
     def fused_apply_and_solve(
