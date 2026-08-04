@@ -2061,19 +2061,10 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
             j0, j1 = panels[j]
             eta_j = eta_i if j == i else _eta_panel(j0, j1)
             for q in range(n_kpts):
-                # Same per-q grid phase the dense path applies before the
-                # Coulomb kernel; omitting it silently yields the wrong kern.
-                #
-                # The i-side phase is folded into the RIGHT factor rather than
-                # materialised on the left. gphase multiplies along the GRID
-                # axis, which both sides share, so
-                #     (eta_i*g) @ conj(apply(eta_j*g)).T
-                #   = eta_i @ (conj(apply(eta_j*g)) * g).T
-                # exactly. The left operand is then eta_i itself and no `lq_i`
-                # array exists: it was previously rebuilt once per (i,j,q) while
-                # depending only on (i,q) -- 94% redundant at 444 (32 needed,
-                # 528 built), at 8.2 GB each. The fold costs one in-place
-                # multiply on an array already allocated for this pair.
+                # gphase multiplies along the shared grid axis, so
+                #   (eta_i*g) @ conj(apply(eta_j*g)).T
+                # = eta_i @ (conj(apply(eta_j*g)) * g).T
+                # exactly, and the left factor needs no separate array.
                 gphase = gphases[q]
                 eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
                 eta_jq = eta_iq if j == i else np.asarray(

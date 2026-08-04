@@ -23,7 +23,6 @@ class TestFactorize(unittest.TestCase):
                 self.assertEqual(factorize(n), expected)
 
     def test_product_reconstructs_input(self):
-        # Independent of the table above: the factors must multiply back.
         for n in range(1, 500):
             product = 1
             for f in factorize(n):
@@ -38,7 +37,6 @@ class TestFactorize(unittest.TestCase):
 
 class TestIsFftFriendly(unittest.TestCase):
     def test_the_production_mesh_is_hostile(self):
-        # 76 = 2^2 x 19. This is the case that motivated the module.
         self.assertFalse(is_fft_friendly(76))
 
     def test_smooth_neighbours_are_friendly(self):
@@ -50,7 +48,6 @@ class TestIsFftFriendly(unittest.TestCase):
         self.assertTrue(is_fft_friendly(1))
 
     def test_agrees_with_factorize_over_a_range(self):
-        # Cross-check against an independent definition rather than a table.
         for n in range(1, 400):
             expected = all(f in DEFAULT_FFT_RADICES for f in factorize(n))
             self.assertEqual(is_fft_friendly(n), expected, f"disagreement at n={n}")
@@ -77,7 +74,6 @@ class TestGoodFftSize(unittest.TestCase):
                 self.assertEqual(good_fft_size(n), n)
 
     def test_never_rounds_down(self):
-        # The accuracy guarantee: the returned grid is never coarser.
         for n in range(1, 400):
             self.assertGreaterEqual(good_fft_size(n), n, f"rounded down at n={n}")
 
@@ -86,7 +82,6 @@ class TestGoodFftSize(unittest.TestCase):
             self.assertTrue(is_fft_friendly(good_fft_size(n)), f"unfriendly at n={n}")
 
     def test_result_is_minimal(self):
-        # Nothing strictly between n and the answer may be friendly.
         for n in range(1, 400):
             got = good_fft_size(n)
             for candidate in range(n, got):
@@ -105,8 +100,6 @@ class TestGoodFftMesh(unittest.TestCase):
         self.assertEqual(good_fft_mesh((76, 76, 76)), (80, 80, 80))
 
     def test_axes_are_independent(self):
-        # A separable transform penalises only the awkward axis, so only that
-        # axis should move.
         self.assertEqual(good_fft_mesh((64, 76, 72)), (64, 80, 72))
 
     def test_friendly_mesh_unchanged(self):
@@ -128,8 +121,6 @@ class TestDescribeFftMesh(unittest.TestCase):
         self.assertIn("(80, 80, 80)", message)
 
     def test_states_the_cost_of_the_suggestion(self):
-        # The suggestion is not free; the message must say so rather than
-        # reading as an unqualified win. 80^3/76^3 = 1.17.
         message = describe_fft_mesh((76, 76, 76))
         self.assertIn("1.17x the grid points", message)
         self.assertIn("not free", message)
@@ -141,11 +132,7 @@ class TestDescribeFftMesh(unittest.TestCase):
 
 
 class TestBuildPathEmitsTheWarning(unittest.TestCase):
-    """The check must fire from the build path, not merely exist.
-
-    A diagnostic that is never reached is the defect it was written to
-    prevent, so this asserts the wiring rather than the helper.
-    """
+    """The diagnostic must fire from the build path, not merely exist."""
 
     @staticmethod
     def _diamond_111(mesh):
@@ -171,8 +158,6 @@ class TestBuildPathEmitsTheWarning(unittest.TestCase):
         )
 
     def test_real_build_warns_on_a_hostile_mesh(self):
-        # Drives the actual build path rather than inspecting its source: a
-        # diagnostic is only real if it reaches stderr from a real caller.
         import logging
 
         cell = self._diamond_111([19, 19, 19])
@@ -185,8 +170,6 @@ class TestBuildPathEmitsTheWarning(unittest.TestCase):
         self.assertTrue(any("(20, 20, 20)" in line for line in captured.output))
 
     def test_real_build_is_silent_on_a_friendly_mesh(self):
-        # Negative control: without this, a warning that always fired would
-        # pass the test above and be useless.
         import logging
 
         cell = self._diamond_111([20, 20, 20])
