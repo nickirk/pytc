@@ -626,3 +626,83 @@ class TestFusedRightFactor(unittest.TestCase):
             provider.apply_right_factor(0, eta[0], gphase)        # eta not 2-D
         with self.assertRaises(ValueError):
             provider.apply_right_factor(0, eta, gphase[:-1])      # gphase wrong length
+
+
+class TestFusedRightFactorIndependentOracles(unittest.TestCase):
+    """Checks that do NOT reduce to "two implementations of the same recipe agree".
+
+    The bound test compares the fused path against the ``apply``-composed one.
+    Both share ``coulG`` and the same transform recipe, so a common-mode error in
+    that recipe is invisible to it. These two checks attack that blind spot from
+    different sides:
+
+      1. the ALGEBRAIC IDENTITY the construction exists to provide, which fixes
+         where the phase and the conjugate belong;
+      2. an INDEPENDENT COMPOSITION built on numpy's transforms rather than
+         jax's, catching axis/reshape/scaling mistakes in the traced core.
+
+    Neither can catch an error inside ``coulG`` itself -- that comes from pyscf,
+    is shared with production, and is not something this change introduces. The
+    blind spot is named rather than papered over.
+    """
+
+    BOUND = 1e-13
+
+    def test_algebraic_identity_phase_may_move_to_the_right_factor(self):
+        """(eta_i*g) @ conj(apply(eta_j*g)).T  ==  eta_i @ right_factor(eta_j).T
+
+        This is the identity quoted in _right_factor's docstring and the reason
+        the left operand can stay unphased. It pins the phase placement and the
+        conjugate independently of whether the two implementations agree.
+        """
+        cell = _make_cell()
+        mesh = tuple(int(m) for m in cell.mesh)
+        kpts = np.array([[0.0, 0.0, 0.0], [0.11, -0.07, 0.23]])
+        provider = RawKernelProvider(cell=cell, canonical_kpts=kpts, grid_mesh=mesh)
+        n_grid = int(np.prod(mesh))
+        rng = np.random.default_rng(23)
+        eta_i = (rng.standard_normal((3, n_grid))
+                 + 1j * rng.standard_normal((3, n_grid))).astype(np.complex128)
+        eta_j = (rng.standard_normal((4, n_grid))
+                 + 1j * rng.standard_normal((4, n_grid))).astype(np.complex128)
+        for q in range(len(kpts)):
+            gphase = np.exp(-1j * rng.standard_normal(n_grid)).astype(np.complex128)
+            lhs = (eta_i * gphase[None, :]) @ np.conj(
+                np.asarray(provider.apply(q, eta_j * gphase[None, :]))).T
+            rhs = eta_i @ np.asarray(
+                provider.apply_right_factor(q, eta_j, gphase)).T
+            denom = np.abs(lhs).max()
+            rel = np.abs(rhs - lhs).max() / (denom if denom > 0 else 1.0)
+            self.assertLessEqual(rel, self.BOUND, f"identity failed at q={q}")
+
+    def test_matches_an_independent_numpy_composition(self):
+        """Oracle built with numpy transforms, not the jax core under test."""
+        from pyscf.pbc import tools as pbctools
+
+        cell = _make_cell()
+        mesh = tuple(int(m) for m in cell.mesh)
+        kpts = np.array([[0.0, 0.0, 0.0], [0.17, 0.05, -0.09]])
+        provider = RawKernelProvider(cell=cell, canonical_kpts=kpts, grid_mesh=mesh)
+        n_grid = int(np.prod(mesh))
+        Gv = cell.get_Gv(list(mesh))
+        rng = np.random.default_rng(29)
+        eta = (rng.standard_normal((3, n_grid))
+               + 1j * rng.standard_normal((3, n_grid))).astype(np.complex128)
+
+        for q, kpt in enumerate(kpts):
+            gphase = np.exp(-1j * rng.standard_normal(n_grid)).astype(np.complex128)
+            coulG = pbctools.get_coulG(
+                cell, k=np.asarray(kpt, dtype=np.float64), exx=False,
+                Gv=Gv, mesh=list(mesh))
+            coulG = np.asarray(coulG, dtype=np.float64) * (cell.vol / n_grid)
+
+            lq = eta * gphase[None, :]
+            w = np.fft.fftn(lq.reshape((-1,) + mesh), axes=(1, 2, 3))
+            w = w * coulG.reshape(mesh)[None, :, :, :]
+            v = np.fft.ifftn(w, axes=(1, 2, 3)).reshape(eta.shape[0], -1)
+            oracle = np.conj(v) * gphase[None, :]
+
+            fused = np.asarray(provider.apply_right_factor(q, eta, gphase))
+            denom = np.abs(oracle).max()
+            rel = np.abs(fused - oracle).max() / (denom if denom > 0 else 1.0)
+            self.assertLessEqual(rel, self.BOUND, f"numpy oracle mismatch at q={q}")
