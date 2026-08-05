@@ -934,7 +934,8 @@ class RawKernelProvider:
 
     def apply(self, q_index, lq):
         n_kpts = self.canonical_kpts.shape[0]
-        _require_q_index(q_index, n_kpts)
+        if not (0 <= q_index < n_kpts):
+            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         return raw_kernel_apply(
             lq, cell=self.cell, q_kpt=self.canonical_kpts[q_index], grid_mesh=self.grid_mesh
         )
@@ -948,7 +949,8 @@ class RawKernelProvider:
         composition, which is the reference the fused path is gated against.
         """
         n_kpts = self.canonical_kpts.shape[0]
-        _require_q_index(q_index, n_kpts)
+        if not (0 <= q_index < n_kpts):
+            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         eta_j = jnp.asarray(eta_q, dtype=jnp.complex128)
         if eta_j.ndim != 2:
             raise ValueError(f"eta_q must be 2-D (Nip, Ng), got shape {eta_j.shape}.")
@@ -966,7 +968,8 @@ class RawKernelProvider:
         n_retained_pin=-1
     ):
         n_kpts = self.canonical_kpts.shape[0]
-        _require_q_index(q_index, n_kpts)
+        if not (0 <= q_index < n_kpts):
+            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
         return _fused_apply_kernel_and_solve_core(
             Pi_q, eta_q, phase_q, self.coulG_all[q_index], self.grid_mesh, rtol, self_paired,
             retention_mode, n_retained_pin,
@@ -1254,12 +1257,6 @@ def build_kern_q_blocked(provider, q_index, eta_q, phase, *, staging_root,
             os.unlink(rq_path)
         except FileNotFoundError:
             pass
-
-
-def _require_q_index(q_index, n_kpts):
-    """Bounds-check a q index. ValueError, matching the provider surface."""
-    if not (0 <= q_index < n_kpts):
-        raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
 
 
 def _require_mesh3(mesh, name="grid_mesh"):
