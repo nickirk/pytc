@@ -15,6 +15,7 @@ import numpy as np
 from pyscf.pbc.gto import Cell
 
 from pytc.pbc import coulomb
+from pytc.pbc.test._fixtures import diamond_111
 from pytc.pbc.df.isdf import (
     RawKernelProvider,
     apply_raw_kernel_and_solve,
@@ -539,15 +540,7 @@ class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
 
     @staticmethod
     def _diamond_111():
-        cell = Cell()
-        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
-        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
-        cell.unit = "A"
-        cell.basis = "gth-dzvp"
-        cell.pseudo = "gth-pbe"
-        cell.ke_cutoff = 20.0
-        cell.verbose = 0
-        cell.build()
+        cell = diamond_111()
         return cell
 
     def test_x64_on_full_build_passes_machine_tier_gate_all_self_paired_q(self):
@@ -614,15 +607,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         np.testing.assert_array_equal(reshaped, streamed)
 
     def test_bpc_cached_gemm_full_build_roundtrips_on_diamond_111(self):
-        cell = Cell()
-        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
-        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
-        cell.unit = "A"
-        cell.basis = "gth-dzvp"
-        cell.pseudo = "gth-pbe"
-        cell.ke_cutoff = 20.0
-        cell.verbose = 0
-        cell.build()
+        cell = diamond_111()
         kpts = cell.make_kpts([2, 2, 2])
         # Exercises the eta-reuse path end to end (build_pi_eta consumes the
         # reshaped bpc cache); with the pre-fix code this raised in pair_convolve.
@@ -640,15 +625,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         # Freeing the AO cache before eta re-streams the AOs, which must not
         # change the result: same pivots and inpv_kpt, coul_kpt to the solve's
         # own fp-tie. Correctness is independent of the memory strategy.
-        cell = Cell()
-        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
-        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
-        cell.unit = "A"
-        cell.basis = "gth-dzvp"
-        cell.pseudo = "gth-pbe"
-        cell.ke_cutoff = 20.0
-        cell.verbose = 0
-        cell.build()
+        cell = diamond_111()
         kpts = cell.make_kpts([2, 2, 2])
         kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
                   selection_mode="bpc_cached_gemm", bpc_batch_size=64,
@@ -673,15 +650,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         import glob
         import tempfile
 
-        cell = Cell()
-        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
-        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
-        cell.unit = "A"
-        cell.basis = "gth-dzvp"
-        cell.pseudo = "gth-pbe"
-        cell.ke_cutoff = 20.0
-        cell.verbose = 0
-        cell.build()
+        cell = diamond_111()
         kpts = cell.make_kpts([2, 2, 2])
         kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
                   selection_mode="bpc_cached_gemm", bpc_batch_size=64,
@@ -733,15 +702,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         import glob
         import tempfile
 
-        cell = Cell()
-        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
-        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
-        cell.unit = "A"
-        cell.basis = "gth-dzvp"
-        cell.pseudo = "gth-pbe"
-        cell.ke_cutoff = 20.0
-        cell.verbose = 0
-        cell.build()
+        cell = diamond_111()
         kpts = cell.make_kpts([2, 2, 2])
         kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
                   selection_mode="bpc_cached_gemm", bpc_batch_size=64,

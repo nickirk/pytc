@@ -2,6 +2,7 @@
 
 import unittest
 
+from pytc.pbc.test._fixtures import diamond_111
 from pytc.pbc.fft_mesh import (
     DEFAULT_FFT_RADICES,
     describe_fft_mesh,
@@ -134,21 +135,6 @@ class TestDescribeFftMesh(unittest.TestCase):
 class TestBuildPathEmitsTheWarning(unittest.TestCase):
     """The diagnostic must fire from the build path, not merely exist."""
 
-    @staticmethod
-    def _diamond_111(mesh):
-        from pyscf.pbc.gto import Cell
-
-        cell = Cell()
-        cell.atom = "C 0 0 0; C .8917 .8917 .8917"
-        cell.a = "0 1.7834 1.7834\n1.7834 0 1.7834\n1.7834 1.7834 0"
-        cell.unit = "A"
-        cell.basis = "gth-dzvp"
-        cell.pseudo = "gth-pbe"
-        cell.mesh = mesh
-        cell.verbose = 0
-        cell.build()
-        return cell
-
     def _run_build(self, cell):
         from pytc.pbc import coulomb
 
@@ -160,7 +146,7 @@ class TestBuildPathEmitsTheWarning(unittest.TestCase):
     def test_real_build_warns_on_a_hostile_mesh(self):
         import logging
 
-        cell = self._diamond_111([19, 19, 19])
+        cell = diamond_111(mesh=[19, 19, 19])
         with self.assertLogs("pytc.pbc.coulomb", level=logging.WARNING) as captured:
             self._run_build(cell)
         self.assertTrue(
@@ -172,7 +158,7 @@ class TestBuildPathEmitsTheWarning(unittest.TestCase):
     def test_real_build_is_silent_on_a_friendly_mesh(self):
         import logging
 
-        cell = self._diamond_111([20, 20, 20])
+        cell = diamond_111(mesh=[20, 20, 20])
         logger = logging.getLogger("pytc.pbc.coulomb")
         with self.assertLogs(logger, level=logging.WARNING) as captured:
             logger.warning("sentinel so assertLogs has something to capture")

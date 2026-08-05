@@ -680,9 +680,7 @@ def apply_raw_kernel_and_solve(
             f"grid_coords must have shape ({n_grid},3) matching eta_q's grid axis, "
             f"got {grid_coords.shape}."
         )
-    grid_mesh_t = tuple(int(x) for x in grid_mesh)
-    if len(grid_mesh_t) != 3 or any(m <= 0 for m in grid_mesh_t):
-        raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh_t}.")
+    grid_mesh_t = _require_mesh3(grid_mesh)
     if int(np.prod(grid_mesh_t)) != n_grid:
         raise ValueError(
             f"prod(grid_mesh)={int(np.prod(grid_mesh_t))} != eta_q's grid size {n_grid}."
@@ -810,9 +808,7 @@ def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
         raise ValueError(f"lq must be 2-D (Nip, Ng), got shape {lq_np.shape}.")
     n_ip, n_grid = lq_np.shape
 
-    grid_mesh_t = tuple(int(x) for x in grid_mesh)
-    if len(grid_mesh_t) != 3 or any(m <= 0 for m in grid_mesh_t):
-        raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh_t}.")
+    grid_mesh_t = _require_mesh3(grid_mesh)
     if int(np.prod(grid_mesh_t)) != n_grid:
         raise ValueError(f"prod(grid_mesh)={int(np.prod(grid_mesh_t))} != lq's grid size {n_grid}.")
 
@@ -851,9 +847,7 @@ def precompute_coulG_all_q(cell, canonical_kpts, grid_mesh):
         raise ValueError(
             f"canonical_kpts must have shape (Nk,3), got {canonical_kpts_np.shape}."
         )
-    grid_mesh_t = tuple(int(x) for x in grid_mesh)
-    if len(grid_mesh_t) != 3 or any(m <= 0 for m in grid_mesh_t):
-        raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh_t}.")
+    grid_mesh_t = _require_mesh3(grid_mesh)
 
     n_grid = int(np.prod(grid_mesh_t))
     Gv = cell.get_Gv(list(grid_mesh_t))
@@ -931,9 +925,7 @@ class RawKernelProvider:
             raise ValueError(
                 f"canonical_kpts must have shape (Nk,3), got {canonical_kpts.shape}."
             )
-        grid_mesh = tuple(int(x) for x in self.grid_mesh)
-        if len(grid_mesh) != 3 or any(m <= 0 for m in grid_mesh):
-            raise ValueError(f"grid_mesh must be 3 positive ints, got {grid_mesh}.")
+        grid_mesh = _require_mesh3(self.grid_mesh)
         object.__setattr__(self, "canonical_kpts", canonical_kpts)
         object.__setattr__(self, "grid_mesh", grid_mesh)
         object.__setattr__(
@@ -942,8 +934,7 @@ class RawKernelProvider:
 
     def apply(self, q_index, lq):
         n_kpts = self.canonical_kpts.shape[0]
-        if not (0 <= q_index < n_kpts):
-            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+        _require_q_index(q_index, n_kpts)
         return raw_kernel_apply(
             lq, cell=self.cell, q_kpt=self.canonical_kpts[q_index], grid_mesh=self.grid_mesh
         )
@@ -957,8 +948,7 @@ class RawKernelProvider:
         composition, which is the reference the fused path is gated against.
         """
         n_kpts = self.canonical_kpts.shape[0]
-        if not (0 <= q_index < n_kpts):
-            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+        _require_q_index(q_index, n_kpts)
         eta_j = jnp.asarray(eta_q, dtype=jnp.complex128)
         if eta_j.ndim != 2:
             raise ValueError(f"eta_q must be 2-D (Nip, Ng), got shape {eta_j.shape}.")
@@ -976,8 +966,7 @@ class RawKernelProvider:
         n_retained_pin=-1
     ):
         n_kpts = self.canonical_kpts.shape[0]
-        if not (0 <= q_index < n_kpts):
-            raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+        _require_q_index(q_index, n_kpts)
         return _fused_apply_kernel_and_solve_core(
             Pi_q, eta_q, phase_q, self.coulG_all[q_index], self.grid_mesh, rtol, self_paired,
             retention_mode, n_retained_pin,
@@ -1267,6 +1256,34 @@ def build_kern_q_blocked(provider, q_index, eta_q, phase, *, staging_root,
             pass
 
 
+def _require_q_index(q_index, n_kpts):
+    """Bounds-check a q index. ValueError, matching the provider surface."""
+    if not (0 <= q_index < n_kpts):
+        raise ValueError(f"q_index={q_index} out of range for {n_kpts} k-points.")
+
+
+def _require_mesh3(mesh, name="grid_mesh"):
+    """Coerce to a 3-tuple of positive ints, or raise."""
+    t = tuple(int(x) for x in mesh)
+    if len(t) != 3 or any(m <= 0 for m in t):
+        raise ValueError(f"{name} must be 3 positive ints, got {t}.")
+    return t
+
+
+def _normalize_n_retained_pin(n_retained_pin, n_kpts):
+    """Broadcast a pin to one entry per q, or None when unpinned."""
+    if n_retained_pin is None:
+        return None
+    if isinstance(n_retained_pin, (list, tuple, np.ndarray)):
+        if len(n_retained_pin) != n_kpts:
+            raise ValueError(
+                f"n_retained_pin sequence must have length {n_kpts}, got "
+                f"{len(n_retained_pin)}."
+            )
+        return list(n_retained_pin)
+    return [n_retained_pin] * n_kpts
+
+
 def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
                           kern=None,
                            retained_solve_residual_gate=1e-10, retention_mode="single",
@@ -1314,17 +1331,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
     if kern is None and eta.shape[0] != n_kpts:
         raise ValueError(f"eta.shape[0]={eta.shape[0]} must equal mesh_obj.n_kpts={n_kpts}.")
 
-    if n_retained_pin is None:
-        pin_per_q = None
-    elif isinstance(n_retained_pin, (list, tuple, np.ndarray)):
-        if len(n_retained_pin) != n_kpts:
-            raise ValueError(
-                f"n_retained_pin sequence must have length {n_kpts}, got "
-                f"{len(n_retained_pin)}."
-            )
-        pin_per_q = list(n_retained_pin)
-    else:
-        pin_per_q = [n_retained_pin] * n_kpts
+    pin_per_q = _normalize_n_retained_pin(n_retained_pin, n_kpts)
 
     # Precompute every q's Bloch phase once: per-q constant within one build.
     phase_all = precompute_phase_all_q(grid_coords, mesh_obj.canonical_kpts)
@@ -1385,19 +1392,7 @@ def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
     """
     n_kpts = mesh_obj.n_kpts
     neg = mesh_obj.neg
-    # Normalized exactly as build_coul_kpt_device does. A scalar pin is documented
-    # as valid and previously raised TypeError here on the first subscript.
-    if n_retained_pin is None:
-        pin_per_q = None
-    elif isinstance(n_retained_pin, (list, tuple, np.ndarray)):
-        if len(n_retained_pin) != n_kpts:
-            raise ValueError(
-                f"n_retained_pin sequence must have length {n_kpts}, got "
-                f"{len(n_retained_pin)}."
-            )
-        pin_per_q = list(n_retained_pin)
-    else:
-        pin_per_q = [n_retained_pin] * n_kpts
+    pin_per_q = _normalize_n_retained_pin(n_retained_pin, n_kpts)
 
     coul_kpt = [None] * n_kpts
     kern_kpt = [None] * n_kpts
