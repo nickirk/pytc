@@ -2,6 +2,9 @@
 
 import unittest
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 from pytc.pbc.fft_mesh import (
     DEFAULT_FFT_RADICES,
     describe_fft_mesh,

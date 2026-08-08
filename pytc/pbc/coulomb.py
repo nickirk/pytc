@@ -117,6 +117,9 @@ FROZEN_BPC_POLICY = {
     "bpc_min_separation": 2.0,
     "bpc_candidate_oversampling": 4,
     "bpc_n_topup": 16,
+    # Off by default: it reassociates the projection, so the factor values
+    # differ in the last bits from every result produced before it existed.
+    "bpc_blocked_projection": False,
 }
 # Default selector: BPC with the frozen policy, storage chosen by predicted bytes.
 # Promoted 2026-07-29 on owner instruction, after the two blockers were removed.
@@ -283,6 +286,8 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
                        bpc_candidate_oversampling=
                        FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
                        bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"],
+                       bpc_blocked_projection=
+                       FROZEN_BPC_POLICY["bpc_blocked_projection"],
                        cached_ao_max_bytes=None,
                        reuse_ao_cache_for_eta=True, stage_eta_root=None,
                        stage_eta_block=4096, kern_blocking=None,
@@ -441,6 +446,11 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
                 "bpc_min_separation must be finite and non-negative, got "
                 f"{bpc_min_separation!r}."
             )
+        if not isinstance(bpc_blocked_projection, (bool, np.bool_)):
+            raise ValueError(
+                "bpc_blocked_projection must be a bool, got "
+                f"{bpc_blocked_projection!r}."
+            )
         n_topup_resolved = min(int(bpc_n_topup), int(rank))
         bpc_policy_resolved = {
             "batch_size": int(bpc_batch_size),
@@ -449,6 +459,7 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
             "n_topup_requested": int(bpc_n_topup),
             "n_topup": n_topup_resolved,
             "n_topup_clamped_to_rank": n_topup_resolved != int(bpc_n_topup),
+            "blocked_projection": bool(bpc_blocked_projection),
         }
 
     if cached_ao_max_bytes is not None:
@@ -525,6 +536,7 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         "bpc_min_separation": bpc_min_separation,
         "bpc_candidate_oversampling": bpc_candidate_oversampling,
         "bpc_n_topup": bpc_n_topup,
+        "bpc_blocked_projection": bpc_blocked_projection,
         "cached_ao_max_bytes": cached_ao_max_bytes,
         "reuse_ao_cache_for_eta": reuse_ao_cache_for_eta,
         "stage_eta_root": stage_eta_root,
@@ -564,6 +576,10 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
             None if bpc_policy_resolved is None
             else bpc_policy_resolved["n_topup"]
         ),
+        "bpc_blocked_projection": (
+            None if bpc_policy_resolved is None
+            else bpc_policy_resolved["blocked_projection"]
+        ),
         "predicted_cached_ao_bytes": predicted_cache_bytes,
         "cached_ao_max_bytes": cache_ceiling,
         "eta_strategy": eta_strategy,
@@ -599,7 +615,9 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
           bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
           bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
           bpc_candidate_oversampling=FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
-          bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"], reuse_ao_cache_for_eta=True,
+          bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"],
+          bpc_blocked_projection=FROZEN_BPC_POLICY["bpc_blocked_projection"],
+          reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
           n_retained_pin=None, convolve_device=False, p_block_rows=None,
           solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
@@ -627,6 +645,13 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         n_retained_pin: optional int K or length-Nk sequence, forwarded
             per-q to the S4 solve (fixed effective rank; mutually
             exclusive with rtol).
+        bpc_blocked_projection: apply the BPC projection once per round as
+            level-3 BLAS instead of once per pivot. Selects the same pivots
+            (test_isdf_selector.py, test_blocked_projection_matches_
+            sequential_pivots) but reassociates the factor arithmetic, so
+            values differ in the last bits. Measured
+            3.41x on selection at rank 15660; see
+            docs/isdf-periodic/artifacts/task95 in the staging repo.
 
     Returns:
         dict: mesh_obj (KptsMesh), inpv_kpt (Nk,Nip,Nao) complex128,
@@ -669,6 +694,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         bpc_min_separation=bpc_min_separation,
         bpc_candidate_oversampling=bpc_candidate_oversampling,
         bpc_n_topup=bpc_n_topup,
+        bpc_blocked_projection=bpc_blocked_projection,
         cached_ao_max_bytes=cached_ao_max_bytes,
         reuse_ao_cache_for_eta=reuse_ao_cache_for_eta,
         stage_eta_root=stage_eta_root,
@@ -773,6 +799,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
             min_separation=bpc_policy["min_separation"],
             candidate_oversampling=bpc_policy["candidate_oversampling"],
             n_topup=n_topup_eff,
+            blocked_projection=bpc_policy["blocked_projection"],
         )
         selection_provenance.update({
             "bpc_batch_size": bpc_policy["batch_size"],
@@ -784,6 +811,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                 bpc_policy["n_topup_clamped_to_rank"],
             "bpc_rounds": rounds,
             "bpc_joint_within_batch_exact_pivoting": True,
+            "bpc_blocked_projection": bpc_policy["blocked_projection"],
         })
         if selection_mode == "bpc_cached_gemm":
             selection_provenance["cache_bytes"] = int(cached_ao.nbytes)
@@ -1323,7 +1351,10 @@ class ISDFDF:
                  bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
                  bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
                  bpc_candidate_oversampling=FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
-                 bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"], reuse_ao_cache_for_eta=True,
+                 bpc_n_topup=FROZEN_BPC_POLICY["bpc_n_topup"],
+                 bpc_blocked_projection=
+                 FROZEN_BPC_POLICY["bpc_blocked_projection"],
+                 reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
                  n_retained_pin=None, convolve_device=False, p_block_rows=None,
                  solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
@@ -1342,6 +1373,7 @@ class ISDFDF:
         self.bpc_min_separation = bpc_min_separation
         self.bpc_candidate_oversampling = bpc_candidate_oversampling
         self.bpc_n_topup = bpc_n_topup
+        self.bpc_blocked_projection = bpc_blocked_projection
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
         self.convolve_device = convolve_device
         self.p_block_rows = p_block_rows
@@ -1384,6 +1416,7 @@ class ISDFDF:
                 bpc_min_separation=self.bpc_min_separation,
                 bpc_candidate_oversampling=self.bpc_candidate_oversampling,
                 bpc_n_topup=self.bpc_n_topup,
+                bpc_blocked_projection=self.bpc_blocked_projection,
                 reuse_ao_cache_for_eta=self.reuse_ao_cache_for_eta,
                 stage_eta_root=self.stage_eta_root,
                 stage_eta_block=self.stage_eta_block,
