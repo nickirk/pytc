@@ -317,13 +317,39 @@ class TestCholeskyJitterEntry(unittest.TestCase):
                                      retention_mode="single")
         self.assertIn("cholesky_jitter", str(ctx.exception))
 
-    def test_device_path_still_refuses_the_mode(self):
-        # Stage 3 work. Until then the device path must refuse rather than
-        # quietly running eig under a Cholesky label, as it once did.
-        Pi_d, V_d = self.Pi, self.V
-        with self.assertRaises(ValueError):
-            solvers.hermitian_sandwich_solve_device(
-                Pi_d, V_d, retention_mode="cholesky_jitter")
+    def test_device_path_runs_cholesky_not_eigh(self):
+        # The device path once accepted this mode, ran eig, and returned info
+        # labelled Cholesky. It is supported now, so the invariant to hold is
+        # the real one: the label and the arithmetic must agree.
+        W_d, info = solvers.hermitian_sandwich_solve_device(
+            self.Pi, self.V, retention_mode="cholesky_jitter", jitter_rcond=1e-6)
+
+        # s_max is the largest eigenvalue on the truncating branch and is only
+        # zero if the eigendecomposition never ran.
+        self.assertEqual(info["s_max"], 0.0)
+        self.assertEqual(info["n_retained"], -1)
+
+        W_h, _ = hermitian_sandwich_solve(
+            self.Pi, self.V, retention_mode="cholesky_jitter", jitter_rcond=1e-6)
+        W_d, W_h = np.asarray(W_d), np.asarray(W_h)
+        self.assertLess(np.linalg.norm(W_d - W_h) / np.linalg.norm(W_h), 1e-10)
+
+    def test_device_path_reports_its_own_residual(self):
+        # The mode has no retained subspace, but ||Pi W Pi - V|| / ||V|| is
+        # well-defined either way -- without it the path is undiagnosable.
+        W, info = solvers.hermitian_sandwich_solve_device(
+            self.Pi, self.V, retention_mode="cholesky_jitter", jitter_rcond=1e-6)
+        W = np.asarray(W)
+        expected = (np.linalg.norm(self.Pi @ W @ self.Pi - self.V)
+                    / np.linalg.norm(self.V))
+        self.assertAlmostEqual(info["retained_solve_residual"], expected, places=8)
+
+    def test_device_path_rejects_the_truncating_knobs(self):
+        for kw in ({"rtol": 1e-6}, {"n_retained_pin": 4}):
+            with self.subTest(**kw), self.assertRaises(ValueError) as ctx:
+                solvers.hermitian_sandwich_solve_device(
+                    self.Pi, self.V, retention_mode="cholesky_jitter", **kw)
+            self.assertIn("cholesky_jitter", str(ctx.exception))
 
     def test_agrees_with_the_truncating_solver_on_a_well_conditioned_system(self):
         W_chol, _ = hermitian_sandwich_solve(self.Pi, self.V,

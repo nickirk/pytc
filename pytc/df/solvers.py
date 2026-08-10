@@ -1221,8 +1221,52 @@ def hermitian_sandwich_solve(
     return W, info
 
 
+#: Fixed jitter for the jitted Cholesky path. 1e-6 is the measured accuracy
+#: optimum on diamond/gth-dzvp (task #98); the curve is bracketed on both
+#: sides, so this is a measured value rather than a conservative guess.
+_DEFAULT_DEVICE_JITTER_RCOND = 1e-6
+
+
+def _cholesky_jitter_core(Pi_herm, V_herm, jitter_rcond, n, dtype, tiny,
+                          pi_anti_hermitian_residual, v_anti_hermitian_residual):
+    """Jitted Cholesky sandwich: W = (Pi + jI)^-1 V (Pi + jI)^-1.
+
+    Fixed jitter, no escalation -- the host path's escalation loop needs a
+    concretized isfinite() per attempt, which a traced graph cannot do. The
+    caller retries with a larger jitter_rcond if the result is non-finite;
+    jitter_rcond is traced, so a retry reuses this compiled kernel.
+
+    Returns _hermitian_sandwich_solve_core's tuple. n_retained is -1 and the
+    spectral fields are 0: this mode regularizes rather than truncating, so it
+    has no retained subspace and computes no eigenvalues. retained_solve_residual
+    IS computed -- ||Pi W Pi - V|| / ||V|| is well-defined either way, and costs
+    two matmuls against the eigendecomposition this mode exists to avoid.
+    """
+    eps = jnp.finfo(jnp.zeros((), dtype).real.dtype).eps
+    diag_mean = jnp.mean(jnp.real(jnp.diag(Pi_herm)))
+    # Matches prepare_spd_cholesky's convention: relative to the diagonal, with
+    # an eps floor, so the same jitter_rcond means the same thing on both paths.
+    jitter = jnp.maximum(diag_mean * jitter_rcond, eps * diag_mean)
+    mat = Pi_herm + jitter * jnp.eye(n, dtype=dtype)
+
+    chol = jsp_linalg.cho_factor(mat, lower=True)
+    # A is Hermitian, so A^-1 (A^-1 V)^H = A^-1 V A^-1 = W directly.
+    Y = jsp_linalg.cho_solve(chol, V_herm)
+    W = jsp_linalg.cho_solve(chol, Y.conj().T)
+    W = (W + W.conj().T) / 2
+
+    v_norm = jnp.maximum(jnp.linalg.norm(V_herm), tiny)
+    residual = jnp.linalg.norm(Pi_herm @ W @ Pi_herm - V_herm) / v_norm
+    zero = jnp.zeros((), dtype).real
+    return (
+        W, jnp.asarray(-1), zero, zero, pi_anti_hermitian_residual,
+        v_anti_hermitian_residual, residual, zero, zero,
+    )
+
+
 @partial(jax.jit, static_argnames=("retention_mode",))
-def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single", n_retained_pin=-1):
+def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single", n_retained_pin=-1,
+                                   jitter_rcond=1e-6):
     """Fixed-shape, jitted, device-resident core of
     hermitian_sandwich_solve_device (design v2.1 sections 5+6/7).
     Reproduces hermitian_sandwich_solve's math exactly (both retention
@@ -1248,6 +1292,14 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single", n_retai
     v_anti_hermitian_residual = jnp.linalg.norm(V - V.conj().T) / jnp.maximum(
         jnp.linalg.norm(V), tiny
     )
+
+    if retention_mode == "cholesky_jitter":
+        # Returns BEFORE the eigendecomposition -- skipping it is the whole
+        # point of this mode. (svd_lstsq below pays for an eigh it never uses.)
+        return _cholesky_jitter_core(
+            Pi_herm, V_herm, jitter_rcond, n, dtype, tiny,
+            pi_anti_hermitian_residual, v_anti_hermitian_residual,
+        )
 
     eigvals_asc, eigvecs_asc = jnp.linalg.eigh(Pi_herm)
     order = jnp.argsort(eigvals_asc)[::-1]
@@ -1357,7 +1409,7 @@ def _hermitian_sandwich_solve_core(Pi, V, rtol, retention_mode="single", n_retai
 
 
 def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single",
-                                    n_retained_pin=None):
+                                    n_retained_pin=None, jitter_rcond=None):
     """Device (JAX, fixed-shape, jitted) counterpart of
     hermitian_sandwich_solve. See design doc §5-§7.
 
@@ -1390,14 +1442,29 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single"
         raise ValueError(f"V must have shape {(n, n)} matching Pi, got {V_np.shape}.")
     if not np.all(np.isfinite(Pi_np)) or not np.all(np.isfinite(V_np)):
         raise ValueError("Pi and V must be finite.")
-    if retention_mode not in ("single", "pairwise", "svd_lstsq"):
+    if retention_mode not in ("single", "pairwise", "svd_lstsq", "cholesky_jitter"):
         raise ValueError(
-            f"retention_mode must be 'single', 'pairwise' or 'svd_lstsq', "
-            f"got {retention_mode!r}. 'cholesky_jitter' is NOT available on the\n"
-            f"DEVICE path: this path once accepted it, ran eig, and returned info\n"
-            f"labelled Cholesky. The host hermitian_sandwich_solve supports it by\n"
-            f"delegating to _cholesky_jitter_sandwich in this module; routing the\n"
-            f"device path through the same helper is separate, unstarted work."
+            f"retention_mode must be 'single', 'pairwise', 'svd_lstsq' or "
+            f"'cholesky_jitter', got {retention_mode!r}."
+        )
+    if retention_mode == "cholesky_jitter":
+        # This path once accepted the mode, ran eigh, and returned info labelled
+        # Cholesky. _cholesky_jitter_core returns before the eigendecomposition,
+        # so the label and the arithmetic agree.
+        if rtol is not None:
+            raise ValueError(
+                "rtol does not apply to retention_mode='cholesky_jitter'; pass "
+                "jitter_rcond to set the jitter scale."
+            )
+        if n_retained_pin is not None:
+            raise ValueError(
+                "n_retained_pin does not apply to retention_mode='cholesky_jitter': "
+                "the mode regularizes rather than truncating, so it has no retained set."
+            )
+    elif jitter_rcond is not None:
+        raise ValueError(
+            f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
+            f"{retention_mode!r}."
         )
     if n_retained_pin is not None:
         if retention_mode != "single":
@@ -1450,7 +1517,17 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single"
     ) = _hermitian_sandwich_solve_core(
         Pi_jnp, V_jnp, rtol_eff, retention_mode,
         n_retained_pin if n_retained_pin is not None else -1,
+        _DEFAULT_DEVICE_JITTER_RCOND if jitter_rcond is None else jitter_rcond,
     )
+    if retention_mode == "cholesky_jitter" and not bool(jnp.all(jnp.isfinite(W))):
+        # The jitted graph cannot raise, and a too-small fixed jitter fails the
+        # factorization into NaNs rather than an error. Caught here, host-side.
+        raise ValueError(
+            f"cholesky_jitter produced a non-finite W at jitter_rcond="
+            f"{_DEFAULT_DEVICE_JITTER_RCOND if jitter_rcond is None else jitter_rcond:.3e}. "
+            f"The fixed jitter was too small to make Pi positive definite; retry with a "
+            f"larger jitter_rcond (this path does not escalate on its own)."
+        )
 
     info = _solve_info_from_core_output(
         n_retained, s_max, s_min_retained, pi_anti_hermitian_residual,
