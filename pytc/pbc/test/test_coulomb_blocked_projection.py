@@ -39,12 +39,18 @@ class TestPlanResolution(unittest.TestCase):
             selection_mode="bpc_cached_gemm", **kw
         ).to_dict()
 
-    def test_defaults_to_off(self):
-        self.assertFalse(
-            coulomb.FROZEN_BPC_POLICY["bpc_blocked_projection"],
-            "flipping this default changes the last bits of every build",
-        )
-        self.assertFalse(self._plan()["resolved"]["bpc_blocked_projection"])
+    def test_defaults_to_on(self):
+        # Flipped 2026-08-10 by owner decision. Pivots stay byte-identical
+        # (test_isdf_selector); factor values move in the last bits, so a
+        # comparison against a result banked before the flip is not exact.
+        self.assertTrue(coulomb.FROZEN_BPC_POLICY["bpc_blocked_projection"])
+        self.assertTrue(self._plan()["resolved"]["bpc_blocked_projection"])
+
+    def test_can_still_be_turned_off(self):
+        # The slow path stays reachable: it is the reference the blocked path
+        # was gated against.
+        plan = self._plan(bpc_blocked_projection=False)
+        self.assertFalse(plan["resolved"]["bpc_blocked_projection"])
 
     def test_requested_value_survives_into_the_resolved_plan(self):
         plan = self._plan(bpc_blocked_projection=True)
@@ -103,9 +109,9 @@ class TestReachesTheSelector(unittest.TestCase):
         seen, _ = self._run_and_capture(bpc_blocked_projection=True)
         self.assertIs(seen["blocked_projection"], True)
 
-    def test_default_forwards_false(self):
+    def test_default_forwards_true(self):
         seen, _ = self._run_and_capture()
-        self.assertIs(seen["blocked_projection"], False)
+        self.assertIs(seen["blocked_projection"], True)
 
     def test_recorded_in_selection_provenance(self):
         _, built = self._run_and_capture(bpc_blocked_projection=True)

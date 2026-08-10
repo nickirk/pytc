@@ -420,7 +420,7 @@ class TestBuild(unittest.TestCase):
         self.assertEqual(coulomb.FROZEN_BPC_POLICY, {
             "bpc_batch_size": 64, "bpc_min_separation": 2.0,
             "bpc_candidate_oversampling": 4, "bpc_n_topup": 16,
-            "bpc_blocked_projection": False,
+            "bpc_blocked_projection": True,
         })
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)

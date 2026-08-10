@@ -117,9 +117,10 @@ FROZEN_BPC_POLICY = {
     "bpc_min_separation": 2.0,
     "bpc_candidate_oversampling": 4,
     "bpc_n_topup": 16,
-    # Off by default: it reassociates the projection, so the factor values
-    # differ in the last bits from every result produced before it existed.
-    "bpc_blocked_projection": False,
+    # On by default (owner decision 2026-08-10): 3.41x on selection at rank
+    # 15,660 with byte-identical pivots. It reassociates the projection, so
+    # factor values differ in the last bits from results produced before it.
+    "bpc_blocked_projection": True,
 }
 # Default selector: BPC with the frozen policy, storage chosen by predicted bytes.
 # Promoted 2026-07-29 on owner instruction, after the two blockers were removed.
