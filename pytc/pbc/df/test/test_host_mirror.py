@@ -212,7 +212,8 @@ class TestStaticallyInvalidConfigsRefusedAtConstruction(unittest.TestCase):
 
     def test_the_three_placements_fail_at_construction(self):
         cases = (
-            dict(solve_backend="device", retention_mode="cholesky_jitter"),
+            # device + cholesky_jitter is legal as of 2026-08-10; covered by
+            # TestCholeskyBiasPolicyPrecondition instead.
             dict(solve_backend="host", retention_mode="single", jitter_rcond=1e-14),
             dict(solve_backend="host", retention_mode="cholesky_jitter", rtol=1e-6),
             dict(solve_backend="host", retention_mode="cholesky_jitter", n_retained_pin=3),
@@ -233,12 +234,15 @@ class TestStaticallyInvalidConfigsRefusedAtConstruction(unittest.TestCase):
 
 
 class TestCholeskyBiasPolicyPrecondition(unittest.TestCase):
-    """The interim bias policy is warning-only, which is defensible ONLY while the
-    mode cannot run a P-blocked configuration. That confinement is currently a
-    consequence of three separate refusals rather than a stated rule, so it could
-    be removed by accident. These tests make it a contract: if any of them starts
-    failing, warning-only has silently become acceptance and the bias policy must
-    be settled first.
+    """The confinement these tests protected is GONE as of 2026-08-10: the jitted
+    path now runs cholesky_jitter, so the mode can reach a P-blocked run and
+    warning-only is no longer justified by unreachability.
+
+    The owner settled the policy rather than the confinement being removed by
+    accident: judge this mode against an energy reference, not a hard residual
+    gate. What must therefore still hold is the weaker but load-bearing property
+    that the bias is REPORTED. A silent large-bias solve is the failure these
+    tests exist to prevent, and it is now the only one they can prevent.
     """
 
     def setUp(self):
@@ -248,16 +252,42 @@ class TestCholeskyBiasPolicyPrecondition(unittest.TestCase):
     def _isdfdf(self, **kw):
         return ISDFDF(self.cell, self.kpts, rank=12, block_size=200, **kw)
 
-    def test_cholesky_cannot_run_a_p_blocked_configuration(self):
-        # The three refusals that together confine the mode to the reference path.
-        for kw in (dict(solve_backend="device", retention_mode="cholesky_jitter",
-                        jitter_rcond=1e-14),
-                   dict(solve_backend="host", p_block_rows=4),
+    def test_the_reference_path_still_refuses_the_production_lever(self):
+        # The host path remains reference-grade; only its pairing with the
+        # jitted path changed.
+        for kw in (dict(solve_backend="host", p_block_rows=4),
                    dict(solve_backend="host", retention_mode="cholesky_jitter",
                         p_block_rows=4)):
             with self.subTest(**kw):
                 with self.assertRaises(ValueError):
                     self._isdfdf(**kw)
+
+    def test_the_jitted_path_now_accepts_the_mode(self):
+        # Was refused; refusing it again would mean the wiring regressed.
+        df = self._isdfdf(solve_backend="device", retention_mode="cholesky_jitter",
+                          jitter_rcond=1e-6)
+        self.assertEqual(df.retention_mode, "cholesky_jitter")
+
+    def test_a_large_bias_is_reported_not_swallowed(self):
+        # The property the confinement used to guarantee. Without this the mode
+        # can run P-blocked at production scale and say nothing about its bias.
+        import numpy as np
+        from pytc.df.solvers import hermitian_sandwich_solve_device
+        n = 40
+        rng = np.random.default_rng(0)
+        q, _ = np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))
+        pi = (q * np.logspace(0, -9, n)) @ q.conj().T
+        pi = (pi + pi.conj().T) / 2
+        v = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+        v = (v + v.conj().T) / 2
+        with self.assertLogs("pytc.df.solvers", level="WARNING") as captured:
+            _, info = hermitian_sandwich_solve_device(
+                pi, v, retention_mode="cholesky_jitter", jitter_rcond=1e-6)
+        self.assertTrue(
+            any("two-sided fit residual" in line for line in captured.output),
+            f"bias not reported: {captured.output}",
+        )
+        self.assertGreater(info["retained_solve_residual"], 1e-10)
 
     def test_the_reference_path_itself_is_reachable(self):
         # Control: the refusals above must not be vacuous. Without the production

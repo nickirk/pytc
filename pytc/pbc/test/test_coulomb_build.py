@@ -108,12 +108,10 @@ class TestBuildPlan(unittest.TestCase):
                 legal &= not (panel and staged)
                 legal &= not (backend == "host" and (panel or kern_blocked))
                 legal &= not (backend == "host" and custom)
-                legal &= not (backend == "device" and jitter)
                 if retention == "cholesky_jitter":
-                    legal &= (
-                        backend == "host" and not with_rtol and not pin
-                        and not target
-                    )
+                    # Runs on both backends now: the jitted path takes a fixed
+                    # jitter instead of the host loop's escalation.
+                    legal &= not with_rtol and not pin and not target
                 else:
                     legal &= not jitter
                 if retention != "single":

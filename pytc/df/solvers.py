@@ -1538,4 +1538,22 @@ def hermitian_sandwich_solve_device(Pi, V, *, rtol=None, retention_mode="single"
         retention_mode=retention_mode,
         n_retained_pin=n_retained_pin,
     )
+    if retention_mode == "cholesky_jitter":
+        # Parity with _cholesky_jitter_sandwich's bias policy. That policy is
+        # warning-only, which was defensible while the mode could not reach a
+        # P-blocked run; it now can, so the warning is what carries the bias to
+        # the operator (owner decision 2026-08-10: judge by energies, not by a
+        # hard residual gate). Silence here would make warning-only into
+        # acceptance -- see TestCholeskyBiasPolicyPrecondition.
+        _fit_residual = float(retained_solve_residual)
+        if _fit_residual > _RESIDUAL_WARN_THRESHOLD:
+            logger.warning(
+                "hermitian_sandwich_solve_device (cholesky_jitter): two-sided fit "
+                "residual %.3e exceeds acceptance threshold %.0e at jitter_rcond=%.3e. "
+                "This reflects UNREGULARIZED bias, not a factorization failure, and "
+                "more jitter cannot reduce it. Reported, not gated: validate against "
+                "an energy reference.",
+                _fit_residual, _RESIDUAL_WARN_THRESHOLD,
+                _DEFAULT_DEVICE_JITTER_RCOND if jitter_rcond is None else jitter_rcond,
+            )
     return W, info

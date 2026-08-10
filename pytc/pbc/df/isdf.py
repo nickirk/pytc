@@ -1016,7 +1016,7 @@ def precompute_phase_all_q(grid_coords, canonical_kpts):
 def apply_kernel_and_solve_device(
     provider, q_index, Pi_q, eta_q, *, grid_coords=None, phase_q=None, rtol=None,
     retained_solve_residual_gate=1e-10, self_paired=False, retention_mode="single",
-    kern_blocking=None, n_retained_pin=None, kern_q=None,
+    kern_blocking=None, n_retained_pin=None, kern_q=None, jitter_rcond=None,
 ):
     """S4 pipeline glue, device-resident, provider-agnostic: phase multiply
     -> provider.apply -> conjugate -> ZGEMM -> device Hermitian sandwich
@@ -1079,6 +1079,10 @@ def apply_kernel_and_solve_device(
         if not 1 <= n_retained_pin <= n_ip:
             raise ValueError(f"n_retained_pin must be in [1, {n_ip}], got {n_retained_pin}.")
     rtol_eff = 1e-4 if rtol is None else rtol
+    # cholesky_jitter regularizes instead of truncating and refuses rtol;
+    # passing the defaulted rtol_eff down would trip that refusal.
+    _rtol_arg = (None if (n_retained_pin is not None
+                 or retention_mode == "cholesky_jitter") else rtol_eff)
 
     if phase_q is None and grid_coords is None:
         raise ValueError("apply_kernel_and_solve_device: give one of grid_coords/phase_q.")
@@ -1135,9 +1139,9 @@ def apply_kernel_and_solve_device(
             kern_q = kern_q.real.astype(jnp.complex128)
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
             Pi_q_jnp, kern_q,
-            rtol=None if n_retained_pin is not None else rtol_eff,
+            rtol=_rtol_arg,
             retention_mode=retention_mode,
-            n_retained_pin=n_retained_pin,
+            n_retained_pin=n_retained_pin, jitter_rcond=jitter_rcond,
         )
     elif kern_blocking is not None:
         # Bypasses the fused graph, which assumes a resident (Nip, Ng).
@@ -1148,9 +1152,13 @@ def apply_kernel_and_solve_device(
             dtype=jnp.complex128)
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
             Pi_q_jnp, kern_q,
-            rtol=None if n_retained_pin is not None else rtol_eff,
-            retention_mode=retention_mode, n_retained_pin=n_retained_pin)
-    elif (fused := getattr(provider, "fused_apply_and_solve", None)) is not None:
+            rtol=_rtol_arg,
+            retention_mode=retention_mode, n_retained_pin=n_retained_pin,
+            jitter_rcond=jitter_rcond)
+    elif (retention_mode != "cholesky_jitter"
+          # The provider's fused hook takes no jitter, so this mode uses the
+          # unfused path rather than silently solving at the wrong jitter.
+          and (fused := getattr(provider, "fused_apply_and_solve", None)) is not None):
         (
             W_q_unscaled, kern_q, n_retained, s_max, s_min_retained,
             pi_anti_hermitian_residual, v_anti_hermitian_residual,
@@ -1179,8 +1187,9 @@ def apply_kernel_and_solve_device(
 
         W_q_unscaled, solve_info = hermitian_sandwich_solve_device(
             Pi_q_jnp, kern_q,
-            rtol=None if n_retained_pin is not None else rtol_eff,
+            rtol=_rtol_arg,
             retention_mode=retention_mode, n_retained_pin=n_retained_pin,
+            jitter_rcond=jitter_rcond,
         )
 
     # Host-side gate: the jitted solve cannot raise on a traced value, so
@@ -1193,7 +1202,11 @@ def apply_kernel_and_solve_device(
             f"proceed. Validate Pi_q against the NumPy oracle (hermitian_sandwich_solve) "
             f"for a precise diagnosis."
         )
-    if solve_info["retained_solve_residual"] > retained_solve_residual_gate:
+    # The gate is calibrated on the truncating branch's arithmetic; this mode
+    # regularizes instead, so its residual is legitimately large and reported
+    # rather than gated (owner decision 2026-08-10).
+    if (retention_mode != "cholesky_jitter"
+            and solve_info["retained_solve_residual"] > retained_solve_residual_gate):
         raise ValueError(
             f"apply_kernel_and_solve_device: q_index={q_index} retained-space solve "
             f"residual {solve_info['retained_solve_residual']:.3e} exceeds the hard "
@@ -1284,7 +1297,7 @@ def _normalize_n_retained_pin(n_retained_pin, n_kpts):
 def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
                           kern=None,
                            retained_solve_residual_gate=1e-10, retention_mode="single",
-                           kern_blocking=None, n_retained_pin=None):
+                           kern_blocking=None, n_retained_pin=None, jitter_rcond=None):
     """S4 orchestration: build coul_kpt (Nk, Nip, Nip) with one
     apply_kernel_and_solve_device call per unique {q, neg[q]} pair; the
     partner is set by exact conjugation (W[neg[q]] = conj(W[q]),
@@ -1350,6 +1363,7 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
             kern_q=None if kern is None else kern[q],
             phase_q=phase_all[q], rtol=rtol,
             retained_solve_residual_gate=retained_solve_residual_gate,
+            jitter_rcond=jitter_rcond,
             self_paired=(nq == q), retention_mode=retention_mode,
             kern_blocking=kern_blocking,
             n_retained_pin=None if pin_per_q is None else pin_per_q[q],

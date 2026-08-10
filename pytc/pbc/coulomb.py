@@ -200,20 +200,15 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
                     f"solve_backend='host' does not implement {name}; it is a "
                     f"reference path, not a performance path."
                 )
-    elif jitter_rcond is not None:
+    elif jitter_rcond is not None and retention_mode != "cholesky_jitter":
         raise ValueError(
-            "jitter_rcond requires solve_backend='host'; the device path does "
-            "not implement retention_mode='cholesky_jitter'."
+            f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
+            f"{retention_mode!r}."
         )
     # These were statically knowable and yet failed only after pivot selection,
     # because the first version of this validator took neither retention_mode nor
     # rtol. Fixing placement for SOME options and not others is not a fix.
     if retention_mode == "cholesky_jitter":
-        if solve_backend != "host":
-            raise ValueError(
-                f"retention_mode='cholesky_jitter' requires solve_backend='host'; "
-                f"the device path refuses the mode. Got {solve_backend!r}."
-            )
         if rtol is not None:
             raise ValueError(
                 "rtol does not apply to retention_mode='cholesky_jitter': it is a "
@@ -955,7 +950,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
                 provider, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
                 kern=kern_p_blocked,
                 retention_mode=retention_mode, kern_blocking=kern_blocking,
-                n_retained_pin=n_retained_pin,
+                n_retained_pin=n_retained_pin, jitter_rcond=jitter_rcond,
             )
     finally:
         # Never strand the staging file, on success or failure.
