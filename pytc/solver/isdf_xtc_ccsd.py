@@ -94,6 +94,12 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
     def _contract_vvvv_t2(self, cc, t2_jax, eris, t2new_host):
         """Instance hook called by the inherited JAX update path; no VVVV tile."""
         del cc
+        if os.environ.get("PYTC_XTC_DROP_X_RESIDUAL") == "1":
+            raise RuntimeError(
+                "PYTC_XTC_DROP_X_RESIDUAL is not implemented for the "
+                "factorized VVVV solver; use jax_xtc_ccsd.RCCSD for the "
+                "normal-order/residual-X partition study"
+            )
         if eris.vvvv is not None:
             raise RuntimeError(
                 "factorized RCCSD refuses a materialized VVVV store; select "

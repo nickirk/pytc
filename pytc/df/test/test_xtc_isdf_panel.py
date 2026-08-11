@@ -71,6 +71,72 @@ class TestISDFXTCPanelization(unittest.TestCase):
             "The exchange kernel must affect the downstream Delta-U integral.",
         )
 
+    def test_x_normal_order_and_residual_switches_are_independent(self):
+        """A full X store can isolate normal-order and residual-X effects."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
+        l_aux = self.isdf_xtc._compute_L_aux(
+            self.jparams,
+            batch_size=kwargs["batch_size"],
+            host_grid_block_size=kwargs["host_grid_block_size"],
+        )
+        clean_env = {
+            "PYTC_XTC_DROP_X": "0",
+            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
+            "PYTC_XTC_DROP_X_RESIDUAL": "0",
+        }
+        with mock.patch.dict(os.environ, clean_env):
+            full = self.isdf_xtc.compute_delta_u_kernels(
+                self.jparams, L_aux=l_aux, **kwargs
+            )
+
+        no_x = {"D": full["D"], "X": np.zeros_like(np.asarray(full["X"]))}
+        full_obj = self.isdf_xtc.replace(isdf_kernels=full)
+        no_x_obj = self.isdf_xtc.replace(isdf_kernels=no_x)
+        ranges = (slice(0, 2), slice(1, 3), slice(0, 2), slice(1, 3))
+
+        with mock.patch.dict(os.environ, clean_env):
+            full_h = full_obj.get_delta_h(self.jparams)
+            full_e0 = full_obj.get_const(self.jparams, delta_h=full_h)
+            full_du = full_obj.get_delta_U(self.jparams, ranges=ranges)
+            no_x_h = no_x_obj.get_delta_h(self.jparams)
+            no_x_e0 = no_x_obj.get_const(self.jparams, delta_h=no_x_h)
+            no_x_du = no_x_obj.get_delta_U(self.jparams, ranges=ranges)
+
+        with mock.patch.dict(
+            os.environ, {**clean_env, "PYTC_XTC_DROP_X_NORMAL_ORDER": "1"}
+        ):
+            normal_order_dropped_h = full_obj.get_delta_h(self.jparams)
+            normal_order_dropped_e0 = full_obj.get_const(
+                self.jparams, delta_h=normal_order_dropped_h
+            )
+
+        with mock.patch.dict(
+            os.environ, {**clean_env, "PYTC_XTC_DROP_X_RESIDUAL": "1"}
+        ):
+            residual_dropped_du = full_obj.get_delta_U(
+                self.jparams, ranges=ranges
+            )
+            residual_dropped_direct = full_obj._assemble_delta_u_tile(full, ranges)
+
+        # The narrow switches exactly reproduce the relevant portion of the
+        # all-X-dropped Hamiltonian while leaving the other portion available.
+        np.testing.assert_allclose(
+            normal_order_dropped_h, no_x_h, atol=1e-10, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            normal_order_dropped_e0, no_x_e0, atol=1e-10, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            residual_dropped_du, no_x_du, atol=1e-10, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            residual_dropped_direct, no_x_du, atol=1e-10, rtol=1e-10
+        )
+
+        self.assertGreater(np.linalg.norm(np.asarray(full_h - no_x_h)), 1e-10)
+        self.assertGreater(abs(float(full_e0 - no_x_e0)), 1e-10)
+        self.assertGreater(np.linalg.norm(np.asarray(full_du - no_x_du)), 1e-10)
+
     def test_x_s_panel_blocks_matches_baseline(self):
         batch_size = 64
         orb_block_size = 2
