@@ -1,5 +1,8 @@
-"""Periodic (k-point) machinery for pytc, mirroring pyscf's pbc package
-layout (task #21, #proj-isdf-periodic). See
-docs/isdf-periodic/design-periodic-fftisdf.md in the isdf-coulomb-cuda
-repo for the full design.
-"""
+"""Periodic boundary-condition machinery for PyTC."""
+
+from . import jastrow
+from . import tc
+from . import utils
+from . import xtc
+
+__all__ = ["jastrow", "tc", "utils", "xtc"]

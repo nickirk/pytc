@@ -37,6 +37,8 @@ jobs:
           pytc/vmc/test \
           pytc/ansatz/test \
           pytc/df/test \
+          pytc/pbc/df/test \
+          pytc/pbc/test \
           pytc/solver/test \
           pytc/utils/test \
           pytc/coulomb/test \
