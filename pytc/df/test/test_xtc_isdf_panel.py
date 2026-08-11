@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 
+from pytc import xtc as xtc_module
 from pytc.jastrow.rexp import REXP
 from pytc.tc import ISDFTC
 from pytc.xtc import XTC, ISDFXTC
@@ -111,17 +112,25 @@ class TestISDFXTCPanelization(unittest.TestCase):
             normal_order_dropped_e0 = full_obj.get_const(
                 self.jparams, delta_h=normal_order_dropped_h
             )
+            normal_order_dropped_du = full_obj.get_delta_U(
+                self.jparams, ranges=ranges
+            )
 
         with mock.patch.dict(
             os.environ, {**clean_env, "PYTC_XTC_DROP_X_RESIDUAL": "1"}
         ):
+            residual_dropped_h = full_obj.get_delta_h(self.jparams)
+            residual_dropped_e0 = full_obj.get_const(
+                self.jparams, delta_h=residual_dropped_h
+            )
             residual_dropped_du = full_obj.get_delta_U(
                 self.jparams, ranges=ranges
             )
             residual_dropped_direct = full_obj._assemble_delta_u_tile(full, ranges)
 
-        # The narrow switches exactly reproduce the relevant portion of the
-        # all-X-dropped Hamiltonian while leaving the other portion available.
+        # Each narrow switch exactly reproduces its corresponding component of
+        # the all-X-dropped Hamiltonian *and* leaves the complementary
+        # component unchanged within FP64 tolerance.
         np.testing.assert_allclose(
             normal_order_dropped_h, no_x_h, atol=1e-10, rtol=1e-10
         )
@@ -134,6 +143,52 @@ class TestISDFXTCPanelization(unittest.TestCase):
         np.testing.assert_allclose(
             residual_dropped_direct, no_x_du, atol=1e-10, rtol=1e-10
         )
+        np.testing.assert_allclose(
+            normal_order_dropped_du, full_du, atol=1e-10, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            residual_dropped_h, full_h, atol=1e-10, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            residual_dropped_e0, full_e0, atol=1e-10, rtol=1e-10
+        )
+
+        # Mutation oracles: prove the complement assertions reject either
+        # possible broadened switch, rather than merely passing on today's
+        # implementation.
+        real_drop_residual = xtc_module._drop_x_from_residual_integrals
+        with mock.patch.object(
+            xtc_module,
+            "_drop_x_from_residual_integrals",
+            side_effect=lambda: (
+                real_drop_residual()
+                or os.environ.get("PYTC_XTC_DROP_X_NORMAL_ORDER") == "1"
+            ),
+        ), mock.patch.dict(
+            os.environ, {**clean_env, "PYTC_XTC_DROP_X_NORMAL_ORDER": "1"}
+        ):
+            broadened_normal_du = full_obj.get_delta_U(self.jparams, ranges=ranges)
+        with self.assertRaises(AssertionError):
+            np.testing.assert_allclose(
+                broadened_normal_du, full_du, atol=1e-10, rtol=1e-10
+            )
+
+        real_drop_normal = xtc_module._drop_x_from_normal_order
+        with mock.patch.object(
+            xtc_module,
+            "_drop_x_from_normal_order",
+            side_effect=lambda: (
+                real_drop_normal()
+                or os.environ.get("PYTC_XTC_DROP_X_RESIDUAL") == "1"
+            ),
+        ), mock.patch.dict(
+            os.environ, {**clean_env, "PYTC_XTC_DROP_X_RESIDUAL": "1"}
+        ):
+            broadened_residual_h = full_obj.get_delta_h(self.jparams)
+        with self.assertRaises(AssertionError):
+            np.testing.assert_allclose(
+                broadened_residual_h, full_h, atol=1e-10, rtol=1e-10
+            )
 
         self.assertGreater(np.linalg.norm(np.asarray(full_h - no_x_h)), 1e-10)
         self.assertGreater(abs(float(full_e0 - no_x_e0)), 1e-10)
@@ -182,6 +237,8 @@ class TestISDFXTCPanelization(unittest.TestCase):
         self.assertAlmostEqual(drop_all, literal_zero_x, places=10)
         self.assertGreater(abs(full - drop_normal), 1e-10)
         self.assertGreater(abs(full - drop_residual), 1e-10)
+        self.assertGreater(abs(drop_normal - drop_all), 1e-10)
+        self.assertGreater(abs(drop_residual - drop_all), 1e-10)
 
     def test_x_s_panel_blocks_matches_baseline(self):
         batch_size = 64
