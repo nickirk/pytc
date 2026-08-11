@@ -1408,6 +1408,7 @@ class ISDFDF:
         self.n_retained_pin = n_retained_pin
         self._built = None
         self._ao2mo_call_count = 0
+        self._df_sqrt_cache = None
         # get_pp/get_nuc (core-Hamiltonian integrals, unrelated to the J/K
         # factorization) delegate to a real FFTDF instance.
         from pyscf.pbc.df import FFTDF
@@ -1475,6 +1476,125 @@ class ISDFDF:
             raise ValueError("ao2mo kpts violate momentum conservation for this mesh.")
         self._ao2mo_call_count += 1
         return eri.reshape(-1)
+
+    def _df_sqrt_factor(self):
+        """Cached ``(X, W)`` with ``coul_kpt[0] = W W^T``; the Gamma DF square root.
+
+        Shared by :meth:`loop` and :meth:`get_naoaux` so the advertised auxiliary
+        count and the blocks actually yielded cannot disagree -- callers
+        preallocate from the former and fill from the latter.
+        """
+        if getattr(self, "_df_sqrt_cache", None) is not None:
+            return self._df_sqrt_cache
+
+        built = self.build()
+        inpv, coul = built["inpv_kpt"], built["coul_kpt"]
+        if inpv.shape[0] != 1:
+            raise NotImplementedError(
+                f"ISDFDF.loop is Gamma-only; this build has {inpv.shape[0]} k-points. "
+                "A real three-index DF factor does not exist for complex k-point "
+                "factors, so this is a contract change, not a missing branch."
+            )
+        arrays = {}
+        for name, arr in (("inpv_kpt", np.asarray(inpv[0])),
+                          ("coul_kpt", np.asarray(coul[0]))):
+            if np.iscomplexobj(arr):
+                scale = max(float(np.abs(arr).max()), np.finfo(np.float64).tiny)
+                imag = float(np.abs(arr.imag).max()) / scale
+                if imag > 1e-12:
+                    raise ValueError(
+                        f"ISDFDF.loop: {name} has relative imaginary part {imag:.3e} "
+                        "at Gamma, where it must be real; refusing to silently drop it."
+                    )
+                arr = arr.real
+            arrays[name] = np.ascontiguousarray(arr, dtype=np.float64)
+
+        X = arrays["inpv_kpt"]
+        V = arrays["coul_kpt"]
+        V = (V + V.T) / 2
+        evals, evecs = np.linalg.eigh(V)
+        vmax = float(np.abs(evals).max()) if evals.size else 0.0
+        tol = vmax * 1e-12
+        # A DF factor is a square root, so negative directions cannot be
+        # represented at all. Dropping them quietly would change the ERIs the
+        # caller then treats as exact, so the size of what is dropped is the
+        # number that has to be checked, not the count.
+        neg = evals[evals < -tol]
+        if neg.size:
+            dropped = float(-neg.sum()) / max(float(evals[evals > tol].sum()), 1e-300)
+            if dropped > 1e-10:
+                raise ValueError(
+                    f"ISDFDF.loop: coul_kpt has {neg.size} negative eigenvalues "
+                    f"carrying {dropped:.3e} of the positive trace. A three-index DF "
+                    "factor is a square root and cannot represent them; the ERIs "
+                    "would be silently altered."
+                )
+        keep = evals > tol
+        W = evecs[:, keep] * np.sqrt(evals[keep])       # (n_ip, naux)
+        self._df_sqrt_cache = (X, W)
+        return self._df_sqrt_cache
+
+    def loop_cost(self):
+        """What :meth:`loop` would cost, without running it.
+
+        Exposed because the answer decides whether loop() is usable at all, and
+        the caller cannot infer it from the factors: the DF object is much
+        larger and much more expensive than the THC factors it is built from.
+        """
+        X, W = self._df_sqrt_factor()
+        n_ip, nao = X.shape
+        naux = int(W.shape[1])
+        nao_pair = nao * (nao + 1) // 2
+        return {
+            "naux": naux, "nao_pair": nao_pair, "n_ip": int(n_ip), "nao": int(nao),
+            # L = W^T M, contracting n_ip for each of naux x nao_pair entries.
+            "form_flops": 2.0 * naux * n_ip * nao_pair,
+            "stream_bytes": 8.0 * naux * nao_pair,
+        }
+
+    def loop(self, blksize=None):
+        """Stream metric-applied three-index DF blocks (PySCF ``with_df.loop``).
+
+        Yields C-contiguous ``(nrow, nao_pair)`` float64 arrays ``L`` with
+        ``(pq|rs) = sum_a L[a,pq] L[a,rs]``, the AO pair index packed as a lower
+        triangle -- the layout ``pyscf.ao2mo._ao2mo.nr_e2(..., aosym='s2')``
+        consumes. ``pytc.df.thc.extract_vv_df_factor`` requires this API, so
+        ``pytc.solver.isdf_xtc_ccsd`` reaches it through here too.
+
+        Gamma only, deliberately: away from Gamma the factors are complex and a
+        real DF factor does not exist, so a k-point implementation would have to
+        change the contract rather than extend it.
+
+        COST -- read before using this at production size. The THC form is
+        ``(pq|rs) = M^T V M`` with ``M[mu,pq] = X[mu,p] X[mu,q]``, so a DF factor
+        needs a symmetric square root ``V = W W^T`` and ``L = W^T M``. That costs
+        ``2 naux n_ip nao_pair`` to form and ``8 naux nao_pair`` bytes to stream,
+        with ``naux = n_ip = cIP nao``. Both grow far faster than the factors
+        themselves, which are only ``n_ip nao`` and ``n_ip^2``. This adapter is a
+        correctness bridge for small cells; :meth:`loop_cost` is provided so
+        callers can refuse it rather than discover the wall at runtime.
+        """
+        from pyscf import lib
+
+        X, W = self._df_sqrt_factor()
+        n_ip, nao = X.shape
+        naux = int(W.shape[1])
+        if blksize is None:
+            # Cap the (blk, nao, nao) intermediate rather than the output block.
+            blksize = max(1, min(naux, int(256e6 // max(8 * nao * nao, 1))))
+        blksize = int(blksize)
+        if blksize <= 0:
+            raise ValueError(f"blksize must be positive, got {blksize}.")
+
+        for a0 in range(0, naux, blksize):
+            a1 = min(a0 + blksize, naux)
+            # L[a,p,q] = sum_mu W[mu,a] X[mu,p] X[mu,q]
+            Lpq = np.einsum("ma,mp,mq->apq", W[:, a0:a1], X, X, optimize=True)
+            yield np.ascontiguousarray(lib.pack_tril(Lpq))
+
+    def get_naoaux(self):
+        """Number of retained auxiliary functions :meth:`loop` will yield."""
+        return int(self.loop_cost()["naux"])
 
     def get_jk(self, dm_kpts, hermi=1, kpts=None, kpts_band=None, with_j=True,
                with_k=True, omega=None, exxdiv=None):
