@@ -22,10 +22,9 @@ def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
     mem = psutil.virtual_memory()
     available_bytes = mem.available * 0.5  # Use 50% of available memory
     
-    # Calculate memory for main arrays
     def calc_mem_for_batch(batch_size):
-        u_grad_mem = N_grid * batch_size * 3 * bytes_per_elem  # u_grad_batch
-        tmp_mem = Nb2 * batch_size * bytes_per_elem            # tmp array
+        u_grad_mem = N_grid * batch_size * 3 * bytes_per_elem
+        tmp_mem = Nb2 * batch_size * bytes_per_elem
         return u_grad_mem + tmp_mem
     
     # Binary search for largest batch size that fits in memory
@@ -38,7 +37,6 @@ def _get_safe_batch_size(N_grid, Nb2, dtype=np.float64):
             right = mid - 1
     
     batch_size = max(1, min(left, 5000))  
-    #batch_size = max(1, left)
     logger.info(f"Selected batch_size: {batch_size} based on available memory: {mem.available / 1e9:.2f} GB")
     return batch_size
 
@@ -61,7 +59,6 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
         progress = i_end / N_grid * 100
         logging.info(f"K1 progress: {progress:.1f}% (points {i} to {i_end})")
         
-        # Get Jastrow gradients (prefetched or inline)
         if pending_grad is not None:
             u_grad_batch = await_read(pending_grad)
             pending_grad = None
@@ -69,14 +66,12 @@ def calc_K1(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
             u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
         
         tmp = np.zeros((rho_paired.shape[0], i_end - i))
-        # Loop over c (only 3 iterations)
         for c_idx in range(3):
-            # Slice A and B for current c
             A_slice = nabla_rho_paired[:, :, c_idx]  # Shape (i, n)
             B_slice = u_grad_batch[:, :, c_idx]      # Shape (n, k)
         
             # Compute (i, n) @ (n, k) = (i, k) with BLAS acceleration
-            tmp += np.dot((A_slice * weights[None, :]), B_slice)  # Scale A by weights, then matmul
+            tmp += np.dot((A_slice * weights[None, :]), B_slice)
 
         # Prefetch next batch's gradients while we do the final matmul
         next_i = i_end
@@ -105,13 +100,11 @@ def calc_K2(rho_paired, nabla_rho_paired, jastrow_factor, grid_points, weights, 
     """
     start_time = time.perf_counter()
     
-    # Get the transposed term
     Nb = int(np.sqrt(nabla_rho_paired.shape[0]))
     nabla_rho_reshaped = nabla_rho_paired.reshape(Nb, Nb, -1, 3)
     nabla_rho_transposed = nabla_rho_reshaped.transpose(1, 0, 2, 3)
     nabla_rho_transposed = nabla_rho_transposed.reshape(-1, nabla_rho_paired.shape[1], 3)
     
-    # Sum the two terms and compute K1 with combined gradient
     combined_nabla = nabla_rho_paired + nabla_rho_transposed
     result = -calc_K1(rho_paired, combined_nabla, jastrow_factor, grid_points, weights, batch_size)
     elapsed_time = time.perf_counter() - start_time
@@ -132,8 +125,6 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
     
     N_grid = len(grid_points)
     result = np.zeros((rho_paired.shape[0],) * 2)
-    # Process grid points in batches
-    # Automatically determine batch size if not provided
     if batch_size is None:
         batch_size = _get_safe_batch_size(N_grid, rho_paired.shape[0])
     
@@ -146,17 +137,14 @@ def calc_K3(rho_paired, jastrow_factor, grid_points, weights, batch_size=None):
         logging.info(f"K3 progress: {progress:.1f}% (points {i} to {i_end})")
         batch_points = grid_points[i:i_end]
         
-        # Get Jastrow gradients (prefetched or inline)
         if pending_grad is not None:
             u_grad_batch = await_read(pending_grad)
             pending_grad = None
         else:
             u_grad_batch = jastrow_factor.grad(batch_points, grid_points)
         
-        # Compute squared magnitude of gradient
         u_grad_squared = np.sum(u_grad_batch**2, axis=-1)  # (batch, N_grid)
         
-        # Weight both coordinates
         weighted_u_squared = u_grad_squared * weights[i:i_end, None] * weights[None, :]
 
         # Prefetch next batch's gradients while we do matmuls
@@ -201,20 +189,17 @@ def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
     result = np.zeros((Nb2, Nb2))
     weighted_xi_grad = xi_grad * weights[None,:,None]
     
-    # Process r2 points in batches
     pending_grad = None
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
         batch_size_i = i_end - i
         
-        # Get Jastrow gradients (prefetched or inline)
         if pending_grad is not None:
             u_grad_batch = await_read(pending_grad)
             pending_grad = None
         else:
             u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
         
-        # Process each spatial component
         G1_components = []
         for c in range(3):
             xi_slice = weighted_xi_grad[:,:,c]           # (n_fused, N_grid)
@@ -232,10 +217,8 @@ def calc_K1_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
         G1 = np.stack(G1_components, axis=-1)          # (n_fused, batch, 3)
         G1 = einsum('kmc,pkc->pm', G1, C_grad)         # (Nb^2, batch)
         
-        # Contract with xi_rho and weights for this batch
         G2 = einsum('pm,lm,m->pl', G1, xi_rho[:,i:i_end], weights[i:i_end])
         
-        # Accumulate result
         result += einsum('pl,ql->pq', G2, C_rho)
     
     elapsed_time = time.perf_counter() - start_time
@@ -266,7 +249,6 @@ def calc_K2_isdf(C_rho, xi_rho, C_grad, xi_grad, jastrow_factor, grid_points, we
     C_grad_transposed = C_grad_reshaped.transpose(1, 0, 2, 3).reshape(-1, C_grad.shape[1], 3)
     combined_C_grad = C_grad + C_grad_transposed
 
-    # Step 2: Reuse calc_K1_isdf with the combined gradient term
     result = -calc_K1_isdf(C_rho, xi_rho, combined_C_grad, xi_grad,
                           jastrow_factor, grid_points, weights, batch_size)
 
@@ -299,22 +281,18 @@ def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size
     
     result = np.zeros((Nb2, Nb2))
     
-    # Process r2 points in batches
     pending_grad = None
     for i in range(0, N_grid, batch_size):
         i_end = min(i + batch_size, N_grid)
         
-        # Get Jastrow gradients (prefetched or inline)
         if pending_grad is not None:
             u_grad_batch = await_read(pending_grad)
             pending_grad = None
         else:
             u_grad_batch = jastrow_factor.grad(grid_points, grid_points[i:i_end])  # (N_grid, batch, 3)
         
-        # Compute squared magnitude of gradient
         u_grad_squared = np.sum(u_grad_batch**2, axis=-1)  # (N_grid, batch)
         
-        # Weight both coordinates
         weighted_u_squared = u_grad_squared * weights[:, None] * weights[None, i:i_end]  # (N_grid, batch)
 
         # Prefetch next batch's gradients while we do einsums
@@ -324,10 +302,8 @@ def calc_K3_isdf(C_rho, xi_rho, jastrow_factor, grid_points, weights, batch_size
             pending_grad = async_read(
                 lambda _s=next_i, _e=next_end: jastrow_factor.grad(grid_points, grid_points[_s:_e]))
         
-        # Contract with xi_rho for this batch
         G1 = einsum('ki,ij,lj->kl', xi_rho, weighted_u_squared, xi_rho[:,i:i_end])
         
-        # Accumulate result
         result += einsum('kl,pk,ql->pq', G1, C_rho, C_rho)
     
     elapsed_time = time.perf_counter() - start_time

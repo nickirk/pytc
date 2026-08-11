@@ -13,7 +13,6 @@ from pytc.integrals.xtc import XTC as XTC_jax
 from pytc.jastrow import REXP as REXP_jax
 from pytc import tc_helper
 
-# Enable float64 support
 jax.config.update("jax_enable_x64", True)
 
 def get_be_ccpvdz():
@@ -29,17 +28,14 @@ class TestXTC(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up test case using Be atom."""
-        # Get mean-field data
         _, cls.mf = get_be_ccpvdz()
         
-        # Create simple Jastrow factors for both implementations
         cls.params_jax = {'alpha': jnp.array([1.0])}
         cls.params_numpy = np.array([1.0])
         
-        cls.jastrow_jax = REXP_jax()  # Remove params from constructor
-        cls.jastrow_numpy = REXP_np(cls.params_numpy)  # Keep numpy version unchanged
+        cls.jastrow_jax = REXP_jax()
+        cls.jastrow_numpy = REXP_np(cls.params_numpy)
         
-        # Initialize XTC calculators with low grid level for testing
         cls.xtc_jax = XTC_jax.from_pyscf(cls.mf, cls.jastrow_jax, grid_lvl=2)
         cls.xtc_numpy = XTC_numpy(cls.mf, cls.jastrow_numpy, grid_lvl=2)
         
@@ -69,11 +65,10 @@ class TestXTC(unittest.TestCase):
 
     def test_delta_U(self):
         """Test delta_U calculation."""
-        # First test delta_U matrices
         dm1_jax = self.xtc_jax._get_mf_dm()
         # dm1_numpy = self.xtc_numpy._get_mf_dm() # Not needed if we trust JAX dm1
         
-        delta_U_jax = self.xtc_jax.get_delta_U(self.params_jax, dm1_jax)  # Add params
+        delta_U_jax = self.xtc_jax.get_delta_U(self.params_jax, dm1_jax)
         delta_U_numpy = self.xtc_numpy.get_delta_U()
         
         np.testing.assert_allclose(
@@ -82,14 +77,12 @@ class TestXTC(unittest.TestCase):
             rtol=1e-6, atol=1e-6
         )
         
-        # Test symmetry property
         np.testing.assert_allclose(
             np.asarray(delta_U_jax),
             np.asarray(delta_U_jax.transpose(2,3,0,1)),
             rtol=1e-7, atol=1e-7
         )
         
-        # Test gradient calculations with defined points
         test_r1 = np.array([[0.0, 0.0, 0.0]])
         test_r2 = np.array([[0.0, 0.0, 1.0]])
         
@@ -105,7 +98,7 @@ class TestXTC(unittest.TestCase):
 
     def test_delta_h(self):
         """Test delta_h calculation."""
-        delta_h_jax = self.xtc_jax.get_delta_h(self.params_jax)  # Add params
+        delta_h_jax = self.xtc_jax.get_delta_h(self.params_jax)
         delta_h_numpy = self.xtc_numpy._calc_delta_h()
         
         np.testing.assert_allclose(
@@ -114,7 +107,6 @@ class TestXTC(unittest.TestCase):
             rtol=1e-5, atol=1e-5
         )
         
-        # Test hermiticity
         np.testing.assert_allclose(
             np.asarray(delta_h_jax),
             np.asarray(delta_h_jax.T.conj()),
@@ -126,10 +118,8 @@ class TestXTC(unittest.TestCase):
         # JAX returns only delta_h
         delta_h_jax = self.xtc_jax.get_1b(self.params_jax)
         
-        # Get standard h1e
         h1e_std = tc_helper.get_hcore(self.mf)
         
-        # Combine
         h1e_jax = h1e_std + delta_h_jax
         
         # Numpy returns full h1e
@@ -146,10 +136,8 @@ class TestXTC(unittest.TestCase):
         # JAX returns correction + delta_U
         correction_jax = self.xtc_jax.get_2b(self.params_jax)
         
-        # Get standard ERI
         eri_std = tc_helper.get_eri(self.mf)
         
-        # Combine
         v2e_jax = eri_std + correction_jax
         
         # Numpy returns full effective ERI
@@ -187,7 +175,7 @@ class TestXTC(unittest.TestCase):
 
         myrcc = rccsd.RCCSD(self.mf)
         #myrcc.verbose = 5
-        eris = self.xtc_jax.make_eris(self.mf, self.params_jax)  # Pass mf and params
+        eris = self.xtc_jax.make_eris(self.mf, self.params_jax)
         tc_e_corr, t1, t2 = myrcc.kernel(eris=eris)
         t = myrcc.amplitudes_to_vector(t1, t2)
         print("|t2| = ", np.linalg.norm(t2))
@@ -208,10 +196,8 @@ class TestXTC(unittest.TestCase):
         else:
              self.fail(f"Correlation energy {tc_e_corr} does not match expected custom ({expected_custom}) or standard ({expected_standard}) values.")
 
-        # get the hf energy using fock and eris
         no = myrcc.nocc
         
-        # Reconstruct full h1e for checking
         tc_h1e_corr = self.xtc_jax.get_1b(self.params_jax)
         h1e_std = tc_helper.get_hcore(self.mf, self.xtc_jax.mo_coeff)
         tc_h1e = h1e_std + tc_h1e_corr

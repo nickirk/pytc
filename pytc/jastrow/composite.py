@@ -94,7 +94,6 @@ class CompositeJastrow(Jastrow):
         with h5py.File(filename, 'w') as f:
             f.attrs['num_jastrows'] = len(self.jastrows)
             
-            # Save each jastrow's parameters while preserving dict structure
             for i, param_dict in enumerate(params):
                 group = f.create_group(f'jastrow_{i}')
                 for key, value in param_dict.items():
@@ -106,7 +105,7 @@ class CompositeJastrow(Jastrow):
                         nested_group.attrs['num_leaves'] = len(leaves)
                         for j, leaf in enumerate(leaves):
                             nested_group.create_dataset(f'leaf_{j}', data=np.asarray(leaf))
-                    else:  # Direct parameters like rc_raw
+                    else:
                         group.create_dataset(key, data=np.asarray(value))
 
     def read_params(self, filename='jastrow_params.hdf5'):
@@ -126,7 +125,6 @@ class CompositeJastrow(Jastrow):
                 group = f[f'jastrow_{i}']
                 param_dict = {}
                 
-                # Load each parameter from the group
                 for key in group.keys():
                     if isinstance(group[key], h5py.Group):  # Nested structure (e.g., net_vars)
                         nested_group = group[key]
@@ -135,7 +133,7 @@ class CompositeJastrow(Jastrow):
                         for j in range(nested_group.attrs['num_leaves']):
                             leaves.append(jnp.array(nested_group[f'leaf_{j}'][()]))
                         param_dict[key] = tree_util.tree_unflatten(treedef, leaves)
-                    else:  # Direct parameter
+                    else:
                         param_dict[key] = jnp.array(group[key][()])
                 
                 loaded_params.append(param_dict)

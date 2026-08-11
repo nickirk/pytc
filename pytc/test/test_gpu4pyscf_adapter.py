@@ -23,9 +23,10 @@ from pytc.integrals.coulomb import (
 
 
 def _benzene_geom(cc=1.397, ch=1.084):
-    """D6h benzene geometry (Angstrom), same formula as
-    pytc/utils/perf_baseline.py's _benzene_geom -- kept small (STO-3G)
-    here purely for test speed, not physical accuracy."""
+    """D6h benzene geometry (Angstrom). The formula was shared with
+    pytc/utils/perf_baseline.py, deleted upstream in e8c3374; this is now the
+    only copy. Kept small (STO-3G) purely for test speed, not physical
+    accuracy."""
     atoms = []
     rh = cc + ch
     for i in range(6):

@@ -67,7 +67,6 @@ def read(filename):
         keys = {'norb': None, 'nelec': None, 'ms2': None}
         for k in keys:
             keys[k] = [int(l.split(k)[1].split('=')[1].split(',')[0]) for l in lines if k in l][0]
-        # print(keys)
         n_sites = keys['norb']
         n_elec = keys['nelec']
         spin = keys['ms2']
@@ -80,7 +79,6 @@ def read(filename):
             a, i, j, k, l = l.split()
             i, j, k, l = [int(x) - 1 for x in [i, j, k, l]]
             
-            #print(a)
         
             if i + j + k + l == -4:
                 ecore += float(a)
@@ -88,7 +86,6 @@ def read(filename):
             elif k + l ==  -2:
                 h1e[i, j] = float(a)
                 h1e[j, i] = float(a)
-            # print(h1e[i,j],h1e[j,i])
 
             else:
                 g2e[i, j, k, l] = float(a)

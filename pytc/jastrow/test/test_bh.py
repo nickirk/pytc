@@ -10,7 +10,6 @@ from pyscf import gto
 from pytc.jastrow.bh import BoysHandy, BHTerm
 from pytc.legacy.jastrow.sm7 import SM7
 
-# Enable float64 support
 jax.config.update("jax_enable_x64", True)
 
 def get_h2_molecule(bond_length=1.4):
@@ -55,17 +54,12 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         
     def _setup_atom_comparison(self, atom_symbol):
         """Set up BH and SM7 for a given atom."""
-        # Create molecule with atom at origin
         mol = get_atom_molecule(atom_symbol)
         
-        # Get SM7 coefficients and convert to BH terms
         bh_terms = sm7_coeffs_to_bh_terms(atom_symbol)
         
-        # Create BH Jastrow with single nucleus, so terms_per_nucleus is a list with one element
-        # (It naturally has no cutoffs now as we removed them)
         bh = BoysHandy.create(mol, terms_per_nucleus=[bh_terms])
         
-        # Initialize parameters
         bh_params = bh.init_params(key=self.key)
         
         # SM7 uses fixed scaling with b=1.0 and d=1.0
@@ -76,7 +70,6 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         bh_params['b_raw'] = jnp.ones_like(bh_params['b_raw']) * raw_val
         bh_params['d_raw'] = jnp.ones_like(bh_params['d_raw']) * raw_val
         
-        # Create SM7 Jastrow
         sm7 = SM7(atom=atom_symbol)
         
         return bh, bh_params, sm7
@@ -85,20 +78,16 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test He atom: compare BH and SM7 function values."""
         bh, bh_params, sm7 = self._setup_atom_comparison('He')
         
-        # Generate random electron positions
         key1, key2 = random.split(self.key)
         r1 = random.normal(key1, (3,)) * 2.0  # Scale to ~[-2, 2] bohr
         r2 = random.normal(key2, (3,)) * 2.0
         
-        # Compute BH value
         bh_value = bh._compute(r1, r2, bh_params)
         
-        # Compute SM7 value
         # SM7 expects numpy arrays; handle both scalar and array outputs
         sm7_output = sm7(np.array(r1), np.array(r2))
         sm7_value = float(np.atleast_1d(sm7_output).flat[0])
         
-        # Compare values
         np.testing.assert_allclose(
             float(bh_value), sm7_value, rtol=1e-5, atol=1e-8,
             err_msg=f"BH vs SM7 mismatch for He at r1={r1}, r2={r2}"
@@ -108,19 +97,15 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test Be atom: compare BH and SM7 function values."""
         bh, bh_params, sm7 = self._setup_atom_comparison('Be')
         
-        # Generate random electron positions
         key1, key2 = random.split(self.key)
         r1 = random.normal(key1, (3,)) * 2.0
         r2 = random.normal(key2, (3,)) * 2.0
         
-        # Compute BH value
         bh_value = bh._compute(r1, r2, bh_params)
         
-        # Compute SM7 value
         sm7_output = sm7(np.array(r1), np.array(r2))
         sm7_value = float(np.atleast_1d(sm7_output).flat[0])
         
-        # Compare values
         np.testing.assert_allclose(
             float(bh_value), sm7_value, rtol=1e-5, atol=1e-8,
             err_msg=f"BH vs SM7 mismatch for Be at r1={r1}, r2={r2}"
@@ -130,7 +115,6 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test He atom with multiple random positions."""
         bh, bh_params, sm7 = self._setup_atom_comparison('He')
         
-        # Test multiple random point pairs
         n_tests = 10
         for i in range(n_tests):
             key_i = random.fold_in(self.key, i)
@@ -151,7 +135,6 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test Be atom with multiple random positions."""
         bh, bh_params, sm7 = self._setup_atom_comparison('Be')
         
-        # Test multiple random point pairs
         n_tests = 10
         for i in range(n_tests):
             key_i = random.fold_in(self.key, i)
@@ -172,20 +155,16 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test He atom: compare gradients with respect to r1."""
         bh, bh_params, sm7 = self._setup_atom_comparison('He')
         
-        # Generate random electron positions
         key1, key2 = random.split(self.key)
         r1 = random.normal(key1, (3,)) * 2.0
         r2 = random.normal(key2, (3,)) * 2.0
         
-        # Compute BH gradient using JAX autodiff on _compute
         bh_grad_fn = jax.grad(lambda r: bh._compute(r, r2, bh_params))
         bh_grad = bh_grad_fn(r1)
         
-        # Compute SM7 gradient
         # SM7.grad returns shape (1, 1, 3) for single points
         sm7_grad = sm7.grad(np.array(r1), np.array(r2))[0, 0, :]
         
-        # Compare gradients
         np.testing.assert_allclose(
             np.array(bh_grad), sm7_grad, rtol=1e-4, atol=1e-7,
             err_msg=f"BH vs SM7 gradient mismatch for He at r1={r1}, r2={r2}"
@@ -195,19 +174,15 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test Be atom: compare gradients with respect to r1."""
         bh, bh_params, sm7 = self._setup_atom_comparison('Be')
         
-        # Generate random electron positions
         key1, key2 = random.split(self.key)
         r1 = random.normal(key1, (3,)) * 2.0
         r2 = random.normal(key2, (3,)) * 2.0
         
-        # Compute BH gradient using JAX autodiff
         bh_grad_fn = jax.grad(lambda r: bh._compute(r, r2, bh_params))
         bh_grad = bh_grad_fn(r1)
         
-        # Compute SM7 gradient
         sm7_grad = sm7.grad(np.array(r1), np.array(r2))[0, 0, :]
         
-        # Compare gradients
         np.testing.assert_allclose(
             np.array(bh_grad), sm7_grad, rtol=1e-4, atol=1e-7,
             err_msg=f"BH vs SM7 gradient mismatch for Be at r1={r1}, r2={r2}"
@@ -217,7 +192,6 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test He atom gradients with multiple random positions."""
         bh, bh_params, sm7 = self._setup_atom_comparison('He')
         
-        # Test multiple random point pairs
         n_tests = 10
         for i in range(n_tests):
             key_i = random.fold_in(self.key, i)
@@ -238,7 +212,6 @@ class TestBoysHandyVsSM7(unittest.TestCase):
         """Test Be atom gradients with multiple random positions."""
         bh, bh_params, sm7 = self._setup_atom_comparison('Be')
         
-        # Test multiple random point pairs
         n_tests = 10
         for i in range(n_tests):
             key_i = random.fold_in(self.key, i)
@@ -264,7 +237,6 @@ class TestBoysHandy(unittest.TestCase):
         self.mol = get_h2_molecule()
         self.key = random.PRNGKey(0)
         
-        # Create Boys-Handy Jastrow with custom terms
         # Use negative coefficients for e-n terms for expected decay behavior
         # Now terms_per_nucleus should be per atom TYPE, not per atom
         # H2 has only 1 atom type (H), so only 1 list of terms
@@ -278,19 +250,15 @@ class TestBoysHandy(unittest.TestCase):
 
     def test_init(self):
         """Test initialization."""
-        # Test default initialization
         jastrow = BoysHandy.create(self.mol, epsilon=1e-16)
         params = jastrow.init_params()
         
-        # Check parameter structure
         self.assertIn('b_raw', params)
         self.assertIn('d_raw', params)
         self.assertIn('c_raw', params)
         
-        # Check shapes - H2 has 2 atoms but only 1 atom type (H)
         self.assertEqual(params['b_raw'].shape, (1,))  # 1 atom type
         self.assertEqual(params['d_raw'].shape, (1,))  # 1 atom type
-        # Default has 17 terms per atom type
         self.assertEqual(params['c_raw'].shape[0], 1)  # 1 atom type
         self.assertEqual(params['c_raw'].shape[1], 17)  # 17 default terms
 
@@ -299,7 +267,6 @@ class TestBoysHandy(unittest.TestCase):
         flat_params = self.jastrow.flatten_params(self.params)
         restored_params = self.jastrow.unflatten_params(flat_params)
         
-        # Check that parameters are correctly restored
         for key in self.params:
             np.testing.assert_allclose(self.params[key], restored_params[key])
 
@@ -372,7 +339,6 @@ class TestBoysHandy(unittest.TestCase):
         # depending on the interplay of e-n and e-e terms.
         # The key physical requirement is that the function remains finite
         # and well-behaved at all distances.
-        # Let's just check that both values are finite
         self.assertTrue(jnp.isfinite(value_near), "Value at near distance should be finite")
         self.assertTrue(jnp.isfinite(value_far), "Value at far distance should be finite")
 
@@ -384,13 +350,11 @@ class TestBoysHandy(unittest.TestCase):
         grad1, lap1 = self.jastrow.get_log_grads_r1(r1, r2, self.params)
         grad2, lap2 = self.jastrow.get_log_grads_r2(r1, r2, self.params)
         
-        # Check shapes
         self.assertEqual(grad1.shape, (3,))
         self.assertEqual(grad2.shape, (3,))
         self.assertEqual(lap1.shape, ())
         self.assertEqual(lap2.shape, ())
         
-        # Check finite values
         self.assertTrue(jnp.all(jnp.isfinite(grad1)))
         self.assertTrue(jnp.all(jnp.isfinite(grad2)))
         self.assertTrue(jnp.isfinite(lap1))

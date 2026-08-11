@@ -2,7 +2,7 @@
 
 import unittest
 import numpy as np
-from pytc.legacy.jastrow import Jastrow, SM7  # Add SM7 to imports
+from pytc.legacy.jastrow import Jastrow, SM7
 
 
 class SimpleTestJastrow(Jastrow):
@@ -16,7 +16,6 @@ class SimpleTestJastrow(Jastrow):
         delta_r = r1[:, np.newaxis, :] - r2[np.newaxis, :, :]
         result = np.exp(-self.params[0] * np.linalg.norm(delta_r, axis=-1))
         
-        # Handle single point inputs
         if r1.shape[0] == 1 and r2.shape[0] == 1:
             result = result.reshape(1, 1)
             
@@ -31,7 +30,6 @@ class SimpleTestJastrow(Jastrow):
         norm = np.linalg.norm(diff, axis=-1, keepdims=True)
         norm = np.where(norm == 0, 1.0, norm)
         
-        # Note: Use the reshaped call result for proper broadcasting
         jastrow_values = self.__call__(r1, r2)[..., np.newaxis]
         return -self.params[0] * diff / norm * jastrow_values
 
@@ -70,7 +68,6 @@ class TestJastrow(unittest.TestCase):
         n_points = len(self.grid_points)
         self.assertEqual(gradients.shape, (n_points, n_points, 3))
 
-        # Test with different r1, r2
         r1 = np.random.rand(5, 3)
         r2 = np.random.rand(7, 3)
         gradients = self.jastrow.grad(r1, r2)
@@ -107,15 +104,11 @@ class TestJastrow(unittest.TestCase):
             for d in range(3):
                 h = np.zeros(3)
                 h[d] = eps
-                # Forward difference at point1 (keeping point2 fixed)
                 f_forward = self.jastrow(point1[np.newaxis, :] + h, point2[np.newaxis, :])[0, 0]
-                # Backward difference at point1 (keeping point2 fixed)
                 f_backward = self.jastrow(point1[np.newaxis, :] - h, point2[np.newaxis, :])[0, 0]
-                # Central difference
                 grad[d] = (f_forward - f_backward) / (2 * eps)
             return grad
         
-        # Use first 3 points from self.grid_points for numerical stability
         test_points = self.grid_points[:3]
         
         n_points = len(test_points)
@@ -136,7 +129,6 @@ class TestJastrow(unittest.TestCase):
     
     def test_cusp_condition(self):
         """Test if Jastrow factor satisfies cusp condition as r→0 (but r≠0)."""
-        # Test with displacements in various directions
         eps_values = [1e-5, 1e-6, 1e-7, 1e-8]
         directions = [
             [1.0, 0.0, 0.0],  # x-axis
@@ -154,7 +146,7 @@ class TestJastrow(unittest.TestCase):
                     eps * direction
                 ])
                 gradients = self.jastrow.grad(points)  # Shape: (N_grid, N_grid, 3)
-                grad_norm = np.linalg.norm(gradients[0, 1])  # Use first-to-second point gradient
+                grad_norm = np.linalg.norm(gradients[0, 1])
                 self.assertAlmostEqual(
                     grad_norm, 
                     self.jastrow.params[0], places=5, 
@@ -162,19 +154,16 @@ class TestJastrow(unittest.TestCase):
 
     def test_flexible_input(self):
         """Test if Jastrow accepts different input shapes."""
-        # Single point inputs
         point1 = np.array([1.0, 0.0, 0.0])
         point2 = np.array([0.0, 1.0, 0.0])
         value = self.jastrow(point1, point2)
         self.assertEqual(value.shape, (1, 1))
 
-        # Batch of points
         batch1 = np.random.rand(5, 3)
         batch2 = np.random.rand(7, 3)
         value = self.jastrow(batch1, batch2)
         self.assertEqual(value.shape, (5, 7))
 
-        # With atomic positions
         atoms = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
         value = self.jastrow(batch1, batch2, atoms)
         self.assertEqual(value.shape, (5, 7))
@@ -187,10 +176,8 @@ class TestSM7(unittest.TestCase):
         """Set up test cases."""
         from pytc.legacy.jastrow import SM7
         
-        # Create SM7 instance with He atom
         cls.jastrow = SM7(atom='He')
         
-        # Set up test grid points
         cls.grid_points = np.array([
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -232,8 +219,7 @@ class TestSM7(unittest.TestCase):
                 grad[d] = (f_forward - f_backward) / (2 * eps)
             return grad
         
-        # Test with a few points
-        test_points = self.grid_points[:2]  # Use first two points
+        test_points = self.grid_points[:2]
         
         numerical = numerical_gradient(test_points[0], test_points[1])
         analytical = self.jastrow.grad(test_points[0:1], test_points[1:2])[0, 0]
@@ -244,7 +230,7 @@ class TestSM7Specific(unittest.TestCase):
     
     def setUp(self):
         """Set up test case."""
-        self.jastrow = SM7(atom='He')  # Now SM7 is properly imported
+        self.jastrow = SM7(atom='He')
         self.test_points = np.array([
             [0.0, 0.0, 0.0],  # nucleus
             [0.01, 0.0, 0.0],  # near nucleus
@@ -254,7 +240,6 @@ class TestSM7Specific(unittest.TestCase):
     
     def test_electron_electron_scaling(self):
         """Test electron-electron correlation scaling."""
-        # Test points at different separations
         r1 = np.array([[0.0, 0.0, 0.0]])
         r2_points = np.array([
             [2.0, 0.0, 0.0],
@@ -268,8 +253,6 @@ class TestSM7Specific(unittest.TestCase):
             val = self.jastrow(r1, r2[None,:])[0,0]
             values.append(val)
         
-        # Beyond the short-range maximum, the pair term decays with
-        # electron-electron separation.
         values = np.array(values)
         self.assertTrue(np.all(np.diff(values) < 0))
     
@@ -279,7 +262,6 @@ class TestSM7Specific(unittest.TestCase):
         For same-spin electrons: ∂f/∂r12|_{r12=0} = 1/4
         For opposite-spin electrons: ∂f/∂r12|_{r12=0} = 1/2
         """
-        # Test points very close to each other
         eps_values = [1e-5, 1e-6, 1e-7]
         directions = [
             [1.0, 0.0, 0.0],
@@ -288,7 +270,6 @@ class TestSM7Specific(unittest.TestCase):
             [1.0, 1.0, 1.0]/np.sqrt(3)
         ]
         
-        # Expected cusp value for opposite spin electrons
         expected_cusp = 0.5
         
         for eps in eps_values:
@@ -297,11 +278,9 @@ class TestSM7Specific(unittest.TestCase):
                 r1 = np.array([[0.0, 0.0, 0.0]])
                 r2 = eps * direction[None,:]
                 
-                # Calculate gradient
                 grad = self.jastrow.grad(r1, r2)[0,0]
                 grad_norm = np.linalg.norm(grad)
                 
-                # Check if gradient norm matches cusp condition
                 self.assertAlmostEqual(
                     grad_norm, 
                     expected_cusp, 
@@ -309,9 +288,6 @@ class TestSM7Specific(unittest.TestCase):
                     msg=f"Electron-electron cusp condition failed for eps={eps}, direction={direction}"
                 )
                 
-                # Check if gradient points in the right direction
-                # This is the gradient with respect to r1, while r2 is
-                # displaced along ``direction`` from r1.
                 expected_direction = -direction
                 calculated_direction = grad / grad_norm
                 np.testing.assert_array_almost_equal(

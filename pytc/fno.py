@@ -80,7 +80,7 @@ def make_fno_mo_coeff(mf, *, n_keep=None, occ_threshold=None):
             semicanonical basis — useful as the ``n_keep → all-virtuals``
             limit for validation).
         occ_threshold: retain every virtual whose MP2 natural-orbital
-            occupation is ``>= occ_threshold`` (ke-liao's threshold scan).
+            occupation is ``>= occ_threshold``.
             Takes precedence over ``n_keep`` when set.
 
     Returns:

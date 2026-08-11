@@ -56,7 +56,6 @@ def make_test_system(atom_spec, basis='sto-3g', n_walkers=50, key=None):
     
     walkers = initialize_walkers(det, n_walkers, key=key)
     
-    # Warm up walkers with a vmap ansatz call to populate fields
     batch_ansatz = jax.vmap(lambda w, p: sj(w, p), in_axes=(0, None))
     _, walkers = batch_ansatz(walkers, params)
     
@@ -91,7 +90,6 @@ class TestNewtonMergedGradient(unittest.TestCase):
         params = self.params
         walkers = self.walkers
         
-        # ===== Original method: separate loss+grad and Jacobian =====
         loss_fn = make_variance_loss(ansatz=ansatz, optimizer_type="newton", 
                                       use_custom_jvp=True, max_vmap_batch_size=0)
         loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
@@ -99,7 +97,6 @@ class TestNewtonMergedGradient(unittest.TestCase):
         batch = (walkers, ansatz)
         (loss_orig, aux_orig), grads_orig = loss_fn_jvp(params, batch)
         
-        # Original Jacobian computation
         def single_local_energy_grad_orig(w, p):
             return jax.grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
         jac_orig = jax.vmap(single_local_energy_grad_orig, in_axes=(0, None))(walkers, params)
@@ -112,7 +109,6 @@ class TestNewtonMergedGradient(unittest.TestCase):
         curvature_orig = (2.0 / n_walkers) * (jac_centered_orig.T @ jac_centered_orig)
         grads_vec_orig, unravel_fn = jax.flatten_util.ravel_pytree(grads_orig)
         
-        # ===== Merged method: single pass =====
         def single_local_energy_and_grad(w, p):
             return jax.value_and_grad(lambda pp: ansatz.local_energy(w, pp)[0])(p)
         
@@ -125,28 +121,21 @@ class TestNewtonMergedGradient(unittest.TestCase):
             [jnp.reshape(leaf, (n_walkers, -1)) for leaf in jac_flat_merged], axis=1
         )
         
-        # Derive loss
         e_mean = jnp.mean(energies_merged)
         energy_diff = energies_merged - e_mean
         loss_merged = jnp.sum(energy_diff**2) / (n_walkers - 1)
         
-        # Derive gradient
         grads_vec_merged = (2.0 / (n_walkers - 1)) * (jac_mat_merged.T @ energy_diff)
         
-        # Derive curvature
         jac_centered_merged = jac_mat_merged - jnp.mean(jac_mat_merged, axis=0, keepdims=True)
         curvature_merged = (2.0 / n_walkers) * (jac_centered_merged.T @ jac_centered_merged)
         
-        # ===== Verify all match =====
-        # Loss should match exactly
         np.testing.assert_allclose(float(loss_merged), float(loss_orig), rtol=1e-10,
                                    err_msg="Merged loss doesn't match original loss")
         
-        # Jacobian should be identical (same computation)
         np.testing.assert_allclose(jac_mat_merged, jac_mat_orig, rtol=1e-10,
                                    err_msg="Jacobians don't match")
         
-        # Curvature should match exactly
         np.testing.assert_allclose(curvature_merged, curvature_orig, rtol=1e-10,
                                    err_msg="Curvature matrices don't match")
         
@@ -185,13 +174,11 @@ class TestNewtonMergedGradient(unittest.TestCase):
             params=params, state=opt_state, rng=key, batch=batch, global_step_int=0
         )
         
-        # Verify outputs are reasonable
         loss_val = float(stats['loss'])
         e_mean, e_std = stats['aux']
         self.assertTrue(jnp.isfinite(jnp.array(loss_val)), "Loss should be finite")
         self.assertTrue(jnp.isfinite(e_mean), "Mean energy should be finite")
         
-        # Check that parameters actually changed
         params_flat_old, _ = jax.flatten_util.ravel_pytree(params)
         params_flat_new, _ = jax.flatten_util.ravel_pytree(new_params)
         self.assertFalse(jnp.allclose(params_flat_old, params_flat_new),
@@ -398,7 +385,6 @@ class TestPsiCaching(unittest.TestCase):
         
         psi_sign, psi_logabs = psi_values
         
-        # Cached values should match returned values
         np.testing.assert_allclose(updated_walkers.log_psi, psi_logabs, rtol=1e-14)
         np.testing.assert_allclose(updated_walkers.psi_sign, psi_sign, rtol=1e-14)
         
@@ -417,7 +403,6 @@ class TestPsiCaching(unittest.TestCase):
         
         det_sign, det_logabs = det_values
         
-        # Cached values should match determinant values
         np.testing.assert_allclose(updated_walkers.log_psi, det_logabs, rtol=1e-14)
         np.testing.assert_allclose(updated_walkers.psi_sign, det_sign, rtol=1e-14)
         print(f"✓ Det cache populated correctly. log|det| range: [{float(det_logabs.min()):.4f}, {float(det_logabs.max()):.4f}]")
@@ -433,11 +418,9 @@ class TestPsiCaching(unittest.TestCase):
         walkers = self.walkers
         params = self.params
         
-        # Warm up walkers to populate cache
         batch_det = jax.vmap(lambda w, p: det(w, p), in_axes=(0, None))
         _, walkers = batch_det(walkers, None)
         
-        # Run several MCMC steps
         key = random.PRNGKey(123)
         acceptance_rates = []
         for _ in range(20):
@@ -449,11 +432,9 @@ class TestPsiCaching(unittest.TestCase):
         
         mean_acceptance = np.mean(acceptance_rates)
         
-        # Acceptance should be reasonable (not 0 or 1)
         self.assertGreater(mean_acceptance, 0.05, "Acceptance rate too low — cache may be broken")
         self.assertLess(mean_acceptance, 0.95, "Acceptance rate too high — cache may be broken")
         
-        # Verify cache is still consistent after MCMC
         det_values, walkers_check = batch_det(walkers, None)
         det_sign, det_logabs = det_values
         
@@ -486,21 +467,16 @@ class TestShermanMorrison(unittest.TestCase):
         det = self.det_h2
         walkers = self.walkers_h2
         
-        # Work with a single walker (unbatched)
         w0 = jax.tree.map(lambda x: x[0], walkers)
         
-        # Move electron 0 by a small displacement
         new_pos = w0.positions.at[0].set(w0.positions[0] + jnp.array([0.1, -0.2, 0.05]))
         w0_moved = w0.replace(positions=new_pos)
         
-        # ---- Rank-1 update ----
         total_ratio, det_logabs_r1, det_sign_r1, w0_updated = \
             rank1_update_one_electron(det, w0_moved, 0)
         
-        # ---- Full recomputation ----
         (det_sign_full, det_logabs_full), w0_full = eval_det_value_and_grad(det, w0_moved)
         
-        # Compare det ratio
         # From full: ratio = exp(logabs_full - logabs_old) * (sign_full / sign_old)
         sign_old, logabs_old = w0.det_up
         sign_old_dn, logabs_old_dn = w0.det_down
@@ -512,7 +488,6 @@ class TestShermanMorrison(unittest.TestCase):
         np.testing.assert_allclose(float(total_ratio), float(full_ratio), rtol=1e-10,
                                    err_msg="Rank-1 det ratio doesn't match full recomputation")
         
-        # Compare log|det| and sign
         np.testing.assert_allclose(float(det_logabs_r1), float(det_logabs_full), rtol=1e-10,
                                    err_msg="Rank-1 log|det| doesn't match full recomputation")
         np.testing.assert_allclose(float(det_sign_r1), float(det_sign_full), rtol=1e-10,
@@ -527,17 +502,13 @@ class TestShermanMorrison(unittest.TestCase):
         
         w0 = jax.tree.map(lambda x: x[0], walkers)
         
-        # Move electron 0
         new_pos = w0.positions.at[0].set(w0.positions[0] + jnp.array([0.3, -0.1, 0.2]))
         w0_moved = w0.replace(positions=new_pos)
         
-        # Rank-1 update
         _, _, _, w0_r1 = rank1_update_one_electron(det, w0_moved, 0)
         
-        # Full recomputation
         _, w0_full = eval_det_value_and_grad(det, w0_moved)
         
-        # Compare inverse matrices
         np.testing.assert_allclose(w0_r1.inv_up, w0_full.inv_up, rtol=1e-8, atol=1e-12,
                                    err_msg="Rank-1 inv_up doesn't match full inv")
         np.testing.assert_allclose(w0_r1.inv_down, w0_full.inv_down, rtol=1e-8, atol=1e-12,
@@ -558,25 +529,20 @@ class TestShermanMorrison(unittest.TestCase):
         new_pos = w0.positions.at[elec_idx].set(w0.positions[elec_idx] + jnp.array([-0.15, 0.3, 0.1]))
         w0_moved = w0.replace(positions=new_pos)
         
-        # Rank-1 update
         _, _, _, w0_r1 = rank1_update_one_electron(det, w0_moved, elec_idx)
         
-        # Full recomputation
         _, w0_full = eval_det_value_and_grad(det, w0_moved)
         
-        # Compare Slater matrices
         np.testing.assert_allclose(w0_r1.slater_up, w0_full.slater_up, rtol=1e-10,
                                    err_msg="Slater up doesn't match")
         np.testing.assert_allclose(w0_r1.slater_down, w0_full.slater_down, rtol=1e-10,
                                    err_msg="Slater down doesn't match")
         
-        # Compare gradients
         np.testing.assert_allclose(w0_r1.grad_up, w0_full.grad_up, rtol=1e-8, atol=1e-12,
                                    err_msg="Grad up doesn't match")
         np.testing.assert_allclose(w0_r1.grad_down, w0_full.grad_down, rtol=1e-8, atol=1e-12,
                                    err_msg="Grad down doesn't match")
         
-        # Compare laplacians
         np.testing.assert_allclose(w0_r1.lap_up, w0_full.lap_up, rtol=1e-8, atol=1e-12,
                                    err_msg="Lap up doesn't match")
         np.testing.assert_allclose(w0_r1.lap_down, w0_full.lap_down, rtol=1e-8, atol=1e-12,
@@ -593,16 +559,13 @@ class TestShermanMorrison(unittest.TestCase):
         
         w0 = jax.tree.map(lambda x: x[0], walkers)
         
-        # Move electron 0
         elec_idx = 0
         new_pos = w0.positions.at[elec_idx].set(w0.positions[elec_idx] + jnp.array([0.2, -0.1, 0.15]))
         
-        # Partial update
         new_log_j_partial = update_jastrow_one_electron(
             sj, w0.positions, new_pos, elec_idx, jastrow_params, w0.log_jastrow
         )
         
-        # Full recomputation
         new_log_j_full = compute_jastrow_log_value(sj, new_pos, jastrow_params)
         
         np.testing.assert_allclose(float(new_log_j_partial), float(new_log_j_full), rtol=1e-10,
@@ -616,11 +579,9 @@ class TestShermanMorrison(unittest.TestCase):
         walkers = self.walkers_h2
         params = self.params_h2
         
-        # Warm up with full det evaluation to populate cache
         batch_det = jax.vmap(lambda w, p: det(w, p), in_axes=(0, None))
         _, walkers = batch_det(walkers, None)
         
-        # Run MCMC steps
         key = random.PRNGKey(999)
         acceptance_rates = []
         for _ in range(30):
@@ -632,7 +593,6 @@ class TestShermanMorrison(unittest.TestCase):
         
         mean_acc = np.mean(acceptance_rates)
         
-        # Verify cache consistency by full recomputation
         det_values, walkers_check = batch_det(walkers, None)
         det_sign, det_logabs = det_values
         
@@ -641,7 +601,6 @@ class TestShermanMorrison(unittest.TestCase):
         np.testing.assert_allclose(walkers.psi_sign, det_sign, rtol=1e-6,
                                    err_msg="Cached psi_sign inconsistent after 30 rank-1 MCMC steps")
         
-        # Also verify inverse matrices are consistent
         np.testing.assert_allclose(walkers.inv_up, walkers_check.inv_up, rtol=1e-5, atol=1e-10,
                                    err_msg="inv_up inconsistent after 30 rank-1 MCMC steps")
         np.testing.assert_allclose(walkers.inv_down, walkers_check.inv_down, rtol=1e-5, atol=1e-10,
@@ -656,11 +615,9 @@ class TestShermanMorrison(unittest.TestCase):
         walkers = self.walkers_h2
         params = self.params_h2
         
-        # Warm up with full SJ evaluation to populate cache
         batch_sj = jax.vmap(lambda w, p: sj(w, p), in_axes=(0, None))
         _, walkers = batch_sj(walkers, params)
         
-        # Run MCMC steps
         key = random.PRNGKey(777)
         acceptance_rates = []
         for _ in range(30):
@@ -672,7 +629,6 @@ class TestShermanMorrison(unittest.TestCase):
         
         mean_acc = np.mean(acceptance_rates)
         
-        # Verify cache consistency by full recomputation
         psi_values, walkers_check = batch_sj(walkers, params)
         psi_sign, psi_logabs = psi_values
         
@@ -694,17 +650,14 @@ class TestShermanMorrison(unittest.TestCase):
         
         w0 = jax.tree.map(lambda x: x[0], walkers)
         
-        # Test each electron type
         for elec_idx in [0, 1, 2, 3]:  # 0,1 = alpha; 2,3 = beta
             new_pos = w0.positions.at[elec_idx].set(
                 w0.positions[elec_idx] + jnp.array([0.2, -0.1, 0.15])
             )
             w0_moved = w0.replace(positions=new_pos)
             
-            # Rank-1
             ratio_r1, logabs_r1, sign_r1, w_r1 = rank1_update_one_electron(det, w0_moved, elec_idx)
             
-            # Full
             (sign_full, logabs_full), w_full = eval_det_value_and_grad(det, w0_moved)
             
             np.testing.assert_allclose(float(logabs_r1), float(logabs_full), rtol=1e-9,
@@ -764,16 +717,13 @@ class TestOptimizeRefVar(unittest.TestCase):
         )
         elapsed = time.time() - start_time
         
-        # Basic sanity checks
         self.assertEqual(len(opt_results['energies']), n_opt_steps)
         self.assertTrue(all(np.isfinite(opt_results['energies'])), "All energies should be finite")
         
-        # Energy should be in reasonable range (not diverging)
         final_energy = opt_results['energies'][-1]
         self.assertLess(abs(final_energy), abs(hf_energy) * 100,
                        f"Energy {final_energy} diverged far from HF energy {hf_energy}")
         
-        # Variance should decrease (or at least not explode)
         initial_var = opt_results['cost'][0]
         final_var = opt_results['cost'][-1]
         
@@ -834,7 +784,6 @@ class TestJacobianSubsampling(unittest.TestCase):
                                       use_custom_jvp=True, max_vmap_batch_size=0)
         loss_fn_jvp = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
         
-        # Full optimizer (all walkers)
         opt_full = NewtonOptimizer(
             value_and_grad_func=loss_fn_jvp,
             learning_rate=0.1, damping=1e-3,
@@ -856,16 +805,13 @@ class TestJacobianSubsampling(unittest.TestCase):
         new_params_full, _, stats_full = opt_full.step(params, 0, key1, batch)
         new_params_sub, _, stats_sub = opt_sub.step(params, 0, key2, batch)
         
-        # Both should produce finite results
         flat_full, _ = jax.flatten_util.ravel_pytree(new_params_full)
         flat_sub, _ = jax.flatten_util.ravel_pytree(new_params_sub)
         self.assertTrue(jnp.all(jnp.isfinite(flat_full)), "Full params should be finite")
         self.assertTrue(jnp.all(jnp.isfinite(flat_sub)), "Sub-sampled params should be finite")
         
-        # Both should have the same parameter structure
         self.assertEqual(flat_full.shape, flat_sub.shape)
         
-        # Both losses should be finite and positive
         self.assertTrue(jnp.isfinite(stats_full['loss']), "Full loss should be finite")
         self.assertTrue(jnp.isfinite(stats_sub['loss']), "Sub-sampled loss should be finite")
         self.assertGreater(float(stats_full['loss']), 0)
@@ -895,7 +841,6 @@ class TestJacobianSubsampling(unittest.TestCase):
             key=key,
         )
         
-        # All energies should be finite
         self.assertTrue(all(np.isfinite(opt_results['energies'])), 
                         "All energies should be finite with sub-sampling")
         self.assertTrue(all(np.isfinite(opt_results['cost'])),

@@ -342,7 +342,7 @@ class DTN(Jastrow):
 
     def init_params(self, **kwargs):
         rc_en_raw = jnp.zeros(self.n_types)
-        rc_ee_raw = jnp.zeros(1)   # Global
+        rc_ee_raw = jnp.zeros(1)
 
         c_ee_raw = jnp.array(
             [t.c for t in self.ee_terms]
@@ -374,7 +374,6 @@ class DTN(Jastrow):
         c_en = jnp.array(params['c_en_raw'])
         c_een = jnp.array(params['c_een_raw'])
 
-        # --- GLOBAL EVALUATIONS ---
         r12 = self._raw_distance(r1, r2)
         C_r12 = self._cutoff_envelope(r12, rc_ee)
         p_r12 = self._get_powers(r12, self.max_degree)
@@ -386,7 +385,6 @@ class DTN(Jastrow):
         else:
             ee_total = 0.0
 
-        # --- PER-NUCLEUS EVALUATIONS ---
         def compute_atom(atom_idx):
             type_idx = self.atom_type_map[atom_idx]
             nuc_pos = self.nuclear_pos[atom_idx]

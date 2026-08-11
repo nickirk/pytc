@@ -23,12 +23,10 @@ class TestSM(unittest.TestCase):
         jastrow = SM7(atom='Be')
         xtc = XTC(mf, jastrow, grid_lvl=2)
         
-        # Run CCSD with XTC integrals
         mycc = cc.rccsd.RCCSD(mf)
         eris = xtc.make_eris()
         
         
-        # Let's try packing the last two dimensions: (nocc, nvir, nvir*nvir)
         nocc, nvir, _, _ = eris.ovvv.shape
         
         e_corr, t1, t2 = mycc.kernel(eris=eris)
@@ -54,12 +52,10 @@ class TestSM(unittest.TestCase):
         jastrow = SM17(atom='Be')
         xtc = XTC(mf, jastrow, grid_lvl=2)
         
-        # Run CCSD with XTC integrals
         mycc = cc.rccsd.RCCSD(mf)
         eris = xtc.make_eris()
         e_corr, t1, t2 = mycc.kernel(eris=eris)
         
-        # Calculate total energy
         no = mycc.nocc
         tc_h1e = xtc.get_1b()
         tc_e_hf = 2. * np.einsum('ii->', tc_h1e[:no, :no])

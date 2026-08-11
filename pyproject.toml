@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytc-qc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python TransCorrelation package"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -29,6 +29,7 @@ dependencies = [
     "folx>=0.2.22",
 
     "pyscf",
+    "h5py",
 ]
 
 classifiers = [
@@ -46,19 +47,14 @@ classifiers = [
 gpu = [
     "jaxlib[cuda]",
 ]
-docs = [
-    "sphinx>=7.0",
-    "furo",
-    "myst-parser",
-    "sphinx-copybutton",
-    "sphinx-autodoc-typehints",
-]
 test = [
     "coverage[toml]>=7.0",
 ]
 
 [project.urls]
 Homepage = "https://pypi.org/project/pytc-qc/"
+Documentation = "https://nickirk.github.io/pytc-docs/"
+Source = "https://github.com/nickirk/pytc"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -9,11 +9,10 @@ from pyscf import lib
 from pyscf import ao2mo
 
 from pytc.solver import xtc_ccsd
-from pytc.integrals import xtc as xtc_mod
+from pytc import xtc as xtc_mod
 from pytc.utils.gpu_memory import resolve_vvvv_panel_block_sizes
 from pytc.utils.gpu_memory import estimate_blksize
 
-# JAX config
 jax.config.update("jax_enable_x64", True)
 
 logger = logging.getLogger(__name__)
@@ -94,29 +93,7 @@ def kernel_process_ovvv_block(ovvv_blk, t1, t2, tau):
 
     Implementation notes
     --------------------
-    This kernel has been rewritten three times in response to production
-    XLA failures on pCV5Z-class (≈30 GB f64 ``ovvv_blk``) inputs:
-
-    * v1 (textbook): paired ``'kdac'``/``'kcad'`` einsums against the
-      same ``ovvv_blk``.  XLA fused an axis-1↔3 transpose of the 30 GB
-      tile into several downstream contractions (``input_transpose_fusion``
-      HLOs) and the autotuner aborted with ``NOT_FOUND: No valid config
-      found!`` on shapes like ``f64[1179, 3070116]``.
-
-    * v2 (commit ``eeb39b2``): precomputed ``ovvv_swap`` and
-      ``ovvv_t1sym = 2*ovvv_blk - ovvv_swap`` inside this ``@jax.jit``.
-      XLA's common-subexpression / fusion passes still re-fused the
-      transpose into the downstream GEMMs that contract ``(c, d)``
-      against ``tau`` in ``tmp_a`` and ``tmp_b``.  The natural GEMM plan
-      for ``einsum('kdac,ijcd->kaij', ovvv_blk, tau)`` wants
-      ``(k*a, d*c) @ (d*c, i*j)``, which requires reshape-after-transpose
-      of ``ovvv_blk`` into layout ``(k, a, c, d)``.  At
-      ``(nocc=21, nvir=1179, blk=124)`` that scratch is 27 GB, and the
-      BFC allocator could not fit it alongside ``ovvv_blk`` +
-      ``ovvv_swap`` + ``ovvv_t1sym`` + t1/t2/tau → OOM → autotuner
-      reports "NOT_FOUND" (no config can allocate its scratch).
-
-    * v3 (current): two targeted changes.
+    * v3 (current): three targeted changes.
 
       1. Materialise ``ovvv_swap`` with an ``optimization_barrier`` so
          XLA cannot re-fuse the transpose into any downstream tile
@@ -227,7 +204,6 @@ class RCCSD(xtc_ccsd.RCCSD):
         if t2 is None: t2 = self.t2
         if eris is None: eris = self.eris
         
-        # Cast to JAX for computation
         t1_jax = jnp.asarray(t1)
         t2_jax = jnp.asarray(t2)
         fock_jax = jnp.asarray(eris.fock)
@@ -273,13 +249,11 @@ def _update_amps(cc, t1, t2, eris):
     logger.debug("Starting _update_amps (JAX-Optimized)")
     t_start = time.perf_counter()
     
-    # 1. Cast inputs to JAX and move to GPU
     t1_jax = jnp.asarray(t1)
     t2_jax = jnp.asarray(t2)
     
     nocc, nvir = t1_jax.shape
     
-    # Load small intermediates to GPU
     fock_jax = jnp.asarray(eris.fock)
     mo_e_o = jnp.diag(fock_jax)[:nocc]
     mo_e_v = jnp.diag(fock_jax)[nocc:] + cc.level_shift
@@ -298,8 +272,6 @@ def _update_amps(cc, t1, t2, eris):
     logger.debug(f"Phase 1 data transfer to GPU took {time.perf_counter()-t_start:.4f} s")
     t_kernels = time.perf_counter()
     
-    # 2. Compute intermediates (Micro-Kernels)
-    # These return JAX arrays on GPU
     Fov = _jax_cc_Fov(t1_jax, fock_jax, eris_ovov)
     Foo = _jax_cc_Foo(t1_jax, t2_jax, fock_jax, eris_ovov)
     Fvv = _jax_cc_Fvv(t1_jax, t2_jax, fock_jax, eris_ovov)
@@ -317,7 +289,6 @@ def _update_amps(cc, t1, t2, eris):
     # Total needed for full GPU accumulators: 2*size_W + 2*size_tmp + Lvv (negligible)
     total_acc_mem = 2 * size_W + 2 * size_tmp
     
-    # Use centralized GPU budget utility for accumulator decision
     _gpu_max = getattr(cc, 'gpu_max_memory', None)
     use_gpu_acc_flag, _ = estimate_blksize(
         nocc, nvir, 'acc_decision', gpu_max_memory_mb=_gpu_max)
@@ -326,11 +297,7 @@ def _update_amps(cc, t1, t2, eris):
     # Force host accumulation whenever the OVVV/VOVV pipeline below cannot
     # keep accumulators GPU-resident.  See ``_should_force_host_accumulators``
     # for the exact predicate (multi-GPU OR HDF5-backed ovvv OR HDF5-backed
-    # vovv).  Previously the override only checked the multi-GPU case, so a
-    # single-GPU run with HDF5-backed ovvv (large systems where ovvv was
-    # spilled to disk regardless of device count) hit a misleading
-    # AssertionError further down complaining that the multi-GPU check
-    # "above" had failed to set use_gpu_acc=False.
+    # vovv).
     _n_devices_local = len(xtc_ccsd._solver_local_devices())
     if _should_force_host_accumulators(eris, _n_devices_local) and use_gpu_acc:
         logger.debug(
@@ -344,7 +311,6 @@ def _update_amps(cc, t1, t2, eris):
 
     logger.debug(f"Accumulators need {total_acc_mem/1024**3:.2f} GB. Using GPU acc: {use_gpu_acc}")
 
-    # Initialize accumulators with non-ovvv terms
     if use_gpu_acc:
         # GPU Path
         Lvv_acc = Fvv_unshifted - jnp.einsum('kc,ka->ac', fov, t1_jax)
@@ -365,10 +331,8 @@ def _update_amps(cc, t1, t2, eris):
         tmp_b_acc = jnp.zeros((nocc, nvir, nocc, nocc))
         
     else:
-        # Host Path - Compute base terms on GPU then move to Host
         Lvv_acc = np.array(Fvv_unshifted - jnp.einsum('kc,ka->ac', fov, t1_jax))
         
-        # Wvoov base
         tmp = eris_ovvo.transpose(2,0,3,1)
         tmp -= jnp.einsum('kcli,la->akic', eris_ovoo, t1_jax)
         tmp -= 0.5 * jnp.einsum('ldkc,ilda->akic', eris_ovov, t2_jax)
@@ -378,7 +342,6 @@ def _update_amps(cc, t1, t2, eris):
         Wvoov_acc = np.array(tmp)
         del tmp
         
-        # Wvovo base
         tmp = eris_oovv.transpose(2,0,3,1)
         tmp -= jnp.einsum('lcki,la->akci', eris_ovoo, t1_jax)
         tmp -= 0.5 * jnp.einsum('lckd,ilda->akci', eris_ovov, t2_jax)
@@ -417,10 +380,10 @@ def _update_amps(cc, t1, t2, eris):
     t_comp_dur = time.perf_counter() - t_comp
     
     t_trans = time.perf_counter()
-    t1new_host += np.asarray(t1new_jax) # Move T1 partial to host
+    t1new_host += np.asarray(t1new_jax)
     t_trans_dur = time.perf_counter() - t_trans
     
-    del t1new_jax # Free GPU memory
+    del t1new_jax
     logger.debug(f"T1 core updates: Comp {t_comp_dur:.4f}s, Host accum {t_trans_dur:.4f}s")
     
     t_ovvv = time.perf_counter()
@@ -471,7 +434,7 @@ def _update_amps(cc, t1, t2, eris):
         from pytc.utils.prefetch import async_read, await_read
 
         if use_gpu_acc:
-            # Should be unreachable: the early ``_force_host_acc`` override
+            # Should be unreachable: the early ``_should_force_host_accumulators`` override
             # forces ``use_gpu_acc = False`` whenever ``eris.ovvv`` is not
             # an in-RAM ndarray (i.e. exactly when this branch runs).
             raise AssertionError(
@@ -611,7 +574,7 @@ def _update_amps(cc, t1, t2, eris):
             tmp_a_blk_np = np.asarray(tmp_a_blk)
             tmp_b_blk_np = np.asarray(tmp_b_blk)
             t1_readback = time.perf_counter()
-            release_gpu_slot()  # GPU pipeline is now free for the next tile
+            release_gpu_slot()
             with ovvv_acc_lock:
                 t1new_host[:, p0:p1] += t1_upd_np
                 Lvv_acc[p0:p1, :] += Lvv_blk_np
@@ -659,7 +622,6 @@ def _update_amps(cc, t1, t2, eris):
                 _other,
             )
 
-        # Drop per-device caches now that the OVVV phase is complete.
         del ovvv_t1_by_dev, ovvv_t2_by_dev, ovvv_tau_by_dev
     t_t2 = time.perf_counter()
             
@@ -796,16 +758,11 @@ def _update_amps(cc, t1, t2, eris):
             return term
 
         def consume_vovv(spec, device, term, release_gpu_slot):
-            # Capture the device tag up front; ``device`` itself is no
-            # longer needed once the kernel has produced ``term``.
-            # (A prior refactor accidentally introduced ``del device``
-            # while the format string below still referenced it, causing
-            # ``UnboundLocalError`` on every VOVV tile.)
             device_key = getattr(device, "id", "host")
             p0, p1 = spec
             t0_trans = time.perf_counter()
             term_host = np.asarray(term)  # GPU→CPU readback
-            release_gpu_slot()  # GPU pipeline is now free for the next tile
+            release_gpu_slot()
             with vovv_acc_lock:
                 t2new_host[:, :, p0:p1, :] += term_host
             logger.debug(
@@ -839,7 +796,6 @@ def _update_amps(cc, t1, t2, eris):
                 _other,
             )
 
-        # Drop per-device caches as soon as the VOVV phase is done.
         del vovv_t1_by_dev, vovv_oovv_by_dev
 
         t2new_host = t2new_host + t2new_host.transpose(1, 0, 3, 2)
@@ -853,7 +809,6 @@ def _update_amps(cc, t1, t2, eris):
     
     # --- Output Preparation ---
     
-    # Use GPU accumulators if available, else copy from host
     if not use_gpu_acc:
         Lvv_acc = jnp.asarray(Lvv_acc)
         Wvoov_acc = jnp.asarray(Wvoov_acc)
@@ -865,11 +820,9 @@ def _update_amps(cc, t1, t2, eris):
     eris_oooo = jnp.asarray(eris.oooo)   # ~3 MB (tiny)
     eris_vooo = jnp.asarray(eris.vooo)   # ~77 MB
     eris_vovo = jnp.asarray(eris.vovo)   # ~2 GB
-    # Reload eris_ovvo (needed for tmp2 below; was freed implicitly or still live)
-    # It was loaded in Phase 1 and not freed, so it's still available.
+    # eris_ovvo was loaded in Phase 1 and never freed; it is reused for tmp2 below.
     logger.debug(f"Phase 6 deferred ERI load done")
         
-    # Basic T2 terms
     t2new_basic = jnp.zeros_like(t2_jax)
     tmp2 = jnp.einsum('kcai,jc->akij', eris_ovvo, t1_jax)
     tmp2 += eris_vooo.transpose(0, 2, 1, 3)
@@ -920,9 +873,8 @@ def _update_amps(cc, t1, t2, eris):
     logger.debug(f"Phase 7: freed ERIs/accumulators before VVVV")
 
     # --- VVVV Contraction ---
-    _contract_vvvv_t2(cc, tau_jax, eris, t2new_host)
+    getattr(cc, "_contract_vvvv_t2", _contract_vvvv_t2)(cc, tau_jax, eris, t2new_host)
     
-    # Final Division
     eia = mo_e_o[:,None] - mo_e_v
     eijab = eia[:, None, :, None] + eia[None, :, None, :]
     
@@ -932,7 +884,6 @@ def _update_amps(cc, t1, t2, eris):
     t1new_host /= eia_np
     t2new_host /= eijab_np
     
-    # Release the X slice cache at the end of each iteration.
     from pytc.integrals.xtc import invalidate_X_cache
     invalidate_X_cache()
 
@@ -962,7 +913,6 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             return
 
         if isinstance(eris.vvvv, h5py.Dataset):
-            # HDF5-backed: read blocks from disk, transfer to GPU, contract
             blksize, _ = estimate_blksize(
                 nocc, nvir, 'vvvv_gpu',
                 gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
@@ -998,7 +948,6 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                 p1 = min(p0 + blksize, nvir)
                 t0 = time.perf_counter()
 
-                # Await prefetched block or read synchronously
                 if pending is not None and pending_key == (p0, p1):
                     vvvv_blk_np = await_read(pending)
                     pending = None
@@ -1008,7 +957,6 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
                 vvvv_blk_jax = jnp.asarray(vvvv_blk_np)
                 del vvvv_blk_np
 
-                # Kick off NEXT block read in background
                 next_p0 = p0 + blksize
                 if next_p0 < nvir:
                     next_p1 = min(next_p0 + blksize, nvir)
@@ -1123,12 +1071,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
     # Fine-grained per-stage timing.  Every line below is a wall-clock
     # marker that can be cross-referenced against ``nvidia-smi dmon -s pu
     # -d 1 -o DT`` (which writes ``YYYYMMDD HH:MM:SS`` per row, matching
-    # the Python logger's ``%(asctime)s``).  Use:
-    #
-    #   grep '\[VVVV-(issue|consume) d[01]\]' ben_*.out
-    #
-    # to extract just the markers, then overlay with the dmon log to see
-    # which sub-stage of which device's tile was running at every second.
+    # the Python logger's ``%(asctime)s``).
     # Each marker is tagged ``[VVVV-issue dN]`` or ``[VVVV-consume dN]``
     # so the device producing it is unambiguous.
 
@@ -1259,7 +1202,7 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             "[VVVV-consume d%s] np.asarray RETURN +%.4fs (GPU done + DMA copied)",
             dev_id, t_asarray_1 - t_asarray_0,
         )
-        release_gpu_slot()  # GPU pipeline is now free to issue the next tile
+        release_gpu_slot()
         t_accum_0 = time.perf_counter()
         t2new_host[:, :, p0:p1, r0:r1] += term_host
         t_accum_1 = time.perf_counter()
@@ -1279,17 +1222,14 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
 
     # Tile-id round-robin across local devices.  We intentionally do NOT
     # pass ``device_key=lambda spec: spec[0]`` (p-block locality) here:
-    # the Apr-7 ``_get_isdf_device_cache`` refactor made phi_isdf /
-    # grad_phi_isdf / K1 / K3 / D fully device-resident, so there is no
-    # longer any locality benefit from keeping r-tiles of a given p on
-    # one device.  With ``device_key`` on, ``_round_robin_pipeline``
+    # there is no longer any locality benefit from keeping r-tiles of
+    # a given p on one device.  With ``device_key`` on, ``_round_robin_pipeline``
     # would assign the first-seen p-block to device 0, the second to
     # device 1, etc.  At small ``p_blksize`` that is fine, but at the
     # degenerate ``p_blksize=1`` the scheduler must drain all ``n_r``
     # tiles of ``p=0`` before dispatching ``p=1`` to device 1, leaving
-    # every other device idle for roughly ``n_r * per_tile_gpu_time``
-    # (observed on QZ: device 0 finished 1306 tiles while device 1 had
-    # only started 64).  Default tile-id round-robin avoids that:
+    # every other device idle for roughly ``n_r * per_tile_gpu_time``.
+    # Default tile-id round-robin avoids that:
     # ``(p=0,r=0)→d0, (p=0,r=1)→d1, (p=0,r=2)→d0, ...`` so every device
     # gets work on tile 0/1 and the staggering is bounded by a single
     # tile's latency.

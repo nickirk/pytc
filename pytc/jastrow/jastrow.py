@@ -71,7 +71,6 @@ class Jastrow:
         Returns:
             Gradients of shape (batch_size_out, batch_size_in, 3)
         """
-        # Default implementation using vmap over grad_r
         @partial(jax.vmap, in_axes=(None, 0))
         def grad_fn(r1, r2):
             return self.grad_r(r1, r2, params)
@@ -92,7 +91,6 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
             
-        # Use folx for efficient forward-mode Laplacian
         return folx.forward_laplacian(scalar_fn)(r1).laplacian
     
     
@@ -125,7 +123,6 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(x, r2, params).reshape(-1)[0]
             
-        # Use folx for efficient forward-mode gradient and Laplacian
         fwd_lapl = folx.forward_laplacian(scalar_fn)(r1)
         grad_u = fwd_lapl.jacobian.dense_array
         lapl_u = fwd_lapl.laplacian
@@ -148,7 +145,6 @@ class Jastrow:
         def scalar_fn(x):
             return self._compute(r1, x, params).reshape(-1)[0]
             
-        # Use folx for efficient forward-mode gradient and Laplacian
         fwd_lapl = folx.forward_laplacian(scalar_fn)(r2)
         grad_u = fwd_lapl.jacobian.dense_array
         lapl_u = fwd_lapl.laplacian
@@ -158,3 +154,42 @@ class Jastrow:
     def init_params(self, **kwargs):
         """Initialize parameters. Subclasses should implement this."""
         pass
+
+    def get_pair_grid_grad_lap(self, elec_coords, params):
+        """Compute grad_1/lap_1 of u(r_i, r_j) wrt r_i for ALL (i, j) pairs
+        at once.
+
+        Default implementation: a per-pair vmap grid built directly from
+        ``get_log_grads_r1`` -- correct for any subclass, but recomputes
+        each electron's per-pair quantities independently for every one of
+        the N pairs it appears in (O(N^2*M) redundant work for Jastrows
+        with atom-dependent structure). Subclasses with a cheaper
+        whole-electron-set formulation (e.g. ``BoysHandyAnalytical``,
+        which precomputes per-electron tables once and assembles the pair
+        grid via a scan) should override this method; callers never branch
+        on which implementation is in use -- polymorphism handles it.
+
+        Args:
+            elec_coords: (N, 3) all electron positions.
+            params: Jastrow parameters.
+
+        Returns:
+            (grad_pair, lap_pair): grad_pair has shape (N, N, 3) and
+            lap_pair has shape (N, N), where [i, j] holds grad_1/lap_1 of
+            u(r_i, r_j) wrt r_i. Diagonal (i == j) entries are meaningless
+            and are masked out by the caller.
+        """
+        def compute_pair(i, r_i, j, r_j):
+            # Displace the i == j diagonal before evaluating: the caller
+            # masks it out, but a NaN produced at r_i == r_j (0/0 in
+            # autodiff'd pair norms) survives a multiplicative mask
+            # (NaN * 0 = NaN). The displaced value is discarded, so its
+            # magnitude is irrelevant; index-based so genuinely coincident
+            # DISTINCT electrons still propagate their true value.
+            r_j_safe = jnp.where(i == j, r_j + 1.0, r_j)
+            return self.get_log_grads_r1(r_i, r_j_safe, params)
+
+        idx = jnp.arange(elec_coords.shape[0])
+        inner = jax.vmap(compute_pair, in_axes=(None, None, 0, 0))
+        outer = jax.vmap(inner, in_axes=(0, 0, None, None))
+        return outer(idx, elec_coords, idx, elec_coords)

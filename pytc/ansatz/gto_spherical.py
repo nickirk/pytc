@@ -121,7 +121,6 @@ class MolGTO_Spherical:
             n_contractions = cs.shape[1]
             base_ao_idx = ao_loc[i]
             
-            # Normalize coefficients
             # PySCF's gto_norm gives normalization for r^l * exp(-alpha * r^2)
             norms = np.array([gto.gto_norm(ell, e) for e in es])
             
@@ -133,7 +132,6 @@ class MolGTO_Spherical:
                 
                 start = base_ao_idx + c_idx * (2*ell + 1)
                 end = start + (2*ell + 1)
-                # Indices for this contraction
                 # Each contraction produces 2l+1 functions
                 indices = np.arange(start, end)
                 
@@ -229,7 +227,6 @@ def eval_ao_spherical(mol_gto: MolGTO_Spherical, pos: jax.Array, deriv=0):
         
         vals = res.x
         grads = res.jacobian.data 
-        # Transpose from (batch, 3, nao) to (batch, nao, 3)
         grads = jnp.transpose(grads, (0, 2, 1))
         
         laps = res.laplacian

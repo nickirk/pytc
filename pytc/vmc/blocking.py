@@ -37,15 +37,12 @@ def block_analysis(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray
         block_size = 2**i
         n_blocks = n_data // block_size
         
-        # Truncate data to neatly fit into blocks
         truncated_data = data[:n_blocks * block_size]
         blocks = truncated_data.reshape((n_blocks, block_size))
         
-        # Mean of each block
         block_means = np.mean(blocks, axis=1)
         
         if n_blocks > 1:
-            # Error of the means
             block_var = np.var(block_means, ddof=1)
             block_error = np.sqrt(block_var / n_blocks)
             
@@ -81,7 +78,6 @@ def detect_equilibration_cma(data: np.ndarray, threshold_sigma: float = 0.5, pri
     
     deviations = np.abs(cma_from_end - steady_state_mean)
     
-    # We use a strict threshold based on the intrinsic noise of the data
     threshold = threshold_sigma * steady_state_std
     
     if print_results:
@@ -160,14 +156,11 @@ def analyze_optimization_history(
         logger.info(f"\\nEstimated standard error (from plateau): {max_err:.6f}")
         logger.info(f"Final Result:         {mean_energy:.6f} +/- {max_err:.6f}")
         
-    # Also perform Polyak-Ruppert averaging on the parameters if they exist
     polyak_params = None
     if 'params' in history:
         params_history = history['params']
-        # Extract the equilibrated part of the parameters history (slices each leaf's axis=0)
         equil_params_history = jtu.tree_map(lambda x: x[burn_in_idx:], params_history)
         
-        # Average each parameter over the equilibrated trace
         polyak_params = jtu.tree_map(lambda x: np.mean(x, axis=0), equil_params_history)
             
     return {

@@ -1,11 +1,16 @@
 import unittest
 from unittest import mock
+import os
+import tempfile
+
+import h5py
 import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 
 from pytc.jastrow.rexp import REXP
+from pytc.integrals.tc import ISDFTC
 from pytc.integrals.xtc import XTC, ISDFXTC
 
 
@@ -72,6 +77,37 @@ class TestISDFXTCPanelization(unittest.TestCase):
             atol=1e-9,
             rtol=1e-9,
         )
+
+    def test_incomplete_kernel_store_closes_read_handle(self):
+        fd, path = tempfile.mkstemp(suffix=".h5")
+        os.close(fd)
+        try:
+            with h5py.File(path, "w") as store:
+                store.create_dataset("D", data=np.zeros((1, 1)))
+
+            opened_reads = []
+            real_file = h5py.File
+
+            def tracking_file(name, mode="r", *args, **kwargs):
+                handle = real_file(name, mode, *args, **kwargs)
+                if mode == "r":
+                    opened_reads.append(handle)
+                return handle
+
+            base = self.isdf_xtc.replace(isdf_kernels={})
+            with mock.patch.object(ISDFTC, "isdf", return_value=base):
+                with mock.patch.object(
+                    ISDFXTC,
+                    "compute_delta_u_kernels",
+                    return_value={"D": np.zeros((1, 1)), "X": np.zeros((1, 1, 1))},
+                ):
+                    with mock.patch("pytc.xtc.h5py.File", side_effect=tracking_file):
+                        self.isdf_xtc.isdf(self.jparams, save_path=path)
+
+            self.assertEqual(len(opened_reads), 1)
+            self.assertFalse(opened_reads[0].id.valid)
+        finally:
+            os.remove(path)
 
     def test_delta_u_tile_assembly_matches_public_api(self):
         kernels = self.isdf_xtc.compute_delta_u_kernels(
@@ -320,7 +356,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
             f"nocc={cls.nocc} nvir={cls.nvir}"
         )
 
-    # ---------- helpers -------------------------------------------------
 
     def _ovov_ranges(self):
         """ovov single-tile ranges: ``slice_p==slice_r``, ``slice_q==slice_s``."""
@@ -343,7 +378,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
             return padded[:p_len, :q_len, :r_len, :s_len]
         if layout == "qr":
             return padded[:p_len, :q_len, :r_len, :s_len]
-        # "ps"
         return padded[:p_len, :q_len, :r_len, :s_len]
 
     def _padded_tile_shape(self, layout, p_len, q_len, r_len, s_len, ps):
@@ -351,9 +385,8 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
             return (ps,    q_len, ps,    s_len)
         if layout == "qr":
             return (p_len, ps,    ps,    s_len)
-        return     (ps,    q_len, r_len, ps)   # "ps"
+        return     (ps,    q_len, r_len, ps)
 
-    # ---------- _assemble_tc_tile shortcut ------------------------------
 
     def _check_assemble_tc_tile_all_layouts(self, ranges, tag):
         p_len = ranges[0].stop - ranges[0].start
@@ -387,7 +420,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
     def test_assemble_tc_tile_vovo_single_tile_all_layouts(self):
         self._check_assemble_tc_tile_all_layouts(self._vovo_ranges(), "vovo")
 
-    # ---------- _assemble_delta_u_tile shortcut -------------------------
 
     def _check_assemble_delta_u_tile_all_layouts(self, ranges, tag):
         p_len = ranges[0].stop - ranges[0].start
@@ -426,7 +458,6 @@ class TestAssembleTileShortcutAsymmetricPadding(unittest.TestCase):
         self._check_assemble_delta_u_tile_all_layouts(
             self._vovo_ranges(), "vovo")
 
-    # ---------- End-to-end _assemble_2b_tile (TC + ΔU together) --------
 
     def test_assemble_2b_tile_ovov_single_tile_all_layouts(self):
         ranges = self._ovov_ranges()

@@ -8,7 +8,6 @@ from pyscf import gto, scf
 from pytc.integrals.xtc import XTC
 from pytc.jastrow import REXP
 
-# Enable float64
 jax.config.update("jax_enable_x64", True)
 
 def get_h2o_sto6g():
@@ -29,7 +28,6 @@ class TestXTCBlock(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mol, cls.mf = get_h2o_sto6g()
-        # Use coarse grid for speed
         cls.jastrow = REXP(epsilon=1e-8)
         cls.xtc = XTC.from_pyscf(cls.mf, cls.jastrow, grid_lvl=1)
         cls.jastrow_params = cls.jastrow.init_params(alpha=1.0)
@@ -41,10 +39,8 @@ class TestXTCBlock(unittest.TestCase):
         """Test if 'oooo' block matches full tensor slice."""
         print(f"\nTesting XTC oooo block... nocc={self.nocc}")
         
-        # Compute full tensor
         full_2b = self.xtc.get_2b(self.jastrow_params)
         
-        # Compute block
         block_2b = self.xtc.get_2b(self.jastrow_params, block_str='oooo')
         
         slice_o = slice(0, self.nocc)
@@ -57,10 +53,8 @@ class TestXTCBlock(unittest.TestCase):
         """Test if 'oovv' block matches full tensor slice."""
         print("\nTesting XTC oovv block...")
         
-        # Compute full tensor
         full_2b = self.xtc.get_2b(self.jastrow_params)
         
-        # Compute block
         block_2b = self.xtc.get_2b(self.jastrow_params, block_str='oovv')
         
         slice_o = slice(0, self.nocc)
@@ -75,7 +69,6 @@ class TestXTCBlock(unittest.TestCase):
         """Test custom ranges."""
         print("\nTesting XTC custom ranges...")
         
-        # Define arbitrary ranges
         range_p = slice(0, 6)
         range_q = slice(1, 4)
         range_r = slice(2, 5)

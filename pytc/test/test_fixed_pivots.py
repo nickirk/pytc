@@ -1,4 +1,4 @@
-"""Unit tests for isdf_decompose fixed_pivots override path (pytc/df.py).
+"""Unit tests for the ``isdf_decompose`` fixed-pivot override.
 
 Covers the still-live ``fixed_pivots`` kwarg: native pivots fed back as
 fixed_pivots must reproduce bit-identical phi_piv/grad_phi_piv columns and

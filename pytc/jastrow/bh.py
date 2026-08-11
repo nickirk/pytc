@@ -46,19 +46,12 @@ class BoysHandy(Jastrow):
     name: str = struct.field(pytree_node=False, default=None)
 
     @classmethod
-    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None,
-               analytical_gradients=True):
-        if analytical_gradients and cls is BoysHandy:
-            nuclear_charges = jnp.array(mol.atom_charges())
-            n_types = len(jnp.unique(nuclear_charges))
-            has_ecp = bool(getattr(mol, '_ecp', {}) or getattr(mol, '_pseudo', {}))
-            if n_types == 1 and not has_ecp:
-                from pytc.jastrow.bha import BoysHandyAnalytical
-                return BoysHandyAnalytical.create(
-                    mol, terms_per_nucleus=terms_per_nucleus,
-                    epsilon=epsilon, name=name,
-                )
+    def create(cls, mol, terms_per_nucleus=None, epsilon=1e-16, name=None):
+        """Always returns the generic (folx-autodiff) BoysHandy.
 
+        No implicit substitution: callers who want the analytic-derivative
+        implementation construct ``BoysHandyAnalytical`` directly.
+        """
         nelectron = mol.nelectron
         nuclear_pos = jnp.array(mol.atom_coords())
         nuclear_charges = jnp.array(mol.atom_charges())
@@ -202,7 +195,6 @@ class BoysHandy(Jastrow):
             d_I = d[type_idx]
             c_I = c[type_idx]
             
-            # Retrieve indices for all terms of this atom type
             m_indices = self._term_m[type_idx]
             n_indices = self._term_n[type_idx]
             o_indices = self._term_o[type_idx]
@@ -222,21 +214,17 @@ class BoysHandy(Jastrow):
             p_r2I = get_powers(r2I, self.max_degree)
             p_r12 = get_powers(r12, self.max_degree)
             
-            # Get powers for all terms at once using advanced indexing
             v_r1I_m = p_r1I[m_indices]
             v_r2I_n = p_r2I[n_indices]
             v_r2I_m = p_r2I[m_indices]
             v_r1I_n = p_r1I[n_indices]
             v_r12_o = p_r12[o_indices]
             
-            # Compute term values
             non_cusp_term = (v_r1I_m * v_r2I_n + v_r2I_m * v_r1I_n) * v_r12_o
             cusp_term = (2.0 / d_I) * v_r12_o
             
-            # Select term type based on cusp mask
             term_vals = jnp.where(mask, cusp_term, non_cusp_term)
             
-            # Sum contributions
             total_val = jnp.sum(delta_vals * c_I * term_vals)
             return total_val
 

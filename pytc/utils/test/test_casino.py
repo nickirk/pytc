@@ -9,17 +9,14 @@ class TestCasinoParameters(unittest.TestCase):
         from pytc.utils.parser import parse_casl
         params = parse_casl(self.param_file)
         
-        # Test basic structure
         self.assertIn("JASTROW", params)
         self.assertEqual(len(params["JASTROW"].keys()), 6)  # 6 terms
         
-        # Test Term 1
         term1 = params["JASTROW"]["TERM 1"]
         self.assertEqual(term1["Rank"], [2, 0])
         self.assertEqual(term1["e-e basis"]["Type"], "natural power")
         self.assertEqual(term1["e-e basis"]["Order"], 9)
         
-        # Test some parameters
         self.assertEqual(term1["Linear parameters"]["Channel 1-2"]["c_2"][0], 0.17116191470246386)
         self.assertEqual(term1["Linear parameters"]["Channel 1-2"]["c_2"][1], "optimizable")
 
@@ -34,13 +31,11 @@ class TestCasinoParameters(unittest.TestCase):
         params = parse_casl(self.param_file)
         
         term5 = params["JASTROW"]["TERM 5"]
-        # Check basic structure
         self.assertEqual(term5["Rank"], [1, 1])
         self.assertEqual(term5["e-n cusp"], "T")
         self.assertEqual(term5["Rules"], ["1=2", "Z", "!N2", "!N3", "!N4"])
         self.assertEqual(term5["e-n basis"]["Type"], "none")
         
-        # Check orbital cusp parameters
         cusp = term5["e-n cutoff"]
         self.assertEqual(cusp["Type"], "orbital cusp")
         self.assertEqual(cusp["Constants"]["norb"], 1)
@@ -49,7 +44,6 @@ class TestCasinoParameters(unittest.TestCase):
         self.assertEqual(cusp["Constants"]["C"], 0.0)
         self.assertEqual(cusp["Constants"]["L_grid"], 0.17857142857142855)
         
-        # Check some orbital values
         orbital = cusp["Constants"]["Orbital 1"]
         self.assertEqual(orbital["phi_0"], 6.0094243060681904)
         self.assertEqual(orbital["phi_1"], 6.0093041288121842)
@@ -60,13 +54,11 @@ class TestCasinoParameters(unittest.TestCase):
         params = parse_casl(self.param_file)
         
         term6 = params["JASTROW"]["TERM 6"]
-        # Check basic structure
         self.assertEqual(term6["Rank"], [1, 1])
         self.assertEqual(term6["e-n cusp"], "T")
         self.assertEqual(term6["Rules"], ["1=2", "Z", "!N1"])
         self.assertEqual(term6["e-n basis"]["Type"], "none")
         
-        # Check orbital cusp parameters
         cusp = term6["e-n cutoff"]
         self.assertEqual(cusp["Type"], "orbital cusp")
         self.assertEqual(cusp["Constants"]["norb"], 1)
@@ -75,7 +67,6 @@ class TestCasinoParameters(unittest.TestCase):
         self.assertEqual(cusp["Constants"]["C"], 0.0)
         self.assertEqual(cusp["Constants"]["L_grid"], 1.2500000000000000)
         
-        # Check some orbital values
         orbital = cusp["Constants"]["Orbital 1"]
         self.assertEqual(orbital["phi_0"], 0.32923116737332220)
         self.assertEqual(orbital["phi_1"], 0.32922879594635573)

@@ -40,10 +40,8 @@ def _cartesian_gto(
     r2 = jnp.sum(ctr_xyz**2, axis=-1) # (N, nimages)
     gauss = jnp.exp(-expts[:, jnp.newaxis, :] * r2[:, :, jnp.newaxis]) # (N, nimages, M)
     
-    # Combine
     all_prod = coeffs[:, jnp.newaxis, :] * gauss * xyz_ijk # (N, nimages, M)
     
-    # Sum over images then primitives
     term_sum = jnp.sum(all_prod, axis=(1, 2)) # (N,)
     return term_sum
 
@@ -147,7 +145,6 @@ class MolGTO:
             jnp.array([[0.0, 0.0, 0.0]]),
         )
 
-# Standalone evaluation functions
 def eval_gto(mol_gto: MolGTO, xyz: jax.Array) -> jax.Array:
     """Evaluate basis functions at a single point."""
     return _cartesian_gto(

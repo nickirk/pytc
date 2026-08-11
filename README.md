@@ -1,13 +1,16 @@
 <p align="left">
-  <img src="docs/_static/pytc-logo.svg" alt="PyTC logo" width="280">
+  <img src="https://raw.githubusercontent.com/nickirk/pytc/main/assets/pytc-logo.svg" alt="PyTC logo" width="280">
 </p>
 
 # PyTC
 
 ![CI](https://github.com/nickirk/pytc/actions/workflows/ci.yml/badge.svg)
+[![Documentation](https://img.shields.io/badge/docs-online-brightgreen.svg)](https://nickirk.github.io/pytc-docs/)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
 
 **Py**thon **T**rans**C**orrelation package
+
+Documentation: https://nickirk.github.io/pytc-docs/
 
 ## Development provenance
 
@@ -58,7 +61,7 @@ python -m pip install pytc-qc
 python -m pip install -U "jax[cuda12]"
 ```
 
-For source checkout / development install, see [docs/installation.md](https://github.com/nickirk/pytc/blob/main/docs/installation.md).
+For source checkout / development install, see the [installation guide](https://nickirk.github.io/pytc-docs/installation.html).
 
 ## Quick Start
 
@@ -96,7 +99,7 @@ mycc = jax_xtc_ccsd.RCCSD(mf, my_isdf_xtc, jastrow_params)
 e_corr, t1, t2 = mycc.kernel(eris=eris_isdf)
 ```
 
-See [docs/quickstart.md](https://github.com/nickirk/pytc/blob/main/docs/quickstart.md) for additional examples and explanations.
+See the [quickstart guide](https://nickirk.github.io/pytc-docs/quickstart.html) for additional examples and explanations.
 
 ## Code Overview
 
@@ -157,7 +160,7 @@ python -m unittest discover -v
 
 ## Publications
 
-*No publications yet. This section will be updated when papers using pytc are published.*
+- **Interpolative Separable Density-Fitting for Transcorrelated Hamiltonians** — Ke Liao, Yifan Cheng, Werner Dobrautz, Tianyu Zhu, and Ali Alavi. [arXiv:2607.17314 (2026)](https://arxiv.org/abs/2607.17314)
 
 ## Contributing
 

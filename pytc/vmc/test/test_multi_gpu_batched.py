@@ -37,15 +37,12 @@ class TestMultiGPUBatched(unittest.TestCase):
         mesh = create_mesh()
         ws = shard_walker(walkers, mesh)
         
-        # This should now return sharded_batched_vmap (wrapped in partial)
         vmap_fn = get_vmap_fn(max_vmap_batch_size=4, mesh=mesh)
         
-        # Execute batched computation
         result = vmap_fn(lambda w: det(w, None)[0][1])(ws)
         
         print(f"Result sharding: {result.sharding}")
         
-        # Check if it's sharded along 'walkers' axis
         from jax.sharding import PartitionSpec as P
         self.assertEqual(result.sharding.spec, P('walkers'))
         print("✓ Sharding preserved with batching!")

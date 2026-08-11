@@ -40,11 +40,9 @@ def make_energy_loss(
         where AuxData is a namedtuple with (mean_energy, energy_std, clipped_energies, diff)
     """
     
-    # Default cost function: mean energy
     if cost_fn is None:
         cost_fn = jnp.mean
     
-    # Choose vmap implementation
     vmap_impl = get_vmap_fn(max_vmap_batch_size, mesh)
     
     batch_local_energy = vmap_impl(
@@ -59,10 +57,8 @@ def make_energy_loss(
         out_axes=0
     )
     
-    # Note: We don't need batch_log_psi anymore - in the JVP we call ansatz directly on the batch
     
     if use_custom_jvp:
-        # Internal structure to hold all data needed for gradient computation
         from collections import namedtuple
         AuxData = namedtuple('AuxData', ['mean_energy', 'energy_std', 'clipped_energies', 'diff'])
         
@@ -79,22 +75,22 @@ def make_energy_loss(
                 aux: AuxData namedtuple with (mean_energy, energy_std, clipped_energies, diff)
                      Can be indexed as aux[0], aux[1] for backward compatibility
             """
-            # Extract walkers from batch
+            # Extract walkers from batch. The custom-JVP path always
+            # evaluates with the factory ansatz (primal AND tangent); a
+            # batch-carried ansatz in the (walkers, ansatz) convention is
+            # honored only by the non-JVP variant below. Mixing the two
+            # here would make the primal energies and the JVP tangent
+            # disagree.
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                walkers, ansatz_arg = batch_data
-                ansatz_dynamic = ansatz_arg
+                walkers = batch_data[0]
             else:
                 walkers = batch_data
-                ansatz_dynamic = ansatz
             
-            # Compute all local energies using vmap (or batched_vmap)
             energies = batch_local_energy(walkers, params)
             
-            # Compute statistics
             mean_energy = jnp.mean(energies)
             energy_std = jnp.mean(jnp.abs(energies - mean_energy))
             
-            # Clip energies to avoid numerical instability
             clipped_energies = jnp.clip(
                 energies,
                 mean_energy - clip_multiplier * energy_std,
@@ -105,10 +101,8 @@ def make_energy_loss(
             mean_clipped = jnp.mean(clipped_energies)
             diff = clipped_energies - mean_clipped
             
-            # Compute cost
             cost = cost_fn(clipped_energies)
             
-            # Return cost and auxiliary data (namedtuple is indexable and JIT-compatible)
             return cost, AuxData(mean_energy, energy_std, clipped_energies, diff)
         
         @loss_fn.defjvp
@@ -130,45 +124,41 @@ def make_energy_loss(
             params, batch_data = primals
             params_tangent, _ = tangents
             
-            # Run forward pass to get primal output and cached intermediate values
             cost_primal, aux_data = loss_fn(params, batch_data)
             mean_energy = aux_data.mean_energy
             energy_std = aux_data.energy_std
             clipped_energies = aux_data.clipped_energies
             diff = aux_data.diff
             
-            # Extract walkers from batch_data
-            if isinstance(batch_data, tuple):
+            # Extract walkers from batch_data, mirroring the forward pass.
+            # The tangent uses the factory ansatz, matching the primal
+            # energies above (see the forward-pass note).
+            if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 walkers = batch_data[0]
             else:
                 walkers = batch_data
-            
-         # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
-            # batch_network takes (walkers, params) but we only differentiate params
-            # So we curry it to make a function of just params
+
+            # batch_network takes (walkers, params) but we only differentiate
+            # params, so curry it to a function of params alone.
             def log_psi_fn(p):
                 # Use standard vmap with checkpointing for correct global gradients
                 return vmap_impl(
-                    jax.checkpoint(lambda w, p: ansatz_dynamic(w, p)[0][1]),
+                    jax.checkpoint(lambda w, p: ansatz(w, p)[0][1]),
                     in_axes=(0, None),
                     out_axes=0
                     )(walkers, p)
             
-            # Single JVP call - now only differentiating wrt params
             log_psi_primal, log_psi_tangent = jax.jvp(
                 log_psi_fn,
                 (params,),
                 (params_tangent,)
             )
             
-            # VMC gradient: single dot product!
             # ∇⟨E⟩ = ⟨(E_L - ⟨E⟩) * ∇log|ψ|⟩ = dot(diff, ∇log|ψ|) / N
             n_walkers = diff.shape[0]
             cost_tangent = jnp.dot(diff, log_psi_tangent) / n_walkers
             
             
-            # Return primal cost and tangent
             # Tangent aux_data: use zeros for cached values (they're not differentiated)
             tangent_aux = AuxData(0.0, 0.0, jnp.zeros_like(clipped_energies), jnp.zeros_like(diff))
             return (cost_primal, aux_data), (cost_tangent, tangent_aux)
@@ -176,7 +166,6 @@ def make_energy_loss(
         return loss_fn
     
     else:
-        # Standard loss without custom JVP
         def loss_fn(params, batch_data):
             """Energy loss function (standard autodiff).
             
@@ -188,7 +177,6 @@ def make_energy_loss(
                 loss: Scalar loss value (mean energy or custom cost)
                 aux: Tuple of (mean_energy, energy_std)
             """
-            # Extract walkers from batch
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 walkers, ansatz_arg = batch_data
                 ansatz_dynamic = ansatz_arg
@@ -196,28 +184,23 @@ def make_energy_loss(
                 walkers = batch_data
                 ansatz_dynamic = ansatz
             
-            # Define batch_local_energy using the current ansatz
             batch_local_energy = vmap_impl(
                 lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
                 in_axes=(0, None), 
                 out_axes=0
             )
             
-            # Compute all local energies using vmap
             energies = batch_local_energy(walkers, params)
             
-            # Compute statistics
             mean_energy = jnp.mean(energies)
             energy_std = jnp.mean(jnp.abs(energies - mean_energy))
             
-            # Clip energies
             clipped_energies = jnp.clip(
                 energies,
                 mean_energy - clip_multiplier * energy_std,
                 mean_energy + clip_multiplier * energy_std
             )
             
-            # Compute cost
             cost = cost_fn(clipped_energies)
             
             return cost, (mean_energy, energy_std)
@@ -255,16 +238,13 @@ def make_variance_loss(
         Loss function with signature (params, batch_data) -> (variance, (mean_energy, energy_mad))
     """
     
-    # Choose vmap implementation
     vmap_impl = get_vmap_fn(max_vmap_batch_size, mesh)
     
-    # Define batch_local_energy using the current ansatz
     batch_local_energy = vmap_impl(
         lambda w, p: ansatz.local_energy(w, p)[0],
         in_axes=(0, None), 
         out_axes=0
     )
-    # Define batch_network using the current ansatz
     batch_network = vmap_impl(
         lambda w, p: ansatz(w, p)[0][1],  # Returns log_psi
         in_axes=(0, None), 
@@ -285,18 +265,15 @@ def make_variance_loss(
                 variance: Sample variance of local energies
                 aux: Tuple of (mean_energy, energy_std)
             """
-            # Extract walkers from batch
             if isinstance(batch_data, tuple):
                 walkers = batch_data[0]
             else:
                 walkers = batch_data
             
-            # Compute local energies
             energies = batch_local_energy(walkers, params)
             e_mean = jnp.mean(energies)
             e_std = jnp.mean(jnp.abs(energies - e_mean))
             
-            # Clip energies to suppress outliers (same scheme as make_energy_loss)
             if clip_multiplier > 0:
                 energies = jnp.clip(
                     energies,
@@ -306,7 +283,6 @@ def make_variance_loss(
                 # Recompute mean after clipping for a consistent variance
                 e_mean = jnp.mean(energies)
             
-            # Sample variance: sum((E - <E>)^2) / (n - 1)
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             
@@ -321,7 +297,6 @@ def make_variance_loss(
             params_tangent, _ = tangents
             jastrow_params_tangent, linear_coeffs_tangent = params_tangent
             
-            # Extract walkers and ansatz
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 walkers, ansatz_arg = batch_data
                 ansatz_dynamic = ansatz_arg
@@ -332,8 +307,7 @@ def make_variance_loss(
             if ansatz_dynamic is None:
                 raise ValueError("Ansatz must be provided either in make_variance_loss or in batch_data")
 
-            # Forward pass
-            energies = batch_local_energy(walkers, params) # Pass ansatz
+            energies = batch_local_energy(walkers, params)
             e_mean = jnp.mean(energies)
             e_std = jnp.mean(jnp.abs(energies - e_mean))
             
@@ -352,10 +326,7 @@ def make_variance_loss(
             
 
             
-            # ========== Standard Gradient Method ==========
-            # Compute JVP of local energies
             def compute_energies(p):
-                # Use standard vmap with checkpointing
                 return vmap_impl(
                         jax.checkpoint(lambda w, p: ansatz_dynamic.local_energy(w, p)[0]),
                         in_axes=(0, None),
@@ -367,8 +338,6 @@ def make_variance_loss(
                 (params,),
                 (params_tangent,)
             )
-            # Single JVP call - now only differentiating wrt params
-            #log_psi_primal = batch_network(walkers, params)
             # Variance gradient: ∇var = 2 * mean((E_L - ⟨E⟩) * ∇E_L)
             energy_diff = energies - e_mean
             if n_walkers > 1:
@@ -381,7 +350,6 @@ def make_variance_loss(
         return loss_fn
     
     else:
-        # Standard variance loss without custom JVP
         def loss_fn(params, batch_data):
             """Variance loss function (standard autodiff).
             
@@ -393,7 +361,6 @@ def make_variance_loss(
                 variance: Sample variance of local energies
                 aux: Tuple of (mean_energy, energy_std)
             """
-            # Extract walkers from batch
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 walkers, ansatz_arg = batch_data
                 ansatz_dynamic = ansatz_arg
@@ -401,19 +368,16 @@ def make_variance_loss(
                 walkers = batch_data
                 ansatz_dynamic = ansatz
             
-            # Define batch_local_energy using the current ansatz
             batch_local_energy = vmap_impl(
                 lambda w, p: ansatz_dynamic.local_energy(w, p)[0],
                 in_axes=(0, None), 
                 out_axes=0
             )
             
-            # Compute local energies
             energies = batch_local_energy(walkers, params)
             e_mean = jnp.mean(energies)
             e_std = jnp.mean(jnp.abs(energies - e_mean))
             
-            # Clip energies
             if clip_multiplier > 0:
                 energies = jnp.clip(
                     energies,
@@ -422,7 +386,6 @@ def make_variance_loss(
                 )
                 e_mean = jnp.mean(energies)
             
-            # Sample variance: sum((E - <E>)^2) / (n - 1)
             n_walkers = energies.shape[0]
             variance = jnp.sum((energies - e_mean)**2) / (n_walkers - 1) if n_walkers > 1 else 0.0
             

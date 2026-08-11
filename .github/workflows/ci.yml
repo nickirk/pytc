@@ -36,6 +36,7 @@ jobs:
           pytc/jastrow/test \
           pytc/vmc/test \
           pytc/ansatz/test \
+          pytc/df/test \
           pytc/solver/test \
           pytc/utils/test \
           pytc/coulomb/test \
