@@ -3,7 +3,7 @@ import os
 import numpy as np
 from pyscf import gto, scf
 from pytc.utils import fcidump
-from pytc.xtc import XTC
+from pytc.integrals.xtc import XTC
 from pytc.jastrow import REXP
 
 class TestFCIDump(unittest.TestCase):

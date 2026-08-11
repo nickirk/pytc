@@ -10,8 +10,8 @@ import jax.numpy as jnp
 from pyscf import gto, scf
 
 from pytc.jastrow.rexp import REXP
-from pytc.tc import ISDFTC
-from pytc.xtc import XTC, ISDFXTC
+from pytc.integrals.tc import ISDFTC
+from pytc.integrals.xtc import XTC, ISDFXTC
 
 
 jax.config.update("jax_enable_x64", True)
@@ -164,7 +164,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
             "_contract_delta_U_kernels",
             side_effect=AssertionError("direct tile should not route through chunk scheduler"),
         ):
-            with mock.patch("pytc.xtc._get_device_free_bytes", return_value=1):
+            with mock.patch("pytc.integrals.xtc._get_device_free_bytes", return_value=1):
                 with self.assertRaises(RuntimeError):
                     self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges)
 

@@ -64,6 +64,7 @@ if not os.environ.get("SPHINX_AUTODOC_BUILD"):
     log.log_startup_info()
 
 # Primary API - JAX autodiff implementations
+from . import integrals
 from . import tc
 from . import xtc
 from . import scf
@@ -79,6 +80,7 @@ from . import jastrow
 from . import vmc
 
 __all__ = [
+    'integrals',
     'tc',
     'xtc',
     'scf',

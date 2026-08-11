@@ -5,7 +5,7 @@ from pyscf import scf
 from pyscf.scf import hf
 import jax
 import jax.numpy as jnp
-from .tc import TC, ISDFTC
+from .integrals.tc import TC, ISDFTC
 
 class TCSCF(hf.RHF):
     """

@@ -9,7 +9,7 @@ Covers:
 import os
 import unittest
 
-import pytc.tc as tc
+import pytc.integrals.tc as tc
 from pytc.utils.gpu_memory import adaptive_rank_block_size
 
 

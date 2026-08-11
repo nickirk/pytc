@@ -7,7 +7,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pyscf import gto, scf
-from pytc.xtc import XTC
+from pytc.integrals.xtc import XTC
 from pytc.jastrow.rexp import REXP
 from pytc.solver import xtc_ccsd
 from pytc.fno import make_fno_mo_coeff

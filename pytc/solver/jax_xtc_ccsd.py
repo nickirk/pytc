@@ -884,7 +884,7 @@ def _update_amps(cc, t1, t2, eris):
     t1new_host /= eia_np
     t2new_host /= eijab_np
     
-    from pytc.xtc import invalidate_X_cache
+    from pytc.integrals.xtc import invalidate_X_cache
     invalidate_X_cache()
 
     logger.debug("_update_amps finished in %.3f s", time.perf_counter()-t_start)

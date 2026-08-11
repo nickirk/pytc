@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from pyscf import gto, scf, lib
 
-from pytc import xtc
+from pytc.integrals import xtc
 from pytc.jastrow import rexp
 from pytc.solver import xtc_ccsd
 

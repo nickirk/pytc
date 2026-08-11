@@ -5,7 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
-from pytc.xtc import XTC
+from pytc.integrals.xtc import XTC
 from pytc.jastrow import REXP
 
 jax.config.update("jax_enable_x64", True)

@@ -39,6 +39,7 @@ jobs:
           pytc/df/test \
           pytc/solver/test \
           pytc/utils/test \
+          pytc/coulomb/test \
           pytc/legacy/jastrow/test \
           pytc/legacy/test
         do
@@ -83,3 +84,4 @@ jobs:
         python -c "from pytc.vmc import optimize, sample"
         python -c "from pytc.jastrow import REXP, Poly, NuclearCusp, BoysHandy"
         python -c "from pytc.ansatz.sj import SlaterJastrow"
+        python -c "from pytc.coulomb import get_mo_coeff, get_grid_ao_values_and_weights"
