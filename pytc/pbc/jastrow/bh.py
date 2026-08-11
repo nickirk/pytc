@@ -8,7 +8,7 @@ from flax import struct
 
 from pytc.jastrow.bh import BoysHandy as MolecularBoysHandy
 
-from ..utils import mic_displacement
+from ..utils import mic_displacement, reduce_lattice
 
 
 @struct.dataclass
@@ -26,7 +26,7 @@ class BoysHandy(MolecularBoysHandy):
             name=name,
         )
         return cls(
-            lattice=jnp.asarray(cell.lattice_vectors()),
+            lattice=jnp.asarray(reduce_lattice(cell.lattice_vectors())),
             **{field.name: getattr(molecular, field.name) for field in fields(molecular)},
         )
 

@@ -14,6 +14,7 @@ from pytc.jastrow import CompositeJastrow
 from pytc.jastrow import NuclearCusp as MolecularNuclearCusp
 from pytc.pbc.jastrow import BoysHandy, NuclearCusp
 from pytc.pbc.tc import create_tc
+from pytc.pbc.utils import mic_displacement, reduce_lattice
 from pytc.pbc.xtc import create_xtc
 
 jax.config.update("jax_enable_x64", True)
@@ -36,6 +37,30 @@ def _mean_field(cell):
     mf.exxdiv = None
     mf.kernel()
     return mf
+
+
+def _fcc_lattice(length=6.0):
+    return 0.5 * length * np.array(
+        [
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+
+
+def _explicit_mic_distances(displacements, lattice, shell=3):
+    shifts = np.stack(
+        np.meshgrid(
+            np.arange(-shell, shell + 1),
+            np.arange(-shell, shell + 1),
+            np.arange(-shell, shell + 1),
+            indexing="ij",
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    images = displacements[:, None, :] - shifts @ lattice
+    return np.min(np.linalg.norm(images, axis=-1), axis=-1)
 
 
 def _molecule():
@@ -88,6 +113,76 @@ class TestPeriodicJastrows(unittest.TestCase):
             )
             np.testing.assert_allclose(shifted_gradient, gradient, atol=1e-10)
             np.testing.assert_allclose(shifted_laplacian, laplacian, atol=1e-10)
+
+    def test_fcc_minimum_image_matches_explicit_search(self):
+        lattice = _fcc_lattice()
+        reduced = reduce_lattice(lattice)
+        rng = np.random.default_rng(9127)
+        frac1 = rng.random((2000, 3))
+        frac2 = rng.random((2000, 3))
+        displacements = (frac1 - frac2) @ lattice
+
+        expected = _explicit_mic_distances(displacements, lattice, shell=3)
+        actual_vectors = mic_displacement(
+            jnp.asarray(displacements), jnp.zeros_like(displacements), reduced
+        )
+        actual = np.linalg.norm(np.asarray(actual_vectors), axis=-1)
+        np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
+
+        frac = displacements @ np.linalg.inv(lattice)
+        naive = np.linalg.norm(
+            (frac - np.round(frac)) @ lattice,
+            axis=-1,
+        )
+        self.assertGreater(np.count_nonzero(naive > expected + 1e-10), 0)
+
+        point = jnp.asarray(displacements[0])
+        jacobian = jax.jacfwd(
+            lambda r: mic_displacement(r, jnp.zeros(3), reduced)
+        )(point)
+        np.testing.assert_allclose(jacobian, np.eye(3), atol=1e-12)
+
+    def test_reduction_is_required_for_skewed_triclinic_cell(self):
+        lattice = np.array(
+            [
+                [0.0, 3.0, 3.0],
+                [3.0, 6.0, 9.0],
+                [9.0, 6.0, 9.0],
+            ]
+        )
+        reduced = reduce_lattice(lattice)
+        rng = np.random.default_rng(2204)
+        displacements = (rng.random((2000, 3)) - rng.random((2000, 3))) @ lattice
+        expected = _explicit_mic_distances(displacements, lattice, shell=3)
+
+        reduced_vectors = mic_displacement(
+            jnp.asarray(displacements), jnp.zeros_like(displacements), reduced
+        )
+        reduced_distances = np.linalg.norm(np.asarray(reduced_vectors), axis=-1)
+        np.testing.assert_allclose(
+            reduced_distances, expected, atol=1e-12, rtol=1e-12
+        )
+
+        unreduced_vectors = mic_displacement(
+            jnp.asarray(displacements), jnp.zeros_like(displacements), lattice
+        )
+        unreduced_distances = np.linalg.norm(np.asarray(unreduced_vectors), axis=-1)
+        self.assertGreater(
+            np.count_nonzero(unreduced_distances > expected + 1e-10), 0
+        )
+
+        cell = periodic_gto.Cell()
+        cell.atom = "H 0 0 0; H 0.2 0.3 0.4"
+        cell.basis = "sto-3g"
+        cell.a = lattice
+        cell.unit = "B"
+        cell.cart = True
+        cell.verbose = 0
+        cell.build()
+        np.testing.assert_allclose(BoysHandy.create(cell).lattice, reduced, atol=1e-12)
+        np.testing.assert_allclose(
+            NuclearCusp.create(cell, n_radial=20).lattice, reduced, atol=1e-12
+        )
 
 
 class TestGammaOracle(unittest.TestCase):

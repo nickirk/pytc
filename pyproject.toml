@@ -30,6 +30,7 @@ dependencies = [
 
     "pyscf",
     "h5py",
+    "spglib>=1.9.4",
 ]
 
 classifiers = [
