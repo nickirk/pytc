@@ -12,6 +12,7 @@ from pyscf import gto, scf
 from pytc.jastrow.rexp import REXP
 from pytc.tc import ISDFTC
 from pytc.xtc import XTC, ISDFXTC
+from pytc.solver import jax_xtc_ccsd
 
 
 jax.config.update("jax_enable_x64", True)
@@ -28,6 +29,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
         )
         mf = scf.RHF(mol)
         mf.kernel()
+        cls.mf = mf
 
         jastrow = REXP()
         cls.jparams = {"alpha": jnp.array([1.0])}
@@ -136,6 +138,50 @@ class TestISDFXTCPanelization(unittest.TestCase):
         self.assertGreater(np.linalg.norm(np.asarray(full_h - no_x_h)), 1e-10)
         self.assertGreater(abs(float(full_e0 - no_x_e0)), 1e-10)
         self.assertGreater(np.linalg.norm(np.asarray(full_du - no_x_du)), 1e-10)
+
+    def test_x_partition_switches_match_literal_zero_x_end_to_end(self):
+        """The JAX-CCSD split agrees with an explicit zero-X Hamiltonian."""
+        clean_env = {
+            "PYTC_XTC_DROP_X": "0",
+            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
+            "PYTC_XTC_DROP_X_RESIDUAL": "0",
+        }
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
+        with mock.patch.dict(os.environ, clean_env):
+            full_obj = self.isdf_xtc.isdf(self.jparams, **kwargs)
+
+        zero_x_kernels = dict(full_obj.isdf_kernels)
+        zero_x_kernels["X"] = np.zeros_like(np.asarray(zero_x_kernels["X"]))
+        literal_zero_x_obj = full_obj.replace(isdf_kernels=zero_x_kernels)
+
+        def solve(obj, drop_normal_order, drop_residual):
+            env = {
+                **clean_env,
+                "PYTC_XTC_DROP_X_NORMAL_ORDER": "1" if drop_normal_order else "0",
+                "PYTC_XTC_DROP_X_RESIDUAL": "1" if drop_residual else "0",
+            }
+            with mock.patch.dict(os.environ, env):
+                cc = jax_xtc_ccsd.RCCSD(
+                    self.mf, obj, self.jparams,
+                    max_memory=2_000, gpu_max_memory=2_000,
+                    on_the_fly_vvvv=True,
+                )
+                cc.max_cycle = 50
+                cc.kernel()
+                energy = float(cc.e_tot)
+                if hasattr(cc, "eris") and hasattr(cc.eris, "close"):
+                    cc.eris.close()
+                return energy
+
+        full = solve(full_obj, False, False)
+        drop_normal = solve(full_obj, True, False)
+        drop_residual = solve(full_obj, False, True)
+        drop_all = solve(full_obj, True, True)
+        literal_zero_x = solve(literal_zero_x_obj, False, False)
+
+        self.assertAlmostEqual(drop_all, literal_zero_x, places=10)
+        self.assertGreater(abs(full - drop_normal), 1e-10)
+        self.assertGreater(abs(full - drop_residual), 1e-10)
 
     def test_x_s_panel_blocks_matches_baseline(self):
         batch_size = 64
