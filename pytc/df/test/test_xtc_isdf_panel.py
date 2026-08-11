@@ -36,6 +36,41 @@ class TestISDFXTCPanelization(unittest.TestCase):
         n_rank = max(8, 3 * xtc.n_orb)
         cls.isdf_xtc = ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
 
+    def test_drop_x_preserves_direct_kernel_and_zeroes_exchange(self):
+        """The no-X study lever only removes the exchange kernel on a real toy system."""
+        kwargs = dict(
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        l_aux = self.isdf_xtc._compute_L_aux(
+            self.jparams,
+            batch_size=kwargs["batch_size"],
+            host_grid_block_size=kwargs["host_grid_block_size"],
+        )
+        with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "0"}):
+            full = self.isdf_xtc.compute_delta_u_kernels(
+                self.jparams, L_aux=l_aux, **kwargs
+            )
+        with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "1"}):
+            no_x = self.isdf_xtc.compute_delta_u_kernels(
+                self.jparams, L_aux=l_aux, **kwargs
+            )
+
+        np.testing.assert_array_equal(np.asarray(no_x["D"]), np.asarray(full["D"]))
+        self.assertGreater(np.linalg.norm(np.asarray(full["X"])), 0.0)
+        np.testing.assert_array_equal(np.asarray(no_x["X"]), np.zeros_like(no_x["X"]))
+        full_delta_u = self.isdf_xtc.replace(isdf_kernels=full).get_delta_U(
+            self.jparams
+        )
+        no_x_delta_u = self.isdf_xtc.replace(isdf_kernels=no_x).get_delta_U(
+            self.jparams
+        )
+        self.assertGreater(
+            np.linalg.norm(np.asarray(full_delta_u - no_x_delta_u)), 0.0,
+            "The exchange kernel must affect the downstream Delta-U integral.",
+        )
+
     def test_x_s_panel_blocks_matches_baseline(self):
         batch_size = 64
         orb_block_size = 2

@@ -1,5 +1,6 @@
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -196,6 +197,88 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
             f"include_d=True seen — D was double-counted: {recorded_include_d}",
         )
         fh.close()
+
+
+class TestDropXLever(unittest.TestCase):
+    """PYTC_XTC_DROP_X=1 zeroes the exchange X kernel (no-X accuracy study)."""
+
+    def _make_obj(self, n_orb=4, n_rank=3):
+        obj = xtc_mod.ISDFXTC.__new__(xtc_mod.ISDFXTC)
+        rng = np.random.default_rng(7)
+        object.__setattr__(obj, "n_orb", n_orb)
+        object.__setattr__(obj, "phi_isdf", rng.normal(size=(n_orb, n_rank)))
+        object.__setattr__(obj, "grad_phi_isdf", rng.normal(size=(n_orb, n_rank, 3)))
+        object.__setattr__(obj, "pivots", np.arange(n_rank))
+        object.__setattr__(obj, "is_incore", True)
+        object.__setattr__(obj, "save_path", None)
+        return obj
+
+    def _wire(self, obj, x_side_effect):
+        object.__setattr__(obj, "_compute_L_aux", lambda *a, **k: None)
+        object.__setattr__(obj, "_get_mf_dm", lambda: np.eye(obj.n_orb))
+        object.__setattr__(obj, "_compute_D_kernel", mock.Mock(return_value=np.ones((3, 3))))
+        object.__setattr__(obj, "_compute_X_kernel", mock.Mock(side_effect=x_side_effect))
+
+    def test_pin_set_skips_x_build_and_returns_zeros(self):
+        obj = self._make_obj()
+        self._wire(obj, AssertionError("X build must be skipped"))
+        with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "1"}):
+            out = obj.compute_delta_u_kernels(None)
+        np.testing.assert_array_equal(out["D"], np.ones((3, 3)))
+        np.testing.assert_array_equal(out["X"], np.zeros((4, 4, 3)))
+        obj._compute_X_kernel.assert_not_called()
+
+    def test_pin_unset_builds_x_normally(self):
+        obj = self._make_obj()
+
+        def fake_x(jp, ranges, bs, L_aux, Gb=None, L_Q=None, host_grid_block_size=None):
+            r, s = ranges[2], ranges[3]
+            return np.ones((r.stop - r.start, s.stop - s.start, 3))
+
+        obj = self._make_obj()
+        self._wire(obj, fake_x)
+        with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "0"}):
+            out = obj.compute_delta_u_kernels(None)
+        np.testing.assert_array_equal(out["X"], np.ones((4, 4, 3)))
+
+    def test_pin_set_persists_zero_x(self):
+        obj = self._make_obj()
+        self._wire(obj, AssertionError("X build must be skipped"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "store.h5")
+            with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "1"}):
+                out = obj.compute_delta_u_kernels(None, save_path=path)
+            np.testing.assert_array_equal(out["X"][:], np.zeros((4, 4, 3)))
+            out["X"].file.close()
+            with h5py.File(path, "r") as fh:
+                np.testing.assert_array_equal(fh["D"][:], np.ones((3, 3)))
+                np.testing.assert_array_equal(fh["X"][:], np.zeros((4, 4, 3)))
+
+    def test_store_load_pin_rebuilds_cache_instead_of_reusing_full_x(self):
+        X_ref = np.random.default_rng(3).normal(size=(4, 4, 3))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "store.h5")
+            with h5py.File(path, "w") as fh:
+                fh.create_dataset("D", data=np.full((3, 3), 7.0))
+                fh.create_dataset("X", data=X_ref)
+                fh.create_dataset("X_rm", data=X_ref)
+                fh.attrs["pytc_xtc_x_mode"] = "full"
+            fake_parent = types.SimpleNamespace(isdf_kernels={"L_aux": object()})
+            obj = self._make_obj()
+            self._wire(obj, AssertionError("X build must be skipped"))
+            captured = {}
+            object.__setattr__(obj, "replace", lambda **kw: captured.update(kw) or obj)
+            with mock.patch.object(xtc_mod.ISDFTC, "isdf", return_value=fake_parent):
+                with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "1"}):
+                    obj.isdf(None, save_path=path)
+            kernels = captured["isdf_kernels"]
+            np.testing.assert_array_equal(kernels["D"], np.ones((3, 3)))
+            np.testing.assert_array_equal(kernels["X"][:], np.zeros_like(X_ref))
+            kernels["X"].file.close()
+            with h5py.File(path, "r") as fh:
+                self.assertEqual(fh.attrs["pytc_xtc_x_mode"], "dropped")
+                np.testing.assert_array_equal(fh["X"][:], np.zeros_like(X_ref))
+                self.assertNotIn("X_rm", fh)
 
 
 if __name__ == "__main__":

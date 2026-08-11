@@ -1059,6 +1059,8 @@ class ISDFXTC(XTC, ISDFTC):
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+        drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
+        requested_x_mode = "dropped" if drop_x else "full"
         
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
@@ -1071,26 +1073,37 @@ class ISDFXTC(XTC, ISDFTC):
             try:
                 f = h5py.File(out_path, 'r')
                 if 'D' in f and 'X' in f:
-                    logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
-                    logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
-                    kernels['D'] = f['D'][:]
-                    if self.is_incore:
-                        logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
-                        kernels['X'] = f['X'][:]
+                    cached_x_mode = f.attrs.get("pytc_xtc_x_mode", "full")
+                    if isinstance(cached_x_mode, bytes):
+                        cached_x_mode = cached_x_mode.decode()
+                    if cached_x_mode != requested_x_mode:
+                        logger.info(
+                            "  Delta-U cache X mode is %s, but this run requests %s; "
+                            "recomputing D/X kernels.",
+                            cached_x_mode,
+                            requested_x_mode,
+                        )
                     else:
-                        # Keep the file open only when its datasets escape for
-                        # out-of-core streaming.
-                        logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
-                        kernels['X'] = f['X']
-                        # Rank-major twin (panel-contiguous) when the store
-                        # carries it; the factorized contraction prefers it.
-                        if 'X_rm' in f:
-                            logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
-                            kernels['X_rm'] = f['X_rm']
-                    logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    result = self.replace(isdf_kernels=kernels, save_path=out_path)
-                    keep_open = not self.is_incore
-                    return result
+                        logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
+                        logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
+                        kernels['D'] = f['D'][:]
+                        if self.is_incore:
+                            logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
+                            kernels['X'] = f['X'][:]
+                        else:
+                            # Keep the file open only when its datasets escape for
+                            # out-of-core streaming.
+                            logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
+                            kernels['X'] = f['X']
+                            # Rank-major twin (panel-contiguous) when the store
+                            # carries it; the factorized contraction prefers it.
+                            if 'X_rm' in f:
+                                logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
+                                kernels['X_rm'] = f['X_rm']
+                        logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
+                        result = self.replace(isdf_kernels=kernels, save_path=out_path)
+                        keep_open = not self.is_incore
+                        return result
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
             finally:
@@ -1162,6 +1175,12 @@ class ISDFXTC(XTC, ISDFTC):
         )
         
         logger.info("Computing X kernel...")
+
+        drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
+        if drop_x:
+            logger.warning(
+                "PYTC_XTC_DROP_X=1: skipping the X kernel build; X stays zero "
+                "and the exchange TC contribution is dropped from the integrals")
         
         if save_path:
             # If L_aux is a dataset from the same file, we must close the read-only handle 
@@ -1188,6 +1207,7 @@ class ISDFXTC(XTC, ISDFTC):
             if 'X' in f: del f['X']
             if 'X_rm' in f: del f['X_rm']  # stale twin once X is rewritten
             X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
+            f.attrs['pytc_xtc_x_mode'] = 'dropped' if drop_x else 'full'
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
@@ -1196,6 +1216,8 @@ class ISDFXTC(XTC, ISDFTC):
 
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
         for r0 in range(0, n_orb, orb_block_size):
+            if drop_x:
+                break
             r1 = min(r0 + orb_block_size, n_orb)
             logger.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
             for s_panel0 in range(r0, n_orb, s_panel_span):
