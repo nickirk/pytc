@@ -162,7 +162,9 @@ class TestOptionsRefusedAtConstruction(unittest.TestCase):
             dict(p_block_rows=4, kern_blocking={"staging_root": "/tmp"}),
             dict(p_block_rows=4, stage_eta_root="/tmp"),
             dict(solve_backend="host", p_block_rows=4),
-            dict(solve_backend="device", jitter_rcond=1e-14),
+            # device + jitter_rcond is legal since 2026-08-10 (the jitted path
+            # runs cholesky_jitter); jitter on a TRUNCATING mode still is not.
+            dict(solve_backend="device", jitter_rcond=1e-14, rtol=1e-6),
             dict(solve_backend="nonsense"),
         )
         for kw in cases:

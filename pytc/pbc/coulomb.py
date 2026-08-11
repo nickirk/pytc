@@ -605,7 +605,28 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
     )
 
 
-def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
+#: Production default for the S4 solve. eigh's truncating path is kept reachable,
+#: but a build that does not ask for spectral truncation gets the Cholesky path
+#: (owner decision 2026-08-10: "eigh gets us nowhere in production").
+DEFAULT_RETENTION_MODE = "cholesky_jitter"
+
+
+def _resolve_retention_mode(retention_mode, rtol, n_retained_pin=None):
+    """None means "caller did not choose"; a truncation-only argument decides.
+
+    rtol and n_retained_pin are meaningful only to the truncating modes, so
+    passing either IS a request for truncation. Letting a default collide with
+    an explicit argument would turn every existing caller into an error telling
+    them to use a different algorithm, which is not what a default is for.
+    """
+    if retention_mode is not None:
+        return retention_mode
+    if rtol is not None or n_retained_pin is not None:
+        return "single"
+    return DEFAULT_RETENTION_MODE
+
+
+def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
           provider_cls=RawKernelProvider, selection_mode=None,
           fixed_pivots=None, on_selection=None,
           bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
@@ -656,6 +677,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
         solve_infos (length-Nk list), immutable-plan requested/resolved
         provenance, and kernel_provider provenance.
     """
+    retention_mode = _resolve_retention_mode(retention_mode, rtol, n_retained_pin)
     validate_option_compatibility(
         p_block_rows=p_block_rows, kern_blocking=kern_blocking,
         stage_eta_root=stage_eta_root, solve_backend=solve_backend,
@@ -1342,7 +1364,7 @@ class ISDFDF:
         rank, block_size, rtol, retention_mode: forwarded to build().
     """
 
-    def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode="single",
+    def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
                  selection_mode=None, fixed_pivots=None,
                  bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
                  bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
@@ -1359,7 +1381,8 @@ class ISDFDF:
         self.rank = rank
         self.block_size = block_size
         self.rtol = rtol
-        self.retention_mode = retention_mode
+        self.retention_mode = _resolve_retention_mode(
+            retention_mode, rtol, n_retained_pin)
         self.solve_backend = solve_backend
         self.jitter_rcond = jitter_rcond
         self.cached_ao_max_bytes = cached_ao_max_bytes
@@ -1377,7 +1400,7 @@ class ISDFDF:
         validate_option_compatibility(
             p_block_rows=p_block_rows, kern_blocking=kern_blocking,
             stage_eta_root=stage_eta_root, solve_backend=solve_backend,
-            jitter_rcond=jitter_rcond, retention_mode=retention_mode, rtol=rtol,
+            jitter_rcond=jitter_rcond, retention_mode=self.retention_mode, rtol=rtol,
             n_retained_pin=n_retained_pin)
         self.stage_eta_root = stage_eta_root
         self.stage_eta_block = stage_eta_block
