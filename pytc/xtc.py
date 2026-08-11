@@ -1165,6 +1165,7 @@ class ISDFXTC(XTC, ISDFTC):
         L_Q = self.phi_isdf.T * sqrt_dm1[None, :]  # (N_rank, n_orb)
         
         logger.info("Computing D kernel...")
+        d_start_time = time.perf_counter()
         D = self._compute_D_kernel(
             jastrow_params,
             batch_size,
@@ -1173,7 +1174,11 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             d_reduce_group_blocks=d_reduce_group_blocks,
         )
-        
+        logger.info(
+            "  compute_delta_u_kernels: D build completed in %.3f s",
+            time.perf_counter() - d_start_time,
+        )
+
         logger.info("Computing X kernel...")
 
         drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
@@ -1215,6 +1220,7 @@ class ISDFXTC(XTC, ISDFTC):
         s_panel_span = max(1, orb_block_size) * x_s_panel_blocks
 
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
+        x_start_time = time.perf_counter()
         for r0 in range(0, n_orb, orb_block_size):
             if drop_x:
                 break
@@ -1254,6 +1260,12 @@ class ISDFXTC(XTC, ISDFTC):
 
                 del X_panel, X_panel_np
                 gc.collect()
+
+        logger.info(
+            "  compute_delta_u_kernels: X build completed in %.3f s%s",
+            time.perf_counter() - x_start_time,
+            " (dropped)" if drop_x else "",
+        )
                 
         if save_path:
             # Return dataset object for X to allow streaming
