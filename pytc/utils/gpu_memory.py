@@ -41,6 +41,12 @@ PYTC_SOLVER_BLK
     pre-set a known-good size and avoid JAX recompiles from repeated auto-shrink.
     Example: ``PYTC_SOLVER_BLK=130`` for nkeep=300 on an 80 GB A100.
 
+PYTC_XLA_CACHE_DIR
+    Absolute directory for the optional persistent JAX/XLA compilation cache.
+    Persistent caching is disabled unless this is set (or a cache directory is
+    passed directly to :func:`enable_xla_compilation_cache`).  This avoids an
+    implicit cache write to a user's home directory on shared systems.
+
 Usage
 -----
 >>> from pytc.utils.gpu_memory import estimate_blksize
@@ -1183,6 +1189,7 @@ def adaptive_rank_block_size(Np, Nq, N_fused, *,
 # ---------------------------------------------------------------------------
 
 _XLA_CACHE_ENABLED = False
+_XLA_CACHE_DIR_ENV = "PYTC_XLA_CACHE_DIR"
 
 
 def enable_xla_compilation_cache(cache_dir=None):
@@ -1197,12 +1204,14 @@ def enable_xla_compilation_cache(cache_dir=None):
     Parameters
     ----------
     cache_dir : str or None
-        Directory for the cache.  Defaults to ``~/.cache/jax_xla``.
-        The directory is created automatically by JAX if needed.
+        Absolute directory for the cache.  When omitted, reads
+        ``PYTC_XLA_CACHE_DIR``.  Persistent caching is disabled when neither
+        is supplied.  The directory is created before JAX is configured.
 
     Notes
     -----
-    Safe to call multiple times — subsequent calls are no-ops.
+    Safe to call multiple times after the cache is enabled — subsequent calls
+    are no-ops.
     Must be called *before* the first ``jax.jit`` invocation to have
     full effect (JAX ignores late cache-dir changes for already-traced
     functions).
@@ -1232,7 +1241,20 @@ def enable_xla_compilation_cache(cache_dir=None):
         return
 
     if cache_dir is None:
-        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jax_xla")
+        cache_dir = os.environ.get(_XLA_CACHE_DIR_ENV)
+
+    if not cache_dir:
+        logger.info("XLA persistent compilation cache disabled; set %s to "
+                    "an absolute approved directory to enable it",
+                    _XLA_CACHE_DIR_ENV)
+        return
+
+    cache_dir = os.fspath(cache_dir)
+    if not os.path.isabs(cache_dir):
+        raise ValueError(
+            f"{_XLA_CACHE_DIR_ENV} must be an absolute path; got {cache_dir!r}"
+        )
+    os.makedirs(cache_dir, exist_ok=True)
 
     jax.config.update("jax_compilation_cache_dir", cache_dir)
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
