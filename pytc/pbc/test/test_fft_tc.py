@@ -148,7 +148,35 @@ class TestFFTTC(unittest.TestCase):
         np.testing.assert_allclose(actual_u3, expected_u3, atol=1e-12, rtol=1e-12)
 
     def test_fft_xtc_delta_u_matches_direct_uniform_grid_oracle(self):
-        direct = XTC(
+        direct = self._direct_xtc()
+        expected = direct.get_delta_U(self.params, batch_size=8)
+        actual = self.xtc.get_delta_U(self.params, batch_size=8)
+        np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
+
+    def test_fft_xtc_integrals_match_direct_uniform_grid_oracle(self):
+        direct = self._direct_xtc()
+        dm1 = self.xtc._get_mf_dm()
+        np.testing.assert_allclose(
+            self.xtc.get_2b(self.params, dm1=dm1, batch_size=8),
+            direct.get_2b(self.params, dm1=dm1, batch_size=8),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        np.testing.assert_allclose(
+            self.xtc.get_1b(self.params, dm1=dm1, batch_size=8),
+            direct.get_1b(self.params, dm1=dm1, batch_size=8),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        np.testing.assert_allclose(
+            self.xtc.get_3b_fock(self.params, dm1),
+            direct.get_3b_fock_full(self.params, dm1),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+
+    def _direct_xtc(self):
+        return XTC(
             grid_points=self.xtc.grid_points,
             weights=self.xtc.weights,
             phi=self.xtc.phi,
@@ -161,9 +189,6 @@ class TestFFTTC(unittest.TestCase):
             mo_occ=self.xtc.mo_occ,
             energy_nuc=self.xtc.energy_nuc,
         )
-        expected = direct.get_delta_U(self.params, batch_size=8)
-        actual = self.xtc.get_delta_U(self.params, batch_size=8)
-        np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
 
     def test_fft_backend_rejects_nonuniform_weights(self):
         weights = np.asarray(self.tc.weights).copy()
