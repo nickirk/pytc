@@ -913,10 +913,9 @@ def _contract_vvvv_t2(cc, t2_jax, eris, t2new_host):
             return
 
         if isinstance(eris.vvvv, h5py.Dataset):
-            blksize, _ = estimate_blksize(
-                nocc, nvir, 'vvvv_gpu',
-                gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-                host_max_memory_mb=getattr(cc, 'max_memory', None))
+            blksize = xtc_ccsd.resolve_vvvv_disk_block_size(
+                nocc, nvir, cc, kind='vvvv_gpu'
+            )
             logger.debug(f"VVVV contraction from disk: blksize={blksize}, "
                          f"n_blocks={(nvir+blksize-1)//blksize}")
 

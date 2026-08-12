@@ -63,6 +63,35 @@ def _normal_ordered_e_core(reference_energy, fock, oooo, nocc):
     return core.real
 
 
+def resolve_vvvv_disk_block_size(nocc, nvir, cc, *, kind, n_fused=None):
+    """Resolve a bounded first-axis block for disk-backed VVVV I/O.
+
+    The host slab written by the AO2MO path is
+    ``(block, nvir, nvir, nvir)``.  It is a different resource from the
+    symmetric on-the-fly GPU tile, so an unconstrained compute estimate can
+    choose a single multi-GiB HDF5 write.  The RCCSD VVVV panel override is a
+    hard cap for both the writer and the disk-reader contractions.
+    """
+    auto, _ = estimate_blksize(
+        nocc, nvir, kind,
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        n_fused=n_fused,
+    )
+    p_block = getattr(cc, 'vvvv_p_block_size', None)
+    r_block = getattr(cc, 'vvvv_r_block_size', None)
+    if p_block is not None and r_block is not None and int(p_block) != int(r_block):
+        raise ValueError(
+            "Disk-backed VVVV requires equal vvvv_p_block_size and "
+            "vvvv_r_block_size"
+        )
+    configured = p_block if p_block is not None else r_block
+    block = int(configured) if configured is not None else int(auto)
+    if block < 1:
+        raise ValueError("Disk-backed VVVV block size must be positive")
+    return min(block, nvir)
+
+
 def make_x_normal_ordered_eris_view(
         full_eris, no_x_eris, drop_x_component, *,
         max_materialized_vvvv_bytes=256 * 1024**2):
@@ -588,10 +617,9 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             nocc = cc.nocc
             nvir = cc.nmo - nocc
 
-            mem_host = cc.max_memory * 1e6
-            # Block size: each block loads (blk, nvir, nvir, nvir) floats
-            blksize = max(4, int(mem_host / (nvir * nvir * nvir * 8)))
-            blksize = min(nvir, blksize)
+            blksize = resolve_vvvv_disk_block_size(
+                nocc, nvir, cc, kind='vvvv'
+            )
 
             from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
             chunks = [(p0, min(p0 + blksize, nvir))
@@ -1760,14 +1788,13 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
 
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv',
-        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
-        n_fused=_n_fused)
-    blksize = max(4, blksize)
+    blksize = resolve_vvvv_disk_block_size(
+        nocc, nvir, cc, kind='vvvv', n_fused=_n_fused
+    )
+    eris.vvvv_disk_block_size = blksize
+    eris.vvvv_disk_n_blocks = (nvir + blksize - 1) // blksize
     logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
-                f"n_blocks={(nvir+blksize-1)//blksize})")
+                f"n_blocks={eris.vvvv_disk_n_blocks})")
 
     from pytc.utils.prefetch import async_read, await_read
     ds = eris.vvvv
