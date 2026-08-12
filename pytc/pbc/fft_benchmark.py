@@ -28,9 +28,59 @@ import jax.numpy as jnp
 import numpy as np
 
 
-K1_FORWARD_TRANSFORMS = 2_552_580
-K1_INVERSE_TRANSFORMS = 10_460_880
-K1_TOTAL_TRANSFORMS = K1_FORWARD_TRANSFORMS + K1_INVERSE_TRANSFORMS
+@dataclass(frozen=True)
+class K1ProjectionTarget:
+    n_atoms: int = 54
+    n_mu: int = 15_660
+    basis: str = "cc-pVTZ"
+    pseudo: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("n_atoms", "n_mu"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.basis, str) or not self.basis.strip():
+            raise ValueError("basis must be a nonempty string")
+        if self.pseudo is not None and (
+            not isinstance(self.pseudo, str) or not self.pseudo.strip()
+        ):
+            raise ValueError("pseudo must be None or a nonempty string")
+
+    @property
+    def forward_channel_count(self) -> int:
+        return 1 + 3 * self.n_atoms
+
+    @property
+    def inverse_channel_count(self) -> int:
+        return 12 * self.n_atoms + 20
+
+    @property
+    def forward_transform_count(self) -> int:
+        return self.forward_channel_count * self.n_mu
+
+    @property
+    def inverse_transform_count(self) -> int:
+        return self.inverse_channel_count * self.n_mu
+
+    @property
+    def total_transform_count(self) -> int:
+        return self.forward_transform_count + self.inverse_transform_count
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "forward_channel_formula": "1 + 3 * n_atoms",
+            "inverse_channel_formula": "12 * n_atoms + 20",
+            "forward_channel_count": self.forward_channel_count,
+            "inverse_channel_count": self.inverse_channel_count,
+            "forward_transform_count": self.forward_transform_count,
+            "inverse_transform_count": self.inverse_transform_count,
+            "total_transform_count": self.total_transform_count,
+        }
+
+
+DEFAULT_K1_TARGET = K1ProjectionTarget()
 
 
 @dataclass(frozen=True)
@@ -77,20 +127,22 @@ def projected_wall_seconds(transform_count: int, transforms_per_second: float) -
 def projected_k1_wall_seconds(
     forward_transforms_per_second: float,
     inverse_transforms_per_second: float,
+    target: K1ProjectionTarget = DEFAULT_K1_TARGET,
 ) -> dict[str, float]:
     """Project the K1 transform wall using direction-specific warm rates."""
     forward_seconds = projected_wall_seconds(
-        K1_FORWARD_TRANSFORMS, forward_transforms_per_second
+        target.forward_transform_count, forward_transforms_per_second
     )
     inverse_seconds = projected_wall_seconds(
-        K1_INVERSE_TRANSFORMS, inverse_transforms_per_second
+        target.inverse_transform_count, inverse_transforms_per_second
     )
     total_seconds = forward_seconds + inverse_seconds
     return {
         "forward_seconds": forward_seconds,
         "inverse_seconds": inverse_seconds,
         "total_seconds": total_seconds,
-        "effective_transforms_per_second": K1_TOTAL_TRANSFORMS / total_seconds,
+        "effective_transforms_per_second": target.total_transform_count
+        / total_seconds,
     }
 
 
@@ -145,6 +197,7 @@ def _git_commit() -> str | None:
 
 
 def _time_transform(transform: Any, device_input: Any, repeats: int) -> dict[str, Any]:
+    """Time a pure transform against one fixed, immutable resident input."""
     start = time.perf_counter()
     output = transform(device_input)
     _sync(output)
@@ -161,11 +214,19 @@ def _time_transform(transform: Any, device_input: Any, repeats: int) -> dict[str
         "output": output,
         "compile_and_first_seconds": compile_and_first_seconds,
         "warm_seconds": [float(value) for value in samples],
+        "warm_min_seconds": float(min(samples)),
+        "warm_max_seconds": float(max(samples)),
+        "warm_mean_seconds": float(statistics.fmean(samples)),
+        "warm_spread_seconds": float(max(samples) - min(samples)),
+        "warm_population_stdev_seconds": float(statistics.pstdev(samples)),
         "warm_median_seconds": float(statistics.median(samples)),
     }
 
 
-def run_case(case: FFTBenchmarkCase) -> dict[str, Any]:
+def run_case(
+    case: FFTBenchmarkCase,
+    target: K1ProjectionTarget = DEFAULT_K1_TARGET,
+) -> dict[str, Any]:
     rng = np.random.default_rng(case.seed)
     real = rng.standard_normal(case.array_shape)
     imag = rng.standard_normal(case.array_shape)
@@ -202,13 +263,15 @@ def run_case(case: FFTBenchmarkCase) -> dict[str, Any]:
         )
         del timing["output"]
     k1_wall = projected_k1_wall_seconds(
-        forward["transforms_per_second"], inverse["transforms_per_second"]
+        forward["transforms_per_second"],
+        inverse["transforms_per_second"],
+        target,
     )
     input_bytes = int(host_input.nbytes)
     output_bytes = int(host_output.nbytes)
 
     return {
-        "schema": "pytc.pbc.fft_benchmark.v2",
+        "schema": "pytc.pbc.fft_benchmark.v3",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
         "case": asdict(case),
@@ -217,6 +280,7 @@ def run_case(case: FFTBenchmarkCase) -> dict[str, Any]:
         "dtype": str(host_input.dtype),
         "n_grid": math.prod(case.mesh),
         "flops_per_transform": flops_per_transform,
+        "timing_input_policy": "fixed immutable resident array reused across samples",
         "forward": forward,
         "inverse": inverse,
         "host_to_device_seconds": host_to_device_seconds,
@@ -233,9 +297,7 @@ def run_case(case: FFTBenchmarkCase) -> dict[str, Any]:
             "python": sys.version.split()[0],
         },
         "k1_projection": {
-            "forward_transform_count": K1_FORWARD_TRANSFORMS,
-            "inverse_transform_count": K1_INVERSE_TRANSFORMS,
-            "total_transform_count": K1_TOTAL_TRANSFORMS,
+            "target": target.receipt(),
             **k1_wall,
         },
     }
@@ -258,12 +320,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--channel-batch", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=9182)
+    parser.add_argument("--n-atoms", type=int, default=DEFAULT_K1_TARGET.n_atoms)
+    parser.add_argument("--n-mu", type=int, default=DEFAULT_K1_TARGET.n_mu)
+    parser.add_argument("--basis", default=DEFAULT_K1_TARGET.basis)
+    parser.add_argument("--pseudo", default=DEFAULT_K1_TARGET.pseudo)
     parser.add_argument("--output")
     parser.add_argument("--emit-matrix", action="store_true")
     args = parser.parse_args(argv)
 
+    target = K1ProjectionTarget(
+        n_atoms=args.n_atoms,
+        n_mu=args.n_mu,
+        basis=args.basis,
+        pseudo=args.pseudo,
+    )
+
     if args.emit_matrix:
-        _write_result([asdict(case) for case in recommended_cases()], args.output)
+        _write_result(
+            {
+                "projection_target": target.receipt(),
+                "cases": [asdict(case) for case in recommended_cases()],
+            },
+            args.output,
+        )
         return 0
 
     case = FFTBenchmarkCase(
@@ -273,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         repeats=args.repeats,
         seed=args.seed,
     )
-    _write_result(run_case(case), args.output)
+    _write_result(run_case(case, target), args.output)
     return 0
 
 
