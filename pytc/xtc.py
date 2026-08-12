@@ -54,6 +54,44 @@ def _drop_x_from_residual_integrals():
     )
 
 
+def _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z):
+    """Contract an orbital-leg Tucker X core without reconstructing X.
+
+    ``z`` represents ``X[r,s,c] = U[r,a] Z[a,b,c] U[s,b]``.  The returned
+    quantity is the X contribution to the unsymmetrized Delta-U tile,
+    ``-sum_c phi_p[p,c] phi_q[q,c] X[r,s,c]``.
+    """
+    phi_p = jnp.asarray(phi_p)
+    phi_q = jnp.asarray(phi_q)
+    u_r = jnp.asarray(u_r)
+    u_s = jnp.asarray(u_s)
+    z = jnp.asarray(z)
+    c_pq = phi_p[:, None, :] * phi_q[None, :, :]
+    core_pq = jnp.einsum("pqc,abc->pqab", c_pq, z, optimize=True)
+    return -jnp.einsum("pqab,ra,sb->pqrs", core_pq, u_r, u_s,
+                       optimize=True)
+
+
+def _tucker_x_normal_order_intermediates(u, z, dm1, phi_tilde, gb):
+    """Return the X intermediates used by reference normal ordering.
+
+    This is algebraically equivalent to contracting a dense X tensor, but
+    retains the separated orbital legs throughout.
+    """
+    u = jnp.asarray(u)
+    z = jnp.asarray(z)
+    dm1 = jnp.asarray(dm1)
+    phi_tilde = jnp.asarray(phi_tilde)
+    gb = jnp.asarray(gb)
+
+    density_core = jnp.einsum("ra,rs,sb->ab", u, dm1, u, optimize=True)
+    wc = jnp.einsum("abc,ab->c", z, density_core, optimize=True)
+    phi_core = jnp.einsum("ra,rc->ac", u, phi_tilde, optimize=True)
+    y_all = jnp.einsum("qb,abc,ac->qc", u, z, phi_core, optimize=True)
+    j_x_sym = -jnp.einsum("pa,qb,abc,c->pq", u, u, z, gb, optimize=True)
+    return wc, y_all, j_x_sym
+
+
 # ------------------------------------------------------------------
 # Opt-in issue-stage decomposition for ``_assemble_2b_tile``.
 #
@@ -1301,6 +1339,129 @@ class ISDFXTC(XTC, ISDFTC):
         else:
             return {'D': D, 'X': X}
 
+    def select_tucker_x_orbital_basis(
+        self,
+        jastrow_params,
+        n_factor,
+        *,
+        oversampling=8,
+        seed=0,
+        batch_size=1000,
+        L_aux=None,
+        orb_block_size=128,
+        host_grid_block_size=None,
+    ):
+        """Select an orbital Tucker basis from a streamed X sketch.
+
+        This avoids constructing or writing a global ``X[norb,norb,R]``
+        tensor.  A Khatri--Rao random test matrix is applied to each X panel
+        as it is produced, yielding only an ``norb x (n_factor+oversampling)``
+        sketch.  QR of that sketch supplies the common orbital basis U.
+
+        The approximation is controlled by ``n_factor``.  Requesting the
+        complete orbital dimension returns a full orthogonal basis, for which
+        a subsequently built Tucker core is an exact representation of X.
+        """
+        n_orb = int(self.n_orb)
+        n_factor = int(n_factor)
+        if not 1 <= n_factor <= n_orb:
+            raise ValueError(
+                f"n_factor must lie in [1, {n_orb}], got {n_factor}"
+            )
+        oversampling = max(0, int(oversampling))
+        n_probe = min(n_orb, n_factor + oversampling)
+        orb_block_size = max(1, int(orb_block_size))
+
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+
+        dm1 = self._get_mf_dm()
+        gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        sqrt_dm1 = jnp.sqrt(jnp.maximum(jnp.diagonal(dm1), 0.0))
+        l_q = self.phi_isdf.T * sqrt_dm1[None, :]
+        n_rank = int(self.phi_isdf.shape[1])
+
+        rng = np.random.default_rng(seed)
+        # A separable random map over (s,c) avoids an norb*R*n_probe
+        # allocation while still sampling both right-hand X indices.
+        omega_s = rng.standard_normal((n_orb, n_probe)) / np.sqrt(n_probe)
+        omega_c = rng.standard_normal((n_rank, n_probe))
+        sketch = np.zeros((n_orb, n_probe), dtype=np.float64)
+
+        logger.info(
+            "Selecting Tucker-X orbital basis: factors=%d probes=%d; "
+            "streaming r panels of %d rows",
+            n_factor, n_probe, orb_block_size,
+        )
+        for r0 in range(0, n_orb, orb_block_size):
+            r1 = min(r0 + orb_block_size, n_orb)
+            panel = self._compute_X_kernel(
+                jastrow_params,
+                (slice(None), slice(None), slice(r0, r1), slice(None)),
+                batch_size,
+                L_aux,
+                Gb=gb,
+                L_Q=l_q,
+                host_grid_block_size=host_grid_block_size,
+            )
+            sketch[r0:r1] = np.einsum(
+                'rsc,sk,ck->rk', np.asarray(panel), omega_s, omega_c,
+                optimize=True,
+            )
+            del panel
+            gc.collect()
+
+        basis, _ = np.linalg.qr(sketch, mode='reduced')
+        return basis[:, :n_factor]
+
+    def compute_tucker_x_core(
+        self,
+        jastrow_params,
+        orbital_basis,
+        *,
+        batch_size=1000,
+        L_aux=None,
+        host_grid_block_size=None,
+    ):
+        """Build ``Z = U.T X U`` directly, without materializing dense X.
+
+        ``orbital_basis`` must have orthonormal columns in the original MO
+        row space.  The returned core has shape ``(M, M, R)`` and pairs with
+        U through ``X[r,s,c] ~= U[r,a] Z[a,b,c] U[s,b]``.
+        """
+        u = np.asarray(orbital_basis, dtype=np.float64)
+        n_orb = int(self.n_orb)
+        if u.ndim != 2 or u.shape[0] != n_orb or not u.shape[1]:
+            raise ValueError(
+                f"orbital_basis must have shape ({n_orb}, M), got {u.shape}"
+            )
+        gram_error = np.max(np.abs(u.T @ u - np.eye(u.shape[1])))
+        if gram_error > 1e-10:
+            raise ValueError(
+                "orbital_basis columns must be orthonormal; "
+                f"maximum Gram-matrix error is {gram_error:.3e}"
+            )
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+
+        dm1 = self._get_mf_dm()
+        gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        sqrt_dm1 = jnp.sqrt(jnp.maximum(jnp.diagonal(dm1), 0.0))
+        l_q = self.phi_isdf.T * sqrt_dm1[None, :]
+        projected_rows = jnp.matmul(jnp.asarray(u.T), self.phi_isdf)
+        n_factor = u.shape[1]
+        core = self._compute_X_kernel(
+            jastrow_params,
+            (slice(None), slice(None), slice(0, n_factor), slice(0, n_factor)),
+            batch_size,
+            L_aux,
+            Gb=gb,
+            L_Q=l_q,
+            host_grid_block_size=host_grid_block_size,
+            orbital_rows=projected_rows,
+        )
+        return {'U': u, 'Z': np.asarray(core)}
+
     def _iter_sharded_delta_u_blocks(
         self,
         L_aux,
@@ -1509,7 +1670,9 @@ class ISDFXTC(XTC, ISDFTC):
             
         return D
 
-    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024, L_aux=None, Gb=None, L_Q=None, host_grid_block_size=None):
+    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024,
+                          L_aux=None, Gb=None, L_Q=None,
+                          host_grid_block_size=None, orbital_rows=None):
         """Compute X kernel for Delta U for a specific orbital range with grid-blocking.
         
         Uses low-rank factorization: Q = L_Q @ L_Q.T where L_Q has shape (N_rank, n_orb).
@@ -1536,12 +1699,18 @@ class ISDFXTC(XTC, ISDFTC):
             sqrt_dm1 = jnp.sqrt(jnp.maximum(dm1_diag, 0.0))
             L_Q = self.phi_isdf.T * sqrt_dm1[None, :]
             
-        phi_isdf = self.phi_isdf
-        n_orb = self.n_orb
+        # ``orbital_rows`` lets a caller form U.T @ X @ U directly.  The
+        # grid/kernel algebra remains unchanged because X is bilinear in the
+        # two orbital rows; only the rows supplied to _calc_X_shard change.
+        # The density factor L_Q intentionally remains in the original MO
+        # basis, since it represents the reference density rather than an X
+        # output index.
+        phi_isdf = self.phi_isdf if orbital_rows is None else orbital_rows
+        n_orb = phi_isdf.shape[0]
         
         slice_p, slice_q, slice_r, slice_s = ranges
-        Nr = self.phi_isdf[slice_r].shape[0]
-        Ns = self.phi_isdf[slice_s].shape[0]
+        Nr = phi_isdf[slice_r].shape[0]
+        Ns = phi_isdf[slice_s].shape[0]
         X = np.zeros((Nr, Ns, n_rank))
         
         xi_phi_ds = None
