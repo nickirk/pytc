@@ -80,3 +80,12 @@ def create_tc(mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
         mo_coeff=coefficients,
         nocc=int(np.sum(mf.mo_occ > 0)),
     )
+
+
+def create_tc_fft(mf, jastrow_factor, mo_coeff=None, mesh=None):
+    """Build a uniform-grid Gamma TC object with FFT-backed integrals."""
+    from .fft_tc import create_tc_fft as _create_tc_fft
+
+    return _create_tc_fft(
+        mf, jastrow_factor, mo_coeff=mo_coeff, mesh=mesh
+    )

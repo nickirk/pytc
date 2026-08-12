@@ -28,3 +28,12 @@ def create_xtc(mf, jastrow_factor, mo_coeff=None, grid_lvl=2):
         mo_occ=jnp.asarray(mf.mo_occ),
         energy_nuc=float(mf.energy_nuc()),
     )
+
+
+def create_xtc_fft(mf, jastrow_factor, mo_coeff=None, mesh=None):
+    """Build a uniform-grid Gamma xTC object with FFT-backed integrals."""
+    from .fft_tc import create_xtc_fft as _create_xtc_fft
+
+    return _create_xtc_fft(
+        mf, jastrow_factor, mo_coeff=mo_coeff, mesh=mesh
+    )
