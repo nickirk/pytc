@@ -133,7 +133,7 @@ class TestGetKBareDeviceAdapter(unittest.TestCase):
         cls.cell = _make_cell()
         cls.kpts = cls.cell.make_kpts([1, 1, 3], wrap_around=False)
         cls.built = coulomb.build(
-            cls.cell, cls.kpts, rank=6, block_size=100, rtol=1e-8,
+            cls.cell, cls.kpts, rank=6, block_size=100,
         )
         cls.mesh = cls.built["mesh_obj"]
         cls.inpv = np.asarray(cls.built["inpv_kpt"])

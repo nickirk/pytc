@@ -54,7 +54,7 @@ class TestGetAoEriMatchesGetK(unittest.TestCase):
     def _check_at_rank(self, rank):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=rank, block_size=200, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=rank, block_size=200)
         mesh_obj = result["mesh_obj"]
         inpv_kpt = np.asarray(result["inpv_kpt"])
         coul_kpt = np.asarray(result["coul_kpt"])
@@ -95,7 +95,7 @@ class TestGetAoEriStructure(unittest.TestCase):
     def test_shape_and_momentum_conservation_for_general_triples(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=10, block_size=200, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=10, block_size=200)
         mesh_obj = result["mesh_obj"]
         inpv_kpt = np.asarray(result["inpv_kpt"])
         coul_kpt = np.asarray(result["coul_kpt"])
@@ -149,7 +149,7 @@ class TestGetAoEriVsExactFftdf(unittest.TestCase):
     def test_rank_matched_parity_vs_fftdf_exact_eri(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=15, block_size=200, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=15, block_size=200)
         mesh_obj = result["mesh_obj"]
         inpv_kpt = np.asarray(result["inpv_kpt"])
         coul_kpt = np.asarray(result["coul_kpt"])
@@ -179,7 +179,7 @@ class TestGetMoEri(unittest.TestCase):
     def test_matches_manual_ao_to_mo_transform(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=10, block_size=200, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=10, block_size=200)
         mesh_obj = result["mesh_obj"]
         inpv_kpt = np.asarray(result["inpv_kpt"])
         coul_kpt = np.asarray(result["coul_kpt"])

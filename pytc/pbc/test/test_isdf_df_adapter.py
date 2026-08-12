@@ -115,7 +115,7 @@ class TestISDFDFStructure(unittest.TestCase):
         mf = KRHF(cell, kpts)
         mf.verbose = 0
         mf.with_df = ISDFDF(
-            cell, kpts, rank=3, block_size=13, rtol=1e-8,
+            cell, kpts, rank=3, block_size=13,
             fixed_pivots=pivots,
         )
         mf.kernel()
@@ -146,7 +146,7 @@ class TestISDFDFStructure(unittest.TestCase):
         canonical_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
         pivots = self._fixed_pivots(cell, canonical_kpts)
         adapter = ISDFDF(
-            cell, canonical_kpts, rank=3, block_size=13, rtol=1e-4,
+            cell, canonical_kpts, rank=3, block_size=13,
             fixed_pivots=pivots,
         )
 
@@ -166,7 +166,7 @@ class TestISDFDFStructure(unittest.TestCase):
         order = np.array([2, 0, 1])
         shuffled_kpts = canonical_kpts[order]
         shuffled = ISDFDF(
-            cell, shuffled_kpts, rank=3, block_size=13, rtol=1e-4,
+            cell, shuffled_kpts, rank=3, block_size=13,
             fixed_pivots=pivots,
         )
         _, vk_shuffled = shuffled.get_jk(
@@ -193,7 +193,7 @@ class TestISDFDFStructure(unittest.TestCase):
         wrapped_kpts = cell.make_kpts([1, 1, 3], wrap_around=True)
         wrapped_mesh = canonicalize_kpts(cell, wrapped_kpts)
         wrapped = ISDFDF(
-            cell, wrapped_kpts, rank=3, block_size=13, rtol=1e-4,
+            cell, wrapped_kpts, rank=3, block_size=13,
             fixed_pivots=pivots,
         )
         dm_wrapped = wrapped_mesh.from_canonical(dm)
@@ -210,7 +210,7 @@ class TestISDFDFStructure(unittest.TestCase):
         canonical_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
         pivots = self._fixed_pivots(cell, canonical_kpts)
         adapter = ISDFDF(
-            cell, canonical_kpts, rank=3, block_size=13, rtol=1e-4,
+            cell, canonical_kpts, rank=3, block_size=13,
             fixed_pivots=pivots,
         )
         built = adapter.build()
@@ -255,7 +255,7 @@ class TestISDFDFRealKrhf(unittest.TestCase):
         for rank in (6, 14):
             mf = KRHF(cell, kpts)
             mf.verbose = 0
-            mf.with_df = ISDFDF(cell, kpts, rank=rank, block_size=100, rtol=1e-4)
+            mf.with_df = ISDFDF(cell, kpts, rank=rank, block_size=100)
             e = mf.kernel()
             self.assertTrue(mf.converged, msg=f"rank={rank} did not converge")
             errors.append(abs(e - e_ref) / cell.natm)
@@ -268,7 +268,7 @@ class TestISDFDFRealKrhf(unittest.TestCase):
         mf = KRHF(cell, kpts)
         mf.verbose = 0
         self.assertEqual(mf.exxdiv, "ewald")  # pyscf's own KSCF default
-        mf.with_df = ISDFDF(cell, kpts, rank=6, block_size=100, rtol=1e-4)
+        mf.with_df = ISDFDF(cell, kpts, rank=6, block_size=100)
         e = mf.kernel()
         self.assertTrue(mf.converged)
         self.assertTrue(np.isfinite(e))

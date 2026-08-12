@@ -355,7 +355,7 @@ class TestBuild(unittest.TestCase):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
         seen = []
-        result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8,
+        result = coulomb.build(cell, kpts, rank=3, block_size=9,
                                on_selection=lambda p, prov: seen.append((p, prov)))
         self.assertEqual(len(seen), 1)
         pivots, prov = seen[0]
@@ -368,7 +368,7 @@ class TestBuild(unittest.TestCase):
         self.assertNotEqual(result["selection_provenance"]["pivot_indices"][0], -12345)
 
         # The round trip is the point: feeding it back reproduces the build.
-        resumed = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8,
+        resumed = coulomb.build(cell, kpts, rank=3, block_size=9,
                                 fixed_pivots=np.asarray(
                                     result["selection_provenance"]["pivot_indices"]))
         np.testing.assert_allclose(resumed["coul_kpt"], result["coul_kpt"],
@@ -384,7 +384,7 @@ class TestBuild(unittest.TestCase):
             raise RuntimeError("scratch filesystem full")
 
         with self.assertLogs("pytc.pbc.coulomb", level="WARNING") as cm:
-            result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8,
+            result = coulomb.build(cell, kpts, rank=3, block_size=9,
                                    on_selection=boom)
         self.assertTrue(any("scratch filesystem full" in m for m in cm.output))
         # Recorded, not silent: a later reader can tell the pivots were not saved.
@@ -425,7 +425,7 @@ class TestBuild(unittest.TestCase):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
         # rank=3 is far below n_topup=16: exactly the combination that used to raise.
-        result = coulomb.build(cell, kpts, rank=3, block_size=9, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=3, block_size=9)
         prov = result["selection_provenance"]
         self.assertEqual(prov["selector"], "bpc")
         self.assertIn(prov["storage"], ("cached", "streamed"))
@@ -440,7 +440,7 @@ class TestBuild(unittest.TestCase):
     def test_build_produces_self_consistent_artifact(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=4, block_size=11, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=4, block_size=11)
 
         mesh_obj = result["mesh_obj"]
         self.assertEqual(mesh_obj.n_kpts, 3)
@@ -468,11 +468,11 @@ class TestBuild(unittest.TestCase):
         )
         pivots, _, _ = pivoted_cholesky_hermitian(diagonal, column, rank=3)
         selected = coulomb.build(
-            cell, kpts, rank=3, block_size=13, rtol=1e-8,
+            cell, kpts, rank=3, block_size=13,
             selection_mode="streamed", fixed_pivots=pivots,
         )
         baseline = coulomb.build(
-            cell, kpts, rank=3, block_size=13, rtol=1e-8,
+            cell, kpts, rank=3, block_size=13,
             selection_mode="streamed",
         )
         self.assertEqual(selected["selection_provenance"]["mode"], "fixed_pivots_experimental")
@@ -485,7 +485,7 @@ class TestBuild(unittest.TestCase):
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
         with self.assertRaisesRegex(ValueError, "requires an explicit fixed_pivots"):
             coulomb.build(
-                cell, kpts, rank=3, block_size=13, rtol=1e-8,
+                cell, kpts, rank=3, block_size=13,
                 selection_mode="fixed_pivots",
             )
 
@@ -499,7 +499,8 @@ class TestBuild(unittest.TestCase):
 
         # The manual reconstruction below drives the exact streamed oracle, so
         # request it explicitly rather than inheriting whatever the default is.
-        result = coulomb.build(cell, kpts, rank=rank, block_size=block_size, rtol=1e-8,
+        result = coulomb.build(cell, kpts, rank=rank, block_size=block_size,
+                               rtol=1e-8, retention_mode="single",
                                selection_mode="streamed")
 
         mesh_obj = canonicalize_kpts(cell, kpts)
@@ -561,7 +562,7 @@ class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
         )
         result = coulomb.build(
             cell, kpts, rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
-            selection_mode="streamed",
+            retention_mode="single", selection_mode="streamed",
         )
         for q, info in enumerate(result["solve_infos"]):
             self.assertLessEqual(
@@ -575,7 +576,7 @@ class TestDiamond111DevicePrecisionGuard(unittest.TestCase):
         with jax.enable_x64(False):
             with self.assertRaises(ValueError) as ctx:
                 coulomb.build(
-                    cell, kpts, rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                    cell, kpts, rank=6 * cell.nao_nr(), block_size=64,
                     selection_mode="streamed",
                 )
         message = str(ctx.exception)
@@ -627,7 +628,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         # reshaped bpc cache); with the pre-fix code this raised in pair_convolve.
         result = coulomb.build(
             cell, kpts, rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
-            selection_mode="bpc_cached_gemm",
+            retention_mode="single", selection_mode="bpc_cached_gemm",
         )
         for q, info in enumerate(result["solve_infos"]):
             self.assertLessEqual(
@@ -649,7 +650,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         cell.verbose = 0
         cell.build()
         kpts = cell.make_kpts([2, 2, 2])
-        kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+        kw = dict(rank=6 * cell.nao_nr(), block_size=64,
                   selection_mode="bpc_cached_gemm", bpc_batch_size=64,
                   bpc_min_separation=2.0, bpc_candidate_oversampling=4, bpc_n_topup=16)
         reuse = coulomb.build(cell, kpts, reuse_ao_cache_for_eta=True, **kw)
@@ -661,9 +662,16 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         np.testing.assert_array_equal(
             np.asarray(reuse["inpv_kpt"]), np.asarray(freed["inpv_kpt"]),
         )
+        # 1e-10 was the eigh path's fp-tie. On the cholesky_jitter default the
+        # two AO streaming orders agree to ~1.9e-09 (0.9% of elements exceed
+        # 1e-10), so the tie is looser -- the jittered Cholesky is more
+        # order-sensitive than the eigendecomposition was. Kept on the default
+        # deliberately: this asserts memory-strategy equivalence for the path we
+        # ship, and the bound is set from the shipped path's actual behaviour
+        # rather than inherited from a solve we no longer use.
         np.testing.assert_allclose(
             np.asarray(reuse["coul_kpt"]), np.asarray(freed["coul_kpt"]),
-            rtol=0.0, atol=1e-10,
+            rtol=0.0, atol=1e-8,
         )
 
     def test_stage_eta_root_matches_in_ram_build_and_cleans_up(self):
@@ -682,7 +690,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         cell.verbose = 0
         cell.build()
         kpts = cell.make_kpts([2, 2, 2])
-        kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+        kw = dict(rank=6 * cell.nao_nr(), block_size=64,
                   selection_mode="bpc_cached_gemm", bpc_batch_size=64,
                   bpc_min_separation=2.0, bpc_candidate_oversampling=4,
                   bpc_n_topup=16)
@@ -743,6 +751,7 @@ class TestBpcCachedGemmEtaReuse(unittest.TestCase):
         cell.build()
         kpts = cell.make_kpts([2, 2, 2])
         kw = dict(rank=6 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                  retention_mode="single",
                   selection_mode="bpc_cached_gemm", bpc_batch_size=64,
                   bpc_min_separation=2.0, bpc_candidate_oversampling=4,
                   bpc_n_topup=16)
@@ -786,7 +795,7 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
         self.assertTrue(jax.config.jax_enable_x64)
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
-        common = dict(rank=4, block_size=9, rtol=1e-8)
+        common = dict(rank=4, block_size=9)
         want = coulomb.build(cell, kpts, **common)
         # Several panels, so the off-diagonal pair work and the AO re-sweep both
         # actually run -- one panel would exercise neither.
@@ -817,7 +826,7 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
         # the combination would let a caller believe two levers were active.
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
-        common = dict(rank=4, block_size=9, rtol=1e-8, p_block_rows=2)
+        common = dict(rank=4, block_size=9,  p_block_rows=2)
         with self.assertRaises(ValueError):
             coulomb.build(cell, kpts, kern_blocking=dict(
                 staging_root="/tmp", row_block=2, grid_chunk=8), **common)
@@ -844,7 +853,7 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
             kpts = cell.make_kpts(kmesh, wrap_around=False)
             for panel in (1, 2, 3):        # 3 leaves a ragged final panel
                 with self.subTest(kmesh=tuple(kmesh), p_block_rows=panel):
-                    common = dict(rank=4, block_size=9, rtol=1e-8,
+                    common = dict(rank=4, block_size=9,
                                   p_block_rows=panel)
                     mirrored = coulomb.build(cell, kpts, **common)
                     explicit = coulomb.build(
@@ -882,7 +891,7 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
             kpts = cell.make_kpts(kmesh, wrap_around=False)
             for panel in (1, 2, 3):
                 with self.subTest(kmesh=tuple(kmesh), p_block_rows=panel):
-                    common = dict(rank=4, block_size=9, rtol=1e-8,
+                    common = dict(rank=4, block_size=9,
                                   p_block_rows=panel)
                     fallback = coulomb.build(cell, kpts, **common)
                     fused = coulomb.build(cell, kpts, provider_cls=_FusedOnly,
@@ -894,7 +903,7 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
     def test_panel_blocked_agrees_across_panel_sizes(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
-        common = dict(rank=4, block_size=9, rtol=1e-8)
+        common = dict(rank=4, block_size=9)
         one = coulomb.build(cell, kpts, p_block_rows=4, **common)
         many = coulomb.build(cell, kpts, p_block_rows=1, **common)
         np.testing.assert_allclose(np.asarray(many["coul_kpt"]),

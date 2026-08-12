@@ -157,7 +157,7 @@ class TestBuildPathEmitsTheWarning(unittest.TestCase):
 
         coulomb.build(
             cell, cell.make_kpts([1, 1, 1]), rank=2 * cell.nao_nr(),
-            block_size=64, rtol=1e-4, selection_mode="streamed",
+            block_size=64, selection_mode="streamed",
         )
 
     def test_real_build_warns_on_a_hostile_mesh(self):

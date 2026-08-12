@@ -99,7 +99,7 @@ class TestReachesTheSelector(unittest.TestCase):
         ):
             built = coulomb.build(
                 cell, cell.make_kpts([1, 1, 1]),
-                rank=2 * cell.nao_nr(), block_size=64, rtol=1e-4,
+                rank=2 * cell.nao_nr(), block_size=64,
                 selection_mode="bpc_cached_gemm", bpc_n_topup=2,
                 bpc_batch_size=4, **kw
             )
@@ -134,7 +134,7 @@ class TestDfAdapterForwards(unittest.TestCase):
         cell = _make_cell()
         df = coulomb.ISDFDF(
             cell, cell.make_kpts([1, 1, 1]), rank=2 * cell.nao_nr(),
-            block_size=64, rtol=1e-4, bpc_blocked_projection=True,
+            block_size=64, bpc_blocked_projection=True,
         )
         self.assertTrue(df.bpc_blocked_projection)
 

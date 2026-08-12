@@ -614,15 +614,24 @@ DEFAULT_RETENTION_MODE = "cholesky_jitter"
 def _resolve_retention_mode(retention_mode, rtol, n_retained_pin=None):
     """None means "caller did not choose"; a truncation-only argument decides.
 
-    rtol and n_retained_pin are meaningful only to the truncating modes, so
-    passing either IS a request for truncation. Letting a default collide with
-    an explicit argument would turn every existing caller into an error telling
-    them to use a different algorithm, which is not what a default is for.
+    A truncation-only argument (rtol, n_retained_pin) used to select the eigh
+    path silently. That made the cholesky_jitter default true of this module and
+    false of the tooling -- the shared campaign helper passes rtol
+    unconditionally, so production kept running eigh after the default flipped,
+    and 119 test call sites were validating eigh while we believed otherwise.
+    Refusing is the only version of a default that holds: truncation is now
+    something a caller asks for by name.
     """
     if retention_mode is not None:
         return retention_mode
     if rtol is not None or n_retained_pin is not None:
-        return "single"
+        given = "rtol" if rtol is not None else "n_retained_pin"
+        raise ValueError(
+            f"{given} is a truncation threshold, and the default retention "
+            f"mode {DEFAULT_RETENTION_MODE!r} does not truncate, so {given} "
+            f"would be silently ignored. Pass retention_mode='single' to ask "
+            f"for eigh truncation explicitly, or drop {given}."
+        )
     return DEFAULT_RETENTION_MODE
 
 

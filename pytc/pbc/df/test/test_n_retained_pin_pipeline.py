@@ -121,7 +121,8 @@ class TestPinnedPipeline(unittest.TestCase):
         from pytc.pbc import coulomb
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
-        built = coulomb.build(cell, kpts, rank=4, block_size=11, n_retained_pin=2)
+        built = coulomb.build(cell, kpts, rank=4, block_size=11, n_retained_pin=2,
+                              retention_mode="single")
         self.assertGreaterEqual(built["n_selected"], 2)
         for q, info in enumerate(built["solve_infos"]):
             self.assertEqual(info["n_retained_pin"], 2, f"q={q}")
