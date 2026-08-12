@@ -352,21 +352,73 @@ def pivoted_cholesky_batched_hermitian(
     return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
 
 
-def _resolve_pair_convolve(convolve_device):
-    """Pick the host or device convolve.
+def _resolve_pair_convolve(convolve_device=True):
+    """The device convolve. THE NUMPY PATH IS NO LONGER USED BY THE BUILD.
 
-    The device path is not GPU-only: on the JAX CPU backend XLA fuses the
-    post-GEMM chain (transform, square, inverse transform) that the numpy path
-    materialises stage by stage. Measured at the 333 block shape on 48 host
-    threads, 354.1 against 139.99 GFLOP/s -- 2.53x with no GPU present, agreeing
-    with the numpy path to 8.4e-16. Whether a device is used is JAX's placement
-    decision, not this flag's.
+    Owner directive (2026-08-12): "remove the numpy path, since we want the same
+    code to be run on GPU in the future". One runtime, no host round-trip.
+
+    It is also strictly faster, and for a reason worth keeping written down: the
+    build used to mix numpy/BLAS here with JAX/XLA in the Coulomb apply, so two
+    thread pools coexisted -- and XLA's is sized from the cpuset and ignores
+    OMP_NUM_THREADS, MKL_NUM_THREADS and OPENBLAS_NUM_THREADS alike. Measured on
+    the real 222 build (job 59928607):
+
+        numpy path, 24 threads   243.7 s      numpy path, 8 threads   35.7 s
+        device path, 24 threads   38.0 s      device path, 8 threads  35.5 s
+
+    **6.4x at the default thread count, and the thread sensitivity collapses from
+    6.8x to 1.07x.** Tuning OMP_NUM_THREADS reached the same wall, but a thread
+    count tuned on a 24-core node is wrong on a 48-core one; removing the second
+    pool from the hot path is machine-independent.
+
+    On the JAX CPU backend XLA also fuses the post-GEMM chain (transform, square,
+    inverse transform) that the numpy path materialised stage by stage -- 354.1
+    against 139.99 GFLOP/s at the 333 block shape. Whether a device is used is
+    JAX's placement decision, not this function's.
+
+    ``convolve_device`` is retained as an accepted argument so existing callers
+    and stored provenance keep working, but it no longer selects anything.
+    Passing False is honoured as a request for the REFERENCE implementation and
+    is used only by the equivalence tests -- see ``pair_convolve`` in kpts.py,
+    which stays precisely because the device path is gated against it to 8.4e-16
+    rather than assumed correct. Deleting the oracle would delete the proof.
     """
-    from pytc.pbc.df.kpts import pair_convolve
-    if not convolve_device:
+    if convolve_device is False:
+        # Explicit opt-in to the reference path. Not reachable from build();
+        # kept so the gate test can ask for it by name.
+        from pytc.pbc.df.kpts import pair_convolve
         return pair_convolve
     from pytc.pbc.df.kpts import pair_convolve_device
     return pair_convolve_device
+
+
+_NUMPY_PATH_IGNORED_LOGGED = False
+
+
+def _build_pair_convolve(convolve_device):
+    """The convolve the BUILD uses. Always the device one.
+
+    Separate from ``_resolve_pair_convolve`` on purpose: the resolver still has
+    to be able to hand out the numpy reference for the equivalence gate, while
+    the build must not be able to reach it at all. Routing the build through its
+    own function is what makes "the numpy path is gone from production" a
+    property of the code rather than of every caller's argument.
+
+    A caller that explicitly asked for the numpy path is told, once per process,
+    that it did not get it. Silently ignoring an argument is how a lever comes to
+    look like it fired when it did not -- which has already cost this project a
+    day of measurement.
+    """
+    global _NUMPY_PATH_IGNORED_LOGGED
+    if convolve_device is False and not _NUMPY_PATH_IGNORED_LOGGED:
+        logger.info(
+            "convolve_device=False was requested but the numpy convolve path has "
+            "been removed from the build (owner directive 2026-08-12, for GPU "
+            "portability); using the device path, which is gated against the "
+            "numpy reference to 8.4e-16.")
+        _NUMPY_PATH_IGNORED_LOGGED = True
+    return _resolve_pair_convolve(True)
 
 
 def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=False):
@@ -395,7 +447,7 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=Fa
         (Pi, eta): (Nk, Nip, Nip) and (Nk, Nip, Ng) complex128.
     """
     # Local import: kpts.py stays a leaf.
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _build_pair_convolve(convolve_device)
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -503,7 +555,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
     (Pi, eta_memmap, stats). Costs and design:
     docs/isdf-periodic/task46_phaseB_eta_staging_spec.md.
     """
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _build_pair_convolve(convolve_device)
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -754,40 +806,103 @@ def apply_raw_kernel_and_solve(
 # given l_q[neg[q]] = conj(l_q[q]). Verified in test_raw_kernel_apply_dagger_law.
 
 
+# WHY THESE ARE SEPARATE jit UNITS AND MUST STAY THAT WAY.
+#
+# Written as one traced region, XLA fuses the elementwise work into the FFT's
+# loop nest and the fused kernel loses the threaded FFT path. Measured on 24
+# cores at n_ip=256, mesh 57^3 (task #103, job 59921330):
+#
+#     fft + ifft alone                       0.239 s at 12.45 cores
+#     + ONE elementwise multiply between     1.161 s at  2.46 cores
+#     the whole thing fused (as shipped)     2.354 s at  1.26 cores
+#     the pointwise algebra alone, no FFT    0.117 s at  3.52 cores
+#
+# Transforms 0.24 s plus pointwise 0.12 s, but 2.35 s together -- 6.5x the sum
+# of the parts. Nothing got more expensive; only the COMBINING did. Splitting the
+# stages into separate jit units forces materialisation at the boundaries and
+# lets each run at its own ceiling: 7.46x at n_ip=2048 (job 59923770), output
+# bit-identical (rel_err 0.0), and the win grows with panel size.
+#
+# `lax.optimization_barrier` does NOT work here (1.99 s vs 1.83 s): it constrains
+# the optimiser without forcing a buffer boundary. Only separate compiled units do.
+#
+# NO MEMORY IS SAVED BY FUSING, which is what the previous docstring assumed.
+# Peak RSS is identical across fused, split, and every row-chunk size tested --
+# 28.79 GiB in all five cases -- because the transform already allocates
+# full-size arrays internally, so the temporary the fusion "avoided" was being
+# allocated anyway. Row-chunking to bound it is therefore unnecessary AND slower
+# (1.8-2.1x), since it starves the transform of the batch it parallelises over.
+#
+# If you re-fuse these for readability, you will silently give back ~7x.
+
+
+# No grid_mesh argument: these act on an already-reshaped 4-D array, so the mesh
+# is carried by its shape, which jit already keys on.
+@jax.jit
+def _fft_fwd(lq_mesh):
+    return jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
+
+
+@jax.jit
+def _fft_inv(wq_mesh):
+    return jnp.fft.ifftn(wq_mesh, axes=(1, 2, 3))
+
+
 @partial(jax.jit, static_argnames=("grid_mesh",))
+def _apply_coulg(wq_mesh, coulG_scaled, grid_mesh):
+    vq = jnp.asarray(coulG_scaled, dtype=wq_mesh.dtype).reshape(grid_mesh)
+    return wq_mesh * vq[None, :, :, :]
+
+
 def _raw_kernel_apply_core(lq, coulG_scaled, grid_mesh):
-    """Jitted core of the "raw" provider: v_q = IFFT(coulG_scaled * FFT(lq)).
-    No validation (host wrapper's job), no phase multiply, no outer
-    conjugate."""
+    """Core of the "raw" provider: v_q = IFFT(coulG_scaled * FFT(lq)).
+
+    No validation (host wrapper's job), no phase multiply, no outer conjugate.
+
+    NOT one jit: see the note above. The stages are separate compiled units on
+    purpose, and re-fusing them costs ~7x.
+    """
     n_ip = lq.shape[0]
     lq_mesh = lq.reshape((n_ip,) + grid_mesh)
-    wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
-    vq_mesh = jnp.asarray(coulG_scaled, dtype=lq.dtype).reshape(grid_mesh)
-    vq_mesh = wq_mesh * vq_mesh[None, :, :, :]
-    rq_mesh = jnp.fft.ifftn(vq_mesh, axes=(1, 2, 3))
+    wq_mesh = _fft_fwd(lq_mesh)
+    vq_mesh = _apply_coulg(wq_mesh, coulG_scaled, grid_mesh)
+    rq_mesh = _fft_inv(vq_mesh)
     return rq_mesh.reshape(n_ip, -1)
 
 
 @partial(jax.jit, static_argnames=("grid_mesh",))
+def _rf_pre(eta, gphase, grid_mesh):
+    return (eta * gphase[None, :]).reshape((eta.shape[0],) + grid_mesh)
+
+
+@jax.jit
+def _rf_post(rq_mesh, gphase):
+    # n_ip comes from the array's own leading axis, not an argument: a traced
+    # int cannot be a reshape dimension.
+    return jnp.conj(rq_mesh.reshape(rq_mesh.shape[0], -1)) * gphase[None, :]
+
+
 def _raw_right_factor_core(eta, coulG_scaled, gphase, grid_mesh):
-    """Jitted core of ``right_q(eta) = conj(apply(q, eta*g)) * g``.
+    """``right_q(eta) = conj(apply(q, eta*g)) * g``, as SEPARATE jit units.
 
-    The whole sequence in one traced function so the phase multiply fuses into
-    the transform rather than materialising ``lq = eta*g`` as a separate array.
-    That temporary is the point: in the P-blocked loop it is panel-sized and was
-    rebuilt per pair, so removing it is the saving, not the transform itself.
+    NOT one traced region -- see the note above ``_fft_fwd``. The previous
+    revision fused the whole sequence deliberately, to avoid materialising
+    ``lq = eta*g`` as a panel-sized array. **That saving does not exist**: peak
+    RSS is identical fused and split (28.79 GiB in every variant measured,
+    job 59923770), because the transform allocates full-size arrays regardless.
+    The fusion bought no memory and cost 6.5x in wall.
 
-    Numerically this is NOT required to match the unfused composition bitwise --
-    XLA may reassociate across the fused region. The pre-registered gate holds it
-    to a c128 bound against the generic ``apply``-composed path instead.
+    Numerically this is NOT required to match the fused composition bitwise --
+    XLA may reassociate either way. In practice the split path measured
+    ``rel_err = 0.0`` against the fused one at every shape tested; the
+    pre-registered gate still holds it to a c128 bound against the generic
+    ``apply``-composed path rather than to bitwise identity.
     """
-    n_ip = eta.shape[0]
-    lq_mesh = (eta * gphase[None, :]).reshape((n_ip,) + grid_mesh)
-    wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
-    vq_mesh = jnp.asarray(coulG_scaled, dtype=eta.dtype).reshape(grid_mesh)
-    vq_mesh = wq_mesh * vq_mesh[None, :, :, :]
-    rq_mesh = jnp.fft.ifftn(vq_mesh, axes=(1, 2, 3))
-    return jnp.conj(rq_mesh.reshape(n_ip, -1)) * gphase[None, :]
+    lq_mesh = _rf_pre(eta, gphase, grid_mesh)
+    wq_mesh = _fft_fwd(lq_mesh)
+    vq_mesh = _apply_coulg(wq_mesh, coulG_scaled, grid_mesh)
+    rq_mesh = _fft_inv(vq_mesh)
+    return _rf_post(rq_mesh, gphase)
 
 
 def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
@@ -1883,7 +1998,7 @@ def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
     """
     X_rows = np.asarray(X_rows)
     n_kpts, n_rows = int(X_rows.shape[0]), int(X_rows.shape[1])
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _build_pair_convolve(convolve_device)
     eta = np.empty((n_kpts, n_rows, int(n_grid)), dtype=np.complex128)
     col = 0
     index = 0
@@ -2014,7 +2129,7 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         raise ValueError(f"panel_rows must be an integer, got {type(panel_rows)}.")
     if int(panel_rows) <= 0:
         raise ValueError(f"panel_rows must be positive, got {panel_rows}.")
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _build_pair_convolve(convolve_device)
 
     # Pi needs no AO stream -- it is X against itself -- so it is built once and
     # never regenerated, whatever the panel schedule does.
