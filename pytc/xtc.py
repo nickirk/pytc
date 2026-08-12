@@ -1440,25 +1440,28 @@ class ISDFXTC(XTC, ISDFTC):
 
         logger.info(
             "Selecting Tucker-X orbital basis: factors=%d probes=%d; "
-            "streaming r panels of %d rows",
+            "streaming fused r panels of %d rows",
             n_factor, n_probe, orb_block_size,
         )
         for r0 in range(0, n_orb, orb_block_size):
             r1 = min(r0 + orb_block_size, n_orb)
-            panel = self._compute_X_kernel(
+            # Apply the random map while the X contributions are still in
+            # the grid kernel.  Materializing a (r, s, rank) panel first
+            # would repeat virtually all of a dense-X build merely to reduce
+            # it to the r-by-probe sketch on the host.
+            panel_sketch = self._compute_X_sketch(
                 jastrow_params,
                 (slice(None), slice(None), slice(r0, r1), slice(None)),
                 batch_size,
                 L_aux,
                 Gb=gb,
                 L_Q=l_q,
+                omega_s=omega_s,
+                omega_c=omega_c,
                 host_grid_block_size=host_grid_block_size,
             )
-            sketch[r0:r1] = np.einsum(
-                'rsc,sk,ck->rk', np.asarray(panel), omega_s, omega_c,
-                optimize=True,
-            )
-            del panel
+            sketch[r0:r1] = np.asarray(panel_sketch)
+            del panel_sketch
             gc.collect()
 
         basis, _ = np.linalg.qr(sketch, mode='reduced')
@@ -1719,6 +1722,139 @@ class ISDFXTC(XTC, ISDFTC):
         )
             
         return D
+
+    def _compute_X_sketch(self, jastrow_params, ranges, batch_size=1024,
+                          L_aux=None, Gb=None, L_Q=None,
+                          omega_s=None, omega_c=None,
+                          host_grid_block_size=None):
+        """Apply a separable random map to X without materializing X.
+
+        Given ``omega_s[s,k]`` and ``omega_c[c,k]``, return
+
+        ``S[r,k] = sum_{s,c} X[r,s,c] omega_s[s,k] omega_c[c,k]``.
+
+        This is the same Khatri--Rao range-finder sketch used by
+        :meth:`select_tucker_x_orbital_basis`, but the s/c projection is
+        associated into the grid kernel.  In particular, no ``(r,s,rank)``
+        exchange panel is allocated, copied to the host, or contracted after
+        the fact.
+        """
+        if omega_s is None or omega_c is None:
+            raise ValueError("omega_s and omega_c are required for an X sketch")
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+
+        n_devices = jax.local_device_count()
+        devices = jax.local_devices()
+        n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
+        n_orb = self.phi_isdf.shape[0]
+        omega_s = np.asarray(omega_s, dtype=np.float64)
+        omega_c = np.asarray(omega_c, dtype=np.float64)
+        if omega_s.shape[0] != n_orb or omega_c.shape[0] != n_rank:
+            raise ValueError(
+                "X sketch probe dimensions disagree with orbital/rank dimensions: "
+                f"omega_s={omega_s.shape}, omega_c={omega_c.shape}, "
+                f"expected ({n_orb}, K) and ({n_rank}, K)"
+            )
+        if omega_s.ndim != 2 or omega_c.ndim != 2 or omega_s.shape[1] != omega_c.shape[1]:
+            raise ValueError("omega_s and omega_c must be rank-2 with equal probe counts")
+
+        dm1 = self._get_mf_dm()
+        if Gb is None:
+            Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        if L_Q is None:
+            sqrt_dm1 = jnp.sqrt(jnp.maximum(jnp.diagonal(dm1), 0.0))
+            L_Q = self.phi_isdf.T * sqrt_dm1[None, :]
+
+        slice_p, slice_q, slice_r, slice_s = ranges
+        del slice_p, slice_q
+        nr = self.phi_isdf[slice_r].shape[0]
+        omega_s_panel = omega_s[slice_s]
+        n_probe = omega_s.shape[1]
+
+        xi_phi_ds = None
+        f_xi = None
+        if self.xi_phi is None and self.save_path:
+            f_xi = h5py.File(self.save_path, 'r')
+            xi_phi_ds = f_xi['xi_phi']
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        grid_sharding = NamedSharding(mesh, P('devices', None))
+        weights_sharding = NamedSharding(mesh, P('devices'))
+        xi_sharding = NamedSharding(mesh, P(None, 'devices'))
+        g_sharding = NamedSharding(mesh, P(None, 'devices', None))
+
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P('devices', None), P('devices'), P(None, 'devices'),
+                      P(None, 'devices', None), P(), P(), P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+        def sharded_X_sketch(grid_shard, weights_shard, xi_shard, G_shard,
+                             params, omega_s_rep, omega_c_rep, l_q_rep):
+            x_local = self._calc_X_sketch_shard(
+                params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, self.phi_isdf, ranges, n_orb, batch_size, l_q_rep,
+                omega_s_rep, omega_c_rep,
+            )
+            return jax.lax.psum(x_local, 'devices')
+
+        params_rep = jax.tree_util.tree_map(
+            lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
+        )
+        omega_s_rep = jax.device_put(omega_s_panel, rep_sharding)
+        omega_c_rep = jax.device_put(omega_c, rep_sharding)
+        l_q_rep = jax.device_put(np.asarray(L_Q), rep_sharding)
+        if host_grid_block_size is None:
+            host_grid_block_size = n_grid
+        block_padded = (
+            (host_grid_block_size + n_devices - 1) // n_devices
+        ) * n_devices
+
+        sketch = np.zeros((nr, n_probe), dtype=np.float64)
+        t_prepare_host = t_h2d = t_shard_compute = t_host_accumulate = 0.0
+        t_kernel_start = time.perf_counter()
+        try:
+            xi_phi_source = self.xi_phi if self.xi_phi is not None else xi_phi_ds
+            for _g0, _g1, sharded_grid, sharded_weights, sharded_G, sharded_xi_phi, t_host_blk, t_h2d_blk in self._iter_sharded_delta_u_blocks(
+                L_aux=L_aux,
+                xi_phi_source=xi_phi_source,
+                host_grid_block_size=host_grid_block_size,
+                block_padded=block_padded,
+                n_rank=n_rank,
+                devices=devices,
+                grid_sharding=grid_sharding,
+                weights_sharding=weights_sharding,
+                g_sharding=g_sharding,
+                xi_sharding=xi_sharding,
+            ):
+                t_prepare_host += t_host_blk
+                t_h2d += t_h2d_blk
+                t_compute_start = time.perf_counter()
+                sketch_rep = sharded_X_sketch(
+                    sharded_grid, sharded_weights, sharded_xi_phi, sharded_G,
+                    params_rep, omega_s_rep, omega_c_rep, l_q_rep,
+                )
+                t_shard_compute += time.perf_counter() - t_compute_start
+                t_accum_start = time.perf_counter()
+                sketch += np.asarray(sketch_rep)
+                t_host_accumulate += time.perf_counter() - t_accum_start
+                del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, sketch_rep
+                gc.collect()
+        finally:
+            if f_xi:
+                f_xi.close()
+
+        logger.debug(
+            "  _compute_X_sketch profile: prepare_host=%.4f s, host_to_device=%.4f s, "
+            "shard_compute=%.4f s, host_accumulate=%.4f s, total=%.4f s",
+            t_prepare_host, t_h2d, t_shard_compute, t_host_accumulate,
+            time.perf_counter() - t_kernel_start,
+        )
+        return sketch
 
     def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024,
                           L_aux=None, Gb=None, L_Q=None,
@@ -1997,6 +2133,111 @@ class ISDFXTC(XTC, ISDFTC):
         
         X_final, _ = jax.lax.scan(scan_X, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
         return X_final
+
+    def _calc_X_sketch_shard(self, jastrow_params, dm1, grid_points, weights,
+                             xi_phi, G_shard, Gb, phi, ranges, n_orb,
+                             batch_size=1024, L_Q=None, omega_s=None,
+                             omega_c=None):
+        """Return the in-kernel Khatri--Rao X sketch for one grid shard.
+
+        This is the associative form of ``_calc_X_shard`` followed by
+        ``einsum('rsc,sk,ck->rk', X, omega_s, omega_c)``.  Contracting the
+        s and ISDF-rank legs first avoids the dense X accumulator that the
+        basis selector does not otherwise need.
+        """
+        del jastrow_params, dm1, Gb, n_orb
+        N_rank = phi.shape[1]
+        N_shard = grid_points.shape[0]
+        _slice_p, _slice_q, slice_r, slice_s = ranges
+        phi_r = phi[slice_r]
+        phi_s = phi[slice_s]
+        Nr = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+        n_probe = omega_s.shape[1]
+
+        if omega_s.shape[0] != Ns or omega_c.shape != (N_rank, n_probe):
+            raise ValueError(
+                "X sketch shard probe dimensions disagree with its orbital/rank panels"
+            )
+
+        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
+        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
+        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
+        n_batches = padded_size // batch_size
+
+        def compute_proj(phi_rows, vec_T, l_q, chunk_size=2048):
+            """Compute ``(phi_rows * vec_T) @ l_q`` in rank chunks."""
+            n_rows = phi_rows.shape[0]
+            n_batch = vec_T.shape[0]
+            n_density = l_q.shape[1]
+            n_rank = l_q.shape[0]
+            num_chunks = (n_rank + chunk_size - 1) // chunk_size
+            pad_len = num_chunks * chunk_size - n_rank
+            if pad_len > 0:
+                phi_p = jnp.pad(phi_rows, ((0, 0), (0, pad_len)))
+                vec_p = jnp.pad(vec_T, ((0, 0), (0, pad_len)))
+                lq_p = jnp.pad(l_q, ((0, pad_len), (0, 0)))
+            else:
+                phi_p, vec_p, lq_p = phi_rows, vec_T, l_q
+
+            def body_fn(carry, i):
+                start = i * chunk_size
+                p_c = jax.lax.dynamic_slice(phi_p, (0, start), (n_rows, chunk_size))
+                v_c = jax.lax.dynamic_slice(vec_p, (0, start), (n_batch, chunk_size))
+                l_c = jax.lax.dynamic_slice(lq_p, (start, 0), (chunk_size, n_density))
+                term = jnp.matmul(p_c[None, :, :] * v_c[:, None, :], l_c)
+                return carry + term, None
+
+            result, _ = jax.lax.scan(
+                body_fn, jnp.zeros((n_batch, n_rows, n_density)),
+                jnp.arange(num_chunks),
+            )
+            return result
+
+        def project_pair(p_r, p_s, rank_probe, w_batch):
+            # p_s is first reduced over its orbital leg.  The remaining
+            # contraction is only (batch, r, probe), rather than a dense
+            # (batch, r, s) pair object followed by a rank-sized output.
+            p_s_probe = jnp.einsum('bso,sk->bok', p_s, omega_s,
+                                    optimize=True)
+            return jnp.einsum('bro,bok,bk,b->rk', p_r, p_s_probe,
+                              rank_probe, w_batch, optimize=True)
+
+        def scan_X_sketch(sketch_acc, i_batch):
+            start = i_batch * batch_size
+            w_batch = jax.lax.dynamic_slice(weights_padded, (start,), (batch_size,))
+            xi_batch = jax.lax.dynamic_slice(
+                xi_padded, (0, start), (N_rank, batch_size)
+            )
+            G_batch = jax.lax.dynamic_slice(
+                G_padded, (0, start, 0), (N_rank, batch_size, 3)
+            )
+            xi_T = xi_batch.T
+            xi_probe = jnp.matmul(xi_T, omega_c)
+            p_s_xi = compute_proj(phi_s, xi_T, L_Q)
+            p_r_xi = compute_proj(phi_r, xi_T, L_Q)
+
+            for component in range(3):
+                g_T = G_batch[:, :, component].T
+                g_probe = jnp.matmul(g_T, omega_c)
+                p_r_g = compute_proj(phi_r, g_T, L_Q)
+                p_s_g = compute_proj(phi_s, g_T, L_Q)
+                sketch_acc = sketch_acc + project_pair(
+                    p_r_g, p_s_g, xi_probe, w_batch
+                )
+                sketch_acc = sketch_acc + project_pair(
+                    p_r_g, p_s_xi, g_probe, w_batch
+                )
+                sketch_acc = sketch_acc + project_pair(
+                    p_r_xi, p_s_g, g_probe, w_batch
+                )
+            return sketch_acc, None
+
+        sketch_final, _ = jax.lax.scan(
+            scan_X_sketch, jnp.zeros((Nr, n_probe)), jnp.arange(n_batches)
+        )
+        return sketch_final
 
 
 

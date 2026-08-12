@@ -49,6 +49,20 @@ class _FakeTuckerBuild:
         self.panel_shapes.append(panel.shape)
         return panel
 
+    def _compute_X_sketch(
+        self, params, ranges, batch_size, l_aux, *, Gb=None, L_Q=None,
+        omega_s=None, omega_c=None, host_grid_block_size=None,
+    ):
+        """Dense-oracle implementation of the fused selector protocol."""
+        panel = self._compute_X_kernel(
+            params, ranges, batch_size, l_aux, Gb=Gb, L_Q=L_Q,
+            host_grid_block_size=host_grid_block_size,
+        )
+        return np.einsum(
+            "rsc,sk,ck->rk", panel, omega_s[ranges[3]], omega_c,
+            optimize=True,
+        )
+
 
 class _FakeTuckerRuntime:
     """Minimal runtime object for the dense-vs-factor solver entry points."""
@@ -120,6 +134,34 @@ class TestTuckerXAlgebra(unittest.TestCase):
 
 
 class TestStreamedTuckerBuild(unittest.TestCase):
+    def test_fused_sketch_shard_matches_dense_panel_projection(self):
+        """Associating the random map into the kernel must change no algebra."""
+        rng = np.random.default_rng(24)
+        n_orb, n_rank, n_grid, n_probe = 5, 4, 5, 3
+        phi = jnp.asarray(rng.normal(size=(n_orb, n_rank)))
+        xi = jnp.asarray(rng.normal(size=(n_rank, n_grid)))
+        grad = jnp.asarray(rng.normal(size=(n_rank, n_grid, 3)))
+        grid = jnp.asarray(rng.normal(size=(n_grid, 3)))
+        weights = jnp.asarray(rng.normal(size=(n_grid,)))
+        l_q = jnp.asarray(rng.normal(size=(n_rank, n_orb)))
+        omega_s = jnp.asarray(rng.normal(size=(3, n_probe)))
+        omega_c = jnp.asarray(rng.normal(size=(n_rank, n_probe)))
+        ranges = (slice(None), slice(None), slice(1, 4), slice(0, 3))
+
+        dense = xtc_mod.ISDFXTC._calc_X_shard(
+            None, None, jnp.eye(n_grid), grid, weights, xi, grad,
+            jnp.ones((n_rank,)), phi, ranges, n_orb, batch_size=3, L_Q=l_q,
+        )
+        actual = xtc_mod.ISDFXTC._calc_X_sketch_shard(
+            None, None, jnp.eye(n_grid), grid, weights, xi, grad,
+            jnp.ones((n_rank,)), phi, ranges, n_orb, batch_size=3, L_Q=l_q,
+            omega_s=omega_s, omega_c=omega_c,
+        )
+        expected = jnp.einsum("rsc,sk,ck->rk", dense, omega_s, omega_c,
+                              optimize=True)
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected),
+                                   rtol=1e-11, atol=1e-11)
+
     def test_full_rank_streamed_basis_and_core_recover_x(self):
         rng = np.random.default_rng(20)
         n_orb, n_rank = 6, 6
@@ -233,6 +275,40 @@ class TestTuckerXSolverViews(unittest.TestCase):
 
 class TestRealFactorOnlyH2(unittest.TestCase):
     """Exercise the actual ISDF, ERI, and CCSD paths with no dense-X key."""
+
+    def test_fused_sketch_matches_materialized_x(self):
+        """The production grid/sharding path matches the old host projection."""
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
+            unit="Angstrom", verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        jparams = {"alpha": jnp.array([1.0])}
+        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
+        isdf = xtc_mod.ISDFXTC.from_xtc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True,
+        )
+        isdf = isdf.isdf(
+            jparams, batch_size=64, orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        l_aux = isdf._compute_L_aux(jparams, batch_size=64,
+                                    host_grid_block_size=512)
+        rng = np.random.default_rng(25)
+        n_probe = 2
+        omega_s = rng.normal(size=(base.n_orb, n_probe)) / np.sqrt(n_probe)
+        omega_c = rng.normal(size=(isdf.phi_isdf.shape[1], n_probe))
+        ranges = (slice(None), slice(None), slice(None), slice(None))
+        actual = isdf._compute_X_sketch(
+            jparams, ranges, batch_size=64, L_aux=l_aux,
+            omega_s=omega_s, omega_c=omega_c, host_grid_block_size=512,
+        )
+        expected = np.einsum(
+            "rsc,sk,ck->rk", np.asarray(isdf.isdf_kernels["X"]),
+            omega_s, omega_c, optimize=True,
+        )
+        np.testing.assert_allclose(np.asarray(actual), expected,
+                                   rtol=1e-10, atol=1e-10)
 
     def test_full_rank_factor_only_view_matches_dense_x(self):
         mol = gto.M(
