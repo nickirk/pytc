@@ -7,6 +7,7 @@ from unittest import mock
 
 import jax
 import jax.numpy as jnp
+import h5py
 import numpy as np
 from pyscf import gto, scf
 
@@ -164,6 +165,9 @@ class TestNormalOrderedXView(unittest.TestCase):
         ):
             self.assertIsNone(view.feri)
             self.assertFalse(view.fock.flags.writeable)
+            self.assertIsInstance(view.vvvv, h5py.Dataset)
+            self.assertIs(view.vvvv, two_body_source.vvvv)
+            self.assertTrue(view.vvvv_is_streamed_normal_ordered_source)
             np.testing.assert_array_equal(view.fock, reference_source.fock)
             np.testing.assert_array_equal(view.mo_energy, np.diag(reference_source.fock))
             self.assertAlmostEqual(
@@ -189,6 +193,18 @@ class TestNormalOrderedXView(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "materialized VVVV"):
             xtc_ccsd.make_x_normal_ordered_eris_view(
                 on_the_fly_like, no_x_eris, "zero_one"
+            )
+
+        # In-memory VVVV views remain bounded: the H10 driver must use the
+        # disk source above rather than accidentally materialize a huge array.
+        in_memory_like = copy.copy(full_eris)
+        in_memory_like.vvvv = np.asarray(full_eris.vvvv)
+        with self.assertRaisesRegex(ValueError, "would materialize"):
+            xtc_ccsd.make_x_normal_ordered_eris_view(
+                in_memory_like,
+                no_x_eris,
+                "zero_one",
+                max_materialized_vvvv_bytes=1,
             )
 
         # Finally run the two hybrid Hamiltonians through CCSD.  Supplying the

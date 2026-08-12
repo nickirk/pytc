@@ -83,10 +83,12 @@ def make_x_normal_ordered_eris_view(
 
     This deliberately does *not* call ``ao2mo``/``make_eris``: those paths
     re-contract the two-body ERIs into a Fock matrix and would undo the
-    reference-normal-ordering construction.  The VVVV block is materialized
-    for the view so the JAX on-the-fly VVVV path cannot re-read ``xtc_obj`` and
-    silently restore X.  A byte limit makes this a small-system validation
-    helper until a streamed normal-ordered VVVV view exists.
+    reference-normal-ordering construction.  A disk-backed VVVV dataset is
+    retained as a streamed read-only view, so the JAX disk contraction reads
+    the selected full/no-X two-body source directly.  An in-memory VVVV is
+    copied and bounded by ``max_materialized_vvvv_bytes``.  ``None`` is never
+    allowed because the JAX on-the-fly path re-reads ``xtc_obj`` and could
+    silently restore X.
     """
     if drop_x_component not in ("zero_one", "two_body"):
         raise ValueError(
@@ -111,14 +113,6 @@ def make_x_normal_ordered_eris_view(
             "A normal-ordered X ERI view requires a materialized VVVV block; "
             "the on-the-fly VVVV path reads xtc_obj and cannot represent this view"
         )
-    vvvv_nbytes = int(np.prod(vvvv.shape)) * np.dtype(vvvv.dtype).itemsize
-    if vvvv_nbytes > max_materialized_vvvv_bytes:
-        raise ValueError(
-            "Normal-ordered X ERI view would materialize a VVVV block of "
-            f"{vvvv_nbytes / 1024**2:.1f} MiB (limit "
-            f"{max_materialized_vvvv_bytes / 1024**2:.1f} MiB)"
-        )
-
     # A shallow copy keeps the ordinary ERI blocks in their existing backing
     # store.  The source ERIs are retained below, and the view has no owning
     # HDF5 handle, so closing/destructing it cannot close a source container.
@@ -126,7 +120,22 @@ def make_x_normal_ordered_eris_view(
     view.feri = None
     view._normal_ordered_x_sources = (full_eris, no_x_eris)
     view.normal_ordered_x_component = drop_x_component
-    view.vvvv = np.array(vvvv, copy=True)
+    if isinstance(vvvv, h5py.Dataset):
+        # The solver already has a streamed HDF5 contraction.  Keeping the
+        # selected source dataset prevents a multi-GiB VVVV copy for H10 and,
+        # unlike the dynamic path, cannot consult ``xtc_obj``.
+        view.vvvv = vvvv
+        view.vvvv_is_streamed_normal_ordered_source = True
+    else:
+        vvvv_nbytes = int(np.prod(vvvv.shape)) * np.dtype(vvvv.dtype).itemsize
+        if vvvv_nbytes > max_materialized_vvvv_bytes:
+            raise ValueError(
+                "Normal-ordered X ERI view would materialize a VVVV block of "
+                f"{vvvv_nbytes / 1024**2:.1f} MiB (limit "
+                f"{max_materialized_vvvv_bytes / 1024**2:.1f} MiB)"
+            )
+        view.vvvv = np.array(vvvv, copy=True)
+        view.vvvv_is_streamed_normal_ordered_source = False
 
     target_fock = np.array(reference_source.fock, copy=True)
     target_fock.setflags(write=False)
