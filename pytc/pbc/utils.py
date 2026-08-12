@@ -5,7 +5,6 @@ import warnings
 import jax
 import jax.numpy as jnp
 import numpy as np
-import spglib
 from flax import struct
 
 
@@ -24,6 +23,15 @@ _NEIGHBOR_SHIFTS = jnp.asarray(
 
 def reduce_lattice(lattice):
     """Return a Niggli-reduced basis for the same translation lattice."""
+    try:
+        import spglib
+    except ModuleNotFoundError as error:
+        if error.name != "spglib":
+            raise
+        raise ModuleNotFoundError(
+            "spglib is required for periodic lattice reduction"
+        ) from error
+
     lattice = np.asarray(lattice, dtype=np.float64)
     if lattice.shape != (3, 3) or not np.isfinite(lattice).all():
         raise ValueError("lattice must be a finite 3x3 array")

@@ -1,6 +1,8 @@
 """Protocol tests for the periodic batched-FFT benchmark."""
 
 import json
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,6 +20,39 @@ from pytc.pbc.fft_benchmark import (
 
 
 class TestFFTBenchmarkProtocol(unittest.TestCase):
+    def test_import_does_not_require_spglib_until_lattice_reduction(self):
+        script = r'''
+import builtins
+
+real_import = builtins.__import__
+
+
+def import_without_spglib(name, *args, **kwargs):
+    if name == "spglib" or name.startswith("spglib."):
+        raise ModuleNotFoundError("No module named 'spglib'", name="spglib")
+    return real_import(name, *args, **kwargs)
+
+
+builtins.__import__ = import_without_spglib
+from pytc.pbc.fft_benchmark import recommended_cases
+from pytc.pbc.utils import reduce_lattice
+
+assert recommended_cases()
+try:
+    reduce_lattice([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+except ModuleNotFoundError as error:
+    assert str(error) == "spglib is required for periodic lattice reduction"
+else:
+    raise AssertionError("lattice reduction unexpectedly succeeded without spglib")
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[3],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_production_mesh_flop_count_matches_cost_card(self):
         self.assertAlmostEqual(fft_flops((57, 57, 57)) / 1e6, 16.2, places=1)
 
