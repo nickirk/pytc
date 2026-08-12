@@ -92,6 +92,24 @@ def resolve_vvvv_disk_block_size(nocc, nvir, cc, *, kind, n_fused=None):
     return min(block, nvir)
 
 
+def _record_vvvv_write_receipt(eris, *, nvir, p_blksize, r_blksize):
+    """Record the panel layout resolved by the writer that filled ``vvvv``.
+
+    The consumer gate must inspect this receipt rather than recomputing a
+    second panel layout: it is written from the exact values used by the loop
+    that owns every HDF5 assignment.
+    """
+    receipt = {
+        'nvir': int(nvir),
+        'p_blksize': int(p_blksize),
+        'r_blksize': int(r_blksize),
+        'n_p_blocks': (int(nvir) + int(p_blksize) - 1) // int(p_blksize),
+        'n_r_blocks': (int(nvir) + int(r_blksize) - 1) // int(r_blksize),
+    }
+    eris.vvvv_write_receipt = receipt
+    return receipt
+
+
 def make_x_normal_ordered_eris_view(
         full_eris, no_x_eris, drop_x_component, *,
         max_materialized_vvvv_bytes=256 * 1024**2):
@@ -1620,11 +1638,13 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         include_accumulators=False,
     )
     panel_size = p_blksize
+    receipt = _record_vvvv_write_receipt(
+        eris, nvir=nvir, p_blksize=p_blksize, r_blksize=r_blksize
+    )
     logger.info(
         "    Writing VVVV to disk (p_blksize=%d, r_blksize=%d, n_p_blocks=%d, n_r_blocks=%d)",
         p_blksize, r_blksize,
-        (nvir + p_blksize - 1) // p_blksize,
-        (nvir + r_blksize - 1) // r_blksize,
+        receipt['n_p_blocks'], receipt['n_r_blocks'],
     )
 
     # If X is an HDF5 dataset, preload it into RAM to avoid 15k+ per-tile
@@ -1791,10 +1811,11 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
     blksize = resolve_vvvv_disk_block_size(
         nocc, nvir, cc, kind='vvvv', n_fused=_n_fused
     )
-    eris.vvvv_disk_block_size = blksize
-    eris.vvvv_disk_n_blocks = (nvir + blksize - 1) // blksize
+    receipt = _record_vvvv_write_receipt(
+        eris, nvir=nvir, p_blksize=blksize, r_blksize=blksize
+    )
     logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
-                f"n_blocks={eris.vvvv_disk_n_blocks})")
+                f"n_blocks={receipt['n_p_blocks']})")
 
     from pytc.utils.prefetch import async_read, await_read
     ds = eris.vvvv

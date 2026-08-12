@@ -47,6 +47,7 @@ class _FakeXTC:
 
     def __init__(self, nvir):
         self.nvir = nvir
+        self.isdf_kernels = {"X": np.zeros((1, 1, 1))}
 
     def get_2b(self, params, *, ranges):
         width = ranges[0].stop - ranges[0].start
@@ -86,10 +87,65 @@ class TestVVVVDiskPanels(unittest.TestCase):
             [(start, stop) for start, stop, _, _ in eris.vvvv.writes],
             [(0, 16), (16, 32), (32, 48), (48, 60)],
         )
-        self.assertEqual(eris.vvvv_disk_block_size, panel)
-        self.assertEqual(eris.vvvv_disk_n_blocks, 4)
+        self.assertEqual(
+            eris.vvvv_write_receipt,
+            {
+                "nvir": nvir,
+                "p_blksize": panel,
+                "r_blksize": panel,
+                "n_p_blocks": 4,
+                "n_r_blocks": 4,
+            },
+        )
         self.assertTrue(all(shape[0] <= panel for _, _, shape, _ in eris.vvvv.writes))
         self.assertLess(max(size for _, _, _, size in eris.vvvv.writes), 32 * 1024**2)
+
+    def test_df_writer_publishes_the_panel_receipt_it_uses(self):
+        """The driver-visible receipt must come from the real DF writer loop."""
+        nocc = 1
+        nvir = 60
+        panel = 16
+        cc = SimpleNamespace(
+            gpu_max_memory=24_000,
+            vvvv_p_block_size=panel,
+            vvvv_r_block_size=panel,
+        )
+        eris = SimpleNamespace(vvvv=_RecordingDataset())
+        xtc_obj = _FakeXTC(nvir)
+        device = SimpleNamespace(id=0)
+
+        def synchronous_pipeline(specs, issue_tile, consume_tile, *, devices):
+            for spec in specs:
+                handle = issue_tile(spec, device)
+                consume_tile(spec, device, handle, lambda: None)
+
+        def fake_tile(xtc_obj, params, ranges, *, device, panel_size):
+            p_len = ranges[0].stop - ranges[0].start
+            r_len = ranges[2].stop - ranges[2].start
+            return np.zeros((p_len, nvir, r_len, nvir))
+
+        with mock.patch.object(
+                xtc_ccsd, "resolve_vvvv_panel_block_sizes", return_value=(panel, panel)), \
+             mock.patch.object(xtc_ccsd, "_solver_local_devices", return_value=[device]), \
+             mock.patch.object(xtc_ccsd, "_round_robin_pipeline", side_effect=synchronous_pipeline), \
+             mock.patch.object(xtc_ccsd.xtc_mod, "compute_2b_tile", side_effect=fake_tile), \
+             mock.patch.object(xtc_ccsd, "_AsyncHDF5Writer", _SynchronousWriter):
+            xtc_ccsd._compute_vvvv_block_df(
+                eris, xtc_obj, None, np.zeros((nvir, nvir, 1)),
+                nocc, nvir, nocc + nvir, cc,
+            )
+
+        self.assertEqual(
+            eris.vvvv_write_receipt,
+            {
+                "nvir": nvir,
+                "p_blksize": panel,
+                "r_blksize": panel,
+                "n_p_blocks": 4,
+                "n_r_blocks": 4,
+            },
+        )
+        self.assertEqual(len(eris.vvvv.writes), 4)
 
     def test_reader_and_writer_share_the_explicit_disk_cap(self):
         cc = SimpleNamespace(
