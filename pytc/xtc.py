@@ -72,6 +72,32 @@ def _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z):
                        optimize=True)
 
 
+def _get_tucker_x_factors(kernels):
+    """Return a validated ``(U, Z)`` Tucker-X representation, if present.
+
+    A factorized X deliberately uses a different key from the dense ``X``
+    dataset.  That prevents an approximate calculation from accidentally
+    falling back to, or preloading, the full tensor.  The representation is
+    ``X[r,s,c] ~= U[r,a] Z[a,b,c] U[s,b]``.
+    """
+    factors = kernels.get("X_tucker")
+    if factors is None:
+        return None
+    if not isinstance(factors, dict) or set(("U", "Z")) - set(factors):
+        raise ValueError("X_tucker must be a mapping containing U and Z")
+
+    u = factors["U"]
+    z = factors["Z"]
+    if getattr(u, "ndim", None) != 2 or getattr(z, "ndim", None) != 3:
+        raise ValueError("X_tucker factors must have U[orbital,factor] and Z[factor,factor,rank]")
+    if z.shape[:2] != (u.shape[1], u.shape[1]):
+        raise ValueError(
+            "X_tucker dimensions disagree: "
+            f"U has {u.shape[1]} factors but Z has shape {z.shape}"
+        )
+    return u, z
+
+
 def _tucker_x_normal_order_intermediates(u, z, dm1, phi_tilde, gb):
     """Return the X intermediates used by reference normal ordering.
 
@@ -332,9 +358,11 @@ def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=Non
         )
 
     kernels = getattr(xtc_obj, "isdf_kernels", None)
-    required = ("K1_kernel", "K3_kernel", "D", "X")
-    if kernels is None or any(key not in kernels for key in required):
-        missing = [key for key in required if kernels is None or key not in kernels]
+    required = ("K1_kernel", "K3_kernel", "D")
+    missing = [key for key in required if kernels is None or key not in kernels]
+    if kernels is None or ("X" not in kernels and "X_tucker" not in kernels):
+        missing.append("X or X_tucker")
+    if missing:
         raise RuntimeError(
             "XTC tile execution requires precomputed ISDF kernels. "
             f"Missing: {missing}"
@@ -947,6 +975,28 @@ def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     x_flat = X_sliced.reshape(Nr * Ns, X_sliced.shape[2])
     x_term = jnp.matmul(cpq, x_flat.T)
     return (d_term - x_term).reshape(Np, Nq, Nr, Ns)
+
+
+@partial(jax.jit, static_argnums=(8,))
+def _contract_delta_u_tucker_direct_tile_jit(D, z, phi_p, phi_q, phi_r,
+                                             phi_s, u_r, u_s,
+                                             include_x=True):
+    """Balanced direct Delta-U tile with separated X orbital legs.
+
+    This is the solver-facing path for ``X_tucker``.  It never reconstructs
+    an ``(r,s,c)`` X panel: the only X-side intermediate is the
+    ``(p,q,a,b)`` contracted core.  Consequently the persisted and
+    transferred exchange object is ``Z`` rather than a dense X tensor.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+
+    cpq = (phi_p[:, None, :] * phi_q[None, :, :]).reshape(Np * Nq, D.shape[0])
+    crs = (phi_r[:, None, :] * phi_s[None, :, :]).reshape(Nr * Ns, D.shape[1])
+    d_term = jnp.matmul(jnp.matmul(cpq, D), crs.T).reshape(Np, Nq, Nr, Ns)
+    if not include_x:
+        return d_term
+    return d_term + _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z)
 
 
 @jax.jit
@@ -2036,7 +2086,13 @@ class ISDFXTC(XTC, ISDFTC):
              kernels = self.isdf_kernels
              
         D = kernels['D']
-        X = kernels['X']
+        tucker_x = _get_tucker_x_factors(kernels)
+        if tucker_x is None:
+            X = kernels['X']
+        else:
+            # Do not touch a dense X backing when a Tucker view was supplied:
+            # the normal-order path below contracts U/Z directly.
+            X = None
         drop_x_normal_order = _drop_x_from_normal_order()
         if drop_x_normal_order:
             logger.warning(
@@ -2073,10 +2129,15 @@ class ISDFXTC(XTC, ISDFTC):
         wc = jnp.zeros((phi.shape[1],)) # (N_rank,)
         Y_all = jnp.zeros((self.n_orb, phi.shape[1])) # (N_orb, N_rank)
 
+        tucker_j_x_sym = None
         if drop_x_normal_order:
             # The pre-zeroed projected intermediates are the exact D-only
             # normal-order result and avoid loading any X panels from disk.
             pass
+        elif tucker_x is not None:
+            wc, Y_all, tucker_j_x_sym = _tucker_x_normal_order_intermediates(
+                tucker_x[0], tucker_x[1], dm1, phi_tilde, Gb,
+            )
         elif is_hdf5:
             # Process strictly in chunks to respect memory
             logger.debug("Streaming X in chunks from HDF5")
@@ -2125,6 +2186,8 @@ class ISDFXTC(XTC, ISDFTC):
         # J_X_sym: - sum X_pq G_c
         if drop_x_normal_order:
             J_X_sym = jnp.zeros_like(J_D_total)
+        elif tucker_j_x_sym is not None:
+            J_X_sym = tucker_j_x_sym[slice_p, slice_q]
         elif is_hdf5:
             start_p, stop_p, step_p = slice_p.indices(self.n_orb)
             start_q, stop_q, step_q = slice_q.indices(self.n_orb)
@@ -2177,12 +2240,43 @@ class ISDFXTC(XTC, ISDFTC):
     def _contract_delta_U_kernels(self, kernels, ranges):
         """Contract precomputed kernels to get Delta U block."""
         D = kernels['D']
-        X = kernels['X']
+        tucker_x = _get_tucker_x_factors(kernels)
         include_x = not _drop_x_from_residual_integrals()
         if not include_x:
             logger.warning("X exchange contribution omitted from residual Delta-U integrals")
         
         slice_p, slice_q, slice_r, slice_s = ranges
+
+        if tucker_x is not None:
+            # This generic public-block API is intentionally kept separate
+            # from the solver tile path below.  It forms the existing
+            # scan-based D contribution, then adds the factor-direct X term;
+            # neither branch materialises dense X[r,s,c].
+            n_rank = D.shape[0]
+            phi_p = self.phi_isdf[slice_p]
+            phi_q = self.phi_isdf[slice_q]
+            phi_r = self.phi_isdf[slice_r]
+            phi_s = self.phi_isdf[slice_s]
+            rbs = self._get_fixed_rank_block_size()
+            if rbs is None:
+                from pytc.utils.gpu_memory import adaptive_rank_block_size
+                rbs = adaptive_rank_block_size(
+                    phi_p.shape[0], phi_q.shape[0], n_rank,
+                    gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None),
+                )
+            d_only = _contract_delta_U_kernels_jit(
+                jnp.asarray(D), jnp.zeros((1, 1, 1), dtype=jnp.float64),
+                jnp.asarray(phi_p), jnp.asarray(phi_q), jnp.asarray(phi_r),
+                jnp.asarray(phi_s), rbs, False,
+            )
+            if not include_x:
+                return d_only
+            u, z = tucker_x
+            return d_only + _contract_tucker_x_residual(
+                phi_p, phi_q, u[slice_r], u[slice_s], z,
+            )
+
+        X = kernels['X']
         
         def get_info(sl, total):
             if isinstance(sl, slice):
@@ -2426,7 +2520,8 @@ class ISDFXTC(XTC, ISDFTC):
         """Compute one unsymmetrized Delta U tile from prepared kernel panels."""
         global _DELTA_U_DIRECT_TILE_PROFILED
         D = kernels['D']
-        X = kernels['X']
+        tucker_x = _get_tucker_x_factors(kernels)
+        X = None if tucker_x is not None else kernels['X']
         include_x = not _drop_x_from_residual_integrals()
         slice_p, slice_q, slice_r, slice_s = ranges
         device_key = getattr(device, "id", "host")
@@ -2484,6 +2579,77 @@ class ISDFXTC(XTC, ISDFTC):
                 f"(D_resident={D_resident is not None}). "
                 "Reduce the solver tile panel size."
             )
+
+        if tucker_x is not None:
+            # Keep the existing conservative tile guard until a measured
+            # factor-direct peak model is available.  It uses the historical
+            # dense-X bound, so it may choose a smaller panel than necessary
+            # but it cannot overcommit a GPU while we validate this path.
+            u, z = tucker_x
+            u_r = u[slice_r]
+            u_s = u[slice_s]
+            if panel_size is not None:
+                phi_p = _pad_axis(phi_p, 0, Np) if Np != p_len else jnp.asarray(phi_p)
+                phi_q = _pad_axis(phi_q, 0, Nq_eff) if Nq_eff != Nq else jnp.asarray(phi_q)
+                phi_r = _pad_axis(phi_r, 0, Nr) if Nr != r_len else jnp.asarray(phi_r)
+                phi_s = _pad_axis(phi_s, 0, Ns_eff) if Ns_eff != Ns else jnp.asarray(phi_s)
+                u_r = _pad_axis(u_r, 0, Nr) if Nr != r_len else jnp.asarray(u_r)
+                u_s = _pad_axis(u_s, 0, Ns_eff) if Ns_eff != Ns else jnp.asarray(u_s)
+            else:
+                phi_p = jnp.asarray(phi_p)
+                phi_q = jnp.asarray(phi_q)
+                phi_r = jnp.asarray(phi_r)
+                phi_s = jnp.asarray(phi_s)
+
+            if device is not None:
+                D = D_resident if D_resident is not None else jax.device_put(np.asarray(D), device)
+                # The per-device ISDF cache is keyed by this object.  Retain
+                # the factor backing itself as the identity guard so a new
+                # approximation cannot inherit stale device buffers.
+                factor_cache = cache.get("X_tucker") if cache is not None else None
+                if factor_cache is None or factor_cache[0] is not u or factor_cache[1] is not z:
+                    factor_cache = (
+                        u, z,
+                        jax.device_put(np.asarray(u), device),
+                        jax.device_put(np.asarray(z), device),
+                    )
+                    if cache is not None:
+                        cache["X_tucker"] = factor_cache
+                u_device, z_device = factor_cache[2:]
+                u_r = u_device[slice_r]
+                u_s = u_device[slice_s]
+                if panel_size is not None:
+                    u_r = _pad_axis(u_r, 0, Nr) if Nr != r_len else u_r
+                    u_s = _pad_axis(u_s, 0, Ns_eff) if Ns_eff != Ns else u_s
+                if cache is None:
+                    phi_p = jax.device_put(phi_p, device)
+                    phi_q = jax.device_put(phi_q, device)
+                    phi_r = jax.device_put(phi_r, device)
+                    phi_s = jax.device_put(phi_s, device)
+            else:
+                D = jnp.asarray(D)
+                u_r = jnp.asarray(u_r)
+                u_s = jnp.asarray(u_s)
+                z_device = jnp.asarray(z)
+
+            device_ctx = (
+                jax.default_device(device)
+                if device is not None
+                else contextlib.nullcontext()
+            )
+            with device_ctx:
+                result = _contract_delta_u_tucker_direct_tile_jit(
+                    D, z_device, phi_p, phi_q, phi_r, phi_s, u_r, u_s,
+                    include_x,
+                )
+                if profile:
+                    jax.block_until_ready(result)
+                    logger.debug(
+                        "_get_delta_u_direct_tile Tucker first-tile profile: "
+                        "total %.3fs (device=%s, factors=%d)",
+                        time.perf_counter() - t0, device_key, z.shape[0],
+                    )
+                return result
 
         X_sliced = (
             _read_X_slice(X, slice_r, slice_s)

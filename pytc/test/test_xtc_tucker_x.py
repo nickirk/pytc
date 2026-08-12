@@ -1,8 +1,10 @@
 """Algebra and streaming-build controls for orbital-leg Tucker X."""
 
 import unittest
+from unittest import mock
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from pytc import xtc as xtc_mod
@@ -43,6 +45,25 @@ class _FakeTuckerBuild:
             )
         self.panel_shapes.append(panel.shape)
         return panel
+
+
+class _FakeTuckerRuntime:
+    """Minimal runtime object for the dense-vs-factor solver entry points."""
+
+    def __init__(self, phi, dm1):
+        self.phi_isdf = jnp.asarray(phi)
+        self.n_orb = phi.shape[0]
+        self.dm1 = jnp.asarray(dm1)
+        self.gpu_max_memory = None
+
+    def _get_mf_dm(self):
+        return self.dm1
+
+    def _get_fixed_rank_block_size(self):
+        return 2
+
+    def _contract_delta_U_kernels(self, kernels, ranges):
+        return xtc_mod.ISDFXTC._contract_delta_U_kernels(self, kernels, ranges)
 
 
 class TestTuckerXAlgebra(unittest.TestCase):
@@ -126,6 +147,85 @@ class TestStreamedTuckerBuild(unittest.TestCase):
             xtc_mod.ISDFXTC.compute_tucker_x_core(
                 fake, None, np.ones((4, 2)),
             )
+
+
+class TestTuckerXSolverViews(unittest.TestCase):
+    """The production tile and normal-order paths accept X_tucker only."""
+
+    def setUp(self):
+        rng = np.random.default_rng(22)
+        self.n_orb, self.n_rank = 6, 4
+        phi = rng.normal(size=(self.n_orb, self.n_rank))
+        dm1 = rng.normal(size=(self.n_orb, self.n_orb))
+        self.runtime = _FakeTuckerRuntime(phi, dm1)
+        self.d = rng.normal(size=(self.n_rank, self.n_rank))
+        x = rng.normal(size=(self.n_orb, self.n_orb, self.n_rank))
+        self.x = 0.5 * (x + x.swapaxes(0, 1))
+        self.u, _ = np.linalg.qr(rng.normal(size=(self.n_orb, self.n_orb)))
+        self.z = np.einsum("ra,rsc,sb->abc", self.u, self.x, self.u,
+                           optimize=True)
+        self.dense = {"D": self.d, "X": self.x}
+        # Deliberately no dense-X key: an accidental fallback raises KeyError.
+        self.factor = {"D": self.d, "X_tucker": {"U": self.u, "Z": self.z}}
+
+    def test_direct_tile_factor_view_matches_dense_x(self):
+        ranges = (slice(0, 3), slice(2, 5), slice(1, 4), slice(0, 2))
+        with mock.patch.object(xtc_mod, "_get_device_free_bytes", return_value=2**40):
+            expected = xtc_mod.ISDFXTC._get_delta_u_direct_tile(
+                self.runtime, self.dense, ranges,
+            )
+            actual = xtc_mod.ISDFXTC._get_delta_u_direct_tile(
+                self.runtime, self.factor, ranges,
+            )
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected),
+                                   rtol=1e-11, atol=1e-11)
+
+    def test_padded_direct_tile_factor_view_matches_dense_x(self):
+        ranges = (slice(0, 3), slice(2, 5), slice(1, 4), slice(0, 2))
+        with mock.patch.object(xtc_mod, "_get_device_free_bytes", return_value=2**40):
+            expected = xtc_mod.ISDFXTC._get_delta_u_direct_tile(
+                self.runtime, self.dense, ranges, panel_size=4,
+            )
+            actual = xtc_mod.ISDFXTC._get_delta_u_direct_tile(
+                self.runtime, self.factor, ranges, panel_size=4,
+            )
+        self.assertEqual(actual.shape, (4, 3, 4, 2))
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected),
+                                   rtol=1e-11, atol=1e-11)
+
+    def test_generic_delta_u_and_normal_order_factor_views_match_dense_x(self):
+        ranges = (slice(0, 3), slice(1, 5), slice(1, 4), slice(0, 2))
+        expected_u = xtc_mod.ISDFXTC._contract_delta_U_kernels(
+            self.runtime, self.dense, ranges,
+        )
+        actual_u = xtc_mod.ISDFXTC._contract_delta_U_kernels(
+            self.runtime, self.factor, ranges,
+        )
+        np.testing.assert_allclose(np.asarray(actual_u), np.asarray(expected_u),
+                                   rtol=1e-11, atol=1e-11)
+
+        self.runtime.isdf_kernels = self.dense
+        expected_public_u = xtc_mod.ISDFXTC.get_delta_U(
+            self.runtime, None, ranges=ranges,
+        )
+        self.runtime.isdf_kernels = self.factor
+        actual_public_u = xtc_mod.ISDFXTC.get_delta_U(
+            self.runtime, None, ranges=ranges,
+        )
+        np.testing.assert_allclose(np.asarray(actual_public_u),
+                                   np.asarray(expected_public_u),
+                                   rtol=1e-11, atol=1e-11)
+
+        self.runtime.isdf_kernels = self.dense
+        expected_h = xtc_mod.ISDFXTC.get_delta_h(
+            self.runtime, None, ranges=(slice(0, 4), slice(1, 6)),
+        )
+        self.runtime.isdf_kernels = self.factor
+        actual_h = xtc_mod.ISDFXTC.get_delta_h(
+            self.runtime, None, ranges=(slice(0, 4), slice(1, 6)),
+        )
+        np.testing.assert_allclose(np.asarray(actual_h), np.asarray(expected_h),
+                                   rtol=1e-11, atol=1e-11)
 
 
 if __name__ == "__main__":
