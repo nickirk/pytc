@@ -125,11 +125,21 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestConvolveDeviceFlag(unittest.TestCase):
-    """`convolve_device` selects the XLA-fused convolve. It is not GPU-only --
-    on the JAX CPU backend it measured 2.53x over the numpy path at the 333
-    block shape -- so the flag must reach the staged builder, and both paths
-    must agree."""
+class TestBuildUsesTheDeviceConvolve(unittest.TestCase):
+    """The build uses the device convolve, and it agrees with the numpy reference.
+
+    Replaces the old `convolve_device` flag tests. The flag is gone -- the numpy
+    path was removed from the build (owner directive 2026-08-12) because mixing
+    OpenBLAS with XLA cost 4.05x at 333, and a switch with one position is not a
+    switch. But the numpy `pair_convolve` remains in kpts.py as the ORACLE, so
+    what still needs testing is the invariant the flag used to carry:
+
+      * the build reaches the device path, and
+      * the device path still equals the numpy one.
+
+    Asserting the second without the first would pass even if the build had
+    quietly reverted to numpy, which is precisely the regression the old
+    "flag reaches the staged builder" test existed to catch."""
 
     @staticmethod
     def _inputs(n_k=8, n_ip=60, n_ao=20, n_grid=240):
@@ -148,17 +158,31 @@ class TestConvolveDeviceFlag(unittest.TestCase):
         phase = np.exp(2j * np.pi * np.outer(np.arange(n_k), np.arange(n_k)) / n_k)
         return X, ao, phase / np.sqrt(n_k), neg
 
-    def test_device_flag_matches_host_path(self):
+    def test_build_output_matches_the_numpy_oracle(self):
+        from pytc.pbc.df.kpts import pair_convolve
         X, ao, phase, neg = self._inputs()
-        host = build_pi_eta(X, [ao], phase, neg, imag_tol=1e30, convolve_device=False)
-        dev = build_pi_eta(X, [ao], phase, neg, imag_tol=1e30, convolve_device=True)
-        for name, a, b in (("Pi", host[0], dev[0]), ("eta", host[1], dev[1])):
+        built = build_pi_eta(X, [ao], phase, neg, imag_tol=1e30)
+        want_pi = pair_convolve(X, X, phase, imag_tol=1e30)[neg]
+        want_eta = pair_convolve(X, ao, phase, imag_tol=1e30)[neg]
+        for name, got, want in (("Pi", built[0], want_pi),
+                                ("eta", built[1], want_eta)):
             with self.subTest(name=name):
-                np.testing.assert_allclose(b, a, rtol=0, atol=1e-12)
+                np.testing.assert_allclose(got, want, rtol=0, atol=1e-12)
 
-    def test_staged_builder_accepts_the_flag(self):
-        # Regression: the staged builder imported pair_convolve directly, so the
-        # flag could not reach production even once the device path existed.
+    def test_the_build_actually_calls_the_device_path(self):
+        # The equality test above would pass even if the build had silently
+        # reverted to numpy, since the two agree. This is the half that cannot:
+        # it asserts WHICH function the build resolves to.
+        from pytc.pbc.df import isdf as _isdf
+        from pytc.pbc.df.kpts import pair_convolve_device
+        self.assertIs(_isdf._pair_convolve(), pair_convolve_device)
+
+    def test_no_convolve_selector_survives_in_the_build_api(self):
+        # The numpy path is gone, so a keyword selecting it must be gone too --
+        # a lingering no-op keyword is how a caller comes to believe it chose
+        # something. Covers the staged builder, which previously imported
+        # pair_convolve directly and could not be switched at all.
         import inspect
-        sig = inspect.signature(build_pi_eta_staged)
-        self.assertIn("convolve_device", sig.parameters)
+        for fn in (build_pi_eta, build_pi_eta_staged):
+            with self.subTest(fn=fn.__name__):
+                self.assertNotIn("convolve_device", inspect.signature(fn).parameters)

@@ -287,7 +287,6 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
                        cached_ao_max_bytes=None,
                        reuse_ao_cache_for_eta=True, stage_eta_root=None,
                        stage_eta_block=4096, kern_blocking=None,
-                       convolve_device=False,
                        p_block_rows=None, solve_backend="device",
                        retention_mode="single", rtol=None,
                        n_retained_pin=None, jitter_rcond=None,
@@ -538,7 +537,6 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         "stage_eta_root": stage_eta_root,
         "stage_eta_block": stage_eta_block,
         "kern_blocking": kern_blocking,
-        "convolve_device": convolve_device,
         "p_block_rows": p_block_rows,
         "solve_backend": solve_backend,
         "retention_mode": retention_mode,
@@ -645,7 +643,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
           bpc_blocked_projection=FROZEN_BPC_POLICY["bpc_blocked_projection"],
           reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-          n_retained_pin=None, convolve_device=False, p_block_rows=None,
+          n_retained_pin=None, p_block_rows=None,
           solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
@@ -727,7 +725,6 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         stage_eta_root=stage_eta_root,
         stage_eta_block=stage_eta_block,
         kern_blocking=kern_blocking,
-        convolve_device=convolve_device,
         p_block_rows=p_block_rows,
         solve_backend=solve_backend,
         retention_mode=retention_mode,
@@ -747,7 +744,6 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     stage_eta_root = resolved_plan["stage_eta_root"]
     stage_eta_block = resolved_plan["stage_eta_block"]
     kern_blocking = resolved_plan["kern_blocking"]
-    convolve_device = resolved_plan["convolve_device"]
     p_block_rows = resolved_plan["p_block_rows"]
     solve_backend = resolved_plan["solve_backend"]
     retention_mode = resolved_plan["retention_mode"]
@@ -946,8 +942,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
                 inpv_kpt, _ao_block_factory, mesh_obj.phase, mesh_obj.neg,
                 provider,
                 grid_coords, panel_rows=int(p_block_rows),
-                convolve_device=convolve_device,
-                self_paired=lambda q: int(neg_arr[q]) == q,
+                        self_paired=lambda q: int(neg_arr[q]) == q,
             )
         elif stage_eta_root is not None:
             staged_path = os.path.join(
@@ -960,12 +955,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
                 additional_reserve_bytes=(
                     int(inpv_kpt.shape[1]) * int(grid_coords.shape[0]) * 16
                     if kern_blocking is not None else 0),
-                convolve_device=convolve_device,
-            )
+                    )
         else:
             Pi, eta = build_pi_eta(
                 inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg,
-                convolve_device=convolve_device)
+)
 
         if solve_backend == "host":
             # Reference path. Exists so an accuracy question can be settled without
@@ -1383,7 +1377,7 @@ class ISDFDF:
                  FROZEN_BPC_POLICY["bpc_blocked_projection"],
                  reuse_ao_cache_for_eta=True,
                  stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
-                 n_retained_pin=None, convolve_device=False, p_block_rows=None,
+                 n_retained_pin=None, p_block_rows=None,
                  solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
         self.cell = cell
         self.kpts = np.asarray(kpts, dtype=np.float64)
@@ -1403,7 +1397,6 @@ class ISDFDF:
         self.bpc_n_topup = bpc_n_topup
         self.bpc_blocked_projection = bpc_blocked_projection
         self.reuse_ao_cache_for_eta = reuse_ao_cache_for_eta
-        self.convolve_device = convolve_device
         self.p_block_rows = p_block_rows
         # Fail here, not hours later inside build() after pivot selection.
         validate_option_compatibility(
@@ -1451,7 +1444,6 @@ class ISDFDF:
                 stage_eta_block=self.stage_eta_block,
                 kern_blocking=self.kern_blocking,
                 n_retained_pin=self.n_retained_pin,
-                convolve_device=self.convolve_device,
                 p_block_rows=self.p_block_rows,
             )
         return self._built

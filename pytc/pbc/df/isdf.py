@@ -352,76 +352,30 @@ def pivoted_cholesky_batched_hermitian(
     return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
 
 
-def _resolve_pair_convolve(convolve_device=True):
-    """The device convolve. THE NUMPY PATH IS NO LONGER USED BY THE BUILD.
+def _pair_convolve():
+    """The convolve. There is exactly one, and it is the device path.
 
     Owner directive (2026-08-12): "remove the numpy path, since we want the same
-    code to be run on GPU in the future". One runtime, no host round-trip.
+    code to be run on GPU in the future" -- and then, on the vestigial selector
+    this function replaced: "if numpy is removed, why do we still need this
+    keyword?" Correct: a switch with one position is not a switch.
 
-    It is also strictly faster, and for a reason worth keeping written down: the
-    build used to mix numpy/BLAS here with JAX/XLA in the Coulomb apply, so two
-    thread pools coexisted -- and XLA's is sized from the cpuset and ignores
-    OMP_NUM_THREADS, MKL_NUM_THREADS and OPENBLAS_NUM_THREADS alike. Measured on
-    the real 222 build (job 59928607):
+    Measured on the real 222 build before removal (job 59928607), the numpy path
+    cost 243.7 s at 24 threads against 38.0 s here, because it put a second thread
+    pool (OpenBLAS) alongside XLA's -- and XLA's is sized from the cpuset and
+    ignores OMP_NUM_THREADS, MKL_NUM_THREADS and OPENBLAS_NUM_THREADS. At 333:
+    1903.0 s -> 470.2 s, a 4.05x cut with no environment tuning.
 
-        numpy path, 24 threads   243.7 s      numpy path, 8 threads   35.7 s
-        device path, 24 threads   38.0 s      device path, 8 threads  35.5 s
-
-    **6.4x at the default thread count, and the thread sensitivity collapses from
-    6.8x to 1.07x.** Tuning OMP_NUM_THREADS reached the same wall, but a thread
-    count tuned on a 24-core node is wrong on a 48-core one; removing the second
-    pool from the hot path is machine-independent.
-
-    On the JAX CPU backend XLA also fuses the post-GEMM chain (transform, square,
-    inverse transform) that the numpy path materialised stage by stage -- 354.1
-    against 139.99 GFLOP/s at the 333 block shape. Whether a device is used is
-    JAX's placement decision, not this function's.
-
-    ``convolve_device`` is retained as an accepted argument so existing callers
-    and stored provenance keep working, but it no longer selects anything.
-    Passing False is honoured as a request for the REFERENCE implementation and
-    is used only by the equivalence tests -- see ``pair_convolve`` in kpts.py,
-    which stays precisely because the device path is gated against it to 8.4e-16
-    rather than assumed correct. Deleting the oracle would delete the proof.
+    ``pair_convolve`` (numpy) still exists in kpts.py as the reference the device
+    path is gated against to 8.4e-16 -- the tests call it directly, by name, so
+    the build needs no keyword to reach it. Deleting the oracle would delete the
+    proof that this path is correct.
     """
-    if convolve_device is False:
-        # Explicit opt-in to the reference path. Not reachable from build();
-        # kept so the gate test can ask for it by name.
-        from pytc.pbc.df.kpts import pair_convolve
-        return pair_convolve
     from pytc.pbc.df.kpts import pair_convolve_device
     return pair_convolve_device
 
 
-_NUMPY_PATH_IGNORED_LOGGED = False
-
-
-def _build_pair_convolve(convolve_device):
-    """The convolve the BUILD uses. Always the device one.
-
-    Separate from ``_resolve_pair_convolve`` on purpose: the resolver still has
-    to be able to hand out the numpy reference for the equivalence gate, while
-    the build must not be able to reach it at all. Routing the build through its
-    own function is what makes "the numpy path is gone from production" a
-    property of the code rather than of every caller's argument.
-
-    A caller that explicitly asked for the numpy path is told, once per process,
-    that it did not get it. Silently ignoring an argument is how a lever comes to
-    look like it fired when it did not -- which has already cost this project a
-    day of measurement.
-    """
-    global _NUMPY_PATH_IGNORED_LOGGED
-    if convolve_device is False and not _NUMPY_PATH_IGNORED_LOGGED:
-        logger.info(
-            "convolve_device=False was requested but the numpy convolve path has "
-            "been removed from the build (owner directive 2026-08-12, for GPU "
-            "portability); using the device path, which is gated against the "
-            "numpy reference to 8.4e-16.")
-        _NUMPY_PATH_IGNORED_LOGGED = True
-    return _resolve_pair_convolve(True)
-
-
-def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=False):
+def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     """Build Pi^q = pair_convolve(X, X)[q] and eta^q = pair_convolve(X, AO)[q].
     eta is accumulated block-by-block so one pair_convolve call holds only
     one block of AO data. See design doc §4-§5.
@@ -447,7 +401,7 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=Fa
         (Pi, eta): (Nk, Nip, Nip) and (Nk, Nip, Ng) complex128.
     """
     # Local import: kpts.py stays a leaf.
-    pair_convolve = _build_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -542,7 +496,7 @@ class StagedEta:
 def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
                         staging_block=4096, imag_tol=1e-10,
                         free_bytes_safety=1.25, additional_reserve_bytes=0,
-                        convolve_device=False):
+                        ):
     """build_pi_eta with eta written to a (Nk, Nip, Ng) C-order memmap rather
     than held in RAM, so only one q's contiguous slab need be resident.
 
@@ -555,7 +509,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
     (Pi, eta_memmap, stats). Costs and design:
     docs/isdf-periodic/task46_phaseB_eta_staging_spec.md.
     """
-    pair_convolve = _build_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -1983,7 +1937,7 @@ def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
 
 
 def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
-                       imag_tol=1e-10, convolve_device=False, on_block=None):
+                       imag_tol=1e-10, on_block=None):
     """eta for a slab of pivot rows, holding one AO block at a time.
 
     ``build_pi_eta`` cannot be reused here: it does ``list(ao_blocks)`` to learn
@@ -1998,7 +1952,7 @@ def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
     """
     X_rows = np.asarray(X_rows)
     n_kpts, n_rows = int(X_rows.shape[0]), int(X_rows.shape[1])
-    pair_convolve = _build_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
     eta = np.empty((n_kpts, n_rows, int(n_grid)), dtype=np.complex128)
     col = 0
     index = 0
@@ -2067,7 +2021,7 @@ def _right_factor(provider, q, eta_q, gphase):
 def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
                             panel_rows, imag_tol=1e-10,
-                            convolve_device=False, self_paired=None,
+                            self_paired=None,
                             on_block=None, on_panel=None):
     """kern for every q without holding a full eta.
 
@@ -2129,7 +2083,7 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         raise ValueError(f"panel_rows must be an integer, got {type(panel_rows)}.")
     if int(panel_rows) <= 0:
         raise ValueError(f"panel_rows must be positive, got {panel_rows}.")
-    pair_convolve = _build_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
 
     # Pi needs no AO stream -- it is X against itself -- so it is built once and
     # never regenerated, whatever the panel schedule does.
@@ -2164,7 +2118,7 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         """eta rows [p0:p1) for every q, one AO block resident at a time."""
         return _eta_rows_streamed(
             X[:, p0:p1, :], ao_block_factory(), phase, neg, n_grid_total,
-            imag_tol=imag_tol, convolve_device=convolve_device,
+            imag_tol=imag_tol,
             on_block=on_block)
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
