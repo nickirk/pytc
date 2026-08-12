@@ -6,8 +6,11 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+from pyscf import gto, scf
 
 from pytc import xtc as xtc_mod
+from pytc.jastrow.rexp import REXP
+from pytc.solver import jax_xtc_ccsd
 
 
 jax.config.update("jax_enable_x64", True)
@@ -226,6 +229,80 @@ class TestTuckerXSolverViews(unittest.TestCase):
         )
         np.testing.assert_allclose(np.asarray(actual_h), np.asarray(expected_h),
                                    rtol=1e-11, atol=1e-11)
+
+
+class TestRealFactorOnlyH2(unittest.TestCase):
+    """Exercise the actual ISDF, ERI, and CCSD paths with no dense-X key."""
+
+    def test_full_rank_factor_only_view_matches_dense_x(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
+            unit="Angstrom", verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        jparams = {"alpha": jnp.array([1.0])}
+        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
+        isdf = xtc_mod.ISDFXTC.from_xtc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True,
+        )
+        isdf = isdf.isdf(
+            jparams, batch_size=64, orb_block_size=2,
+            host_grid_block_size=512,
+        )
+        l_aux = isdf._compute_L_aux(jparams, batch_size=64,
+                                    host_grid_block_size=512)
+        dense = isdf.isdf_kernels
+        u = isdf.select_tucker_x_orbital_basis(
+            jparams, base.n_orb, oversampling=2, seed=23, batch_size=64,
+            L_aux=l_aux, orb_block_size=2, host_grid_block_size=512,
+        )
+        factors = isdf.compute_tucker_x_core(
+            jparams, u, batch_size=64, L_aux=l_aux,
+            host_grid_block_size=512,
+        )
+        factor_kernels = dict(dense)
+        factor_kernels.pop("X")
+        factor_kernels["X_tucker"] = factors
+        dense_obj = isdf.replace(isdf_kernels=dense)
+        factor_obj = isdf.replace(isdf_kernels=factor_kernels)
+        self.assertNotIn("X", factor_obj.isdf_kernels)
+        np.testing.assert_allclose(
+            np.asarray(factor_obj.get_delta_h(jparams)),
+            np.asarray(dense_obj.get_delta_h(jparams)), rtol=1e-10, atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            np.asarray(factor_obj.get_delta_U(jparams)),
+            np.asarray(dense_obj.get_delta_U(jparams)), rtol=1e-10, atol=1e-10,
+        )
+
+        dense_cc = jax_xtc_ccsd.RCCSD(
+            mf, dense_obj, jparams, max_memory=2_000, gpu_max_memory=2_000,
+            on_the_fly_vvvv=False,
+        )
+        factor_cc = jax_xtc_ccsd.RCCSD(
+            mf, factor_obj, jparams, max_memory=2_000, gpu_max_memory=2_000,
+            on_the_fly_vvvv=False,
+        )
+        dense_eris = dense_cc.ao2mo()
+        factor_eris = factor_cc.ao2mo()
+        try:
+            np.testing.assert_allclose(np.asarray(factor_eris.fock),
+                                       np.asarray(dense_eris.fock),
+                                       rtol=1e-10, atol=1e-10)
+            np.testing.assert_allclose(np.asarray(factor_eris.ovov),
+                                       np.asarray(dense_eris.ovov),
+                                       rtol=1e-10, atol=1e-10)
+            np.testing.assert_allclose(np.asarray(factor_eris.vvvv),
+                                       np.asarray(dense_eris.vvvv),
+                                       rtol=1e-10, atol=1e-10)
+            dense_cc.max_cycle = factor_cc.max_cycle = 50
+            e_dense = float(dense_cc.kernel(eris=dense_eris)[0])
+            e_factor = float(factor_cc.kernel(eris=factor_eris)[0])
+            self.assertTrue(dense_cc.converged and factor_cc.converged)
+            self.assertAlmostEqual(e_factor, e_dense, places=10)
+        finally:
+            dense_eris.close()
+            factor_eris.close()
 
 
 if __name__ == "__main__":
