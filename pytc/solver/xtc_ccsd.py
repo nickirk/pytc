@@ -1,5 +1,6 @@
 import contextlib
 import concurrent.futures
+import copy
 import logging
 import threading
 import time
@@ -31,6 +32,121 @@ import h5py
 from pytc import xtc as xtc_mod
 
 logger = logging.getLogger(__name__)
+
+
+def eris_reference_energy(eris):
+    """Return the reference energy represented by a CCSD ERI container.
+
+    ``RCCSD`` receives a Fock matrix (the reference-normal-ordered one-body
+    coefficient) together with un-normal-ordered two-electron integrals.  The
+    scalar ``e_core`` is the compensating constant which makes this expression
+    the requested reference energy.  Keeping this small calculation outside
+    :meth:`RCCSD.get_e_hf` makes it possible to construct and validate a
+    reference-normal-ordered ERI view without rebuilding the ERIs.
+    """
+    nocc = eris.nocc
+    fock = np.asarray(eris.fock)
+    energy = 2 * np.einsum('ii->', fock[:nocc, :nocc])
+    if hasattr(eris, 'oooo'):
+        oooo = np.asarray(eris.oooo)
+        energy -= 2 * np.einsum('iijj->', oooo)
+        energy += np.einsum('ijji->', oooo)
+    energy += getattr(eris, 'e_core', 0)
+    return energy.real
+
+
+def _normal_ordered_e_core(reference_energy, fock, oooo, nocc):
+    """Solve the CCSD-container scalar for a supplied normal-order triple."""
+    core = reference_energy - 2 * np.einsum('ii->', fock[:nocc, :nocc])
+    core += 2 * np.einsum('iijj->', oooo)
+    core -= np.einsum('ijji->', oooo)
+    return core.real
+
+
+def make_x_normal_ordered_eris_view(
+        full_eris, no_x_eris, drop_x_component, *,
+        max_materialized_vvvv_bytes=256 * 1024**2):
+    """Construct a reference-normal-ordered X-channel ERI view.
+
+    ``full_eris`` and ``no_x_eris`` must be built from the *same* persisted
+    full-X kernel store.  Their difference is then the exact linear X
+    normal-order triple.  The returned view combines its scalar, Fock matrix,
+    and two-body ERIs as one of two internally consistent Hamiltonians:
+
+    ``drop_x_component="zero_one"``
+        Remove the X scalar and one-body normal-ordered pieces, while retaining
+        the full two-body operator: ``(E_no-X, F_no-X, Gamma_full)``.
+
+    ``drop_x_component="two_body"``
+        Retain the X scalar and one-body normal-ordered pieces, while removing
+        X from the two-body operator: ``(E_full, F_full, Gamma_no-X)``.
+
+    This deliberately does *not* call ``ao2mo``/``make_eris``: those paths
+    re-contract the two-body ERIs into a Fock matrix and would undo the
+    reference-normal-ordering construction.  The VVVV block is materialized
+    for the view so the JAX on-the-fly VVVV path cannot re-read ``xtc_obj`` and
+    silently restore X.  A byte limit makes this a small-system validation
+    helper until a streamed normal-ordered VVVV view exists.
+    """
+    if drop_x_component not in ("zero_one", "two_body"):
+        raise ValueError(
+            "drop_x_component must be 'zero_one' or 'two_body', got "
+            f"{drop_x_component!r}"
+        )
+    if full_eris.nocc != no_x_eris.nocc:
+        raise ValueError("full and no-X ERIs must use the same occupied space")
+    if np.asarray(full_eris.fock).shape != np.asarray(no_x_eris.fock).shape:
+        raise ValueError("full and no-X ERIs must use the same MO space")
+
+    if drop_x_component == "zero_one":
+        reference_source = no_x_eris
+        two_body_source = full_eris
+    else:
+        reference_source = full_eris
+        two_body_source = no_x_eris
+
+    vvvv = getattr(two_body_source, 'vvvv', None)
+    if vvvv is None:
+        raise ValueError(
+            "A normal-ordered X ERI view requires a materialized VVVV block; "
+            "the on-the-fly VVVV path reads xtc_obj and cannot represent this view"
+        )
+    vvvv_nbytes = int(np.prod(vvvv.shape)) * np.dtype(vvvv.dtype).itemsize
+    if vvvv_nbytes > max_materialized_vvvv_bytes:
+        raise ValueError(
+            "Normal-ordered X ERI view would materialize a VVVV block of "
+            f"{vvvv_nbytes / 1024**2:.1f} MiB (limit "
+            f"{max_materialized_vvvv_bytes / 1024**2:.1f} MiB)"
+        )
+
+    # A shallow copy keeps the ordinary ERI blocks in their existing backing
+    # store.  The source ERIs are retained below, and the view has no owning
+    # HDF5 handle, so closing/destructing it cannot close a source container.
+    view = copy.copy(two_body_source)
+    view.feri = None
+    view._normal_ordered_x_sources = (full_eris, no_x_eris)
+    view.normal_ordered_x_component = drop_x_component
+    view.vvvv = np.array(vvvv, copy=True)
+
+    target_fock = np.array(reference_source.fock, copy=True)
+    target_fock.setflags(write=False)
+    view.fock = target_fock
+    view.fvo = np.array(target_fock[view.nocc:, :view.nocc], copy=True)
+    view.fvo.setflags(write=False)
+    view.mo_energy = np.array(np.diag(target_fock), copy=True)
+    view.mo_energy.setflags(write=False)
+
+    target_reference_energy = eris_reference_energy(reference_source)
+    view.e_core = _normal_ordered_e_core(
+        target_reference_energy, target_fock, np.asarray(view.oooo), view.nocc
+    )
+    # This catches a scalar rebalance error immediately, before a CCSD solve
+    # could hide it in a total energy.
+    if not np.allclose(
+            eris_reference_energy(view), target_reference_energy,
+            rtol=1e-12, atol=1e-12):
+        raise RuntimeError("failed to preserve the requested normal-ordered reference energy")
+    return view
 
 class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""
@@ -86,19 +202,7 @@ class RCCSD(rccsd.RCCSD):
             if getattr(self, 'e_hf', None) is not None:
                 return self.e_hf
             return self._scf.e_tot
-        
-        no = self.nocc
-        fock = eris.fock
-        # E_hf = 2*sum_i F_ii - 2*sum_ij (ii|jj) + sum_ij (ij|ji) + E_core
-        e_hf = 2*np.einsum('ii->', fock[:no,:no])
-        if hasattr(eris, 'oooo'):
-            oooo = np.asarray(eris.oooo)
-            e_hf -= 2*np.einsum('iijj ->', oooo)
-            e_hf += np.einsum('ijji ->', oooo)
-        
-        e_hf += getattr(eris, 'e_core', 0)
-        
-        return e_hf.real
+        return eris_reference_energy(eris)
 
     def _finalize(self):
         if self.converged:
