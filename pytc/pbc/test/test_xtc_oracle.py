@@ -14,7 +14,7 @@ from pytc.jastrow import CompositeJastrow
 from pytc.jastrow import NuclearCusp as MolecularNuclearCusp
 from pytc.pbc.jastrow import BoysHandy, NuclearCusp
 from pytc.pbc.tc import create_tc
-from pytc.pbc.utils import mic_displacement, reduce_lattice
+from pytc.pbc.utils import ReducedLattice, mic_displacement, reduce_lattice
 from pytc.pbc.xtc import create_xtc
 
 jax.config.update("jax_enable_x64", True)
@@ -60,6 +60,22 @@ def _explicit_mic_distances(displacements, lattice, shell=3):
         axis=-1,
     ).reshape(-1, 3)
     images = displacements[:, None, :] - shifts @ lattice
+    return np.min(np.linalg.norm(images, axis=-1), axis=-1)
+
+
+def _neighbor_mic_distances(displacements, lattice):
+    frac = displacements @ np.linalg.inv(lattice)
+    wrapped = frac - np.round(frac)
+    shifts = np.stack(
+        np.meshgrid(
+            np.arange(-1, 2),
+            np.arange(-1, 2),
+            np.arange(-1, 2),
+            indexing="ij",
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    images = (wrapped[:, None, :] - shifts) @ lattice
     return np.min(np.linalg.norm(images, axis=-1), axis=-1)
 
 
@@ -116,7 +132,7 @@ class TestPeriodicJastrows(unittest.TestCase):
 
     def test_fcc_minimum_image_matches_explicit_search(self):
         lattice = _fcc_lattice()
-        reduced = reduce_lattice(lattice)
+        reduced = ReducedLattice.create(lattice)
         rng = np.random.default_rng(9127)
         frac1 = rng.random((2000, 3))
         frac2 = rng.random((2000, 3))
@@ -150,26 +166,28 @@ class TestPeriodicJastrows(unittest.TestCase):
                 [9.0, 6.0, 9.0],
             ]
         )
-        reduced = reduce_lattice(lattice)
+        reduced_basis = reduce_lattice(lattice)
+        reduced = ReducedLattice.create(lattice)
         rng = np.random.default_rng(2204)
         displacements = (rng.random((2000, 3)) - rng.random((2000, 3))) @ lattice
         expected = _explicit_mic_distances(displacements, lattice, shell=3)
 
-        reduced_vectors = mic_displacement(
+        reduced_displacements = mic_displacement(
             jnp.asarray(displacements), jnp.zeros_like(displacements), reduced
         )
-        reduced_distances = np.linalg.norm(np.asarray(reduced_vectors), axis=-1)
+        reduced_distances = np.linalg.norm(
+            np.asarray(reduced_displacements), axis=-1
+        )
         np.testing.assert_allclose(
             reduced_distances, expected, atol=1e-12, rtol=1e-12
         )
 
-        unreduced_vectors = mic_displacement(
-            jnp.asarray(displacements), jnp.zeros_like(displacements), lattice
-        )
-        unreduced_distances = np.linalg.norm(np.asarray(unreduced_vectors), axis=-1)
+        unreduced_distances = _neighbor_mic_distances(displacements, lattice)
         self.assertGreater(
             np.count_nonzero(unreduced_distances > expected + 1e-10), 0
         )
+        with self.assertRaisesRegex(TypeError, "ReducedLattice"):
+            mic_displacement(jnp.zeros(3), jnp.zeros(3), lattice)
 
         cell = periodic_gto.Cell()
         cell.atom = "H 0 0 0; H 0.2 0.3 0.4"
@@ -179,9 +197,13 @@ class TestPeriodicJastrows(unittest.TestCase):
         cell.cart = True
         cell.verbose = 0
         cell.build()
-        np.testing.assert_allclose(BoysHandy.create(cell).lattice, reduced, atol=1e-12)
         np.testing.assert_allclose(
-            NuclearCusp.create(cell, n_radial=20).lattice, reduced, atol=1e-12
+            BoysHandy.create(cell).lattice.vectors, reduced_basis, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            NuclearCusp.create(cell, n_radial=20).lattice.vectors,
+            reduced_basis,
+            atol=1e-12,
         )
 
 
@@ -195,6 +217,13 @@ class TestGammaOracle(unittest.TestCase):
     def test_rejects_non_gamma_mean_field(self):
         cell = _cell(6.0)
         mf = periodic_scf.RHF(cell, kpt=np.array([0.1, 0.0, 0.0]))
+        mf.kernel()
+        with self.assertRaisesRegex(NotImplementedError, "Gamma"):
+            create_tc(mf, BoysHandy.create(cell), grid_lvl=0)
+
+    def test_rejects_kpoint_mesh_mean_field_with_gamma_error(self):
+        cell = _cell(6.0)
+        mf = periodic_scf.KRHF(cell, kpts=cell.make_kpts([2, 1, 1]))
         mf.kernel()
         with self.assertRaisesRegex(NotImplementedError, "Gamma"):
             create_tc(mf, BoysHandy.create(cell), grid_lvl=0)

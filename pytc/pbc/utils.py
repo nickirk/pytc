@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import spglib
+from flax import struct
 
 
 _NEIGHBOR_SHIFTS = jnp.asarray(
@@ -48,6 +49,17 @@ def reduce_lattice(lattice):
     return reduced
 
 
+@struct.dataclass
+class ReducedLattice:
+    """Opaque carrier for a Niggli-reduced translation basis."""
+
+    vectors: jax.Array
+
+    @classmethod
+    def create(cls, lattice):
+        return cls(vectors=jnp.asarray(reduce_lattice(lattice)))
+
+
 @jax.custom_jvp
 def _wrap_to_half(frac):
     return frac - jnp.round(frac)
@@ -62,10 +74,13 @@ def _wrap_to_half_jvp(primals, tangents):
 
 @jax.custom_jvp
 def mic_displacement(r1, r2, lattice):
-    """Return the nearest image of ``r1 - r2`` in a reduced basis."""
-    frac = (r1 - r2) @ jnp.linalg.inv(lattice)
+    """Return the nearest image using a validated reduced basis."""
+    if not isinstance(lattice, ReducedLattice):
+        raise TypeError("lattice must be a ReducedLattice")
+    vectors = lattice.vectors
+    frac = (r1 - r2) @ jnp.linalg.inv(vectors)
     wrapped = _wrap_to_half(frac)
-    candidates = (wrapped[..., None, :] - _NEIGHBOR_SHIFTS) @ lattice
+    candidates = (wrapped[..., None, :] - _NEIGHBOR_SHIFTS) @ vectors
     squared_distances = jnp.sum(candidates * candidates, axis=-1)
     nearest = jnp.argmin(squared_distances, axis=-1)
     return jnp.take_along_axis(

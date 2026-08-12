@@ -8,14 +8,14 @@ from flax import struct
 
 from pytc.jastrow.bh import BoysHandy as MolecularBoysHandy
 
-from ..utils import mic_displacement, reduce_lattice
+from ..utils import ReducedLattice, mic_displacement
 
 
 @struct.dataclass
 class BoysHandy(MolecularBoysHandy):
     """Boys--Handy Jastrow with periodic electron distances."""
 
-    lattice: jax.Array = None
+    lattice: ReducedLattice = None
 
     @classmethod
     def create(cls, cell, terms_per_nucleus=None, epsilon=1e-16, name=None):
@@ -26,7 +26,7 @@ class BoysHandy(MolecularBoysHandy):
             name=name,
         )
         return cls(
-            lattice=jnp.asarray(reduce_lattice(cell.lattice_vectors())),
+            lattice=ReducedLattice.create(cell.lattice_vectors()),
             **{field.name: getattr(molecular, field.name) for field in fields(molecular)},
         )
 

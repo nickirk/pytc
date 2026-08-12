@@ -13,10 +13,21 @@ logger = logging.getLogger(__name__)
 
 
 def _require_gamma_real(mf, mo_coeff):
-    kpoint = np.asarray(getattr(mf, "kpt", np.zeros(3)))
-    if not np.allclose(kpoint, 0.0, atol=1e-12):
-        raise NotImplementedError("periodic TC currently supports Gamma only")
     coefficients = np.asarray(mo_coeff)
+    if coefficients.ndim != 2:
+        raise NotImplementedError(
+            "periodic TC currently supports a single Gamma-point RHF only"
+        )
+    try:
+        kpoint = np.asarray(mf.kpt)
+    except (AttributeError, ValueError) as error:
+        raise NotImplementedError(
+            "periodic TC currently supports a single Gamma-point RHF only"
+        ) from error
+    if kpoint.shape != (3,) or not np.allclose(kpoint, 0.0, atol=1e-12):
+        raise NotImplementedError(
+            "periodic TC currently supports a single Gamma-point RHF only"
+        )
     if np.iscomplexobj(coefficients):
         if not np.allclose(coefficients.imag, 0.0, atol=1e-12):
             raise NotImplementedError("periodic TC currently requires real orbitals")

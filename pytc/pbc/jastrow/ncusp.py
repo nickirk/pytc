@@ -8,20 +8,20 @@ from flax import struct
 
 from pytc.jastrow.ncusp import NuclearCusp as MolecularNuclearCusp
 
-from ..utils import mic_displacement, reduce_lattice
+from ..utils import ReducedLattice, mic_displacement
 
 
 @struct.dataclass
 class NuclearCusp(MolecularNuclearCusp):
     """Nuclear-cusp correction with periodic electron--nucleus distances."""
 
-    lattice: jax.Array = None
+    lattice: ReducedLattice = None
 
     @classmethod
     def create(cls, cell, name=None, n_radial=1000):
         molecular = MolecularNuclearCusp.create(cell, name=name, n_radial=n_radial)
         return cls(
-            lattice=jnp.asarray(reduce_lattice(cell.lattice_vectors())),
+            lattice=ReducedLattice.create(cell.lattice_vectors()),
             **{field.name: getattr(molecular, field.name) for field in fields(molecular)},
         )
 
