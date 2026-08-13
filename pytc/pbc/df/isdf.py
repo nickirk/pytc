@@ -128,6 +128,44 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
     return np.asarray(accepted, dtype=np.int64)
 
 
+# Task #107: the selection factor lives on device (task #113's decision, verified
+# by job 59987566 -- donated updates held peak growth at 0.00 GB against a
+# control that grew a full extra copy, at 4.1x the speed and bit-identical).
+#
+# WIDTH BUCKET. The projection reads `factor[:, :p0]`, and p0 advances every
+# round, so a literal slice hands jit a NEW SHAPE each time: 580 compilations at
+# 444/cc-pvtz. Padding to the full rank instead keeps one shape but does ~2x the
+# projection flops on average, and projection is 36.6% of selection. Bucketing the
+# width to a multiple of 4096 gives 11 shapes at 1.14x flops -- columns between p0
+# and the bucket edge are still zero, so they contribute nothing, and correctness
+# follows from the zero-initialisation rather than from explicit masking.
+_SELECTION_WIDTH_BUCKET = 4096
+
+
+def _bucketed_width(p0, rank):
+    if p0 <= 0:
+        return 0
+    return int(min(rank, -(-p0 // _SELECTION_WIDTH_BUCKET) * _SELECTION_WIDTH_BUCKET))
+
+
+@jax.jit
+def _selection_projection(factor_w, retained_idx, block):
+    """block - factor_w @ conj(factor_w[retained_idx]).T, on device."""
+    return block - factor_w @ jnp.conj(factor_w[retained_idx]).T
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _selection_write(factor, block_factor, p0):
+    """Write a retained block into the factor IN PLACE.
+
+    donate_argnums=(0,) is load-bearing, not an optimisation: without it every
+    round copies the whole [n_grid x rank] factor -- 97.6 GB at 444/cc-pvtz, 581
+    times. Measured in job 59987566: donated 0.00 GB growth, undonated a full
+    extra copy. The caller must not use the old buffer afterwards.
+    """
+    return jax.lax.dynamic_update_slice(factor, block_factor, (0, p0))
+
+
 def pivoted_cholesky_batched_hermitian(
     diag, col_batch_eval, rank, *, mesh, batch_size, min_separation=2.0,
     candidate_oversampling=1, n_topup=0, rcond=1e-12, ramp_scale=1e-12,
@@ -191,7 +229,14 @@ def pivoted_cholesky_batched_hermitian(
         if columns.shape != (diag.size, candidates.size):
             raise ValueError("col_batch_eval must return shape (n_grid, n_batch).")
         if factor is None:
-            factor = np.zeros((diag.size, rank), dtype=columns.dtype)
+            # Device-resident for the blocked path (task #113). The legacy
+            # branch below writes columns in place with numpy assignment, so it
+            # keeps a host array -- porting it is not in scope and pretending
+            # otherwise would silently break the reference path.
+            if blocked_projection:
+                factor = jnp.zeros((diag.size, rank), dtype=columns.dtype)
+            else:
+                factor = np.zeros((diag.size, rank), dtype=columns.dtype)
         existing = factor[:, :len(pivots)]
         projection_started = time.perf_counter()
         residual_batch = columns[candidates]
@@ -221,6 +266,7 @@ def pivoted_cholesky_batched_hermitian(
             # candidate residual Gram are byte-identical, and the only fp delta
             # is R's Gram recursion vs sequential coefficient accumulation.
             from scipy.linalg import solve_triangular
+            from jax.scipy.linalg import solve_triangular as jax_solve_triangular
             retained_local = []
             for local_index in local_pivots[:local_count]:
                 index = int(candidates[local_index])
@@ -238,20 +284,28 @@ def pivoted_cholesky_batched_hermitian(
                 retained_local = np.asarray(retained_local, dtype=np.int64)
                 retained_idx = candidates[retained_local]
                 projection_started = time.perf_counter()
-                block = np.array(columns[:, retained_local])
+                block = jnp.asarray(columns[:, retained_local])
                 if p0:
-                    factor_L = factor[:, :p0]
-                    block -= factor_L @ factor_L[retained_idx].conj().T
+                    # Bucketed width, not `:p0`: see _SELECTION_WIDTH_BUCKET.
+                    # Columns in [p0, width) are still zero and contribute nothing.
+                    width = _bucketed_width(p0, rank)
+                    block = _selection_projection(
+                        factor[:, :width], retained_idx, block)
                 projection_seconds += time.perf_counter() - projection_started
                 factor_update_started = time.perf_counter()
                 gram = residual_batch[np.ix_(retained_local, retained_local)]
                 upper_R = np.linalg.cholesky(gram).conj().T
-                block_factor = solve_triangular(
-                    upper_R.T, block.T, lower=True,
+                block_factor = jax_solve_triangular(
+                    jnp.asarray(upper_R.T), block.T, lower=True,
                 ).T
-                factor[:, p0:p0 + m] = block_factor
+                # Donated: the old buffer must not be used after this call.
+                factor = _selection_write(factor, block_factor, p0)
+                # diag stays on host -- it drives the loop's control flow and is
+                # only [n_grid] float64 (2.6 MB), so the downdate contribution is
+                # the one small array that comes back each round.
                 diag = np.maximum(
-                    diag - np.sum(np.abs(block_factor) ** 2, axis=1), 0.0,
+                    diag - np.asarray(
+                        jnp.sum(jnp.abs(block_factor) ** 2, axis=1)), 0.0,
                 )
                 factor_update_seconds += time.perf_counter() - factor_update_started
             existing = factor[:, :len(pivots)]
@@ -319,8 +373,18 @@ def pivoted_cholesky_batched_hermitian(
         projection_seconds = time.perf_counter() - projection_started
         factor_update_started = time.perf_counter()
         vector = (column[:, 0] - correction) / np.sqrt(diag[index])
-        factor[:, len(pivots)] = vector
-        diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
+        if isinstance(factor, jnp.ndarray):
+            # The top-up runs AFTER the batched rounds and writes one column at
+            # a time, so it inherits whichever factor those rounds produced. It
+            # is NOT gated on blocked_projection, which is why scoping the port
+            # to the blocked branch alone left this in-place write reachable --
+            # caught by test_isdf_selector, not by inspection.
+            factor = _selection_write(
+                factor, jnp.asarray(vector)[:, None], len(pivots))
+            diag = np.maximum(diag - np.abs(np.asarray(vector)) ** 2, 0.0)
+        else:
+            factor[:, len(pivots)] = vector
+            diag = np.maximum(diag - np.abs(vector) ** 2, 0.0)
         factor_update_seconds = time.perf_counter() - factor_update_started
         selected[index] = True
         pivots.append(index)
@@ -2152,10 +2216,26 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     # term amortised over a growing denominator.
     loop_started = time.perf_counter()
     for i, (i0, i1) in enumerate(panels):
-        eta_i = _eta_panel(i0, i1)
+        # HOISTED (task #116 follow-up). eta_i is reused by every j >= i, so it
+        # is staged on device ONCE PER PANEL rather than once per pair. Inside
+        # the j loop it cost P(P+1)/2 conversions instead of P -- 21 vs 6 at
+        # P=6, i.e. 488 GB of avoidable host->device traffic at 444/cc-pvtz,
+        # which cancelled most of what removing the rq materialisation saved.
+        #
+        # The host array is released immediately: everything below consumes the
+        # device version, so keeping both would hold two panels (65 GB) where
+        # one will do.
+        eta_i_host = _eta_panel(i0, i1)
+        eta_i = jnp.asarray(eta_i_host, dtype=jnp.complex128)
+        del eta_i_host
         for j in range(i, len(panels)):
             j0, j1 = panels[j]
-            eta_j = eta_i if j == i else _eta_panel(j0, j1)
+            if j == i:
+                eta_j = eta_i
+            else:
+                eta_j_host = _eta_panel(j0, j1)
+                eta_j = jnp.asarray(eta_j_host, dtype=jnp.complex128)
+                del eta_j_host
             for q in range(n_kpts):
                 # gphase multiplies along the shared grid axis, so
                 #   (eta_i*g) @ conj(apply(eta_j*g)).T
@@ -2165,9 +2245,9 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 # jnp, not np: the contraction below runs on device, so the
                 # operands are staged once here instead of a panel-sized array
                 # crossing the boundary per pair (task #116).
-                eta_iq = jnp.asarray(eta_i[q], dtype=jnp.complex128)
-                eta_jq = eta_iq if j == i else jnp.asarray(
-                    eta_j[q], dtype=jnp.complex128)
+                # Device slices of already-device panels: no host transfer.
+                eta_iq = eta_i[q]
+                eta_jq = eta_iq if j == i else eta_j[q]
                 rq_j = _right_factor(provider, q, eta_jq, gphase)
                 block = np.asarray(_panel_block(eta_iq, rq_j, inv_sqrt_grid))
                 kern[q, i0:i1, j0:j1] = block
@@ -2182,7 +2262,11 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
                 del rq_j
-            del eta_j
+            if j != i:
+                # Only when it is a distinct buffer -- on the diagonal eta_j
+                # ALIASES eta_i, and dropping it there would free the panel the
+                # remaining j iterations still need.
+                del eta_j
             # Counted HERE: the pair's kernel work is finished, so elapsed contains
             # it. Advancing at the eta build instead is what made the previous
             # revision optimistic.
