@@ -158,6 +158,30 @@ class TestPeriodicJastrows(unittest.TestCase):
         )(point)
         np.testing.assert_allclose(jacobian, np.eye(3), atol=1e-12)
 
+    def test_fcc_boundary_image_choice_is_eager_jit_stable(self):
+        lattice = _fcc_lattice()
+        reduced = ReducedLattice.create(lattice)
+        fractional = np.stack(
+            np.meshgrid(
+                np.arange(4) / 4,
+                np.arange(4) / 4,
+                np.arange(4) / 4,
+                indexing="ij",
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
+        grid = jnp.asarray(fractional @ lattice)
+
+        eager = mic_displacement(
+            grid[:, None, :], grid[None, :, :], reduced
+        )
+        compiled = jax.jit(
+            lambda points: mic_displacement(
+                points[:, None, :], points[None, :, :], reduced
+            )
+        )(grid)
+        np.testing.assert_allclose(compiled, eager, atol=1e-12, rtol=1e-12)
+
     def test_reduction_is_required_for_skewed_triclinic_cell(self):
         lattice = np.array(
             [

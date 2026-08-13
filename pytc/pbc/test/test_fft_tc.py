@@ -29,6 +29,23 @@ def _cell():
     return cell
 
 
+def _fcc_carbon_cell():
+    cell = gto.Cell()
+    cell.atom = "C 0 0 0; C 0.8917 0.8917 0.8917"
+    cell.basis = "sto-3g"
+    cell.a = np.array(
+        [
+            [0.0, 1.7834, 1.7834],
+            [1.7834, 0.0, 1.7834],
+            [1.7834, 1.7834, 0.0],
+        ]
+    )
+    cell.unit = "A"
+    cell.verbose = 0
+    cell.build()
+    return cell
+
+
 class TestFFTTC(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -124,6 +141,22 @@ class TestFFTTC(unittest.TestCase):
             atol=1e-12,
             rtol=1e-12,
         )
+
+    def test_reused_gradient_row_matches_fcc_boundary_oracle(self):
+        cell = _fcc_carbon_cell()
+        mesh = (4, 4, 4)
+        grid = jnp.asarray(cell.gen_uniform_grids(mesh))
+        jastrow = BoysHandy.create(cell)
+        params = jastrow.init_params()
+        compiled = jax.jit(
+            lambda left: jastrow.grad_r_batch(
+                left[None, :], grid, params
+            )[0]
+        )
+
+        eager = jastrow.grad_r_batch(grid, grid, params)
+        reused = jnp.stack([compiled(left) for left in grid])
+        np.testing.assert_allclose(reused, eager, atol=1e-12, rtol=1e-12)
 
     def test_fft_tc_two_body_matches_direct_uniform_grid_oracle(self):
         n_orb = self.tc.n_orb

@@ -90,7 +90,23 @@ def mic_displacement(r1, r2, lattice):
     wrapped = _wrap_to_half(frac)
     candidates = (wrapped[..., None, :] - _NEIGHBOR_SHIFTS) @ vectors
     squared_distances = jnp.sum(candidates * candidates, axis=-1)
-    nearest = jnp.argmin(squared_distances, axis=-1)
+    # A uniform mesh can place a pair exactly on a Wigner--Seitz boundary.
+    # Several images then have the same norm, but floating reductions may
+    # round those equal norms differently in eager and JIT execution.  A raw
+    # argmin can consequently select different image directions even though
+    # the distance is unchanged.  Gradients are direction-sensitive, so make
+    # the boundary convention explicit: distances equal to numerical precision
+    # share a tie, and the first candidate in the fixed shift ordering wins.
+    minimum = jnp.min(squared_distances, axis=-1, keepdims=True)
+    scale = jnp.maximum(
+        jnp.max(jnp.abs(squared_distances), axis=-1, keepdims=True),
+        jnp.asarray(1.0, dtype=squared_distances.dtype),
+    )
+    tolerance = 64.0 * jnp.finfo(squared_distances.dtype).eps * scale
+    tied = squared_distances <= minimum + tolerance
+    indices = jnp.arange(squared_distances.shape[-1], dtype=jnp.int32)
+    sentinel = jnp.asarray(squared_distances.shape[-1], dtype=jnp.int32)
+    nearest = jnp.min(jnp.where(tied, indices, sentinel), axis=-1)
     return jnp.take_along_axis(
         candidates, nearest[..., None, None], axis=-2
     )[..., 0, :]
