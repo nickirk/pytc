@@ -2011,11 +2011,29 @@ def _right_factor(provider, q, eta_q, gphase):
                     type(provider).__name__)
         _RIGHT_FACTOR_PATH_LOGGED = True
     if fused is not None:
-        return np.asarray(fused(q, eta_q, gphase))
+        # DEVICE-RESIDENT (task #116). This used to end `np.asarray(...)`, which
+        # pulled a whole right-factor panel to host -- 32.5 GB at 444/cc-pvtz
+        # with P=6, and 65.0 GB at the P that OOM-killed job 59952219, where the
+        # failing allocation was exactly one panel. The caller now contracts on
+        # device and materialises only the (block_rows x block_rows) result, so
+        # the panel-sized host copy disappears and the block GEMM stops being a
+        # numpy/OpenBLAS island inside an otherwise-XLA loop.
+        return fused(q, eta_q, gphase)
     lq = eta_q * gphase[None, :]
-    rq = np.conj(np.asarray(provider.apply(q, lq)))
-    rq *= gphase[None, :]
+    rq = jnp.conj(jnp.asarray(provider.apply(q, lq)))
+    rq = rq * gphase[None, :]
     return rq
+
+
+@jax.jit
+def _panel_block(eta_iq, rq_j, inv_sqrt_grid):
+    """One panel pair's kernel block: (eta_i @ rq_j.T) * inv_sqrt(n_grid).
+
+    Kept on device deliberately. The operands are panel-sized; the result is
+    (block_rows x block_rows), roughly 0.6 GB at 444/cc-pvtz against a 32.5 GB
+    operand, so materialising the OUTPUT costs ~2% of materialising an INPUT.
+    """
+    return (eta_iq @ rq_j.T) * inv_sqrt_grid
 
 
 def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
@@ -2125,6 +2143,9 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     q_kpts = np.asarray(provider.canonical_kpts, dtype=np.float64)
     # Known up front, so eta slabs preallocate and the AO stream is never listed.
     n_grid_total = int(grid_coords.shape[0])
+    # Precomputed once: the contraction scales by 1/sqrt(n_grid), and passing
+    # it in keeps _panel_block's signature free of a traced-vs-static split.
+    inv_sqrt_grid = 1.0 / np.sqrt(n_grid_total)
     gphases = np.exp(-1j * (grid_coords @ q_kpts.T)).T          # (Nk, Ng)
     kern = np.zeros((n_kpts, n_ip, n_ip), dtype=np.complex128)
     # After the fixed setup above, so elapsed is loop work and not an allocation
@@ -2141,18 +2162,22 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 # = eta_i @ (conj(apply(eta_j*g)) * g).T
                 # exactly, and the left factor needs no separate array.
                 gphase = gphases[q]
-                eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
-                eta_jq = eta_iq if j == i else np.asarray(
-                    eta_j[q], dtype=np.complex128)
+                # jnp, not np: the contraction below runs on device, so the
+                # operands are staged once here instead of a panel-sized array
+                # crossing the boundary per pair (task #116).
+                eta_iq = jnp.asarray(eta_i[q], dtype=jnp.complex128)
+                eta_jq = eta_iq if j == i else jnp.asarray(
+                    eta_j[q], dtype=jnp.complex128)
                 rq_j = _right_factor(provider, q, eta_jq, gphase)
-                block = (eta_iq @ rq_j.T) / np.sqrt(n_grid_total)
+                block = np.asarray(_panel_block(eta_iq, rq_j, inv_sqrt_grid))
                 kern[q, i0:i1, j0:j1] = block
                 if j != i and not mirror:
                     # No self-adjointness guarantee: compute the transposed panel
                     # instead of mirroring it. Correct for any provider, at twice
                     # the off-diagonal work.
                     rq_i = _right_factor(provider, q, eta_iq, gphase)
-                    kern[q, j0:j1, i0:i1] = (eta_jq @ rq_i.T) / np.sqrt(n_grid_total)
+                    kern[q, j0:j1, i0:i1] = np.asarray(
+                        _panel_block(eta_jq, rq_i, inv_sqrt_grid))
                     del rq_i
                 elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
