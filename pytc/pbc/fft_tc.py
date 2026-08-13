@@ -15,6 +15,7 @@ from __future__ import annotations
 from functools import reduce
 from operator import mul
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
@@ -22,6 +23,7 @@ from pyscf.pbc import dft as periodic_dft
 
 from pytc.integrals.tc import TC
 from pytc.integrals.xtc import XTC
+from pytc.utils.reuse import ReuseScope
 
 from .tc import _require_gamma_real
 
@@ -69,6 +71,7 @@ def fft_pair_potential(
     right_functions,
     *,
     squared_gradient=False,
+    _reuse=None,
 ):
     r"""Apply the periodic pair kernel to right-grid functions with FFTs.
 
@@ -94,11 +97,25 @@ def fft_pair_potential(
 
     axes = (-3, -2, -1)
     rhs_hat = jnp.fft.fftn((right * weights[None, :]).reshape((-1,) + mesh), axes=axes)
+    reuse = ReuseScope(max_entries=1) if _reuse is None else _reuse
+    evaluator_key = (
+        "fft_tc_gradient_row",
+        id(grid_points),
+        id(jastrow_factor),
+        id(jastrow_params),
+        mesh,
+    )
+    gradient_row = reuse.get_or_compute(
+        evaluator_key,
+        lambda: jax.jit(
+            lambda left: jastrow_factor.grad_r_batch(
+                left[None, :], grid, jastrow_params
+            )[0]
+        ),
+    )
     values = []
     for left_flat in range(grid.shape[0]):
-        gradients_by_y = jastrow_factor.grad_r_batch(
-            grid[left_flat : left_flat + 1], grid, jastrow_params
-        )[0]
+        gradients_by_y = gradient_row(grid[left_flat])
         if squared_gradient:
             kernel_by_y = jnp.sum(gradients_by_y * gradients_by_y, axis=-1)
         else:
@@ -154,6 +171,7 @@ def calc_isdf_kernels_fft(
     if xi_grad.shape != xi_phi.shape + (3,):
         raise ValueError("xi_grad must have shape (n_rank, n_grid, 3)")
 
+    reuse = ReuseScope(max_entries=1)
     gradient_potential = fft_pair_potential(
         grid_points,
         weights,
@@ -161,6 +179,7 @@ def calc_isdf_kernels_fft(
         jastrow_factor,
         jastrow_params,
         xi_phi,
+        _reuse=reuse,
     )
     squared_potential = fft_pair_potential(
         grid_points,
@@ -170,6 +189,7 @@ def calc_isdf_kernels_fft(
         jastrow_params,
         xi_phi,
         squared_gradient=True,
+        _reuse=reuse,
     )
     u1 = jnp.einsum(
         "kgc,lgc,g->klc", xi_grad, gradient_potential, weights
@@ -178,7 +198,7 @@ def calc_isdf_kernels_fft(
     return u1, u3
 
 
-def _fft_v_block(obj, jastrow_params, rows: slice, cols: slice):
+def _fft_v_block(obj, jastrow_params, rows: slice, cols: slice, reuse):
     phi_rows = obj.phi[rows]
     phi_cols = obj.phi[cols]
     right = jnp.einsum("rg,sg->rsg", phi_rows, phi_cols)
@@ -190,13 +210,14 @@ def _fft_v_block(obj, jastrow_params, rows: slice, cols: slice):
         obj.jastrow_factor,
         jastrow_params,
         flat,
+        _reuse=reuse,
     )
     return potential.reshape(
         (phi_rows.shape[0], phi_cols.shape[0], obj.grid_points.shape[0], 3)
     )
 
 
-def _fft_k1(obj, jastrow_params, ranges):
+def _fft_k1(obj, jastrow_params, ranges, reuse):
     p, q, r, s = ranges
     phi_p = obj.phi[p]
     phi_q = obj.phi[q]
@@ -211,6 +232,7 @@ def _fft_k1(obj, jastrow_params, ranges):
         obj.jastrow_factor,
         jastrow_params,
         right.reshape((-1, obj.grid_points.shape[0])),
+        _reuse=reuse,
     )
     left = jnp.einsum("pgd,qg->pqgd", grad_p, phi_q)
     value = jnp.einsum("pqgd,agd,g->pqa", left, potential, obj.weights)
@@ -219,7 +241,7 @@ def _fft_k1(obj, jastrow_params, ranges):
     )
 
 
-def _fft_k3(obj, jastrow_params, ranges):
+def _fft_k3(obj, jastrow_params, ranges, reuse):
     p, q, r, s = ranges
     phi_p = obj.phi[p]
     phi_q = obj.phi[q]
@@ -234,6 +256,7 @@ def _fft_k3(obj, jastrow_params, ranges):
         jastrow_params,
         right.reshape((-1, obj.grid_points.shape[0])),
         squared_gradient=True,
+        _reuse=reuse,
     )
     left = jnp.einsum("pg,qg->pqg", phi_p, phi_q)
     value = jnp.einsum("pqg,ag,g->pqa", left, potential, obj.weights)
@@ -242,39 +265,41 @@ def _fft_k3(obj, jastrow_params, ranges):
     )
 
 
-def _tc_block_fft(obj, jastrow_params, ranges):
-    k1 = _fft_k1(obj, jastrow_params, ranges)
+def _tc_block_fft(obj, jastrow_params, ranges, reuse):
+    k1 = _fft_k1(obj, jastrow_params, ranges, reuse)
     if ranges[0] == ranges[1]:
         k2 = k1.transpose(1, 0, 2, 3)
     else:
         swapped = (ranges[1], ranges[0], ranges[2], ranges[3])
-        k2 = _fft_k1(obj, jastrow_params, swapped).transpose(1, 0, 2, 3)
-    return 0.5 * (k1 - k2 + _fft_k3(obj, jastrow_params, ranges))
+        k2 = _fft_k1(obj, jastrow_params, swapped, reuse).transpose(1, 0, 2, 3)
+    return 0.5 * (k1 - k2 + _fft_k3(obj, jastrow_params, ranges, reuse))
 
 
-def _get_2b_fft(obj, jastrow_params, block_str=None, ranges=None):
+def _get_2b_fft(obj, jastrow_params, block_str=None, ranges=None, reuse=None):
     if ranges is None and block_str is not None:
         ranges = obj._get_block_ranges(block_str)
     if ranges is None:
         ranges = (slice(None),) * 4
 
-    result = _tc_block_fft(obj, jastrow_params, ranges)
+    reuse = ReuseScope(max_entries=1) if reuse is None else reuse
+    result = _tc_block_fft(obj, jastrow_params, ranges, reuse)
     if ranges[0] == ranges[2] and ranges[1] == ranges[3]:
         result = result + result.transpose(2, 3, 0, 1)
     else:
         transpose_ranges = (ranges[2], ranges[3], ranges[0], ranges[1])
         result = result + _tc_block_fft(
-            obj, jastrow_params, transpose_ranges
+            obj, jastrow_params, transpose_ranges, reuse
         ).transpose(2, 3, 0, 1)
     return -result
 
 
-def _delta_u_fft(obj, jastrow_params, dm1=None, ranges=None):
+def _delta_u_fft(obj, jastrow_params, dm1=None, ranges=None, reuse=None):
     if dm1 is None:
         dm1 = obj._get_mf_dm()
     if ranges is None:
         ranges = (slice(None),) * 4
     p, q, r, s = ranges
+    reuse = ReuseScope(max_entries=1) if reuse is None else reuse
     occupied = slice(0, obj.nocc) if obj.nocc is not None else slice(None)
     occupations = jnp.diagonal(dm1)[occupied]
 
@@ -290,7 +315,7 @@ def _delta_u_fft(obj, jastrow_params, dm1=None, ranges=None):
             (cols.start, cols.stop, cols.step),
         )
         if key not in block_cache:
-            block_cache[key] = _fft_v_block(obj, jastrow_params, rows, cols)
+            block_cache[key] = _fft_v_block(obj, jastrow_params, rows, cols, reuse)
         return block_cache[key]
 
     v_occ_occ = v_block(occupied, occupied)
@@ -332,7 +357,39 @@ def _delta_u_fft(obj, jastrow_params, dm1=None, ranges=None):
     return -result
 
 
-def _get_3b_fock_fft(obj, jastrow_params, dm1):
+def _delta_h_fft(obj, jastrow_params, dm1=None, block_str=None, ranges=None):
+    if dm1 is None:
+        dm1 = obj._get_mf_dm()
+    if ranges is None and block_str is not None:
+        ranges = obj._get_block_ranges(block_str)
+    if ranges is None:
+        ranges = (slice(None),) * 4
+
+    slice_p, slice_q, _, _ = ranges
+    occupied = slice(0, obj.nocc)
+    occupations = jnp.diagonal(dm1)[occupied]
+    reuse = ReuseScope(max_entries=1)
+    delta_u_pqoo = _delta_u_fft(
+        obj,
+        jastrow_params,
+        dm1,
+        (slice_p, slice_q, occupied, occupied),
+        reuse=reuse,
+    )
+    term1 = 2 * jnp.einsum("pqoo,o->pq", delta_u_pqoo, occupations)
+    delta_u_pooq = _delta_u_fft(
+        obj,
+        jastrow_params,
+        dm1,
+        (slice_p, occupied, occupied, slice_q),
+        reuse=reuse,
+    )
+    term2 = jnp.einsum("pooq,o->pq", delta_u_pooq, occupations)
+    return -0.5 * (term1 - term2)
+
+
+def _get_3b_fock_fft(obj, jastrow_params, dm1, reuse=None):
+    reuse = ReuseScope(max_entries=1) if reuse is None else reuse
     density = jnp.einsum("mg,ng,mn->g", obj.phi, obj.phi, dm1)
     potential = fft_pair_potential(
         obj.grid_points,
@@ -341,6 +398,7 @@ def _get_3b_fock_fft(obj, jastrow_params, dm1):
         obj.jastrow_factor,
         jastrow_params,
         density,
+        _reuse=reuse,
     )[0]
     local = jnp.sum(potential * potential, axis=-1)
     return jnp.einsum("pg,qg,g,g->pq", obj.phi, obj.phi, obj.weights, local)
@@ -354,7 +412,9 @@ class FFTTC(TC):
 
     def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         del batch_size
-        return _get_2b_fft(self, jastrow_params, block_str, ranges)
+        return _get_2b_fft(
+            self, jastrow_params, block_str, ranges, reuse=ReuseScope(max_entries=1)
+        )
 
     def get_3b_fock(self, jastrow_params, dm1):
         return _get_3b_fock_fft(self, jastrow_params, dm1)
@@ -368,16 +428,33 @@ class FFTXTC(XTC):
 
     def get_delta_U(self, jastrow_params, dm1=None, ranges=None, batch_size=1000):
         del batch_size
-        return _delta_u_fft(self, jastrow_params, dm1, ranges)
+        return _delta_u_fft(
+            self, jastrow_params, dm1, ranges, reuse=ReuseScope(max_entries=1)
+        )
+
+    def get_delta_h(
+        self,
+        jastrow_params,
+        dm1=None,
+        block_str=None,
+        ranges=None,
+        orb_block_size=None,
+        batch_size=1000,
+    ):
+        del orb_block_size, batch_size
+        return _delta_h_fft(self, jastrow_params, dm1, block_str, ranges)
 
     def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         if dm1 is None:
             dm1 = self._get_mf_dm()
-        tc_result = _get_2b_fft(self, jastrow_params, block_str, ranges)
+        reuse = ReuseScope(max_entries=1)
+        tc_result = _get_2b_fft(
+            self, jastrow_params, block_str, ranges, reuse=reuse
+        )
         if ranges is None and block_str is not None:
             ranges = self._get_block_ranges(block_str)
-        return tc_result + self.get_delta_U(
-            jastrow_params, dm1=dm1, ranges=ranges, batch_size=batch_size
+        return tc_result + _delta_u_fft(
+            self, jastrow_params, dm1=dm1, ranges=ranges, reuse=reuse
         )
 
     def get_3b_fock(self, jastrow_params, dm1):

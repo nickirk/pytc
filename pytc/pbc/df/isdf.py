@@ -17,6 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from pytc.utils.reuse import ReuseScope
+
 logger = logging.getLogger(__name__)
 
 
@@ -2130,47 +2132,106 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     # After the fixed setup above, so elapsed is loop work and not an allocation
     # term amortised over a growing denominator.
     loop_started = time.perf_counter()
-    for i, (i0, i1) in enumerate(panels):
-        eta_i = _eta_panel(i0, i1)
-        for j in range(i, len(panels)):
-            j0, j1 = panels[j]
-            eta_j = eta_i if j == i else _eta_panel(j0, j1)
-            for q in range(n_kpts):
-                # gphase multiplies along the shared grid axis, so
-                #   (eta_i*g) @ conj(apply(eta_j*g)).T
-                # = eta_i @ (conj(apply(eta_j*g)) * g).T
-                # exactly, and the left factor needs no separate array.
-                gphase = gphases[q]
-                eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
-                eta_jq = eta_iq if j == i else np.asarray(
-                    eta_j[q], dtype=np.complex128)
-                rq_j = _right_factor(provider, q, eta_jq, gphase)
-                block = (eta_iq @ rq_j.T) / np.sqrt(n_grid_total)
-                kern[q, i0:i1, j0:j1] = block
-                if j != i and not mirror:
-                    # No self-adjointness guarantee: compute the transposed panel
-                    # instead of mirroring it. Correct for any provider, at twice
-                    # the off-diagonal work.
-                    rq_i = _right_factor(provider, q, eta_iq, gphase)
-                    kern[q, j0:j1, i0:i1] = (eta_jq @ rq_i.T) / np.sqrt(n_grid_total)
-                    del rq_i
-                elif j != i:
+
+    def _report_pair(i, i0, i1, j, j0, j1):
+        nonlocal pairs_done
+        pairs_done += 1
+        elapsed = time.perf_counter() - loop_started
+        logger.info(
+            "p_blocked: pair %d/%d done (i=%d rows[%d:%d], j=%d rows[%d:%d]) "
+            "elapsed %.1fs",
+            pairs_done, n_pairs, i, i0, i1, j, j0, j1, elapsed,
+        )
+        if on_panel is not None:
+            on_panel(pairs_done, n_pairs, elapsed)
+
+    if mirror:
+        # The right factor depends only on (j, q), not on the left panel i. Keep
+        # exactly one j-panel bundle alive, consume every i <= j, then discard it.
+        # This turns Nk*P(P+1)/2 provider applications into Nk*P without retaining
+        # more than one panel-sized right-factor bundle.
+        right_reuse = ReuseScope(max_entries=1)
+        for j, (j0, j1) in enumerate(panels):
+            eta_j = _eta_panel(j0, j1)
+            right_key = ("p_blocked_right_panel", j, j0, j1)
+
+            def _build_right_panel():
+                return tuple(
+                    _right_factor(
+                        provider,
+                        q,
+                        np.asarray(eta_j[q], dtype=np.complex128),
+                        gphases[q],
+                    )
+                    for q in range(n_kpts)
+                )
+
+            right_by_q = right_reuse.get_or_compute(
+                right_key, _build_right_panel
+            )
+            for q, rq_j in enumerate(right_by_q):
+                eta_jq = np.asarray(eta_j[q], dtype=np.complex128)
+                kern[q, j0:j1, j0:j1] = (
+                    eta_jq @ rq_j.T
+                ) / np.sqrt(n_grid_total)
+            del rq_j
+            _report_pair(j, j0, j1, j, j0, j1)
+            del eta_j
+
+            for i, (i0, i1) in enumerate(panels[:j]):
+                eta_i = _eta_panel(i0, i1)
+
+                def _unexpected_miss():
+                    raise AssertionError("right-panel reuse entry expired early")
+
+                right_by_q = right_reuse.get_or_compute(
+                    right_key, _unexpected_miss
+                )
+                for q, rq_j in enumerate(right_by_q):
+                    eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
+                    block = (eta_iq @ rq_j.T) / np.sqrt(n_grid_total)
+                    kern[q, i0:i1, j0:j1] = block
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
                 del rq_j
-            del eta_j
-            # Counted HERE: the pair's kernel work is finished, so elapsed contains
-            # it. Advancing at the eta build instead is what made the previous
-            # revision optimistic.
-            pairs_done += 1
-            elapsed = time.perf_counter() - loop_started
-            logger.info(
-                "p_blocked: pair %d/%d done (i=%d rows[%d:%d], j=%d rows[%d:%d]) "
-                "elapsed %.1fs",
-                pairs_done, n_pairs, i, i0, i1, j, j0, j1, elapsed,
-            )
-            if on_panel is not None:
-                on_panel(pairs_done, n_pairs, elapsed)
-        del eta_i
+                del eta_i
+                _report_pair(i, i0, i1, j, j0, j1)
+            right_reuse.discard(right_key)
+            del right_by_q
+
+        reuse_stats = right_reuse.stats()
+        logger.info(
+            "p_blocked: right-factor reuse hits=%d misses=%d evictions=%d",
+            reuse_stats.hits,
+            reuse_stats.misses,
+            reuse_stats.evictions,
+        )
+    else:
+        # Without a self-adjointness guarantee, the transposed block requires a
+        # second provider application whose right operand is eta_i. Preserve the
+        # general schedule rather than applying the mirror-only reuse assumption.
+        for i, (i0, i1) in enumerate(panels):
+            eta_i = _eta_panel(i0, i1)
+            for j in range(i, len(panels)):
+                j0, j1 = panels[j]
+                eta_j = eta_i if j == i else _eta_panel(j0, j1)
+                for q in range(n_kpts):
+                    gphase = gphases[q]
+                    eta_iq = np.asarray(eta_i[q], dtype=np.complex128)
+                    eta_jq = eta_iq if j == i else np.asarray(
+                        eta_j[q], dtype=np.complex128)
+                    rq_j = _right_factor(provider, q, eta_jq, gphase)
+                    block = (eta_iq @ rq_j.T) / np.sqrt(n_grid_total)
+                    kern[q, i0:i1, j0:j1] = block
+                    if j != i:
+                        rq_i = _right_factor(provider, q, eta_iq, gphase)
+                        kern[q, j0:j1, i0:i1] = (
+                            eta_jq @ rq_i.T
+                        ) / np.sqrt(n_grid_total)
+                        del rq_i
+                    del rq_j
+                del eta_j
+                _report_pair(i, i0, i1, j, j0, j1)
+            del eta_i
 
     if self_paired is not None:
         # The dense solve projects BOTH Pi_q and kern_q at self-paired q

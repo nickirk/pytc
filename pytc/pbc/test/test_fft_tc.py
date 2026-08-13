@@ -11,6 +11,7 @@ from pytc.pbc.fft_tc import calc_isdf_kernels_fft, fft_pair_potential
 from pytc.pbc.jastrow import BoysHandy
 from pytc.pbc.tc import create_tc_fft
 from pytc.pbc.xtc import create_xtc_fft
+from pytc.utils.reuse import ReuseScope
 
 
 jax.config.update("jax_enable_x64", True)
@@ -76,6 +77,52 @@ class TestFFTTC(unittest.TestCase):
         )
         np.testing.assert_allclose(
             actual_squared, expected_squared, atol=1e-12, rtol=1e-12
+        )
+
+    def test_fft_pair_potential_reuses_one_compiled_gradient_evaluator(self):
+        right = jnp.arange(16, dtype=jnp.float64).reshape(2, 8) / 10
+        reuse = ReuseScope(max_entries=1)
+        vector = fft_pair_potential(
+            self.tc.grid_points,
+            self.tc.weights,
+            self.tc.fft_mesh,
+            self.jastrow,
+            self.params,
+            right,
+            _reuse=reuse,
+        )
+        squared = fft_pair_potential(
+            self.tc.grid_points,
+            self.tc.weights,
+            self.tc.fft_mesh,
+            self.jastrow,
+            self.params,
+            right,
+            squared_gradient=True,
+            _reuse=reuse,
+        )
+        stats = reuse.stats()
+        self.assertEqual((stats.misses, stats.hits, stats.entries), (1, 1, 1))
+
+        gradients = self.jastrow.grad_r_batch(
+            self.tc.grid_points, self.tc.grid_points, self.params
+        )
+        np.testing.assert_allclose(
+            vector,
+            jnp.einsum("xyc,ay,y->axc", gradients, right, self.tc.weights),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        np.testing.assert_allclose(
+            squared,
+            jnp.einsum(
+                "xy,ay,y->ax",
+                jnp.sum(gradients * gradients, axis=-1),
+                right,
+                self.tc.weights,
+            ),
+            atol=1e-12,
+            rtol=1e-12,
         )
 
     def test_fft_tc_two_body_matches_direct_uniform_grid_oracle(self):

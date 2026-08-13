@@ -261,6 +261,40 @@ class TestPBlockedKern(unittest.TestCase):
         # And no event may report more work than had happened by then.
         self.assertTrue(all(e <= total_applies for _, _, e in seen))
 
+    def test_self_adjoint_path_reuses_each_right_panel_across_left_panels(self):
+        cell, mesh_obj, grids, X, ao, provider = self._fixture(n_ip=6)
+        applies = {"n": 0}
+        real_apply = provider.apply
+
+        class CountingProvider:
+            canonical_kpts = provider.canonical_kpts
+            is_self_adjoint_per_q = True
+
+            def apply(self, q, lq):
+                applies["n"] += 1
+                return real_apply(q, lq)
+
+        panel_rows = 2
+        n_panels = -(-X.shape[1] // panel_rows)
+        with self.assertLogs("pytc.pbc.df.isdf", level="INFO") as cm:
+            build_pi_kern_p_blocked(
+                X,
+                lambda: [ao],
+                mesh_obj.phase,
+                mesh_obj.neg,
+                CountingProvider(),
+                grids,
+                panel_rows=panel_rows,
+            )
+
+        self.assertEqual(applies["n"], mesh_obj.n_kpts * n_panels)
+        reuse_lines = [m for m in cm.output if "right-factor reuse" in m]
+        self.assertEqual(len(reuse_lines), 1)
+        self.assertIn(f"misses={n_panels}", reuse_lines[0])
+        self.assertIn(
+            f"hits={n_panels * (n_panels - 1) // 2}", reuse_lines[0]
+        )
+
     def test_progress_needs_no_callback(self):
         """Positive control: with on_panel omitted the log must STILL fire. If only
         the hook-based assertions were checked, default-on was never covered."""
