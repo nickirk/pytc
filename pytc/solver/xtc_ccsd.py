@@ -948,9 +948,10 @@ def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, b0, b1)
 
 def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     """Initialize DF tensors and HDF5 file."""
-    if isinstance(with_df._cderi, str):
+    cderi = getattr(with_df, '_cderi', None)
+    if isinstance(cderi, str):
         import h5py
-        eris.feri = h5py.File(with_df._cderi, 'a')
+        eris.feri = h5py.File(cderi, 'a')
     elif isinstance(getattr(with_df, '_cderi_to_save', None), str):
         import h5py
         eris.feri = h5py.File(with_df._cderi_to_save, 'a')

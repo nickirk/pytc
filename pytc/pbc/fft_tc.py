@@ -155,6 +155,7 @@ def calc_isdf_kernels_fft(
     mesh,
     jastrow_factor,
     jastrow_params,
+    _reuse=None,
 ):
     """Build ISDF ``U1`` and ``U3`` kernels with the FFT pair backend.
 
@@ -171,7 +172,7 @@ def calc_isdf_kernels_fft(
     if xi_grad.shape != xi_phi.shape + (3,):
         raise ValueError("xi_grad must have shape (n_rank, n_grid, 3)")
 
-    reuse = ReuseScope(max_entries=1)
+    reuse = ReuseScope(max_entries=1) if _reuse is None else _reuse
     gradient_potential = fft_pair_potential(
         grid_points,
         weights,
@@ -196,6 +197,36 @@ def calc_isdf_kernels_fft(
     )
     u3 = jnp.einsum("kg,lg,g->kl", xi_phi, squared_potential, weights)
     return u1, u3
+
+
+def calc_isdf_l_aux_fft(
+    xi_phi,
+    weights,
+    grid_points,
+    mesh,
+    jastrow_factor,
+    jastrow_params,
+    _reuse=None,
+):
+    """Build the vector ``L_aux[rank, grid, 3]`` with the FFT backend.
+
+    ``L_aux[a, x]`` is the weighted pair integral of ``xi_phi[a]`` with
+    ``grad_1 u(x, y)``.  It is the only Jastrow-dependent grid object needed
+    by the downstream ISDF ``D/X`` mean-field-reduction algebra.
+    """
+    xi_phi = jnp.asarray(xi_phi)
+    if xi_phi.ndim != 2:
+        raise ValueError("xi_phi must have shape (n_rank, n_grid)")
+    reuse = ReuseScope(max_entries=1) if _reuse is None else _reuse
+    return fft_pair_potential(
+        grid_points,
+        weights,
+        mesh,
+        jastrow_factor,
+        jastrow_params,
+        xi_phi,
+        _reuse=reuse,
+    )
 
 
 def _fft_v_block(obj, jastrow_params, rows: slice, cols: slice, reuse):

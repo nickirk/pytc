@@ -7,7 +7,11 @@ from pyscf.pbc import gto, scf
 
 from pytc import kmat
 from pytc.integrals.xtc import XTC
-from pytc.pbc.fft_tc import calc_isdf_kernels_fft, fft_pair_potential
+from pytc.pbc.fft_tc import (
+    calc_isdf_kernels_fft,
+    calc_isdf_l_aux_fft,
+    fft_pair_potential,
+)
 from pytc.pbc.jastrow import BoysHandy
 from pytc.pbc.tc import create_tc_fft
 from pytc.pbc.xtc import create_xtc_fft
@@ -226,6 +230,29 @@ class TestFFTTC(unittest.TestCase):
         )
         np.testing.assert_allclose(actual_u1, expected_u1, atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(actual_u3, expected_u3, atol=1e-12, rtol=1e-12)
+
+    def test_fft_isdf_l_aux_matches_direct_uniform_grid_oracle(self):
+        xi_phi = jnp.array(
+            [
+                [0.2, 0.8, -0.1, 0.5, 0.3, -0.2, 0.4, 0.7],
+                [0.6, -0.3, 0.9, 0.1, -0.4, 0.2, 0.8, -0.5],
+            ]
+        )
+        actual = calc_isdf_l_aux_fft(
+            xi_phi,
+            self.tc.weights,
+            self.tc.grid_points,
+            self.tc.fft_mesh,
+            self.jastrow,
+            self.params,
+        )
+        gradients = self.jastrow.grad_r_batch(
+            self.tc.grid_points, self.tc.grid_points, self.params
+        )
+        expected = jnp.einsum(
+            "ay,y,xyc->axc", xi_phi, self.tc.weights, gradients
+        )
+        np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
 
     def test_fft_xtc_delta_u_matches_direct_uniform_grid_oracle(self):
         direct = self._direct_xtc()
