@@ -9,6 +9,7 @@ coefficient matrix by an explicit singular-value decomposition.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,9 @@ import numpy as np
 from jax import nn
 
 from .fft_tc import _mesh_tuple, _source_indices, _validate_uniform_grid
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,14 @@ class BoysHandyFamily:
     algebraic_rank: int
     numerical_rank: int
     envelope_numerical_rank: int
+    rank_threshold: float
+    smallest_kept_singular: float
+    largest_discarded_singular: float
+    kept_to_discarded_gap: float
+    envelope_rank_threshold: float
+    envelope_smallest_kept_singular: float
+    envelope_largest_discarded_singular: float
+    envelope_kept_to_discarded_gap: float
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,29 @@ def _envelope_labels(jastrow_factor):
     return tuple(labels)
 
 
+def _singular_value_receipt(singular_values, rank_rtol):
+    singular_values = np.abs(np.asarray(singular_values, dtype=float))
+    scale = float(np.max(singular_values, initial=0.0))
+    threshold = rank_rtol * scale
+    keep = singular_values > threshold
+    kept = singular_values[keep]
+    discarded = singular_values[~keep]
+    smallest_kept = float(np.min(kept, initial=np.inf))
+    largest_discarded = float(np.max(discarded, initial=0.0))
+    gap = (
+        float(smallest_kept / largest_discarded)
+        if largest_discarded > 0.0
+        else float("inf")
+    )
+    return {
+        "rank": int(np.count_nonzero(keep)),
+        "threshold": threshold,
+        "smallest_kept": smallest_kept,
+        "largest_discarded": largest_discarded,
+        "gap": gap,
+    }
+
+
 def boys_handy_coefficient_families(jastrow_factor, params, *, rank_rtol=1e-12):
     """Return exact coefficient matrices grouped by ``(atom_type, o)``."""
     if not 0 <= rank_rtol < 1:
@@ -112,19 +147,14 @@ def boys_handy_coefficient_families(jastrow_factor, params, *, rank_rtol=1e-12):
 
     families = []
     for (atom_type, power), matrix in sorted(matrices.items()):
-        eigenvalues = np.linalg.eigvalsh(matrix)
-        scale = float(np.max(np.abs(eigenvalues), initial=0.0))
         algebraic_rank = int(np.linalg.matrix_rank(matrix))
-        threshold = rank_rtol * scale
-        numerical_rank = int(np.count_nonzero(np.abs(eigenvalues) > threshold))
-        envelope_singular_values = np.linalg.svd(matrix[1:, :], compute_uv=False)
-        envelope_scale = float(
-            np.max(np.abs(envelope_singular_values), initial=0.0)
+        rank_receipt = _singular_value_receipt(
+            np.linalg.svd(matrix, compute_uv=False), rank_rtol
         )
-        envelope_numerical_rank = int(
-            np.count_nonzero(
-                np.abs(envelope_singular_values) > rank_rtol * envelope_scale
-            )
+        envelope_matrix = matrix.copy()
+        envelope_matrix[0, :] = 0.0
+        envelope_receipt = _singular_value_receipt(
+            np.linalg.svd(envelope_matrix, compute_uv=False), rank_rtol
         )
         families.append(
             BoysHandyFamily(
@@ -132,8 +162,22 @@ def boys_handy_coefficient_families(jastrow_factor, params, *, rank_rtol=1e-12):
                 radial_power=power,
                 coefficient=matrix,
                 algebraic_rank=algebraic_rank,
-                numerical_rank=numerical_rank,
-                envelope_numerical_rank=envelope_numerical_rank,
+                numerical_rank=rank_receipt["rank"],
+                envelope_numerical_rank=envelope_receipt["rank"],
+                rank_threshold=rank_receipt["threshold"],
+                smallest_kept_singular=rank_receipt["smallest_kept"],
+                largest_discarded_singular=rank_receipt[
+                    "largest_discarded"
+                ],
+                kept_to_discarded_gap=rank_receipt["gap"],
+                envelope_rank_threshold=envelope_receipt["threshold"],
+                envelope_smallest_kept_singular=envelope_receipt[
+                    "smallest_kept"
+                ],
+                envelope_largest_discarded_singular=envelope_receipt[
+                    "largest_discarded"
+                ],
+                envelope_kept_to_discarded_gap=envelope_receipt["gap"],
             )
         )
     return labels, tuple(families)
@@ -380,6 +424,26 @@ def prepare_boys_handy_channels(
     channels, families = _channels(
         jastrow_factor, jastrow_params, grid, mesh, rank_rtol=rank_rtol
     )
+    for family in families:
+        logger.info(
+            "Boys-Handy channel rank: atom_type=%d radial_power=%d "
+            "full=%d threshold=%.3e smallest_kept=%.3e "
+            "largest_discarded=%.3e gap=%.3e; envelope=%d "
+            "threshold=%.3e smallest_kept=%.3e largest_discarded=%.3e "
+            "gap=%.3e",
+            family.atom_type,
+            family.radial_power,
+            family.numerical_rank,
+            family.rank_threshold,
+            family.smallest_kept_singular,
+            family.largest_discarded_singular,
+            family.kept_to_discarded_gap,
+            family.envelope_numerical_rank,
+            family.envelope_rank_threshold,
+            family.envelope_smallest_kept_singular,
+            family.envelope_largest_discarded_singular,
+            family.envelope_kept_to_discarded_gap,
+        )
     return BoysHandyChannelPlan(
         mesh=mesh,
         n_grid=grid.shape[0],
@@ -503,6 +567,21 @@ def apply_boys_handy_channel_plan(
                 family.radial_power,
                 family.envelope_numerical_rank,
                 family.numerical_rank if family.radial_power else 0,
+            )
+            for family in families
+        ),
+        "family_rank_receipts": tuple(
+            (
+                family.atom_type,
+                family.radial_power,
+                family.rank_threshold,
+                family.smallest_kept_singular,
+                family.largest_discarded_singular,
+                family.kept_to_discarded_gap,
+                family.envelope_rank_threshold,
+                family.envelope_smallest_kept_singular,
+                family.envelope_largest_discarded_singular,
+                family.envelope_kept_to_discarded_gap,
             )
             for family in families
         ),

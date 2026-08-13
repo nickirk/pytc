@@ -118,13 +118,54 @@ class TestBoysHandyChannels(unittest.TestCase):
             [family.radial_power for family in families], [0, 1, 2, 3, 4, 6]
         )
 
+    def test_rank_receipt_exposes_kept_discarded_gap(self):
+        _, exact_families = boys_handy_coefficient_families(
+            self.jastrow, self.params
+        )
+        for family in exact_families:
+            self.assertLessEqual(
+                family.largest_discarded_singular, family.rank_threshold
+            )
+            self.assertLessEqual(
+                family.envelope_largest_discarded_singular,
+                family.envelope_rank_threshold,
+            )
+            if family.numerical_rank:
+                self.assertGreater(
+                    family.smallest_kept_singular, family.rank_threshold
+                )
+            if family.envelope_numerical_rank:
+                self.assertGreater(
+                    family.envelope_smallest_kept_singular,
+                    family.envelope_rank_threshold,
+                )
+
+        _, truncated_families = boys_handy_coefficient_families(
+            self.jastrow, self.params, rank_rtol=0.5
+        )
+        receipt = next(
+            family
+            for family in truncated_families
+            if family.radial_power == 2
+        )
+        self.assertGreater(receipt.largest_discarded_singular, 0.0)
+        self.assertGreater(receipt.kept_to_discarded_gap, 1.0)
+        self.assertGreater(
+            receipt.envelope_largest_discarded_singular, 0.0
+        )
+        self.assertGreater(receipt.envelope_kept_to_discarded_gap, 1.0)
+
     def test_prepared_plan_is_eager_jit_and_reuse_stable(self):
-        plan = prepare_boys_handy_channels(
-            self.grid,
-            self.weights,
-            self.mesh,
-            self.jastrow,
-            self.params,
+        with self.assertLogs("pytc.pbc.bh_channels", level="INFO") as logs:
+            plan = prepare_boys_handy_channels(
+                self.grid,
+                self.weights,
+                self.mesh,
+                self.jastrow,
+                self.params,
+            )
+        self.assertTrue(
+            any("largest_discarded=" in message for message in logs.output)
         )
         for squared_gradient in (False, True):
             eager = apply_boys_handy_channel_plan(
