@@ -352,24 +352,30 @@ def pivoted_cholesky_batched_hermitian(
     return np.asarray(pivots, dtype=np.int64), factor[:, :len(pivots)], len(pivots), rounds
 
 
-def _resolve_pair_convolve(convolve_device):
-    """Pick the host or device convolve.
+def _pair_convolve():
+    """The convolve. There is exactly one, and it is the device path.
 
-    The device path is not GPU-only: on the JAX CPU backend XLA fuses the
-    post-GEMM chain (transform, square, inverse transform) that the numpy path
-    materialises stage by stage. Measured at the 333 block shape on 48 host
-    threads, 354.1 against 139.99 GFLOP/s -- 2.53x with no GPU present, agreeing
-    with the numpy path to 8.4e-16. Whether a device is used is JAX's placement
-    decision, not this flag's.
+    Owner directive (2026-08-12): "remove the numpy path, since we want the same
+    code to be run on GPU in the future" -- and then, on the vestigial selector
+    this function replaced: "if numpy is removed, why do we still need this
+    keyword?" Correct: a switch with one position is not a switch.
+
+    Measured on the real 222 build before removal (job 59928607), the numpy path
+    cost 243.7 s at 24 threads against 38.0 s here, because it put a second thread
+    pool (OpenBLAS) alongside XLA's -- and XLA's is sized from the cpuset and
+    ignores OMP_NUM_THREADS, MKL_NUM_THREADS and OPENBLAS_NUM_THREADS. At 333:
+    1903.0 s -> 470.2 s, a 4.05x cut with no environment tuning.
+
+    ``pair_convolve`` (numpy) still exists in kpts.py as the reference the device
+    path is gated against to 8.4e-16 -- the tests call it directly, by name, so
+    the build needs no keyword to reach it. Deleting the oracle would delete the
+    proof that this path is correct.
     """
-    from pytc.pbc.df.kpts import pair_convolve
-    if not convolve_device:
-        return pair_convolve
     from pytc.pbc.df.kpts import pair_convolve_device
     return pair_convolve_device
 
 
-def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=False):
+def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10):
     """Build Pi^q = pair_convolve(X, X)[q] and eta^q = pair_convolve(X, AO)[q].
     eta is accumulated block-by-block so one pair_convolve call holds only
     one block of AO data. See design doc §4-§5.
@@ -395,7 +401,7 @@ def build_pi_eta(X, ao_blocks, phase, neg, *, imag_tol=1e-10, convolve_device=Fa
         (Pi, eta): (Nk, Nip, Nip) and (Nk, Nip, Ng) complex128.
     """
     # Local import: kpts.py stays a leaf.
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -490,7 +496,7 @@ class StagedEta:
 def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
                         staging_block=4096, imag_tol=1e-10,
                         free_bytes_safety=1.25, additional_reserve_bytes=0,
-                        convolve_device=False):
+                        ):
     """build_pi_eta with eta written to a (Nk, Nip, Ng) C-order memmap rather
     than held in RAM, so only one q's contiguous slab need be resident.
 
@@ -503,7 +509,7 @@ def build_pi_eta_staged(X, ao_blocks, phase, neg, *, staging_path, n_grid,
     (Pi, eta_memmap, stats). Costs and design:
     docs/isdf-periodic/task46_phaseB_eta_staging_spec.md.
     """
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
 
     X = np.asarray(X)
     if X.ndim != 3:
@@ -754,40 +760,103 @@ def apply_raw_kernel_and_solve(
 # given l_q[neg[q]] = conj(l_q[q]). Verified in test_raw_kernel_apply_dagger_law.
 
 
+# WHY THESE ARE SEPARATE jit UNITS AND MUST STAY THAT WAY.
+#
+# Written as one traced region, XLA fuses the elementwise work into the FFT's
+# loop nest and the fused kernel loses the threaded FFT path. Measured on 24
+# cores at n_ip=256, mesh 57^3 (task #103, job 59921330):
+#
+#     fft + ifft alone                       0.239 s at 12.45 cores
+#     + ONE elementwise multiply between     1.161 s at  2.46 cores
+#     the whole thing fused (as shipped)     2.354 s at  1.26 cores
+#     the pointwise algebra alone, no FFT    0.117 s at  3.52 cores
+#
+# Transforms 0.24 s plus pointwise 0.12 s, but 2.35 s together -- 6.5x the sum
+# of the parts. Nothing got more expensive; only the COMBINING did. Splitting the
+# stages into separate jit units forces materialisation at the boundaries and
+# lets each run at its own ceiling: 7.46x at n_ip=2048 (job 59923770), output
+# bit-identical (rel_err 0.0), and the win grows with panel size.
+#
+# `lax.optimization_barrier` does NOT work here (1.99 s vs 1.83 s): it constrains
+# the optimiser without forcing a buffer boundary. Only separate compiled units do.
+#
+# NO MEMORY IS SAVED BY FUSING, which is what the previous docstring assumed.
+# Peak RSS is identical across fused, split, and every row-chunk size tested --
+# 28.79 GiB in all five cases -- because the transform already allocates
+# full-size arrays internally, so the temporary the fusion "avoided" was being
+# allocated anyway. Row-chunking to bound it is therefore unnecessary AND slower
+# (1.8-2.1x), since it starves the transform of the batch it parallelises over.
+#
+# If you re-fuse these for readability, you will silently give back ~7x.
+
+
+# No grid_mesh argument: these act on an already-reshaped 4-D array, so the mesh
+# is carried by its shape, which jit already keys on.
+@jax.jit
+def _fft_fwd(lq_mesh):
+    return jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
+
+
+@jax.jit
+def _fft_inv(wq_mesh):
+    return jnp.fft.ifftn(wq_mesh, axes=(1, 2, 3))
+
+
 @partial(jax.jit, static_argnames=("grid_mesh",))
+def _apply_coulg(wq_mesh, coulG_scaled, grid_mesh):
+    vq = jnp.asarray(coulG_scaled, dtype=wq_mesh.dtype).reshape(grid_mesh)
+    return wq_mesh * vq[None, :, :, :]
+
+
 def _raw_kernel_apply_core(lq, coulG_scaled, grid_mesh):
-    """Jitted core of the "raw" provider: v_q = IFFT(coulG_scaled * FFT(lq)).
-    No validation (host wrapper's job), no phase multiply, no outer
-    conjugate."""
+    """Core of the "raw" provider: v_q = IFFT(coulG_scaled * FFT(lq)).
+
+    No validation (host wrapper's job), no phase multiply, no outer conjugate.
+
+    NOT one jit: see the note above. The stages are separate compiled units on
+    purpose, and re-fusing them costs ~7x.
+    """
     n_ip = lq.shape[0]
     lq_mesh = lq.reshape((n_ip,) + grid_mesh)
-    wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
-    vq_mesh = jnp.asarray(coulG_scaled, dtype=lq.dtype).reshape(grid_mesh)
-    vq_mesh = wq_mesh * vq_mesh[None, :, :, :]
-    rq_mesh = jnp.fft.ifftn(vq_mesh, axes=(1, 2, 3))
+    wq_mesh = _fft_fwd(lq_mesh)
+    vq_mesh = _apply_coulg(wq_mesh, coulG_scaled, grid_mesh)
+    rq_mesh = _fft_inv(vq_mesh)
     return rq_mesh.reshape(n_ip, -1)
 
 
 @partial(jax.jit, static_argnames=("grid_mesh",))
+def _rf_pre(eta, gphase, grid_mesh):
+    return (eta * gphase[None, :]).reshape((eta.shape[0],) + grid_mesh)
+
+
+@jax.jit
+def _rf_post(rq_mesh, gphase):
+    # n_ip comes from the array's own leading axis, not an argument: a traced
+    # int cannot be a reshape dimension.
+    return jnp.conj(rq_mesh.reshape(rq_mesh.shape[0], -1)) * gphase[None, :]
+
+
 def _raw_right_factor_core(eta, coulG_scaled, gphase, grid_mesh):
-    """Jitted core of ``right_q(eta) = conj(apply(q, eta*g)) * g``.
+    """``right_q(eta) = conj(apply(q, eta*g)) * g``, as SEPARATE jit units.
 
-    The whole sequence in one traced function so the phase multiply fuses into
-    the transform rather than materialising ``lq = eta*g`` as a separate array.
-    That temporary is the point: in the P-blocked loop it is panel-sized and was
-    rebuilt per pair, so removing it is the saving, not the transform itself.
+    NOT one traced region -- see the note above ``_fft_fwd``. The previous
+    revision fused the whole sequence deliberately, to avoid materialising
+    ``lq = eta*g`` as a panel-sized array. **That saving does not exist**: peak
+    RSS is identical fused and split (28.79 GiB in every variant measured,
+    job 59923770), because the transform allocates full-size arrays regardless.
+    The fusion bought no memory and cost 6.5x in wall.
 
-    Numerically this is NOT required to match the unfused composition bitwise --
-    XLA may reassociate across the fused region. The pre-registered gate holds it
-    to a c128 bound against the generic ``apply``-composed path instead.
+    Numerically this is NOT required to match the fused composition bitwise --
+    XLA may reassociate either way. In practice the split path measured
+    ``rel_err = 0.0`` against the fused one at every shape tested; the
+    pre-registered gate still holds it to a c128 bound against the generic
+    ``apply``-composed path rather than to bitwise identity.
     """
-    n_ip = eta.shape[0]
-    lq_mesh = (eta * gphase[None, :]).reshape((n_ip,) + grid_mesh)
-    wq_mesh = jnp.fft.fftn(lq_mesh, axes=(1, 2, 3))
-    vq_mesh = jnp.asarray(coulG_scaled, dtype=eta.dtype).reshape(grid_mesh)
-    vq_mesh = wq_mesh * vq_mesh[None, :, :, :]
-    rq_mesh = jnp.fft.ifftn(vq_mesh, axes=(1, 2, 3))
-    return jnp.conj(rq_mesh.reshape(n_ip, -1)) * gphase[None, :]
+    lq_mesh = _rf_pre(eta, gphase, grid_mesh)
+    wq_mesh = _fft_fwd(lq_mesh)
+    vq_mesh = _apply_coulg(wq_mesh, coulG_scaled, grid_mesh)
+    rq_mesh = _fft_inv(vq_mesh)
+    return _rf_post(rq_mesh, gphase)
 
 
 def raw_kernel_apply(lq, *, cell, q_kpt, grid_mesh):
@@ -1868,7 +1937,7 @@ def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
 
 
 def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
-                       imag_tol=1e-10, convolve_device=False, on_block=None):
+                       imag_tol=1e-10, on_block=None):
     """eta for a slab of pivot rows, holding one AO block at a time.
 
     ``build_pi_eta`` cannot be reused here: it does ``list(ao_blocks)`` to learn
@@ -1883,7 +1952,7 @@ def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
     """
     X_rows = np.asarray(X_rows)
     n_kpts, n_rows = int(X_rows.shape[0]), int(X_rows.shape[1])
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
     eta = np.empty((n_kpts, n_rows, int(n_grid)), dtype=np.complex128)
     col = 0
     index = 0
@@ -1952,7 +2021,7 @@ def _right_factor(provider, q, eta_q, gphase):
 def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
                             panel_rows, imag_tol=1e-10,
-                            convolve_device=False, self_paired=None,
+                            self_paired=None,
                             on_block=None, on_panel=None):
     """kern for every q without holding a full eta.
 
@@ -2014,7 +2083,7 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         raise ValueError(f"panel_rows must be an integer, got {type(panel_rows)}.")
     if int(panel_rows) <= 0:
         raise ValueError(f"panel_rows must be positive, got {panel_rows}.")
-    pair_convolve = _resolve_pair_convolve(convolve_device)
+    pair_convolve = _pair_convolve()
 
     # Pi needs no AO stream -- it is X against itself -- so it is built once and
     # never regenerated, whatever the panel schedule does.
@@ -2049,7 +2118,7 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         """eta rows [p0:p1) for every q, one AO block resident at a time."""
         return _eta_rows_streamed(
             X[:, p0:p1, :], ao_block_factory(), phase, neg, n_grid_total,
-            imag_tol=imag_tol, convolve_device=convolve_device,
+            imag_tol=imag_tol,
             on_block=on_block)
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)

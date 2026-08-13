@@ -214,7 +214,7 @@ class TestGetKVsRealFftdf(unittest.TestCase):
     def _build_and_dm(self, kmesh, rank, seed):
         cell = _make_cell()
         kpts = cell.make_kpts(kmesh, wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=rank, block_size=100, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=rank, block_size=100)
         mesh_obj = result["mesh_obj"]
         rng = np.random.default_rng(seed)
         dm_kpts = _tr_symmetric_hermitian_fixture(
@@ -271,7 +271,7 @@ class TestGenuinePairMeshRegression(unittest.TestCase):
     def _build_and_dm(self, rank, seed):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 4], wrap_around=False)
-        result = coulomb.build(cell, kpts, rank=rank, block_size=100, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=rank, block_size=100)
         mesh_obj = result["mesh_obj"]
         rng = np.random.default_rng(seed)
         dm_kpts = _tr_symmetric_hermitian_fixture(
@@ -359,7 +359,8 @@ class TestRetentionPolicyDefaultAvoidsBlowup(unittest.TestCase):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
         n_ao = cell.nao
-        result = coulomb.build(cell, kpts, rank=10, block_size=100, rtol=1e-8)
+        result = coulomb.build(cell, kpts, rank=10, block_size=100, rtol=1e-8,
+                               retention_mode="single")
         mesh_obj = result["mesh_obj"]
         inpv_kpt = np.asarray(result["inpv_kpt"])
         coul_kpt = np.asarray(result["coul_kpt"])

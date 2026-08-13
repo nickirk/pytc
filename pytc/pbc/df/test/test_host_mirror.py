@@ -79,9 +79,11 @@ class TestHostMirrorMatchesDevice(unittest.TestCase):
                 provider = RawKernelProvider(
                     cell=cell, canonical_kpts=mesh.canonical_kpts, grid_mesh=cell.mesh)
                 coul_d, kern_d, _, n_calls_d = build_coul_kpt_device(
-                    provider, Pi, eta, grids, mesh, rtol=1e-6)
+                    provider, Pi, eta, grids, mesh, rtol=1e-6,
+                    retention_mode="single")
                 coul_h, kern_h, infos, n_calls_h = build_coul_kpt_host(
-                    cell, Pi, eta, grids, mesh, rtol=1e-6)
+                    cell, Pi, eta, grids, mesh, rtol=1e-6,
+                    retention_mode="single")
                 self.assertEqual(n_calls_h, n_calls_d)
                 np.testing.assert_allclose(np.asarray(coul_d), coul_h, atol=1e-12)
                 np.testing.assert_allclose(np.asarray(kern_d), kern_h, atol=1e-11)
@@ -119,8 +121,10 @@ class TestHostMirrorMatchesDevice(unittest.TestCase):
         cell, mesh, grids, Pi, eta = _setup((1, 1, 3))
         provider = RawKernelProvider(
             cell=cell, canonical_kpts=mesh.canonical_kpts, grid_mesh=cell.mesh)
-        _, _, _, n_dev = build_coul_kpt_device(provider, Pi, eta, grids, mesh, rtol=1e-6)
-        _, _, _, n_host = build_coul_kpt_host(cell, Pi, eta, grids, mesh, rtol=1e-6)
+        _, _, _, n_dev = build_coul_kpt_device(
+            provider, Pi, eta, grids, mesh, rtol=1e-6, retention_mode="single")
+        _, _, _, n_host = build_coul_kpt_host(
+            cell, Pi, eta, grids, mesh, rtol=1e-6, retention_mode="single")
         self.assertEqual(n_host, n_dev)
         self.assertLess(n_host, mesh.n_kpts)
 
@@ -231,7 +235,7 @@ class TestStaticallyInvalidConfigsRefusedAtConstruction(unittest.TestCase):
         for bad in (True, 3.7):
             with self.subTest(bpc_n_topup=bad):
                 with self.assertRaises(ValueError):
-                    build(self.cell, self.kpts, rank=12, block_size=200, rtol=1e-6,
+                    build(self.cell, self.kpts, rank=12, block_size=200,
                           selection_mode="bpc_streamed", bpc_n_topup=bad)
 
 
@@ -311,7 +315,7 @@ class TestBpcPolicyAndCacheGate(unittest.TestCase):
         self.kpts = self.cell.make_kpts((1, 1, 1), wrap_around=False)
 
     def _build(self, **kw):
-        return build(self.cell, self.kpts, rank=12, block_size=200, rtol=1e-6, **kw)
+        return build(self.cell, self.kpts, rank=12, block_size=200, **kw)
 
     def test_frozen_policy_no_longer_fails_on_a_small_rank(self):
         # The exact combination that broke 19 tests: n_topup=16 against rank=12.
