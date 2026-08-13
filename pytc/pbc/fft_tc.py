@@ -71,6 +71,7 @@ def fft_pair_potential(
     right_functions,
     *,
     squared_gradient=False,
+    channel_factorized=False,
     _reuse=None,
 ):
     r"""Apply the periodic pair kernel to right-grid functions with FFTs.
@@ -84,6 +85,43 @@ def fft_pair_potential(
     ``|grad_x u|^2``.  The left-coordinate dependence is retained exactly;
     later optimisations may factor it into Boys--Handy envelope channels.
     """
+    if channel_factorized:
+        from .jastrow import BoysHandy as PeriodicBoysHandy
+
+        channel_factorized = isinstance(jastrow_factor, PeriodicBoysHandy)
+
+    if channel_factorized:
+        from .bh_channels import (
+            apply_boys_handy_channel_plan,
+            prepare_boys_handy_channels,
+        )
+
+        reuse = ReuseScope(max_entries=1) if _reuse is None else _reuse
+        plan_key = (
+            "boys_handy_channel_plan",
+            id(grid_points),
+            id(jastrow_factor),
+            id(jastrow_params),
+            _mesh_tuple(mesh),
+        )
+        plan = reuse.get_or_compute(
+            plan_key,
+            lambda: prepare_boys_handy_channels(
+                grid_points,
+                weights,
+                mesh,
+                jastrow_factor,
+                jastrow_params,
+            ),
+        )
+        result, _ = apply_boys_handy_channel_plan(
+            plan,
+            weights,
+            right_functions,
+            squared_gradient=squared_gradient,
+        )
+        return result
+
     mesh = _validate_uniform_grid(grid_points, weights, mesh)
     grid = jnp.asarray(grid_points)
     weights = jnp.asarray(weights)
@@ -155,6 +193,7 @@ def calc_isdf_kernels_fft(
     mesh,
     jastrow_factor,
     jastrow_params,
+    channel_factorized=False,
     _reuse=None,
 ):
     """Build ISDF ``U1`` and ``U3`` kernels with the FFT pair backend.
@@ -180,6 +219,7 @@ def calc_isdf_kernels_fft(
         jastrow_factor,
         jastrow_params,
         xi_phi,
+        channel_factorized=channel_factorized,
         _reuse=reuse,
     )
     squared_potential = fft_pair_potential(
@@ -190,6 +230,7 @@ def calc_isdf_kernels_fft(
         jastrow_params,
         xi_phi,
         squared_gradient=True,
+        channel_factorized=channel_factorized,
         _reuse=reuse,
     )
     u1 = jnp.einsum(
@@ -206,15 +247,18 @@ def calc_isdf_l_aux_fft(
     mesh,
     jastrow_factor,
     jastrow_params,
+    channel_factorized=False,
     _reuse=None,
 ):
     """Build the vector ``L_aux[rank, grid, 3]`` with the FFT backend.
 
     ``L_aux[a, x]`` is the weighted pair integral of ``xi_phi[a]`` with
     ``grad_1 u(x, y)``.  It is the only Jastrow-dependent grid object needed
-    by the downstream ISDF ``D/X`` mean-field-reduction algebra.  Exact
-    convolution requires the uniform grid validated here and a Jastrow
-    gradient that depends only on the periodic minimum-image displacement.
+    by the downstream ISDF ``D/X`` mean-field-reduction algebra.  The
+    left-row backend is exact for any pair gradient on the validated uniform
+    mesh.  The channel backend additionally requires the separated radial
+    kernels to depend only on the periodic minimum-image displacement; its
+    nuclear envelopes retain their explicit left/right coordinates.
     """
     xi_phi = jnp.asarray(xi_phi)
     if xi_phi.ndim != 2:
@@ -227,6 +271,7 @@ def calc_isdf_l_aux_fft(
         jastrow_factor,
         jastrow_params,
         xi_phi,
+        channel_factorized=channel_factorized,
         _reuse=reuse,
     )
 

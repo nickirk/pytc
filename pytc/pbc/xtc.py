@@ -51,6 +51,7 @@ def create_isdf_xtc_fft(
     save_path=None,
     ls_grid_batch_size=16384,
     fixed_pivots=None,
+    channel_factorized=True,
     kernel_kwargs=None,
 ):
     """Build the Gamma periodic ISDF xTC factors consumed by RCCSD.
@@ -103,6 +104,7 @@ def create_isdf_xtc_fft(
         fft_xtc.fft_mesh,
         jastrow_factor,
         jastrow_params,
+        channel_factorized=channel_factorized,
         _reuse=reuse,
     )
     l_aux = calc_isdf_l_aux_fft(
@@ -112,6 +114,7 @@ def create_isdf_xtc_fft(
         fft_xtc.fft_mesh,
         jastrow_factor,
         jastrow_params,
+        channel_factorized=channel_factorized,
         _reuse=reuse,
     )
 
