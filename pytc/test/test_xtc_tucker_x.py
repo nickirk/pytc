@@ -2,7 +2,10 @@
 
 import unittest
 from unittest import mock
+from pathlib import Path
+import tempfile
 
+import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -275,6 +278,64 @@ class TestTuckerXSolverViews(unittest.TestCase):
 
 class TestRealFactorOnlyH2(unittest.TestCase):
     """Exercise the actual ISDF, ERI, and CCSD paths with no dense-X key."""
+
+    def test_source_free_builder_cache_never_writes_dense_x(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
+            unit="Angstrom", verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        jparams = {"alpha": jnp.array([1.0])}
+        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root) / "base.h5"
+            isdf = xtc_mod.ISDFXTC.from_xtc(
+                base, n_rank=max(8, 3 * base.n_orb), save_path=str(cache),
+            )
+            direct = isdf.build_tucker_x_kernels_direct(
+                jparams, base.n_orb, oversampling=2, seed=31, batch_size=64,
+                orb_block_size=2, host_grid_block_size=512, save_path=str(cache),
+            )
+            self.assertNotIn("X", direct.isdf_kernels)
+            with h5py.File(cache, "r") as handle:
+                self.assertNotIn("X", handle)
+                self.assertNotIn("X_rm", handle)
+                self.assertTrue({"K1_kernel", "K3_kernel", "L_aux"} <= set(handle))
+
+    def test_source_free_full_rank_factor_view_matches_dense_x(self):
+        """The direct builder needs no materialized-X cache to recover full X."""
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
+            unit="Angstrom", verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        jparams = {"alpha": jnp.array([1.0])}
+        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
+        isdf = xtc_mod.ISDFXTC.from_xtc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True,
+        )
+
+        direct = isdf.build_tucker_x_kernels_direct(
+            jparams, base.n_orb, oversampling=2, seed=29, batch_size=64,
+            orb_block_size=2, host_grid_block_size=512,
+        )
+        dense = isdf.isdf(
+            jparams, batch_size=64, orb_block_size=2,
+            host_grid_block_size=512,
+        )
+
+        self.assertNotIn("X", direct.isdf_kernels)
+        self.assertNotIn("L_aux", direct.isdf_kernels)
+        self.assertIn("D", direct.isdf_kernels)
+        self.assertIn("X_tucker", direct.isdf_kernels)
+        np.testing.assert_allclose(
+            np.asarray(direct.get_delta_h(jparams)),
+            np.asarray(dense.get_delta_h(jparams)), rtol=1e-10, atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            np.asarray(direct.get_delta_U(jparams)),
+            np.asarray(dense.get_delta_U(jparams)), rtol=1e-10, atol=1e-10,
+        )
 
     def test_fused_sketch_matches_materialized_x(self):
         """The production grid/sharding path matches the old host projection."""

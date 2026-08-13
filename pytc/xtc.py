@@ -1515,6 +1515,72 @@ class ISDFXTC(XTC, ISDFTC):
         )
         return {'U': u, 'Z': np.asarray(core)}
 
+    def build_tucker_x_kernels_direct(
+        self,
+        jastrow_params,
+        n_factor,
+        *,
+        oversampling=8,
+        seed=0,
+        batch_size=1000,
+        orb_block_size=128,
+        host_grid_block_size=None,
+        save_path=None,
+        d_reduce_group_blocks=1,
+        r2_tile_size=None,
+        gpu_budget_bytes=None,
+    ):
+        """Build a factor-only X view without materializing dense ``X``.
+
+        This path first prepares only the shared TC intermediates
+        ``K1_kernel``, ``K3_kernel``, and ``L_aux``.  It then builds ``D`` and
+        the Tucker orbital basis/core directly from ``L_aux``.  The returned
+        object carries ``D`` and ``X_tucker`` but deliberately has no dense
+        ``X`` key, making it suitable for source-free construction studies and
+        production factor-only calculations.
+
+        When ``save_path`` is supplied, the reusable base intermediates may be
+        cached there by :class:`ISDFTC`; no dense exchange dataset is created.
+        """
+        base = ISDFTC.isdf(
+            self,
+            jastrow_params,
+            save_path=save_path,
+            batch_size=batch_size,
+            host_grid_block_size=host_grid_block_size,
+            r2_tile_size=r2_tile_size,
+            gpu_budget_bytes=gpu_budget_bytes,
+        )
+        kernels = dict(base.isdf_kernels)
+        l_aux = kernels.pop("L_aux")
+        d_kernel = base._compute_D_kernel(
+            jastrow_params,
+            batch_size,
+            L_aux=l_aux,
+            host_grid_block_size=host_grid_block_size,
+            d_reduce_group_blocks=d_reduce_group_blocks,
+        )
+        orbital_basis = base.select_tucker_x_orbital_basis(
+            jastrow_params,
+            n_factor,
+            oversampling=oversampling,
+            seed=seed,
+            batch_size=batch_size,
+            L_aux=l_aux,
+            orb_block_size=orb_block_size,
+            host_grid_block_size=host_grid_block_size,
+        )
+        factors = base.compute_tucker_x_core(
+            jastrow_params,
+            orbital_basis,
+            batch_size=batch_size,
+            L_aux=l_aux,
+            host_grid_block_size=host_grid_block_size,
+        )
+        kernels["D"] = np.asarray(d_kernel)
+        kernels["X_tucker"] = factors
+        return base.replace(isdf_kernels=kernels)
+
     def _iter_sharded_delta_u_blocks(
         self,
         L_aux,
