@@ -948,6 +948,18 @@ def _process_vovv_block_prefetched(vovv_slice, eris_oovv, t1, t2, t2new, b0, b1)
 
 def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     """Initialize DF tensors and HDF5 file."""
+    loop = getattr(with_df, "loop", None)
+    blockdim = getattr(with_df, "blockdim", None)
+    if (
+        not callable(loop)
+        or not isinstance(blockdim, (int, np.integer))
+        or blockdim < 1
+    ):
+        raise TypeError(
+            "Density-fitting provider must expose callable loop() and a "
+            "positive integer blockdim"
+        )
+
     cderi = getattr(with_df, '_cderi', None)
     if isinstance(cderi, str):
         import h5py
@@ -964,7 +976,7 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     Lov = np.empty((naux, nocc, nvir))
     
     mem_elements = int(eris.max_memory * 1e6 / 8)
-    chunks = (min(nvir_pair, int(mem_elements/with_df.blockdim)), min(naux, with_df.blockdim))
+    chunks = (min(nvir_pair, int(mem_elements/blockdim)), min(naux, blockdim))
     eris.vvL = eris.feri.create_dataset('vvL', (nvir_pair, naux), 'f8', chunks=chunks)
     
     mo = np.asarray(mo_coeff, order='F')
@@ -972,7 +984,7 @@ def _init_df_eris(eris, with_df, nvir, naux, nocc, nmo, mo_coeff):
     p1 = 0
     Lpq = None
     
-    for k, eri1 in enumerate(with_df.loop()):
+    for k, eri1 in enumerate(loop()):
         Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1', out=Lpq)
         p0, p1 = p1, p1 + Lpq.shape[0]
         Lpq = Lpq.reshape(p1-p0, nmo, nmo)

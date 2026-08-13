@@ -212,7 +212,9 @@ def calc_isdf_l_aux_fft(
 
     ``L_aux[a, x]`` is the weighted pair integral of ``xi_phi[a]`` with
     ``grad_1 u(x, y)``.  It is the only Jastrow-dependent grid object needed
-    by the downstream ISDF ``D/X`` mean-field-reduction algebra.
+    by the downstream ISDF ``D/X`` mean-field-reduction algebra.  Exact
+    convolution requires the uniform grid validated here and a Jastrow
+    gradient that depends only on the periodic minimum-image displacement.
     """
     xi_phi = jnp.asarray(xi_phi)
     if xi_phi.ndim != 2:

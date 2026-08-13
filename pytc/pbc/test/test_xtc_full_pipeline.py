@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +15,7 @@ from pytc.jastrow import Jastrow
 from pytc.pbc.jastrow import BoysHandy
 from pytc.pbc.xtc import create_isdf_xtc_fft
 from pytc.solver import isdf_xtc_ccsd, jax_xtc_ccsd
+from pytc.solver.xtc_ccsd import _init_df_eris
 
 
 jax.config.update("jax_enable_x64", True)
@@ -145,6 +147,19 @@ class TestPeriodicXTCFullPipeline(unittest.TestCase):
                     "X",
                 ):
                     self.assertIn(name, handle)
+
+    def test_df_bridge_rejects_incomplete_provider_before_allocation(self):
+        incomplete = SimpleNamespace(blockdim=1)
+        with self.assertRaisesRegex(TypeError, "callable loop"):
+            _init_df_eris(
+                SimpleNamespace(),
+                incomplete,
+                nvir=1,
+                naux=1,
+                nocc=1,
+                nmo=2,
+                mo_coeff=np.eye(2),
+            )
 
 
 if __name__ == "__main__":
