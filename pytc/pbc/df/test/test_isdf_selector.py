@@ -31,6 +31,10 @@ def _random_psd(rng, n, true_rank, dtype=np.complex128):
 
 
 class _SyntheticPeriodicCell:
+    @staticmethod
+    def nao_nr():
+        return 3
+
     def pbc_eval_gto(self, label, coords, kpts):
         self.assert_label(label)
         grid_index = np.asarray(coords[:, 0], dtype=np.int64)
@@ -46,6 +50,21 @@ class _SyntheticPeriodicCell:
     def assert_label(label):
         if label != "GTOval":
             raise AssertionError(label)
+
+
+class _SyntheticPeriodicEvaluator:
+    def __init__(self, cell, kpts):
+        self.cell = cell
+        self.kpts = list(np.asarray(kpts))
+        self.nao = 3
+        self.nkpts = len(self.kpts)
+
+    def evaluate(self, coords):
+        return self.cell.pbc_eval_gto("GTOval", coords, kpts=self.kpts)
+
+    @staticmethod
+    def provenance():
+        return {"backend": "synthetic_test_oracle"}
 
 
 def _translation_test_cell():
@@ -303,10 +322,13 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
         kpts = np.zeros((2, 3))
+        evaluator = _SyntheticPeriodicEvaluator(cell, kpts)
         _, streamed_batch = build_periodic_batched_pivot_oracle(
-            cell, kpts, grid_coords, block_size=4,
+            cell, kpts, grid_coords, block_size=4, evaluator=evaluator,
         )
-        _, _, cache = build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size=4)
+        _, _, cache = build_cached_periodic_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4, evaluator=evaluator
+        )
         indices = np.array([1, 4, 7], dtype=np.int64)
         np.testing.assert_allclose(
             streamed_batch(indices), periodic_metric_columns_from_ao(cache, indices), atol=1e-12,
@@ -316,9 +338,12 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
         kpts = np.zeros((2, 3))
-        _, _, cache = build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size=4)
+        evaluator = _SyntheticPeriodicEvaluator(cell, kpts)
+        _, _, cache = build_cached_periodic_pivot_oracle(
+            cell, kpts, grid_coords, block_size=4, evaluator=evaluator
+        )
         diag, gemm_columns, _ = build_cached_periodic_bpc_gemm_oracle(
-            cell, kpts, grid_coords, block_size=4,
+            cell, kpts, grid_coords, block_size=4, evaluator=evaluator,
         )
         indices = np.array([1, 4, 7], dtype=np.int64)
         np.testing.assert_allclose(diag, np.sum(np.abs(cache) ** 2, axis=(0, 2)) ** 2 / 2)
@@ -372,12 +397,14 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         cell = _SyntheticPeriodicCell()
         grid_coords = np.column_stack((np.arange(9), np.zeros((9, 2))))
         kpts = np.zeros((2, 3))
+        evaluator = _SyntheticPeriodicEvaluator(cell, kpts)
         streamed_diag, streamed_col = build_periodic_pivot_oracle(
-            cell, kpts, grid_coords, block_size=4,
+            cell, kpts, grid_coords, block_size=4, evaluator=evaluator,
         )
         cached_stats = {}
         cached_diag, cached_col, _ = build_cached_periodic_pivot_oracle(
             cell, kpts, grid_coords, block_size=4, stats=cached_stats,
+            evaluator=evaluator,
         )
         streamed_pivots, _, streamed_count = pivoted_cholesky_hermitian(
             streamed_diag, streamed_col, rank=3,
@@ -388,7 +415,14 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
         np.testing.assert_allclose(cached_diag, streamed_diag)
         self.assertEqual(cached_count, streamed_count)
         np.testing.assert_array_equal(cached_pivots, streamed_pivots)
-        self.assertEqual(cached_stats, {"pbc_eval_calls": 3, "grid_points": 9})
+        self.assertEqual(
+            cached_stats,
+            {
+                "backend": {"backend": "synthetic_test_oracle"},
+                "pbc_eval_calls": 3,
+                "grid_points": 9,
+            },
+        )
 
 
 

@@ -34,6 +34,7 @@ from pytc.pbc.df.isdf import (
     pivoted_cholesky_batched_hermitian,
     stream_ao_blocks,
 )
+from pytc.pbc.df.gto import PeriodicGTOEvaluator, eval_periodic_ao
 from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
 from pytc.pbc.fft_mesh import describe_fft_mesh
 
@@ -758,7 +759,15 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     if resolved_plan["storage_requested"] == "auto":
         cache_gate["auto_resolved_to"] = storage
 
-    ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
+    ao_evaluator = PeriodicGTOEvaluator.from_cell(
+        cell, mesh_obj.canonical_kpts
+    )
+    ao_backend = ao_evaluator.provenance()
+    ao_stats = {
+        "pbc_eval_calls": 0,
+        "grid_points": 0,
+        "backend": ao_backend,
+    }
     selection_provenance = {
         "mode": selection_mode,
         "selector": selector,
@@ -769,6 +778,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         "cache_bytes": 0,
         "panel_bytes": 0,
         "ao_dtype": np.dtype(np.complex128).name,
+        "ao_backend": ao_backend,
         **cache_gate,
     }
     cached_ao = None
@@ -799,14 +809,17 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     elif selection_mode == "bpc_streamed":
         diag, col_batch_eval = build_periodic_batched_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            evaluator=ao_evaluator,
         )
     elif selection_mode == "bpc_cached_gemm":
         diag, col_batch_eval, cached_ao = build_cached_periodic_bpc_gemm_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            evaluator=ao_evaluator,
         )
     else:
         diag, col_eval = build_periodic_pivot_oracle(
             cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            evaluator=ao_evaluator,
         )
     if selection_mode == "fixed_pivots":
         pass
@@ -841,7 +854,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
 
     selector_ao_calls = ao_stats["pbc_eval_calls"]
     selector_ao_grid_points = ao_stats["grid_points"]
-    ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
+    ao_stats = {
+        "pbc_eval_calls": 0,
+        "grid_points": 0,
+        "backend": ao_backend,
+    }
     selection_provenance["ao_calls_selection"] = selector_ao_calls
     selection_provenance["ao_grid_points_selection"] = selector_ao_grid_points
 
@@ -864,7 +881,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             )
             selection_provenance["on_selection_error"] = repr(exc)
     inpv_kpt = np.asarray(
-        cell.pbc_eval_gto("GTOval", grid_coords[pivots], kpts=list(mesh_obj.canonical_kpts)),
+        eval_periodic_ao(
+            ao_evaluator,
+            jnp.asarray(grid_coords[pivots], dtype=jnp.float64),
+        ),
         dtype=np.complex128,
     )
     ao_stats["pbc_eval_calls"] += 1
@@ -899,6 +919,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         ao_blocks_for_eta = (
             blk for _, _, blk in stream_ao_blocks(
                 cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+                evaluator=ao_evaluator,
             )
         )
 
@@ -924,6 +945,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             blk for _, _, blk in stream_ao_blocks(
                 cell, mesh_obj.canonical_kpts, grid_coords, block_size,
                 stats=ao_stats if first else None,
+                evaluator=ao_evaluator,
             )
         )
     # With stage_eta_root set, eta is staged to a memmap: per-q reads off a

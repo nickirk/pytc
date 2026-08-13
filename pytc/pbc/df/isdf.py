@@ -17,6 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from pytc.pbc.df.gto import PeriodicGTOEvaluator, eval_periodic_ao
+
 logger = logging.getLogger(__name__)
 
 
@@ -1579,7 +1581,33 @@ def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
 # either stays bounded by one block regardless of the full grid size Ng.
 
 
-def stream_ao_blocks(cell, kpts, grid_coords, block_size, *, stats=None):
+def _resolve_periodic_gto_evaluator(cell, kpts, evaluator):
+    if evaluator is None:
+        evaluator = PeriodicGTOEvaluator.from_cell(cell, kpts)
+    if evaluator.nao != cell.nao_nr():
+        raise ValueError(
+            f"AO evaluator nao={evaluator.nao} does not match cell nao={cell.nao_nr()}."
+        )
+    if evaluator.nkpts != len(np.asarray(kpts).reshape(-1, 3)):
+        raise ValueError("AO evaluator k-point count does not match kpts.")
+    return evaluator
+
+
+def _evaluate_periodic_ao(evaluator, coords):
+    custom_evaluate = getattr(evaluator, "evaluate", None)
+    if custom_evaluate is not None:
+        if not callable(custom_evaluate):
+            raise TypeError("AO evaluator evaluate attribute must be callable.")
+        return np.asarray(custom_evaluate(coords), dtype=np.complex128)
+    return np.asarray(
+        eval_periodic_ao(evaluator, jnp.asarray(coords, dtype=jnp.float64)),
+        dtype=np.complex128,
+    )
+
+
+def stream_ao_blocks(
+    cell, kpts, grid_coords, block_size, *, stats=None, evaluator=None
+):
     """S1: stream AO values at kpts over grid_coords in blocks of
     block_size grid points; host memory stays bounded by one block.
 
@@ -1600,20 +1628,31 @@ def stream_ao_blocks(cell, kpts, grid_coords, block_size, *, stats=None):
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
-    kpts_list = list(np.asarray(kpts, dtype=np.float64))
+    evaluator = _resolve_periodic_gto_evaluator(cell, kpts, evaluator)
+    if stats is not None:
+        stats.setdefault("backend", evaluator.provenance())
 
     for g0 in range(0, n_grid, block_size):
         g1 = min(g0 + block_size, n_grid)
-        ao_block = np.asarray(
-            cell.pbc_eval_gto("GTOval", grid_coords[g0:g1], kpts=kpts_list), dtype=np.complex128,
-        )
+        coords = grid_coords[g0:g1]
+        # Keep one compiled grid-block shape.  Padding only the terminal block
+        # avoids a second XLA executable while preserving the yielded extent.
+        if g1 - g0 < block_size:
+            padded = np.empty((block_size, 3), dtype=np.float64)
+            padded[:g1 - g0] = coords
+            padded[g1 - g0:] = coords[-1]
+            ao_block = _evaluate_periodic_ao(evaluator, padded)[:, :g1 - g0]
+        else:
+            ao_block = _evaluate_periodic_ao(evaluator, coords)
         if stats is not None:
             stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
             stats["grid_points"] = stats.get("grid_points", 0) + (g1 - g0)
         yield g0, g1, ao_block
 
 
-def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
+def build_periodic_pivot_oracle(
+    cell, kpts, grid_coords, block_size, *, stats=None, evaluator=None
+):
     """S2 periodic pivot-selection metric oracle (design doc §3): a
     (diag, col_eval) pair for the reference-cell pair-density Gram matrix
     M[r,r'] = |sum_{k,mu} conj(AO_k(r,mu)) AO_k(r',mu)|^2 / Nk, never
@@ -1630,19 +1669,17 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=No
     n_grid = grid_coords.shape[0]
     kpts_np = np.asarray(kpts, dtype=np.float64)
     n_kpts = kpts_np.shape[0]
+    evaluator = _resolve_periodic_gto_evaluator(cell, kpts_np, evaluator)
 
     diag = np.empty(n_grid, dtype=np.float64)
     for g0, g1, ao_block in stream_ao_blocks(
-        cell, kpts_np, grid_coords, block_size, stats=stats,
+        cell, kpts_np, grid_coords, block_size, stats=stats, evaluator=evaluator,
     ):
         pooled = np.sum(np.abs(ao_block) ** 2, axis=(0, 2))  # (blk,), sum_{k,mu} |AO_k(r,mu)|^2
         diag[g0:g1] = pooled ** 2 / n_kpts
 
     def col_eval(j):
-        ao_j_block = np.asarray(
-            cell.pbc_eval_gto("GTOval", grid_coords[j:j + 1], kpts=list(kpts_np)),
-            dtype=np.complex128,
-        )
+        ao_j_block = _evaluate_periodic_ao(evaluator, grid_coords[j:j + 1])
         if stats is not None:
             stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
             stats["grid_points"] = stats.get("grid_points", 0) + 1
@@ -1650,7 +1687,7 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=No
 
         col = np.empty(n_grid, dtype=np.complex128)
         for g0, g1, ao_block in stream_ao_blocks(
-            cell, kpts_np, grid_coords, block_size, stats=stats,
+            cell, kpts_np, grid_coords, block_size, stats=stats, evaluator=evaluator,
         ):
             gram = np.einsum("km,krm->r", ao_j.conj(), ao_block, optimize=True)
             col[g0:g1] = (np.abs(gram) ** 2 / n_kpts).astype(np.complex128)
@@ -1659,29 +1696,29 @@ def build_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=No
     return diag, col_eval
 
 
-def build_periodic_batched_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
+def build_periodic_batched_pivot_oracle(
+    cell, kpts, grid_coords, block_size, *, stats=None, evaluator=None
+):
     """Exact streamed periodic metric with one full AO sweep per column batch."""
     diagonal, _ = build_periodic_pivot_oracle(
-        cell, kpts, grid_coords, block_size, stats=stats,
+        cell, kpts, grid_coords, block_size, stats=stats, evaluator=evaluator,
     )
     kpts_np = np.asarray(kpts, dtype=np.float64)
     n_grid = len(grid_coords)
     n_kpts = len(kpts_np)
+    evaluator = _resolve_periodic_gto_evaluator(cell, kpts_np, evaluator)
 
     def col_batch_eval(indices):
         indices = np.asarray(indices, dtype=np.int64)
         if indices.ndim != 1 or indices.size == 0 or np.any(indices < 0) or np.any(indices >= n_grid):
             raise ValueError("indices must be a nonempty in-range integer vector.")
-        pivot_ao = np.asarray(
-            cell.pbc_eval_gto("GTOval", grid_coords[indices], kpts=list(kpts_np)),
-            dtype=np.complex128,
-        )
+        pivot_ao = _evaluate_periodic_ao(evaluator, grid_coords[indices])
         if stats is not None:
             stats["pbc_eval_calls"] = stats.get("pbc_eval_calls", 0) + 1
             stats["grid_points"] = stats.get("grid_points", 0) + int(indices.size)
         columns = np.empty((n_grid, indices.size), dtype=np.complex128)
         for g0, g1, ao_block in stream_ao_blocks(
-            cell, kpts_np, grid_coords, block_size, stats=stats,
+            cell, kpts_np, grid_coords, block_size, stats=stats, evaluator=evaluator,
         ):
             gram = np.einsum("kbm,krm->br", pivot_ao.conj(), ao_block, optimize=True)
             columns[g0:g1] = (np.abs(gram) ** 2 / n_kpts).T
@@ -1721,7 +1758,9 @@ def explicit_candidate_identity(indices):
     return {"kind": "explicit_indices", "indices": indices.tolist()}
 
 
-def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
+def build_cached_periodic_pivot_oracle(
+    cell, kpts, grid_coords, block_size, *, stats=None, evaluator=None
+):
     """Full-cache oracle carrying the same metric as the streamed path.
 
     Reference-only test oracle; intentionally no production caller. It is the
@@ -1734,7 +1773,7 @@ def build_cached_periodic_pivot_oracle(cell, kpts, grid_coords, block_size, *, s
     n_kpts = len(kpts_np)
     cache = None
     for g0, g1, ao_block in stream_ao_blocks(
-        cell, kpts_np, grid_coords, block_size, stats=stats,
+        cell, kpts_np, grid_coords, block_size, stats=stats, evaluator=evaluator,
     ):
         if cache is None:
             cache = np.empty((n_kpts, n_grid, ao_block.shape[2]), dtype=np.complex128)
@@ -1764,13 +1803,17 @@ def periodic_metric_columns_from_ao(ao, indices):
     return (np.abs(gram) ** 2 / ao.shape[0]).T.astype(np.float64)
 
 
-def build_cached_periodic_bpc_gemm_oracle(cell, kpts, grid_coords, block_size, *, stats=None):
+def build_cached_periodic_bpc_gemm_oracle(
+    cell, kpts, grid_coords, block_size, *, stats=None, evaluator=None
+):
     """Opt-in contiguous feature cache for BPC's threaded candidate GEMM."""
     kpts_np = np.asarray(kpts, dtype=np.float64)
     n_grid = len(grid_coords)
     n_kpts = len(kpts_np)
     features = None
-    for g0, g1, ao_block in stream_ao_blocks(cell, kpts_np, grid_coords, block_size, stats=stats):
+    for g0, g1, ao_block in stream_ao_blocks(
+        cell, kpts_np, grid_coords, block_size, stats=stats, evaluator=evaluator
+    ):
         if features is None:
             features = np.empty((n_grid, n_kpts * ao_block.shape[2]), dtype=np.complex128)
         features[g0:g1] = ao_block.transpose(1, 0, 2).reshape(g1 - g0, -1)
