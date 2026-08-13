@@ -1542,6 +1542,14 @@ class ISDFXTC(XTC, ISDFTC):
         When ``save_path`` is supplied, the reusable base intermediates may be
         cached there by :class:`ISDFTC`; no dense exchange dataset is created.
         """
+        if save_path and os.path.exists(save_path):
+            with h5py.File(save_path, 'r') as handle:
+                dense_keys = sorted({'X', 'X_rm'}.intersection(handle.keys()))
+            if dense_keys:
+                raise ValueError(
+                    "Factor-only Tucker construction refuses a cache containing "
+                    f"dense exchange data: {dense_keys}"
+                )
         base = ISDFTC.isdf(
             self,
             jastrow_params,
