@@ -148,10 +148,26 @@ def _bucketed_width(p0, rank):
     return int(min(rank, -(-p0 // _SELECTION_WIDTH_BUCKET) * _SELECTION_WIDTH_BUCKET))
 
 
-@jax.jit
-def _selection_projection(factor_w, retained_idx, block):
-    """block - factor_w @ conj(factor_w[retained_idx]).T, on device."""
-    return block - factor_w @ jnp.conj(factor_w[retained_idx]).T
+@partial(jax.jit, static_argnames=("width",))
+def _selection_projection(factor, retained_idx, block, width):
+    """block - L @ conj(L[retained]).T for L = factor[:, :width], on device.
+
+    The slice happens INSIDE the jit, deliberately. Slicing in Python first --
+    `_selection_projection(factor[:, :width], ...)` -- is an eager op on an
+    immutable array, so it MATERIALISES a copy of up to the whole
+    [n_grid x rank] factor on every round: 97.6 GB x 596 rounds at 444/cc-pvtz.
+    That is what made job 59992249's selection ~3x slower than baseline.
+
+    Passing the full array and slicing under trace lets XLA fold the slice into
+    the operand instead of building it. `width` is static so the traced shape is
+    fixed; bucketing keeps the number of distinct widths at 11 rather than 580.
+
+    The irony is worth recording: task #113 existed to eliminate per-round copies
+    of this array, donation was verified to prevent them in the WRITE, and this
+    line reintroduced them in the READ -- where the verification never looked.
+    """
+    left = jax.lax.dynamic_slice(factor, (0, 0), (factor.shape[0], width))
+    return block - left @ jnp.conj(left[retained_idx]).T
 
 
 @partial(jax.jit, donate_argnums=(0,))
@@ -164,6 +180,34 @@ def _selection_write(factor, block_factor, p0):
     extra copy. The caller must not use the old buffer afterwards.
     """
     return jax.lax.dynamic_update_slice(factor, block_factor, (0, p0))
+
+
+def _write_factor_block(factor, block_factor, p0, *, check=True):
+    """Donated in-place write, with donation ASSERTED rather than assumed.
+
+    JAX deletes a buffer it has donated, so `is_deleted()` reports directly
+    whether the write reused the input or silently copied it. At 444/cc-pvtz the
+    factor is 97.6 GB and there are ~596 rounds, so a donation that quietly
+    stops firing costs ~58 TB of copying -- a performance failure that looks
+    exactly like working code, and which no small-scale test can reach: donation
+    verified in situ at 3 GB (16/16 rounds donated) while job 59992249's
+    selection footprint was 255.5 GB against an expected 117.7 GB, i.e. the
+    shape of a second factor.
+
+    Raising here converts that silent failure into a named one, in the log of
+    whichever run hits it.
+    """
+    out = _selection_write(factor, block_factor, p0)
+    if check and not factor.is_deleted():
+        out.block_until_ready()
+        if not factor.is_deleted():
+            raise RuntimeError(
+                "donation did not fire on the selection factor write "
+                f"(shape {tuple(factor.shape)}, {factor.nbytes/1e9:.1f} GB): the "
+                "input buffer survived, so this round COPIED the factor instead "
+                "of updating it in place. Every round would pay that copy."
+            )
+    return out
 
 
 def pivoted_cholesky_batched_hermitian(
@@ -290,7 +334,7 @@ def pivoted_cholesky_batched_hermitian(
                     # Columns in [p0, width) are still zero and contribute nothing.
                     width = _bucketed_width(p0, rank)
                     block = _selection_projection(
-                        factor[:, :width], retained_idx, block)
+                        factor, retained_idx, block, width)
                 projection_seconds += time.perf_counter() - projection_started
                 factor_update_started = time.perf_counter()
                 gram = residual_batch[np.ix_(retained_local, retained_local)]
@@ -299,7 +343,7 @@ def pivoted_cholesky_batched_hermitian(
                     jnp.asarray(upper_R.T), block.T, lower=True,
                 ).T
                 # Donated: the old buffer must not be used after this call.
-                factor = _selection_write(factor, block_factor, p0)
+                factor = _write_factor_block(factor, block_factor, p0)
                 # diag stays on host -- it drives the loop's control flow and is
                 # only [n_grid] float64 (2.6 MB), so the downdate contribution is
                 # the one small array that comes back each round.
@@ -379,7 +423,7 @@ def pivoted_cholesky_batched_hermitian(
             # is NOT gated on blocked_projection, which is why scoping the port
             # to the blocked branch alone left this in-place write reachable --
             # caught by test_isdf_selector, not by inspection.
-            factor = _selection_write(
+            factor = _write_factor_block(
                 factor, jnp.asarray(vector)[:, None], len(pivots))
             diag = np.maximum(diag - np.abs(np.asarray(vector)) ** 2, 0.0)
         else:
