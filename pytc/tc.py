@@ -1629,6 +1629,7 @@ class ISDFTC(TC):
 
         if reuse_aux_kernels:
             logger.info("  Computing L_aux and H_aux for exact K1/K3 recovery...")
+            aux_build_start = time.perf_counter()
             L_aux, H_aux = self._compute_L_aux(
                 jastrow_params,
                 batch_size,
@@ -1636,6 +1637,11 @@ class ISDFTC(TC):
                 host_grid_block_size=host_grid_block_size,
                 include_h_aux=True,
             )
+            logger.info(
+                "  L_aux/H_aux construction completed in %.4f s",
+                time.perf_counter() - aux_build_start,
+            )
+            recovery_start = time.perf_counter()
             if self.is_incore:
                 kernels = kmat_jax.calc_kmat_kernels_from_aux(
                     self.xi_phi, self.xi_grad, self.weights, L_aux, H_aux
@@ -1683,8 +1689,13 @@ class ISDFTC(TC):
                     h_aux_file = H_aux.file
                     del h_aux_file['H_aux']
                     h_aux_file.flush()
+            logger.info(
+                "  K1/K3 auxiliary recovery completed in %.4f s",
+                time.perf_counter() - recovery_start,
+            )
         else:
             logger.info("  Computing K1 and K3 kernels...")
+            direct_k_start = time.perf_counter()
             kernels = self.compute_kmat_kernels(
                 jastrow_params,
                 batch_size,
@@ -1692,12 +1703,21 @@ class ISDFTC(TC):
                 r2_tile_size=r2_tile_size,
                 gpu_budget_bytes=gpu_budget_bytes,
             )
+            logger.info(
+                "  K1/K3 direct construction completed in %.4f s",
+                time.perf_counter() - direct_k_start,
+            )
             logger.info("  Computing L_aux...")
+            laux_start = time.perf_counter()
             L_aux = self._compute_L_aux(
                 jastrow_params,
                 batch_size,
                 save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
+            )
+            logger.info(
+                "  L_aux construction completed in %.4f s",
+                time.perf_counter() - laux_start,
             )
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
@@ -1717,6 +1737,12 @@ class ISDFTC(TC):
         
         if out_path and not self.is_incore:
             with h5py.File(out_path, 'a') as f:
+                # This provenance is deliberately on the base cache because
+                # timing cards must not mistake a direct K cache for an
+                # auxiliary-recovered one (or vice versa) after a restart.
+                f.attrs['pytc_kmat_kernel_mode'] = (
+                    'aux-recovery' if reuse_aux_kernels else 'direct'
+                )
                 for k, v in kernels.items():
                     if k == 'L_aux': continue
                     if k in f: del f[k]

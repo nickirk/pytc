@@ -134,6 +134,25 @@ class TestISDFXTCPanelization(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, clean_env):
             direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
+            direct_store_path = os.path.join(tmpdir, "h2_direct_streamed.h5")
+            with h5py.File(direct_store_path, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf_xtc.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf_xtc.xi_grad))
+            direct_out_of_core = self.isdf_xtc.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=direct_store_path,
+            ).isdf(
+                self.jparams,
+                save_path=direct_store_path,
+                batch_size=64,
+                orb_block_size=2,
+                host_grid_block_size=512,
+            )
+            self.assertIn("K1_kernel", direct_out_of_core.isdf_kernels)
+            with h5py.File(direct_store_path, "r") as f:
+                self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "direct")
             store_path = os.path.join(tmpdir, "h2_aux_streamed.h5")
             # Match a genuine out-of-core ISDF object: xi lives only in the
             # persistent store and the object carries None for both fields.
@@ -174,6 +193,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
             with h5py.File(store_path, "r") as f:
                 self.assertIn("L_aux", f)
                 self.assertNotIn("H_aux", f)
+                self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
 
     def test_x_normal_order_and_residual_switches_are_independent(self):
         """A full X store can isolate normal-order and residual-X effects."""
