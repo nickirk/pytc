@@ -152,19 +152,29 @@ def _bucketed_width(p0, rank):
 def _selection_projection(factor, retained_idx, block, width):
     """block - L @ conj(L[retained]).T for L = factor[:, :width], on device.
 
-    The slice happens INSIDE the jit, deliberately. Slicing in Python first --
-    `_selection_projection(factor[:, :width], ...)` -- is an eager op on an
-    immutable array, so it MATERIALISES a copy of up to the whole
-    [n_grid x rank] factor on every round: 97.6 GB x 596 rounds at 444/cc-pvtz.
-    That is what made job 59992249's selection ~3x slower than baseline.
+    WARNING: this slice IS materialised. Slicing under trace rather than in
+    Python was intended to let XLA fold it into the dot operand; XLA's own
+    memory accounting says it does not, at the production shape
+    (n_grid=328509, rank=37120):
 
-    Passing the full array and slicing under trace lets XLA fold the slice into
-    the operand instead of building it. `width` is static so the traced shape is
-    fixed; bucketing keeps the number of distinct widths at 11 rather than 580.
+        width   4096   slice 10.8 GB   temp 10.8 GB
+        width  18432   slice 48.4 GB   temp 48.5 GB
+        width  37120   slice 97.6 GB   temp  0.0 GB   <- width == rank
 
-    The irony is worth recording: task #113 existed to eliminate per-round copies
-    of this array, donation was verified to prevent them in the WRITE, and this
-    line reintroduced them in the READ -- where the verification never looked.
+    Temp tracks the slice exactly until the slice becomes the identity, at
+    which point XLA aliases the argument and it is free. So the copy is real
+    and avoidable: the columns in [p0, rank) are exactly zero -- the same
+    premise the bucket already relies on -- so passing the full factor is
+    numerically identical and costs no temp, at the price of GEMM arithmetic on
+    zero columns (~2x FLOPs). Whether that trade pays is being measured; do not
+    assume it either way.
+
+    `width` is static so the traced shape is fixed; bucketing keeps the number
+    of distinct widths at 11 rather than 580.
+
+    Task #113 existed to eliminate per-round copies of this array and verified
+    donation prevents them in the WRITE. This line reintroduced them in the
+    READ, where that verification never looked.
     """
     left = jax.lax.dynamic_slice(factor, (0, 0), (factor.shape[0], width))
     return block - left @ jnp.conj(left[retained_idx]).T
