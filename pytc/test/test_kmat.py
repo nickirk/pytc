@@ -329,6 +329,31 @@ class TestKmatFromAuxParity(unittest.TestCase):
             rtol=0, atol=2e-12,
         )
 
+    def test_out_of_core_kmat_mode_is_persisted(self):
+        """Fresh direct and recovered caches must remain distinguishable."""
+        with tempfile.TemporaryDirectory() as directory:
+            for mode, reuse_aux_kernels in (("direct", False), ("aux-recovery", True)):
+                path = f"{directory}/{mode}.h5"
+                with h5py.File(path, "w") as handle:
+                    handle.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
+                    handle.create_dataset("xi_grad", data=np.asarray(self.isdf.xi_grad))
+                out_of_core = self.isdf.replace(
+                    is_incore=False,
+                    xi_phi=None,
+                    xi_grad=None,
+                    save_path=path,
+                ).isdf(
+                    self.params,
+                    save_path=path,
+                    batch_size=32,
+                    host_grid_block_size=512,
+                    reuse_aux_kernels=reuse_aux_kernels,
+                )
+                self.assertIn("K1_kernel", out_of_core.isdf_kernels)
+                with h5py.File(path, "r") as handle:
+                    self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], mode)
+                    self.assertNotIn("H_aux", handle)
+
 
 
 class TestStreamingContractionParity(unittest.TestCase):
