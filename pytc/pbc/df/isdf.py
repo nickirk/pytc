@@ -291,11 +291,18 @@ def pivoted_cholesky_batched_hermitian(
                 factor = jnp.zeros((diag.size, rank), dtype=columns.dtype)
             else:
                 factor = np.zeros((diag.size, rank), dtype=columns.dtype)
-        existing = factor[:, :len(pivots)]
         projection_started = time.perf_counter()
         residual_batch = columns[candidates]
         if pivots:
-            residual_batch = residual_batch - existing[candidates] @ existing[candidates].conj().T
+            # Gather the candidate ROWS, then slice columns -- not the reverse.
+            # `factor[:, :p]` builds an [n_grid x p] intermediate, and on a
+            # device array that is a materialised copy (up to 97.6 GB per round
+            # at 444/cc-pvtz) of which only these `batch` rows are ever read.
+            # Measured 130x on JAX and 1.0x on numpy (job 60001324) -- the
+            # asymmetry is why this line was free before the port and expensive
+            # after it, and why the baseline ran in 1,877 s.
+            existing_c = factor[candidates, :len(pivots)]
+            residual_batch = residual_batch - existing_c @ existing_c.conj().T
         projection_seconds = time.perf_counter() - projection_started
         local_diag = np.maximum(np.real(np.diag(residual_batch)), 0.0)
         within_batch_started = time.perf_counter()
@@ -362,8 +369,11 @@ def pivoted_cholesky_batched_hermitian(
                         jnp.sum(jnp.abs(block_factor) ** 2, axis=1)), 0.0,
                 )
                 factor_update_seconds += time.perf_counter() - factor_update_started
-            existing = factor[:, :len(pivots)]
         else:
+            # Full [n_grid x p] is genuinely needed here: the sequential branch
+            # forms `existing @ existing[index].conj()` over every grid row.
+            # `factor` is numpy on this branch, so the slice is a view and free.
+            existing = factor[:, :len(pivots)]
             for local_index in local_pivots[:local_count]:
                 index = int(candidates[local_index])
                 if selected[index] or diag[index] <= threshold:
