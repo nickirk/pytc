@@ -1369,8 +1369,16 @@ class ISDFTC(TC):
         return {'K1_kernel': jnp.asarray(K1_kernel),
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
-    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None, host_grid_block_size=None):
-        """Compute L_aux (G) for the full grid with grid-blocking to save host RAM."""
+    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
+                       host_grid_block_size=None, include_h_aux=False):
+        """Compute L_aux, and optionally its exact squared-gradient companion.
+
+        When ``include_h_aux`` is true this also forms
+        ``H_aux[a,g] = sum_h xi_phi[a,h] w_h |grad u(g,h)|^2`` in the same
+        double-grid pass.  ``H_aux`` lets the K3 ISDF kernel be recovered by
+        one-grid contraction; paired with ``L_aux`` it likewise recovers K1.
+        The default is deliberately unchanged for existing callers.
+        """
         n_devices = jax.local_device_count()
         devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
@@ -1380,13 +1388,19 @@ class ISDFTC(TC):
             host_grid_block_size = n_grid
             
         L_aux_out = None
+        H_aux_out = None
         f_out = None
         if save_path:
             f_out = h5py.File(save_path, 'a')
             if 'L_aux' in f_out: del f_out['L_aux']
             L_aux_out = f_out.create_dataset('L_aux', (n_rank, n_grid, 3), dtype='f8')
+            if include_h_aux:
+                if 'H_aux' in f_out: del f_out['H_aux']
+                H_aux_out = f_out.create_dataset('H_aux', (n_rank, n_grid), dtype='f8')
         else:
             L_aux_out = np.zeros((n_rank, n_grid, 3))
+            if include_h_aux:
+                H_aux_out = np.zeros((n_rank, n_grid))
             
         xi_phi_ds = None
         f_xi = None
@@ -1403,6 +1417,8 @@ class ISDFTC(TC):
             
         def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
             def scan_body(carry, i):
+                if include_h_aux:
+                    l_aux_carry, h_aux_carry = carry
                 r_eval = grid_eval_shard
                 g_batch = jax.lax.dynamic_slice(grid_int, (i * batch_size, 0), (batch_size, 3))
                 w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
@@ -1411,6 +1427,10 @@ class ISDFTC(TC):
                 u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
                 xi_weighted = xi_batch * w_batch[None, :]
                 update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
+                if include_h_aux:
+                    grad_sq = jnp.sum(u_grad**2, axis=-1)
+                    h_update = jnp.einsum('ab,ib->ai', xi_weighted, grad_sq)
+                    return (l_aux_carry + update, h_aux_carry + h_update), None
                 return carry + update, None
 
             n_int = grid_int.shape[0]
@@ -1422,18 +1442,34 @@ class ISDFTC(TC):
                 weights_int = jnp.pad(weights_int, (0, pad_int))
                 xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
                 
-            init_val = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
-            res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
-            return res
+            l_aux_init = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
+            if include_h_aux:
+                h_aux_init = jnp.zeros((n_rank, grid_eval_shard.shape[0]))
+                (l_aux_res, h_aux_res), _ = jax.lax.scan(
+                    scan_body, (l_aux_init, h_aux_init), jnp.arange(n_batches)
+                )
+                return l_aux_res, h_aux_res
+            l_aux_res, _ = jax.lax.scan(scan_body, l_aux_init, jnp.arange(n_batches))
+            return l_aux_res
 
-        @shard_map(
-            mesh=mesh,
-            in_specs=(P('devices', None), P(), P(), P(), P()),
-            out_specs=P(None, 'devices', None),
-            check_vma=False,
-        )
-        def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
-            return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+        if include_h_aux:
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P('devices', None), P(), P(), P(), P()),
+                out_specs=(P(None, 'devices', None), P(None, 'devices')),
+                check_vma=False,
+            )
+            def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+                return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+        else:
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P('devices', None), P(), P(), P(), P()),
+                out_specs=P(None, 'devices', None),
+                check_vma=False,
+            )
+            def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+                return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
 
         try:
             for r0 in range(0, n_grid, host_grid_block_size):
@@ -1451,6 +1487,7 @@ class ISDFTC(TC):
                 sharded_grid_eval = jax.device_put(grid_eval_block, eval_sharding)
                 
                 res_rep_accum = None
+                h_aux_rep_accum = None
                 
                 # Also controlled by host_grid_block_size to limit peak memory of inputs
                 from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
@@ -1484,6 +1521,9 @@ class ISDFTC(TC):
                         sharded_grid_eval, params_rep, grid_int_chunk, weights_int_chunk, xi_phi_chunk
                     )
 
+                    if include_h_aux:
+                        res_partial, h_partial = res_partial
+
                     # While shard_map runs, prefetch next integration block.
                     next_g0 = g0 + host_grid_block_size
                     if next_g0 < n_grid:
@@ -1491,15 +1531,27 @@ class ISDFTC(TC):
                     
                     if res_rep_accum is None:
                         res_rep_accum = res_partial
+                        if include_h_aux:
+                            h_aux_rep_accum = h_partial
                     else:
                         res_rep_accum += res_partial
+                        if include_h_aux:
+                            h_aux_rep_accum += h_partial
                     
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
+                    if include_h_aux:
+                        del h_partial
                 
                 res_block = res_rep_accum[:, :n_eval, :]
                 L_aux_out[:, r0:r1, :] = np.asarray(res_block)
+                if include_h_aux:
+                    h_aux_block = h_aux_rep_accum[:, :n_eval]
+                    H_aux_out[:, r0:r1] = np.asarray(h_aux_block)
+                    del h_aux_block
                 
                 del sharded_grid_eval, res_rep_accum, res_block
+                if include_h_aux:
+                    del h_aux_rep_accum
                 gc.collect()
                 
         finally:
@@ -1511,6 +1563,8 @@ class ISDFTC(TC):
             if f_out and not isinstance(L_aux_out, h5py.Dataset):
                 f_out.close()
             
+        if include_h_aux:
+            return L_aux_out, H_aux_out
         return L_aux_out
 	
 

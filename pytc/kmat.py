@@ -373,6 +373,54 @@ def calc_K3_kernel(xi_phi_r1, xi_phi_r2, weights_r1, weights_r2, jastrow_factor,
     return K3_kernel
 
 
+def calc_kmat_kernels_from_aux(xi_phi, xi_grad, weights, L_aux, H_aux):
+    r"""Recover the ISDF K1/K3 kernels from auxiliary pair contractions.
+
+    ``L_aux`` is already required by the three-body TC term and contains
+
+    ``L_aux[l, g, c] = sum_h xi_phi[l, h] w_h grad_c u(g, h)``.
+
+    If the same grid pass also forms
+
+    ``H_aux[l, g] = sum_h xi_phi[l, h] w_h |grad u(g, h)|^2``,
+
+    the two K kernels are exact one-grid contractions:
+
+    ``K1[k, l, c] = sum_g xi_grad[k, g, c] w_g L_aux[l, g, c]``
+    ``K3[k, l]    = sum_g xi_phi[k, g] w_g H_aux[l, g]``.
+
+    This removes the separate rank-by-rank double-grid scan.  It is an
+    algebraic identity, not a Jastrow or ISDF approximation.  The caller is
+    responsible for streaming grid panels on production-size systems; this
+    compact routine is the in-core parity reference for that future path.
+    """
+    xi_phi = jnp.asarray(xi_phi)
+    xi_grad = jnp.asarray(xi_grad)
+    weights = jnp.asarray(weights)
+    L_aux = jnp.asarray(L_aux)
+    H_aux = jnp.asarray(H_aux)
+
+    if xi_phi.ndim != 2 or xi_grad.ndim != 3:
+        raise ValueError("xi_phi must be rank-2 and xi_grad rank-3")
+    n_rank, n_grid = xi_phi.shape
+    if xi_grad.shape != (n_rank, n_grid, 3):
+        raise ValueError("xi_grad shape must be (n_rank, n_grid, 3)")
+    if weights.shape != (n_grid,):
+        raise ValueError("weights shape must be (n_grid,)")
+    if L_aux.shape != (n_rank, n_grid, 3):
+        raise ValueError("L_aux shape must be (n_rank, n_grid, 3)")
+    if H_aux.shape != (n_rank, n_grid):
+        raise ValueError("H_aux shape must be (n_rank, n_grid)")
+
+    K1_kernel = jnp.einsum(
+        "kgc,g,lgc->klc", xi_grad, weights, L_aux, optimize=True
+    )
+    K3_kernel = jnp.einsum(
+        "kg,g,lg->kl", xi_phi, weights, H_aux, optimize=True
+    )
+    return {"K1_kernel": K1_kernel, "K3_kernel": K3_kernel}
+
+
 @partial(jax.jit, static_argnums=(6,))
 def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_size=128):
     """JITted version of K1 contraction.
