@@ -1154,6 +1154,7 @@ class ISDFXTC(XTC, ISDFTC):
         d_reduce_group_blocks=1,
         r2_tile_size=None,
         gpu_budget_bytes=None,
+        reuse_aux_kernels=False,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1170,6 +1171,10 @@ class ISDFXTC(XTC, ISDFTC):
             r2_tile_size: Optional r2-grid tile size for kernel assembly.
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
+            reuse_aux_kernels: Opt-in exact K1/K3 recovery from ``L_aux`` and
+                its squared-gradient companion.  This currently supports only
+                the in-core parity gate; out-of-core requests fail closed in
+                the parent ISDF implementation.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -1180,7 +1185,9 @@ class ISDFXTC(XTC, ISDFTC):
         
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
-                               r2_tile_size=r2_tile_size, gpu_budget_bytes=gpu_budget_bytes)
+                               r2_tile_size=r2_tile_size,
+                               gpu_budget_bytes=gpu_budget_bytes,
+                               reuse_aux_kernels=reuse_aux_kernels)
         kernels = isdf_tc.isdf_kernels
         
         if out_path and os.path.exists(out_path):

@@ -1569,7 +1569,7 @@ class ISDFTC(TC):
 	
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
-             r2_tile_size=None, gpu_budget_bytes=None):
+             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1582,14 +1582,27 @@ class ISDFTC(TC):
             r2_tile_size: Optional r2-grid tile size for kernel assembly.
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
+            reuse_aux_kernels: Opt-in exact parity path that builds ``L_aux``
+                and ``H_aux`` together, then recovers K1/K3 from one-grid
+                contractions.  Initially restricted to in-core validation;
+                an out-of-core request fails closed until the streamed
+                contraction path is implemented.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+        if reuse_aux_kernels and not self.is_incore:
+            raise ValueError(
+                "reuse_aux_kernels is currently an in-core exact-parity "
+                "path; out-of-core dispatch requires the streamed "
+                "auxiliary contraction implementation"
+            )
         
         kernels = {}
-        if out_path and os.path.exists(out_path):
+        # An opt-in auxiliary-reuse request must execute that path, not
+        # silently accept a pre-existing direct K1/K3 cache.
+        if out_path and os.path.exists(out_path) and not reuse_aux_kernels:
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
@@ -1614,17 +1627,35 @@ class ISDFTC(TC):
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 
-        logger.info("  Computing K1 and K3 kernels...")
-        
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size,
-                                            host_grid_block_size=host_grid_block_size,
-                                            r2_tile_size=r2_tile_size,
-                                            gpu_budget_bytes=gpu_budget_bytes)
+        if reuse_aux_kernels:
+            logger.info("  Computing L_aux and H_aux for exact K1/K3 recovery...")
+            L_aux, H_aux = self._compute_L_aux(
+                jastrow_params,
+                batch_size,
+                host_grid_block_size=host_grid_block_size,
+                include_h_aux=True,
+            )
+            kernels = kmat_jax.calc_kmat_kernels_from_aux(
+                self.xi_phi, self.xi_grad, self.weights, L_aux, H_aux
+            )
+        else:
+            logger.info("  Computing K1 and K3 kernels...")
+            kernels = self.compute_kmat_kernels(
+                jastrow_params,
+                batch_size,
+                host_grid_block_size=host_grid_block_size,
+                r2_tile_size=r2_tile_size,
+                gpu_budget_bytes=gpu_budget_bytes,
+            )
+            logger.info("  Computing L_aux...")
+            L_aux = self._compute_L_aux(
+                jastrow_params,
+                batch_size,
+                save_path=out_path if not self.is_incore else None,
+                host_grid_block_size=host_grid_block_size,
+            )
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
-        
-        logger.info("  Computing L_aux...")
-        L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
         
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
         # If it's an HDF5 dataset, we keep it as is.

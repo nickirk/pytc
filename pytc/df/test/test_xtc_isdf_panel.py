@@ -74,6 +74,68 @@ class TestISDFXTCPanelization(unittest.TestCase):
             "The exchange kernel must affect the downstream Delta-U integral.",
         )
 
+    def test_aux_recovered_kernels_preserve_h2_xtc_normal_order(self):
+        """Exact auxiliary K recovery must leave the full H2 XTC view intact."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
+        clean_env = {
+            "PYTC_XTC_DROP_X": "0",
+            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
+            "PYTC_XTC_DROP_X_RESIDUAL": "0",
+        }
+        with mock.patch.dict(os.environ, clean_env):
+            direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
+            recovered = self.isdf_xtc.isdf(
+                self.jparams, reuse_aux_kernels=True, **kwargs
+            )
+
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K1_kernel"]),
+                np.asarray(direct.isdf_kernels["K1_kernel"]),
+                rtol=0,
+                atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K3_kernel"]),
+                np.asarray(direct.isdf_kernels["K3_kernel"]),
+                rtol=0,
+                atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.get_2b(self.jparams)),
+                np.asarray(direct.get_2b(self.jparams)),
+                rtol=0,
+                atol=2e-12,
+            )
+
+            direct_h = direct.get_delta_h(self.jparams)
+            recovered_h = recovered.get_delta_h(self.jparams)
+            np.testing.assert_allclose(
+                np.asarray(recovered_h), np.asarray(direct_h), rtol=0, atol=2e-12
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.get_delta_U(self.jparams)),
+                np.asarray(direct.get_delta_U(self.jparams)),
+                rtol=0,
+                atol=2e-12,
+            )
+            self.assertAlmostEqual(
+                float(recovered.get_const(self.jparams, delta_h=recovered_h)),
+                float(direct.get_const(self.jparams, delta_h=direct_h)),
+                places=12,
+            )
+
+    def test_aux_reuse_rejects_unimplemented_out_of_core_dispatch(self):
+        """The exact gate cannot silently materialize production-scale arrays."""
+        out_of_core = self.isdf_xtc.replace(is_incore=False)
+        with self.assertRaisesRegex(ValueError, "out-of-core dispatch"):
+            out_of_core.isdf(
+                self.jparams,
+                batch_size=64,
+                orb_block_size=2,
+                host_grid_block_size=512,
+                reuse_aux_kernels=True,
+            )
+
     def test_x_normal_order_and_residual_switches_are_independent(self):
         """A full X store can isolate normal-order and residual-X effects."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
