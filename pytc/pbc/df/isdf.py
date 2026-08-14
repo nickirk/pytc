@@ -2326,6 +2326,8 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 elif j != i:
                     kern[q, j0:j1, i0:i1] = np.conj(block).T
                 del rq_j
+                # Do not let the final q slices extend into the next panel pair.
+                del eta_iq, eta_jq, block
             if j != i:
                 # Only when it is a distinct buffer -- on the diagonal eta_j
                 # ALIASES eta_i, and dropping it there would free the panel the

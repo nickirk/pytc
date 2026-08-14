@@ -382,6 +382,38 @@ class TestPBlockedStorageContract(unittest.TestCase):
             self.assertEqual(calls["n"], n_panels * (n_panels + 1) // 2,
                              f"panel_rows={panel_rows}")
 
+    def test_q_slices_are_released_before_panel_progress(self):
+        """A completed pair must not leave its final q-slice objects live."""
+        import jax.numpy as jnp
+        import pytc.pbc.df.isdf as isdf_module
+
+        cell, mesh_obj, grids, X, chunks, provider = self._fixture()
+        slice_refs = []
+        real_panel_block = isdf_module._panel_block
+
+        def right_factor_without_input_dependency(provider, q, eta_q, gphase):
+            slice_refs.append(weakref.ref(eta_q))
+            return jnp.zeros(eta_q.shape, dtype=eta_q.dtype)
+
+        def recording_panel_block(eta_iq, rq_j, inv_sqrt_grid):
+            slice_refs.append(weakref.ref(eta_iq))
+            return real_panel_block(eta_iq, rq_j, inv_sqrt_grid)
+
+        def assert_released(*_):
+            gc.collect()
+            self.assertTrue(slice_refs)
+            self.assertTrue(all(ref() is None for ref in slice_refs))
+            slice_refs.clear()
+
+        with unittest.mock.patch.object(
+            isdf_module, "_right_factor", right_factor_without_input_dependency
+        ), unittest.mock.patch.object(
+            isdf_module, "_panel_block", recording_panel_block
+        ):
+            build_pi_kern_p_blocked(
+                X, lambda: iter(chunks), mesh_obj.phase, mesh_obj.neg,
+                provider, grids, panel_rows=2, on_panel=assert_released)
+
     def test_byte_model_names_the_floor_no_knob_can_reach(self):
         # Synthetic 444/k222 shape: asserted, never allocated.
         big = dict(n_kpts=8, n_ip=37120, n_grid=438948, ao_block_cols=4096, n_ao=3712)
