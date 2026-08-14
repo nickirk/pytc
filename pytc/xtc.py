@@ -1155,6 +1155,7 @@ class ISDFXTC(XTC, ISDFTC):
         r2_tile_size=None,
         gpu_budget_bytes=None,
         reuse_aux_kernels=False,
+        use_laux_fast_grad=False,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1175,6 +1176,9 @@ class ISDFXTC(XTC, ISDFTC):
                 its squared-gradient companion.  The parent ISDF
                 implementation streams the out-of-core auxiliary contraction
                 when a persistent output path is provided.
+            use_laux_fast_grad: Opt into the Jastrow's L_aux-only fast
+                derivative path.  The parent validates this mode against any
+                reusable base cache.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -1187,7 +1191,8 @@ class ISDFXTC(XTC, ISDFTC):
                                host_grid_block_size=host_grid_block_size,
                                r2_tile_size=r2_tile_size,
                                gpu_budget_bytes=gpu_budget_bytes,
-                               reuse_aux_kernels=reuse_aux_kernels)
+                               reuse_aux_kernels=reuse_aux_kernels,
+                               use_laux_fast_grad=use_laux_fast_grad)
         kernels = isdf_tc.isdf_kernels
         
         if out_path and os.path.exists(out_path):

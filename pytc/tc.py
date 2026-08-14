@@ -1581,7 +1581,8 @@ class ISDFTC(TC):
 	
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
-             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False):
+             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False,
+             use_laux_fast_grad=False):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1600,6 +1601,9 @@ class ISDFTC(TC):
                 and left-rank panels, retaining only the final K kernels in
                 host memory; it requires a persistent ``save_path`` for the
                 L_aux/H_aux datasets.
+            use_laux_fast_grad: Opt into an algebraically equivalent,
+                Jastrow-provided fast derivative for the L_aux double-grid
+                contraction.  The choice is persisted on out-of-core caches.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
@@ -1611,6 +1615,7 @@ class ISDFTC(TC):
                 "and H_aux can be streamed rather than materialized"
             )
         
+        laux_gradient_mode = "fast" if use_laux_fast_grad else "direct"
         kernels = {}
         # An opt-in auxiliary-reuse request must execute that path, not
         # silently accept a pre-existing direct K1/K3 cache.
@@ -1618,24 +1623,39 @@ class ISDFTC(TC):
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
-                    logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
-                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
-                    kernels['K1_kernel'] = f['K1_kernel'][:]
-                    logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
-                    kernels['K3_kernel'] = f['K3_kernel'][:]
-                    if self.is_incore:
-                        logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
-                        kernels['L_aux'] = f['L_aux'][:]
+                    cached_laux_mode = f.attrs.get(
+                        "pytc_laux_gradient_mode", "direct"
+                    )
+                    if isinstance(cached_laux_mode, bytes):
+                        cached_laux_mode = cached_laux_mode.decode()
+                    if cached_laux_mode != laux_gradient_mode:
+                        logger.info(
+                            "  L_aux cache gradient mode is %s, but this run "
+                            "requests %s; recomputing base intermediates.",
+                            cached_laux_mode, laux_gradient_mode,
+                        )
                         f.close()
+                        f = None
                     else:
-                        logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
-                        kernels['L_aux'] = f['L_aux'] 
+                        logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
+                        logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
+                        kernels['K1_kernel'] = f['K1_kernel'][:]
+                        logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
+                        kernels['K3_kernel'] = f['K3_kernel'][:]
+                        if self.is_incore:
+                            logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
+                            kernels['L_aux'] = f['L_aux'][:]
+                            f.close()
+                        else:
+                            logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
+                            kernels['L_aux'] = f['L_aux']
 
-                    logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    return self.replace(isdf_kernels=kernels)
+                        logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
+                        return self.replace(isdf_kernels=kernels)
                 
                 # If we are here, keys are missing. Close the file!
-                f.close()
+                if f is not None:
+                    f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 
@@ -1648,6 +1668,7 @@ class ISDFTC(TC):
                 save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
                 include_h_aux=True,
+                use_laux_fast_grad=use_laux_fast_grad,
             )
             logger.info(
                 "  L_aux/H_aux construction completed in %.4f s",
@@ -1726,6 +1747,7 @@ class ISDFTC(TC):
                 batch_size,
                 save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
+                use_laux_fast_grad=use_laux_fast_grad,
             )
             logger.info(
                 "  L_aux construction completed in %.4f s",
@@ -1755,6 +1777,7 @@ class ISDFTC(TC):
                 f.attrs['pytc_kmat_kernel_mode'] = (
                     'aux-recovery' if reuse_aux_kernels else 'direct'
                 )
+                f.attrs['pytc_laux_gradient_mode'] = laux_gradient_mode
                 for k, v in kernels.items():
                     if k == 'L_aux': continue
                     if k in f: del f[k]
