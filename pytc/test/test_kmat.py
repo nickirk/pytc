@@ -1,13 +1,20 @@
 """Tests for JAX implementation of kinetic matrix elements."""
 
 import unittest
+import tempfile
 import numpy as np
+import h5py
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pytc.legacy.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
-from pytc.kmat import calc_K1, calc_K3
-from pytc.jastrow import Poly
+from pytc.kmat import (
+    calc_K1,
+    calc_K3,
+    calc_kmat_kernels_from_aux,
+    calc_kmat_kernels_from_aux_streamed,
+)
+from pytc.jastrow import Poly, BoysHandy, CompositeJastrow, NuclearCusp
 
 
 class TestKmat(unittest.TestCase):
@@ -208,6 +215,198 @@ class TestKmat(unittest.TestCase):
         )
 
 
+class TestKmatFromAuxParity(unittest.TestCase):
+    """The K1/K3-from-aux identity must hold on a physical H2 ISDF grid."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pyscf import gto, scf
+        from pytc.jastrow.rexp import REXP
+        from pytc.tc import TC, ISDFTC
+
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            basis="sto-3g",
+            unit="Angstrom",
+            verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        cls.params = {"alpha": jnp.array([1.0])}
+        base = TC.from_pyscf(mf, REXP(), grid_lvl=0)
+        cls.isdf = ISDFTC.from_tc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True
+        )
+
+    def test_h2_kernels_recover_from_laux_and_haux(self):
+        """No pair-kernel approximation is permitted in the first gate."""
+        grid_block = self.isdf.grid_points.shape[0]
+        direct = self.isdf.compute_kmat_kernels(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=grid_block,
+            gpu_budget_bytes=2_000 * 1024**2,
+        )
+        l_aux, h_aux = self.isdf._compute_L_aux(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=grid_block,
+            include_h_aux=True,
+        )
+        recovered = calc_kmat_kernels_from_aux(
+            self.isdf.xi_phi,
+            self.isdf.xi_grad,
+            self.isdf.weights,
+            l_aux,
+            h_aux,
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(recovered["K1_kernel"]),
+            np.asarray(direct["K1_kernel"]),
+            rtol=0,
+            atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered["K3_kernel"]),
+            np.asarray(direct["K3_kernel"]),
+            rtol=0,
+            atol=2e-12,
+        )
+        # The downstream ISDF two-body correction is the physics-facing
+        # parity check.  L_aux is identical in both views; only K1/K3 are
+        # exchanged for their exact auxiliary recovery.
+        direct_2b = self.isdf.replace(
+            isdf_kernels={**direct, "L_aux": l_aux}
+        ).get_2b(self.params)
+        recovered_2b = self.isdf.replace(
+            isdf_kernels={**recovered, "L_aux": l_aux}
+        ).get_2b(self.params)
+        np.testing.assert_allclose(
+            np.asarray(recovered_2b),
+            np.asarray(direct_2b),
+            rtol=0,
+            atol=2e-12,
+        )
+
+    def test_h2_streamed_aux_recovery_matches_direct_from_hdf5(self):
+        """The out-of-core recovery must use HDF5 panels without a K-square GPU temporary."""
+        grid_block = 127  # force several grid panels on the physical H2 grid
+        direct = self.isdf.compute_kmat_kernels(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=self.isdf.grid_points.shape[0],
+            gpu_budget_bytes=2_000 * 1024**2,
+        )
+        l_aux, h_aux = self.isdf._compute_L_aux(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=self.isdf.grid_points.shape[0],
+            include_h_aux=True,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".h5") as tmp:
+            with h5py.File(tmp.name, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf.xi_grad))
+                f.create_dataset("weights", data=np.asarray(self.isdf.weights))
+                f.create_dataset("L_aux", data=np.asarray(l_aux))
+                f.create_dataset("H_aux", data=np.asarray(h_aux))
+                streamed = calc_kmat_kernels_from_aux_streamed(
+                    f["xi_phi"],
+                    f["xi_grad"],
+                    f["weights"],
+                    f["L_aux"],
+                    f["H_aux"],
+                    grid_block_size=grid_block,
+                    rank_block_size=3,
+                )
+
+        np.testing.assert_allclose(
+            streamed["K1_kernel"], np.asarray(direct["K1_kernel"]),
+            rtol=0, atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            streamed["K3_kernel"], np.asarray(direct["K3_kernel"]),
+            rtol=0, atol=2e-12,
+        )
+
+    def test_out_of_core_kmat_mode_is_persisted(self):
+        """Fresh direct and recovered caches must remain distinguishable."""
+        with tempfile.TemporaryDirectory() as directory:
+            for mode, reuse_aux_kernels in (("direct", False), ("aux-recovery", True)):
+                path = f"{directory}/{mode}.h5"
+                with h5py.File(path, "w") as handle:
+                    handle.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
+                    handle.create_dataset("xi_grad", data=np.asarray(self.isdf.xi_grad))
+                out_of_core = self.isdf.replace(
+                    is_incore=False,
+                    xi_phi=None,
+                    xi_grad=None,
+                    save_path=path,
+                ).isdf(
+                    self.params,
+                    save_path=path,
+                    batch_size=32,
+                    host_grid_block_size=512,
+                    reuse_aux_kernels=reuse_aux_kernels,
+                )
+                self.assertIn("K1_kernel", out_of_core.isdf_kernels)
+                with h5py.File(path, "r") as handle:
+                    self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], mode)
+                    self.assertNotIn("H_aux", handle)
+
+
+class TestLauxAnalyticalBoysHandy(unittest.TestCase):
+    """The L_aux-only analytic B-H derivative must retain physical parity."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pyscf import gto, scf
+        from pytc.tc import TC, ISDFTC
+
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            basis="sto-3g",
+            unit="Angstrom",
+            verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        ncusp = NuclearCusp.create(mol, n_radial=128)
+        boys_handy = BoysHandy.create(mol)
+        cls.params = [ncusp.init_params(), boys_handy.init_params()]
+        jastrow = CompositeJastrow.create([ncusp, boys_handy])
+        base = TC.from_pyscf(mf, jastrow, grid_lvl=0)
+        cls.isdf = ISDFTC.from_tc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True
+        )
+
+    def test_fast_bh_derivative_preserves_laux_and_two_body(self):
+        block = 512
+        direct = self.isdf.isdf(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=block,
+            reuse_aux_kernels=True,
+        )
+        fast = self.isdf.isdf(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=block,
+            reuse_aux_kernels=True,
+            use_laux_fast_grad=True,
+        )
+        for key in ("K1_kernel", "K3_kernel", "L_aux"):
+            np.testing.assert_allclose(
+                np.asarray(fast.isdf_kernels[key]),
+                np.asarray(direct.isdf_kernels[key]),
+                rtol=0, atol=2e-12,
+            )
+
+        np.testing.assert_allclose(
+            np.asarray(fast.get_2b(self.params)),
+            np.asarray(direct.get_2b(self.params)), rtol=0, atol=2e-12
+        )
+
+
 
 class TestStreamingContractionParity(unittest.TestCase):
     """contract_K1_minus_K2_isdf / contract_K3_isdf_streaming must match the
@@ -330,4 +529,3 @@ class TestStreamingContractionParity(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

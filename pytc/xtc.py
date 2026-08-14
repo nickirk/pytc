@@ -28,9 +28,94 @@ from .utils.tile_memory import find_max_blksize as _find_max_blksize
 from . import tc_helper
 from . import kmat as kmat_jax
 from .utils import sharding_core
-from .utils import tile_timers as _tile_timers
 
 logger = logging.getLogger(__name__)
+
+
+def _drop_x_from_normal_order():
+    """Whether to omit X only from the normal-ordered 0-/1-body terms.
+
+    ``PYTC_XTC_DROP_X`` remains the study's all-X switch.  The narrower
+    switch is deliberately separate so a full X store can be used to
+    partition the no-X energy change between normal ordering and the residual
+    two-body operator without rebuilding the kernels.
+    """
+    return (
+        os.environ.get("PYTC_XTC_DROP_X") == "1"
+        or os.environ.get("PYTC_XTC_DROP_X_NORMAL_ORDER") == "1"
+    )
+
+
+def _drop_x_from_residual_integrals():
+    """Whether to omit X only from the residual two-body Delta-U operator."""
+    return (
+        os.environ.get("PYTC_XTC_DROP_X") == "1"
+        or os.environ.get("PYTC_XTC_DROP_X_RESIDUAL") == "1"
+    )
+
+
+def _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z):
+    """Contract an orbital-leg Tucker X core without reconstructing X.
+
+    ``z`` represents ``X[r,s,c] = U[r,a] Z[a,b,c] U[s,b]``.  The returned
+    quantity is the X contribution to the unsymmetrized Delta-U tile,
+    ``-sum_c phi_p[p,c] phi_q[q,c] X[r,s,c]``.
+    """
+    phi_p = jnp.asarray(phi_p)
+    phi_q = jnp.asarray(phi_q)
+    u_r = jnp.asarray(u_r)
+    u_s = jnp.asarray(u_s)
+    z = jnp.asarray(z)
+    c_pq = phi_p[:, None, :] * phi_q[None, :, :]
+    core_pq = jnp.einsum("pqc,abc->pqab", c_pq, z, optimize=True)
+    return -jnp.einsum("pqab,ra,sb->pqrs", core_pq, u_r, u_s,
+                       optimize=True)
+
+
+def _get_tucker_x_factors(kernels):
+    """Return a validated ``(U, Z)`` Tucker-X representation, if present.
+
+    A factorized X deliberately uses a different key from the dense ``X``
+    dataset.  That prevents an approximate calculation from accidentally
+    falling back to, or preloading, the full tensor.  The representation is
+    ``X[r,s,c] ~= U[r,a] Z[a,b,c] U[s,b]``.
+    """
+    factors = kernels.get("X_tucker")
+    if factors is None:
+        return None
+    if not isinstance(factors, dict) or set(("U", "Z")) - set(factors):
+        raise ValueError("X_tucker must be a mapping containing U and Z")
+
+    u = factors["U"]
+    z = factors["Z"]
+    if getattr(u, "ndim", None) != 2 or getattr(z, "ndim", None) != 3:
+        raise ValueError("X_tucker factors must have U[orbital,factor] and Z[factor,factor,rank]")
+    if z.shape[:2] != (u.shape[1], u.shape[1]):
+        raise ValueError(
+            "X_tucker dimensions disagree: "
+            f"U has {u.shape[1]} factors but Z has shape {z.shape}"
+        )
+    return u, z
+
+
+def _tucker_x_normal_order_intermediates(u, z, dm1, phi_tilde, gb):
+    """Return the X intermediates used by reference normal ordering.
+
+    This is algebraically equivalent to contracting a dense X tensor, but
+    retains the separated orbital legs throughout.
+    """
+    u = jnp.asarray(u)
+    z = jnp.asarray(z)
+    dm1 = jnp.asarray(dm1)
+    phi_tilde = jnp.asarray(phi_tilde)
+    gb = jnp.asarray(gb)
+
+    density_core = jnp.einsum("ra,rs,sb->ab", u, dm1, u, optimize=True)
+    wc = jnp.einsum("abc,ab->c", z, density_core, optimize=True)
+    phi_core = jnp.einsum("ra,rc->ac", u, phi_tilde, optimize=True)
+    y_all = jnp.einsum("qb,abc,ac->qc", u, z, phi_core, optimize=True)
+    j_x_sym = -jnp.einsum("pa,qb,abc,c->pq", u, u, z, gb, optimize=True)
+    return wc, y_all, j_x_sym
 
 
 # ------------------------------------------------------------------
@@ -273,9 +358,11 @@ def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=Non
         )
 
     kernels = getattr(xtc_obj, "isdf_kernels", None)
-    required = ("K1_kernel", "K3_kernel", "D", "X")
-    if kernels is None or any(key not in kernels for key in required):
-        missing = [key for key in required if kernels is None or key not in kernels]
+    required = ("K1_kernel", "K3_kernel", "D")
+    missing = [key for key in required if kernels is None or key not in kernels]
+    if kernels is None or ("X" not in kernels and "X_tucker" not in kernels):
+        missing.append("X or X_tucker")
+    if missing:
         raise RuntimeError(
             "XTC tile execution requires precomputed ISDF kernels. "
             f"Missing: {missing}"
@@ -671,7 +758,7 @@ class XTC(TC):
         """
         return self.get_delta_h(jastrow_params, dm1, block_str, ranges, orb_block_size, batch_size)
 
-    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000, fused=False):
+    def get_2b(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
         """Compute two-body integrals correction."""
         start_time = time.perf_counter()
         logger.debug("Starting XTC.get_2b")
@@ -683,7 +770,7 @@ class XTC(TC):
         
         # Accumulate on host to avoid holding two output-sized GPU tensors.
         # ISDFTC.get_2b already returns via host internally.
-        tc_result = super().get_2b(jastrow_params, ranges=ranges, fused=fused)
+        tc_result = super().get_2b(jastrow_params, ranges=ranges)
         result_np = np.array(tc_result)  # writable host copy
         del tc_result
         
@@ -776,9 +863,9 @@ class XTC(TC):
         return eris
 
 
-@partial(jax.jit, static_argnums=(6,))
+@partial(jax.jit, static_argnums=(6, 7))
 def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
-                                   rank_block_size=128):
+                                   rank_block_size=128, include_x=True):
     """JITted version of Delta U contraction.
     
     Args:
@@ -832,6 +919,9 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
 
     term_d_init = jnp.zeros((Np, Nq, Nr, Ns))
     term_d, _ = jax.lax.scan(scan_d_block, term_d_init, (D_scannable, phi_r_scannable, phi_s_scannable))
+
+    if not include_x:
+        return term_d
     
     # Term 2 & 3: T_X = - sum_c (phi_p*phi_q)_c * X[r,s,c]
     # Scan over blocks of c (rank index of X)
@@ -869,19 +959,44 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     return term_d + term_x
 
 
-@jax.jit
-def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
+@partial(jax.jit, static_argnums=(6,))
+def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
+                                      include_x=True):
     """Balanced direct Delta U tile contraction using fixed-shape matmuls."""
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
 
     cpq = (phi_p[:, None, :] * phi_q[None, :, :]).reshape(Np * Nq, D.shape[0])
     crs = (phi_r[:, None, :] * phi_s[None, :, :]).reshape(Nr * Ns, D.shape[1])
-    x_flat = X_sliced.reshape(Nr * Ns, X_sliced.shape[2])
-
     d_term = jnp.matmul(jnp.matmul(cpq, D), crs.T)
+    if not include_x:
+        return d_term.reshape(Np, Nq, Nr, Ns)
+
+    x_flat = X_sliced.reshape(Nr * Ns, X_sliced.shape[2])
     x_term = jnp.matmul(cpq, x_flat.T)
     return (d_term - x_term).reshape(Np, Nq, Nr, Ns)
+
+
+@partial(jax.jit, static_argnums=(8,))
+def _contract_delta_u_tucker_direct_tile_jit(D, z, phi_p, phi_q, phi_r,
+                                             phi_s, u_r, u_s,
+                                             include_x=True):
+    """Balanced direct Delta-U tile with separated X orbital legs.
+
+    This is the solver-facing path for ``X_tucker``.  It never reconstructs
+    an ``(r,s,c)`` X panel: the only X-side intermediate is the
+    ``(p,q,a,b)`` contracted core.  Consequently the persisted and
+    transferred exchange object is ``Z`` rather than a dense X tensor.
+    """
+    Np, Nq = phi_p.shape[0], phi_q.shape[0]
+    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
+
+    cpq = (phi_p[:, None, :] * phi_q[None, :, :]).reshape(Np * Nq, D.shape[0])
+    crs = (phi_r[:, None, :] * phi_s[None, :, :]).reshape(Nr * Ns, D.shape[1])
+    d_term = jnp.matmul(jnp.matmul(cpq, D), crs.T).reshape(Np, Nq, Nr, Ns)
+    if not include_x:
+        return d_term
+    return d_term + _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z)
 
 
 @jax.jit
@@ -1039,7 +1154,8 @@ class ISDFXTC(XTC, ISDFTC):
         d_reduce_group_blocks=1,
         r2_tile_size=None,
         gpu_budget_bytes=None,
-        x_store_chunks=None,
+        reuse_aux_kernels=False,
+        use_laux_fast_grad=False,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1053,56 +1169,74 @@ class ISDFXTC(XTC, ISDFTC):
                 together per X-kernel grid pass.
             d_reduce_group_blocks: Group size multiplier for D-kernel grid
                 blocking (`D` effective host block = group * host_grid_block_size).
-            r2_tile_size: Optional r2 host-loop tile size for the K1/K3 build,
-                forwarded to compute_kmat_kernels (auto-sized when None).
-            gpu_budget_bytes: Optional per-device memory budget override for
-                the K1/K3 tile solver (probed live when None).
-            x_store_chunks: Optional explicit HDF5 chunk shape for the X
-                dataset, as a 3-tuple (orb_chunk, orb_chunk, rank_chunk).
-                When None (default), HDF5 auto-chunks — which spans the full
-                rank axis per chunk and causes ~21× read amplification when
-                the factorized RCCSD streams X panel-wise along the rank
-                axis.  Set to (orb_block_size, orb_block_size, rank_panel)
-                to align chunks with the streamed read pattern and eliminate
-                the amplification.  Byte-identical data; only the on-disk
-                layout changes.
+            r2_tile_size: Optional r2-grid tile size for kernel assembly.
+            gpu_budget_bytes: Optional device-memory budget in bytes for kernel
+                assembly.
+            reuse_aux_kernels: Opt-in exact K1/K3 recovery from ``L_aux`` and
+                its squared-gradient companion.  The parent ISDF
+                implementation streams the out-of-core auxiliary contraction
+                when a persistent output path is provided.
+            use_laux_fast_grad: Opt into the Jastrow's L_aux-only fast
+                derivative path.  The parent validates this mode against any
+                reusable base cache.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+        drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
+        requested_x_mode = "dropped" if drop_x else "full"
         
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
-                               r2_tile_size=r2_tile_size, gpu_budget_bytes=gpu_budget_bytes)
+                               r2_tile_size=r2_tile_size,
+                               gpu_budget_bytes=gpu_budget_bytes,
+                               reuse_aux_kernels=reuse_aux_kernels,
+                               use_laux_fast_grad=use_laux_fast_grad)
         kernels = isdf_tc.isdf_kernels
         
         if out_path and os.path.exists(out_path):
+            f = None
+            keep_open = False
             try:
                 f = h5py.File(out_path, 'r')
                 if 'D' in f and 'X' in f:
-                    logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
-                    logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
-                    kernels['D'] = f['D'][:]
-                    if self.is_incore:
-                        logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
-                        kernels['X'] = f['X'][:]
-                        f.close()
+                    cached_x_mode = f.attrs.get("pytc_xtc_x_mode", "full")
+                    if isinstance(cached_x_mode, bytes):
+                        cached_x_mode = cached_x_mode.decode()
+                    if cached_x_mode != requested_x_mode:
+                        logger.info(
+                            "  Delta-U cache X mode is %s, but this run requests %s; "
+                            "recomputing D/X kernels.",
+                            cached_x_mode,
+                            requested_x_mode,
+                        )
                     else:
-                        # Do NOT close 'f' here; the dataset object keeps the file open.
-                        logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
-                        kernels['X'] = f['X']
-                        # Rank-major twin (panel-contiguous) when the store
-                        # carries it: the factorized contraction prefers it
-                        # (see isdf_xtc_ccsd._factorized_state); legacy
-                        # consumers keep using kernels['X'] untouched.
-                        if 'X_rm' in f:
-                            logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
-                            kernels['X_rm'] = f['X_rm']
-                    logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    return self.replace(isdf_kernels=kernels, save_path=out_path)
+                        logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
+                        logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
+                        kernels['D'] = f['D'][:]
+                        if self.is_incore:
+                            logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
+                            kernels['X'] = f['X'][:]
+                        else:
+                            # Keep the file open only when its datasets escape for
+                            # out-of-core streaming.
+                            logger.debug(f"out-of-core mode: Streaming X from file. X shape: {f['X'].shape}")
+                            kernels['X'] = f['X']
+                            # Rank-major twin (panel-contiguous) when the store
+                            # carries it; the factorized contraction prefers it.
+                            if 'X_rm' in f:
+                                logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
+                                kernels['X_rm'] = f['X_rm']
+                        logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
+                        result = self.replace(isdf_kernels=kernels, save_path=out_path)
+                        keep_open = not self.is_incore
+                        return result
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading Delta U kernels from {out_path}: {e}. Recomputing...")
+            finally:
+                if f is not None and not keep_open:
+                    f.close()
 
         # Pass L_aux to avoid redundant calculation
         delta_u_kernels = self.compute_delta_u_kernels(
@@ -1112,7 +1246,6 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             x_s_panel_blocks=x_s_panel_blocks,
             d_reduce_group_blocks=d_reduce_group_blocks,
-            x_store_chunks=x_store_chunks,
         )
         kernels.update(delta_u_kernels)
         
@@ -1141,7 +1274,6 @@ class ISDFXTC(XTC, ISDFTC):
         host_grid_block_size=None,
         x_s_panel_blocks=1,
         d_reduce_group_blocks=1,
-        x_store_chunks=None,
     ):
         """Compute D, X kernels for Delta U with orbital and grid batching."""
         if L_aux is None:
@@ -1161,6 +1293,7 @@ class ISDFXTC(XTC, ISDFTC):
         L_Q = self.phi_isdf.T * sqrt_dm1[None, :]  # (N_rank, n_orb)
         
         logger.info("Computing D kernel...")
+        d_start_time = time.perf_counter()
         D = self._compute_D_kernel(
             jastrow_params,
             batch_size,
@@ -1169,8 +1302,18 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             d_reduce_group_blocks=d_reduce_group_blocks,
         )
-        
+        logger.info(
+            "  compute_delta_u_kernels: D build completed in %.3f s",
+            time.perf_counter() - d_start_time,
+        )
+
         logger.info("Computing X kernel...")
+
+        drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
+        if drop_x:
+            logger.warning(
+                "PYTC_XTC_DROP_X=1: skipping the X kernel build; X stays zero "
+                "and the exchange TC contribution is dropped from the integrals")
         
         if save_path:
             # If L_aux is a dataset from the same file, we must close the read-only handle 
@@ -1195,11 +1338,9 @@ class ISDFXTC(XTC, ISDFTC):
             if 'D' in f: del f['D']
             f.create_dataset('D', data=np.array(D))
             if 'X' in f: del f['X']
-            if x_store_chunks is not None:
-                X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8',
-                                     chunks=x_store_chunks)
-            else:
-                X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
+            if 'X_rm' in f: del f['X_rm']  # stale twin once X is rewritten
+            X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
+            f.attrs['pytc_xtc_x_mode'] = 'dropped' if drop_x else 'full'
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
@@ -1207,7 +1348,10 @@ class ISDFXTC(XTC, ISDFTC):
         s_panel_span = max(1, orb_block_size) * x_s_panel_blocks
 
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
+        x_start_time = time.perf_counter()
         for r0 in range(0, n_orb, orb_block_size):
+            if drop_x:
+                break
             r1 = min(r0 + orb_block_size, n_orb)
             logger.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
             for s_panel0 in range(r0, n_orb, s_panel_span):
@@ -1244,12 +1388,218 @@ class ISDFXTC(XTC, ISDFTC):
 
                 del X_panel, X_panel_np
                 gc.collect()
+
+        logger.info(
+            "  compute_delta_u_kernels: X build completed in %.3f s%s",
+            time.perf_counter() - x_start_time,
+            " (dropped)" if drop_x else "",
+        )
                 
         if save_path:
             # Return dataset object for X to allow streaming
             return {'D': f['D'][:], 'X': X}
         else:
             return {'D': D, 'X': X}
+
+    def select_tucker_x_orbital_basis(
+        self,
+        jastrow_params,
+        n_factor,
+        *,
+        oversampling=8,
+        seed=0,
+        batch_size=1000,
+        L_aux=None,
+        orb_block_size=128,
+        host_grid_block_size=None,
+    ):
+        """Select an orbital Tucker basis from a streamed X sketch.
+
+        This avoids constructing or writing a global ``X[norb,norb,R]``
+        tensor.  A Khatri--Rao random test matrix is applied to each X panel
+        as it is produced, yielding only an ``norb x (n_factor+oversampling)``
+        sketch.  QR of that sketch supplies the common orbital basis U.
+
+        The approximation is controlled by ``n_factor``.  Requesting the
+        complete orbital dimension returns a full orthogonal basis, for which
+        a subsequently built Tucker core is an exact representation of X.
+        """
+        n_orb = int(self.n_orb)
+        n_factor = int(n_factor)
+        if not 1 <= n_factor <= n_orb:
+            raise ValueError(
+                f"n_factor must lie in [1, {n_orb}], got {n_factor}"
+            )
+        oversampling = max(0, int(oversampling))
+        n_probe = min(n_orb, n_factor + oversampling)
+        orb_block_size = max(1, int(orb_block_size))
+
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+
+        dm1 = self._get_mf_dm()
+        gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        sqrt_dm1 = jnp.sqrt(jnp.maximum(jnp.diagonal(dm1), 0.0))
+        l_q = self.phi_isdf.T * sqrt_dm1[None, :]
+        n_rank = int(self.phi_isdf.shape[1])
+
+        rng = np.random.default_rng(seed)
+        # A separable random map over (s,c) avoids an norb*R*n_probe
+        # allocation while still sampling both right-hand X indices.
+        omega_s = rng.standard_normal((n_orb, n_probe)) / np.sqrt(n_probe)
+        omega_c = rng.standard_normal((n_rank, n_probe))
+        sketch = np.zeros((n_orb, n_probe), dtype=np.float64)
+
+        logger.info(
+            "Selecting Tucker-X orbital basis: factors=%d probes=%d; "
+            "streaming fused r panels of %d rows",
+            n_factor, n_probe, orb_block_size,
+        )
+        for r0 in range(0, n_orb, orb_block_size):
+            r1 = min(r0 + orb_block_size, n_orb)
+            # Apply the random map while the X contributions are still in
+            # the grid kernel.  Materializing a (r, s, rank) panel first
+            # would repeat virtually all of a dense-X build merely to reduce
+            # it to the r-by-probe sketch on the host.
+            panel_sketch = self._compute_X_sketch(
+                jastrow_params,
+                (slice(None), slice(None), slice(r0, r1), slice(None)),
+                batch_size,
+                L_aux,
+                Gb=gb,
+                L_Q=l_q,
+                omega_s=omega_s,
+                omega_c=omega_c,
+                host_grid_block_size=host_grid_block_size,
+            )
+            sketch[r0:r1] = np.asarray(panel_sketch)
+            del panel_sketch
+            gc.collect()
+
+        basis, _ = np.linalg.qr(sketch, mode='reduced')
+        return basis[:, :n_factor]
+
+    def compute_tucker_x_core(
+        self,
+        jastrow_params,
+        orbital_basis,
+        *,
+        batch_size=1000,
+        L_aux=None,
+        host_grid_block_size=None,
+    ):
+        """Build ``Z = U.T X U`` directly, without materializing dense X.
+
+        ``orbital_basis`` must have orthonormal columns in the original MO
+        row space.  The returned core has shape ``(M, M, R)`` and pairs with
+        U through ``X[r,s,c] ~= U[r,a] Z[a,b,c] U[s,b]``.
+        """
+        u = np.asarray(orbital_basis, dtype=np.float64)
+        n_orb = int(self.n_orb)
+        if u.ndim != 2 or u.shape[0] != n_orb or not u.shape[1]:
+            raise ValueError(
+                f"orbital_basis must have shape ({n_orb}, M), got {u.shape}"
+            )
+        gram_error = np.max(np.abs(u.T @ u - np.eye(u.shape[1])))
+        if gram_error > 1e-10:
+            raise ValueError(
+                "orbital_basis columns must be orthonormal; "
+                f"maximum Gram-matrix error is {gram_error:.3e}"
+            )
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+
+        dm1 = self._get_mf_dm()
+        gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        sqrt_dm1 = jnp.sqrt(jnp.maximum(jnp.diagonal(dm1), 0.0))
+        l_q = self.phi_isdf.T * sqrt_dm1[None, :]
+        projected_rows = jnp.matmul(jnp.asarray(u.T), self.phi_isdf)
+        n_factor = u.shape[1]
+        core = self._compute_X_kernel(
+            jastrow_params,
+            (slice(None), slice(None), slice(0, n_factor), slice(0, n_factor)),
+            batch_size,
+            L_aux,
+            Gb=gb,
+            L_Q=l_q,
+            host_grid_block_size=host_grid_block_size,
+            orbital_rows=projected_rows,
+        )
+        return {'U': u, 'Z': np.asarray(core)}
+
+    def build_tucker_x_kernels_direct(
+        self,
+        jastrow_params,
+        n_factor,
+        *,
+        oversampling=8,
+        seed=0,
+        batch_size=1000,
+        orb_block_size=128,
+        host_grid_block_size=None,
+        save_path=None,
+        d_reduce_group_blocks=1,
+        r2_tile_size=None,
+        gpu_budget_bytes=None,
+    ):
+        """Build a factor-only X view without materializing dense ``X``.
+
+        This path first prepares only the shared TC intermediates
+        ``K1_kernel``, ``K3_kernel``, and ``L_aux``.  It then builds ``D`` and
+        the Tucker orbital basis/core directly from ``L_aux``.  The returned
+        object carries ``D`` and ``X_tucker`` but deliberately has no dense
+        ``X`` key, making it suitable for source-free construction studies and
+        production factor-only calculations.
+
+        When ``save_path`` is supplied, the reusable base intermediates may be
+        cached there by :class:`ISDFTC`; no dense exchange dataset is created.
+        """
+        if save_path and os.path.exists(save_path):
+            with h5py.File(save_path, 'r') as handle:
+                dense_keys = sorted({'X', 'X_rm'}.intersection(handle.keys()))
+            if dense_keys:
+                raise ValueError(
+                    "Factor-only Tucker construction refuses a cache containing "
+                    f"dense exchange data: {dense_keys}"
+                )
+        base = ISDFTC.isdf(
+            self,
+            jastrow_params,
+            save_path=save_path,
+            batch_size=batch_size,
+            host_grid_block_size=host_grid_block_size,
+            r2_tile_size=r2_tile_size,
+            gpu_budget_bytes=gpu_budget_bytes,
+        )
+        kernels = dict(base.isdf_kernels)
+        l_aux = kernels.pop("L_aux")
+        d_kernel = base._compute_D_kernel(
+            jastrow_params,
+            batch_size,
+            L_aux=l_aux,
+            host_grid_block_size=host_grid_block_size,
+            d_reduce_group_blocks=d_reduce_group_blocks,
+        )
+        orbital_basis = base.select_tucker_x_orbital_basis(
+            jastrow_params,
+            n_factor,
+            oversampling=oversampling,
+            seed=seed,
+            batch_size=batch_size,
+            L_aux=l_aux,
+            orb_block_size=orb_block_size,
+            host_grid_block_size=host_grid_block_size,
+        )
+        factors = base.compute_tucker_x_core(
+            jastrow_params,
+            orbital_basis,
+            batch_size=batch_size,
+            L_aux=l_aux,
+            host_grid_block_size=host_grid_block_size,
+        )
+        kernels["D"] = np.asarray(d_kernel)
+        kernels["X_tucker"] = factors
+        return base.replace(isdf_kernels=kernels)
 
     def _iter_sharded_delta_u_blocks(
         self,
@@ -1459,7 +1809,142 @@ class ISDFXTC(XTC, ISDFTC):
             
         return D
 
-    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024, L_aux=None, Gb=None, L_Q=None, host_grid_block_size=None):
+    def _compute_X_sketch(self, jastrow_params, ranges, batch_size=1024,
+                          L_aux=None, Gb=None, L_Q=None,
+                          omega_s=None, omega_c=None,
+                          host_grid_block_size=None):
+        """Apply a separable random map to X without materializing X.
+
+        Given ``omega_s[s,k]`` and ``omega_c[c,k]``, return
+
+        ``S[r,k] = sum_{s,c} X[r,s,c] omega_s[s,k] omega_c[c,k]``.
+
+        This is the same Khatri--Rao range-finder sketch used by
+        :meth:`select_tucker_x_orbital_basis`, but the s/c projection is
+        associated into the grid kernel.  In particular, no ``(r,s,rank)``
+        exchange panel is allocated, copied to the host, or contracted after
+        the fact.
+        """
+        if omega_s is None or omega_c is None:
+            raise ValueError("omega_s and omega_c are required for an X sketch")
+        if L_aux is None:
+            L_aux = self._compute_L_aux(jastrow_params, batch_size)
+
+        n_devices = jax.local_device_count()
+        devices = jax.local_devices()
+        n_grid = self.grid_points.shape[0]
+        n_rank = self.phi_isdf.shape[1]
+        n_orb = self.phi_isdf.shape[0]
+        omega_s = np.asarray(omega_s, dtype=np.float64)
+        omega_c = np.asarray(omega_c, dtype=np.float64)
+        if omega_s.shape[0] != n_orb or omega_c.shape[0] != n_rank:
+            raise ValueError(
+                "X sketch probe dimensions disagree with orbital/rank dimensions: "
+                f"omega_s={omega_s.shape}, omega_c={omega_c.shape}, "
+                f"expected ({n_orb}, K) and ({n_rank}, K)"
+            )
+        if omega_s.ndim != 2 or omega_c.ndim != 2 or omega_s.shape[1] != omega_c.shape[1]:
+            raise ValueError("omega_s and omega_c must be rank-2 with equal probe counts")
+
+        dm1 = self._get_mf_dm()
+        if Gb is None:
+            Gb = jnp.einsum('ub,sb,us->b', self.phi_isdf, self.phi_isdf, dm1)
+        if L_Q is None:
+            sqrt_dm1 = jnp.sqrt(jnp.maximum(jnp.diagonal(dm1), 0.0))
+            L_Q = self.phi_isdf.T * sqrt_dm1[None, :]
+
+        slice_p, slice_q, slice_r, slice_s = ranges
+        del slice_p, slice_q
+        nr = self.phi_isdf[slice_r].shape[0]
+        omega_s_panel = omega_s[slice_s]
+        n_probe = omega_s.shape[1]
+
+        xi_phi_ds = None
+        f_xi = None
+        if self.xi_phi is None and self.save_path:
+            f_xi = h5py.File(self.save_path, 'r')
+            xi_phi_ds = f_xi['xi_phi']
+
+        mesh = sharding_core.create_1d_mesh(devices=devices, axis_name='devices')
+        rep_sharding = sharding_core.get_replicated_sharding(mesh)
+        grid_sharding = NamedSharding(mesh, P('devices', None))
+        weights_sharding = NamedSharding(mesh, P('devices'))
+        xi_sharding = NamedSharding(mesh, P(None, 'devices'))
+        g_sharding = NamedSharding(mesh, P(None, 'devices', None))
+
+        @shard_map(
+            mesh=mesh,
+            in_specs=(P('devices', None), P('devices'), P(None, 'devices'),
+                      P(None, 'devices', None), P(), P(), P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+        def sharded_X_sketch(grid_shard, weights_shard, xi_shard, G_shard,
+                             params, omega_s_rep, omega_c_rep, l_q_rep):
+            x_local = self._calc_X_sketch_shard(
+                params, dm1, grid_shard, weights_shard, xi_shard, G_shard,
+                Gb, self.phi_isdf, ranges, n_orb, batch_size, l_q_rep,
+                omega_s_rep, omega_c_rep,
+            )
+            return jax.lax.psum(x_local, 'devices')
+
+        params_rep = jax.tree_util.tree_map(
+            lambda x: jax.device_put(np.asarray(x), rep_sharding), jastrow_params
+        )
+        omega_s_rep = jax.device_put(omega_s_panel, rep_sharding)
+        omega_c_rep = jax.device_put(omega_c, rep_sharding)
+        l_q_rep = jax.device_put(np.asarray(L_Q), rep_sharding)
+        if host_grid_block_size is None:
+            host_grid_block_size = n_grid
+        block_padded = (
+            (host_grid_block_size + n_devices - 1) // n_devices
+        ) * n_devices
+
+        sketch = np.zeros((nr, n_probe), dtype=np.float64)
+        t_prepare_host = t_h2d = t_shard_compute = t_host_accumulate = 0.0
+        t_kernel_start = time.perf_counter()
+        try:
+            xi_phi_source = self.xi_phi if self.xi_phi is not None else xi_phi_ds
+            for _g0, _g1, sharded_grid, sharded_weights, sharded_G, sharded_xi_phi, t_host_blk, t_h2d_blk in self._iter_sharded_delta_u_blocks(
+                L_aux=L_aux,
+                xi_phi_source=xi_phi_source,
+                host_grid_block_size=host_grid_block_size,
+                block_padded=block_padded,
+                n_rank=n_rank,
+                devices=devices,
+                grid_sharding=grid_sharding,
+                weights_sharding=weights_sharding,
+                g_sharding=g_sharding,
+                xi_sharding=xi_sharding,
+            ):
+                t_prepare_host += t_host_blk
+                t_h2d += t_h2d_blk
+                t_compute_start = time.perf_counter()
+                sketch_rep = sharded_X_sketch(
+                    sharded_grid, sharded_weights, sharded_xi_phi, sharded_G,
+                    params_rep, omega_s_rep, omega_c_rep, l_q_rep,
+                )
+                t_shard_compute += time.perf_counter() - t_compute_start
+                t_accum_start = time.perf_counter()
+                sketch += np.asarray(sketch_rep)
+                t_host_accumulate += time.perf_counter() - t_accum_start
+                del sharded_G, sharded_xi_phi, sharded_grid, sharded_weights, sketch_rep
+                gc.collect()
+        finally:
+            if f_xi:
+                f_xi.close()
+
+        logger.debug(
+            "  _compute_X_sketch profile: prepare_host=%.4f s, host_to_device=%.4f s, "
+            "shard_compute=%.4f s, host_accumulate=%.4f s, total=%.4f s",
+            t_prepare_host, t_h2d, t_shard_compute, t_host_accumulate,
+            time.perf_counter() - t_kernel_start,
+        )
+        return sketch
+
+    def _compute_X_kernel(self, jastrow_params, ranges, batch_size=1024,
+                          L_aux=None, Gb=None, L_Q=None,
+                          host_grid_block_size=None, orbital_rows=None):
         """Compute X kernel for Delta U for a specific orbital range with grid-blocking.
         
         Uses low-rank factorization: Q = L_Q @ L_Q.T where L_Q has shape (N_rank, n_orb).
@@ -1486,12 +1971,18 @@ class ISDFXTC(XTC, ISDFTC):
             sqrt_dm1 = jnp.sqrt(jnp.maximum(dm1_diag, 0.0))
             L_Q = self.phi_isdf.T * sqrt_dm1[None, :]
             
-        phi_isdf = self.phi_isdf
-        n_orb = self.n_orb
+        # ``orbital_rows`` lets a caller form U.T @ X @ U directly.  The
+        # grid/kernel algebra remains unchanged because X is bilinear in the
+        # two orbital rows; only the rows supplied to _calc_X_shard change.
+        # The density factor L_Q intentionally remains in the original MO
+        # basis, since it represents the reference density rather than an X
+        # output index.
+        phi_isdf = self.phi_isdf if orbital_rows is None else orbital_rows
+        n_orb = phi_isdf.shape[0]
         
         slice_p, slice_q, slice_r, slice_s = ranges
-        Nr = self.phi_isdf[slice_r].shape[0]
-        Ns = self.phi_isdf[slice_s].shape[0]
+        Nr = phi_isdf[slice_r].shape[0]
+        Ns = phi_isdf[slice_s].shape[0]
         X = np.zeros((Nr, Ns, n_rank))
         
         xi_phi_ds = None
@@ -1729,6 +2220,111 @@ class ISDFXTC(XTC, ISDFTC):
         X_final, _ = jax.lax.scan(scan_X, jnp.zeros((Nr, Ns, N_rank)), jnp.arange(n_batches))
         return X_final
 
+    def _calc_X_sketch_shard(self, jastrow_params, dm1, grid_points, weights,
+                             xi_phi, G_shard, Gb, phi, ranges, n_orb,
+                             batch_size=1024, L_Q=None, omega_s=None,
+                             omega_c=None):
+        """Return the in-kernel Khatri--Rao X sketch for one grid shard.
+
+        This is the associative form of ``_calc_X_shard`` followed by
+        ``einsum('rsc,sk,ck->rk', X, omega_s, omega_c)``.  Contracting the
+        s and ISDF-rank legs first avoids the dense X accumulator that the
+        basis selector does not otherwise need.
+        """
+        del jastrow_params, dm1, Gb, n_orb
+        N_rank = phi.shape[1]
+        N_shard = grid_points.shape[0]
+        _slice_p, _slice_q, slice_r, slice_s = ranges
+        phi_r = phi[slice_r]
+        phi_s = phi[slice_s]
+        Nr = phi_r.shape[0]
+        Ns = phi_s.shape[0]
+        n_probe = omega_s.shape[1]
+
+        if omega_s.shape[0] != Ns or omega_c.shape != (N_rank, n_probe):
+            raise ValueError(
+                "X sketch shard probe dimensions disagree with its orbital/rank panels"
+            )
+
+        padded_size = ((N_shard + batch_size - 1) // batch_size) * batch_size
+        weights_padded = jnp.pad(weights, (0, padded_size - N_shard))
+        xi_padded = jnp.pad(xi_phi, ((0, 0), (0, padded_size - N_shard)))
+        G_padded = jnp.pad(G_shard, ((0, 0), (0, padded_size - N_shard), (0, 0)))
+        n_batches = padded_size // batch_size
+
+        def compute_proj(phi_rows, vec_T, l_q, chunk_size=2048):
+            """Compute ``(phi_rows * vec_T) @ l_q`` in rank chunks."""
+            n_rows = phi_rows.shape[0]
+            n_batch = vec_T.shape[0]
+            n_density = l_q.shape[1]
+            n_rank = l_q.shape[0]
+            num_chunks = (n_rank + chunk_size - 1) // chunk_size
+            pad_len = num_chunks * chunk_size - n_rank
+            if pad_len > 0:
+                phi_p = jnp.pad(phi_rows, ((0, 0), (0, pad_len)))
+                vec_p = jnp.pad(vec_T, ((0, 0), (0, pad_len)))
+                lq_p = jnp.pad(l_q, ((0, pad_len), (0, 0)))
+            else:
+                phi_p, vec_p, lq_p = phi_rows, vec_T, l_q
+
+            def body_fn(carry, i):
+                start = i * chunk_size
+                p_c = jax.lax.dynamic_slice(phi_p, (0, start), (n_rows, chunk_size))
+                v_c = jax.lax.dynamic_slice(vec_p, (0, start), (n_batch, chunk_size))
+                l_c = jax.lax.dynamic_slice(lq_p, (start, 0), (chunk_size, n_density))
+                term = jnp.matmul(p_c[None, :, :] * v_c[:, None, :], l_c)
+                return carry + term, None
+
+            result, _ = jax.lax.scan(
+                body_fn, jnp.zeros((n_batch, n_rows, n_density)),
+                jnp.arange(num_chunks),
+            )
+            return result
+
+        def project_pair(p_r, p_s, rank_probe, w_batch):
+            # p_s is first reduced over its orbital leg.  The remaining
+            # contraction is only (batch, r, probe), rather than a dense
+            # (batch, r, s) pair object followed by a rank-sized output.
+            p_s_probe = jnp.einsum('bso,sk->bok', p_s, omega_s,
+                                    optimize=True)
+            return jnp.einsum('bro,bok,bk,b->rk', p_r, p_s_probe,
+                              rank_probe, w_batch, optimize=True)
+
+        def scan_X_sketch(sketch_acc, i_batch):
+            start = i_batch * batch_size
+            w_batch = jax.lax.dynamic_slice(weights_padded, (start,), (batch_size,))
+            xi_batch = jax.lax.dynamic_slice(
+                xi_padded, (0, start), (N_rank, batch_size)
+            )
+            G_batch = jax.lax.dynamic_slice(
+                G_padded, (0, start, 0), (N_rank, batch_size, 3)
+            )
+            xi_T = xi_batch.T
+            xi_probe = jnp.matmul(xi_T, omega_c)
+            p_s_xi = compute_proj(phi_s, xi_T, L_Q)
+            p_r_xi = compute_proj(phi_r, xi_T, L_Q)
+
+            for component in range(3):
+                g_T = G_batch[:, :, component].T
+                g_probe = jnp.matmul(g_T, omega_c)
+                p_r_g = compute_proj(phi_r, g_T, L_Q)
+                p_s_g = compute_proj(phi_s, g_T, L_Q)
+                sketch_acc = sketch_acc + project_pair(
+                    p_r_g, p_s_g, xi_probe, w_batch
+                )
+                sketch_acc = sketch_acc + project_pair(
+                    p_r_g, p_s_xi, g_probe, w_batch
+                )
+                sketch_acc = sketch_acc + project_pair(
+                    p_r_xi, p_s_g, g_probe, w_batch
+                )
+            return sketch_acc, None
+
+        sketch_final, _ = jax.lax.scan(
+            scan_X_sketch, jnp.zeros((Nr, n_probe)), jnp.arange(n_batches)
+        )
+        return sketch_final
+
 
 
     def get_delta_U(self, jastrow_params, dm1=None, block_str=None, ranges=None, batch_size=1000):
@@ -1817,7 +2413,19 @@ class ISDFXTC(XTC, ISDFTC):
              kernels = self.isdf_kernels
              
         D = kernels['D']
-        X = kernels['X']
+        tucker_x = _get_tucker_x_factors(kernels)
+        if tucker_x is None:
+            X = kernels['X']
+        else:
+            # Do not touch a dense X backing when a Tucker view was supplied:
+            # the normal-order path below contracts U/Z directly.
+            X = None
+        drop_x_normal_order = _drop_x_from_normal_order()
+        if drop_x_normal_order:
+            logger.warning(
+                "X exchange contribution omitted from normal-ordered "
+                "constant and one-body correction"
+            )
         phi = self.phi_isdf
 
         slice_p = slice(None)
@@ -1844,11 +2452,20 @@ class ISDFXTC(XTC, ISDFTC):
         phi_tilde = jnp.dot(dm1, phi)
 
         is_hdf5 = isinstance(X, (h5py.Dataset, h5py.File))
-        
+
         wc = jnp.zeros((phi.shape[1],)) # (N_rank,)
         Y_all = jnp.zeros((self.n_orb, phi.shape[1])) # (N_orb, N_rank)
-        
-        if is_hdf5:
+
+        tucker_j_x_sym = None
+        if drop_x_normal_order:
+            # The pre-zeroed projected intermediates are the exact D-only
+            # normal-order result and avoid loading any X panels from disk.
+            pass
+        elif tucker_x is not None:
+            wc, Y_all, tucker_j_x_sym = _tucker_x_normal_order_intermediates(
+                tucker_x[0], tucker_x[1], dm1, phi_tilde, Gb,
+            )
+        elif is_hdf5:
             # Process strictly in chunks to respect memory
             logger.debug("Streaming X in chunks from HDF5")
             chunk_size = orb_block_size
@@ -1892,9 +2509,13 @@ class ISDFXTC(XTC, ISDFTC):
         
         # J_X: - sum phi_p phi_q w_c
         J_X = - jnp.dot(phi_p * wc[None, :], phi_q.T)
-        
+
         # J_X_sym: - sum X_pq G_c
-        if is_hdf5:
+        if drop_x_normal_order:
+            J_X_sym = jnp.zeros_like(J_D_total)
+        elif tucker_j_x_sym is not None:
+            J_X_sym = tucker_j_x_sym[slice_p, slice_q]
+        elif is_hdf5:
             start_p, stop_p, step_p = slice_p.indices(self.n_orb)
             start_q, stop_q, step_q = slice_q.indices(self.n_orb)
             
@@ -1946,9 +2567,43 @@ class ISDFXTC(XTC, ISDFTC):
     def _contract_delta_U_kernels(self, kernels, ranges):
         """Contract precomputed kernels to get Delta U block."""
         D = kernels['D']
-        X = kernels['X']
+        tucker_x = _get_tucker_x_factors(kernels)
+        include_x = not _drop_x_from_residual_integrals()
+        if not include_x:
+            logger.warning("X exchange contribution omitted from residual Delta-U integrals")
         
         slice_p, slice_q, slice_r, slice_s = ranges
+
+        if tucker_x is not None:
+            # This generic public-block API is intentionally kept separate
+            # from the solver tile path below.  It forms the existing
+            # scan-based D contribution, then adds the factor-direct X term;
+            # neither branch materialises dense X[r,s,c].
+            n_rank = D.shape[0]
+            phi_p = self.phi_isdf[slice_p]
+            phi_q = self.phi_isdf[slice_q]
+            phi_r = self.phi_isdf[slice_r]
+            phi_s = self.phi_isdf[slice_s]
+            rbs = self._get_fixed_rank_block_size()
+            if rbs is None:
+                from pytc.utils.gpu_memory import adaptive_rank_block_size
+                rbs = adaptive_rank_block_size(
+                    phi_p.shape[0], phi_q.shape[0], n_rank,
+                    gpu_max_memory_mb=getattr(self, 'gpu_max_memory', None),
+                )
+            d_only = _contract_delta_U_kernels_jit(
+                jnp.asarray(D), jnp.zeros((1, 1, 1), dtype=jnp.float64),
+                jnp.asarray(phi_p), jnp.asarray(phi_q), jnp.asarray(phi_r),
+                jnp.asarray(phi_s), rbs, False,
+            )
+            if not include_x:
+                return d_only
+            u, z = tucker_x
+            return d_only + _contract_tucker_x_residual(
+                phi_p, phi_q, u[slice_r], u[slice_s], z,
+            )
+
+        X = kernels['X']
         
         def get_info(sl, total):
             if isinstance(sl, slice):
@@ -2008,7 +2663,10 @@ class ISDFXTC(XTC, ISDFTC):
         if total_needed_bytes < threshold_bytes:
             phi_r = self.phi_isdf[slice_r]
             phi_s = self.phi_isdf[slice_s]
-            X_full = _read_X_slice(X, slice_r, slice_s)
+            X_full = (
+                _read_X_slice(X, slice_r, slice_s)
+                if include_x else np.zeros((1, 1, 1), dtype=np.float64)
+            )
             return _contract_delta_U_kernels_jit(
                 D,
                 jnp.asarray(X_full),
@@ -2017,6 +2675,7 @@ class ISDFXTC(XTC, ISDFTC):
                 jnp.asarray(phi_r),
                 jnp.asarray(phi_s),
                 _rbs,
+                include_x,
             )
 
         # Chunking strategy to avoid VRAM exhaustion. Stream only the X panel
@@ -2074,11 +2733,15 @@ class ISDFXTC(XTC, ISDFTC):
                 alen = ie - i_start
                 r_sel = _chunk_selector(r_idx_np, i_start, ie)
                 pr_np = np.asarray(phi_isdf_src[r_sel])
-                xc_np = np.asarray(_read_X_slice(X, r_sel, slice_s))
+                xc_np = (
+                    np.asarray(_read_X_slice(X, r_sel, slice_s))
+                    if include_x else np.zeros((1, 1, 1), dtype=np.float64)
+                )
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
                     pr_np = np.pad(pr_np, ((0, pad), (0, 0)))
-                    xc_np = np.pad(xc_np, ((0, pad), (0, 0), (0, 0)))
+                    if include_x:
+                        xc_np = np.pad(xc_np, ((0, pad), (0, 0), (0, 0)))
                 return pr_np, xc_np, alen
 
             phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(0)
@@ -2095,7 +2758,7 @@ class ISDFXTC(XTC, ISDFTC):
                 cur_actual = actual_len
 
                 res_chunk = _contract_delta_U_kernels_jit(
-                    D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs)
+                    D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs, include_x)
 
                 next_i = i + orb_chunk_size
                 if next_i < Nr:
@@ -2132,11 +2795,15 @@ class ISDFXTC(XTC, ISDFTC):
                 alen = ie - i_start
                 s_sel = _chunk_selector(s_idx_np, i_start, ie)
                 ps_np = np.asarray(phi_isdf_src[s_sel])
-                xc_np = np.asarray(_read_X_slice(X, slice_r, s_sel))
+                xc_np = (
+                    np.asarray(_read_X_slice(X, slice_r, s_sel))
+                    if include_x else np.zeros((1, 1, 1), dtype=np.float64)
+                )
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
                     ps_np = np.pad(ps_np, ((0, pad), (0, 0)))
-                    xc_np = np.pad(xc_np, ((0, 0), (0, pad), (0, 0)))
+                    if include_x:
+                        xc_np = np.pad(xc_np, ((0, 0), (0, pad), (0, 0)))
                 return ps_np, xc_np, alen
 
             phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(0)
@@ -2155,7 +2822,7 @@ class ISDFXTC(XTC, ISDFTC):
                 cur_phi_s = jnp.asarray(cur_phi_s)
                 cur_X = jnp.asarray(cur_X)
                 res_chunk = _contract_delta_U_kernels_jit(
-                    D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs)
+                    D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs, include_x)
 
                 next_i = i + orb_chunk_size
                 if next_i < Ns:
@@ -2180,7 +2847,9 @@ class ISDFXTC(XTC, ISDFTC):
         """Compute one unsymmetrized Delta U tile from prepared kernel panels."""
         global _DELTA_U_DIRECT_TILE_PROFILED
         D = kernels['D']
-        X = kernels['X']
+        tucker_x = _get_tucker_x_factors(kernels)
+        X = None if tucker_x is not None else kernels['X']
+        include_x = not _drop_x_from_residual_integrals()
         slice_p, slice_q, slice_r, slice_s = ranges
         device_key = getattr(device, "id", "host")
         panel_layout = _normalize_panel_layout(panel_layout)
@@ -2238,7 +2907,81 @@ class ISDFXTC(XTC, ISDFTC):
                 "Reduce the solver tile panel size."
             )
 
-        X_sliced = _read_X_slice(X, slice_r, slice_s)
+        if tucker_x is not None:
+            # Keep the existing conservative tile guard until a measured
+            # factor-direct peak model is available.  It uses the historical
+            # dense-X bound, so it may choose a smaller panel than necessary
+            # but it cannot overcommit a GPU while we validate this path.
+            u, z = tucker_x
+            u_r = u[slice_r]
+            u_s = u[slice_s]
+            if panel_size is not None:
+                phi_p = _pad_axis(phi_p, 0, Np) if Np != p_len else jnp.asarray(phi_p)
+                phi_q = _pad_axis(phi_q, 0, Nq_eff) if Nq_eff != Nq else jnp.asarray(phi_q)
+                phi_r = _pad_axis(phi_r, 0, Nr) if Nr != r_len else jnp.asarray(phi_r)
+                phi_s = _pad_axis(phi_s, 0, Ns_eff) if Ns_eff != Ns else jnp.asarray(phi_s)
+                u_r = _pad_axis(u_r, 0, Nr) if Nr != r_len else jnp.asarray(u_r)
+                u_s = _pad_axis(u_s, 0, Ns_eff) if Ns_eff != Ns else jnp.asarray(u_s)
+            else:
+                phi_p = jnp.asarray(phi_p)
+                phi_q = jnp.asarray(phi_q)
+                phi_r = jnp.asarray(phi_r)
+                phi_s = jnp.asarray(phi_s)
+
+            if device is not None:
+                D = D_resident if D_resident is not None else jax.device_put(np.asarray(D), device)
+                # The per-device ISDF cache is keyed by this object.  Retain
+                # the factor backing itself as the identity guard so a new
+                # approximation cannot inherit stale device buffers.
+                factor_cache = cache.get("X_tucker") if cache is not None else None
+                if factor_cache is None or factor_cache[0] is not u or factor_cache[1] is not z:
+                    factor_cache = (
+                        u, z,
+                        jax.device_put(np.asarray(u), device),
+                        jax.device_put(np.asarray(z), device),
+                    )
+                    if cache is not None:
+                        cache["X_tucker"] = factor_cache
+                u_device, z_device = factor_cache[2:]
+                u_r = u_device[slice_r]
+                u_s = u_device[slice_s]
+                if panel_size is not None:
+                    u_r = _pad_axis(u_r, 0, Nr) if Nr != r_len else u_r
+                    u_s = _pad_axis(u_s, 0, Ns_eff) if Ns_eff != Ns else u_s
+                if cache is None:
+                    phi_p = jax.device_put(phi_p, device)
+                    phi_q = jax.device_put(phi_q, device)
+                    phi_r = jax.device_put(phi_r, device)
+                    phi_s = jax.device_put(phi_s, device)
+            else:
+                D = jnp.asarray(D)
+                u_r = jnp.asarray(u_r)
+                u_s = jnp.asarray(u_s)
+                z_device = jnp.asarray(z)
+
+            device_ctx = (
+                jax.default_device(device)
+                if device is not None
+                else contextlib.nullcontext()
+            )
+            with device_ctx:
+                result = _contract_delta_u_tucker_direct_tile_jit(
+                    D, z_device, phi_p, phi_q, phi_r, phi_s, u_r, u_s,
+                    include_x,
+                )
+                if profile:
+                    jax.block_until_ready(result)
+                    logger.debug(
+                        "_get_delta_u_direct_tile Tucker first-tile profile: "
+                        "total %.3fs (device=%s, factors=%d)",
+                        time.perf_counter() - t0, device_key, z.shape[0],
+                    )
+                return result
+
+        X_sliced = (
+            _read_X_slice(X, slice_r, slice_s)
+            if include_x else np.zeros((1, 1, 1), dtype=np.float64)
+        )
         if profile:
             t_read = time.perf_counter()
             logger.debug(
@@ -2260,7 +3003,7 @@ class ISDFXTC(XTC, ISDFTC):
             # Keeping ``X_sliced`` as a
             # NumPy array until the explicit ``jax.device_put`` below
             # gives a single, correctly-targeted host→device copy.
-            if isinstance(X_sliced, np.ndarray):
+            if include_x and isinstance(X_sliced, np.ndarray):
                 if Nr != r_len or Ns_eff != Ns:
                     pad_cfg = [(0, 0)] * X_sliced.ndim
                     if Nr != r_len:
@@ -2268,7 +3011,7 @@ class ISDFXTC(XTC, ISDFTC):
                     if Ns_eff != Ns:
                         pad_cfg[1] = (0, Ns_eff - X_sliced.shape[1])
                     X_sliced = np.pad(X_sliced, pad_cfg)
-            else:
+            elif include_x:
                 # ``X_sliced`` is already a JAX array (e.g. from a per-
                 # device cache).  Pad with the JAX helper, which keeps
                 # it on its current device.
@@ -2314,7 +3057,7 @@ class ISDFXTC(XTC, ISDFTC):
         )
         with device_ctx:
             result = _contract_delta_u_direct_tile_jit(
-                D, X_sliced, phi_p, phi_q, phi_r, phi_s,
+                D, X_sliced, phi_p, phi_q, phi_r, phi_s, include_x,
             )
             if profile:
                 jax.block_until_ready(result)
@@ -2498,11 +3241,9 @@ class ISDFXTC(XTC, ISDFTC):
             )
         if _stage_timing:
             _t_stage_du0 = time.perf_counter()
-        with _tile_timers.term("delta_u_tile") as _tt:
-            delta_u_tile = self._assemble_delta_u_tile(
-                kernels, ranges, device=device, panel_size=panel_size,
-                panel_layout=panel_layout)
-            _tt.sync(delta_u_tile)
+        delta_u_tile = self._assemble_delta_u_tile(
+            kernels, ranges, device=device, panel_size=panel_size,
+            panel_layout=panel_layout)
         if _stage_timing:
             _t_stage_du1 = time.perf_counter()
             _accum_issue_stage("delta_u_assemble_s", _t_stage_du1 - _t_stage_du0)
@@ -2518,9 +3259,7 @@ class ISDFXTC(XTC, ISDFTC):
         if panel_size is not None:
             if _stage_timing:
                 _t_stage_sum0 = time.perf_counter()
-            with _tile_timers.term("final_sum") as _tt:
-                result = tc_tile + delta_u_tile
-                _tt.sync(result)
+            result = tc_tile + delta_u_tile
             if _stage_timing:
                 _t_stage_sum1 = time.perf_counter()
                 _accum_issue_stage("final_sum_s", _t_stage_sum1 - _t_stage_sum0)

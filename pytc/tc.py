@@ -1,7 +1,6 @@
 """JAX implementation of Transcorrelated method."""
 
 import contextlib
-import collections
 import threading
 import weakref
 from typing import Any
@@ -19,85 +18,6 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 from .utils import sharding_core
-from .utils import tile_timers as _tile_timers
-
-# Optional family-level TC assembly (PYTC_FAMILY_ASSEMBLY): for block
-# families whose tiles share the (p, q) orbital domain, the combined rank
-# tensor T_c = T_K1 - T_K2 + T_K3 is built once per family (each K matrix
-# read exactly once) and cached on device; per tile only the step-2
-# contraction runs.  The per-tile scan path this replaces re-reads the
-# full K matrices for EVERY tile (~57 tiles per family at the 1200 deck —
-# the measured dominant cost of the eris build).  Off by default:
-# bit-identical per-tile path.  Falls back per call when the tile is
-# antisymmetric or the domain's T_c would exceed the budget.
-_FAMILY_ASSEMBLY = os.environ.get("PYTC_FAMILY_ASSEMBLY", "").lower() in (
-    "1", "true", "yes")
-
-# Small LRU cache for family T_c tensors.  Replaces the original
-# single-slot cache so that block families whose family keys coincide
-# (e.g. one family's transpose ranges_T is exactly another family's
-# direct (p, q) domain) can actually hit: the medium pipeline runs its
-# tiles in panel-major order, so the few T_c's live within one panel
-# window stay resident.  Capacity is in entries, not bytes — the caller's
-# budget valve already keeps each T_c ≤ ~4×_FUSED_MEM_CAP_ELEMS; with the
-# panel-major access pattern 4-8 slots cover the working set (~13-17 GB
-# at the 1200 deck).  Multi-GPU pipelines interleave panels across
-# devices and will thrash more, but stay correct (each miss just
-# rebuilds).  Hit/miss counts feed the tile_timers receipts.
-_FAMILY_T_CACHE = collections.OrderedDict()
-_FAMILY_CACHE_SLOTS = int(os.environ.get("PYTC_FAMILY_CACHE_SLOTS", "8") or "8")
-_FAMILY_CACHE_STATS = {"hits": 0, "misses": 0}
-
-
-def _family_cache_get(key):
-    T_c = _FAMILY_T_CACHE.get(key)
-    if T_c is not None:
-        _FAMILY_T_CACHE.move_to_end(key)
-        _FAMILY_CACHE_STATS["hits"] += 1
-        _tile_timers.incr("tc_family_cache_hit")
-    else:
-        _FAMILY_CACHE_STATS["misses"] += 1
-        _tile_timers.incr("tc_family_cache_miss")
-    return T_c
-
-
-def _family_cache_put(key, T_c):
-    _FAMILY_T_CACHE[key] = T_c
-    _FAMILY_T_CACHE.move_to_end(key)
-    while len(_FAMILY_T_CACHE) > _FAMILY_CACHE_SLOTS:
-        _FAMILY_T_CACHE.popitem(last=False)
-
-
-def _slice_key(s):
-    return (getattr(s, "start", None), getattr(s, "stop", None))
-
-
-def _family_direct_tile(xtc_self, kernels, phi_p, phi_q, grad_phi_p,
-                        grad_phi_q, phi_r, phi_s, u1, u3, slice_p, slice_q,
-                        device):
-    """Direct TC tile via the family T_c cache; None → caller falls back."""
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    n_rank = u3.shape[1]
-    # Safety valve: only serve domains whose T_c fits the budget (with
-    # working room); larger domains keep the per-tile scan.
-    if Np * Nq * n_rank > 4 * kmat_jax._FUSED_MEM_CAP_ELEMS:
-        return None
-    # The key must capture the PADDED row counts, not just the slices: the
-    # same (p, q) slices reach here with different panel_layout padding
-    # (e.g. "qr" pads q, "ps" pads p), and a T_c built for one padded
-    # shape is the wrong array for another.
-    key = (id(kernels), _slice_key(slice_p), _slice_key(slice_q), Np, Nq)
-    T_c = _family_cache_get(key)
-    if T_c is None:
-        with _tile_timers.term("tc_family_step1") as _tt:
-            T_c = kmat_jax.family_step1_combined(
-                phi_p, phi_q, grad_phi_p, grad_phi_q, u1, u3)
-            _tt.sync(T_c)
-        _family_cache_put(key, T_c)
-    with _tile_timers.term("tc_family_step2") as _tt:
-        result = kmat_jax.family_step2_tile(T_c, phi_r, phi_s)
-        _tt.sync(result)
-    return 0.5 * result
 
 logger = logging.getLogger(__name__)
 
@@ -573,18 +493,13 @@ class TC:
         
         return (p, q, r, s)
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000,
-               fused=False):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms (K1 + K2 + K3) with multi-GPU support.
         
         Args:
             jastrow_params: Parameters for the Jastrow factor
             block_str: Optional string specifying the block (e.g. 'oovv')
             ranges: Optional tuple of slices (slice_p, slice_q, slice_r, slice_s)
-            fused: Accepted for signature compatibility with
-                ``ISDFTC.get_2b`` (which ``XTC.get_2b`` forwards to
-                unconditionally); ignored here — the base exact path has no
-                rank-fused formulation.
             
         Returns:
             jnp.ndarray: The TC correction term.
@@ -1062,7 +977,6 @@ class ISDFTC(TC):
         r2_tile_size=None,
         mesh_shape=None,
         gpu_budget_bytes=None,
-        fused=False,
     ):
         """Compute K1 and K3 kernels with a 2D (k, g)-mesh + double-host-tiled
         algorithm.
@@ -1115,29 +1029,6 @@ class ISDFTC(TC):
             except Exception:
                 gpu_budget_bytes = 50 * (1024 ** 3)
         gpu_budget_bytes = max(int(gpu_budget_bytes), 1)
-
-        def _log_device_bytes(tag):
-            """Residency receipt: live device bytes at a build phase boundary.
-
-            Log-only -- the kmat budget model counts named buffers, and the
-            gap between its prediction and XLA reality is exactly what these
-            lines measure.
-            """
-            try:
-                stats = jax.devices()[0].memory_stats() or {}
-                logger.info(
-                    "  compute_kmat_kernels %s: bytes_in_use=%.2f GiB, "
-                    "peak_bytes_in_use=%.2f GiB, bytes_limit=%.2f GiB",
-                    tag,
-                    (stats.get("bytes_in_use") or 0) / (1024 ** 3),
-                    (stats.get("peak_bytes_in_use") or 0) / (1024 ** 3),
-                    (stats.get("bytes_limit") or 0) / (1024 ** 3),
-                )
-            except Exception:                                  # noqa: BLE001
-                logger.info("  compute_kmat_kernels %s: device bytes unavailable",
-                            tag)
-
-        _log_device_bytes("entry")
 
         # --- Per-device peak-memory model (bytes, float64) -------------------
         # Each line item maps to a specific tensor or transient inside the
@@ -1426,7 +1317,6 @@ class ISDFTC(TC):
 
         K1_accum = _make_k_sharded_zeros((n_rank_padded, n_rank, 3))
         K3_accum = _make_k_sharded_zeros((n_rank_padded, n_rank))
-        _log_device_bytes("accumulators")
 
         n_r2_tiles = (n_grid + r2_tile_size - 1) // r2_tile_size
         n_r1_blocks = (n_grid + host_grid_block_size - 1) // host_grid_block_size
@@ -1441,7 +1331,6 @@ class ISDFTC(TC):
             sh_grid_r2 = _build_g_sharded(grid_r2_np, axis=0)
             sh_weights_r2 = _build_g_sharded(weights_r2_np, axis=0)
             sh_xi_phi_r2 = _build_g_sharded(xi_phi_r2_np, axis=1)
-            _log_device_bytes(f"r2 tile {j + 1}/{n_r2_tiles} loaded")
 
             for i, g_r1_0 in enumerate(range(0, n_grid, host_grid_block_size)):
                 g_r1_1 = min(g_r1_0 + host_grid_block_size, n_grid)
@@ -1477,12 +1366,24 @@ class ISDFTC(TC):
         # Strip k-axis padding (zero by construction).
         K1_kernel = K1_kernel_padded[:n_rank]
         K3_kernel = K3_kernel_padded[:n_rank]
-        _log_device_bytes("exit")
         return {'K1_kernel': jnp.asarray(K1_kernel),
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
-    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None, host_grid_block_size=None):
-        """Compute L_aux (G) for the full grid with grid-blocking to save host RAM."""
+    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
+                       host_grid_block_size=None, include_h_aux=False,
+                       use_laux_fast_grad=False):
+        """Compute L_aux, and optionally its exact squared-gradient companion.
+
+        When ``include_h_aux`` is true this also forms
+        ``H_aux[a,g] = sum_h xi_phi[a,h] w_h |grad u(g,h)|^2`` in the same
+        double-grid pass.  ``H_aux`` lets the K3 ISDF kernel be recovered by
+        one-grid contraction; paired with ``L_aux`` it likewise recovers K1.
+        The default is deliberately unchanged for existing callers.
+
+        ``use_laux_fast_grad`` selects a Jastrow-provided derivative fast path
+        for this construction only.  It is opt-in so existing caches and all
+        non-L_aux derivative callers retain the ordinary implementation.
+        """
         n_devices = jax.local_device_count()
         devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
@@ -1492,13 +1393,19 @@ class ISDFTC(TC):
             host_grid_block_size = n_grid
             
         L_aux_out = None
+        H_aux_out = None
         f_out = None
         if save_path:
             f_out = h5py.File(save_path, 'a')
             if 'L_aux' in f_out: del f_out['L_aux']
             L_aux_out = f_out.create_dataset('L_aux', (n_rank, n_grid, 3), dtype='f8')
+            if include_h_aux:
+                if 'H_aux' in f_out: del f_out['H_aux']
+                H_aux_out = f_out.create_dataset('H_aux', (n_rank, n_grid), dtype='f8')
         else:
             L_aux_out = np.zeros((n_rank, n_grid, 3))
+            if include_h_aux:
+                H_aux_out = np.zeros((n_rank, n_grid))
             
         xi_phi_ds = None
         f_xi = None
@@ -1515,14 +1422,27 @@ class ISDFTC(TC):
             
         def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
             def scan_body(carry, i):
+                if include_h_aux:
+                    l_aux_carry, h_aux_carry = carry
                 r_eval = grid_eval_shard
                 g_batch = jax.lax.dynamic_slice(grid_int, (i * batch_size, 0), (batch_size, 3))
                 w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
                 xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
                 
-                u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
+                if use_laux_fast_grad:
+                    u_grad = self.jastrow_factor.grad_r_batch_laux(
+                        r_eval, g_batch, jastrow_params
+                    )
+                else:
+                    u_grad = self.jastrow_factor.grad_r_batch(
+                        r_eval, g_batch, jastrow_params
+                    )
                 xi_weighted = xi_batch * w_batch[None, :]
                 update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
+                if include_h_aux:
+                    grad_sq = jnp.sum(u_grad**2, axis=-1)
+                    h_update = jnp.einsum('ab,ib->ai', xi_weighted, grad_sq)
+                    return (l_aux_carry + update, h_aux_carry + h_update), None
                 return carry + update, None
 
             n_int = grid_int.shape[0]
@@ -1534,18 +1454,34 @@ class ISDFTC(TC):
                 weights_int = jnp.pad(weights_int, (0, pad_int))
                 xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
                 
-            init_val = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
-            res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
-            return res
+            l_aux_init = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
+            if include_h_aux:
+                h_aux_init = jnp.zeros((n_rank, grid_eval_shard.shape[0]))
+                (l_aux_res, h_aux_res), _ = jax.lax.scan(
+                    scan_body, (l_aux_init, h_aux_init), jnp.arange(n_batches)
+                )
+                return l_aux_res, h_aux_res
+            l_aux_res, _ = jax.lax.scan(scan_body, l_aux_init, jnp.arange(n_batches))
+            return l_aux_res
 
-        @shard_map(
-            mesh=mesh,
-            in_specs=(P('devices', None), P(), P(), P(), P()),
-            out_specs=P(None, 'devices', None),
-            check_vma=False,
-        )
-        def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
-            return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+        if include_h_aux:
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P('devices', None), P(), P(), P(), P()),
+                out_specs=(P(None, 'devices', None), P(None, 'devices')),
+                check_vma=False,
+            )
+            def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+                return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+        else:
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P('devices', None), P(), P(), P(), P()),
+                out_specs=P(None, 'devices', None),
+                check_vma=False,
+            )
+            def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+                return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
 
         try:
             for r0 in range(0, n_grid, host_grid_block_size):
@@ -1563,6 +1499,7 @@ class ISDFTC(TC):
                 sharded_grid_eval = jax.device_put(grid_eval_block, eval_sharding)
                 
                 res_rep_accum = None
+                h_aux_rep_accum = None
                 
                 # Also controlled by host_grid_block_size to limit peak memory of inputs
                 from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
@@ -1596,6 +1533,9 @@ class ISDFTC(TC):
                         sharded_grid_eval, params_rep, grid_int_chunk, weights_int_chunk, xi_phi_chunk
                     )
 
+                    if include_h_aux:
+                        res_partial, h_partial = res_partial
+
                     # While shard_map runs, prefetch next integration block.
                     next_g0 = g0 + host_grid_block_size
                     if next_g0 < n_grid:
@@ -1603,15 +1543,27 @@ class ISDFTC(TC):
                     
                     if res_rep_accum is None:
                         res_rep_accum = res_partial
+                        if include_h_aux:
+                            h_aux_rep_accum = h_partial
                     else:
                         res_rep_accum += res_partial
+                        if include_h_aux:
+                            h_aux_rep_accum += h_partial
                     
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
+                    if include_h_aux:
+                        del h_partial
                 
                 res_block = res_rep_accum[:, :n_eval, :]
                 L_aux_out[:, r0:r1, :] = np.asarray(res_block)
+                if include_h_aux:
+                    h_aux_block = h_aux_rep_accum[:, :n_eval]
+                    H_aux_out[:, r0:r1] = np.asarray(h_aux_block)
+                    del h_aux_block
                 
                 del sharded_grid_eval, res_rep_accum, res_block
+                if include_h_aux:
+                    del h_aux_rep_accum
                 gc.collect()
                 
         finally:
@@ -1623,11 +1575,14 @@ class ISDFTC(TC):
             if f_out and not isinstance(L_aux_out, h5py.Dataset):
                 f_out.close()
             
+        if include_h_aux:
+            return L_aux_out, H_aux_out
         return L_aux_out
 	
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
-             r2_tile_size=None, gpu_budget_bytes=None):
+             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False,
+             use_laux_fast_grad=False):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1637,54 +1592,169 @@ class ISDFTC(TC):
             save_path: Optional path to save intermediates to HDF5.
             batch_size: Batch size for computation.
             host_grid_block_size: Block size for grid batching on host.
-            r2_tile_size: Optional r2 host-loop tile size for the K1/K3 build;
-                forwarded to compute_kmat_kernels (auto-sized from the budget
-                when None).
-            gpu_budget_bytes: Optional per-device memory budget override for
-                the K1/K3 tile solver (probed live when None).
+            r2_tile_size: Optional r2-grid tile size for kernel assembly.
+            gpu_budget_bytes: Optional device-memory budget in bytes for kernel
+                assembly.
+            reuse_aux_kernels: Opt-in exact path that builds ``L_aux`` and
+                ``H_aux`` together, then recovers K1/K3 from one-grid
+                contractions.  The out-of-core implementation streams grid
+                and left-rank panels, retaining only the final K kernels in
+                host memory; it requires a persistent ``save_path`` for the
+                L_aux/H_aux datasets.
+            use_laux_fast_grad: Opt into an algebraically equivalent,
+                Jastrow-provided fast derivative for the L_aux double-grid
+                contraction.  The choice is persisted on out-of-core caches.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+        if reuse_aux_kernels and not self.is_incore and not out_path:
+            raise ValueError(
+                "out-of-core reuse_aux_kernels requires save_path so L_aux "
+                "and H_aux can be streamed rather than materialized"
+            )
         
+        laux_gradient_mode = "fast" if use_laux_fast_grad else "direct"
         kernels = {}
-        if out_path and os.path.exists(out_path):
+        # An opt-in auxiliary-reuse request must execute that path, not
+        # silently accept a pre-existing direct K1/K3 cache.
+        if out_path and os.path.exists(out_path) and not reuse_aux_kernels:
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
-                    logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
-                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
-                    kernels['K1_kernel'] = f['K1_kernel'][:]
-                    logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
-                    kernels['K3_kernel'] = f['K3_kernel'][:]
-                    if self.is_incore:
-                        logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
-                        kernels['L_aux'] = f['L_aux'][:]
+                    cached_laux_mode = f.attrs.get(
+                        "pytc_laux_gradient_mode", "direct"
+                    )
+                    if isinstance(cached_laux_mode, bytes):
+                        cached_laux_mode = cached_laux_mode.decode()
+                    if cached_laux_mode != laux_gradient_mode:
+                        logger.info(
+                            "  L_aux cache gradient mode is %s, but this run "
+                            "requests %s; recomputing base intermediates.",
+                            cached_laux_mode, laux_gradient_mode,
+                        )
                         f.close()
+                        f = None
                     else:
-                        logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
-                        kernels['L_aux'] = f['L_aux'] 
+                        logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
+                        logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
+                        kernels['K1_kernel'] = f['K1_kernel'][:]
+                        logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
+                        kernels['K3_kernel'] = f['K3_kernel'][:]
+                        if self.is_incore:
+                            logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
+                            kernels['L_aux'] = f['L_aux'][:]
+                            f.close()
+                        else:
+                            logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
+                            kernels['L_aux'] = f['L_aux']
 
-                    logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    return self.replace(isdf_kernels=kernels)
+                        logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
+                        return self.replace(isdf_kernels=kernels)
                 
                 # If we are here, keys are missing. Close the file!
-                f.close()
+                if f is not None:
+                    f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 
-        logger.info("  Computing K1 and K3 kernels...")
-        
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size,
-                                            host_grid_block_size=host_grid_block_size,
-                                            r2_tile_size=r2_tile_size,
-                                            gpu_budget_bytes=gpu_budget_bytes)
+        if reuse_aux_kernels:
+            logger.info("  Computing L_aux and H_aux for exact K1/K3 recovery...")
+            aux_build_start = time.perf_counter()
+            L_aux, H_aux = self._compute_L_aux(
+                jastrow_params,
+                batch_size,
+                save_path=out_path if not self.is_incore else None,
+                host_grid_block_size=host_grid_block_size,
+                include_h_aux=True,
+                use_laux_fast_grad=use_laux_fast_grad,
+            )
+            logger.info(
+                "  L_aux/H_aux construction completed in %.4f s",
+                time.perf_counter() - aux_build_start,
+            )
+            recovery_start = time.perf_counter()
+            if self.is_incore:
+                kernels = kmat_jax.calc_kmat_kernels_from_aux(
+                    self.xi_phi, self.xi_grad, self.weights, L_aux, H_aux
+                )
+            else:
+                # The grid panel follows the L_aux construction panel; rows
+                # of the left K rank are deliberately small so no full R^2
+                # temporary is ever materialized on a GPU.
+                stream_grid_block = host_grid_block_size or min(
+                    self.grid_points.shape[0], 4096
+                )
+                stream_rank_block = min(self.phi_isdf.shape[1], 128)
+                logger.info(
+                    "  Recovering K1/K3 from streamed L_aux/H_aux "
+                    "(grid_block=%d, rank_block=%d)...",
+                    stream_grid_block,
+                    stream_rank_block,
+                )
+                # A genuine out-of-core ISDF object intentionally carries
+                # ``None`` for xi_phi/xi_grad.  Reuse the already-open
+                # L_aux HDF5 file instead of reloading either collocation
+                # tensor into host memory.
+                xi_source_file = L_aux.file
+                xi_phi_source = (
+                    self.xi_phi if self.xi_phi is not None
+                    else xi_source_file['xi_phi']
+                )
+                xi_grad_source = (
+                    self.xi_grad if self.xi_grad is not None
+                    else xi_source_file['xi_grad']
+                )
+                kernels = kmat_jax.calc_kmat_kernels_from_aux_streamed(
+                    xi_phi_source,
+                    xi_grad_source,
+                    self.weights,
+                    L_aux,
+                    H_aux,
+                    grid_block_size=stream_grid_block,
+                    rank_block_size=stream_rank_block,
+                )
+                # H_aux is a transient companion to L_aux, not a cache
+                # format change.  Drop it immediately after exact K3
+                # recovery rather than retaining an extra R-by-G dataset.
+                if isinstance(H_aux, h5py.Dataset):
+                    h_aux_file = H_aux.file
+                    del h_aux_file['H_aux']
+                    h_aux_file.flush()
+            logger.info(
+                "  K1/K3 auxiliary recovery completed in %.4f s",
+                time.perf_counter() - recovery_start,
+            )
+        else:
+            logger.info("  Computing K1 and K3 kernels...")
+            direct_k_start = time.perf_counter()
+            kernels = self.compute_kmat_kernels(
+                jastrow_params,
+                batch_size,
+                host_grid_block_size=host_grid_block_size,
+                r2_tile_size=r2_tile_size,
+                gpu_budget_bytes=gpu_budget_bytes,
+            )
+            logger.info(
+                "  K1/K3 direct construction completed in %.4f s",
+                time.perf_counter() - direct_k_start,
+            )
+            logger.info("  Computing L_aux...")
+            laux_start = time.perf_counter()
+            L_aux = self._compute_L_aux(
+                jastrow_params,
+                batch_size,
+                save_path=out_path if not self.is_incore else None,
+                host_grid_block_size=host_grid_block_size,
+                use_laux_fast_grad=use_laux_fast_grad,
+            )
+            logger.info(
+                "  L_aux construction completed in %.4f s",
+                time.perf_counter() - laux_start,
+            )
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
-        
-        logger.info("  Computing L_aux...")
-        L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
         
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
         # If it's an HDF5 dataset, we keep it as is.
@@ -1701,6 +1771,13 @@ class ISDFTC(TC):
         
         if out_path and not self.is_incore:
             with h5py.File(out_path, 'a') as f:
+                # This provenance is deliberately on the base cache because
+                # timing cards must not mistake a direct K cache for an
+                # auxiliary-recovered one (or vice versa) after a restart.
+                f.attrs['pytc_kmat_kernel_mode'] = (
+                    'aux-recovery' if reuse_aux_kernels else 'direct'
+                )
+                f.attrs['pytc_laux_gradient_mode'] = laux_gradient_mode
                 for k, v in kernels.items():
                     if k == 'L_aux': continue
                     if k in f: del f[k]
@@ -1774,7 +1851,7 @@ class ISDFTC(TC):
             del chunk_np
 
     def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None,
-                            panel_layout="pr", fused=False):
+                            panel_layout="pr"):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
         global _TC_DIRECT_TILE_PROFILED
         _device_key = getattr(device, "id", "host")
@@ -1872,18 +1949,7 @@ class ISDFTC(TC):
         q_len_out = phi_q.shape[0]
 
         with device_ctx:
-            # Family-assembly path (PYTC_FAMILY_ASSEMBLY): serve the tile
-            # from the per-family T_c cache instead of re-scanning the K
-            # matrices per tile.  Antisymmetric tiles and over-budget
-            # domains fall through to the per-tile scan.
-            _fam_result = None
-            if (_FAMILY_ASSEMBLY and panel_size is not None
-                    and slice_p != slice_q):
-                _fam_result = _family_direct_tile(
-                    self, kernels, phi_p, phi_q, grad_phi_p, grad_phi_q,
-                    phi_r, phi_s, u1, u3, slice_p, slice_q, device)
-
-            if slice_p == slice_q and _fam_result is None:
+            if slice_p == slice_q:
                 # The antisymmetrization ``k12 - k12.T(1,0,2,3)`` requires
                 # ``phi_p.shape[0] == phi_q.shape[0]``.  Panel padding can
                 # violate that when ``nocc < panel_blk`` and the layout
@@ -1900,38 +1966,28 @@ class ISDFTC(TC):
                     phi_q      = _pad_axis(phi_q, 0, match_len)
                 # In-kernel antisymmetrisation in (p,q) — avoids
                 # materialising k12 and its transposed copy (~36 s/tile at 5z).
-                with _tile_timers.term("tc_k1_antisym_pq") as _tt:
-                    k12 = kmat_jax.contract_K1_antisym_pq_isdf_streaming(
-                        phi_p, phi_r, phi_s, grad_phi_p, u1, rbs,
-                        panel_size=k_panel)
-                    _tt.sync(k12)
+                k12 = kmat_jax.contract_K1_antisym_pq_isdf_streaming(
+                    phi_p, phi_r, phi_s, grad_phi_p, u1, rbs,
+                    panel_size=k_panel)
             else:
-                if _fam_result is None:
-                    with _tile_timers.term("tc_k1_minus_k2") as _tt:
-                        k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
-                            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
-                            panel_size=k_panel, fused=fused)
-                        _tt.sync(k12)
+                k12 = kmat_jax.contract_K1_minus_K2_isdf_streaming(
+                    phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, u1, rbs,
+                    panel_size=k_panel)
 
             if panel_size is not None:
-                if _fam_result is not None:
-                    result = _fam_result
-                else:
-                    if _profile:
-                        jax.block_until_ready(k12)
-                        _t_k1 = time.perf_counter()
-                        logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
-                                     _t_k1 - _t_put)
-                    with _tile_timers.term("tc_k3") as _tt:
-                        k3 = kmat_jax.contract_K3_isdf_streaming(
-                            phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
-                        _tt.sync(k3)
-                    if _profile:
-                        jax.block_until_ready(k3)
-                        _t_k3 = time.perf_counter()
-                        logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
-                                     "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
-                    result = 0.5 * (k12 + k3)
+                if _profile:
+                    jax.block_until_ready(k12)
+                    _t_k1 = time.perf_counter()
+                    logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
+                                 _t_k1 - _t_put)
+                k3 = kmat_jax.contract_K3_isdf_streaming(
+                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
+                if _profile:
+                    jax.block_until_ready(k3)
+                    _t_k3 = time.perf_counter()
+                    logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
+                                 "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
+                result = 0.5 * (k12 + k3)
                 # If the slice_p==slice_q branch re-padded phi_p/phi_q to
                 # equalise them, slice axes 0/1 back to the caller-expected
                 # extents so the tile matches the panel_layout convention.
@@ -1943,10 +1999,8 @@ class ISDFTC(TC):
 
             result_np = np.array(k12)
             del k12
-            with _tile_timers.term("tc_k3") as _tt:
-                k3 = kmat_jax.contract_K3_isdf_streaming(
-                    phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel, fused=fused)
-                _tt.sync(k3)
+            k3 = kmat_jax.contract_K3_isdf_streaming(
+                phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
             result_np += np.asarray(k3)
             del k3
             result_np *= 0.5
@@ -1957,12 +2011,12 @@ class ISDFTC(TC):
             return jnp.asarray(result_np)
 
     def _assemble_tc_tile(self, kernels, ranges, device=None, panel_size=None,
-                          panel_layout="pr", fused=False):
+                          panel_layout="pr"):
         """Assemble and symmetrize one finished TC tile."""
         panel_layout = _normalize_panel_layout(panel_layout)
         direct = self._get_tc_direct_tile(
             kernels, ranges, device=device, panel_size=panel_size,
-            panel_layout=panel_layout, fused=fused)
+            panel_layout=panel_layout)
 
         if panel_size is not None:
             slice_p, slice_q, slice_r, slice_s = ranges
@@ -1989,7 +2043,7 @@ class ISDFTC(TC):
             ranges_T = (slice_r, slice_s, slice_p, slice_q)
             tmp = self._get_tc_direct_tile(
                 kernels, ranges_T, device=device, panel_size=panel_size,
-                panel_layout=_transpose_panel_layout(panel_layout), fused=fused)
+                panel_layout=_transpose_panel_layout(panel_layout))
             return -(direct + tmp.transpose(2, 3, 0, 1))
 
         result_np = np.array(direct)
@@ -2006,7 +2060,7 @@ class ISDFTC(TC):
 
         return jnp.asarray(-result_np)
 
-    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000, fused=False):
+    def get_2b(self, jastrow_params, block_str=None, ranges=None, batch_size=1000):
         """Calculate TC correction terms using ISDF with multi-GPU support.
 
         Memory-optimized: computes each piece on GPU, immediately transfers
@@ -2025,11 +2079,11 @@ class ISDFTC(TC):
             ranges = (full, full, full, full)
 
         if self.isdf_kernels is None:
-            kernels = self.compute_kmat_kernels(jastrow_params, batch_size, fused=fused)
+            kernels = self.compute_kmat_kernels(jastrow_params, batch_size)
         else:
             kernels = self.isdf_kernels
 
-        result = self._assemble_tc_tile(kernels, ranges, fused=fused)
+        result = self._assemble_tc_tile(kernels, ranges)
         total_time = time.perf_counter() - start_time
         logger.debug(f"ISDFTC.get_2b completed in {total_time:.4f} s")
         return result

@@ -1,18 +1,15 @@
-"""DF/THC algebra: NumPy oracle, JAX production path, and X-store layouts.
+"""Production DF/THC algebra and X-store layouts.
 
-The NumPy section is the reference oracle (and provides
-``extract_vv_df_factor`` for the solver's factorized state).
-The JAX section is the production implementation of the same panelled
-algebra.  The X-store section converts ISDF X factors between the
+The JAX section implements the panelled LS-THC algebra used by the solver.
+``extract_vv_df_factor`` builds its metric-applied virtual DF input.  The
+X-store section converts ISDF X factors between the
 rank-innermost store layout ``(nmo, nmo, rank)`` and the rank-major layout
 ``(rank, nmo, nmo)`` (panel-contiguous), in place or into a new store.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 
@@ -22,91 +19,10 @@ import jax.numpy as jnp
 import numpy as np
 from numpy.typing import NDArray
 
-# ---------------- NumPy oracle ----------------
+# ---------------- DF-factor extraction ----------------
 
 
 Float64Array = NDArray[np.float64]
-DEFAULT_LSTHC_RCOND = 1.0e-12
-
-
-@dataclass(frozen=True)
-class ErrorNorm:
-    """Absolute and relative Frobenius error against an exact FP64 value."""
-
-    absolute_frobenius: float
-    relative_frobenius: float
-
-
-@dataclass(frozen=True)
-class LSTHCFit:
-    """Auditable least-squares fit of the metric-applied DF factor B."""
-
-    weights: Float64Array
-    b_tilde: Float64Array
-    rcond: float
-    effective_rank: int
-    singular_values: Float64Array
-    singular_max: float
-    singular_min_kept: float
-    condition_number: float
-
-
-@dataclass(frozen=True)
-class RobustMetricSpectrum:
-    """PSD diagnostic for a robust metric, which is not PSD by construction."""
-
-    minimum_eigenvalue: float
-    negative_spectral_weight: float
-
-
-def _as_fp64(name: str, value: object, ndim: int) -> Float64Array:
-    """Validate an FP64 real array without silently down-casting input."""
-
-    array = np.asarray(value)
-    if array.ndim != ndim:
-        raise ValueError(f"{name} must have {ndim} dimensions; got {array.shape}")
-    if array.dtype != np.dtype(np.float64):
-        raise ValueError(f"{name} must be real float64; got {array.dtype}")
-    return array
-
-
-def _validate_rcond(rcond: float) -> float:
-    """Require an explicit finite least-squares truncation threshold."""
-
-    value = float(rcond)
-    if not np.isfinite(value) or value <= 0.0 or value > 1.0:
-        raise ValueError(f"rcond must be finite and in (0, 1]; got {rcond!r}")
-    return value
-
-
-def frobenius_error(reference: object, approximation: object) -> ErrorNorm:
-    """Return FP64 absolute/relative Frobenius error without a silent dtype cast."""
-
-    exact = np.asarray(reference)
-    approx = np.asarray(approximation)
-    if exact.dtype != np.dtype(np.float64) or approx.dtype != np.dtype(np.float64):
-        raise ValueError(f"reference and approximation must be float64; got {exact.dtype} and {approx.dtype}")
-    if exact.shape != approx.shape:
-        raise ValueError(f"reference and approximation shapes differ: {exact.shape} vs {approx.shape}")
-    absolute = float(np.linalg.norm(exact - approx))
-    denominator = float(np.linalg.norm(exact))
-    relative = absolute / denominator if denominator else (0.0 if absolute == 0.0 else np.inf)
-    return ErrorNorm(absolute_frobenius=absolute, relative_frobenius=relative)
-
-
-def virtual_pair_df_matrix(l_vv: object) -> Float64Array:
-    """Flatten PyTC's ``B[a,c,Q]`` in C-order pair convention.
-
-    The returned row ``a * nvir + c`` is precisely the virtual pair ``(a,c)``.
-    This is the order produced after PyTC's ``lib.unpack_tril(eris.vvL[:],
-    axis=0)`` at the DF call sites.
-    """
-
-    b = _as_fp64("l_vv", l_vv, 3)
-    nvir_a, nvir_c, _ = b.shape
-    if nvir_a != nvir_c:
-        raise ValueError(f"l_vv virtual axes must be square; got {b.shape}")
-    return b.reshape(nvir_a * nvir_c, b.shape[2])
 
 
 def extract_vv_df_factor(
@@ -161,227 +77,6 @@ def extract_vv_df_factor(
     return np.asarray(lib.unpack_tril(vv_l, axis=0), dtype=np.float64)
 
 
-def scalar_pair_collocation(p_virtual: object) -> Float64Array:
-    """Return ``C[(a,c),mu] = P[a,mu] P[c,mu]`` in B's pair order."""
-
-    p = _as_fp64("p_virtual", p_virtual, 2)
-    nvir, rank = p.shape
-    if rank < 1:
-        raise ValueError("p_virtual must contain at least one selected ISDF column")
-    return np.einsum("am,cm->acm", p, p, optimize=True).reshape(nvir * nvir, rank)
-
-
-def fit_lsthc_pair_factor(
-    b_pair: object,
-    collocation: object,
-    *,
-    rcond: float = DEFAULT_LSTHC_RCOND,
-) -> LSTHCFit:
-    """Fit ``B_tilde = C W`` and retain every rank/conditioning diagnostic."""
-
-    b = _as_fp64("b_pair", b_pair, 2)
-    c = _as_fp64("collocation", collocation, 2)
-    if b.shape[0] != c.shape[0]:
-        raise ValueError(
-            "b_pair and collocation must share the flattened virtual-pair axis; "
-            f"got {b.shape} and {c.shape}"
-        )
-    resolved_rcond = _validate_rcond(rcond)
-    weights, _, effective_rank, singular_values = np.linalg.lstsq(
-        c, b, rcond=resolved_rcond
-    )
-    singular_values = np.asarray(singular_values, dtype=np.float64)
-    singular_max = float(singular_values[0])
-    if effective_rank:
-        singular_min_kept = float(singular_values[effective_rank - 1])
-        condition_number = singular_max / singular_min_kept
-    else:
-        singular_min_kept = 0.0
-        condition_number = np.inf
-    return LSTHCFit(
-        weights=weights,
-        b_tilde=c @ weights,
-        rcond=resolved_rcond,
-        effective_rank=int(effective_rank),
-        singular_values=singular_values,
-        singular_max=singular_max,
-        singular_min_kept=singular_min_kept,
-        condition_number=float(condition_number),
-    )
-
-
-@dataclass(frozen=True)
-class RobustDFTHCModel:
-    """Exact, LS-THC, and robust pair-space representations for one B matrix."""
-
-    b_pair: Float64Array
-    collocation: Float64Array
-    b_tilde: Float64Array
-    weights: Float64Array
-    rcond: float
-    effective_rank: int
-    singular_values: Float64Array
-    singular_max: float
-    singular_min_kept: float
-    condition_number: float
-    delta_b: Float64Array
-    exact_metric: Float64Array
-    lsthc_metric: Float64Array
-    robust_metric: Float64Array
-
-    @property
-    def exact_minus_robust(self) -> Float64Array:
-        """The signed robust residual, ``B B.T - robust``."""
-
-        return self.exact_metric - self.robust_metric
-
-    @property
-    def lsthc_metric_error(self) -> ErrorNorm:
-        """Error of the full LS-THC pair metric against exact DF."""
-
-        return frobenius_error(self.exact_metric, self.lsthc_metric)
-
-    @property
-    def robust_metric_error(self) -> ErrorNorm:
-        """Error of the robust pair metric against exact DF."""
-
-        return frobenius_error(self.exact_metric, self.robust_metric)
-
-    @property
-    def robust_metric_spectrum(self) -> RobustMetricSpectrum:
-        """Return the required indefinite-metric diagnostic for robust DF."""
-
-        symmetric_metric = 0.5 * (self.robust_metric + self.robust_metric.T)
-        eigenvalues = np.linalg.eigvalsh(symmetric_metric)
-        negative = eigenvalues[eigenvalues < 0.0]
-        return RobustMetricSpectrum(
-            minimum_eigenvalue=float(eigenvalues[0]),
-            negative_spectral_weight=float(np.abs(negative).sum()),
-        )
-
-
-def build_robust_df_thc_model(
-    l_vv: object,
-    p_virtual: object,
-    *,
-    rcond: float = DEFAULT_LSTHC_RCOND,
-) -> RobustDFTHCModel:
-    """Build the Phase-B oracle matrices from B[a,c,Q] and P[a,mu]."""
-
-    b_pair = virtual_pair_df_matrix(l_vv)
-    collocation = scalar_pair_collocation(p_virtual)
-    if collocation.shape[0] != b_pair.shape[0]:
-        raise ValueError(
-            "P's virtual dimension does not match L_vv; "
-            f"got C {collocation.shape} and B {b_pair.shape}"
-        )
-    fit = fit_lsthc_pair_factor(b_pair, collocation, rcond=rcond)
-    delta_b = b_pair - fit.b_tilde
-    exact_metric = b_pair @ b_pair.T
-    lsthc_metric = fit.b_tilde @ fit.b_tilde.T
-    robust_metric = fit.b_tilde @ b_pair.T + b_pair @ fit.b_tilde.T - lsthc_metric
-    return RobustDFTHCModel(
-        b_pair=b_pair,
-        collocation=collocation,
-        b_tilde=fit.b_tilde,
-        weights=fit.weights,
-        rcond=fit.rcond,
-        effective_rank=fit.effective_rank,
-        singular_values=fit.singular_values,
-        singular_max=fit.singular_max,
-        singular_min_kept=fit.singular_min_kept,
-        condition_number=fit.condition_number,
-        delta_b=delta_b,
-        exact_metric=exact_metric,
-        lsthc_metric=lsthc_metric,
-        robust_metric=robust_metric,
-    )
-
-
-def direct_df_vvvv_t2_sandwich(
-    left_b: object,
-    right_b: object,
-    t2: object,
-) -> Float64Array:
-    """Evaluate ``sum_cdQ left[a,c,Q] right[b,d,Q] t2[ij,c,d]``.
-
-    This is the direct PyTC VVVV--T2 ordering ``(a,c,b,d)``.  It uses only
-    a rank-bearing sandwich intermediate and never forms ``V[a,c,b,d]``.
-    """
-
-    left = _as_fp64("left_b", left_b, 3)
-    right = _as_fp64("right_b", right_b, 3)
-    amplitudes = _as_fp64("t2", t2, 4)
-    nvir = amplitudes.shape[2]
-    if amplitudes.shape[2] != amplitudes.shape[3]:
-        raise ValueError(f"t2 virtual axes must be square; got {amplitudes.shape}")
-    expected = (nvir, nvir)
-    if left.shape[:2] != expected or right.shape[:2] != expected:
-        raise ValueError(
-            "B virtual axes must match t2; "
-            f"got left {left.shape}, right {right.shape}, t2 {amplitudes.shape}"
-        )
-    if left.shape[2] != right.shape[2]:
-        raise ValueError(f"B auxiliary axes must agree; got {left.shape} and {right.shape}")
-    # S[i,j,c,b,Q] = sum_d t2[i,j,c,d] right[b,d,Q]
-    sandwich = np.einsum("ijcd,bdq->ijcbq", amplitudes, right, optimize=True)
-    return np.einsum("acq,ijcbq->ijab", left, sandwich, optimize=True)
-
-
-@dataclass(frozen=True)
-class DirectDFSandwiches:
-    """Exact, full LS-THC, and robust direct DF VVVV--T2 contractions."""
-
-    exact: Float64Array
-    lsthc: Float64Array
-    robust: Float64Array
-    delta_delta: Float64Array
-
-    @property
-    def exact_minus_robust(self) -> Float64Array:
-        """The signed direct residual, equal to ``delta_delta``."""
-
-        return self.exact - self.robust
-
-    @property
-    def lsthc_error(self) -> ErrorNorm:
-        """Full LS-THC direct-sandwich error against the exact DF sandwich."""
-
-        return frobenius_error(self.exact, self.lsthc)
-
-    @property
-    def robust_error(self) -> ErrorNorm:
-        """Robust direct-sandwich error against the exact DF sandwich."""
-
-        return frobenius_error(self.exact, self.robust)
-
-
-def direct_df_sandwiches(model: RobustDFTHCModel, t2: object) -> DirectDFSandwiches:
-    """Evaluate all three Phase-B direct-DF VVVV--T2 oracle sandwiches."""
-
-    b_shape = model.b_pair.shape
-    n_pair, naux = b_shape
-    nvir = int(round(n_pair**0.5))
-    if nvir * nvir != n_pair:
-        raise ValueError(f"model pair axis is not square: {b_shape}")
-    b = model.b_pair.reshape(nvir, nvir, naux)
-    b_tilde = model.b_tilde.reshape(nvir, nvir, naux)
-    delta_b = model.delta_b.reshape(nvir, nvir, naux)
-    exact = direct_df_vvvv_t2_sandwich(b, b, t2)
-    lsthc = direct_df_vvvv_t2_sandwich(b_tilde, b_tilde, t2)
-    robust = (
-        direct_df_vvvv_t2_sandwich(b_tilde, b, t2)
-        + direct_df_vvvv_t2_sandwich(b, b_tilde, t2)
-        - lsthc
-    )
-    delta_delta = direct_df_vvvv_t2_sandwich(delta_b, delta_b, t2)
-    return DirectDFSandwiches(
-        exact=exact,
-        lsthc=lsthc,
-        robust=robust,
-        delta_delta=delta_delta,
-    )
-
 # ---------------- JAX production path ----------------
 
 
@@ -398,9 +93,9 @@ class Float64NotEnabled(RuntimeError):
 def require_float64():
     """Fail closed if JAX is not in x64 mode.
 
-    Without this the port silently computes in float32, parity comes out around
-    1e-7, and a reviewer comparing against a ~1e-12 target sees 'close enough'.
-    A wrong dtype is not a small error here; it is a different calculation.
+    Without this the computation runs in float32: parity comes out around
+    1e-7 instead of 1e-12.  A wrong dtype is not a small error here; it is a
+    different calculation.
     """
     probe = jnp.zeros(1, dtype=jnp.float64)
     if probe.dtype != jnp.float64:
@@ -414,7 +109,7 @@ def require_float64():
 
 
 def _as_fp64_jax(name: str, value: object, ndim: int):
-    """Mirror of the oracle's _as_fp64, but landing on device as float64."""
+    """Validate rank while landing an operand on device as float64."""
     array = jnp.asarray(value, dtype=jnp.float64)
     if array.ndim != ndim:
         raise ValueError(f"{name} must be a {ndim}D array; got {array.ndim}D "
@@ -438,10 +133,8 @@ def _as_fp64_host(name: str, value: object, ndim: int):
 
 
 # ---------------------------------------------------------------- kernels ---
-# Each jitted body is ONE panel's arithmetic, matching the oracle's einsum
-# subscripts exactly. Subscripts are copied verbatim from the NumPy source: they
-# encode the (a,c,b,d) source ordering that the RCCSD pair swaps depend on, and
-# "simplifying" them is how a port silently breaks pair-swap symmetry.
+# Each jitted body is one panel's arithmetic.  The explicit subscripts encode
+# the (a,c,b,d) source ordering that the RCCSD pair swaps depend on.
 
 @partial(jax.jit, donate_argnums=(0,))
 def _exact_accumulate(out, b_panel, t2):
@@ -466,12 +159,12 @@ def exact_df_panelled(b, t2, aux_panel: int):
 
     The ``(nocc^2, nvir, nvir, q)`` intermediate inside
     :func:`_exact_accumulate` costs ``nocc^2 * nvir^2 * q * 8`` bytes --
-    ~4.9 GiB per aux column at the 1200 deck, so the caller's
+    ~4.9 GiB per aux column at large systems, so the caller's
     ``aux_panel=32`` would demand ~157 GiB.  The
     panel step is therefore clamped so the intermediate stays under
     ``PYTC_EXACT_PANEL_CAP_GB`` (default 8 GiB, read at call time); at q=1
     the GEMM shapes are unchanged (the batch is the occupied-pair axis, not
-    q), so the clamp costs no efficiency.  Small decks are unaffected.
+    q), so the clamp costs no efficiency.  Small cases are unaffected.
     """
 
     per_q = (t2.shape[0] * t2.shape[1] * t2.shape[2] * t2.shape[3]
@@ -637,7 +330,7 @@ def full_thc_panelled(p_virtual, y, t2, rank_panel: int, aux_panel: int):
 
 # ------------------------------------------------------------ entry point ---
 class ScalableDirectSandwichesJax:
-    """Mirrors the oracle's result container, including the robust combination."""
+    """Exact, cross, full-THC, and robust production contractions."""
 
     __slots__ = ("exact", "fit_left_df_right", "df_left_fit_right", "full_thc",
                  "robust")
@@ -654,10 +347,9 @@ class ScalableDirectSandwichesJax:
 
 def df_sandwiches_jax(b, fit, t2, *, rank_panel: int,
                                       aux_panel: int):
-    """JAX port of the oracle's entry point. Same signature, same panel semantics.
+    """Evaluate the panelled production DF/THC contractions.
 
-    `fit` is the oracle's ScalableLSTHCFit (or anything exposing .p_virtual/.y),
-    so the caller does not have to know which backend produced it.
+    ``fit`` exposes the fitted ``p_virtual`` and ``y`` factors.
 
     `b` is deliberately kept HOST-resident (see :func:`_as_fp64_host`): the
     panel loops below only read aux-axis slices, so uploading the whole
@@ -677,7 +369,7 @@ def df_sandwiches_jax(b, fit, t2, *, rank_panel: int,
                          f"{t2_j.shape}")
     if p_j.shape[0] != nvir or y_j.shape != (p_j.shape[1], b_h.shape[2]):
         raise ValueError("implicit fit dimensions do not match B and t2")
-    # Panel bounds mirror the oracle's _positive_panel exactly.
+    # Panel sizes are explicit bounded production inputs.
     for name, size, upper in (("rank_panel", rank_panel, p_j.shape[1]),
                               ("aux_panel", aux_panel, b_h.shape[2])):
         if not 1 <= int(size) <= upper:
@@ -690,36 +382,31 @@ def df_sandwiches_jax(b, fit, t2, *, rank_panel: int,
     return ScalableDirectSandwichesJax(exact, fit_left, df_left, full)
 
 
-def to_numpy(result):
-    """Materialise a JAX result as NumPy float64 for comparison/accumulation."""
-    return {name: np.asarray(getattr(result, name), dtype=np.float64)
-            for name in ("exact", "fit_left_df_right", "df_left_fit_right",
-                         "full_thc", "robust")}
-
-
 def fit_lsthc_jax(p_virtual, b, *, rcond: float, virtual_panel: int):
-    """JAX FP64 normal-equation LS-THC fit, retaining the oracle's panels."""
+    """JAX FP64 normal-equation LS-THC fit with host-resident DF factors."""
     require_float64()
     if not np.isfinite(rcond) or not 0.0 < float(rcond) <= 1.0:
         raise ValueError(f"rcond must be in (0, 1]; got {rcond!r}")
     p = _as_fp64_jax("p_virtual", p_virtual, 2)
-    b = _as_fp64_jax("b", b, 3)
-    if b.shape[:2] != (p.shape[0], p.shape[0]):
+    b_h = _as_fp64_host("b", b, 3)
+    if b_h.shape[:2] != (p.shape[0], p.shape[0]):
         raise ValueError("B and P virtual dimensions differ")
     if not 1 <= int(virtual_panel) <= p.shape[0]:
         raise ValueError("virtual_panel is out of bounds")
     overlap = p.T @ p
     gram = overlap * overlap
-    cross = jnp.zeros((p.shape[1], b.shape[2]), dtype=jnp.float64)
+    cross = jnp.zeros((p.shape[1], b_h.shape[2]), dtype=jnp.float64)
     for a0 in range(0, p.shape[0], int(virtual_panel)):
         a1 = min(a0 + int(virtual_panel), p.shape[0])
-        cross = cross + jnp.einsum("am,cm,acq->mq", p[a0:a1], p, b[a0:a1])
+        b_panel = _as_fp64_jax("b_panel", b_h[a0:a1], 3)
+        cross = cross + jnp.einsum(
+            "am,cm,acq->mq", p[a0:a1], p, b_panel)
     eigenvalues, eigenvectors = jnp.linalg.eigh(0.5 * (gram + gram.T))
     order = jnp.argsort(eigenvalues)[::-1]
     eigenvalues, eigenvectors = jnp.maximum(eigenvalues[order], 0.0), eigenvectors[:, order]
     singular_values = jnp.sqrt(eigenvalues)
-    # Match the existing panelled oracle exactly.  This is a requested dense-C
-    # threshold, not a dimension-dependent policy decision for this dispatch.
+    # This is a requested dense-C threshold, not a dimension-dependent policy
+    # decision for this dispatch.
     floor = float(np.sqrt(np.finfo(np.float64).eps))
     threshold = max(float(rcond), floor) * singular_values[0]
     keep = singular_values > threshold
@@ -738,7 +425,7 @@ def convert_x_to_rank_major(src, dst, *, dataset="X", row_block=8):
     ``src``/``dst`` are paths or open ``h5py.File`` objects.  The loop
     materializes one ``(nmo, row_block, rank)`` slab at a time, so peak
     host memory is ``nmo * row_block * rank * 8`` bytes (~1.6 GiB at the
-    1200 deck with the default block).  Returns the destination path or
+    default block).  Returns the destination path or
     file unchanged.  The destination dataset is written contiguous (no
     HDF5 chunking) so panel reads stay single sequential extents.
     """
@@ -778,14 +465,18 @@ def _convert_x_dataset(src_f, dst_f, dataset, row_block, out_name=None):
             slab.transpose(2, 0, 1))
 
 
-def convert_store_to_rank_major(src, dst, *, x_dataset="X", row_block=8):
-    """Whole-store conversion: every dataset copied, X converted rank-major.
+def convert_store_to_rank_major(src, dst, *, x_dataset="X", x_rm_dataset="X_rm",
+                                row_block=8):
+    """Whole-store conversion: every dataset copied; X kept AND a rank-major
+    twin appended.
 
     The ISDF store carries more than X (K1/K3/D kernels, metadata); a
     store the driver can actually load needs all of it.  Top-level
-    datasets and file attributes are copied verbatim; only ``x_dataset``
-    changes layout (and gains the ``x_layout=rank_major`` attribute the
-    solver's layout detection reads).
+    datasets and file attributes are copied verbatim -- including
+    ``x_dataset`` itself, since legacy consumers read it as
+    ``(nmo, nmo, rank)`` -- and a rank-major twin ``x_rm_dataset`` is
+    added alongside (with the ``x_layout`` attribute and a provenance
+    stamp of the source X).
 
     Writes go to ``<dst>.tmp`` and are atomically renamed into place, so
     an interrupted conversion never leaves a partial file at the
@@ -797,12 +488,26 @@ def convert_store_to_rank_major(src, dst, *, x_dataset="X", row_block=8):
         for key, val in src_f.attrs.items():
             dst_f.attrs[key] = val
         for key in src_f:
-            if key == x_dataset:
-                _convert_x_dataset(src_f, dst_f, x_dataset, row_block)
-            else:
-                src_f.copy(key, dst_f)
+            src_f.copy(key, dst_f)
+        _convert_x_dataset(src_f, dst_f, x_dataset, row_block,
+                           out_name=x_rm_dataset)
+        dst_f[x_rm_dataset].attrs["x_source_stamp"] = (
+            _x_source_stamp(src_f[x_dataset]))
     os.replace(tmp, dst)
     return dst
+
+
+def _x_source_stamp(x):
+    """Provenance stamp for an X dataset: sha256 over shape plus EVERY row
+    slab, so any changed entry changes the stamp (no sampling shortcuts)."""
+
+    import hashlib
+    h = hashlib.sha256(str(tuple(x.shape)).encode())
+    nmo = x.shape[0]
+    step = max(1, nmo // 64)
+    for i0 in range(0, nmo, step):
+        h.update(np.asarray(x[i0:i0 + step], dtype=np.float64).tobytes())
+    return h.hexdigest()
 
 
 def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
@@ -810,9 +515,10 @@ def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
 
     The store keeps ``x_dataset`` (innermost) untouched for legacy
     consumers (eris build, fingerprint manifest); the factorized
-    contraction reads ``out_dataset`` when present.  If ``out_dataset``
-    already exists it is shape/attr-verified and kept, so re-running is
-    cheap.
+    contraction reads ``out_dataset`` when present.  An existing
+    ``out_dataset`` is kept only when it is shape/attr-valid AND its
+    provenance stamp matches the current ``x_dataset``; a stale twin
+    (X rewritten after the twin was built) is rebuilt.
     """
 
     with h5py.File(store, "r+") as fh:
@@ -823,12 +529,15 @@ def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
         nmo, _, rank = x_in.shape
         if out_dataset in fh:
             x_rm = fh[out_dataset]
-            if (tuple(x_rm.shape) != (rank, nmo, nmo)
-                    or x_rm.attrs.get("x_layout") != "rank_major"):
+            valid = (tuple(x_rm.shape) == (rank, nmo, nmo)
+                     and x_rm.attrs.get("x_layout") == "rank_major")
+            if not valid:
                 raise ValueError(
                     f"{out_dataset!r} exists but is not a valid rank-major X: "
                     f"shape {x_rm.shape}, attrs {dict(x_rm.attrs)}")
-            return store
+            if x_rm.attrs.get("x_source_stamp") == _x_source_stamp(x_in):
+                return store
+            del fh[out_dataset]
         # Write to a temp dataset and rename into place: an interrupted
         # conversion must never leave a correctly-shaped but partially
         # written X_rm behind.
@@ -836,41 +545,6 @@ def add_rank_major(store, *, x_dataset="X", out_dataset="X_rm", row_block=8):
         if tmp_name in fh:
             del fh[tmp_name]
         _convert_x_dataset(fh, fh, x_dataset, row_block, out_name=tmp_name)
+        fh[tmp_name].attrs["x_source_stamp"] = _x_source_stamp(x_in)
         fh.move(tmp_name, out_dataset)
     return store
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("src", help="source store path (rank-innermost X)")
-    parser.add_argument("dst", nargs="?", default=None,
-                        help="destination path (not used by --add-rank-major)")
-    parser.add_argument("--dataset", default="X",
-                        help="dataset name in both files (default: X)")
-    parser.add_argument("--row-block", type=int, default=8,
-                        help="nmo rows converted per slab (default: 8)")
-    parser.add_argument("--whole-store", action="store_true",
-                        help="copy all datasets/attrs, converting only "
-                             "--dataset (a driver-loadable store)")
-    parser.add_argument("--add-rank-major", action="store_true",
-                        help="append X_rm (rank-major) to the src store IN "
-                             "PLACE, leaving X innermost untouched")
-    args = parser.parse_args(argv)
-    if args.add_rank_major:
-        add_rank_major(args.src, x_dataset=args.dataset,
-                       row_block=args.row_block)
-    else:
-        if args.dst is None:
-            parser.error("dst is required unless --add-rank-major is given")
-        if args.whole_store:
-            convert_store_to_rank_major(
-                args.src, args.dst, x_dataset=args.dataset,
-                row_block=args.row_block)
-        else:
-            convert_x_to_rank_major(
-                args.src, args.dst, dataset=args.dataset,
-                row_block=args.row_block)
-
-
-if __name__ == "__main__":
-    main()

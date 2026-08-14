@@ -58,6 +58,14 @@ class TestTileTimers(unittest.TestCase):
         finally:
             tile_timers._JSON_PATH = saved_path
 
+    def test_incr_noop_when_disabled_and_accumulates_when_enabled(self):
+        tile_timers._ENABLED = False
+        tile_timers.incr("off_counter")
+        self.assertEqual(tile_timers._STATE["counters"], {})
+        tile_timers._ENABLED = True
+        tile_timers.incr("on_counter", 2)
+        self.assertEqual(tile_timers._STATE["counters"].get("on_counter"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

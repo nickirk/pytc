@@ -1,5 +1,6 @@
 import contextlib
 import concurrent.futures
+import copy
 import logging
 import threading
 import time
@@ -31,6 +32,177 @@ import h5py
 from pytc import xtc as xtc_mod
 
 logger = logging.getLogger(__name__)
+
+
+def eris_reference_energy(eris):
+    """Return the reference energy represented by a CCSD ERI container.
+
+    ``RCCSD`` receives a Fock matrix (the reference-normal-ordered one-body
+    coefficient) together with un-normal-ordered two-electron integrals.  The
+    scalar ``e_core`` is the compensating constant which makes this expression
+    the requested reference energy.  Keeping this small calculation outside
+    :meth:`RCCSD.get_e_hf` makes it possible to construct and validate a
+    reference-normal-ordered ERI view without rebuilding the ERIs.
+    """
+    nocc = eris.nocc
+    fock = np.asarray(eris.fock)
+    energy = 2 * np.einsum('ii->', fock[:nocc, :nocc])
+    if hasattr(eris, 'oooo'):
+        oooo = np.asarray(eris.oooo)
+        energy -= 2 * np.einsum('iijj->', oooo)
+        energy += np.einsum('ijji->', oooo)
+    energy += getattr(eris, 'e_core', 0)
+    return energy.real
+
+
+def _normal_ordered_e_core(reference_energy, fock, oooo, nocc):
+    """Solve the CCSD-container scalar for a supplied normal-order triple."""
+    core = reference_energy - 2 * np.einsum('ii->', fock[:nocc, :nocc])
+    core += 2 * np.einsum('iijj->', oooo)
+    core -= np.einsum('ijji->', oooo)
+    return core.real
+
+
+def resolve_vvvv_disk_block_size(nocc, nvir, cc, *, kind, n_fused=None):
+    """Resolve a bounded first-axis block for disk-backed VVVV I/O.
+
+    The host slab written by the AO2MO path is
+    ``(block, nvir, nvir, nvir)``.  It is a different resource from the
+    symmetric on-the-fly GPU tile, so an unconstrained compute estimate can
+    choose a single multi-GiB HDF5 write.  The RCCSD VVVV panel override is a
+    hard cap for both the writer and the disk-reader contractions.
+    """
+    auto, _ = estimate_blksize(
+        nocc, nvir, kind,
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        n_fused=n_fused,
+    )
+    p_block = getattr(cc, 'vvvv_p_block_size', None)
+    r_block = getattr(cc, 'vvvv_r_block_size', None)
+    if p_block is not None and r_block is not None and int(p_block) != int(r_block):
+        raise ValueError(
+            "Disk-backed VVVV requires equal vvvv_p_block_size and "
+            "vvvv_r_block_size"
+        )
+    configured = p_block if p_block is not None else r_block
+    block = int(configured) if configured is not None else int(auto)
+    if block < 1:
+        raise ValueError("Disk-backed VVVV block size must be positive")
+    return min(block, nvir)
+
+
+def _record_vvvv_write_receipt(eris, *, nvir, p_blksize, r_blksize):
+    """Record the panel layout resolved by the writer that filled ``vvvv``.
+
+    The consumer gate must inspect this receipt rather than recomputing a
+    second panel layout: it is written from the exact values used by the loop
+    that owns every HDF5 assignment.
+    """
+    receipt = {
+        'nvir': int(nvir),
+        'p_blksize': int(p_blksize),
+        'r_blksize': int(r_blksize),
+        'n_p_blocks': (int(nvir) + int(p_blksize) - 1) // int(p_blksize),
+        'n_r_blocks': (int(nvir) + int(r_blksize) - 1) // int(r_blksize),
+    }
+    eris.vvvv_write_receipt = receipt
+    return receipt
+
+
+def make_x_normal_ordered_eris_view(
+        full_eris, no_x_eris, drop_x_component, *,
+        max_materialized_vvvv_bytes=256 * 1024**2):
+    """Construct a reference-normal-ordered X-channel ERI view.
+
+    ``full_eris`` and ``no_x_eris`` must be built from the *same* persisted
+    full-X kernel store.  Their difference is then the exact linear X
+    normal-order triple.  The returned view combines its scalar, Fock matrix,
+    and two-body ERIs as one of two internally consistent Hamiltonians:
+
+    ``drop_x_component="zero_one"``
+        Remove the X scalar and one-body normal-ordered pieces, while retaining
+        the full two-body operator: ``(E_no-X, F_no-X, Gamma_full)``.
+
+    ``drop_x_component="two_body"``
+        Retain the X scalar and one-body normal-ordered pieces, while removing
+        X from the two-body operator: ``(E_full, F_full, Gamma_no-X)``.
+
+    This deliberately does *not* call ``ao2mo``/``make_eris``: those paths
+    re-contract the two-body ERIs into a Fock matrix and would undo the
+    reference-normal-ordering construction.  A disk-backed VVVV dataset is
+    retained as a streamed read-only view, so the JAX disk contraction reads
+    the selected full/no-X two-body source directly.  An in-memory VVVV is
+    copied and bounded by ``max_materialized_vvvv_bytes``.  ``None`` is never
+    allowed because the JAX on-the-fly path re-reads ``xtc_obj`` and could
+    silently restore X.
+    """
+    if drop_x_component not in ("zero_one", "two_body"):
+        raise ValueError(
+            "drop_x_component must be 'zero_one' or 'two_body', got "
+            f"{drop_x_component!r}"
+        )
+    if full_eris.nocc != no_x_eris.nocc:
+        raise ValueError("full and no-X ERIs must use the same occupied space")
+    if np.asarray(full_eris.fock).shape != np.asarray(no_x_eris.fock).shape:
+        raise ValueError("full and no-X ERIs must use the same MO space")
+
+    if drop_x_component == "zero_one":
+        reference_source = no_x_eris
+        two_body_source = full_eris
+    else:
+        reference_source = full_eris
+        two_body_source = no_x_eris
+
+    vvvv = getattr(two_body_source, 'vvvv', None)
+    if vvvv is None:
+        raise ValueError(
+            "A normal-ordered X ERI view requires a materialized VVVV block; "
+            "the on-the-fly VVVV path reads xtc_obj and cannot represent this view"
+        )
+    # A shallow copy keeps the ordinary ERI blocks in their existing backing
+    # store.  The source ERIs are retained below, and the view has no owning
+    # HDF5 handle, so closing/destructing it cannot close a source container.
+    view = copy.copy(two_body_source)
+    view.feri = None
+    view._normal_ordered_x_sources = (full_eris, no_x_eris)
+    view.normal_ordered_x_component = drop_x_component
+    if isinstance(vvvv, h5py.Dataset):
+        # The solver already has a streamed HDF5 contraction.  Keeping the
+        # selected source dataset prevents a multi-GiB VVVV copy for H10 and,
+        # unlike the dynamic path, cannot consult ``xtc_obj``.
+        view.vvvv = vvvv
+        view.vvvv_is_streamed_normal_ordered_source = True
+    else:
+        vvvv_nbytes = int(np.prod(vvvv.shape)) * np.dtype(vvvv.dtype).itemsize
+        if vvvv_nbytes > max_materialized_vvvv_bytes:
+            raise ValueError(
+                "Normal-ordered X ERI view would materialize a VVVV block of "
+                f"{vvvv_nbytes / 1024**2:.1f} MiB (limit "
+                f"{max_materialized_vvvv_bytes / 1024**2:.1f} MiB)"
+            )
+        view.vvvv = np.array(vvvv, copy=True)
+        view.vvvv_is_streamed_normal_ordered_source = False
+
+    target_fock = np.array(reference_source.fock, copy=True)
+    target_fock.setflags(write=False)
+    view.fock = target_fock
+    view.fvo = np.array(target_fock[view.nocc:, :view.nocc], copy=True)
+    view.fvo.setflags(write=False)
+    view.mo_energy = np.array(np.diag(target_fock), copy=True)
+    view.mo_energy.setflags(write=False)
+
+    target_reference_energy = eris_reference_energy(reference_source)
+    view.e_core = _normal_ordered_e_core(
+        target_reference_energy, target_fock, np.asarray(view.oooo), view.nocc
+    )
+    # This catches a scalar rebalance error immediately, before a CCSD solve
+    # could hide it in a total energy.
+    if not np.allclose(
+            eris_reference_energy(view), target_reference_energy,
+            rtol=1e-12, atol=1e-12):
+        raise RuntimeError("failed to preserve the requested normal-ordered reference energy")
+    return view
 
 class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""
@@ -86,19 +258,7 @@ class RCCSD(rccsd.RCCSD):
             if getattr(self, 'e_hf', None) is not None:
                 return self.e_hf
             return self._scf.e_tot
-        
-        no = self.nocc
-        fock = eris.fock
-        # E_hf = 2*sum_i F_ii - 2*sum_ij (ii|jj) + sum_ij (ij|ji) + E_core
-        e_hf = 2*np.einsum('ii->', fock[:no,:no])
-        if hasattr(eris, 'oooo'):
-            oooo = np.asarray(eris.oooo)
-            e_hf -= 2*np.einsum('iijj ->', oooo)
-            e_hf += np.einsum('ijji ->', oooo)
-        
-        e_hf += getattr(eris, 'e_core', 0)
-        
-        return e_hf.real
+        return eris_reference_energy(eris)
 
     def _finalize(self):
         if self.converged:
@@ -236,12 +396,10 @@ def _make_xtc_eris(cc, mo_coeff=None):
         (slice(None), slice(0, nocc), slice(0, nocc), slice(None)),
     )
 
-    fused = getattr(cc, 'fused', False)
-
     def _fock_worker(ranges, device):
         _ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
         with _ctx:
-            return np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges, fused=fused))
+            return np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
 
     if len(_fock_devices) >= 2:
         # Genuinely independent GPUs available — dispatch the two
@@ -335,12 +493,12 @@ def _make_xtc_eris(cc, mo_coeff=None):
         # _get_delta_u_direct_tile, which slices X per tile; if X is still an
         # HDF5 dataset, those slice reads happen on the main dispatch thread
         # and serialize issue_tile, preventing multi-GPU overlap.
-        # The materialized default preloads (a real optimization there); a
-        # class whose contraction reads X panel-wise from the store (e.g. the
-        # factorized subclass) suppresses it via `_preload_x_for_eris = False`
-        # rather than paying for a full host copy it never uses.
         _kernels = xtc_obj.isdf_kernels
         _X_kernel = _kernels.get('X') if _kernels is not None else None
+        # A class whose contraction reads X panel-wise from the store (the
+        # factorized subclass) suppresses the preload via
+        # `_preload_x_for_eris = False` instead of paying for a full host
+        # copy it never uses.
         if (isinstance(_X_kernel, h5py.Dataset)
                 and getattr(cc, "_preload_x_for_eris", True)):
             _x_gb = _X_kernel.size * 8 / 1e9
@@ -406,7 +564,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
             ('vooo', lib.ddot(Lov.T, Loo).reshape(nocc, nvir, nocc, nocc).transpose(1, 0, 2, 3)),
         ]:
             logger.debug("Computing block %s", _blk_str)
-            _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str, fused=fused))
+            _tc = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=_blk_str))
             setattr(eris, _blk_str, _std + _tc)
 
         del Loo, Lov, Lov_reshaped
@@ -422,7 +580,7 @@ def _make_xtc_eris(cc, mo_coeff=None):
         
         def get_block(block_str):
             logger.debug(f"Computing block {block_str} for xtc")
-            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str, fused=fused))
+            tc_part = np.asarray(xtc_obj.get_2b(jastrow_params, block_str=block_str))
             slices = [slice(0, nocc) if c == 'o' else slice(nocc, nmo) for c in block_str]
             return eri_std_full[tuple(slices)] + tc_part
     
@@ -477,10 +635,9 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             nocc = cc.nocc
             nvir = cc.nmo - nocc
 
-            mem_host = cc.max_memory * 1e6
-            # Block size: each block loads (blk, nvir, nvir, nvir) floats
-            blksize = max(4, int(mem_host / (nvir * nvir * nvir * 8)))
-            blksize = min(nvir, blksize)
+            blksize = resolve_vvvv_disk_block_size(
+                nocc, nvir, cc, kind='vvvv'
+            )
 
             from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
             chunks = [(p0, min(p0 + blksize, nvir))
@@ -1067,18 +1224,10 @@ def _run_tiled_block_pipeline(blocks, nvir, panel_blk, nocc,
     panel_size = max(nocc, panel_blk)
     acc_lock   = threading.Lock() if writer is None else None
 
-    # Panel-major ordering: all of one panel's tiles across blocks are
-    # scheduled together.  The family T_c cache's hit pattern depends on it
-    # — one block's transpose ranges_T is often another block's direct
-    # (p, q) domain (e.g. oovv's symmetrization partner is vvoo's tile of
-    # the same panel), and keeping those adjacent lets the small LRU hold
-    # the shared T_c instead of rebuilding it per tile.  Multi-GPU
-    # pipelines may still interleave panels across devices; hits degrade
-    # gracefully to rebuilds.
     tile_specs = [
         (blk, i0, min(i0 + panel_blk, nvir))
-        for i0 in range(0, nvir, panel_blk)
         for blk in blocks
+        for i0 in range(0, nvir, panel_blk)
     ]
 
     # --- Per-stage consume timers ---------------------------------------
@@ -1489,11 +1638,13 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         include_accumulators=False,
     )
     panel_size = p_blksize
+    receipt = _record_vvvv_write_receipt(
+        eris, nvir=nvir, p_blksize=p_blksize, r_blksize=r_blksize
+    )
     logger.info(
         "    Writing VVVV to disk (p_blksize=%d, r_blksize=%d, n_p_blocks=%d, n_r_blocks=%d)",
         p_blksize, r_blksize,
-        (nvir + p_blksize - 1) // p_blksize,
-        (nvir + r_blksize - 1) // r_blksize,
+        receipt['n_p_blocks'], receipt['n_r_blocks'],
     )
 
     # If X is an HDF5 dataset, preload it into RAM to avoid 15k+ per-tile
@@ -1653,19 +1804,18 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
     vvvv shape: (a, b, c, d) = (nvir, nvir, nvir, nvir).
     We iterate over the first index 'a' in blocks to limit memory usage.
     """
-    fused = getattr(cc, 'fused', False)
     _n_fused = None
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
 
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv',
-        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
-        n_fused=_n_fused)
-    blksize = max(4, blksize)
+    blksize = resolve_vvvv_disk_block_size(
+        nocc, nvir, cc, kind='vvvv', n_fused=_n_fused
+    )
+    receipt = _record_vvvv_write_receipt(
+        eris, nvir=nvir, p_blksize=blksize, r_blksize=blksize
+    )
     logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
-                f"n_blocks={(nvir+blksize-1)//blksize})")
+                f"n_blocks={receipt['n_p_blocks']})")
 
     from pytc.utils.prefetch import async_read, await_read
     ds = eris.vvvv
@@ -1699,7 +1849,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
                     tc_blk = await_read(pending_tc)
                     pending_tc = None
                 else:
-                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges, fused=fused))
+                    tc_blk = np.asarray(xtc_obj.get_2b(jastrow_params, ranges=ranges))
 
                 # Kick off NEXT block's get_2b in background
                 next_p0 = p0 + blksize
@@ -1709,7 +1859,7 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
                                    slice(nocc, nmo), slice(nocc, nmo), slice(nocc, nmo))
                     pending_tc = async_read(
                         lambda r=next_ranges: np.asarray(
-                            xtc_obj.get_2b(jastrow_params, ranges=r, fused=fused)))
+                            xtc_obj.get_2b(jastrow_params, ranges=r)))
                     pending_key = (next_p0, next_p1)
 
                 # Fuse std + tc into the slab that will be handed to the writer.

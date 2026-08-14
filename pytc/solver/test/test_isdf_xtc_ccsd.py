@@ -1,14 +1,16 @@
 """Tests for the factorized-dispatch solver class isdf_xtc_ccsd.RCCSD.
 
-These tests EXECUTE the class's own seams on a tiny synthetic deck so that a
+These tests EXECUTE the class's own seams on a tiny synthetic case so that a
 missing or mis-signed dependency (an import target that exists only in a
-diagnostic harness, a renamed attribute) fails in the suite instead of on a
-cluster.  Identity checks alone cannot catch that class: they prove which
-code would run, not that everything it calls exists.
+diagnostic harness, a renamed attribute) fails in the suite rather than in
+production.  Identity checks alone cannot catch that class: they prove
+which code would run, not that everything it calls exists.
 """
 
+import os
 import types
 import unittest
+from unittest import mock
 
 import numpy as np
 from pyscf import gto, scf
@@ -102,17 +104,16 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         self.assertIs(x_backing, x_rm)
         self.assertEqual(x_backing.shape, (self.rank, self.nmo, self.nmo))
         # And the layout detector agrees with the preference.
-        from pytc.solver import isdf_xtc_ccsd as factor_direct_vvvv
+        from pytc.solver import isdf_xtc_ccsd as solver_mod
         self.assertEqual(
-            factor_direct_vvvv._x_backing_layout(
+            solver_mod._x_backing_layout(
                 x_rm, self.nocc, self.nmo - self.nocc, self.rank),
             "rank_major")
 
     def test_hook_executes_streamed_contraction(self):
-        # Execute the hook end-to-end on the synthetic deck: the streamed
+        # Execute the hook end-to-end on the synthetic case: the streamed
         # factor-direct terms plus the JAX sandwich must produce a finite,
-        # nonzero t2 update.  This is the seam the 1200-orbital card relies
-        # on; identity checks alone cannot prove it runs.
+        # nonzero t2 update; identity checks alone cannot prove it runs.
         cc = self._make_cc()
         nvir = self.nmo - self.nocc
         rng = np.random.default_rng(7)
@@ -135,13 +136,28 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "materialized VVVV"):
             cc._contract_vvvv_t2(cc, None, eris, None)
 
+    def test_hook_refuses_every_residual_x_drop_mode(self):
+        """Factorized VVVV must never silently retain X for a no-X study."""
+        eris = types.SimpleNamespace(vvvv=None)
+        clean_env = {
+            "PYTC_XTC_DROP_X": "0",
+            "PYTC_XTC_DROP_X_RESIDUAL": "0",
+        }
+        for flag in clean_env:
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {**clean_env, flag: "1"}
+            ):
+                cc = self._make_cc()
+                with self.assertRaisesRegex(RuntimeError, flag):
+                    cc._contract_vvvv_t2(cc, None, eris, None)
+
 
 class PreloadSuppressionTest(unittest.TestCase):
     """The whole-X host preload fires on the materialized parent but is
     suppressed on the factorized subclass, with identical X content.
 
-    At the 1200-orbital deck the preload is 247 GB of host RAM the streamed
-    contraction never reads; the subclass suppresses it by construction
+    The preload is host RAM the streamed contraction never reads; the
+    subclass suppresses it by construction
     (``_preload_x_for_eris = False``) while the parent's materialized default
     stays byte-identical.  X CONTENT is identical either way -- the store
     bytes are the store bytes; only the backing changes.

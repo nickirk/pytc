@@ -1,7 +1,7 @@
 """Opt-in per-term wall timers for the TC/ΔU tile assembly path.
 
 Motivation: the eris build's tile assembly is the dominant phase cost at
-production decks, but the phase is one opaque number.  Deciding between
+production systems, but the phase is one opaque number.  Deciding between
 reshaping the panels and reformulating the assembly requires the split
 into the individual contraction legs (K1/K2, K3, ΔU, final sum) over ALL
 tiles, not just a first-tile sample.
@@ -51,11 +51,12 @@ _STATE = {
 
 
 def incr(name: str, n: int = 1):
-    """Increment a named counter (e.g. cache hits/misses).  Cheap always;
-    reported alongside the timed terms in the exit dump."""
+    """Increment a named counter.  No-ops when timers are disabled."""
+    if not _ENABLED:
+        return
     with _STATE["lock"]:
         _STATE["counters"][name] = _STATE["counters"].get(name, 0) + n
-        if _ENABLED and not _STATE["atexit_registered"]:
+        if not _STATE["atexit_registered"]:
             atexit.register(_dump_at_exit)
             _STATE["atexit_registered"] = True
 

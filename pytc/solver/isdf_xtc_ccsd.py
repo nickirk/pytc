@@ -6,7 +6,7 @@ that module's instance hook.  The rest of this module is the factor-direct
 contraction machinery it dispatches to: the X factor is never materialized
 in full -- it stays on its host/HDF5 backing and is streamed one rank panel
 at a time (three residency tiers: device lift / host-resident / store
-stream), which is what makes the 1200-orbital deck fittable on one GPU.
+stream), which is what makes large systems fittable on one GPU.
 
 The raw ERI-like tile order in PyTC is ``(a, c, b, d)``; the public
 functions contract that tile directly with a dense RCCSD ``t2`` in
@@ -50,7 +50,7 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
 
     # The contraction reads X panel-wise from its store backing, so the
     # materialized path's whole-X host preload (xtc_ccsd._make_xtc_eris) is
-    # pure waste on this class: at the 1200-orbital deck it is 247 GB of
+    # pure waste on this class: it is hundreds of GB of
     # host RAM for a copy nothing reads.  The preload is suppressed by
     # construction; the parent's materialized default is unchanged.
     _preload_x_for_eris = False
@@ -76,10 +76,9 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         # X stays on its backing (a NumPy array or an HDF5 dataset): the
         # contraction streams it one rank panel at a time, so the full block
         # is never materialized on host or device.  Device X peak is one
-        # panel, which is what makes the 1200-orbital deck fittable.  When
-        # the store carries a rank-major twin (X_rm, panel-contiguous reads
-        # -- measured ~42x cold at the 1200 deck vs the strided innermost
-        # gather), the contraction uses it; legacy consumers keep X.
+        # panel.  When
+        # the store carries a rank-major twin (X_rm, panel-contiguous
+        # reads), the contraction uses it; legacy consumers keep X.
         x_backing = kernels.get("X_rm", kernels["X"])
         with_df = getattr(self, "with_df", None) or self._scf.with_df
         b = thc.extract_vv_df_factor(
@@ -95,6 +94,16 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
     def _contract_vvvv_t2(self, cc, t2_jax, eris, t2new_host):
         """Instance hook called by the inherited JAX update path; no VVVV tile."""
         del cc
+        if (
+            os.environ.get("PYTC_XTC_DROP_X") == "1"
+            or os.environ.get("PYTC_XTC_DROP_X_RESIDUAL") == "1"
+        ):
+            raise RuntimeError(
+                "PYTC_XTC_DROP_X and PYTC_XTC_DROP_X_RESIDUAL are not "
+                "implemented for the factorized VVVV solver; use "
+                "jax_xtc_ccsd.RCCSD for the normal-order/residual-X "
+                "partition study"
+            )
         if eris.vvvv is not None:
             raise RuntimeError(
                 "factorized RCCSD refuses a materialized VVVV store; select "
@@ -108,9 +117,8 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
                 occupied_pair_batch_size=min(8, self.nocc * self.nocc),
                 rank_panel_size=rank_panel)
             final = terms["final"]
-            # The remaining term tensors (~30 GB at the 1200 deck) are
-            # diagnostics; holding them through the sandwich OOM'd the exact
-            # panel; only "final" is consumed below.
+            # Only "final" is consumed below; the other term tensors are
+            # diagnostics and are dropped before the sandwich.
             del terms
             _tt.sync(final)
         with _tile_timers.term("fd_coulomb_sandwich") as _tt:
@@ -138,8 +146,7 @@ class FactorDirectProfile:
 
     The ``compiled_xla_*`` fields come from ``Compiled.memory_analysis()`` for
     the executable that evaluates this branch on the active backend.  They are
-    the reviewable XLA buffer accounting for the actual executable, but still
-    are not a claim about process-wide allocator high-water mark.
+    not a claim about process-wide allocator high-water mark.
     """
 
     wall_seconds: float
@@ -187,8 +194,8 @@ def full_thc_schedule_intermediate_estimate_bytes(
     The schedule has a ``t2`` slab, an output slab, and ``S``, ``T``, and
     ``Y``.  No term has four virtual indices, so this is
     O(B_ij v^2 + B_ij v B_r + B_ij r B_r), not O(v^4). It omits XLA scratch
-    and the whole-array ``jnp.pad`` copies used by this small-deck prototype;
-    use ``compiled_full_thc_memory`` for executable memory accounting.
+    and whole-array ``jnp.pad`` copies; use ``compiled_full_thc_memory`` for
+    executable memory accounting.
     """
 
     b_ij = occupied_pair_batch_size
@@ -209,9 +216,8 @@ def partial_x_schedule_intermediate_estimate_bytes(
 ) -> int:
     """Estimate only the named live algebraic panels for an X branch.
 
-    The estimate deliberately excludes the full ``x`` / ``x_padded`` arrays.
-    The current prototype pads X as a whole device array and is therefore
-    small-deck only; it is not the production host/disk-streamed X schedule.
+    The estimate deliberately excludes the full ``x`` / ``x_padded`` arrays;
+    it covers the padded-panel schedule only.
     """
 
     del rank  # The implementation only holds a panel of the rank axis.
@@ -249,7 +255,7 @@ def _compiled_memory_from_executable(executable) -> CompiledXLAMemory:
     if not hasattr(executable, "memory_analysis"):
         raise RuntimeError(
             "the active JAX backend does not expose Compiled.memory_analysis(); "
-            "the Phase-A GPU card requires executable memory accounting"
+            "the GPU card requires executable memory accounting"
         )
     analysis = executable.memory_analysis()
     return CompiledXLAMemory(
@@ -515,18 +521,68 @@ def contract_full_thc_pair_swapped_t2(
     )
 
 
-def _validate_x(t2: Array, left_out: Array, left_inner: Array, x: Array) -> None:
+def _validate_x_factors(
+    t2: Array, out_factor: Array, inner_factor: Array
+) -> int:
     _validate_t2(t2)
     nvir = t2.shape[2]
-    if left_out.ndim != 2 or left_inner.shape != left_out.shape:
-        raise ValueError("left_out and left_inner must both have shape (nvir, rank)")
-    if left_out.shape[0] != nvir:
-        raise ValueError(f"X factors have nvir={left_out.shape[0]}, expected {nvir}")
-    if x.shape != (nvir, nvir, left_out.shape[1]):
+    if out_factor.ndim != 2 or inner_factor.shape != out_factor.shape:
+        raise ValueError("X endpoint factors must both have shape (nvir, rank)")
+    if out_factor.shape[0] != nvir:
+        raise ValueError(f"X factors have nvir={out_factor.shape[0]}, expected {nvir}")
+    return nvir
+
+
+def _validate_x(t2: Array, out_factor: Array, inner_factor: Array, x: Array) -> None:
+    nvir = _validate_x_factors(t2, out_factor, inner_factor)
+    if x.shape != (nvir, nvir, out_factor.shape[1]):
         raise ValueError(
             "x must have shape (nvir, nvir, rank); "
-            f"got {x.shape}, expected {(nvir, nvir, left_out.shape[1])}"
+            f"got {x.shape}, expected {(nvir, nvir, out_factor.shape[1])}"
         )
+
+
+def _contract_partial_x(
+    kernel,
+    t2: Array,
+    out_factor: Array,
+    inner_factor: Array,
+    x: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> Array:
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    arrays = tuple(map(jnp.asarray, (t2, out_factor, inner_factor, x)))
+    _validate_x(*arrays)
+    return kernel(
+        *arrays,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+
+
+def _compiled_partial_x_memory(
+    kernel,
+    t2: Array,
+    out_factor: Array,
+    inner_factor: Array,
+    x: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> CompiledXLAMemory:
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    arrays = tuple(map(jnp.asarray, (t2, out_factor, inner_factor, x)))
+    _validate_x(*arrays)
+    executable = kernel.lower(
+        *arrays,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    ).compile()
+    return _compiled_memory_from_executable(executable)
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
@@ -602,12 +658,8 @@ def contract_x_left_t2(
 ) -> Array:
     """Contract ``P[a,m] P[c,m] X[b,d,m]`` without a V^4 tile."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, left_out, left_inner, x)))
-    _validate_x(*arrays)
-    return _contract_x_left_t2_jit(
-        *arrays,
+    return _contract_partial_x(
+        _contract_x_left_t2_jit, t2, left_out, left_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
@@ -624,16 +676,11 @@ def compiled_partial_x_left_memory(
 ) -> CompiledXLAMemory:
     """Return XLA accounting for ``P[a,m] P[c,m] X[b,d,m]``."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, left_out, left_inner, x)))
-    _validate_x(*arrays)
-    executable = _contract_x_left_t2_jit.lower(
-        *arrays,
+    return _compiled_partial_x_memory(
+        _contract_x_left_t2_jit, t2, left_out, left_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
-    ).compile()
-    return _compiled_memory_from_executable(executable)
+    )
 
 
 @partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
@@ -709,12 +756,8 @@ def contract_x_right_t2(
 ) -> Array:
     """Contract ``X[a,c,m] P[b,m] P[d,m]`` without a V^4 tile."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, right_out, right_inner, x)))
-    _validate_x(*arrays)
-    return _contract_x_right_t2_jit(
-        *arrays,
+    return _contract_partial_x(
+        _contract_x_right_t2_jit, t2, right_out, right_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
@@ -731,16 +774,11 @@ def compiled_partial_x_right_memory(
 ) -> CompiledXLAMemory:
     """Return XLA accounting for ``X[a,c,m] P[b,m] P[d,m]``."""
 
-    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
-        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
-    arrays = tuple(map(jnp.asarray, (t2, right_out, right_inner, x)))
-    _validate_x(*arrays)
-    executable = _contract_x_right_t2_jit.lower(
-        *arrays,
+    return _compiled_partial_x_memory(
+        _contract_x_right_t2_jit, t2, right_out, right_inner, x,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
-    ).compile()
-    return _compiled_memory_from_executable(executable)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -790,13 +828,12 @@ def _x_backing_layout(x_backing, nocc, nvir, rank):
 
     ``"innermost"`` is the historical store layout ``(nmo, nmo, rank)``;
     ``"rank_major"`` is ``(rank, nmo, nmo)``, where a rank panel is one
-    contiguous block instead of ~nmo^2 strided chunks (the tier-3 read
-    floor at 1200: ~103 MiB/s strided vs multi-GiB/s sequential).  An HDF5
-    backing may declare the layout explicitly via an ``x_layout`` attribute
-    (the converter writes it); otherwise the two are told apart by which
-    axis pair is square.  Shapes with nmo == rank are genuinely ambiguous
-    and fall back to ``"innermost"`` (the historical default) -- rank-major
-    stores with nmo == rank MUST carry the attribute.
+    contiguous block instead of ~nmo^2 strided chunks.  An HDF5 backing may
+    declare the layout explicitly via an ``x_layout`` attribute (the
+    converter writes it); otherwise the two are told apart by which axis
+    pair is square.  Shapes with nmo == rank are genuinely ambiguous and
+    fall back to ``"innermost"`` -- rank-major stores with nmo == rank
+    MUST carry the attribute.
     """
 
     attrs = getattr(x_backing, "attrs", None)
@@ -822,12 +859,7 @@ def _x_backing_layout(x_backing, nocc, nvir, rank):
 
 
 def _validate_x_stream(t2, left_out, left_inner, x_backing, nocc):
-    _validate_t2(t2)
-    nvir = t2.shape[2]
-    if left_out.ndim != 2 or left_inner.shape != left_out.shape:
-        raise ValueError("left_out and left_inner must both have shape (nvir, rank)")
-    if left_out.shape[0] != nvir:
-        raise ValueError(f"X factors have nvir={left_out.shape[0]}, expected {nvir}")
+    nvir = _validate_x_factors(t2, left_out, left_inner)
     rank = left_out.shape[1]
     layout = _x_backing_layout(x_backing, nocc, nvir, rank)
     if int(nocc) < 1 or nvir < 1:
@@ -843,10 +875,9 @@ def _xstream_left_panel_jit(t2_pairs, inner_panel, out_panel, x_panel, *,
     ``x_panel`` arrives rank-LEADING, ``(panel, nvir, nvir)`` (transposed on
     the host inside the prefetch/read path, where the copy is free-ish and
     overlapped).  With the rank axis leading, every einsum below lowers to a
-    cuBLAS-native (strided-)batched GEMM; the previous ``(nvir, nvir, panel)``
-    layout made XLA materialize a physical ``(nvir*nvir, panel)`` transpose
-    of the whole panel on device, whose autotuning buffers OOM'd the BFC
-    allocator at large shapes.
+    cuBLAS-native (strided-)batched GEMM; a rank-last panel layout makes
+    XLA materialize a physical whole-panel transpose on device, whose
+    autotuning buffers can exhaust the allocator at large shapes.
     """
 
     n_padded_pairs, nvir, _ = t2_pairs.shape
@@ -975,12 +1006,11 @@ def contract_x_right_t2_streamed(t2, right_out, right_inner, x_backing, nocc,
 # ---------------------------------------------------------------------------
 # Pipelined X panel streaming (tiers 2/3)
 #
-# At the 1200-orbital deck the design variable is launch count, not transfer
-# volume: the 128-wide panel loop above pays ~2.5 s of pure dispatch per
-# launch, so a cycle burns its time in ~2x167 small launches.  The pipelined
-# loop below sizes each panel to the measured device working set (a cycle
-# then needs ~5 launches) and double-buffers the next panel's host read +
-# H2D transfer behind the current panel's kernel.
+# At large system sizes the design variable is launch count, not transfer
+# volume: small fixed-width panels pay heavy per-launch dispatch.  The
+# pipelined loop below sizes each panel to the measured device working set
+# and double-buffers the next panel's host read + H2D transfer behind the
+# current panel's kernel.
 #
 # NOTE on parity: the panel kernels reduce over the rank axis inside each
 # panel and the host loop accumulates across panels, so widening the panels
@@ -998,8 +1028,7 @@ def _measure_free_device_bytes():
     builds omit ``bytes_available``, so fall back to
     ``bytes_limit - bytes_in_use``; when no combination yields a value the
     raw stats are logged so the next run shows exactly what the device
-    reported (a null measurement once silently forced the minimum panel
-    width on a B200).
+    reported.
     """
 
     try:
@@ -1035,13 +1064,6 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
     when no limited level is found (e.g. macOS, non-cgroup hosts) and
     logs every level it inspected so the tier line is auditable.
     ``root``/``proc_cgroup`` exist for tests.
-
-    ``memory.current`` counts the resident page cache, so
-    ``limit - current`` understates what a lift may use when the job
-    holds a large hot store: cache is reclaimable.  Each level's
-    ``memory.stat`` ``inactive_file`` (the kernel's first eviction
-    target) is added back, capped by ``current``; the INFO line logs the
-    breakdown.
     """
 
     def _read(path):
@@ -1050,19 +1072,6 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
                 return fh.read().strip()
         except OSError:
             return None
-
-    def _read_stat_inactive_file(path):
-        stat = _read(os.path.join(path, "memory.stat"))
-        if stat is None:
-            return 0
-        for line in stat.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0] == "inactive_file":
-                try:
-                    return int(parts[1])
-                except ValueError:
-                    return 0
-        return 0
 
     try:
         with open(proc_cgroup) as fh:
@@ -1100,12 +1109,8 @@ def _cgroup_memory_available_bytes(root="/sys/fs/cgroup",
                 except ValueError:
                     limit = None
                 if limit is not None and limit < 1 << 60:  # v1 "unlimited" is ~2^63
-                    inactive_file = min(_read_stat_inactive_file(path), current)
-                    remaining = limit - current + inactive_file
-                    _logger.info(
-                        "cgroup memory limit at %s: %d bytes remaining "
-                        "(limit %d, current %d, inactive_file %d)",
-                        path, remaining, limit, current, inactive_file)
+                    remaining = limit - current
+                    _logger.info("cgroup memory limit at %s: %d bytes remaining", path, remaining)
                     best = remaining if best is None else min(best, remaining)
             if path == os.path.normpath(root) or path == os.path.dirname(path):
                 break
@@ -1302,6 +1307,9 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
                     if k + 2 < n_blocks:
                         future = panel_read(k + 2)
                     x_dev = x_next
+            # Dispatch is asynchronous: an execution-time OOM surfaces at a
+            # readiness barrier, so the barrier must live inside the try.
+            total = jax.block_until_ready(total)
         except jax.errors.JaxRuntimeError as exc:
             smaller = (panel_size // 2 // rank_panel_size) * rank_panel_size
             msg = str(exc)
@@ -1316,43 +1324,93 @@ def _stream_partial_x_pipelined(panel_kernel, t2, left_out, left_inner,
         return total[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
 
 
+def _contract_x_t2_pipelined(
+    panel_kernel, t2, out_factor, inner_factor, x_backing, nocc, *,
+    occupied_pair_batch_size, rank_panel_size, panel_budget_bytes,
+):
+    layout = _validate_x_stream(t2, out_factor, inner_factor, x_backing, nocc)
+    return _stream_partial_x_pipelined(
+        panel_kernel, t2, out_factor, inner_factor,
+        _x_backing_panel_source(x_backing, nocc, layout), nocc,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+        panel_budget_bytes=panel_budget_bytes)
+
+
 def contract_x_left_t2_pipelined(t2, left_out, left_inner, x_backing, nocc,
-                                         *, occupied_pair_batch_size=8,
-                                         rank_panel_size=128,
-                                         panel_budget_bytes=None):
+                                 *, occupied_pair_batch_size=8,
+                                 rank_panel_size=128,
+                                 panel_budget_bytes=None):
     """Pipelined ``P[a,m] P[c,m] X[b,d,m]``: working-set panels, prefetched."""
 
-    layout = _validate_x_stream(t2, left_out, left_inner, x_backing, nocc)
-    return _stream_partial_x_pipelined(
-        _xstream_left_panel_jit, t2, left_out, left_inner,
-        _x_backing_panel_source(x_backing, nocc, layout), nocc,
+    return _contract_x_t2_pipelined(
+        _xstream_left_panel_jit, t2, left_out, left_inner, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_budget_bytes=panel_budget_bytes)
 
 
 def contract_x_right_t2_pipelined(t2, right_out, right_inner, x_backing, nocc,
-                                          *, occupied_pair_batch_size=8,
-                                          rank_panel_size=128,
-                                          panel_budget_bytes=None):
+                                  *, occupied_pair_batch_size=8,
+                                  rank_panel_size=128,
+                                  panel_budget_bytes=None):
     """Pipelined ``X[a,c,m] P[b,m] P[d,m]``: working-set panels, prefetched."""
 
-    layout = _validate_x_stream(t2, right_out, right_inner, x_backing, nocc)
-    return _stream_partial_x_pipelined(
-        _xstream_right_panel_jit, t2, right_out, right_inner,
-        _x_backing_panel_source(x_backing, nocc, layout), nocc,
+    return _contract_x_t2_pipelined(
+        _xstream_right_panel_jit, t2, right_out, right_inner, x_backing, nocc,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
         panel_budget_bytes=panel_budget_bytes)
 
 
 # Default device-residency cap for the full-lift X path (~24 GiB).  The
-# streamed path exists for decks whose X_vv cannot live on the GPU (the
-# 1200-orbital deck's 247 GB); at smaller decks the full-lift path is
-# dramatically faster (one compiled rank scan instead of ~2x51 host-driven
-# panel kernels per cycle), so when X fits there is no reason to stream.
+# streamed path exists for systems whose X_vv cannot live on the GPU; when X
+# fits on device the full-lift path is faster (one compiled rank scan
+# instead of many host-driven panel kernels).
 _X_FULL_LIFT_CAP_BYTES = int(
     float(os.environ.get("PYTC_X_FULL_LIFT_CAP_GB", "24")) * 1024 ** 3)
+
+
+def _validate_term_factors(p, grad_p, u1, u3, d, *extra):
+    arrays = tuple(map(jnp.asarray, (p, grad_p, u1, u3, d, *extra)))
+    p, grad_p, u1 = arrays[:3]
+    if grad_p.shape != (p.shape[0], p.shape[1], 3):
+        raise ValueError(
+            "grad_p must have shape (nvir, rank, 3); "
+            f"got {grad_p.shape} for p={p.shape}"
+        )
+    if u1.shape != (p.shape[1], p.shape[1], 3):
+        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+    return arrays
+
+
+def _assemble_terms(terms: Mapping[str, Array]) -> Mapping[str, Array]:
+    k1_direct = terms["k1_direct"]
+    k1_pair = terms["k1_pair"]
+    k2_direct = terms["k2_direct"]
+    k2_pair = terms["k2_pair"]
+    k3_direct = terms["k3_direct"]
+    k3_pair = terms["k3_pair"]
+    d_direct = terms["d_direct"]
+    d_pair = terms["d_pair"]
+    x_direct = terms["x_direct"]
+    x_pair = terms["x_pair"]
+    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
+    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
+    delta_direct = d_direct - x_direct
+    delta_pair = d_pair - x_pair
+    tc = -(tc_direct + tc_pair)
+    delta_u = -(delta_direct + delta_pair)
+    return {
+        **terms,
+        "tc_direct": tc_direct,
+        "tc_pair": tc_pair,
+        "delta_direct": delta_direct,
+        "delta_pair": delta_pair,
+        "tc": tc,
+        "delta_u": delta_u,
+        "final": tc + delta_u,
+    }
 
 
 def contract_terms_t2_auto(
@@ -1378,7 +1436,7 @@ def contract_terms_t2_auto(
     * Tier 2 (``fd_x_tier2_host_resident``): X_vv fails the device gate but
       fits in half the measured free host RAM -- X_vv is lifted to host RAM
       once, then contracted by the pipelined panel loop with panel reads as
-      host-array slices (the 1200-orbital deck's 247 GB fits a node's RAM).
+      host-array slices (the block fits a node's RAM).
     * Tier 3 (``fd_x_tier3_stream``): otherwise -- the same pipelined loop
       with panel reads from the backing (HDF5 dataset or ndarray).
 
@@ -1491,14 +1549,7 @@ def contract_terms_t2_xstream(
     panel loop -- tiers 2/3 of :func:`contract_terms_t2_auto`.
     """
 
-    p, grad_p, u1, u3, d = map(jnp.asarray, (p, grad_p, u1, u3, d))
-    if grad_p.shape != (p.shape[0], p.shape[1], 3):
-        raise ValueError(
-            "grad_p must have shape (nvir, rank, 3); "
-            f"got {grad_p.shape} for p={p.shape}"
-        )
-    if u1.shape != (p.shape[1], p.shape[1], 3):
-        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+    p, grad_p, u1, u3, d = _validate_term_factors(p, grad_p, u1, u3, d)
 
     def _timed(name, fn, *args, **kwargs):
         with _tile_timers.term(name) as _tt:
@@ -1538,15 +1589,7 @@ def contract_terms_t2_xstream(
                         _xstream_right_panel_jit, t2, p, p, panel_source, nocc,
                         panel_budget_bytes=panel_budget_bytes, **_kw)
 
-    # Same sign assembly as contract_terms_t2.
-    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
-    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
-    delta_direct = d_direct - x_direct
-    delta_pair = d_pair - x_pair
-    tc = -(tc_direct + tc_pair)
-    delta_u = -(delta_direct + delta_pair)
-    final = tc + delta_u
-    return {
+    return _assemble_terms({
         "k1_direct": k1_direct,
         "k1_pair": k1_pair,
         "k2_direct": k2_direct,
@@ -1557,14 +1600,7 @@ def contract_terms_t2_xstream(
         "d_pair": d_pair,
         "x_direct": x_direct,
         "x_pair": x_pair,
-        "tc_direct": tc_direct,
-        "tc_pair": tc_pair,
-        "delta_direct": delta_direct,
-        "delta_pair": delta_pair,
-        "tc": tc,
-        "delta_u": delta_u,
-        "final": final,
-    }
+    })
 
 
 def contract_terms_t2(
@@ -1582,24 +1618,19 @@ def contract_terms_t2(
     """Return each exact-current-ISDF VVVV--T2 branch and final residual.
 
     Keys ending in ``_direct`` and ``_pair`` are intentionally retained for
-    the Phase-A numerical gate.  The final values reproduce the current
+    the dense-reference numerical gate.  The final values reproduce the current
     ``_assemble_tc_tile`` / ``_assemble_delta_u_tile`` signs:
 
     * ``tc = -0.5 * ((K1 - K2 + K3) + pair_swap(...))``
     * ``delta_u = -((D - X) + pair_swap(D - X))``
 
     There is no ordinary DF Coulomb term here: it is the separately-gated
-    Phase-B scope and is deliberately not changed by this prototype.
+    crossed-DF scope and is deliberately not changed here.
     """
 
-    p, grad_p, u1, u3, d, x = map(jnp.asarray, (p, grad_p, u1, u3, d, x))
-    if grad_p.shape != (p.shape[0], p.shape[1], 3):
-        raise ValueError(
-            "grad_p must have shape (nvir, rank, 3); "
-            f"got {grad_p.shape} for p={p.shape}"
-        )
-    if u1.shape != (p.shape[1], p.shape[1], 3):
-        raise ValueError(f"u1 must have shape (rank, rank, 3); got {u1.shape}")
+    p, grad_p, u1, u3, d, x = _validate_term_factors(
+        p, grad_p, u1, u3, d, x
+    )
 
     # Each Cartesian K1/K2 sum is deliberately one compiled executable. This
     # makes its XLA memory accounting a true per-term record rather than a
@@ -1656,14 +1687,7 @@ def contract_terms_t2(
         rank_panel_size=rank_panel_size,
     )
 
-    tc_direct = 0.5 * (k1_direct - k2_direct + k3_direct)
-    tc_pair = 0.5 * (k1_pair - k2_pair + k3_pair)
-    delta_direct = d_direct - x_direct
-    delta_pair = d_pair - x_pair
-    tc = -(tc_direct + tc_pair)
-    delta_u = -(delta_direct + delta_pair)
-    final = tc + delta_u
-    return {
+    return _assemble_terms({
         "k1_direct": k1_direct,
         "k1_pair": k1_pair,
         "k2_direct": k2_direct,
@@ -1674,14 +1698,7 @@ def contract_terms_t2(
         "d_pair": d_pair,
         "x_direct": x_direct,
         "x_pair": x_pair,
-        "tc_direct": tc_direct,
-        "tc_pair": tc_pair,
-        "delta_direct": delta_direct,
-        "delta_pair": delta_pair,
-        "tc": tc,
-        "delta_u": delta_u,
-        "final": final,
-    }
+    })
 
 
 def _profile_call(
@@ -1724,12 +1741,11 @@ def profile_isdf_factor_direct_terms_t2(
     occupied_pair_batch_size: int = 8,
     rank_panel_size: int = 128,
 ) -> tuple[Mapping[str, Array], Mapping[str, FactorDirectProfile]]:
-    """Measure every Phase-A branch and return the exact factor-direct terms.
+    """Measure every branch and return the exact factor-direct terms.
 
-    Profiling is explicitly opt-in and only used by the scratch prototype and
-    its H10 run card. Each profile distinguishes the schedule-panel estimate
-    from XLA's executable memory analysis. Neither is a process-wide allocator
-    peak; the card labels any ``nvidia-smi`` sample accordingly.
+    Profiling is explicitly opt-in.  Each profile distinguishes the
+    schedule-panel estimate from XLA's executable memory analysis.  Neither
+    is a process-wide allocator peak.
     """
 
     terms = contract_terms_t2(

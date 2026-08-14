@@ -64,6 +64,17 @@ class CompositeJastrow(Jastrow):
             
         return grad_total, lap_total
 
+    def grad_r_batch_laux(self, r1_batch, r2_batch, params):
+        """Accumulate component-specific L_aux derivative fast paths."""
+        grad_total = jnp.zeros(
+            (r1_batch.shape[0], r2_batch.shape[0], 3), dtype=r1_batch.dtype
+        )
+        for jastrow, jastrow_params in zip(self.jastrows, params):
+            grad_total += jastrow.grad_r_batch_laux(
+                r1_batch, r2_batch, jastrow_params
+            )
+        return grad_total
+
     def grad_params(self, r1, r2, params):
         """Compute gradient of u w.r.t parameters.
         
