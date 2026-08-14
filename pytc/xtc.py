@@ -1172,9 +1172,9 @@ class ISDFXTC(XTC, ISDFTC):
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
             reuse_aux_kernels: Opt-in exact K1/K3 recovery from ``L_aux`` and
-                its squared-gradient companion.  This currently supports only
-                the in-core parity gate; out-of-core requests fail closed in
-                the parent ISDF implementation.
+                its squared-gradient companion.  The parent ISDF
+                implementation streams the out-of-core auxiliary contraction
+                when a persistent output path is provided.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()

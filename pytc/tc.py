@@ -1582,21 +1582,21 @@ class ISDFTC(TC):
             r2_tile_size: Optional r2-grid tile size for kernel assembly.
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
-            reuse_aux_kernels: Opt-in exact parity path that builds ``L_aux``
-                and ``H_aux`` together, then recovers K1/K3 from one-grid
-                contractions.  Initially restricted to in-core validation;
-                an out-of-core request fails closed until the streamed
-                contraction path is implemented.
+            reuse_aux_kernels: Opt-in exact path that builds ``L_aux`` and
+                ``H_aux`` together, then recovers K1/K3 from one-grid
+                contractions.  The out-of-core implementation streams grid
+                and left-rank panels, retaining only the final K kernels in
+                host memory; it requires a persistent ``save_path`` for the
+                L_aux/H_aux datasets.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
-        if reuse_aux_kernels and not self.is_incore:
+        if reuse_aux_kernels and not self.is_incore and not out_path:
             raise ValueError(
-                "reuse_aux_kernels is currently an in-core exact-parity "
-                "path; out-of-core dispatch requires the streamed "
-                "auxiliary contraction implementation"
+                "out-of-core reuse_aux_kernels requires save_path so L_aux "
+                "and H_aux can be streamed rather than materialized"
             )
         
         kernels = {}
@@ -1632,12 +1632,57 @@ class ISDFTC(TC):
             L_aux, H_aux = self._compute_L_aux(
                 jastrow_params,
                 batch_size,
+                save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
                 include_h_aux=True,
             )
-            kernels = kmat_jax.calc_kmat_kernels_from_aux(
-                self.xi_phi, self.xi_grad, self.weights, L_aux, H_aux
-            )
+            if self.is_incore:
+                kernels = kmat_jax.calc_kmat_kernels_from_aux(
+                    self.xi_phi, self.xi_grad, self.weights, L_aux, H_aux
+                )
+            else:
+                # The grid panel follows the L_aux construction panel; rows
+                # of the left K rank are deliberately small so no full R^2
+                # temporary is ever materialized on a GPU.
+                stream_grid_block = host_grid_block_size or min(
+                    self.grid_points.shape[0], 4096
+                )
+                stream_rank_block = min(self.phi_isdf.shape[1], 128)
+                logger.info(
+                    "  Recovering K1/K3 from streamed L_aux/H_aux "
+                    "(grid_block=%d, rank_block=%d)...",
+                    stream_grid_block,
+                    stream_rank_block,
+                )
+                # A genuine out-of-core ISDF object intentionally carries
+                # ``None`` for xi_phi/xi_grad.  Reuse the already-open
+                # L_aux HDF5 file instead of reloading either collocation
+                # tensor into host memory.
+                xi_source_file = L_aux.file
+                xi_phi_source = (
+                    self.xi_phi if self.xi_phi is not None
+                    else xi_source_file['xi_phi']
+                )
+                xi_grad_source = (
+                    self.xi_grad if self.xi_grad is not None
+                    else xi_source_file['xi_grad']
+                )
+                kernels = kmat_jax.calc_kmat_kernels_from_aux_streamed(
+                    xi_phi_source,
+                    xi_grad_source,
+                    self.weights,
+                    L_aux,
+                    H_aux,
+                    grid_block_size=stream_grid_block,
+                    rank_block_size=stream_rank_block,
+                )
+                # H_aux is a transient companion to L_aux, not a cache
+                # format change.  Drop it immediately after exact K3
+                # recovery rather than retaining an extra R-by-G dataset.
+                if isinstance(H_aux, h5py.Dataset):
+                    h_aux_file = H_aux.file
+                    del h_aux_file['H_aux']
+                    h_aux_file.flush()
         else:
             logger.info("  Computing K1 and K3 kernels...")
             kernels = self.compute_kmat_kernels(

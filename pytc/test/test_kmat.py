@@ -1,12 +1,19 @@
 """Tests for JAX implementation of kinetic matrix elements."""
 
 import unittest
+import tempfile
 import numpy as np
+import h5py
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from pytc.legacy.kmat import calc_K1 as calc_K1_numpy, calc_K3 as calc_K3_numpy
-from pytc.kmat import calc_K1, calc_K3, calc_kmat_kernels_from_aux
+from pytc.kmat import (
+    calc_K1,
+    calc_K3,
+    calc_kmat_kernels_from_aux,
+    calc_kmat_kernels_from_aux_streamed,
+)
 from pytc.jastrow import Poly
 
 
@@ -279,6 +286,47 @@ class TestKmatFromAuxParity(unittest.TestCase):
             np.asarray(direct_2b),
             rtol=0,
             atol=2e-12,
+        )
+
+    def test_h2_streamed_aux_recovery_matches_direct_from_hdf5(self):
+        """The out-of-core recovery must use HDF5 panels without a K-square GPU temporary."""
+        grid_block = 127  # force several grid panels on the physical H2 grid
+        direct = self.isdf.compute_kmat_kernels(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=self.isdf.grid_points.shape[0],
+            gpu_budget_bytes=2_000 * 1024**2,
+        )
+        l_aux, h_aux = self.isdf._compute_L_aux(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=self.isdf.grid_points.shape[0],
+            include_h_aux=True,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".h5") as tmp:
+            with h5py.File(tmp.name, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf.xi_grad))
+                f.create_dataset("weights", data=np.asarray(self.isdf.weights))
+                f.create_dataset("L_aux", data=np.asarray(l_aux))
+                f.create_dataset("H_aux", data=np.asarray(h_aux))
+                streamed = calc_kmat_kernels_from_aux_streamed(
+                    f["xi_phi"],
+                    f["xi_grad"],
+                    f["weights"],
+                    f["L_aux"],
+                    f["H_aux"],
+                    grid_block_size=grid_block,
+                    rank_block_size=3,
+                )
+
+        np.testing.assert_allclose(
+            streamed["K1_kernel"], np.asarray(direct["K1_kernel"]),
+            rtol=0, atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            streamed["K3_kernel"], np.asarray(direct["K3_kernel"]),
+            rtol=0, atol=2e-12,
         )
 
 

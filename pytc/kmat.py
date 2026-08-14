@@ -421,6 +421,92 @@ def calc_kmat_kernels_from_aux(xi_phi, xi_grad, weights, L_aux, H_aux):
     return {"K1_kernel": K1_kernel, "K3_kernel": K3_kernel}
 
 
+def calc_kmat_kernels_from_aux_streamed(
+    xi_phi,
+    xi_grad,
+    weights,
+    L_aux,
+    H_aux,
+    grid_block_size=4096,
+    rank_block_size=128,
+):
+    r"""Recover exact K1/K3 from streamed auxiliary-grid panels.
+
+    This is the production counterpart of :func:`calc_kmat_kernels_from_aux`.
+    It accepts NumPy/JAX arrays or HDF5-style datasets, reads only a
+    ``rank_block_size`` by ``grid_block_size`` slice of ``xi`` at a time, and
+    keeps the output kernels on host RAM.  The large ``L_aux``/``H_aux``
+    panels are transferred once per grid panel and reused for every left-rank
+    block.  Consequently no R-by-R temporary is materialised on the device.
+
+    The result is the same algebraic identity as the in-core routine:
+
+    ``K1[k,l,c] = sum_g xi_grad[k,g,c] w[g] L_aux[l,g,c]``
+    ``K3[k,l]    = sum_g xi_phi[k,g] w[g] H_aux[l,g]``.
+
+    Parameters are deliberately explicit rather than inferred from a device
+    memory probe.  The caller's grid panel is the device-transfer limit and
+    the rank panel bounds the GEMM output.  This makes the out-of-core route
+    predictable and testable on the same inputs as the direct kernel.
+    """
+    if xi_phi.ndim != 2 or xi_grad.ndim != 3:
+        raise ValueError("xi_phi must be rank-2 and xi_grad rank-3")
+    n_rank, n_grid = xi_phi.shape
+    if xi_grad.shape != (n_rank, n_grid, 3):
+        raise ValueError("xi_grad shape must be (n_rank, n_grid, 3)")
+    if weights.shape != (n_grid,):
+        raise ValueError("weights shape must be (n_grid,)")
+    if L_aux.shape != (n_rank, n_grid, 3):
+        raise ValueError("L_aux shape must be (n_rank, n_grid, 3)")
+    if H_aux.shape != (n_rank, n_grid):
+        raise ValueError("H_aux shape must be (n_rank, n_grid)")
+    if grid_block_size <= 0 or rank_block_size <= 0:
+        raise ValueError("grid_block_size and rank_block_size must be positive")
+
+    # K outputs are modest compared with L_aux and stay resident on the host.
+    # The direct JAX K path instead carries several full R-by-R temporaries on
+    # device, which is what fails for the H30 fused-rank shape on a V100.
+    K1_kernel = np.zeros((n_rank, n_rank, 3), dtype=np.float64)
+    K3_kernel = np.zeros((n_rank, n_rank), dtype=np.float64)
+
+    @jax.jit
+    def _recover_k1_block(xi_grad_block, weights_block, l_aux_block):
+        return (xi_grad_block * weights_block[None, :]) @ l_aux_block.T
+
+    @jax.jit
+    def _recover_k3_block(xi_phi_block, weights_block, h_aux_block):
+        return (xi_phi_block * weights_block[None, :]) @ h_aux_block.T
+
+    for g0 in range(0, n_grid, grid_block_size):
+        g1 = min(g0 + grid_block_size, n_grid)
+        weights_block = jnp.asarray(np.asarray(weights[g0:g1]))
+
+        # A full auxiliary rank panel is intentionally transferred once here.
+        # Only the left K rank is tiled below, so L_aux/H_aux are not replayed
+        # for each individual row and the math remains O(R^2 G).
+        h_aux_block = jnp.asarray(np.asarray(H_aux[:, g0:g1]))
+        l_aux_blocks = [
+            jnp.asarray(np.asarray(L_aux[:, g0:g1, component]))
+            for component in range(3)
+        ]
+
+        for k0 in range(0, n_rank, rank_block_size):
+            k1 = min(k0 + rank_block_size, n_rank)
+            xi_phi_block = jnp.asarray(np.asarray(xi_phi[k0:k1, g0:g1]))
+            K3_kernel[k0:k1] += np.asarray(
+                _recover_k3_block(xi_phi_block, weights_block, h_aux_block)
+            )
+            for component, l_aux_block in enumerate(l_aux_blocks):
+                xi_grad_block = jnp.asarray(
+                    np.asarray(xi_grad[k0:k1, g0:g1, component])
+                )
+                K1_kernel[k0:k1, :, component] += np.asarray(
+                    _recover_k1_block(xi_grad_block, weights_block, l_aux_block)
+                )
+
+    return {"K1_kernel": K1_kernel, "K3_kernel": K3_kernel}
+
+
 @partial(jax.jit, static_argnums=(6,))
 def contract_K1_isdf_jit(phi_p, phi_q, phi_r, phi_s, grad_phi_p, U1, rank_block_size=128):
     """JITted version of K1 contraction.

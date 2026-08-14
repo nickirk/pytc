@@ -124,17 +124,56 @@ class TestISDFXTCPanelization(unittest.TestCase):
                 places=12,
             )
 
-    def test_aux_reuse_rejects_unimplemented_out_of_core_dispatch(self):
-        """The exact gate cannot silently materialize production-scale arrays."""
-        out_of_core = self.isdf_xtc.replace(is_incore=False)
-        with self.assertRaisesRegex(ValueError, "out-of-core dispatch"):
-            out_of_core.isdf(
-                self.jparams,
-                batch_size=64,
-                orb_block_size=2,
-                host_grid_block_size=512,
-                reuse_aux_kernels=True,
+    def test_aux_reuse_streams_out_of_core_xtc_normal_order(self):
+        """The production path streams HDF5 auxiliary panels and preserves XTC."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=127)
+        clean_env = {
+            "PYTC_XTC_DROP_X": "0",
+            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
+            "PYTC_XTC_DROP_X_RESIDUAL": "0",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, clean_env):
+            direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
+            store_path = os.path.join(tmpdir, "h2_aux_streamed.h5")
+            # Match a genuine out-of-core ISDF object: xi lives only in the
+            # persistent store and the object carries None for both fields.
+            with h5py.File(store_path, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf_xtc.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf_xtc.xi_grad))
+            out_of_core = self.isdf_xtc.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=store_path,
             )
+            recovered = out_of_core.isdf(
+                self.jparams,
+                save_path=store_path,
+                reuse_aux_kernels=True,
+                **kwargs,
+            )
+
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K1_kernel"]),
+                np.asarray(direct.isdf_kernels["K1_kernel"]),
+                rtol=0,
+                atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K3_kernel"]),
+                np.asarray(direct.isdf_kernels["K3_kernel"]),
+                rtol=0,
+                atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.get_delta_U(self.jparams)),
+                np.asarray(direct.get_delta_U(self.jparams)),
+                rtol=0,
+                atol=2e-12,
+            )
+            with h5py.File(store_path, "r") as f:
+                self.assertIn("L_aux", f)
+                self.assertNotIn("H_aux", f)
 
     def test_x_normal_order_and_residual_switches_are_independent(self):
         """A full X store can isolate normal-order and residual-X effects."""
