@@ -1370,7 +1370,8 @@ class ISDFTC(TC):
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
-                       host_grid_block_size=None, include_h_aux=False):
+                       host_grid_block_size=None, include_h_aux=False,
+                       use_laux_fast_grad=False):
         """Compute L_aux, and optionally its exact squared-gradient companion.
 
         When ``include_h_aux`` is true this also forms
@@ -1378,6 +1379,10 @@ class ISDFTC(TC):
         double-grid pass.  ``H_aux`` lets the K3 ISDF kernel be recovered by
         one-grid contraction; paired with ``L_aux`` it likewise recovers K1.
         The default is deliberately unchanged for existing callers.
+
+        ``use_laux_fast_grad`` selects a Jastrow-provided derivative fast path
+        for this construction only.  It is opt-in so existing caches and all
+        non-L_aux derivative callers retain the ordinary implementation.
         """
         n_devices = jax.local_device_count()
         devices = jax.local_devices()
@@ -1424,7 +1429,14 @@ class ISDFTC(TC):
                 w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
                 xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
                 
-                u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
+                if use_laux_fast_grad:
+                    u_grad = self.jastrow_factor.grad_r_batch_laux(
+                        r_eval, g_batch, jastrow_params
+                    )
+                else:
+                    u_grad = self.jastrow_factor.grad_r_batch(
+                        r_eval, g_batch, jastrow_params
+                    )
                 xi_weighted = xi_batch * w_batch[None, :]
                 update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
                 if include_h_aux:

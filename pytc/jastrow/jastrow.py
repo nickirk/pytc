@@ -76,6 +76,17 @@ class Jastrow:
             return self.grad_r(r1, r2, params)
         
         return jax.vmap(grad_fn, in_axes=(0, None))(r1_batch, r2_batch)
+
+    def grad_r_batch_laux(self, r1_batch, r2_batch, params):
+        """Return the gradient batch used by the optional L_aux fast path.
+
+        The default deliberately preserves the ordinary derivative route.
+        Specialised Jastrows may override this method with an algebraically
+        equivalent, more efficient batch derivative.  Keeping this separate
+        from :meth:`grad_r_batch` makes the L_aux optimisation opt-in and
+        leaves all other callers on their established implementation.
+        """
+        return self.grad_r_batch(r1_batch, r2_batch, params)
     
     def laplacian_r(self, r1, r2, params):
         """Compute Laplacian of u w.r.t r1 coordinates.

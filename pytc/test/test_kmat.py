@@ -14,7 +14,7 @@ from pytc.kmat import (
     calc_kmat_kernels_from_aux,
     calc_kmat_kernels_from_aux_streamed,
 )
-from pytc.jastrow import Poly
+from pytc.jastrow import Poly, BoysHandy, CompositeJastrow, NuclearCusp
 
 
 class TestKmat(unittest.TestCase):
@@ -353,6 +353,77 @@ class TestKmatFromAuxParity(unittest.TestCase):
                 with h5py.File(path, "r") as handle:
                     self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], mode)
                     self.assertNotIn("H_aux", handle)
+
+
+class TestLauxAnalyticalBoysHandy(unittest.TestCase):
+    """The L_aux-only analytic B-H derivative must retain physical parity."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pyscf import gto, scf
+        from pytc.tc import TC, ISDFTC
+
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            basis="sto-3g",
+            unit="Angstrom",
+            verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        ncusp = NuclearCusp.create(mol, n_radial=128)
+        boys_handy = BoysHandy.create(mol)
+        cls.params = [ncusp.init_params(), boys_handy.init_params()]
+        jastrow = CompositeJastrow.create([ncusp, boys_handy])
+        base = TC.from_pyscf(mf, jastrow, grid_lvl=0)
+        cls.isdf = ISDFTC.from_tc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True
+        )
+
+    def test_fast_bh_derivative_preserves_laux_and_two_body(self):
+        block = 512
+        direct_laux, direct_haux = self.isdf._compute_L_aux(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=block,
+            include_h_aux=True,
+        )
+        fast_laux, fast_haux = self.isdf._compute_L_aux(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=block,
+            include_h_aux=True,
+            use_laux_fast_grad=True,
+        )
+        np.testing.assert_allclose(
+            np.asarray(fast_laux), np.asarray(direct_laux), rtol=0, atol=2e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(fast_haux), np.asarray(direct_haux), rtol=0, atol=2e-12
+        )
+
+        direct_kernels = calc_kmat_kernels_from_aux(
+            self.isdf.xi_phi, self.isdf.xi_grad, self.isdf.weights,
+            direct_laux, direct_haux,
+        )
+        fast_kernels = calc_kmat_kernels_from_aux(
+            self.isdf.xi_phi, self.isdf.xi_grad, self.isdf.weights,
+            fast_laux, fast_haux,
+        )
+        for key in ("K1_kernel", "K3_kernel"):
+            np.testing.assert_allclose(
+                np.asarray(fast_kernels[key]), np.asarray(direct_kernels[key]),
+                rtol=0, atol=2e-12,
+            )
+
+        direct_2b = self.isdf.replace(
+            isdf_kernels={**direct_kernels, "L_aux": direct_laux}
+        ).get_2b(self.params)
+        fast_2b = self.isdf.replace(
+            isdf_kernels={**fast_kernels, "L_aux": fast_laux}
+        ).get_2b(self.params)
+        np.testing.assert_allclose(
+            np.asarray(fast_2b), np.asarray(direct_2b), rtol=0, atol=2e-12
+        )
 
 
 
