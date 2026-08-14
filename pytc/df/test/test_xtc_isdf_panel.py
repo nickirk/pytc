@@ -176,6 +176,51 @@ class TestISDFXTCPanelization(unittest.TestCase):
                 self.assertNotIn("H_aux", f)
                 self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
 
+    def test_aux_reuse_preserves_a_fixed_out_of_core_isdf_basis(self):
+        """A direct cache can be rebuilt with auxiliary K recovery in one gauge."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
+        clean_env = {
+            "PYTC_XTC_DROP_X": "0",
+            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
+            "PYTC_XTC_DROP_X_RESIDUAL": "0",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, clean_env):
+            store_path = os.path.join(tmpdir, "h2_fixed_isdf.h5")
+            with h5py.File(store_path, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf_xtc.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf_xtc.xi_grad))
+                f.create_dataset("pivots", data=np.asarray(self.isdf_xtc.pivots))
+                f.create_dataset("phi_isdf", data=np.asarray(self.isdf_xtc.phi_isdf))
+                f.create_dataset("grad_phi_isdf", data=np.asarray(self.isdf_xtc.grad_phi_isdf))
+            fixed_isdf = self.isdf_xtc.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=store_path,
+            )
+            direct = fixed_isdf.isdf(self.jparams, save_path=store_path, **kwargs)
+            direct_k1 = np.asarray(direct.isdf_kernels["K1_kernel"])
+            direct_k3 = np.asarray(direct.isdf_kernels["K3_kernel"])
+            with h5py.File(store_path, "r") as f:
+                direct_l_aux = f["L_aux"][:]
+            recovered = fixed_isdf.isdf(
+                self.jparams, save_path=store_path, reuse_aux_kernels=True, **kwargs
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K1_kernel"]), direct_k1,
+                rtol=0, atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K3_kernel"]), direct_k3,
+                rtol=0, atol=2e-12,
+            )
+            with h5py.File(store_path, "r") as f:
+                np.testing.assert_allclose(
+                    f["L_aux"][:], direct_l_aux, rtol=0, atol=2e-12,
+                )
+                self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
+                self.assertNotIn("H_aux", f)
+
     def test_x_normal_order_and_residual_switches_are_independent(self):
         """A full X store can isolate normal-order and residual-X effects."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
