@@ -1371,7 +1371,7 @@ class ISDFTC(TC):
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
                        host_grid_block_size=None, include_h_aux=False,
-                       use_laux_fast_grad=False):
+                       use_laux_fast_grad=False, use_laux_exact_split=False):
         """Compute L_aux, and optionally its exact squared-gradient companion.
 
         When ``include_h_aux`` is true this also forms
@@ -1383,6 +1383,15 @@ class ISDFTC(TC):
         ``use_laux_fast_grad`` selects a Jastrow-provided derivative fast path
         for this construction only.  It is opt-in so existing caches and all
         non-L_aux derivative callers retain the ordinary implementation.
+
+        ``use_laux_exact_split`` additionally extracts any Jastrow component
+        that supplies an integration-coordinate-independent gradient.  For
+        such a gradient ``g(r)``, both L_aux and its H_aux companion are
+        completed exactly from the residual pass:
+        ``L = L_R + p*g`` and
+        ``H = H_R + 2*g.L_R + p*|g|^2``, where
+        ``p[a] = sum_h xi[a,h] w[h]``.  This removes the component from the
+        quadratic pair-gradient evaluation without changing the kernel.
         """
         n_devices = jax.local_device_count()
         devices = jax.local_devices()
@@ -1429,7 +1438,16 @@ class ISDFTC(TC):
                 w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
                 xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
                 
-                if use_laux_fast_grad:
+                if use_laux_exact_split:
+                    if use_laux_fast_grad:
+                        u_grad = self.jastrow_factor.grad_r_batch_laux_residual(
+                            r_eval, g_batch, jastrow_params
+                        )
+                    else:
+                        u_grad = self.jastrow_factor.grad_r_batch_residual(
+                            r_eval, g_batch, jastrow_params
+                        )
+                elif use_laux_fast_grad:
                     u_grad = self.jastrow_factor.grad_r_batch_laux(
                         r_eval, g_batch, jastrow_params
                     )
@@ -1482,6 +1500,20 @@ class ISDFTC(TC):
             )
             def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
                 return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+
+        # ``p`` is the sole integration-grid contraction needed by exact
+        # one-grid contributions.  Build it once, including when xi_phi is
+        # streamed from HDF5; this is O(RG), not O(RG^2).
+        one_grid_weighted_xi = None
+        if use_laux_exact_split:
+            one_grid_weighted_xi = np.zeros(n_rank)
+            for g0 in range(0, n_grid, host_grid_block_size):
+                g1 = min(g0 + host_grid_block_size, n_grid)
+                if self.xi_phi is not None:
+                    xi_chunk = np.asarray(self.xi_phi[:, g0:g1])
+                else:
+                    xi_chunk = np.asarray(xi_phi_ds[:, g0:g1])
+                one_grid_weighted_xi += xi_chunk @ np.asarray(self.weights[g0:g1])
 
         try:
             for r0 in range(0, n_grid, host_grid_block_size):
@@ -1555,9 +1587,33 @@ class ISDFTC(TC):
                         del h_partial
                 
                 res_block = res_rep_accum[:, :n_eval, :]
+                one_grid_grad = None
+                if use_laux_exact_split:
+                    one_grid_grad = self.jastrow_factor.laux_one_grid_gradient(
+                        jnp.asarray(grid_eval_block[:n_eval]), jastrow_params
+                    )
+                    if one_grid_grad is not None:
+                        one_grid_grad = np.asarray(one_grid_grad)
+                        l_sep = (
+                            one_grid_weighted_xi[:, None, None]
+                            * one_grid_grad[None, :, :]
+                        )
+                        res_block = np.asarray(res_block) + l_sep
                 L_aux_out[:, r0:r1, :] = np.asarray(res_block)
                 if include_h_aux:
                     h_aux_block = h_aux_rep_accum[:, :n_eval]
+                    if use_laux_exact_split and one_grid_grad is not None:
+                        # The cross term uses the residual L_aux before the
+                        # separable outer product was added above.
+                        l_residual = np.asarray(res_block) - l_sep
+                        h_aux_block = (
+                            np.asarray(h_aux_block)
+                            + 2.0 * np.einsum(
+                                'ik,aik->ai', one_grid_grad, l_residual
+                            )
+                            + one_grid_weighted_xi[:, None]
+                            * np.sum(one_grid_grad**2, axis=-1)[None, :]
+                        )
                     H_aux_out[:, r0:r1] = np.asarray(h_aux_block)
                     del h_aux_block
                 
@@ -1582,7 +1638,7 @@ class ISDFTC(TC):
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
              r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False,
-             use_laux_fast_grad=False):
+             use_laux_fast_grad=False, use_laux_exact_split=False):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1604,6 +1660,9 @@ class ISDFTC(TC):
             use_laux_fast_grad: Opt into an algebraically equivalent,
                 Jastrow-provided fast derivative for the L_aux double-grid
                 contraction.  The choice is persisted on out-of-core caches.
+            use_laux_exact_split: Opt into exact extraction of Jastrow
+                one-grid gradients from the L_aux/H_aux pair pass.  The cache
+                mode records this choice and rejects a mismatched reuse.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
@@ -1615,7 +1674,10 @@ class ISDFTC(TC):
                 "and H_aux can be streamed rather than materialized"
             )
         
-        laux_gradient_mode = "fast" if use_laux_fast_grad else "direct"
+        laux_gradient_mode = "-".join(filter(None, (
+            "split" if use_laux_exact_split else "",
+            "fast" if use_laux_fast_grad else "direct",
+        )))
         kernels = {}
         # An opt-in auxiliary-reuse request must execute that path, not
         # silently accept a pre-existing direct K1/K3 cache.
@@ -1669,6 +1731,7 @@ class ISDFTC(TC):
                 host_grid_block_size=host_grid_block_size,
                 include_h_aux=True,
                 use_laux_fast_grad=use_laux_fast_grad,
+                use_laux_exact_split=use_laux_exact_split,
             )
             logger.info(
                 "  L_aux/H_aux construction completed in %.4f s",
@@ -1748,6 +1811,7 @@ class ISDFTC(TC):
                 save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
                 use_laux_fast_grad=use_laux_fast_grad,
+                use_laux_exact_split=use_laux_exact_split,
             )
             logger.info(
                 "  L_aux construction completed in %.4f s",

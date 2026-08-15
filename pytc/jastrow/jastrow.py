@@ -87,6 +87,30 @@ class Jastrow:
         leaves all other callers on their established implementation.
         """
         return self.grad_r_batch(r1_batch, r2_batch, params)
+
+    def grad_r_batch_laux_residual(self, r1_batch, r2_batch, params):
+        """Return the L_aux gradient left after exact one-grid pieces.
+
+        The default has no separable contribution, so it remains the
+        established L_aux derivative.  A component that exposes an exact
+        one-grid gradient overrides this method with zeros; composite
+        Jastrows can then assemble the residual without type checks in the
+        TC driver.
+        """
+        return self.grad_r_batch_laux(r1_batch, r2_batch, params)
+
+    def grad_r_batch_residual(self, r1_batch, r2_batch, params):
+        """Return the ordinary derivative left after one-grid pieces."""
+        return self.grad_r_batch(r1_batch, r2_batch, params)
+
+    def laux_one_grid_gradient(self, r_batch, params):
+        """Return an exact integration-coordinate-independent gradient.
+
+        ``None`` denotes that this Jastrow has no such contribution.  When a
+        component returns ``g(r)``, L_aux can add
+        ``sum_h xi[a,h] w[h] * g(r)`` without a pair-grid evaluation.
+        """
+        return None
     
     def laplacian_r(self, r1, r2, params):
         """Compute Laplacian of u w.r.t r1 coordinates.

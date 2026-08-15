@@ -332,7 +332,12 @@ class TestKmatFromAuxParity(unittest.TestCase):
     def test_out_of_core_kmat_mode_is_persisted(self):
         """Fresh direct and recovered caches must remain distinguishable."""
         with tempfile.TemporaryDirectory() as directory:
-            for mode, reuse_aux_kernels in (("direct", False), ("aux-recovery", True)):
+            cases = (
+                ("direct", "direct", "direct", False, False),
+                ("aux-recovery", "aux-recovery", "direct", True, False),
+                ("split-direct", "direct", "split-direct", False, True),
+            )
+            for mode, kmat_mode, laux_mode, reuse_aux_kernels, use_laux_exact_split in cases:
                 path = f"{directory}/{mode}.h5"
                 with h5py.File(path, "w") as handle:
                     handle.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
@@ -348,10 +353,12 @@ class TestKmatFromAuxParity(unittest.TestCase):
                     batch_size=32,
                     host_grid_block_size=512,
                     reuse_aux_kernels=reuse_aux_kernels,
+                    use_laux_exact_split=use_laux_exact_split,
                 )
                 self.assertIn("K1_kernel", out_of_core.isdf_kernels)
                 with h5py.File(path, "r") as handle:
-                    self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], mode)
+                    self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], kmat_mode)
+                    self.assertEqual(handle.attrs["pytc_laux_gradient_mode"], laux_mode)
                     self.assertNotIn("H_aux", handle)
 
 
@@ -394,9 +401,22 @@ class TestLauxAnalyticalBoysHandy(unittest.TestCase):
             reuse_aux_kernels=True,
             use_laux_fast_grad=True,
         )
+        split = self.isdf.isdf(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=block,
+            reuse_aux_kernels=True,
+            use_laux_fast_grad=True,
+            use_laux_exact_split=True,
+        )
         for key in ("K1_kernel", "K3_kernel", "L_aux"):
             np.testing.assert_allclose(
                 np.asarray(fast.isdf_kernels[key]),
+                np.asarray(direct.isdf_kernels[key]),
+                rtol=0, atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(split.isdf_kernels[key]),
                 np.asarray(direct.isdf_kernels[key]),
                 rtol=0, atol=2e-12,
             )
@@ -405,6 +425,42 @@ class TestLauxAnalyticalBoysHandy(unittest.TestCase):
             np.asarray(fast.get_2b(self.params)),
             np.asarray(direct.get_2b(self.params)), rtol=0, atol=2e-12
         )
+        np.testing.assert_allclose(
+            np.asarray(split.get_2b(self.params)),
+            np.asarray(direct.get_2b(self.params)), rtol=0, atol=2e-12
+        )
+
+        # The physical split must also survive the out-of-core auxiliary
+        # route.  In particular, the new cache mode may not be mistaken for
+        # a regular fast-gradient store, and H_aux remains transient.
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/split-fast.h5"
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
+                handle.create_dataset("xi_grad", data=np.asarray(self.isdf.xi_grad))
+            streamed_split = self.isdf.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=path,
+            ).isdf(
+                self.params,
+                save_path=path,
+                batch_size=32,
+                host_grid_block_size=block,
+                reuse_aux_kernels=True,
+                use_laux_fast_grad=True,
+                use_laux_exact_split=True,
+            )
+            for key in ("K1_kernel", "K3_kernel", "L_aux"):
+                np.testing.assert_allclose(
+                    np.asarray(streamed_split.isdf_kernels[key]),
+                    np.asarray(split.isdf_kernels[key]),
+                    rtol=0, atol=2e-12,
+                )
+            with h5py.File(path, "r") as handle:
+                self.assertEqual(handle.attrs["pytc_laux_gradient_mode"], "split-fast")
+                self.assertNotIn("H_aux", handle)
 
 
 
