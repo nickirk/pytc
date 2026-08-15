@@ -43,10 +43,15 @@ class ACAFactor:
 
 
 def build_cluster_tree(points: np.ndarray, leaf_size: int) -> tuple[list[ClusterNode], int]:
-    """Build a deterministic longest-axis binary cluster tree."""
+    """Build a deterministic longest-axis binary tree over point features.
+
+    Physical three-dimensional coordinates are the production use, but the
+    routine is deliberately dimension-agnostic so diagnostics can partition
+    grid points in a compact orbital-product feature space as well.
+    """
     points = np.asarray(points, dtype=float)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points must have shape (n_point, 3)")
+    if points.ndim != 2 or points.shape[0] < 1 or points.shape[1] < 1:
+        raise ValueError("points must have shape (n_point, n_dimension)")
     if leaf_size < 2:
         raise ValueError("leaf_size must be at least two")
 

@@ -8,7 +8,10 @@ from pytc.df.hierarchical_pivots import (
     global_pivoted_cholesky,
     hierarchical_pivoted_cholesky,
     local_pivot_candidates,
+    orbital_product_feature_sketch,
+    orbital_product_kernel_block,
     orbital_product_projection_error,
+    relative_block_rank_profile,
 )
 
 
@@ -70,6 +73,30 @@ class TestHierarchicalPivotPrototype(unittest.TestCase):
         screened_error = orbital_product_projection_error(self.features, screened["pivots"])
         self.assertLess(screened["metadata"]["argmax_fraction_initial"], 1.0)
         self.assertGreaterEqual(screened_error + 1e-13, reference_error)
+
+    def test_orbital_product_block_ranks_are_exactly_measured(self):
+        rows = np.arange(8)
+        cols = np.arange(24, 40)
+        block = orbital_product_kernel_block(self.features, rows, cols)
+        expected = (self.features[:, rows].T @ self.features[:, cols]) ** 2
+        np.testing.assert_allclose(block, expected, atol=0.0)
+
+        profile = relative_block_rank_profile(
+            self.features, rows, cols, (1e-4, 1e-6, 1e-8)
+        )
+        ranks = profile["ranks"]
+        self.assertLessEqual(ranks["1e-04"], ranks["1e-06"])
+        self.assertLessEqual(ranks["1e-06"], ranks["1e-08"])
+        self.assertLessEqual(profile["relative_errors"]["1e-04"], 1e-4)
+        self.assertLessEqual(profile["relative_errors"]["1e-06"], 1e-6)
+        self.assertLessEqual(profile["relative_errors"]["1e-08"], 1e-8)
+
+    def test_orbital_product_feature_sketch_is_reproducible(self):
+        first = orbital_product_feature_sketch(self.features, dimension=5, seed=7)
+        second = orbital_product_feature_sketch(self.features, dimension=5, seed=7)
+        self.assertEqual(first.shape, (len(self.points), 5))
+        np.testing.assert_allclose(first, second, atol=0.0)
+        self.assertTrue(np.all(np.isfinite(first)))
 
 
 if __name__ == "__main__":

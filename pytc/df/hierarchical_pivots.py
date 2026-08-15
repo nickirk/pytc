@@ -36,6 +36,85 @@ def _kernel_column(features: np.ndarray, pivot: int) -> np.ndarray:
     return overlap * overlap
 
 
+def orbital_product_kernel_block(
+    features: np.ndarray, rows: np.ndarray, cols: np.ndarray
+) -> np.ndarray:
+    """Return the exact orbital-product Gram block ``K[rows, cols]``."""
+    values = _validate_features(features)
+    row_indices = np.asarray(rows, dtype=int)
+    col_indices = np.asarray(cols, dtype=int)
+    if row_indices.ndim != 1 or col_indices.ndim != 1:
+        raise ValueError("rows and cols must be one-dimensional")
+    if not len(row_indices) or not len(col_indices):
+        raise ValueError("rows and cols must be nonempty")
+    n_grid = values.shape[1]
+    if (
+        np.any(row_indices < 0)
+        or np.any(col_indices < 0)
+        or np.any(row_indices >= n_grid)
+        or np.any(col_indices >= n_grid)
+    ):
+        raise ValueError("rows and cols must index the grid")
+    overlap = values[:, row_indices].T @ values[:, col_indices]
+    return overlap * overlap
+
+
+def orbital_product_feature_sketch(
+    features: np.ndarray, *, dimension: int = 16, seed: int = 701
+) -> np.ndarray:
+    """Build deterministic randomized coordinates for orbital-product clustering.
+
+    The ISDF kernel is the inner product of symmetrized orbital-pair features.
+    This routine projects those exact pair features to a small dimension solely
+    to partition the grid; it does not replace the kernel used for rank/error
+    measurements or pivot selection.
+    """
+    values = _validate_features(features)
+    if dimension < 1:
+        raise ValueError("dimension must be positive")
+    left, right = np.triu_indices(values.shape[0])
+    pair_features = values[left].T * values[right].T
+    pair_features[:, left != right] *= np.sqrt(2.0)
+    rng = np.random.default_rng(seed)
+    projection = rng.standard_normal((pair_features.shape[1], dimension))
+    sketch = pair_features @ projection / np.sqrt(dimension)
+    sketch -= np.mean(sketch, axis=0, keepdims=True)
+    scale = np.std(sketch, axis=0, keepdims=True)
+    return sketch / np.maximum(scale, np.finfo(float).tiny)
+
+
+def relative_block_rank_profile(
+    features: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    tolerances: Iterable[float],
+) -> dict:
+    """Measure exact-SVD ranks needed for relative Frobenius block error."""
+    values = tuple(float(tolerance) for tolerance in tolerances)
+    if any(tolerance < 0.0 for tolerance in values):
+        raise ValueError("tolerances must be nonnegative")
+    block = orbital_product_kernel_block(features, rows, cols)
+    singular_values = np.linalg.svd(block, compute_uv=False)
+    tail_squared = np.concatenate(
+        (np.cumsum(singular_values[::-1] ** 2)[::-1], np.zeros(1))
+    )
+    norm_squared = float(tail_squared[0])
+    scale = max(norm_squared, np.finfo(float).tiny)
+    ranks: dict[str, int] = {}
+    errors: dict[str, float] = {}
+    for tolerance in values:
+        rank = int(np.flatnonzero(np.sqrt(tail_squared / scale) <= tolerance)[0])
+        key = f"{tolerance:.0e}"
+        ranks[key] = rank
+        errors[key] = float(np.sqrt(tail_squared[rank] / scale))
+    return {
+        "shape": [int(block.shape[0]), int(block.shape[1])],
+        "frobenius_norm": float(np.sqrt(norm_squared)),
+        "ranks": ranks,
+        "relative_errors": errors,
+    }
+
+
 def _argmax_with_tiebreak(values: np.ndarray, indices: np.ndarray) -> int:
     """Choose the largest global index among exact ties, deterministically."""
     maximum = np.max(values)
