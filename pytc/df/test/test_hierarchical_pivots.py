@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 from pytc.df.hierarchical_pivots import (
+    gradient_orbital_product_kernel_block,
     global_pivoted_cholesky,
     hierarchical_pivoted_cholesky,
     local_pivot_candidates,
@@ -12,6 +13,7 @@ from pytc.df.hierarchical_pivots import (
     orbital_product_kernel_block,
     orbital_product_projection_error,
     relative_block_rank_profile,
+    relative_gradient_block_rank_profile,
 )
 
 
@@ -90,6 +92,28 @@ class TestHierarchicalPivotPrototype(unittest.TestCase):
         self.assertLessEqual(profile["relative_errors"]["1e-04"], 1e-4)
         self.assertLessEqual(profile["relative_errors"]["1e-06"], 1e-6)
         self.assertLessEqual(profile["relative_errors"]["1e-08"], 1e-8)
+
+    def test_gradient_product_block_ranks_are_exactly_measured(self):
+        rng = np.random.default_rng(17)
+        gradients = rng.normal(size=(*self.features.shape, 3))
+        rows = np.arange(8)
+        cols = np.arange(24, 40)
+        block = gradient_orbital_product_kernel_block(
+            self.features, gradients, rows, cols
+        )
+        orbital = self.features[:, rows].T @ self.features[:, cols]
+        gradient = sum(
+            gradients[:, rows, component].T @ gradients[:, cols, component]
+            for component in range(3)
+        )
+        np.testing.assert_allclose(block, orbital * gradient, atol=0.0)
+
+        profile = relative_gradient_block_rank_profile(
+            self.features, gradients, rows, cols, (1e-4, 1e-6, 1e-8)
+        )
+        ranks = profile["ranks"]
+        self.assertLessEqual(ranks["1e-04"], ranks["1e-06"])
+        self.assertLessEqual(ranks["1e-06"], ranks["1e-08"])
 
     def test_orbital_product_feature_sketch_is_reproducible(self):
         first = orbital_product_feature_sketch(self.features, dimension=5, seed=7)

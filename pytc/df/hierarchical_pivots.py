@@ -36,11 +36,9 @@ def _kernel_column(features: np.ndarray, pivot: int) -> np.ndarray:
     return overlap * overlap
 
 
-def orbital_product_kernel_block(
-    features: np.ndarray, rows: np.ndarray, cols: np.ndarray
-) -> np.ndarray:
-    """Return the exact orbital-product Gram block ``K[rows, cols]``."""
-    values = _validate_features(features)
+def _validate_block_indices(
+    values: np.ndarray, rows: np.ndarray, cols: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     row_indices = np.asarray(rows, dtype=int)
     col_indices = np.asarray(cols, dtype=int)
     if row_indices.ndim != 1 or col_indices.ndim != 1:
@@ -55,8 +53,40 @@ def orbital_product_kernel_block(
         or np.any(col_indices >= n_grid)
     ):
         raise ValueError("rows and cols must index the grid")
+    return row_indices, col_indices
+
+
+def orbital_product_kernel_block(
+    features: np.ndarray, rows: np.ndarray, cols: np.ndarray
+) -> np.ndarray:
+    """Return the exact orbital-product Gram block ``K[rows, cols]``."""
+    values = _validate_features(features)
+    row_indices, col_indices = _validate_block_indices(values, rows, cols)
     overlap = values[:, row_indices].T @ values[:, col_indices]
     return overlap * overlap
+
+
+def gradient_orbital_product_kernel_block(
+    features: np.ndarray,
+    gradient_features: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+) -> np.ndarray:
+    """Return the exact production gradient Gram block ``K_grad[rows, cols]``."""
+    values = _validate_features(features)
+    gradients = np.asarray(gradient_features, dtype=float)
+    if gradients.shape != (values.shape[0], values.shape[1], 3):
+        raise ValueError("gradient_features must have shape (n_feature, n_grid, 3)")
+    if not np.all(np.isfinite(gradients)):
+        raise ValueError("gradient_features must contain only finite values")
+    row_indices, col_indices = _validate_block_indices(values, rows, cols)
+    orbital_overlap = values[:, row_indices].T @ values[:, col_indices]
+    gradient_overlap = sum(
+        gradients[:, row_indices, component].T
+        @ gradients[:, col_indices, component]
+        for component in range(3)
+    )
+    return orbital_overlap * gradient_overlap
 
 
 def orbital_product_feature_sketch(
@@ -90,10 +120,28 @@ def relative_block_rank_profile(
     tolerances: Iterable[float],
 ) -> dict:
     """Measure exact-SVD ranks needed for relative Frobenius block error."""
+    block = orbital_product_kernel_block(features, rows, cols)
+    return _relative_rank_profile(block, tolerances)
+
+
+def relative_gradient_block_rank_profile(
+    features: np.ndarray,
+    gradient_features: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    tolerances: Iterable[float],
+) -> dict:
+    """Measure exact-SVD ranks of the production ISDF gradient kernel."""
+    block = gradient_orbital_product_kernel_block(
+        features, gradient_features, rows, cols
+    )
+    return _relative_rank_profile(block, tolerances)
+
+
+def _relative_rank_profile(block: np.ndarray, tolerances: Iterable[float]) -> dict:
     values = tuple(float(tolerance) for tolerance in tolerances)
     if any(tolerance < 0.0 for tolerance in values):
         raise ValueError("tolerances must be nonnegative")
-    block = orbital_product_kernel_block(features, rows, cols)
     singular_values = np.linalg.svd(block, compute_uv=False)
     tail_squared = np.concatenate(
         (np.cumsum(singular_values[::-1] ** 2)[::-1], np.zeros(1))
