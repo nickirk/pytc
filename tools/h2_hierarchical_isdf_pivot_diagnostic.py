@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 
+import jax
 import numpy as np
 from pyscf import gto, scf
+
+jax.config.update("jax_enable_x64", True)
 
 from pytc.df.hierarchical_pivots import (
     global_pivoted_cholesky,
@@ -51,6 +54,8 @@ def main() -> None:
     points = np.asarray(tc.grid_points)[selection]
     weights = np.asarray(tc.weights)[selection]
     features = np.asarray(tc.phi)[:, selection] * np.sqrt(np.abs(weights))[None, :]
+    if features.dtype != np.float64:
+        raise RuntimeError(f"diagnostic requires float64 features, got {features.dtype}")
     rank = min(args.rank, features.shape[1])
 
     global_result = global_pivoted_cholesky(features, rank)

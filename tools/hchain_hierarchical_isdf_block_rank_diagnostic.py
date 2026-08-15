@@ -15,8 +15,11 @@ import json
 import time
 from collections.abc import Sequence
 
+import jax
 import numpy as np
 from pyscf import gto, scf
+
+jax.config.update("jax_enable_x64", True)
 
 from pytc.df.hierarchical_pivots import (
     orbital_product_feature_sketch,
@@ -188,6 +191,8 @@ def main() -> None:
     coordinates = np.asarray(tc.grid_points)[selection]
     weights = np.asarray(tc.weights)[selection]
     features = np.asarray(tc.phi)[:, selection] * np.sqrt(np.abs(weights))[None, :]
+    if features.dtype != np.float64:
+        raise RuntimeError(f"diagnostic requires float64 features, got {features.dtype}")
     setup_wall_s = time.perf_counter() - setup_started
 
     geometry = profile_tree(
@@ -219,6 +224,7 @@ def main() -> None:
         "system": f"H{args.n_atom}",
         "basis": args.basis,
         "n_orb": int(features.shape[0]),
+        "dtype": str(features.dtype),
         "n_grid_source": int(len(tc.grid_points)),
         "n_grid_diagnostic": int(len(selection)),
         "setup_wall_s": setup_wall_s,

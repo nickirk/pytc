@@ -118,28 +118,32 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
     """Specialized pivoted Cholesky for phi decomposition."""
     n_grid = phi_weighted.shape[1]
 
-    # Deterministic tie-break ramp for argmax (GPU/CPU pivot selection).
-    # GPU tree-reduction in sum(phi**2,axis=0) produces diag_err values differing
-    # ~eps·V (≈1e-16) device-to-device, flipping near-tie argmax results. Adding
-    # a ramp = 1e-12 * arange(n_grid) * max(|diag_err|) overrides reduction noise
-    # (~4 orders above eps, ~4 orders below typical candidate gaps) so the
-    # highest index wins ties deterministically on both devices.
     diag_err = jnp.sum(phi_weighted**2, axis=0)**2 + shift
-    diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
+    tie_break = (
+        1e-12
+        * jnp.arange(n_grid, dtype=diag_err.dtype)
+        * jnp.max(jnp.abs(diag_err))
+    )
+    # Treat the deterministic tie-break as a diagonal perturbation and carry
+    # it through the matching kernel column.  Omitting it from ``S_col`` leaves
+    # a selected diagonal nonzero and allows the same live pivot to recur.
+    diag_err = diag_err + tie_break
 
     # Storage for L factor (N_grid, n_rank)
     L = jnp.zeros((n_grid, n_rank))
     pivots = jnp.zeros(n_rank, dtype=int)
+    selected = jnp.zeros(n_grid, dtype=bool)
 
     def body_fn(step, state):
-        diag_err, L, pivots = state
-        pivot = jnp.argmax(diag_err)
+        diag_err, L, pivots, selected = state
+        scores = jnp.where(selected, -jnp.inf, diag_err)
+        pivot = jnp.argmax(scores)
         pivots = pivots.at[step].set(pivot)
         pivot_val = diag_err[pivot]
 
         dot = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
         S_col = dot**2
-        S_col = S_col.at[pivot].add(shift)
+        S_col = S_col.at[pivot].add(shift + tie_break[pivot])
 
         dot_prod = jnp.dot(L, L[pivot])
         is_small = pivot_val < 1e-12
@@ -150,11 +154,14 @@ def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
         l_col = jnp.where(is_small, 0.0, l_col)
         L = L.at[:, step].set(l_col)
         diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        diag_err = diag_err.at[pivot].set(0.0)
+        selected = selected.at[pivot].set(True)
 
-        return diag_err, L, pivots
+        return diag_err, L, pivots, selected
 
-    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
+    _, _, final_pivots, _ = jax.lax.fori_loop(
+        0, n_rank, body_fn, (diag_err, L, pivots, selected)
+    )
     return final_pivots
 
 
@@ -166,16 +173,22 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
     A_diag = jnp.sum(phi_weighted**2, axis=0)
     B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
     diag_err = A_diag * B_diag + shift
-    # Same deterministic tie-break ramp as _pivoted_cholesky_phi (see comment there).
-    diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
+    tie_break = (
+        1e-12
+        * jnp.arange(n_grid, dtype=diag_err.dtype)
+        * jnp.max(jnp.abs(diag_err))
+    )
+    diag_err = diag_err + tie_break
 
     # Storage for L factor (N_grid, n_rank)
     L = jnp.zeros((n_grid, n_rank))
     pivots = jnp.zeros(n_rank, dtype=int)
+    selected = jnp.zeros(n_grid, dtype=bool)
 
     def body_fn(step, state):
-        diag_err, L, pivots = state
-        pivot = jnp.argmax(diag_err)
+        diag_err, L, pivots, selected = state
+        scores = jnp.where(selected, -jnp.inf, diag_err)
+        pivot = jnp.argmax(scores)
         pivots = pivots.at[step].set(pivot)
         pivot_val = diag_err[pivot]
 
@@ -184,7 +197,7 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
         for c in range(3):
             B_col += jnp.dot(grad_phi_weighted[:, :, c].T, grad_phi_weighted[:, pivot, c])
         S_col = A_col * B_col
-        S_col = S_col.at[pivot].add(shift)
+        S_col = S_col.at[pivot].add(shift + tie_break[pivot])
 
         dot_prod = jnp.dot(L, L[pivot])
         is_small = pivot_val < 1e-12
@@ -195,11 +208,14 @@ def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
         l_col = jnp.where(is_small, 0.0, l_col)
         L = L.at[:, step].set(l_col)
         diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
+        diag_err = diag_err.at[pivot].set(0.0)
+        selected = selected.at[pivot].set(True)
 
-        return diag_err, L, pivots
+        return diag_err, L, pivots, selected
 
-    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
+    _, _, final_pivots, _ = jax.lax.fori_loop(
+        0, n_rank, body_fn, (diag_err, L, pivots, selected)
+    )
     return final_pivots
 
 
