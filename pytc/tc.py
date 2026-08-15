@@ -1369,9 +1369,166 @@ class ISDFTC(TC):
         return {'K1_kernel': jnp.asarray(K1_kernel),
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
+    def _compute_L_aux_hmatrix(
+        self,
+        jastrow_params,
+        save_path,
+        include_h_aux,
+        use_laux_fast_grad,
+        use_laux_exact_split,
+        *,
+        leaf_size,
+        eta,
+        tolerance,
+        max_rank,
+        heldout_size,
+    ):
+        """Construct L_aux through the experimental streamed CUR hierarchy.
+
+        This deliberately targets one accelerator.  The expensive pair
+        derivative remains JAX-compiled, while the geometry tree, rank choice,
+        and ISDF projection stay on host.  It is a controlled experimental
+        mode: chemistry callers must use ``reuse_aux_kernels=True`` so the
+        independently reconstructed H_aux also enters K3 recovery.
+        """
+        from pytc.df.hmatrix import apply_pair_gradient_interpolative_hmatrix
+
+        if jax.local_device_count() != 1:
+            raise ValueError("laux_hmatrix currently requires exactly one local device")
+
+        xi_file = None
+        reuse_xi_file_for_output = False
+        if self.xi_phi is None:
+            if not self.save_path:
+                raise ValueError("laux_hmatrix needs in-memory xi_phi or an ISDF store")
+            # Out-of-core construction reads xi_phi from the same HDF5 cache
+            # that receives L_aux/H_aux.  A second read/write handle to one
+            # file is illegal in h5py, so acquire a single read/write handle
+            # and hand it to the returned datasets below.
+            same_output = save_path and (
+                os.path.abspath(self.save_path) == os.path.abspath(save_path)
+            )
+            xi_file = h5py.File(self.save_path, "a" if same_output else "r")
+            reuse_xi_file_for_output = bool(same_output)
+            xi_phi = np.asarray(xi_file["xi_phi"])
+        else:
+            xi_phi = np.asarray(self.xi_phi)
+
+        try:
+            grid_points = np.asarray(self.grid_points)
+            weights = np.asarray(self.weights)
+            if use_laux_exact_split:
+                if use_laux_fast_grad:
+                    gradient_fn = self.jastrow_factor.grad_r_batch_laux_residual
+                else:
+                    gradient_fn = self.jastrow_factor.grad_r_batch_residual
+            elif use_laux_fast_grad:
+                gradient_fn = self.jastrow_factor.grad_r_batch_laux
+            else:
+                gradient_fn = self.jastrow_factor.grad_r_batch
+
+            @jax.jit
+            def compiled_gradient(rows, cols):
+                return gradient_fn(rows, cols, jastrow_params)
+
+            # Compile a representative panel before the tree starts using its
+            # small set of static panel shapes.
+            sample = jnp.asarray(grid_points[: min(2, len(grid_points))])
+            compiled_gradient(sample, sample).block_until_ready()
+
+            def gradient(rows, cols):
+                return np.asarray(
+                    compiled_gradient(jnp.asarray(rows), jnp.asarray(cols))
+                )
+
+            l_aux, h_aux, metadata = apply_pair_gradient_interpolative_hmatrix(
+                grid_points,
+                weights,
+                xi_phi,
+                gradient,
+                leaf_size=leaf_size,
+                eta=eta,
+                tolerance=tolerance,
+                max_rank=max_rank,
+                heldout_size=heldout_size,
+                direct_fallback=True,
+            )
+            logger.info(
+                "  L_aux hmatrix: %d far / %d near blocks, %d direct fallbacks, "
+                "mean far rank %.2f (max %d), held-out max %.3e",
+                metadata["far_blocks"],
+                metadata["near_blocks"],
+                metadata["far_direct_fallbacks"],
+                metadata["far_rank_mean"],
+                metadata["far_rank_max"],
+                metadata["heldout_error_max"],
+            )
+
+            if use_laux_exact_split:
+                one_grid_gradient = self.jastrow_factor.laux_one_grid_gradient(
+                    jnp.asarray(grid_points), jastrow_params
+                )
+                if one_grid_gradient is not None:
+                    one_grid_gradient = np.asarray(one_grid_gradient)
+                    projected_weights = xi_phi @ weights
+                    l_residual = l_aux
+                    l_aux = l_residual + (
+                        projected_weights[:, None, None]
+                        * one_grid_gradient[None, :, :]
+                    )
+                    if include_h_aux:
+                        h_aux = (
+                            h_aux
+                            + 2.0 * np.einsum(
+                                "ik,aik->ai", one_grid_gradient, l_residual
+                            )
+                            + projected_weights[:, None]
+                            * np.sum(one_grid_gradient * one_grid_gradient, axis=-1)[None, :]
+                        )
+
+            if save_path:
+                if reuse_xi_file_for_output:
+                    f_out = xi_file
+                    # The returned HDF5 datasets own this handle.  Do not
+                    # close it in the reader cleanup below.
+                    xi_file = None
+                else:
+                    f_out = h5py.File(save_path, "a")
+                if "L_aux" in f_out:
+                    del f_out["L_aux"]
+                l_out = f_out.create_dataset("L_aux", data=l_aux)
+                h_out = None
+                if include_h_aux:
+                    if "H_aux" in f_out:
+                        del f_out["H_aux"]
+                    h_out = f_out.create_dataset("H_aux", data=h_aux)
+                f_out.attrs["pytc_laux_hmatrix_mode"] = metadata["mode"]
+                f_out.attrs["pytc_laux_hmatrix_leaf_size"] = int(leaf_size)
+                f_out.attrs["pytc_laux_hmatrix_eta"] = float(eta)
+                f_out.attrs["pytc_laux_hmatrix_tolerance"] = float(tolerance)
+                f_out.attrs["pytc_laux_hmatrix_max_rank"] = int(max_rank)
+                f_out.attrs["pytc_laux_hmatrix_heldout_size"] = int(heldout_size)
+                f_out.attrs["pytc_laux_hmatrix_far_fallbacks"] = int(
+                    metadata["far_direct_fallbacks"]
+                )
+                f_out.flush()
+                if include_h_aux:
+                    return l_out, h_out
+                return l_out
+
+            if include_h_aux:
+                return l_aux, h_aux
+            return l_aux
+        finally:
+            if xi_file is not None:
+                xi_file.close()
+
     def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
                        host_grid_block_size=None, include_h_aux=False,
-                       use_laux_fast_grad=False, use_laux_exact_split=False):
+                       use_laux_fast_grad=False, use_laux_exact_split=False,
+                       use_laux_hmatrix=False, laux_hmatrix_leaf_size=128,
+                       laux_hmatrix_eta=0.5, laux_hmatrix_tolerance=1e-4,
+                       laux_hmatrix_max_rank=16, laux_hmatrix_heldout_size=16):
         """Compute L_aux, and optionally its exact squared-gradient companion.
 
         When ``include_h_aux`` is true this also forms
@@ -1393,6 +1550,20 @@ class ISDFTC(TC):
         ``p[a] = sum_h xi[a,h] w[h]``.  This removes the component from the
         quadratic pair-gradient evaluation without changing the kernel.
         """
+        if use_laux_hmatrix:
+            return self._compute_L_aux_hmatrix(
+                jastrow_params,
+                save_path,
+                include_h_aux,
+                use_laux_fast_grad,
+                use_laux_exact_split,
+                leaf_size=laux_hmatrix_leaf_size,
+                eta=laux_hmatrix_eta,
+                tolerance=laux_hmatrix_tolerance,
+                max_rank=laux_hmatrix_max_rank,
+                heldout_size=laux_hmatrix_heldout_size,
+            )
+
         n_devices = jax.local_device_count()
         devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
@@ -1638,7 +1809,10 @@ class ISDFTC(TC):
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
              r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False,
-             use_laux_fast_grad=False, use_laux_exact_split=False):
+             use_laux_fast_grad=False, use_laux_exact_split=False,
+             use_laux_hmatrix=False, laux_hmatrix_leaf_size=128,
+             laux_hmatrix_eta=0.5, laux_hmatrix_tolerance=1e-4,
+             laux_hmatrix_max_rank=16, laux_hmatrix_heldout_size=16):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1663,6 +1837,10 @@ class ISDFTC(TC):
             use_laux_exact_split: Opt into exact extraction of Jastrow
                 one-grid gradients from the L_aux/H_aux pair pass.  The cache
                 mode records this choice and rejects a mismatched reuse.
+            use_laux_hmatrix: Use the experimental one-device streamed CUR
+                hierarchy for the residual L_aux pair gradient.  It requires
+                ``reuse_aux_kernels=True`` so H_aux is reconstructed and K3
+                is not silently changed.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
@@ -1673,8 +1851,22 @@ class ISDFTC(TC):
                 "out-of-core reuse_aux_kernels requires save_path so L_aux "
                 "and H_aux can be streamed rather than materialized"
             )
+        if use_laux_hmatrix and not reuse_aux_kernels:
+            raise ValueError(
+                "laux_hmatrix requires reuse_aux_kernels=True so H_aux is "
+                "included in the K3 recovery"
+            )
         
+        hmatrix_mode = None
+        if use_laux_hmatrix:
+            hmatrix_mode = (
+                "hmatrix"
+                f"[leaf={laux_hmatrix_leaf_size},eta={laux_hmatrix_eta:.8g},"
+                f"tol={laux_hmatrix_tolerance:.8g},rank={laux_hmatrix_max_rank},"
+                f"heldout={laux_hmatrix_heldout_size}]"
+            )
         laux_gradient_mode = "-".join(filter(None, (
+            hmatrix_mode,
             "split" if use_laux_exact_split else "",
             "fast" if use_laux_fast_grad else "direct",
         )))
@@ -1732,6 +1924,12 @@ class ISDFTC(TC):
                 include_h_aux=True,
                 use_laux_fast_grad=use_laux_fast_grad,
                 use_laux_exact_split=use_laux_exact_split,
+                use_laux_hmatrix=use_laux_hmatrix,
+                laux_hmatrix_leaf_size=laux_hmatrix_leaf_size,
+                laux_hmatrix_eta=laux_hmatrix_eta,
+                laux_hmatrix_tolerance=laux_hmatrix_tolerance,
+                laux_hmatrix_max_rank=laux_hmatrix_max_rank,
+                laux_hmatrix_heldout_size=laux_hmatrix_heldout_size,
             )
             logger.info(
                 "  L_aux/H_aux construction completed in %.4f s",
@@ -1812,6 +2010,12 @@ class ISDFTC(TC):
                 host_grid_block_size=host_grid_block_size,
                 use_laux_fast_grad=use_laux_fast_grad,
                 use_laux_exact_split=use_laux_exact_split,
+                use_laux_hmatrix=use_laux_hmatrix,
+                laux_hmatrix_leaf_size=laux_hmatrix_leaf_size,
+                laux_hmatrix_eta=laux_hmatrix_eta,
+                laux_hmatrix_tolerance=laux_hmatrix_tolerance,
+                laux_hmatrix_max_rank=laux_hmatrix_max_rank,
+                laux_hmatrix_heldout_size=laux_hmatrix_heldout_size,
             )
             logger.info(
                 "  L_aux construction completed in %.4f s",

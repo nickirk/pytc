@@ -1,12 +1,18 @@
 """Controls for the experimental geometry-hierarchical L_aux operator."""
 
+import os
+import tempfile
 import unittest
 
+import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pytc.df.hmatrix import apply_pair_gradient_hmatrix
+from pytc.df.hmatrix import (
+    apply_pair_gradient_hmatrix,
+    apply_pair_gradient_interpolative_hmatrix,
+)
 
 
 def _direct_aux(points, weights, xi_phi, gradient):
@@ -96,6 +102,53 @@ class TestPairGradientHMatrix(unittest.TestCase):
         self.assertLess(
             np.linalg.norm(approx_h - direct_h) / np.linalg.norm(direct_h),
             2e-3,
+        )
+
+    def test_interpolative_blocks_fallback_when_validation_rejects_them(self):
+        direct_l, direct_h = _direct_aux(
+            self.points, self.weights, self.xi_phi, self._gradient
+        )
+        l_aux, h_aux, metadata = apply_pair_gradient_interpolative_hmatrix(
+            self.points,
+            self.weights,
+            self.xi_phi,
+            self._gradient,
+            leaf_size=8,
+            eta=0.05,
+            tolerance=1e-13,
+            max_rank=2,
+            direct_fallback=True,
+        )
+
+        self.assertGreater(metadata["far_blocks"], 0)
+        self.assertGreater(metadata["far_direct_fallbacks"], 0)
+        np.testing.assert_allclose(l_aux, direct_l, rtol=0.0, atol=2e-12)
+        np.testing.assert_allclose(h_aux, direct_h, rtol=0.0, atol=2e-12)
+
+    def test_interpolative_blocks_have_controlled_smooth_kernel_error(self):
+        direct_l, direct_h = _direct_aux(
+            self.points, self.weights, self.xi_phi, self._gradient
+        )
+        l_aux, h_aux, metadata = apply_pair_gradient_interpolative_hmatrix(
+            self.points,
+            self.weights,
+            self.xi_phi,
+            self._gradient,
+            leaf_size=8,
+            eta=0.05,
+            tolerance=None,
+            max_rank=8,
+            direct_fallback=False,
+        )
+
+        self.assertGreater(metadata["far_rank_max"], 0)
+        self.assertLess(
+            np.linalg.norm(l_aux - direct_l) / np.linalg.norm(direct_l),
+            2e-5,
+        )
+        self.assertLess(
+            np.linalg.norm(h_aux - direct_h) / np.linalg.norm(direct_h),
+            2e-5,
         )
 
 
@@ -204,3 +257,206 @@ class TestPhysicalH2ResidualHMatrix(unittest.TestCase):
             isdf_kernels={**recovered, "L_aux": l_aux}
         ).get_2b(self.params)
         np.testing.assert_allclose(recovered_2b, direct_2b, rtol=0.0, atol=atol)
+
+    def test_isdf_hmatrix_mode_reaches_kernels_and_two_body(self):
+        direct = self.subset.isdf(
+            self.params,
+            batch_size=16,
+            host_grid_block_size=64,
+            reuse_aux_kernels=True,
+            use_laux_fast_grad=True,
+        )
+        hierarchy = self.subset.isdf(
+            self.params,
+            batch_size=16,
+            host_grid_block_size=64,
+            reuse_aux_kernels=True,
+            use_laux_fast_grad=True,
+            use_laux_hmatrix=True,
+            laux_hmatrix_leaf_size=8,
+            laux_hmatrix_eta=0.05,
+            # Zero makes every nonzero held-out residual take the direct
+            # fallback, giving an exact end-to-end cache/recovery control.
+            laux_hmatrix_tolerance=0.0,
+            laux_hmatrix_max_rank=16,
+            laux_hmatrix_heldout_size=16,
+        )
+        atol = 2e-12 if jax.config.x64_enabled else 2e-6
+        for key in ("L_aux", "K1_kernel", "K3_kernel"):
+            np.testing.assert_allclose(
+                hierarchy.isdf_kernels[key], direct.isdf_kernels[key], rtol=0.0, atol=atol
+            )
+        np.testing.assert_allclose(
+            hierarchy.get_2b(self.params), direct.get_2b(self.params), rtol=0.0, atol=atol
+        )
+
+    def test_isdf_hmatrix_requires_haux_recovery(self):
+        with self.assertRaisesRegex(ValueError, "reuse_aux_kernels=True"):
+            self.subset.isdf(
+                self.params,
+                batch_size=16,
+                host_grid_block_size=64,
+                use_laux_hmatrix=True,
+            )
+
+    def test_out_of_core_hmatrix_recovers_and_tags_its_cache(self):
+        """The hierarchy must retain streamed K recovery and cache provenance."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/hmatrix.h5"
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("xi_phi", data=np.asarray(self.subset.xi_phi))
+                handle.create_dataset("xi_grad", data=np.asarray(self.subset.xi_grad))
+
+            streamed = self.subset.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=path,
+            ).isdf(
+                self.params,
+                save_path=path,
+                batch_size=16,
+                host_grid_block_size=64,
+                reuse_aux_kernels=True,
+                use_laux_fast_grad=True,
+                use_laux_hmatrix=True,
+                laux_hmatrix_leaf_size=8,
+                laux_hmatrix_eta=0.05,
+                laux_hmatrix_tolerance=0.0,
+                laux_hmatrix_max_rank=16,
+                laux_hmatrix_heldout_size=16,
+            )
+
+            atol = 2e-12 if jax.config.x64_enabled else 2e-6
+            for key in ("L_aux", "K1_kernel", "K3_kernel"):
+                np.testing.assert_allclose(
+                    np.asarray(streamed.isdf_kernels[key]),
+                    np.asarray(
+                        self.direct_l if key == "L_aux" else self.direct_kernels[key]
+                    ),
+                    rtol=0.0,
+                    atol=atol,
+                )
+            with h5py.File(path, "r") as handle:
+                self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
+                self.assertEqual(
+                    handle.attrs["pytc_laux_gradient_mode"],
+                    "hmatrix[leaf=8,eta=0.05,tol=0,rank=16,heldout=16]-fast",
+                )
+                self.assertEqual(handle.attrs["pytc_laux_hmatrix_mode"], "interpolative-cur-v1")
+                self.assertNotIn("H_aux", handle)
+
+
+class TestH2XTCWithHMatrix(unittest.TestCase):
+    """The experimental path must reach full-X Delta-U unchanged in control mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pyscf import gto, scf
+
+        from pytc.jastrow import REXP
+        from pytc.xtc import ISDFXTC, XTC
+
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            basis="sto-3g",
+            unit="Angstrom",
+            verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        cls.mf = mf
+        cls.params = {"alpha": jnp.array([0.4])}
+        cls.base = ISDFXTC.from_xtc(
+            XTC.from_pyscf(mf, REXP(), grid_lvl=0), n_rank=8, is_incore=True
+        )
+
+    def test_full_x_control_follows_hmatrix_laux_path(self):
+        x_variables = (
+            "PYTC_XTC_DROP_X",
+            "PYTC_XTC_DROP_X_NORMAL_ORDER",
+            "PYTC_XTC_DROP_X_RESIDUAL",
+        )
+        previous = {name: os.environ.pop(name, None) for name in x_variables}
+        try:
+            direct = self.base.isdf(
+                self.params,
+                batch_size=32,
+                orb_block_size=2,
+                host_grid_block_size=512,
+                reuse_aux_kernels=True,
+            )
+            hierarchy = self.base.isdf(
+                self.params,
+                batch_size=32,
+                orb_block_size=2,
+                host_grid_block_size=512,
+                reuse_aux_kernels=True,
+                use_laux_hmatrix=True,
+                laux_hmatrix_leaf_size=128,
+                laux_hmatrix_eta=0.05,
+                laux_hmatrix_tolerance=0.0,
+                laux_hmatrix_max_rank=16,
+                laux_hmatrix_heldout_size=16,
+            )
+        finally:
+            for name, value in previous.items():
+                if value is not None:
+                    os.environ[name] = value
+
+        atol = 2e-12 if jax.config.x64_enabled else 2e-6
+        self.assertGreater(np.linalg.norm(np.asarray(hierarchy.isdf_kernels["X"])), 0.0)
+        for key in ("K1_kernel", "K3_kernel", "D", "X"):
+            np.testing.assert_allclose(
+                hierarchy.isdf_kernels[key], direct.isdf_kernels[key], rtol=0.0, atol=atol
+            )
+        np.testing.assert_allclose(
+            hierarchy.get_delta_h(self.params), direct.get_delta_h(self.params), rtol=0.0, atol=atol
+        )
+        np.testing.assert_allclose(
+            hierarchy.get_delta_U(self.params), direct.get_delta_U(self.params), rtol=0.0, atol=atol
+        )
+
+    def test_full_x_approximate_hierarchy_keeps_relaxed_ccsd_energy(self):
+        """A nonzero hierarchy tolerance needs a relaxed-energy guard."""
+        from pytc.solver import jax_xtc_ccsd
+
+        direct = self.base.isdf(
+            self.params,
+            batch_size=32,
+            orb_block_size=2,
+            host_grid_block_size=512,
+            reuse_aux_kernels=True,
+        )
+        hierarchy = self.base.isdf(
+            self.params,
+            batch_size=32,
+            orb_block_size=2,
+            host_grid_block_size=512,
+            reuse_aux_kernels=True,
+            use_laux_hmatrix=True,
+            laux_hmatrix_leaf_size=128,
+            laux_hmatrix_eta=0.05,
+            laux_hmatrix_tolerance=1e-2,
+            laux_hmatrix_max_rank=16,
+            laux_hmatrix_heldout_size=16,
+        )
+
+        def solve(isdf):
+            cc = jax_xtc_ccsd.RCCSD(
+                self.mf, isdf, self.params, max_memory=2_000,
+                gpu_max_memory=2_000, on_the_fly_vvvv=False,
+            )
+            eris = cc.ao2mo()
+            try:
+                cc.max_cycle = 50
+                energy = float(cc.kernel(eris=eris)[0])
+                self.assertTrue(cc.converged)
+                return energy
+            finally:
+                eris.close()
+
+        e_direct = solve(direct)
+        e_hmatrix = solve(hierarchy)
+        # This is intentionally looser than the local observed 0.0002 mHa
+        # shift, while still well below the 1 mHa scale-run gate.
+        self.assertLess(abs(e_hmatrix - e_direct) * 1_000.0, 0.01)

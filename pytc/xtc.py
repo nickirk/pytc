@@ -1157,6 +1157,12 @@ class ISDFXTC(XTC, ISDFTC):
         reuse_aux_kernels=False,
         use_laux_fast_grad=False,
         use_laux_exact_split=False,
+        use_laux_hmatrix=False,
+        laux_hmatrix_leaf_size=128,
+        laux_hmatrix_eta=0.5,
+        laux_hmatrix_tolerance=1e-4,
+        laux_hmatrix_max_rank=16,
+        laux_hmatrix_heldout_size=16,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1183,6 +1189,9 @@ class ISDFXTC(XTC, ISDFTC):
             use_laux_exact_split: Opt into exact extraction of any
                 integration-coordinate-independent Jastrow gradient from
                 the L_aux/H_aux pair pass.
+            use_laux_hmatrix: Opt into the experimental streamed CUR L_aux
+                residual hierarchy inherited from ISDFTC.  This is only valid
+                with the exact auxiliary K1/K3 recovery path.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -1197,7 +1206,13 @@ class ISDFXTC(XTC, ISDFTC):
                                gpu_budget_bytes=gpu_budget_bytes,
                                reuse_aux_kernels=reuse_aux_kernels,
                                use_laux_fast_grad=use_laux_fast_grad,
-                               use_laux_exact_split=use_laux_exact_split)
+                               use_laux_exact_split=use_laux_exact_split,
+                               use_laux_hmatrix=use_laux_hmatrix,
+                               laux_hmatrix_leaf_size=laux_hmatrix_leaf_size,
+                               laux_hmatrix_eta=laux_hmatrix_eta,
+                               laux_hmatrix_tolerance=laux_hmatrix_tolerance,
+                               laux_hmatrix_max_rank=laux_hmatrix_max_rank,
+                               laux_hmatrix_heldout_size=laux_hmatrix_heldout_size)
         kernels = isdf_tc.isdf_kernels
         
         if out_path and os.path.exists(out_path):

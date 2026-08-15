@@ -334,3 +334,247 @@ def apply_pair_gradient_hmatrix(
     metadata["far_rank_max"] = max(ranks, default=0)
     metadata["far_rank_mean"] = float(np.mean(ranks)) if ranks else 0.0
     return l_aux, h_aux, metadata
+
+
+def _greedy_cross_pivots(matrix: np.ndarray, rank_limit: int) -> tuple[np.ndarray, np.ndarray]:
+    """Choose a stable cross from a small, already sampled proxy matrix."""
+    residual = np.asarray(matrix, dtype=float).copy()
+    initial_scale = max(float(np.linalg.norm(residual, ord=np.inf)), 1.0)
+    rows: list[int] = []
+    cols: list[int] = []
+    for _ in range(min(rank_limit, *residual.shape)):
+        row, col = np.unravel_index(np.argmax(np.abs(residual)), residual.shape)
+        pivot = residual[row, col]
+        if abs(pivot) <= np.finfo(float).eps * initial_scale:
+            break
+        rows.append(int(row))
+        cols.append(int(col))
+        residual -= np.outer(residual[:, col], residual[row, :]) / pivot
+    return np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)
+
+
+def _cross_factor(
+    left: np.ndarray,
+    right: np.ndarray,
+    candidate_rows: np.ndarray,
+    candidate_cols: np.ndarray,
+    rank_limit: int,
+    held_rows: np.ndarray,
+    held_cols: np.ndarray,
+    heldout: np.ndarray,
+    tolerance: float | None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Build a CUR factor from two sampled kernel strips.
+
+    The pivot search is confined to the small candidate cross.  The returned
+    error is measured on fresh, deterministic held-out entries, so it can
+    select a rank but is not a global certificate.
+    """
+    proxy = left[candidate_rows, :]
+    pivot_rows, pivot_cols = _greedy_cross_pivots(proxy, rank_limit)
+    if not len(pivot_rows):
+        return np.empty((left.shape[0], 0)), np.empty((0, right.shape[1])), 0.0
+
+    scale = max(float(np.linalg.norm(heldout)), np.finfo(float).tiny)
+    selected_error = float("inf")
+    selected_left = None
+    selected_right = None
+    for rank in range(1, len(pivot_rows) + 1):
+        local_rows = pivot_rows[:rank]
+        local_cols = pivot_cols[:rank]
+        # ``left`` already uses the candidate-column coordinate and ``right``
+        # already uses the candidate-row coordinate; only the left *rows*
+        # retain the block-local grid indexing.
+        core = left[candidate_rows[local_rows]][:, local_cols]
+        factor_left = left[:, local_cols] @ np.linalg.pinv(core, rcond=1e-12)
+        factor_right = right[local_rows, :]
+        error = float(
+            np.linalg.norm(
+                heldout
+                - factor_left[held_rows] @ factor_right[:, held_cols]
+            )
+            / scale
+        )
+        selected_left, selected_right, selected_error = factor_left, factor_right, error
+        if tolerance is not None and error <= tolerance:
+            break
+    assert selected_left is not None and selected_right is not None
+    return selected_left, selected_right, selected_error
+
+
+def _validation_indices(length: int, count: int, excluded: np.ndarray) -> np.ndarray:
+    """Return deterministic validation points distinct from cross candidates when possible."""
+    excluded_set = set(np.asarray(excluded, dtype=int).tolist())
+    candidates = np.unique(
+        np.floor((np.arange(max(count * 3, count)) + 0.5) * length / max(count * 3, count)).astype(int)
+    )
+    chosen = [item for item in candidates if item not in excluded_set]
+    if not chosen:
+        chosen = list(range(length))
+    return np.asarray(chosen[: min(count, len(chosen))], dtype=int)
+
+
+def apply_pair_gradient_interpolative_hmatrix(
+    points: np.ndarray,
+    weights: np.ndarray,
+    xi_phi: np.ndarray,
+    gradient: GradientEvaluator,
+    *,
+    leaf_size: int = 128,
+    eta: float = 0.5,
+    tolerance: float | None = 1e-4,
+    max_rank: int = 16,
+    heldout_size: int = 16,
+    direct_fallback: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Apply a sampled-CUR hierarchical approximation to a pair gradient.
+
+    Each admissible far block evaluates only two kernel strips of width at
+    most ``max_rank`` plus a small held-out check.  Direct near blocks are
+    exact.  The gradient components and the scalar ``|gradient|^2`` each get
+    their own CUR factor; this preserves the required independent H_aux
+    approximation.  A block whose held-out error exceeds ``tolerance`` falls
+    back to its exact direct contraction when ``direct_fallback`` is enabled.
+
+    This is a streamed construction: it never forms a global pair matrix.
+    The tolerance is a rank-selection/fallback gate, not a global error
+    certificate.  Callers must validate L_aux, H_aux, K1/K3, two-body, and
+    energy against the direct operator before using it in chemistry results.
+    """
+    points = np.asarray(points, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    xi_phi = np.asarray(xi_phi, dtype=float)
+    n_grid = len(points)
+    if weights.shape != (n_grid,) or xi_phi.ndim != 2 or xi_phi.shape[1] != n_grid:
+        raise ValueError("incompatible points, weights, and xi_phi shapes")
+    if max_rank < 1:
+        raise ValueError("max_rank must be positive")
+    if tolerance is not None and tolerance < 0.0:
+        raise ValueError("tolerance must be nonnegative or None")
+
+    nodes, root = build_cluster_tree(points, leaf_size)
+    blocks = admissible_blocks(nodes, root, root, eta)
+    row_pair_counts = np.zeros(n_grid, dtype=np.int64)
+    l_aux = np.zeros((xi_phi.shape[0], n_grid, 3))
+    h_aux = np.zeros((xi_phi.shape[0], n_grid))
+    weighted_xi = xi_phi * weights[None, :]
+    metadata = {
+        "mode": "interpolative-cur-v1",
+        "leaf_size": leaf_size,
+        "eta": eta,
+        "tolerance": tolerance,
+        "max_rank": max_rank,
+        "near_blocks": 0,
+        "far_blocks": 0,
+        "far_direct_fallbacks": 0,
+        "near_pair_count": 0,
+        "far_pair_count": 0,
+        "far_factor_storage": 0,
+        "gradient_ranks": [],
+        "h_aux_ranks": [],
+        "heldout_errors": [],
+    }
+
+    def accumulate_direct(rows: np.ndarray, cols: np.ndarray) -> None:
+        value = np.asarray(gradient(points[rows], points[cols]), dtype=float)
+        if value.shape != (len(rows), len(cols), 3):
+            raise ValueError("gradient evaluator returned an incompatible block")
+        xi_weighted = weighted_xi[:, cols]
+        l_aux[:, rows, :] += np.einsum("ah,ihk->aik", xi_weighted, value)
+        h_aux[:, rows] += xi_weighted @ np.sum(value * value, axis=2).T
+
+    for left_id, right_id, is_far in blocks:
+        rows = nodes[left_id].indices
+        cols = nodes[right_id].indices
+        row_pair_counts[rows] += len(cols)
+        if not is_far:
+            accumulate_direct(rows, cols)
+            metadata["near_blocks"] += 1
+            metadata["near_pair_count"] += len(rows) * len(cols)
+            continue
+
+        metadata["far_blocks"] += 1
+        metadata["far_pair_count"] += len(rows) * len(cols)
+        candidate_count = min(max_rank, len(rows), len(cols))
+        candidate_rows = _heldout_indices(len(rows), candidate_count)
+        candidate_cols = _heldout_indices(len(cols), candidate_count)
+        held_rows = _validation_indices(len(rows), heldout_size, candidate_rows)
+        held_cols = _validation_indices(len(cols), heldout_size, candidate_cols)
+
+        # Three JAX kernel calls irrespective of factor rank: all-row/cross,
+        # cross/all-column, then an independent validation patch.
+        left_values = np.asarray(
+            gradient(points[rows], points[cols[candidate_cols]]), dtype=float
+        )
+        right_values = np.asarray(
+            gradient(points[rows[candidate_rows]], points[cols]), dtype=float
+        )
+        held_values = np.asarray(
+            gradient(points[rows[held_rows]], points[cols[held_cols]]), dtype=float
+        )
+        if (
+            left_values.shape != (len(rows), candidate_count, 3)
+            or right_values.shape != (candidate_count, len(cols), 3)
+            or held_values.shape != (len(held_rows), len(held_cols), 3)
+        ):
+            raise ValueError("gradient evaluator returned an incompatible sampled block")
+
+        factors: list[tuple[np.ndarray, np.ndarray]] = []
+        errors: list[float] = []
+        for component in range(3):
+            factor = _cross_factor(
+                left_values[:, :, component],
+                right_values[:, :, component],
+                candidate_rows,
+                candidate_cols,
+                max_rank,
+                held_rows,
+                held_cols,
+                held_values[:, :, component],
+                tolerance,
+            )
+            factors.append(factor[:2])
+            errors.append(factor[2])
+
+        h_left = np.sum(left_values * left_values, axis=2)
+        h_right = np.sum(right_values * right_values, axis=2)
+        h_held = np.sum(held_values * held_values, axis=2)
+        h_factor = _cross_factor(
+            h_left,
+            h_right,
+            candidate_rows,
+            candidate_cols,
+            max_rank,
+            held_rows,
+            held_cols,
+            h_held,
+            tolerance,
+        )
+        errors.append(h_factor[2])
+
+        if direct_fallback and tolerance is not None and max(errors) > tolerance:
+            accumulate_direct(rows, cols)
+            metadata["far_direct_fallbacks"] += 1
+            metadata["heldout_errors"].append(max(errors))
+            continue
+
+        xi_weighted = weighted_xi[:, cols]
+        for component, (factor_left, factor_right) in enumerate(factors):
+            l_aux[:, rows, component] += (
+                xi_weighted @ factor_right.T
+            ) @ factor_left.T
+            metadata["gradient_ranks"].append(factor_left.shape[1])
+            metadata["far_factor_storage"] += factor_left.size + factor_right.size
+        h_left_factor, h_right_factor = h_factor[:2]
+        h_aux[:, rows] += (xi_weighted @ h_right_factor.T) @ h_left_factor.T
+        metadata["h_aux_ranks"].append(h_left_factor.shape[1])
+        metadata["far_factor_storage"] += h_left_factor.size + h_right_factor.size
+        metadata["heldout_errors"].append(max(errors))
+
+    if not np.all(row_pair_counts == n_grid):
+        raise AssertionError("hierarchical block partition does not cover every pair")
+    ranks = metadata["gradient_ranks"] + metadata["h_aux_ranks"]
+    metadata["far_rank_max"] = max(ranks, default=0)
+    metadata["far_rank_mean"] = float(np.mean(ranks)) if ranks else 0.0
+    metadata["heldout_error_max"] = max(metadata["heldout_errors"], default=0.0)
+    return l_aux, h_aux, metadata
