@@ -306,8 +306,31 @@ def persist_tucker(path: Path, factors: dict, source: dict, revision: str) -> di
     }
 
 
+def tucker_l_aux_dataset(isdf, source: dict):
+    """Return the persisted L_aux backing an out-of-core full-X view.
+
+    ISDFXTC deliberately evicts L_aux from its transient kernel dictionary
+    after forming D/X.  The out-of-core full-X store retains L_aux alongside
+    X, so Tucker basis/core construction must stream it from that same store
+    rather than silently rebuild it or assume the dictionary still owns it.
+    """
+    l_aux = isdf.isdf_kernels.get("L_aux")
+    if l_aux is not None:
+        return l_aux
+    x_kernel = isdf.isdf_kernels.get("X")
+    if not isinstance(x_kernel, h5py.Dataset):
+        raise SystemExit("FATAL: Tucker-X requires L_aux or a streamed full-X dataset")
+    x_store = Path(x_kernel.file.filename).resolve()
+    expected = Path(source["path"]).resolve()
+    if x_store != expected:
+        raise SystemExit(f"FATAL: Tucker-X store mismatch: {x_store} != {expected}")
+    if "L_aux" not in x_kernel.file:
+        raise SystemExit("FATAL: full-X store does not contain streamed L_aux")
+    return x_kernel.file["L_aux"]
+
+
 def tucker_view(isdf, params, source: dict, factor_path: Path, revision: str, args):
-    l_aux = isdf.isdf_kernels["L_aux"]
+    l_aux = tucker_l_aux_dataset(isdf, source)
     basis_start = time.perf_counter()
     u = isdf.select_tucker_x_orbital_basis(
         params,

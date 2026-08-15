@@ -56,6 +56,24 @@ class TestHChainLauxHMatrixMatrixDriver(unittest.TestCase):
                 )
                 self.assertFalse(driver.DERIVED_DATASETS.intersection(target.keys()))
 
+    def test_tucker_laux_streams_from_full_x_store_after_kernel_eviction(self):
+        """ISDFXTC evicts L_aux in memory after building full X."""
+        driver = _load_driver_module()
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "direct.h5"
+            with h5py.File(source_path, "w") as source:
+                source.create_dataset("L_aux", data=np.arange(24.0).reshape(2, 4, 3))
+                source.create_dataset("X", data=np.ones((2, 2, 2)))
+
+                class FullXView:
+                    isdf_kernels = {"X": source["X"]}
+
+                l_aux = driver.tucker_l_aux_dataset(
+                    FullXView(), {"path": str(source_path)}
+                )
+                self.assertIsInstance(l_aux, h5py.Dataset)
+                np.testing.assert_array_equal(l_aux[:], source["L_aux"][:])
+
 
 if __name__ == "__main__":
     unittest.main()
