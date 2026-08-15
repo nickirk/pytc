@@ -344,6 +344,11 @@ class TestPhysicalH2ResidualHMatrix(unittest.TestCase):
                     "hmatrix[leaf=8,eta=0.05,tol=0,rank=16,heldout=16]-fast",
                 )
                 self.assertEqual(handle.attrs["pytc_laux_hmatrix_mode"], "interpolative-cur-v1")
+                self.assertGreater(handle.attrs["pytc_laux_hmatrix_far_blocks"], 0)
+                self.assertEqual(
+                    handle.attrs["pytc_laux_hmatrix_far_fallbacks"],
+                    handle.attrs["pytc_laux_hmatrix_far_blocks"],
+                )
                 self.assertNotIn("H_aux", handle)
 
 

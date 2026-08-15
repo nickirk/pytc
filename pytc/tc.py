@@ -1508,8 +1508,26 @@ class ISDFTC(TC):
                 f_out.attrs["pytc_laux_hmatrix_tolerance"] = float(tolerance)
                 f_out.attrs["pytc_laux_hmatrix_max_rank"] = int(max_rank)
                 f_out.attrs["pytc_laux_hmatrix_heldout_size"] = int(heldout_size)
+                f_out.attrs["pytc_laux_hmatrix_near_blocks"] = int(
+                    metadata["near_blocks"]
+                )
+                f_out.attrs["pytc_laux_hmatrix_far_blocks"] = int(
+                    metadata["far_blocks"]
+                )
                 f_out.attrs["pytc_laux_hmatrix_far_fallbacks"] = int(
                     metadata["far_direct_fallbacks"]
+                )
+                f_out.attrs["pytc_laux_hmatrix_far_rank_max"] = int(
+                    metadata["far_rank_max"]
+                )
+                f_out.attrs["pytc_laux_hmatrix_far_rank_mean"] = float(
+                    metadata["far_rank_mean"]
+                )
+                f_out.attrs["pytc_laux_hmatrix_far_factor_storage"] = int(
+                    metadata["far_factor_storage"]
+                )
+                f_out.attrs["pytc_laux_hmatrix_heldout_error_max"] = float(
+                    metadata["heldout_error_max"]
                 )
                 f_out.flush()
                 if include_h_aux:
