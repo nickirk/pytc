@@ -348,6 +348,35 @@ class TestBuild(unittest.TestCase):
                     provider_cls=_UnserializableProvider,
                 )
 
+    def test_selection_provenance_carries_per_round_stage_stats(self):
+        """Per-stage timings must reach a REAL build, not only a unit test.
+
+        `stage_stats` was a selector parameter no production caller ever
+        supplied -- the only `stage_stats=` argument in the product was in
+        test_isdf_selector. So the per-stage timings, including the
+        `materialisation_seconds` bucket added to attribute the async device
+        read that a wall-clock gap was hiding in, observed nothing during an
+        actual build. A profiling run would have produced no breakdown at all.
+        """
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 1], wrap_around=False)
+        seen = []
+        coulomb.build(cell, kpts, rank=3, block_size=9,
+                      selection_mode="bpc_streamed",
+                      on_selection=lambda p, prov: seen.append(prov))
+        self.assertEqual(len(seen), 1)
+        stats = seen[0].get("bpc_stage_stats")
+        self.assertIsNotNone(
+            stats, "per-stage timings never reach the callback, so a build "
+                   "cannot be profiled from its own receipt")
+        self.assertTrue(stats, "stage stats present but EMPTY -- a vacuous pass")
+        for item in stats:
+            for field in ("candidate_eval_seconds", "projection_seconds",
+                          "materialisation_seconds",
+                          "within_batch_pivot_seconds", "factor_update_seconds"):
+                self.assertIn(field, item)
+                self.assertGreaterEqual(item[field], 0.0)
+
     def test_on_selection_fires_once_before_the_build_and_enables_resume(self):
         """The hook exists so hours of selection survive an interruption. Assert
         the property that matters -- what it hands back is sufficient to resume --

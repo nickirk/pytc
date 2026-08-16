@@ -823,6 +823,18 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         # The plan validates and resolves all BPC tuning before AO evaluation.
         bpc_policy = resolved_plan["bpc_policy"]
         n_topup_eff = bpc_policy["n_topup"]
+        # Per-round stage timings are collected ALWAYS, not behind a flag.
+        # `stage_stats` existed on the selector but no production caller ever
+        # supplied it -- the only `stage_stats=` argument in the whole product
+        # was in a unit test. So every per-stage number, including the
+        # `materialisation_seconds` bucket added to attribute the async device
+        # read, was unreachable from a real build: the instrumentation existed
+        # and observed nothing. A profiling run would have returned no breakdown.
+        #
+        # Cost is a dict per round (~600 at 444/cc-pvtz), alongside `bpc_rounds`
+        # which already carries the per-round candidate indices, so this is much
+        # the smaller of the two.
+        selection_stage_stats = []
         pivots, selection_factor, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
             batch_size=bpc_policy["batch_size"],
@@ -830,6 +842,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             candidate_oversampling=bpc_policy["candidate_oversampling"],
             n_topup=n_topup_eff,
             blocked_projection=bpc_policy["blocked_projection"],
+            stage_stats=selection_stage_stats,
         )
         # Same release as the streamed branch above; see that comment.
         del selection_factor
@@ -842,6 +855,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             "bpc_n_topup_clamped_to_rank":
                 bpc_policy["n_topup_clamped_to_rank"],
             "bpc_rounds": rounds,
+            "bpc_stage_stats": selection_stage_stats,
             "bpc_joint_within_batch_exact_pivoting": True,
             "bpc_blocked_projection": bpc_policy["blocked_projection"],
         })
