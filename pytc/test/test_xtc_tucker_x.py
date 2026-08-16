@@ -12,6 +12,7 @@ import numpy as np
 from pyscf import gto, scf
 
 from pytc import xtc as xtc_mod
+from pytc.df import LauxHMatrixConfig
 from pytc.jastrow.rexp import REXP
 from pytc.solver import jax_xtc_ccsd
 
@@ -26,6 +27,7 @@ class _FakeTuckerBuild:
         self.x = np.asarray(x)
         self.n_orb = self.x.shape[0]
         self.phi_isdf = np.eye(self.n_orb)
+        self.grid_points = np.zeros((self.n_orb, 3))
         self.panel_shapes = []
 
     def _get_mf_dm(self):
@@ -196,6 +198,82 @@ class TestStreamedTuckerBuild(unittest.TestCase):
                 fake, None, np.ones((4, 2)),
             )
 
+    def test_rank_controls_reject_silent_coercions(self):
+        fake = _FakeTuckerBuild(np.zeros((4, 4, 4)))
+        invalid_controls = (
+            {"n_factor": 1.9},
+            {"n_factor": True},
+            {"n_factor": 0},
+            {"n_factor": 5},
+            {"n_factor": 2, "oversampling": -3},
+            {"n_factor": 2, "oversampling": 2.9},
+            {"n_factor": 2, "orb_block_size": 0},
+            {"n_factor": 2, "orb_block_size": 1.5},
+            {"n_factor": 2, "seed": True},
+        )
+        for controls in invalid_controls:
+            with self.subTest(controls=controls), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                xtc_mod.ISDFXTC.select_tucker_x_orbital_basis(
+                    fake, None, **controls
+                )
+
+    def test_nonfinite_or_complex_basis_is_rejected_before_cast(self):
+        fake = _FakeTuckerBuild(np.zeros((4, 4, 4)))
+        invalid_bases = (
+            np.full((4, 2), np.nan),
+            np.full((4, 2), np.inf),
+            np.eye(4, 2, dtype=np.complex128) * (1.0 + 1.0j),
+        )
+        for basis in invalid_bases:
+            with self.subTest(dtype=basis.dtype), self.assertRaisesRegex(
+                ValueError, "finite|real-valued"
+            ):
+                xtc_mod.ISDFXTC.compute_tucker_x_core(fake, None, basis)
+
+    def test_invalid_sketch_probes_and_outputs_are_rejected(self):
+        fake = _FakeTuckerBuild(np.zeros((4, 4, 4)))
+        ranges = (slice(None), slice(None), slice(None), slice(None))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            xtc_mod.ISDFXTC._compute_X_sketch(
+                fake,
+                None,
+                ranges,
+                L_aux=object(),
+                omega_s=np.full((4, 2), np.nan),
+                omega_c=np.ones((4, 2)),
+            )
+        with self.assertRaisesRegex(ValueError, "real-valued"):
+            xtc_mod.ISDFXTC._compute_X_sketch(
+                fake,
+                None,
+                ranges,
+                L_aux=object(),
+                omega_s=np.ones((4, 2)),
+                omega_c=np.ones((4, 2), dtype=complex),
+            )
+
+        with mock.patch.object(
+            fake, "_compute_X_sketch", return_value=np.full((2, 2), np.nan)
+        ):
+            with self.assertRaisesRegex(ValueError, "X sketch panel.*finite"):
+                xtc_mod.ISDFXTC.select_tucker_x_orbital_basis(
+                    fake, None, 2, oversampling=0, orb_block_size=2
+                )
+
+    def test_nonfinite_or_complex_core_is_rejected(self):
+        for invalid_value in (np.nan, np.inf, 1.0j):
+            x = np.zeros((4, 4, 4), dtype=np.asarray(invalid_value).dtype)
+            x[0, 0, 0] = invalid_value
+            fake = _FakeTuckerBuild(x)
+            with self.subTest(value=invalid_value), self.assertRaisesRegex(
+                ValueError, "Tucker-X core.*finite|Tucker-X core.*real-valued"
+            ):
+                xtc_mod.ISDFXTC.compute_tucker_x_core(
+                    fake, None, np.eye(4)
+                )
+
 
 class TestTuckerXSolverViews(unittest.TestCase):
     """The production tile and normal-order paths accept X_tucker only."""
@@ -301,6 +379,61 @@ class TestRealFactorOnlyH2(unittest.TestCase):
                 self.assertNotIn("X", handle)
                 self.assertNotIn("X_rm", handle)
                 self.assertTrue({"K1_kernel", "K3_kernel", "L_aux"} <= set(handle))
+
+    def test_source_free_builder_composes_hmatrix_and_exposes_provenance(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
+            unit="Angstrom", verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        jparams = {"alpha": jnp.array([1.0])}
+        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
+        isdf = xtc_mod.ISDFXTC.from_xtc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True,
+        )
+        permissive = LauxHMatrixConfig(128, 0.05, 1e-2, 16, 16)
+        direct = isdf.build_tucker_x_kernels_direct(
+            jparams,
+            base.n_orb,
+            oversampling=2,
+            seed=37,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+            reuse_aux_kernels=True,
+            use_laux_fast_grad=True,
+            use_laux_exact_split=True,
+            laux_hmatrix=permissive,
+        )
+
+        self.assertNotIn("X", direct.isdf_kernels)
+        self.assertIn("X_tucker", direct.isdf_kernels)
+        metadata = direct.laux_build_metadata
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.mode, "interpolative-cur-v1")
+        self.assertEqual(
+            metadata.config_fingerprint,
+            permissive.cache_tag + "-split-fast",
+        )
+        self.assertGreater(metadata.far_blocks, 0)
+        self.assertGreater(metadata.accepted_far_blocks, 0)
+        leaves = jax.tree_util.tree_leaves(direct)
+        self.assertFalse(any(leaf is metadata for leaf in leaves))
+
+        fallback_heavy = isdf.isdf(
+            jparams,
+            batch_size=64,
+            host_grid_block_size=512,
+            reuse_aux_kernels=True,
+            use_laux_fast_grad=True,
+            use_laux_exact_split=True,
+            laux_hmatrix=LauxHMatrixConfig(128, 0.05, 0.0, 16, 16),
+        )
+        fallback_metadata = fallback_heavy.laux_build_metadata
+        self.assertEqual(fallback_metadata.far_blocks, metadata.far_blocks)
+        self.assertGreater(
+            fallback_metadata.direct_fallbacks, metadata.direct_fallbacks
+        )
 
     def test_source_free_full_rank_factor_view_matches_dense_x(self):
         """The direct builder needs no materialized-X cache to recover full X."""

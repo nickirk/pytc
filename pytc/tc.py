@@ -1,6 +1,7 @@
 """JAX implementation of Transcorrelated method."""
 
 import contextlib
+from dataclasses import dataclass
 import threading
 import weakref
 from typing import Any
@@ -37,6 +38,24 @@ def _laux_gradient_mode(use_fast, use_exact_split, hmatrix_config=None):
         "split" if use_exact_split else "",
         "fast" if use_fast else "direct",
     )))
+
+
+@dataclass(frozen=True)
+class LauxBuildMetadata:
+    """Durable scalar provenance for an in-core hierarchical L_aux build."""
+
+    mode: str
+    near_blocks: int
+    far_blocks: int
+    direct_fallbacks: int
+    far_rank_max: int
+    far_rank_mean: float
+    heldout_error_max: float
+    config_fingerprint: str
+
+    @property
+    def accepted_far_blocks(self):
+        return self.far_blocks - self.direct_fallbacks
 
 
 def _panel_blk_overrides():
@@ -754,6 +773,8 @@ class ISDFTC(TC):
         phi: ISDF basis for density (Nb, N_fused)
         grad_phi: ISDF basis for gradients (Nb, N_fused, 3)
         isdf_kernels: Dictionary storing precomputed kernels (U1, U3)
+        laux_build_metadata: Non-array provenance for a hierarchical L_aux
+            build, excluded from the numeric pytree.
     """
     xi_phi: jnp.ndarray = struct.field(default=None)
     xi_grad: jnp.ndarray = struct.field(default=None)
@@ -763,6 +784,9 @@ class ISDFTC(TC):
     isdf_kernels: dict = struct.field(default=None, pytree_node=True)
     is_incore: bool = struct.field(default=False, pytree_node=False)
     save_path: str = struct.field(default=None, pytree_node=False)
+    laux_build_metadata: LauxBuildMetadata = struct.field(
+        default=None, pytree_node=False
+    )
 
     def _get_fixed_rank_block_size(self):
         """Return a fixed rank_block_size that is safe for all orbital slices.
@@ -934,7 +958,18 @@ class ISDFTC(TC):
         return cache
 
     @classmethod
-    def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
+    def from_tc(
+        cls,
+        tc_obj,
+        n_rank=None,
+        is_incore=False,
+        save_path=None,
+        ls_grid_batch_size=16384,
+        fixed_pivots=None,
+        batch_size=1,
+        candidate_oversampling=2,
+        n_topup=0,
+    ):
         """Initialize ISDFTC object from TC object.
         
         Args:
@@ -943,6 +978,12 @@ class ISDFTC(TC):
             is_incore: Whether to perform in-core decomposition
             save_path: Path to save ISDF kernels
             ls_grid_batch_size: Batch size for grid decomposition in isdf_decompose
+            fixed_pivots: Optional fixed pivot sequence.
+            batch_size: Exact columns retained per blocked pivot round. One
+                preserves exact greedy pivot selection.
+            candidate_oversampling: Candidate-pool multiplier for exact
+                within-pool re-pivoting.
+            n_topup: Final exact-greedy singleton pivots after blocked rounds.
             
         Returns:
             ISDFTC: Initialized ISDFTC object
@@ -955,7 +996,10 @@ class ISDFTC(TC):
         logger.info("ISDFTC.from_tc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
-            is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
+            is_incore=is_incore, save_path=save_path,
+            grid_batch_size=ls_grid_batch_size, fixed_pivots=fixed_pivots,
+            batch_size=batch_size,
+            candidate_oversampling=candidate_oversampling, n_topup=n_topup,
         )
         
         return cls(
@@ -1394,25 +1438,22 @@ class ISDFTC(TC):
 
         if not isinstance(config, LauxHMatrixConfig):
             raise TypeError("laux_hmatrix must be a LauxHMatrixConfig")
+        if not self.is_incore:
+            raise ValueError(
+                "laux_hmatrix is currently in-core only; out-of-core "
+                "construction requires panelized xi_phi and output support"
+            )
         if jax.local_device_count() != 1:
             raise ValueError("laux_hmatrix requires exactly one local device")
 
-        xi_file = None
-        reuse_xi_file_for_output = False
         if self.xi_phi is None:
-            if not self.save_path:
-                raise ValueError(
-                    "laux_hmatrix needs in-memory xi_phi or an ISDF store"
-                )
-            same_output = save_path and (
-                os.path.abspath(self.save_path) == os.path.abspath(save_path)
+            raise ValueError(
+                "in-core laux_hmatrix requires in-memory xi_phi"
             )
-            xi_file = h5py.File(self.save_path, "a" if same_output else "r")
-            reuse_xi_file_for_output = bool(same_output)
-            xi_phi = np.asarray(xi_file["xi_phi"])
-        else:
-            xi_phi = np.asarray(self.xi_phi)
+        xi_phi = np.asarray(self.xi_phi)
 
+        output_file = None
+        keep_output_open = False
         try:
             grid_points = np.asarray(self.grid_points)
             weights = np.asarray(self.weights)
@@ -1457,6 +1498,18 @@ class ISDFTC(TC):
                 metadata["far_rank_max"],
                 metadata["heldout_error_max"],
             )
+            build_metadata = LauxBuildMetadata(
+                mode=str(metadata["mode"]),
+                near_blocks=int(metadata["near_blocks"]),
+                far_blocks=int(metadata["far_blocks"]),
+                direct_fallbacks=int(metadata["far_direct_fallbacks"]),
+                far_rank_max=int(metadata["far_rank_max"]),
+                far_rank_mean=float(metadata["far_rank_mean"]),
+                heldout_error_max=float(metadata["heldout_error_max"]),
+                config_fingerprint=_laux_gradient_mode(
+                    use_laux_fast_grad, use_laux_exact_split, config
+                ),
+            )
 
             if use_laux_exact_split:
                 one_grid_gradient = self.jastrow_factor.laux_one_grid_gradient(
@@ -1483,13 +1536,9 @@ class ISDFTC(TC):
                     )
 
             if not save_path:
-                return l_aux, h_aux
+                return l_aux, h_aux, build_metadata
 
-            if reuse_xi_file_for_output:
-                output_file = xi_file
-                xi_file = None
-            else:
-                output_file = h5py.File(save_path, "a")
+            output_file = h5py.File(save_path, "a")
             for name in ("L_aux", "H_aux"):
                 if name in output_file:
                     del output_file[name]
@@ -1514,15 +1563,16 @@ class ISDFTC(TC):
             for name, value in attributes.items():
                 output_file.attrs[f"pytc_laux_hmatrix_{name}"] = value
             output_file.flush()
-            return l_out, h_out
+            keep_output_open = True
+            return l_out, h_out, build_metadata
         finally:
-            if xi_file is not None:
-                xi_file.close()
+            if output_file is not None and not keep_output_open:
+                output_file.close()
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
                        host_grid_block_size=None, include_h_aux=False,
                        use_laux_fast_grad=False, use_laux_exact_split=False,
-                       laux_hmatrix=None):
+                       laux_hmatrix=None, return_build_metadata=False):
         """Compute L_aux, and optionally its exact squared-gradient companion.
 
         When ``include_h_aux`` is true this also forms
@@ -1550,12 +1600,20 @@ class ISDFTC(TC):
                     "laux_hmatrix requires include_h_aux=True so H_aux is "
                     "approximated independently"
                 )
-            return self._compute_L_aux_hmatrix(
+            result = self._compute_L_aux_hmatrix(
                 jastrow_params,
                 save_path,
                 use_laux_fast_grad,
                 use_laux_exact_split,
                 laux_hmatrix,
+            )
+            if return_build_metadata:
+                return result
+            return result[:2]
+
+        if return_build_metadata:
+            raise ValueError(
+                "return_build_metadata is only valid with laux_hmatrix"
             )
 
         n_devices = jax.local_device_count()
@@ -1832,12 +1890,22 @@ class ISDFTC(TC):
             laux_hmatrix: Optional ``LauxHMatrixConfig``.  When present, the
                 residual pair gradient uses direct near blocks and sampled-CUR
                 far blocks.  This requires ``reuse_aux_kernels=True`` and is
-                never selected by default.
+                currently in-core only, and is never selected by default.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+        if laux_hmatrix is not None:
+            from pytc.df.hmatrix import LauxHMatrixConfig
+
+            if not isinstance(laux_hmatrix, LauxHMatrixConfig):
+                raise TypeError("laux_hmatrix must be a LauxHMatrixConfig")
+            if not self.is_incore:
+                raise ValueError(
+                    "laux_hmatrix is currently in-core only; out-of-core "
+                    "construction requires panelized xi_phi and output support"
+                )
         if reuse_aux_kernels and not self.is_incore and not out_path:
             raise ValueError(
                 "out-of-core reuse_aux_kernels requires save_path so L_aux "
@@ -1848,15 +1916,11 @@ class ISDFTC(TC):
                 "laux_hmatrix requires reuse_aux_kernels=True so H_aux "
                 "enters the K3 recovery"
             )
-        if laux_hmatrix is not None:
-            from pytc.df.hmatrix import LauxHMatrixConfig
-
-            if not isinstance(laux_hmatrix, LauxHMatrixConfig):
-                raise TypeError("laux_hmatrix must be a LauxHMatrixConfig")
         laux_gradient_mode = _laux_gradient_mode(
             use_laux_fast_grad, use_laux_exact_split, laux_hmatrix
         )
         kernels = {}
+        laux_build_metadata = None
         # An opt-in auxiliary-reuse request must execute that path, not
         # silently accept a pre-existing direct K1/K3 cache.
         if out_path and os.path.exists(out_path) and not reuse_aux_kernels:
@@ -1891,7 +1955,10 @@ class ISDFTC(TC):
                             kernels['L_aux'] = f['L_aux']
 
                         logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
-                        return self.replace(isdf_kernels=kernels)
+                        return self.replace(
+                            isdf_kernels=kernels,
+                            laux_build_metadata=None,
+                        )
                 
                 # If we are here, keys are missing. Close the file!
                 if f is not None:
@@ -1902,7 +1969,7 @@ class ISDFTC(TC):
         if reuse_aux_kernels:
             logger.info("  Computing L_aux and H_aux for exact K1/K3 recovery...")
             aux_build_start = time.perf_counter()
-            L_aux, H_aux = self._compute_L_aux(
+            aux_result = self._compute_L_aux(
                 jastrow_params,
                 batch_size,
                 save_path=out_path if not self.is_incore else None,
@@ -1911,7 +1978,12 @@ class ISDFTC(TC):
                 use_laux_fast_grad=use_laux_fast_grad,
                 use_laux_exact_split=use_laux_exact_split,
                 laux_hmatrix=laux_hmatrix,
+                return_build_metadata=laux_hmatrix is not None,
             )
+            if laux_hmatrix is not None:
+                L_aux, H_aux, laux_build_metadata = aux_result
+            else:
+                L_aux, H_aux = aux_result
             logger.info(
                 "  L_aux/H_aux construction completed in %.4f s",
                 time.perf_counter() - aux_build_start,
@@ -2031,7 +2103,11 @@ class ISDFTC(TC):
                 
         logger.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
         
-        return self.replace(isdf_kernels=kernels, save_path=out_path)
+        return self.replace(
+            isdf_kernels=kernels,
+            save_path=out_path,
+            laux_build_metadata=laux_build_metadata,
+        )
 
     def _accumulate_transpose_block(self, result_np, U1, U3, ranges_T,
                                     scale, n_sub=2, device=None):

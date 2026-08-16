@@ -21,6 +21,7 @@ from pytc.df.pivots import (
     phi_diagonal,
     pivoted_cholesky_streaming,
 )
+from pytc.tc import ISDFTC
 from pytc.xtc import ISDFXTC
 
 
@@ -371,6 +372,45 @@ class TestISDFPivotSelection(unittest.TestCase):
                 n_topup=1,
             )
         kwargs = mocked.call_args.kwargs
+        self.assertEqual(kwargs["batch_size"], 8)
+        self.assertEqual(kwargs["candidate_oversampling"], 4)
+        self.assertEqual(kwargs["n_topup"], 1)
+
+    def test_from_tc_forwards_aligned_pivot_controls(self):
+        phi = jnp.ones((2, 6))
+        grad = jnp.ones((2, 6, 3))
+        source = SimpleNamespace(
+            grid_points=jnp.zeros((6, 3)),
+            weights=jnp.ones(6),
+            phi=phi,
+            grad_phi=grad,
+            n_orb=2,
+            grid_lvl=0,
+            jastrow_factor=None,
+            mo_coeff=jnp.eye(2),
+            nocc=1,
+        )
+        fixed_pivots = jnp.asarray([1, 0])
+        decomposition = (
+            phi[:, :2],
+            jnp.ones((2, 6)),
+            grad[:, :2],
+            jnp.ones((2, 6, 3)),
+            fixed_pivots,
+            None,
+        )
+        with patch("pytc.df.isdf_decompose", return_value=decomposition) as mocked:
+            ISDFTC.from_tc(
+                source,
+                n_rank=2,
+                is_incore=True,
+                fixed_pivots=fixed_pivots,
+                batch_size=8,
+                candidate_oversampling=4,
+                n_topup=1,
+            )
+        kwargs = mocked.call_args.kwargs
+        self.assertIs(kwargs["fixed_pivots"], fixed_pivots)
         self.assertEqual(kwargs["batch_size"], 8)
         self.assertEqual(kwargs["candidate_oversampling"], 4)
         self.assertEqual(kwargs["n_topup"], 1)

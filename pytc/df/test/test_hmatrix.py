@@ -1,9 +1,8 @@
 """Numerical and physical controls for the opt-in L_aux hierarchy."""
 
-import tempfile
 import unittest
+from unittest import mock
 
-import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -26,8 +25,14 @@ class TestLauxHMatrixConfig(unittest.TestCase):
         config = LauxHMatrixConfig(8, 0.05, 1e-3, 4, 6)
         self.assertEqual(
             config.cache_tag,
-            "hmatrix[leaf=8,eta=0.05,tol=0.001,rank=4,heldout=6,fallback=1]",
+            "hmatrix[leaf=8,eta=0x1.999999999999ap-5,"
+            "tol=0x1.0624dd2f1a9fcp-10,rank=4,heldout=6,fallback=1]",
         )
+        adjacent = (
+            LauxHMatrixConfig(8, 0.123456781, 1e-3, 4, 6),
+            LauxHMatrixConfig(8, 0.123456782, 1e-3, 4, 6),
+        )
+        self.assertNotEqual(adjacent[0].cache_tag, adjacent[1].cache_tag)
         invalid = (
             (1, 0.05, 1e-3, 4, 6),
             (8, 0.0, 1e-3, 4, 6),
@@ -233,63 +238,36 @@ class TestPhysicalH2ResidualHMatrix(unittest.TestCase):
                 laux_hmatrix=self.exact_config,
             )
 
-    def test_out_of_core_cache_is_recoverable_and_fully_tagged(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = f"{directory}/hmatrix.h5"
-            with h5py.File(path, "w") as handle:
-                handle.create_dataset("xi_phi", data=np.asarray(self.subset.xi_phi))
-                handle.create_dataset("xi_grad", data=np.asarray(self.subset.xi_grad))
+    def test_out_of_core_fails_before_dataset_materialization(self):
+        class FailIfMaterialized:
+            materialized = False
 
-            streamed = self.subset.replace(
-                is_incore=False,
-                xi_phi=None,
-                xi_grad=None,
-                save_path=path,
-            ).isdf(
+            def __array__(self, *args, **kwargs):
+                del args, kwargs
+                self.materialized = True
+                raise AssertionError("xi_phi must not be materialized")
+
+        xi_phi = FailIfMaterialized()
+        out_of_core = self.subset.replace(
+            is_incore=False,
+            xi_phi=xi_phi,
+            save_path="must-not-open.h5",
+        )
+        with mock.patch(
+            "pytc.tc.h5py.File",
+            side_effect=AssertionError("HDF5 must not be opened"),
+        ) as open_file, self.assertRaisesRegex(ValueError, "in-core only"):
+            out_of_core.isdf(
                 self.params,
-                save_path=path,
+                save_path="must-not-open.h5",
                 batch_size=16,
                 host_grid_block_size=64,
                 reuse_aux_kernels=True,
                 use_laux_fast_grad=True,
                 laux_hmatrix=self.exact_config,
             )
-            observed = {
-                key: np.asarray(streamed.isdf_kernels[key])
-                for key in ("L_aux", "K1_kernel", "K3_kernel")
-            }
-            streamed.isdf_kernels["L_aux"].file.close()
-
-            atol = 2e-12 if jax.config.x64_enabled else 2e-6
-            references = {
-                "L_aux": self.direct_l,
-                "K1_kernel": self.direct_kernels["K1_kernel"],
-                "K3_kernel": self.direct_kernels["K3_kernel"],
-            }
-            for key in observed:
-                np.testing.assert_allclose(
-                    observed[key], references[key], rtol=0.0, atol=atol
-                )
-            with h5py.File(path, "r") as handle:
-                self.assertEqual(
-                    handle.attrs["pytc_kmat_kernel_mode"], "aux-recovery"
-                )
-                self.assertEqual(
-                    handle.attrs["pytc_laux_gradient_mode"],
-                    self.exact_config.cache_tag + "-fast",
-                )
-                self.assertEqual(
-                    handle.attrs["pytc_laux_hmatrix_mode"],
-                    "interpolative-cur-v1",
-                )
-                self.assertGreater(
-                    handle.attrs["pytc_laux_hmatrix_far_blocks"], 0
-                )
-                self.assertEqual(
-                    handle.attrs["pytc_laux_hmatrix_far_fallbacks"],
-                    handle.attrs["pytc_laux_hmatrix_far_blocks"],
-                )
-                self.assertNotIn("H_aux", handle)
+        open_file.assert_not_called()
+        self.assertFalse(xi_phi.materialized)
 
 
 class TestH2XTCWithHMatrix(unittest.TestCase):

@@ -242,15 +242,19 @@ class TestISDFXTCPanelization(unittest.TestCase):
         finally:
             os.remove(path)
 
-    def test_delta_u_cache_rejects_a_different_laux_mode(self):
-        config = LauxHMatrixConfig(8, 0.05, 1e-3, 4, 4)
+    def test_delta_u_cache_rejects_adjacent_float_laux_modes(self):
+        cached_config = LauxHMatrixConfig(8, 0.123456781, 1e-3, 4, 4)
+        requested_config = LauxHMatrixConfig(8, 0.123456782, 1e-3, 4, 4)
+        self.assertNotEqual(cached_config.cache_tag, requested_config.cache_tag)
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "stale_delta_u.h5")
             with h5py.File(path, "w") as store:
                 store.create_dataset("D", data=np.full((1, 1), 7.0))
                 store.create_dataset("X", data=np.full((1, 1, 1), 7.0))
                 store.attrs["pytc_xtc_x_mode"] = "full"
-                store.attrs["pytc_xtc_laux_gradient_mode"] = "direct"
+                store.attrs["pytc_xtc_laux_gradient_mode"] = (
+                    cached_config.cache_tag + "-direct"
+                )
 
             rebuilt = {
                 "D": np.full((1, 1), 3.0),
@@ -267,7 +271,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
                     self.jparams,
                     save_path=path,
                     reuse_aux_kernels=True,
-                    laux_hmatrix=config,
+                    laux_hmatrix=requested_config,
                 )
 
             compute.assert_called_once()
@@ -275,7 +279,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
             with h5py.File(path, "r") as store:
                 self.assertEqual(
                     store.attrs["pytc_xtc_laux_gradient_mode"],
-                    config.cache_tag + "-direct",
+                    requested_config.cache_tag + "-direct",
                 )
 
     def test_delta_u_tile_assembly_matches_public_api(self):

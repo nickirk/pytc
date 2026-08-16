@@ -77,8 +77,8 @@ class LauxHMatrixConfig:
     def cache_tag(self) -> str:
         return (
             "hmatrix"
-            f"[leaf={self.leaf_size},eta={self.eta:.8g},"
-            f"tol={self.tolerance:.8g},rank={self.max_rank},"
+            f"[leaf={self.leaf_size},eta={float(self.eta).hex()},"
+            f"tol={float(self.tolerance).hex()},rank={self.max_rank},"
             f"heldout={self.heldout_size},fallback={int(self.direct_fallback)}]"
         )
 

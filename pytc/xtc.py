@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial, reduce
+import operator
 import numpy as np
 import os
 import gc
@@ -31,6 +32,36 @@ from . import kmat as kmat_jax
 from .utils import sharding_core
 
 logger = logging.getLogger(__name__)
+
+
+def _strict_integer_control(name, value, *, minimum=None, maximum=None):
+    """Return an integer control without silently truncating or coercing it."""
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be an integer, not bool")
+    try:
+        result = operator.index(value)
+    except TypeError as error:
+        raise TypeError(f"{name} must be an integer, got {value!r}") from error
+    result = int(result)
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {result}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{name} must be at most {maximum}, got {result}")
+    return result
+
+
+def _finite_real_array(name, value):
+    """Convert a numeric input only after rejecting complex/non-finite data."""
+    array = np.asarray(value)
+    if np.iscomplexobj(array):
+        raise ValueError(f"{name} must be real-valued; complex inputs are unsupported")
+    try:
+        array = np.asarray(array, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a real numeric array") from error
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+    return array
 
 
 def _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z):
@@ -1230,7 +1261,11 @@ class ISDFXTC(XTC, ISDFTC):
                                 logger.debug(f"  rank-major X_rm found, shape: {f['X_rm'].shape}")
                                 kernels['X_rm'] = f['X_rm']
                         logger.debug(f"ISDF intermediates (Delta U) loaded from file in {time.perf_counter() - start_time:.4f} s")
-                        result = self.replace(isdf_kernels=kernels, save_path=out_path)
+                        result = self.replace(
+                            isdf_kernels=kernels,
+                            save_path=out_path,
+                            laux_build_metadata=isdf_tc.laux_build_metadata,
+                        )
                         keep_open = not self.is_incore
                         return result
             except (IOError, KeyError) as e:
@@ -1264,7 +1299,11 @@ class ISDFXTC(XTC, ISDFTC):
                 
         logger.info(f"ISDF intermediates (Delta U) computed in {time.perf_counter() - start_time:.4f} s")
         
-        return self.replace(isdf_kernels=kernels, save_path=out_path)
+        return self.replace(
+            isdf_kernels=kernels,
+            save_path=out_path,
+            laux_build_metadata=isdf_tc.laux_build_metadata,
+        )
 
     def compute_delta_u_kernels(
         self,
@@ -1418,14 +1457,17 @@ class ISDFXTC(XTC, ISDFTC):
         a subsequently built Tucker core is an exact representation of X.
         """
         n_orb = int(self.n_orb)
-        n_factor = int(n_factor)
-        if not 1 <= n_factor <= n_orb:
-            raise ValueError(
-                f"n_factor must lie in [1, {n_orb}], got {n_factor}"
-            )
-        oversampling = max(0, int(oversampling))
+        n_factor = _strict_integer_control(
+            "n_factor", n_factor, minimum=1, maximum=n_orb
+        )
+        oversampling = _strict_integer_control(
+            "oversampling", oversampling, minimum=0
+        )
         n_probe = min(n_orb, n_factor + oversampling)
-        orb_block_size = max(1, int(orb_block_size))
+        orb_block_size = _strict_integer_control(
+            "orb_block_size", orb_block_size, minimum=1
+        )
+        seed = _strict_integer_control("seed", seed, minimum=0)
 
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
@@ -1465,11 +1507,19 @@ class ISDFXTC(XTC, ISDFTC):
                 omega_c=omega_c,
                 host_grid_block_size=host_grid_block_size,
             )
-            sketch[r0:r1] = np.asarray(panel_sketch)
+            panel_sketch = _finite_real_array("X sketch panel", panel_sketch)
+            expected_shape = (r1 - r0, n_probe)
+            if panel_sketch.shape != expected_shape:
+                raise ValueError(
+                    "X sketch panel has the wrong shape: "
+                    f"expected {expected_shape}, got {panel_sketch.shape}"
+                )
+            sketch[r0:r1] = panel_sketch
             del panel_sketch
             gc.collect()
 
         basis, _ = np.linalg.qr(sketch, mode='reduced')
+        basis = _finite_real_array("selected orbital basis", basis)
         return basis[:, :n_factor]
 
     def compute_tucker_x_core(
@@ -1487,7 +1537,7 @@ class ISDFXTC(XTC, ISDFTC):
         row space.  The returned core has shape ``(M, M, R)`` and pairs with
         U through ``X[r,s,c] ~= U[r,a] Z[a,b,c] U[s,b]``.
         """
-        u = np.asarray(orbital_basis, dtype=np.float64)
+        u = _finite_real_array("orbital_basis", orbital_basis)
         n_orb = int(self.n_orb)
         if u.ndim != 2 or u.shape[0] != n_orb or not u.shape[1]:
             raise ValueError(
@@ -1518,7 +1568,14 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             orbital_rows=projected_rows,
         )
-        return {'U': u, 'Z': np.asarray(core)}
+        core = _finite_real_array("Tucker-X core", core)
+        expected_shape = (n_factor, n_factor, int(self.phi_isdf.shape[1]))
+        if core.shape != expected_shape:
+            raise ValueError(
+                "Tucker-X core has the wrong shape: "
+                f"expected {expected_shape}, got {core.shape}"
+            )
+        return {'U': u, 'Z': core}
 
     def build_tucker_x_kernels_direct(
         self,
@@ -1534,6 +1591,10 @@ class ISDFXTC(XTC, ISDFTC):
         d_reduce_group_blocks=1,
         r2_tile_size=None,
         gpu_budget_bytes=None,
+        reuse_aux_kernels=False,
+        use_laux_fast_grad=False,
+        use_laux_exact_split=False,
+        laux_hmatrix=None,
     ):
         """Build a factor-only X view without materializing dense ``X``.
 
@@ -1546,6 +1607,8 @@ class ISDFXTC(XTC, ISDFTC):
 
         When ``save_path`` is supplied, the reusable base intermediates may be
         cached there by :class:`ISDFTC`; no dense exchange dataset is created.
+        The accepted L_aux construction controls are forwarded unchanged.
+        ``laux_hmatrix`` is opt-in and currently requires an in-core object.
         """
         if save_path and os.path.exists(save_path):
             with h5py.File(save_path, 'r') as handle:
@@ -1563,6 +1626,10 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             r2_tile_size=r2_tile_size,
             gpu_budget_bytes=gpu_budget_bytes,
+            reuse_aux_kernels=reuse_aux_kernels,
+            use_laux_fast_grad=use_laux_fast_grad,
+            use_laux_exact_split=use_laux_exact_split,
+            laux_hmatrix=laux_hmatrix,
         )
         kernels = dict(base.isdf_kernels)
         l_aux = kernels.pop("L_aux")
@@ -1828,15 +1895,17 @@ class ISDFXTC(XTC, ISDFTC):
         n_grid = self.grid_points.shape[0]
         n_rank = self.phi_isdf.shape[1]
         n_orb = self.phi_isdf.shape[0]
-        omega_s = np.asarray(omega_s, dtype=np.float64)
-        omega_c = np.asarray(omega_c, dtype=np.float64)
+        omega_s = _finite_real_array("omega_s", omega_s)
+        omega_c = _finite_real_array("omega_c", omega_c)
+        if omega_s.ndim != 2 or omega_c.ndim != 2:
+            raise ValueError("omega_s and omega_c must both be rank-2")
         if omega_s.shape[0] != n_orb or omega_c.shape[0] != n_rank:
             raise ValueError(
                 "X sketch probe dimensions disagree with orbital/rank dimensions: "
                 f"omega_s={omega_s.shape}, omega_c={omega_c.shape}, "
                 f"expected ({n_orb}, K) and ({n_rank}, K)"
             )
-        if omega_s.ndim != 2 or omega_c.ndim != 2 or omega_s.shape[1] != omega_c.shape[1]:
+        if omega_s.shape[1] != omega_c.shape[1]:
             raise ValueError("omega_s and omega_c must be rank-2 with equal probe counts")
 
         dm1 = self._get_mf_dm()
