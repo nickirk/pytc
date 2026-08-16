@@ -1,6 +1,5 @@
 import contextlib
 import concurrent.futures
-import copy
 import logging
 import threading
 import time
@@ -55,14 +54,6 @@ def eris_reference_energy(eris):
     return energy.real
 
 
-def _normal_ordered_e_core(reference_energy, fock, oooo, nocc):
-    """Solve the CCSD-container scalar for a supplied normal-order triple."""
-    core = reference_energy - 2 * np.einsum('ii->', fock[:nocc, :nocc])
-    core += 2 * np.einsum('iijj->', oooo)
-    core -= np.einsum('ijji->', oooo)
-    return core.real
-
-
 def resolve_vvvv_disk_block_size(nocc, nvir, cc, *, kind, n_fused=None):
     """Resolve a bounded first-axis block for disk-backed VVVV I/O.
 
@@ -109,100 +100,6 @@ def _record_vvvv_write_receipt(eris, *, nvir, p_blksize, r_blksize):
     eris.vvvv_write_receipt = receipt
     return receipt
 
-
-def make_x_normal_ordered_eris_view(
-        full_eris, no_x_eris, drop_x_component, *,
-        max_materialized_vvvv_bytes=256 * 1024**2):
-    """Construct a reference-normal-ordered X-channel ERI view.
-
-    ``full_eris`` and ``no_x_eris`` must be built from the *same* persisted
-    full-X kernel store.  Their difference is then the exact linear X
-    normal-order triple.  The returned view combines its scalar, Fock matrix,
-    and two-body ERIs as one of two internally consistent Hamiltonians:
-
-    ``drop_x_component="zero_one"``
-        Remove the X scalar and one-body normal-ordered pieces, while retaining
-        the full two-body operator: ``(E_no-X, F_no-X, Gamma_full)``.
-
-    ``drop_x_component="two_body"``
-        Retain the X scalar and one-body normal-ordered pieces, while removing
-        X from the two-body operator: ``(E_full, F_full, Gamma_no-X)``.
-
-    This deliberately does *not* call ``ao2mo``/``make_eris``: those paths
-    re-contract the two-body ERIs into a Fock matrix and would undo the
-    reference-normal-ordering construction.  A disk-backed VVVV dataset is
-    retained as a streamed read-only view, so the JAX disk contraction reads
-    the selected full/no-X two-body source directly.  An in-memory VVVV is
-    copied and bounded by ``max_materialized_vvvv_bytes``.  ``None`` is never
-    allowed because the JAX on-the-fly path re-reads ``xtc_obj`` and could
-    silently restore X.
-    """
-    if drop_x_component not in ("zero_one", "two_body"):
-        raise ValueError(
-            "drop_x_component must be 'zero_one' or 'two_body', got "
-            f"{drop_x_component!r}"
-        )
-    if full_eris.nocc != no_x_eris.nocc:
-        raise ValueError("full and no-X ERIs must use the same occupied space")
-    if np.asarray(full_eris.fock).shape != np.asarray(no_x_eris.fock).shape:
-        raise ValueError("full and no-X ERIs must use the same MO space")
-
-    if drop_x_component == "zero_one":
-        reference_source = no_x_eris
-        two_body_source = full_eris
-    else:
-        reference_source = full_eris
-        two_body_source = no_x_eris
-
-    vvvv = getattr(two_body_source, 'vvvv', None)
-    if vvvv is None:
-        raise ValueError(
-            "A normal-ordered X ERI view requires a materialized VVVV block; "
-            "the on-the-fly VVVV path reads xtc_obj and cannot represent this view"
-        )
-    # A shallow copy keeps the ordinary ERI blocks in their existing backing
-    # store.  The source ERIs are retained below, and the view has no owning
-    # HDF5 handle, so closing/destructing it cannot close a source container.
-    view = copy.copy(two_body_source)
-    view.feri = None
-    view._normal_ordered_x_sources = (full_eris, no_x_eris)
-    view.normal_ordered_x_component = drop_x_component
-    if isinstance(vvvv, h5py.Dataset):
-        # The solver already has a streamed HDF5 contraction.  Keeping the
-        # selected source dataset prevents a multi-GiB VVVV copy for H10 and,
-        # unlike the dynamic path, cannot consult ``xtc_obj``.
-        view.vvvv = vvvv
-        view.vvvv_is_streamed_normal_ordered_source = True
-    else:
-        vvvv_nbytes = int(np.prod(vvvv.shape)) * np.dtype(vvvv.dtype).itemsize
-        if vvvv_nbytes > max_materialized_vvvv_bytes:
-            raise ValueError(
-                "Normal-ordered X ERI view would materialize a VVVV block of "
-                f"{vvvv_nbytes / 1024**2:.1f} MiB (limit "
-                f"{max_materialized_vvvv_bytes / 1024**2:.1f} MiB)"
-            )
-        view.vvvv = np.array(vvvv, copy=True)
-        view.vvvv_is_streamed_normal_ordered_source = False
-
-    target_fock = np.array(reference_source.fock, copy=True)
-    target_fock.setflags(write=False)
-    view.fock = target_fock
-    view.fvo = np.array(target_fock[view.nocc:, :view.nocc], copy=True)
-    view.fvo.setflags(write=False)
-    view.mo_energy = np.array(np.diag(target_fock), copy=True)
-    view.mo_energy.setflags(write=False)
-
-    target_reference_energy = eris_reference_energy(reference_source)
-    view.e_core = _normal_ordered_e_core(
-        target_reference_energy, target_fock, np.asarray(view.oooo), view.nocc
-    )
-    # This catches a scalar rebalance error immediately, before a CCSD solve
-    # could hide it in a total energy.
-    if not np.allclose(
-            eris_reference_energy(view), target_reference_energy,
-            rtol=1e-12, atol=1e-12):
-        raise RuntimeError("failed to preserve the requested normal-ordered reference energy")
-    return view
 
 class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""

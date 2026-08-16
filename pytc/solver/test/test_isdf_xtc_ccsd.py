@@ -7,10 +7,8 @@ production.  Identity checks alone cannot catch that class: they prove
 which code would run, not that everything it calls exists.
 """
 
-import os
 import types
 import unittest
-from unittest import mock
 
 import numpy as np
 from pyscf import gto, scf
@@ -135,22 +133,6 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         eris = types.SimpleNamespace(vvvv=np.zeros((1, 1, 1, 1)))
         with self.assertRaisesRegex(RuntimeError, "materialized VVVV"):
             cc._contract_vvvv_t2(cc, None, eris, None)
-
-    def test_hook_refuses_every_residual_x_drop_mode(self):
-        """Factorized VVVV must never silently retain X for a no-X study."""
-        eris = types.SimpleNamespace(vvvv=None)
-        clean_env = {
-            "PYTC_XTC_DROP_X": "0",
-            "PYTC_XTC_DROP_X_RESIDUAL": "0",
-        }
-        for flag in clean_env:
-            with self.subTest(flag=flag), mock.patch.dict(
-                os.environ, {**clean_env, flag: "1"}
-            ):
-                cc = self._make_cc()
-                with self.assertRaisesRegex(RuntimeError, flag):
-                    cc._contract_vvvv_t2(cc, None, eris, None)
-
 
 class PreloadSuppressionTest(unittest.TestCase):
     """The whole-X host preload fires on the materialized parent but is

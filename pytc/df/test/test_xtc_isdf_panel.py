@@ -9,11 +9,10 @@ import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 
-from pytc import xtc as xtc_module
+from pytc.df.hmatrix import LauxHMatrixConfig
 from pytc.jastrow.rexp import REXP
 from pytc.tc import ISDFTC
 from pytc.xtc import XTC, ISDFXTC
-from pytc.solver import jax_xtc_ccsd
 
 
 jax.config.update("jax_enable_x64", True)
@@ -39,100 +38,54 @@ class TestISDFXTCPanelization(unittest.TestCase):
         n_rank = max(8, 3 * xtc.n_orb)
         cls.isdf_xtc = ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
 
-    def test_drop_x_preserves_direct_kernel_and_zeroes_exchange(self):
-        """The no-X study lever only removes the exchange kernel on a real toy system."""
-        kwargs = dict(
-            batch_size=64,
-            orb_block_size=2,
-            host_grid_block_size=512,
-        )
-        l_aux = self.isdf_xtc._compute_L_aux(
-            self.jparams,
-            batch_size=kwargs["batch_size"],
-            host_grid_block_size=kwargs["host_grid_block_size"],
-        )
-        with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "0"}):
-            full = self.isdf_xtc.compute_delta_u_kernels(
-                self.jparams, L_aux=l_aux, **kwargs
-            )
-        with mock.patch.dict(os.environ, {"PYTC_XTC_DROP_X": "1"}):
-            no_x = self.isdf_xtc.compute_delta_u_kernels(
-                self.jparams, L_aux=l_aux, **kwargs
-            )
-
-        np.testing.assert_array_equal(np.asarray(no_x["D"]), np.asarray(full["D"]))
-        self.assertGreater(np.linalg.norm(np.asarray(full["X"])), 0.0)
-        np.testing.assert_array_equal(np.asarray(no_x["X"]), np.zeros_like(no_x["X"]))
-        full_delta_u = self.isdf_xtc.replace(isdf_kernels=full).get_delta_U(
-            self.jparams
-        )
-        no_x_delta_u = self.isdf_xtc.replace(isdf_kernels=no_x).get_delta_U(
-            self.jparams
-        )
-        self.assertGreater(
-            np.linalg.norm(np.asarray(full_delta_u - no_x_delta_u)), 0.0,
-            "The exchange kernel must affect the downstream Delta-U integral.",
-        )
-
     def test_aux_recovered_kernels_preserve_h2_xtc_normal_order(self):
         """Exact auxiliary K recovery must leave the full H2 XTC view intact."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
-        clean_env = {
-            "PYTC_XTC_DROP_X": "0",
-            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
-            "PYTC_XTC_DROP_X_RESIDUAL": "0",
-        }
-        with mock.patch.dict(os.environ, clean_env):
-            direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
-            recovered = self.isdf_xtc.isdf(
-                self.jparams, reuse_aux_kernels=True, **kwargs
-            )
+        direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
+        recovered = self.isdf_xtc.isdf(
+            self.jparams, reuse_aux_kernels=True, **kwargs
+        )
 
-            np.testing.assert_allclose(
-                np.asarray(recovered.isdf_kernels["K1_kernel"]),
-                np.asarray(direct.isdf_kernels["K1_kernel"]),
-                rtol=0,
-                atol=2e-12,
-            )
-            np.testing.assert_allclose(
-                np.asarray(recovered.isdf_kernels["K3_kernel"]),
-                np.asarray(direct.isdf_kernels["K3_kernel"]),
-                rtol=0,
-                atol=2e-12,
-            )
-            np.testing.assert_allclose(
-                np.asarray(recovered.get_2b(self.jparams)),
-                np.asarray(direct.get_2b(self.jparams)),
-                rtol=0,
-                atol=2e-12,
-            )
+        np.testing.assert_allclose(
+            np.asarray(recovered.isdf_kernels["K1_kernel"]),
+            np.asarray(direct.isdf_kernels["K1_kernel"]),
+            rtol=0,
+            atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered.isdf_kernels["K3_kernel"]),
+            np.asarray(direct.isdf_kernels["K3_kernel"]),
+            rtol=0,
+            atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered.get_2b(self.jparams)),
+            np.asarray(direct.get_2b(self.jparams)),
+            rtol=0,
+            atol=2e-12,
+        )
 
-            direct_h = direct.get_delta_h(self.jparams)
-            recovered_h = recovered.get_delta_h(self.jparams)
-            np.testing.assert_allclose(
-                np.asarray(recovered_h), np.asarray(direct_h), rtol=0, atol=2e-12
-            )
-            np.testing.assert_allclose(
-                np.asarray(recovered.get_delta_U(self.jparams)),
-                np.asarray(direct.get_delta_U(self.jparams)),
-                rtol=0,
-                atol=2e-12,
-            )
-            self.assertAlmostEqual(
-                float(recovered.get_const(self.jparams, delta_h=recovered_h)),
-                float(direct.get_const(self.jparams, delta_h=direct_h)),
-                places=12,
-            )
+        direct_h = direct.get_delta_h(self.jparams)
+        recovered_h = recovered.get_delta_h(self.jparams)
+        np.testing.assert_allclose(
+            np.asarray(recovered_h), np.asarray(direct_h), rtol=0, atol=2e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered.get_delta_U(self.jparams)),
+            np.asarray(direct.get_delta_U(self.jparams)),
+            rtol=0,
+            atol=2e-12,
+        )
+        self.assertAlmostEqual(
+            float(recovered.get_const(self.jparams, delta_h=recovered_h)),
+            float(direct.get_const(self.jparams, delta_h=direct_h)),
+            places=12,
+        )
 
     def test_aux_reuse_streams_out_of_core_xtc_normal_order(self):
         """The production path streams HDF5 auxiliary panels and preserves XTC."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=127)
-        clean_env = {
-            "PYTC_XTC_DROP_X": "0",
-            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
-            "PYTC_XTC_DROP_X_RESIDUAL": "0",
-        }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, clean_env):
+        with tempfile.TemporaryDirectory() as tmpdir:
             direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
             store_path = os.path.join(tmpdir, "h2_aux_streamed.h5")
             # Match a genuine out-of-core ISDF object: xi lives only in the
@@ -179,12 +132,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
     def test_aux_reuse_preserves_a_fixed_out_of_core_isdf_basis(self):
         """A direct cache can be rebuilt with auxiliary K recovery in one gauge."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
-        clean_env = {
-            "PYTC_XTC_DROP_X": "0",
-            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
-            "PYTC_XTC_DROP_X_RESIDUAL": "0",
-        }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, clean_env):
+        with tempfile.TemporaryDirectory() as tmpdir:
             store_path = os.path.join(tmpdir, "h2_fixed_isdf.h5")
             with h5py.File(store_path, "w") as f:
                 f.create_dataset("xi_phi", data=np.asarray(self.isdf_xtc.xi_phi))
@@ -220,172 +168,6 @@ class TestISDFXTCPanelization(unittest.TestCase):
                 )
                 self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
                 self.assertNotIn("H_aux", f)
-
-    def test_x_normal_order_and_residual_switches_are_independent(self):
-        """A full X store can isolate normal-order and residual-X effects."""
-        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
-        l_aux = self.isdf_xtc._compute_L_aux(
-            self.jparams,
-            batch_size=kwargs["batch_size"],
-            host_grid_block_size=kwargs["host_grid_block_size"],
-        )
-        clean_env = {
-            "PYTC_XTC_DROP_X": "0",
-            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
-            "PYTC_XTC_DROP_X_RESIDUAL": "0",
-        }
-        with mock.patch.dict(os.environ, clean_env):
-            full = self.isdf_xtc.compute_delta_u_kernels(
-                self.jparams, L_aux=l_aux, **kwargs
-            )
-
-        no_x = {"D": full["D"], "X": np.zeros_like(np.asarray(full["X"]))}
-        full_obj = self.isdf_xtc.replace(isdf_kernels=full)
-        no_x_obj = self.isdf_xtc.replace(isdf_kernels=no_x)
-        ranges = (slice(0, 2), slice(1, 3), slice(0, 2), slice(1, 3))
-
-        with mock.patch.dict(os.environ, clean_env):
-            full_h = full_obj.get_delta_h(self.jparams)
-            full_e0 = full_obj.get_const(self.jparams, delta_h=full_h)
-            full_du = full_obj.get_delta_U(self.jparams, ranges=ranges)
-            no_x_h = no_x_obj.get_delta_h(self.jparams)
-            no_x_e0 = no_x_obj.get_const(self.jparams, delta_h=no_x_h)
-            no_x_du = no_x_obj.get_delta_U(self.jparams, ranges=ranges)
-
-        with mock.patch.dict(
-            os.environ, {**clean_env, "PYTC_XTC_DROP_X_NORMAL_ORDER": "1"}
-        ):
-            normal_order_dropped_h = full_obj.get_delta_h(self.jparams)
-            normal_order_dropped_e0 = full_obj.get_const(
-                self.jparams, delta_h=normal_order_dropped_h
-            )
-            normal_order_dropped_du = full_obj.get_delta_U(
-                self.jparams, ranges=ranges
-            )
-
-        with mock.patch.dict(
-            os.environ, {**clean_env, "PYTC_XTC_DROP_X_RESIDUAL": "1"}
-        ):
-            residual_dropped_h = full_obj.get_delta_h(self.jparams)
-            residual_dropped_e0 = full_obj.get_const(
-                self.jparams, delta_h=residual_dropped_h
-            )
-            residual_dropped_du = full_obj.get_delta_U(
-                self.jparams, ranges=ranges
-            )
-            residual_dropped_direct = full_obj._assemble_delta_u_tile(full, ranges)
-
-        # Each narrow switch exactly reproduces its corresponding component of
-        # the all-X-dropped Hamiltonian *and* leaves the complementary
-        # component unchanged within FP64 tolerance.
-        np.testing.assert_allclose(
-            normal_order_dropped_h, no_x_h, atol=1e-10, rtol=1e-10
-        )
-        np.testing.assert_allclose(
-            normal_order_dropped_e0, no_x_e0, atol=1e-10, rtol=1e-10
-        )
-        np.testing.assert_allclose(
-            residual_dropped_du, no_x_du, atol=1e-10, rtol=1e-10
-        )
-        np.testing.assert_allclose(
-            residual_dropped_direct, no_x_du, atol=1e-10, rtol=1e-10
-        )
-        np.testing.assert_allclose(
-            normal_order_dropped_du, full_du, atol=1e-10, rtol=1e-10
-        )
-        np.testing.assert_allclose(
-            residual_dropped_h, full_h, atol=1e-10, rtol=1e-10
-        )
-        np.testing.assert_allclose(
-            residual_dropped_e0, full_e0, atol=1e-10, rtol=1e-10
-        )
-
-        # Mutation oracles: prove the complement assertions reject either
-        # possible broadened switch, rather than merely passing on today's
-        # implementation.
-        real_drop_residual = xtc_module._drop_x_from_residual_integrals
-        with mock.patch.object(
-            xtc_module,
-            "_drop_x_from_residual_integrals",
-            side_effect=lambda: (
-                real_drop_residual()
-                or os.environ.get("PYTC_XTC_DROP_X_NORMAL_ORDER") == "1"
-            ),
-        ), mock.patch.dict(
-            os.environ, {**clean_env, "PYTC_XTC_DROP_X_NORMAL_ORDER": "1"}
-        ):
-            broadened_normal_du = full_obj.get_delta_U(self.jparams, ranges=ranges)
-        with self.assertRaises(AssertionError):
-            np.testing.assert_allclose(
-                broadened_normal_du, full_du, atol=1e-10, rtol=1e-10
-            )
-
-        real_drop_normal = xtc_module._drop_x_from_normal_order
-        with mock.patch.object(
-            xtc_module,
-            "_drop_x_from_normal_order",
-            side_effect=lambda: (
-                real_drop_normal()
-                or os.environ.get("PYTC_XTC_DROP_X_RESIDUAL") == "1"
-            ),
-        ), mock.patch.dict(
-            os.environ, {**clean_env, "PYTC_XTC_DROP_X_RESIDUAL": "1"}
-        ):
-            broadened_residual_h = full_obj.get_delta_h(self.jparams)
-        with self.assertRaises(AssertionError):
-            np.testing.assert_allclose(
-                broadened_residual_h, full_h, atol=1e-10, rtol=1e-10
-            )
-
-        self.assertGreater(np.linalg.norm(np.asarray(full_h - no_x_h)), 1e-10)
-        self.assertGreater(abs(float(full_e0 - no_x_e0)), 1e-10)
-        self.assertGreater(np.linalg.norm(np.asarray(full_du - no_x_du)), 1e-10)
-
-    def test_x_partition_switches_match_literal_zero_x_end_to_end(self):
-        """The JAX-CCSD split agrees with an explicit zero-X Hamiltonian."""
-        clean_env = {
-            "PYTC_XTC_DROP_X": "0",
-            "PYTC_XTC_DROP_X_NORMAL_ORDER": "0",
-            "PYTC_XTC_DROP_X_RESIDUAL": "0",
-        }
-        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
-        with mock.patch.dict(os.environ, clean_env):
-            full_obj = self.isdf_xtc.isdf(self.jparams, **kwargs)
-
-        zero_x_kernels = dict(full_obj.isdf_kernels)
-        zero_x_kernels["X"] = np.zeros_like(np.asarray(zero_x_kernels["X"]))
-        literal_zero_x_obj = full_obj.replace(isdf_kernels=zero_x_kernels)
-
-        def solve(obj, drop_normal_order, drop_residual):
-            env = {
-                **clean_env,
-                "PYTC_XTC_DROP_X_NORMAL_ORDER": "1" if drop_normal_order else "0",
-                "PYTC_XTC_DROP_X_RESIDUAL": "1" if drop_residual else "0",
-            }
-            with mock.patch.dict(os.environ, env):
-                cc = jax_xtc_ccsd.RCCSD(
-                    self.mf, obj, self.jparams,
-                    max_memory=2_000, gpu_max_memory=2_000,
-                    on_the_fly_vvvv=True,
-                )
-                cc.max_cycle = 50
-                cc.kernel()
-                energy = float(cc.e_tot)
-                if hasattr(cc, "eris") and hasattr(cc.eris, "close"):
-                    cc.eris.close()
-                return energy
-
-        full = solve(full_obj, False, False)
-        drop_normal = solve(full_obj, True, False)
-        drop_residual = solve(full_obj, False, True)
-        drop_all = solve(full_obj, True, True)
-        literal_zero_x = solve(literal_zero_x_obj, False, False)
-
-        self.assertAlmostEqual(drop_all, literal_zero_x, places=10)
-        self.assertGreater(abs(full - drop_normal), 1e-10)
-        self.assertGreater(abs(full - drop_residual), 1e-10)
-        self.assertGreater(abs(drop_normal - drop_all), 1e-10)
-        self.assertGreater(abs(drop_residual - drop_all), 1e-10)
 
     def test_x_s_panel_blocks_matches_baseline(self):
         batch_size = 64
@@ -459,6 +241,42 @@ class TestISDFXTCPanelization(unittest.TestCase):
             self.assertFalse(opened_reads[0].id.valid)
         finally:
             os.remove(path)
+
+    def test_delta_u_cache_rejects_a_different_laux_mode(self):
+        config = LauxHMatrixConfig(8, 0.05, 1e-3, 4, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "stale_delta_u.h5")
+            with h5py.File(path, "w") as store:
+                store.create_dataset("D", data=np.full((1, 1), 7.0))
+                store.create_dataset("X", data=np.full((1, 1, 1), 7.0))
+                store.attrs["pytc_xtc_x_mode"] = "full"
+                store.attrs["pytc_xtc_laux_gradient_mode"] = "direct"
+
+            rebuilt = {
+                "D": np.full((1, 1), 3.0),
+                "X": np.full((1, 1, 1), 5.0),
+            }
+            base = self.isdf_xtc.replace(isdf_kernels={})
+            with mock.patch.object(ISDFTC, "isdf", return_value=base), \
+                    mock.patch.object(
+                        ISDFXTC,
+                        "compute_delta_u_kernels",
+                        return_value=rebuilt,
+                    ) as compute:
+                result = self.isdf_xtc.isdf(
+                    self.jparams,
+                    save_path=path,
+                    reuse_aux_kernels=True,
+                    laux_hmatrix=config,
+                )
+
+            compute.assert_called_once()
+            np.testing.assert_array_equal(result.isdf_kernels["D"], rebuilt["D"])
+            with h5py.File(path, "r") as store:
+                self.assertEqual(
+                    store.attrs["pytc_xtc_laux_gradient_mode"],
+                    config.cache_tag + "-direct",
+                )
 
     def test_delta_u_tile_assembly_matches_public_api(self):
         kernels = self.isdf_xtc.compute_delta_u_kernels(

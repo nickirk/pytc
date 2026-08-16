@@ -18,6 +18,7 @@ from collections import OrderedDict
 from .tc import (
     TC,
     ISDFTC,
+    _laux_gradient_mode,
     _normalize_panel_layout,
     _transpose_panel_layout,
     _pad_axis,
@@ -30,28 +31,6 @@ from . import kmat as kmat_jax
 from .utils import sharding_core
 
 logger = logging.getLogger(__name__)
-
-
-def _drop_x_from_normal_order():
-    """Whether to omit X only from the normal-ordered 0-/1-body terms.
-
-    ``PYTC_XTC_DROP_X`` remains the study's all-X switch.  The narrower
-    switch is deliberately separate so a full X store can be used to
-    partition the no-X energy change between normal ordering and the residual
-    two-body operator without rebuilding the kernels.
-    """
-    return (
-        os.environ.get("PYTC_XTC_DROP_X") == "1"
-        or os.environ.get("PYTC_XTC_DROP_X_NORMAL_ORDER") == "1"
-    )
-
-
-def _drop_x_from_residual_integrals():
-    """Whether to omit X only from the residual two-body Delta-U operator."""
-    return (
-        os.environ.get("PYTC_XTC_DROP_X") == "1"
-        or os.environ.get("PYTC_XTC_DROP_X_RESIDUAL") == "1"
-    )
 
 
 def _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z):
@@ -959,9 +938,8 @@ def _contract_delta_U_kernels_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     return term_d + term_x
 
 
-@partial(jax.jit, static_argnums=(6,))
-def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
-                                      include_x=True):
+@jax.jit
+def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s):
     """Balanced direct Delta U tile contraction using fixed-shape matmuls."""
     Np, Nq = phi_p.shape[0], phi_q.shape[0]
     Nr, Ns = phi_r.shape[0], phi_s.shape[0]
@@ -969,18 +947,14 @@ def _contract_delta_u_direct_tile_jit(D, X_sliced, phi_p, phi_q, phi_r, phi_s,
     cpq = (phi_p[:, None, :] * phi_q[None, :, :]).reshape(Np * Nq, D.shape[0])
     crs = (phi_r[:, None, :] * phi_s[None, :, :]).reshape(Nr * Ns, D.shape[1])
     d_term = jnp.matmul(jnp.matmul(cpq, D), crs.T)
-    if not include_x:
-        return d_term.reshape(Np, Nq, Nr, Ns)
-
     x_flat = X_sliced.reshape(Nr * Ns, X_sliced.shape[2])
     x_term = jnp.matmul(cpq, x_flat.T)
     return (d_term - x_term).reshape(Np, Nq, Nr, Ns)
 
 
-@partial(jax.jit, static_argnums=(8,))
+@jax.jit
 def _contract_delta_u_tucker_direct_tile_jit(D, z, phi_p, phi_q, phi_r,
-                                             phi_s, u_r, u_s,
-                                             include_x=True):
+                                             phi_s, u_r, u_s):
     """Balanced direct Delta-U tile with separated X orbital legs.
 
     This is the solver-facing path for ``X_tucker``.  It never reconstructs
@@ -994,8 +968,6 @@ def _contract_delta_u_tucker_direct_tile_jit(D, z, phi_p, phi_q, phi_r,
     cpq = (phi_p[:, None, :] * phi_q[None, :, :]).reshape(Np * Nq, D.shape[0])
     crs = (phi_r[:, None, :] * phi_s[None, :, :]).reshape(Nr * Ns, D.shape[1])
     d_term = jnp.matmul(jnp.matmul(cpq, D), crs.T).reshape(Np, Nq, Nr, Ns)
-    if not include_x:
-        return d_term
     return d_term + _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z)
 
 
@@ -1165,6 +1137,7 @@ class ISDFXTC(XTC, ISDFTC):
         reuse_aux_kernels=False,
         use_laux_fast_grad=False,
         use_laux_exact_split=False,
+        laux_hmatrix=None,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1191,13 +1164,13 @@ class ISDFXTC(XTC, ISDFTC):
             use_laux_exact_split: Opt into exact extraction of any
                 integration-coordinate-independent Jastrow gradient from
                 the L_aux/H_aux pair pass.
+            laux_hmatrix: Optional ``LauxHMatrixConfig`` forwarded to the
+                auxiliary construction.  The direct path remains the default.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
-        drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
-        requested_x_mode = "dropped" if drop_x else "full"
         
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
@@ -1205,8 +1178,12 @@ class ISDFXTC(XTC, ISDFTC):
                                gpu_budget_bytes=gpu_budget_bytes,
                                reuse_aux_kernels=reuse_aux_kernels,
                                use_laux_fast_grad=use_laux_fast_grad,
-                               use_laux_exact_split=use_laux_exact_split)
+                               use_laux_exact_split=use_laux_exact_split,
+                               laux_hmatrix=laux_hmatrix)
         kernels = isdf_tc.isdf_kernels
+        requested_laux_mode = _laux_gradient_mode(
+            use_laux_fast_grad, use_laux_exact_split, laux_hmatrix
+        )
         
         if out_path and os.path.exists(out_path):
             f = None
@@ -1217,12 +1194,23 @@ class ISDFXTC(XTC, ISDFTC):
                     cached_x_mode = f.attrs.get("pytc_xtc_x_mode", "full")
                     if isinstance(cached_x_mode, bytes):
                         cached_x_mode = cached_x_mode.decode()
-                    if cached_x_mode != requested_x_mode:
+                    cached_laux_mode = f.attrs.get(
+                        "pytc_xtc_laux_gradient_mode", "direct"
+                    )
+                    if isinstance(cached_laux_mode, bytes):
+                        cached_laux_mode = cached_laux_mode.decode()
+                    if cached_x_mode != "full":
                         logger.info(
-                            "  Delta-U cache X mode is %s, but this run requests %s; "
+                            "  Delta-U cache X mode is %s, not full; "
                             "recomputing D/X kernels.",
                             cached_x_mode,
-                            requested_x_mode,
+                        )
+                    elif cached_laux_mode != requested_laux_mode:
+                        logger.info(
+                            "  Delta-U cache L_aux mode is %s, but this run "
+                            "requests %s; recomputing D/X kernels.",
+                            cached_laux_mode,
+                            requested_laux_mode,
                         )
                     else:
                         logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
@@ -1269,6 +1257,7 @@ class ISDFXTC(XTC, ISDFTC):
         
         if out_path:
             with h5py.File(out_path, 'a') as f:
+                f.attrs['pytc_xtc_laux_gradient_mode'] = requested_laux_mode
                 if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
@@ -1321,12 +1310,6 @@ class ISDFXTC(XTC, ISDFTC):
         )
 
         logger.info("Computing X kernel...")
-
-        drop_x = os.environ.get("PYTC_XTC_DROP_X") == "1"
-        if drop_x:
-            logger.warning(
-                "PYTC_XTC_DROP_X=1: skipping the X kernel build; X stays zero "
-                "and the exchange TC contribution is dropped from the integrals")
         
         if save_path:
             # If L_aux is a dataset from the same file, we must close the read-only handle 
@@ -1353,7 +1336,7 @@ class ISDFXTC(XTC, ISDFTC):
             if 'X' in f: del f['X']
             if 'X_rm' in f: del f['X_rm']  # stale twin once X is rewritten
             X = f.create_dataset('X', (n_orb, n_orb, n_rank), dtype='f8')
-            f.attrs['pytc_xtc_x_mode'] = 'dropped' if drop_x else 'full'
+            f.attrs['pytc_xtc_x_mode'] = 'full'
         else:
             X = np.zeros((n_orb, n_orb, n_rank), dtype='f8')
             
@@ -1363,8 +1346,6 @@ class ISDFXTC(XTC, ISDFTC):
         # Exploit symmetry: X[r,s,a] = X[s,r,a], only compute upper triangle blocks
         x_start_time = time.perf_counter()
         for r0 in range(0, n_orb, orb_block_size):
-            if drop_x:
-                break
             r1 = min(r0 + orb_block_size, n_orb)
             logger.info(f"  compute_delta_u_kernels: Computing X blocks for r-range [{r0}:{r1}]...")
             for s_panel0 in range(r0, n_orb, s_panel_span):
@@ -1403,9 +1384,8 @@ class ISDFXTC(XTC, ISDFTC):
                 gc.collect()
 
         logger.info(
-            "  compute_delta_u_kernels: X build completed in %.3f s%s",
+            "  compute_delta_u_kernels: X build completed in %.3f s",
             time.perf_counter() - x_start_time,
-            " (dropped)" if drop_x else "",
         )
                 
         if save_path:
@@ -2433,12 +2413,6 @@ class ISDFXTC(XTC, ISDFTC):
             # Do not touch a dense X backing when a Tucker view was supplied:
             # the normal-order path below contracts U/Z directly.
             X = None
-        drop_x_normal_order = _drop_x_from_normal_order()
-        if drop_x_normal_order:
-            logger.warning(
-                "X exchange contribution omitted from normal-ordered "
-                "constant and one-body correction"
-            )
         phi = self.phi_isdf
 
         slice_p = slice(None)
@@ -2470,11 +2444,7 @@ class ISDFXTC(XTC, ISDFTC):
         Y_all = jnp.zeros((self.n_orb, phi.shape[1])) # (N_orb, N_rank)
 
         tucker_j_x_sym = None
-        if drop_x_normal_order:
-            # The pre-zeroed projected intermediates are the exact D-only
-            # normal-order result and avoid loading any X panels from disk.
-            pass
-        elif tucker_x is not None:
+        if tucker_x is not None:
             wc, Y_all, tucker_j_x_sym = _tucker_x_normal_order_intermediates(
                 tucker_x[0], tucker_x[1], dm1, phi_tilde, Gb,
             )
@@ -2524,9 +2494,7 @@ class ISDFXTC(XTC, ISDFTC):
         J_X = - jnp.dot(phi_p * wc[None, :], phi_q.T)
 
         # J_X_sym: - sum X_pq G_c
-        if drop_x_normal_order:
-            J_X_sym = jnp.zeros_like(J_D_total)
-        elif tucker_j_x_sym is not None:
+        if tucker_j_x_sym is not None:
             J_X_sym = tucker_j_x_sym[slice_p, slice_q]
         elif is_hdf5:
             start_p, stop_p, step_p = slice_p.indices(self.n_orb)
@@ -2581,9 +2549,6 @@ class ISDFXTC(XTC, ISDFTC):
         """Contract precomputed kernels to get Delta U block."""
         D = kernels['D']
         tucker_x = _get_tucker_x_factors(kernels)
-        include_x = not _drop_x_from_residual_integrals()
-        if not include_x:
-            logger.warning("X exchange contribution omitted from residual Delta-U integrals")
         
         slice_p, slice_q, slice_r, slice_s = ranges
 
@@ -2609,8 +2574,6 @@ class ISDFXTC(XTC, ISDFTC):
                 jnp.asarray(phi_p), jnp.asarray(phi_q), jnp.asarray(phi_r),
                 jnp.asarray(phi_s), rbs, False,
             )
-            if not include_x:
-                return d_only
             u, z = tucker_x
             return d_only + _contract_tucker_x_residual(
                 phi_p, phi_q, u[slice_r], u[slice_s], z,
@@ -2676,10 +2639,7 @@ class ISDFXTC(XTC, ISDFTC):
         if total_needed_bytes < threshold_bytes:
             phi_r = self.phi_isdf[slice_r]
             phi_s = self.phi_isdf[slice_s]
-            X_full = (
-                _read_X_slice(X, slice_r, slice_s)
-                if include_x else np.zeros((1, 1, 1), dtype=np.float64)
-            )
+            X_full = _read_X_slice(X, slice_r, slice_s)
             return _contract_delta_U_kernels_jit(
                 D,
                 jnp.asarray(X_full),
@@ -2688,7 +2648,7 @@ class ISDFXTC(XTC, ISDFTC):
                 jnp.asarray(phi_r),
                 jnp.asarray(phi_s),
                 _rbs,
-                include_x,
+                True,
             )
 
         # Chunking strategy to avoid VRAM exhaustion. Stream only the X panel
@@ -2746,15 +2706,11 @@ class ISDFXTC(XTC, ISDFTC):
                 alen = ie - i_start
                 r_sel = _chunk_selector(r_idx_np, i_start, ie)
                 pr_np = np.asarray(phi_isdf_src[r_sel])
-                xc_np = (
-                    np.asarray(_read_X_slice(X, r_sel, slice_s))
-                    if include_x else np.zeros((1, 1, 1), dtype=np.float64)
-                )
+                xc_np = np.asarray(_read_X_slice(X, r_sel, slice_s))
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
                     pr_np = np.pad(pr_np, ((0, pad), (0, 0)))
-                    if include_x:
-                        xc_np = np.pad(xc_np, ((0, pad), (0, 0), (0, 0)))
+                    xc_np = np.pad(xc_np, ((0, pad), (0, 0), (0, 0)))
                 return pr_np, xc_np, alen
 
             phi_r_chunk, X_chunk, actual_len = _prepare_r_chunk(0)
@@ -2771,7 +2727,7 @@ class ISDFXTC(XTC, ISDFTC):
                 cur_actual = actual_len
 
                 res_chunk = _contract_delta_U_kernels_jit(
-                    D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs, include_x)
+                    D, cur_X, phi_p, phi_q, cur_phi_r, phi_s, _rbs, True)
 
                 next_i = i + orb_chunk_size
                 if next_i < Nr:
@@ -2808,15 +2764,11 @@ class ISDFXTC(XTC, ISDFTC):
                 alen = ie - i_start
                 s_sel = _chunk_selector(s_idx_np, i_start, ie)
                 ps_np = np.asarray(phi_isdf_src[s_sel])
-                xc_np = (
-                    np.asarray(_read_X_slice(X, slice_r, s_sel))
-                    if include_x else np.zeros((1, 1, 1), dtype=np.float64)
-                )
+                xc_np = np.asarray(_read_X_slice(X, slice_r, s_sel))
                 if alen < orb_chunk_size:
                     pad = orb_chunk_size - alen
                     ps_np = np.pad(ps_np, ((0, pad), (0, 0)))
-                    if include_x:
-                        xc_np = np.pad(xc_np, ((0, 0), (0, pad), (0, 0)))
+                    xc_np = np.pad(xc_np, ((0, 0), (0, pad), (0, 0)))
                 return ps_np, xc_np, alen
 
             phi_s_chunk, X_chunk, actual_len = _prepare_s_chunk(0)
@@ -2835,7 +2787,7 @@ class ISDFXTC(XTC, ISDFTC):
                 cur_phi_s = jnp.asarray(cur_phi_s)
                 cur_X = jnp.asarray(cur_X)
                 res_chunk = _contract_delta_U_kernels_jit(
-                    D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs, include_x)
+                    D, cur_X, phi_p, phi_q, phi_r, cur_phi_s, _rbs, True)
 
                 next_i = i + orb_chunk_size
                 if next_i < Ns:
@@ -2862,7 +2814,6 @@ class ISDFXTC(XTC, ISDFTC):
         D = kernels['D']
         tucker_x = _get_tucker_x_factors(kernels)
         X = None if tucker_x is not None else kernels['X']
-        include_x = not _drop_x_from_residual_integrals()
         slice_p, slice_q, slice_r, slice_s = ranges
         device_key = getattr(device, "id", "host")
         panel_layout = _normalize_panel_layout(panel_layout)
@@ -2980,7 +2931,6 @@ class ISDFXTC(XTC, ISDFTC):
             with device_ctx:
                 result = _contract_delta_u_tucker_direct_tile_jit(
                     D, z_device, phi_p, phi_q, phi_r, phi_s, u_r, u_s,
-                    include_x,
                 )
                 if profile:
                     jax.block_until_ready(result)
@@ -2991,10 +2941,7 @@ class ISDFXTC(XTC, ISDFTC):
                     )
                 return result
 
-        X_sliced = (
-            _read_X_slice(X, slice_r, slice_s)
-            if include_x else np.zeros((1, 1, 1), dtype=np.float64)
-        )
+        X_sliced = _read_X_slice(X, slice_r, slice_s)
         if profile:
             t_read = time.perf_counter()
             logger.debug(
@@ -3016,7 +2963,7 @@ class ISDFXTC(XTC, ISDFTC):
             # Keeping ``X_sliced`` as a
             # NumPy array until the explicit ``jax.device_put`` below
             # gives a single, correctly-targeted host→device copy.
-            if include_x and isinstance(X_sliced, np.ndarray):
+            if isinstance(X_sliced, np.ndarray):
                 if Nr != r_len or Ns_eff != Ns:
                     pad_cfg = [(0, 0)] * X_sliced.ndim
                     if Nr != r_len:
@@ -3024,7 +2971,7 @@ class ISDFXTC(XTC, ISDFTC):
                     if Ns_eff != Ns:
                         pad_cfg[1] = (0, Ns_eff - X_sliced.shape[1])
                     X_sliced = np.pad(X_sliced, pad_cfg)
-            elif include_x:
+            else:
                 # ``X_sliced`` is already a JAX array (e.g. from a per-
                 # device cache).  Pad with the JAX helper, which keeps
                 # it on its current device.
@@ -3070,7 +3017,7 @@ class ISDFXTC(XTC, ISDFTC):
         )
         with device_ctx:
             result = _contract_delta_u_direct_tile_jit(
-                D, X_sliced, phi_p, phi_q, phi_r, phi_s, include_x,
+                D, X_sliced, phi_p, phi_q, phi_r, phi_s,
             )
             if profile:
                 jax.block_until_ready(result)
