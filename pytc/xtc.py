@@ -2,7 +2,6 @@
 
 import contextlib
 from functools import partial, reduce
-import operator
 import numpy as np
 import os
 import gc
@@ -32,36 +31,6 @@ from . import kmat as kmat_jax
 from .utils import sharding_core
 
 logger = logging.getLogger(__name__)
-
-
-def _strict_integer_control(name, value, *, minimum=None, maximum=None):
-    """Return an integer control without silently truncating or coercing it."""
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be an integer, not bool")
-    try:
-        result = operator.index(value)
-    except TypeError as error:
-        raise TypeError(f"{name} must be an integer, got {value!r}") from error
-    result = int(result)
-    if minimum is not None and result < minimum:
-        raise ValueError(f"{name} must be at least {minimum}, got {result}")
-    if maximum is not None and result > maximum:
-        raise ValueError(f"{name} must be at most {maximum}, got {result}")
-    return result
-
-
-def _finite_real_array(name, value):
-    """Convert a numeric input only after rejecting complex/non-finite data."""
-    array = np.asarray(value)
-    if np.iscomplexobj(array):
-        raise ValueError(f"{name} must be real-valued; complex inputs are unsupported")
-    try:
-        array = np.asarray(array, dtype=np.float64)
-    except (TypeError, ValueError) as error:
-        raise TypeError(f"{name} must be a real numeric array") from error
-    if not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} must contain only finite values")
-    return array
 
 
 def _contract_tucker_x_residual(phi_p, phi_q, u_r, u_s, z):
@@ -1457,17 +1426,11 @@ class ISDFXTC(XTC, ISDFTC):
         a subsequently built Tucker core is an exact representation of X.
         """
         n_orb = int(self.n_orb)
-        n_factor = _strict_integer_control(
-            "n_factor", n_factor, minimum=1, maximum=n_orb
-        )
-        oversampling = _strict_integer_control(
-            "oversampling", oversampling, minimum=0
-        )
+        n_factor = int(n_factor)
+        oversampling = int(oversampling)
         n_probe = min(n_orb, n_factor + oversampling)
-        orb_block_size = _strict_integer_control(
-            "orb_block_size", orb_block_size, minimum=1
-        )
-        seed = _strict_integer_control("seed", seed, minimum=0)
+        orb_block_size = int(orb_block_size)
+        seed = int(seed)
 
         if L_aux is None:
             L_aux = self._compute_L_aux(jastrow_params, batch_size)
@@ -1507,7 +1470,7 @@ class ISDFXTC(XTC, ISDFTC):
                 omega_c=omega_c,
                 host_grid_block_size=host_grid_block_size,
             )
-            panel_sketch = _finite_real_array("X sketch panel", panel_sketch)
+            panel_sketch = np.asarray(panel_sketch, dtype=np.float64)
             expected_shape = (r1 - r0, n_probe)
             if panel_sketch.shape != expected_shape:
                 raise ValueError(
@@ -1519,7 +1482,6 @@ class ISDFXTC(XTC, ISDFTC):
             gc.collect()
 
         basis, _ = np.linalg.qr(sketch, mode='reduced')
-        basis = _finite_real_array("selected orbital basis", basis)
         return basis[:, :n_factor]
 
     def compute_tucker_x_core(
@@ -1537,7 +1499,7 @@ class ISDFXTC(XTC, ISDFTC):
         row space.  The returned core has shape ``(M, M, R)`` and pairs with
         U through ``X[r,s,c] ~= U[r,a] Z[a,b,c] U[s,b]``.
         """
-        u = _finite_real_array("orbital_basis", orbital_basis)
+        u = np.asarray(orbital_basis, dtype=np.float64)
         n_orb = int(self.n_orb)
         if u.ndim != 2 or u.shape[0] != n_orb or not u.shape[1]:
             raise ValueError(
@@ -1568,7 +1530,7 @@ class ISDFXTC(XTC, ISDFTC):
             host_grid_block_size=host_grid_block_size,
             orbital_rows=projected_rows,
         )
-        core = _finite_real_array("Tucker-X core", core)
+        core = np.asarray(core, dtype=np.float64)
         expected_shape = (n_factor, n_factor, int(self.phi_isdf.shape[1]))
         if core.shape != expected_shape:
             raise ValueError(
@@ -1895,8 +1857,8 @@ class ISDFXTC(XTC, ISDFTC):
         n_grid = self.grid_points.shape[0]
         n_rank = self.phi_isdf.shape[1]
         n_orb = self.phi_isdf.shape[0]
-        omega_s = _finite_real_array("omega_s", omega_s)
-        omega_c = _finite_real_array("omega_c", omega_c)
+        omega_s = np.asarray(omega_s, dtype=np.float64)
+        omega_c = np.asarray(omega_c, dtype=np.float64)
         if omega_s.ndim != 2 or omega_c.ndim != 2:
             raise ValueError("omega_s and omega_c must both be rank-2")
         if omega_s.shape[0] != n_orb or omega_c.shape[0] != n_rank:
