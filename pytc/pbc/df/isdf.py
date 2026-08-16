@@ -155,9 +155,27 @@ def _settle(value):
     return ready() if ready is not None else value
 
 
+# Task #127 A/B knob. OFF by default and inert when off -- the bucketed return
+# below is byte-for-byte the previous behaviour, so a flag-off run is the old
+# code path.
+#
+# WHY IT EXISTS: at a bucketed width, `dynamic_slice` in _selection_projection
+# MATERIALISES the [n_grid x width] prefix; only at width == rank does XLA alias
+# the argument and the copy vanish. Job 60129052 put projection at 62.2% of
+# selection, and the aliasing boundary in its own records puts ~64% of that in
+# the copy. Passing rank trades the copy for arithmetic on zero columns.
+#
+# NUMERICALLY IDENTICAL either way: columns in [p0, rank) are exactly zero, which
+# is the premise bucketing already relies on. If pivots move, the premise is
+# false and the timing is irrelevant -- the run gates on that.
+_SELECTION_FULL_WIDTH = False
+
+
 def _bucketed_width(p0, rank):
     if p0 <= 0:
         return 0
+    if _SELECTION_FULL_WIDTH:
+        return int(rank)
     return int(min(rank, -(-p0 // _SELECTION_WIDTH_BUCKET) * _SELECTION_WIDTH_BUCKET))
 
 
