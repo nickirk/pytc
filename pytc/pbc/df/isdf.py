@@ -314,7 +314,9 @@ def pivoted_cholesky_batched_hermitian(
         # An earlier revision of this comment justified NOT calling
         # `block_until_ready()` above by claiming a forced sync "would serialise
         # dispatch". That was a cost claim asserted from reading the code, and
-        # projects/task121/batched_overlap_probe.py refutes it: forcing the sync
+        # a standalone overlap probe refutes it (agent workspace, not in this
+        # repo -- ask for `batched_overlap_probe.py` if you want to rerun it):
+        # forcing the sync
         # measured 0.99x the no-sync wall, inside a 5.6% noise band. Nothing
         # independent sits between the dispatch and this read, so there is no
         # overlap for a sync to destroy. Both spellings cost the same.
@@ -326,7 +328,8 @@ def pivoted_cholesky_batched_hermitian(
         #
         # Without this bucket the seconds land between two `perf_counter` calls
         # and are charged to NO stage: a local reproduction of this exact shape
-        # (projects/task121/timer_blindness_probe.py, checksum-matched arms) put
+        # (`timer_blindness_probe.py`, checksum-matched arms; kept in the agent
+        # workspace, not in this repo -- ask if you want to rerun it) put
         # 47-66% of the real projection cost in that untimed gap, varying run to
         # run. Any attribution built on `projection_seconds` alone is unfounded.
         materialisation_started = time.perf_counter()
@@ -490,7 +493,8 @@ def pivoted_cholesky_batched_hermitian(
         # This corrects a claim I committed in e34476d and had NOT measured --
         # that top-up's projection cost is charged to `factor_update_seconds`,
         # recorded as a hardcoded 0.0. @Woke flagged it as unverified and he was
-        # right to: projects/task121/topup_accounting_probe.py, checksum-matched
+        # right to: a standalone `topup_accounting_probe.py` (agent workspace,
+        # not in this repo -- ask if you want to rerun it), checksum-matched
         # arms, measured the OPPOSITE split -- the majority already landed in
         # `projection_seconds` (~70-80% across runs) and only the rest leaked
         # onward. A large jnp column slice does not dispatch freely the way the
