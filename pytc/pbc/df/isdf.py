@@ -240,6 +240,16 @@ def _selection_projection(factor, retained_idx, block, width):
     donation prevents them in the WRITE. This line reintroduced them in the
     READ, where that verification never looked.
     """
+    # SAFE ONLY BY INVARIANT, not independently (@Woke). `width` comes from the
+    # caller and `factor` no longer has a fixed width: under
+    # _SELECTION_GROW_BUFFER the buffer holds exactly _bucketed_width(p0, rank)
+    # at this point, because growth uses p0 + m and the next round's p0 is
+    # exactly that. If that arithmetic is ever changed so the buffer can be
+    # NARROWER than `width`, this dynamic_slice does not raise -- it clamps, and
+    # the projection silently reads the wrong columns.
+    #
+    # This line was unconditionally safe when the factor was always full rank.
+    # It is not any more, and the dependency lives three hundred lines away.
     left = jax.lax.dynamic_slice(factor, (0, 0), (factor.shape[0], width))
     return block - left @ jnp.conj(left[retained_idx]).T
 
