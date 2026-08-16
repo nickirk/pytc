@@ -656,3 +656,29 @@ class TestGrowBufferIsNumericallyIdentical(unittest.TestCase):
         self.assertGreater(len(widths), 1,
                            f"buffer never grew -- only widths {widths} allocated, "
                            "so the growth branch was never exercised")
+
+
+class TestGrowthDonatesItsBuffer(unittest.TestCase):
+    """Growth must donate, or it holds three buffers instead of two.
+
+    Not an optimisation: at 444 the last growth is 96.9 + 97.6 + 97.6 = 292.0 GB
+    undonated against a 429.5 GB cgroup, on a campaign that OOM-killed at
+    499.3 GB. Donated it is 194.4 GB -- the same peak the current
+    slice-every-round path already reaches.
+    """
+
+    def test_the_zeros_buffer_is_actually_donated(self):
+        import jax.numpy as jnp
+        from pytc.pbc.df import isdf as _isdf
+        grown = jnp.zeros((16, 8))
+        factor = jnp.ones((16, 4))
+        out = _isdf._grow_factor(grown, factor)
+        out.block_until_ready()
+        # A donated argument is invalidated by the call. If donation silently
+        # stopped working, `grown` would still be readable and the transient
+        # would be one buffer larger than we costed for.
+        self.assertTrue(grown.is_deleted(),
+                        "growth buffer was NOT donated; the transient at 444 is "
+                        "292 GB rather than 194 GB")
+        np.testing.assert_allclose(np.asarray(out)[:, :4], 1.0)
+        np.testing.assert_allclose(np.asarray(out)[:, 4:], 0.0)

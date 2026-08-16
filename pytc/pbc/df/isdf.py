@@ -142,6 +142,26 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
 _SELECTION_WIDTH_BUCKET = 4096
 
 
+@partial(jax.jit, donate_argnums=(0,))
+def _grow_factor(grown, factor):
+    """Copy `factor` into the wider `grown`, DONATING `grown`.
+
+    Donation is not an optimisation here, it is what makes growth affordable at
+    production rank. Undonated, a growth event holds three buffers at once --
+    the old factor, the fresh zeros and the update's output. At the last growth
+    at 444 that is 96.9 + 97.6 + 97.6 = 292.0 GB transient against a 429.5 GB
+    cgroup, on a campaign that OOM-killed at 499.3 GB.
+
+    Donated, the output reuses the zeros buffer and the transient is 194.4 GB --
+    which is exactly what the current slice-every-round path already peaks at
+    (97.6 GB factor + a 96.9 GB slice temp), so growing is not worse. It cannot
+    go below two buffers: a donated buffer cannot be reused for a WIDER output,
+    so the transient doubling is intrinsic to growing. Found by @Woke, and the
+    local fixture provably cannot show it -- at rank 22 the factor is kilobytes.
+    """
+    return jax.lax.dynamic_update_slice(grown, factor, (0, 0))
+
+
 def _settle(value):
     """Force a dispatched device computation to finish, so the timer that ends
     here measures it rather than the timer that happens to contain the next
@@ -462,8 +482,9 @@ def pivoted_cholesky_batched_hermitian(
                         # dynamic_update_slice CLAMPS an out-of-bounds start
                         # rather than raising, so an undersized buffer writes to
                         # the wrong columns SILENTLY. Grow first, always.
-                        grown = jnp.zeros((factor.shape[0], need), dtype=factor.dtype)
-                        factor = jax.lax.dynamic_update_slice(grown, factor, (0, 0))
+                        factor = _grow_factor(
+                            jnp.zeros((factor.shape[0], need), dtype=factor.dtype),
+                            factor)
                 factor = _write_factor_block(factor, block_factor, p0)
                 # Settle the WRITE inside this window. The `jnp.sum` sync below
                 # depends on `block_factor`, not on `factor`, so without this the
@@ -607,8 +628,9 @@ def pivoted_cholesky_batched_hermitian(
             if _SELECTION_GROW_BUFFER:
                 need = _bucketed_width(len(pivots) + 1, rank)
                 if need > factor.shape[1]:
-                    grown = jnp.zeros((factor.shape[0], need), dtype=factor.dtype)
-                    factor = jax.lax.dynamic_update_slice(grown, factor, (0, 0))
+                    factor = _grow_factor(
+                        jnp.zeros((factor.shape[0], need), dtype=factor.dtype),
+                        factor)
             factor = _write_factor_block(
                 factor, jnp.asarray(vector)[:, None], len(pivots))
             diag = np.maximum(diag - np.abs(np.asarray(vector)) ** 2, 0.0)
