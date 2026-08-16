@@ -13,9 +13,8 @@ self-check.
 | `03_dense_xtc_ccsd.py` | Exact (dense, non-ISDF) transcorrelated CCSD | The transcorrelated (xTC) Hamiltonian and CCSD integration |
 | `04_isdf_xtc_ccsd.py` | ISDF-approximated xTC-CCSD, vs. 03's dense reference | Interpolative Separable Density Fitting (ISDF) |
 | `05_make_fno_xtc_ccsd.py` | FNO (MP2 natural orbital) virtual-space truncation scan, via ISDF | Frozen/truncated natural orbitals (FNO) |
-| `06_hmatrix_laux_h2.py` | Direct versus controlled hierarchical L_aux/H_aux on H2 | Experimental hierarchical residual construction |
 
-A deterministic, non-stochastic alternative to `01` is
+A sixth example -- a deterministic, non-stochastic alternative to `01` -- is
 deferred. It relied on a Jastrow optimizer that was found to be broken on
 `main` (a downstream host-array materialization severs its JAX gradient path)
 and has been removed from `main` pending a fix; see the tracked bug (task #49).
