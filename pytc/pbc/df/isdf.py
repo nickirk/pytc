@@ -142,6 +142,19 @@ def _batch_candidates(diag, selected, batch_size, mesh, min_separation, ramp):
 _SELECTION_WIDTH_BUCKET = 4096
 
 
+def _settle(value):
+    """Force a dispatched device computation to finish, so the timer that ends
+    here measures it rather than the timer that happens to contain the next
+    host read.
+
+    Costs nothing measurable in this loop: nothing independent sits between
+    dispatch and the following read, so there is no overlap to lose. Measured at
+    0.99x the no-sync wall, inside a 5.6% noise band.
+    """
+    ready = getattr(value, "block_until_ready", None)
+    return ready() if ready is not None else value
+
+
 def _bucketed_width(p0, rank):
     if p0 <= 0:
         return 0
@@ -303,6 +316,18 @@ def pivoted_cholesky_batched_hermitian(
             # after it, and why the baseline ran in 1,877 s.
             existing_c = factor[candidates, :len(pivots)]
             residual_batch = residual_batch - existing_c @ existing_c.conj().T
+        # Settle HERE so `projection_seconds` means the projection.
+        #
+        # Without this the gather and GEMM above are merely DISPATCHED, and
+        # their execution is paid at the first host read -- `np.diag` below,
+        # inside `materialisation_seconds`. That made the bucket named for the
+        # device read actually hold "GEMM execution + host reduction", so a
+        # materialisation-dominated profile could not distinguish "the read is
+        # the regression" from "the projection GEMM is the regression". Given
+        # the GEMM is the leading suspect (130x on JAX vs 1.0x on numpy, above),
+        # the ambiguity sat exactly on the hypothesis under test. Found by
+        # @Woke reviewing the profiling driver before its job ran.
+        residual_batch = _settle(residual_batch)
         projection_seconds = time.perf_counter() - projection_started
         # `projection_seconds` above is DISPATCH ONLY when blocked_projection is
         # on: `factor` is then a jnp array, so the gather and the GEMM are both
@@ -382,6 +407,11 @@ def pivoted_cholesky_batched_hermitian(
                     width = _bucketed_width(p0, rank)
                     block = _selection_projection(
                         factor, retained_idx, block, width)
+                # Same reason as the first segment: `_selection_projection` is
+                # jitted, so without settling here its execution would be paid
+                # at the `jnp.sum` sync below and charged to `factor_update`,
+                # which would then not be a write bucket either.
+                block = _settle(block)
                 projection_seconds += time.perf_counter() - projection_started
                 factor_update_started = time.perf_counter()
                 gram = residual_batch[np.ix_(retained_local, retained_local)]
@@ -391,6 +421,13 @@ def pivoted_cholesky_batched_hermitian(
                 ).T
                 # Donated: the old buffer must not be used after this call.
                 factor = _write_factor_block(factor, block_factor, p0)
+                # Settle the WRITE inside this window. The `jnp.sum` sync below
+                # depends on `block_factor`, not on `factor`, so without this the
+                # write stays pending and is paid at the NEXT round's
+                # `factor[candidates, :p]` gather -- inflating that round's
+                # `projection` and deflating this one's `factor_update`, across
+                # rounds where it is hardest to notice.
+                factor = _settle(factor)
                 # diag stays on host -- it drives the loop's control flow and is
                 # only [n_grid] float64 (2.6 MB), so the downdate contribution is
                 # the one small array that comes back each round.
