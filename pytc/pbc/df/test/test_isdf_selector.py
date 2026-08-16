@@ -470,9 +470,10 @@ class TestSelectionFactorLifetime(unittest.TestCase):
     regression.
 
     NOTE for anyone extending this: do not patch with `Mock(return_value=...)`.
-    The mock retains the returned tuple itself, so the weakref never dies and
-    the test passes regardless of what coulomb.py does -- a gate that cannot
-    fail. Patch with a plain function that builds the tuple per call.
+    The mock retains the returned tuple itself, so the weakref never dies, the
+    factor is alive at the callback no matter what coulomb.py does, and the
+    assertions below fail even against a correct fix -- a gate that cannot
+    pass. Patch with a plain function that builds the tuple per call.
     """
 
     def _run_and_report_liveness(self, selection_mode):
