@@ -310,8 +310,19 @@ def pivoted_cholesky_batched_hermitian(
         # `residual_batch`, so it is where that work is actually paid for.
         #
         # Timing it separately costs nothing -- the sync already happened here.
-        # Forcing `block_until_ready()` inside the window above would instead
-        # serialise dispatch and change what we are measuring.
+        #
+        # An earlier revision of this comment justified NOT calling
+        # `block_until_ready()` above by claiming a forced sync "would serialise
+        # dispatch". That was a cost claim asserted from reading the code, and
+        # projects/task121/batched_overlap_probe.py refutes it: forcing the sync
+        # measured 0.99x the no-sync wall, inside a 5.6% noise band. Nothing
+        # independent sits between the dispatch and this read, so there is no
+        # overlap for a sync to destroy. Both spellings cost the same.
+        #
+        # The real reason to time this line instead is narrower: the read
+        # already happens here, so it needs no added call, and this way the
+        # bucket also captures the host-side `diag`/`real`/`maximum` reduction
+        # rather than only the device wait.
         #
         # Without this bucket the seconds land between two `perf_counter` calls
         # and are charged to NO stage: a local reproduction of this exact shape
@@ -465,13 +476,16 @@ def pivoted_cholesky_batched_hermitian(
         projection_seconds = time.perf_counter() - projection_started
         # Force the read HERE so the split is exact rather than approximate.
         #
-        # This is the opposite choice from the batched round above, and the
-        # reason they differ is overlap. There, syncing inside the window would
-        # destroy real overlap and change what is measured. Here there is no
-        # overlap to lose: the only thing between this point and the host read
-        # in the factor update is `vector`, which DEPENDS on `correction`, so
-        # nothing can proceed until it lands. Forcing it one line earlier moves
-        # where the seconds are recorded, not when the work happens.
+        # Different spelling from the batched round above, same reason. Neither
+        # path has anything independent between the dispatch and the host read,
+        # so a forced sync destroys no overlap in either (measured for the
+        # batched case: 0.99x wall, inside a 5.6% noise band). The paths differ
+        # only in WHERE the natural read lands. Above, it is the very next line,
+        # so timing that line is enough. Here it is buried inside the factor
+        # update, several statements later and mixed with the write -- so the
+        # read is pulled forward to a named point. `vector` DEPENDS on
+        # `correction`, so nothing could have proceeded without it anyway:
+        # this moves where the seconds are recorded, not when work happens.
         #
         # This corrects a claim I committed in e34476d and had NOT measured --
         # that top-up's projection cost is charged to `factor_update_seconds`,
