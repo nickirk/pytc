@@ -811,12 +811,19 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     if selection_mode == "fixed_pivots":
         pass
     elif selection_mode == "streamed":
-        pivots, _, n_selected = pivoted_cholesky_hermitian(diag, col_eval, rank=rank)
+        pivots, selection_factor, n_selected = pivoted_cholesky_hermitian(
+            diag, col_eval, rank=rank)
+        # Release the [n_grid x rank] factor: nothing downstream reads it, and
+        # `_` would BIND it for the rest of this function -- which includes the
+        # entire panel loop. Measured at 444/cc-pvtz as a single live
+        # float64[328509, 37120] = 97.6 GB still resident at panel-loop entry
+        # (job 60116274), which is the memory half of the 444 regression.
+        del selection_factor
     else:
         # The plan validates and resolves all BPC tuning before AO evaluation.
         bpc_policy = resolved_plan["bpc_policy"]
         n_topup_eff = bpc_policy["n_topup"]
-        pivots, _, n_selected, rounds = pivoted_cholesky_batched_hermitian(
+        pivots, selection_factor, n_selected, rounds = pivoted_cholesky_batched_hermitian(
             diag, col_batch_eval, rank=rank, mesh=cell.mesh,
             batch_size=bpc_policy["batch_size"],
             min_separation=bpc_policy["min_separation"],
@@ -824,6 +831,8 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             n_topup=n_topup_eff,
             blocked_projection=bpc_policy["blocked_projection"],
         )
+        # Same release as the streamed branch above; see that comment.
+        del selection_factor
         selection_provenance.update({
             "bpc_batch_size": bpc_policy["batch_size"],
             "bpc_min_separation_grid_units": bpc_policy["min_separation"],

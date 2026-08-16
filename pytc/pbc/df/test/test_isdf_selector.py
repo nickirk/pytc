@@ -451,5 +451,81 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
             pivoted_cholesky_hermitian(diag, lambda j: np.zeros(2), rank=True)
 
 
+class TestSelectionFactorLifetime(unittest.TestCase):
+    """The selection factor must not survive its own selector call.
+
+    `pivoted_cholesky_*` returns the [n_grid x rank] factor in position 1.
+    Binding it to `_` at the call site keeps it alive for the rest of
+    coulomb.build -- which includes the entire panel loop. At 444/cc-pvtz that
+    was measured as one live float64[328509, 37120] = 97.6 GB still resident at
+    panel-loop entry (job 60116274), and it is the memory half of the 444
+    regression.
+
+    NOTE for anyone extending this: do not patch with `Mock(return_value=...)`.
+    The mock retains the returned tuple itself, so the weakref never dies and
+    the test passes regardless of what coulomb.py does -- a gate that cannot
+    fail. Patch with a plain function that builds the tuple per call.
+    """
+
+    def _run_and_report_liveness(self, selection_mode):
+        import gc
+        import weakref
+        import jax.numpy as jnp
+        from pytc.pbc import coulomb as _coulomb
+
+        cell = Cell()
+        cell.atom = "H 0 0 0; H 0 0 0.74"
+        cell.a = np.eye(3) * 4.0
+        cell.basis = "sto-3g"
+        cell.unit = "A"
+        cell.ke_cutoff = 8.0
+        cell.verbose = 0
+        cell.build()
+
+        seen = {}
+
+        def _make(real):
+            def patched(*args, **kwargs):
+                out = real(*args, **kwargs)
+                factor = jnp.asarray(np.asarray(out[1]))
+                seen["ref"] = weakref.ref(factor)
+                return (out[0], factor) + tuple(out[2:])
+            return patched
+
+        target = ("pivoted_cholesky_batched_hermitian"
+                  if selection_mode != "streamed" else
+                  "pivoted_cholesky_hermitian")
+        real = getattr(_coulomb, target)
+
+        def on_selection(pivots, provenance):
+            gc.collect()
+            seen["alive_at_callback"] = seen["ref"]() is not None
+
+        original = getattr(_coulomb, target)
+        setattr(_coulomb, target, _make(real))
+        try:
+            _coulomb.build(cell, cell.make_kpts([1, 1, 1], wrap_around=False),
+                           rank=4, block_size=64,
+                           selection_mode=selection_mode,
+                           on_selection=on_selection)
+        finally:
+            setattr(_coulomb, target, original)
+        self.assertIn("alive_at_callback", seen,
+                      "the patched selector never ran -- the test proves nothing")
+        return seen["alive_at_callback"]
+
+    def test_streamed_releases_selection_factor(self):
+        self.assertFalse(
+            self._run_and_report_liveness("streamed"),
+            "streamed branch retains the selection factor past pivot extraction; "
+            "remove of `del selection_factor` must fail this test")
+
+    def test_bpc_releases_selection_factor(self):
+        self.assertFalse(
+            self._run_and_report_liveness("bpc_streamed"),
+            "bpc branch retains the selection factor past pivot extraction; "
+            "removal of `del selection_factor` must fail this test")
+
+
 if __name__ == "__main__":
     unittest.main()
