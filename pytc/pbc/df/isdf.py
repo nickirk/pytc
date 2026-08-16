@@ -170,6 +170,19 @@ def _settle(value):
 # false and the timing is irrelevant -- the run gates on that.
 _SELECTION_FULL_WIDTH = False
 
+# Task #127: allocate the factor at the LIVE BUCKETED WIDTH and grow it, instead
+# of allocating at full rank and slicing the live prefix out every round.
+#
+# The point is that the slice then covers the WHOLE array, so XLA aliases it and
+# the copy disappears -- the same aliasing the full-width flag buys, but WITHOUT
+# its arithmetic on zero columns, because the array really is only as wide as the
+# live part. The copy happens once per bucket growth (~10x) rather than once per
+# round (~580x): 31.4 TB -> 0.6 TB at 444 by traffic arithmetic.
+#
+# ORDER IS LOAD-BEARING: project, THEN grow, THEN write. Growing before the
+# projection makes the buffer wider than the frontier and reintroduces the slice.
+_SELECTION_GROW_BUFFER = False
+
 
 def _bucketed_width(p0, rank):
     if p0 <= 0:
@@ -319,7 +332,9 @@ def pivoted_cholesky_batched_hermitian(
             # keeps a host array -- porting it is not in scope and pretending
             # otherwise would silently break the reference path.
             if blocked_projection:
-                factor = jnp.zeros((diag.size, rank), dtype=columns.dtype)
+                initial = (_bucketed_width(retain_count, rank)
+                           if _SELECTION_GROW_BUFFER else rank)
+                factor = jnp.zeros((diag.size, initial), dtype=columns.dtype)
             else:
                 factor = np.zeros((diag.size, rank), dtype=columns.dtype)
         projection_started = time.perf_counter()
@@ -438,6 +453,17 @@ def pivoted_cholesky_batched_hermitian(
                     jnp.asarray(upper_R.T), block.T, lower=True,
                 ).T
                 # Donated: the old buffer must not be used after this call.
+                # Grow BEFORE the write and AFTER the projection above. The
+                # write needs p0 + block columns; the projection needed only p0
+                # rounded up, which is what the buffer currently holds.
+                if _SELECTION_GROW_BUFFER:
+                    need = _bucketed_width(p0 + block_factor.shape[1], rank)
+                    if need > factor.shape[1]:
+                        # dynamic_update_slice CLAMPS an out-of-bounds start
+                        # rather than raising, so an undersized buffer writes to
+                        # the wrong columns SILENTLY. Grow first, always.
+                        grown = jnp.zeros((factor.shape[0], need), dtype=factor.dtype)
+                        factor = jax.lax.dynamic_update_slice(grown, factor, (0, 0))
                 factor = _write_factor_block(factor, block_factor, p0)
                 # Settle the WRITE inside this window. The `jnp.sum` sync below
                 # depends on `block_factor`, not on `factor`, so without this the
@@ -571,6 +597,18 @@ def pivoted_cholesky_batched_hermitian(
             # is NOT gated on blocked_projection, which is why scoping the port
             # to the blocked branch alone left this in-place write reachable --
             # caught by test_isdf_selector, not by inspection.
+            # The top-up loop writes one column at a time PAST the batched
+            # frontier, so a grown buffer must be widened here too. Omitting
+            # this does not raise: dynamic_update_slice clamps, the column is
+            # written over an existing one, and the factor comes back short --
+            # measured as (80, 20) against an expected (80, 22). The batched
+            # loop had this guard; this loop did not, and only a fixture that
+            # actually grows exposes it.
+            if _SELECTION_GROW_BUFFER:
+                need = _bucketed_width(len(pivots) + 1, rank)
+                if need > factor.shape[1]:
+                    grown = jnp.zeros((factor.shape[0], need), dtype=factor.dtype)
+                    factor = jax.lax.dynamic_update_slice(grown, factor, (0, 0))
             factor = _write_factor_block(
                 factor, jnp.asarray(vector)[:, None], len(pivots))
             diag = np.maximum(diag - np.abs(np.asarray(vector)) ** 2, 0.0)

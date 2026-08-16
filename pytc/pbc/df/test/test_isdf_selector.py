@@ -582,3 +582,77 @@ class TestFullWidthProjectionIsNumericallyIdentical(unittest.TestCase):
         finally:
             _isdf._SELECTION_FULL_WIDTH = original
         self.assertEqual(_isdf._bucketed_width(100, 10_000), 4096)
+
+
+class TestGrowBufferIsNumericallyIdentical(unittest.TestCase):
+    """Growing the factor must change allocation only, never the answer.
+
+    The projection is identical because the buffer is exactly as wide as the
+    live frontier -- the columns a full-rank buffer would carry beyond it are
+    zero and contribute nothing. If pivots move, that premise is false.
+
+    Guards a failure mode that does NOT raise: `dynamic_update_slice` clamps an
+    out-of-bounds start, so an undersized buffer writes to the wrong columns
+    silently and the run continues with wrong numbers. Only a value check finds
+    it, which is how it was found.
+    """
+
+    def _select(self, grow):
+        from pytc.pbc.df import isdf as _isdf
+        rng = np.random.default_rng(91)
+        feature = rng.normal(size=(80, 24)) + 1j * rng.normal(size=(80, 24))
+        metric = feature @ feature.conj().T
+        # The bucket MUST be smaller than rank or the buffer never grows and
+        # this test is vacuous -- at the default 4096 with rank 22 the capacity
+        # is rank from the first allocation and the growth branch never runs.
+        # Mutation testing caught exactly that: removing the growth still passed.
+        original = _isdf._SELECTION_GROW_BUFFER
+        original_bucket = _isdf._SELECTION_WIDTH_BUCKET
+        try:
+            _isdf._SELECTION_WIDTH_BUCKET = 4
+            _isdf._SELECTION_GROW_BUFFER = grow
+            return pivoted_cholesky_batched_hermitian(
+                np.real(np.diag(metric)), lambda idx: metric[:, idx], rank=22,
+                mesh=(5, 4, 4), batch_size=4, n_topup=2, blocked_projection=True)
+        finally:
+            _isdf._SELECTION_GROW_BUFFER = original
+            _isdf._SELECTION_WIDTH_BUCKET = original_bucket
+
+    def test_pivots_and_factor_survive_growing(self):
+        p_flat, f_flat, n_flat, _ = self._select(False)
+        p_grow, f_grow, n_grow, _ = self._select(True)
+        np.testing.assert_array_equal(p_flat, p_grow)
+        self.assertEqual(n_flat, n_grow)
+        np.testing.assert_allclose(np.asarray(f_flat), np.asarray(f_grow), atol=1e-10)
+
+    def test_returned_factor_has_the_selected_width(self):
+        """A grown buffer must still return exactly len(pivots) columns."""
+        pivots, factor, count, _ = self._select(True)
+        self.assertEqual(np.asarray(factor).shape[1], len(pivots))
+        self.assertEqual(count, len(pivots))
+
+    def test_the_knob_defaults_off(self):
+        from pytc.pbc.df import isdf as _isdf
+        self.assertFalse(_isdf._SELECTION_GROW_BUFFER)
+        self.assertEqual(_isdf._SELECTION_WIDTH_BUCKET, 4096,
+                         "bucket not restored; a later test would run on the "
+                         "wrong granularity")
+
+    def test_the_fixture_actually_grows_the_buffer(self):
+        """Without this the suite passes while never running the growth branch."""
+        from pytc.pbc.df import isdf as _isdf
+        seen = []
+        original = _isdf.jnp.zeros
+        def spy(shape, *a, **k):
+            if isinstance(shape, tuple) and len(shape) == 2:
+                seen.append(shape[1])
+            return original(shape, *a, **k)
+        _isdf.jnp.zeros = spy
+        try:
+            self._select(True)
+        finally:
+            _isdf.jnp.zeros = original
+        widths = sorted(set(seen))
+        self.assertGreater(len(widths), 1,
+                           f"buffer never grew -- only widths {widths} allocated, "
+                           "so the growth branch was never exercised")
