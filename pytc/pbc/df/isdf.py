@@ -304,7 +304,23 @@ def pivoted_cholesky_batched_hermitian(
             existing_c = factor[candidates, :len(pivots)]
             residual_batch = residual_batch - existing_c @ existing_c.conj().T
         projection_seconds = time.perf_counter() - projection_started
+        # `projection_seconds` above is DISPATCH ONLY when blocked_projection is
+        # on: `factor` is then a jnp array, so the gather and the GEMM are both
+        # async and neither has run yet. The next line is the first host read of
+        # `residual_batch`, so it is where that work is actually paid for.
+        #
+        # Timing it separately costs nothing -- the sync already happened here.
+        # Forcing `block_until_ready()` inside the window above would instead
+        # serialise dispatch and change what we are measuring.
+        #
+        # Without this bucket the seconds land between two `perf_counter` calls
+        # and are charged to NO stage: a local reproduction of this exact shape
+        # (projects/task121/timer_blindness_probe.py, checksum-matched arms) put
+        # 47-66% of the real projection cost in that untimed gap, varying run to
+        # run. Any attribution built on `projection_seconds` alone is unfounded.
+        materialisation_started = time.perf_counter()
         local_diag = np.maximum(np.real(np.diag(residual_batch)), 0.0)
+        materialisation_seconds = time.perf_counter() - materialisation_started
         within_batch_started = time.perf_counter()
         local_pivots, _, local_count = pivoted_cholesky_hermitian(
             local_diag, lambda index: residual_batch[:, index],
@@ -403,6 +419,7 @@ def pivoted_cholesky_batched_hermitian(
                 "candidate_count": int(candidates.size), "retained_count": len(retained),
                 "candidate_eval_seconds": candidate_seconds,
                 "projection_seconds": projection_seconds,
+                "materialisation_seconds": materialisation_seconds,
                 "within_batch_pivot_seconds": within_batch_seconds,
                 "factor_update_seconds": factor_update_seconds,
             })
@@ -431,10 +448,26 @@ def pivoted_cholesky_batched_hermitian(
             raise ValueError("col_batch_eval singleton must return shape (n_grid, 1).")
         if factor is None:
             factor = np.zeros((diag.size, rank), dtype=column.dtype)
-        existing = factor[:, :len(pivots)]
         projection_started = time.perf_counter()
+        # `factor[:, :p]` is the SAME full-width column slice 897b346 removed
+        # from the batched rounds: on a jnp factor it is a materialised copy of
+        # an [n_grid x p] prefix. It used to sit ABOVE `projection_started`, so
+        # its cost was charged to no stage at all. Timed here, not hoisted --
+        # the slice is part of the projection, not free setup.
+        #
+        # It is NOT the same waste as the batched case, which copied [n_grid x p]
+        # to read `batch` rows: this matvec genuinely reads every row. The cost
+        # is the extra copy, and by top-up p is already close to `rank`, so
+        # padding to full width to read `factor` in place should be nearly free.
+        # Untested at 444 -- proposed, not applied.
+        existing = factor[:, :len(pivots)]
         correction = existing @ existing[index].conj() if pivots else 0.0
         projection_seconds = time.perf_counter() - projection_started
+        # Async on a jnp factor: the host read that pays for the line above is
+        # `np.asarray(vector)` in the factor-update block, so top-up's real
+        # projection cost is charged to `factor_update_seconds`. Zero here keeps
+        # the record shape uniform rather than implying it was measured.
+        materialisation_seconds = 0.0
         factor_update_started = time.perf_counter()
         vector = (column[:, 0] - correction) / np.sqrt(diag[index])
         if isinstance(factor, jnp.ndarray):
@@ -459,6 +492,7 @@ def pivoted_cholesky_batched_hermitian(
                 "candidate_count": 1, "retained_count": 1,
                 "candidate_eval_seconds": candidate_seconds,
                 "projection_seconds": projection_seconds,
+                "materialisation_seconds": materialisation_seconds,
                 "within_batch_pivot_seconds": 0.0,
                 "factor_update_seconds": factor_update_seconds,
             })

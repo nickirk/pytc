@@ -219,6 +219,14 @@ class TestExperimentalSelectionPrimitives(unittest.TestCase):
             self.assertGreaterEqual(item["projection_seconds"], 0.0)
             self.assertGreaterEqual(item["within_batch_pivot_seconds"], 0.0)
             self.assertGreaterEqual(item["factor_update_seconds"], 0.0)
+            # Required on EVERY record, both stages. Under blocked_projection
+            # `projection_seconds` times dispatch only -- the gather and GEMM are
+            # async and the host pays for them at the next read. Without this
+            # bucket those seconds fall between two perf_counter calls and are
+            # attributed to no stage, which is how a wall-clock gap can look
+            # unexplained while every named stage looks cheap.
+            self.assertIn("materialisation_seconds", item)
+            self.assertGreaterEqual(item["materialisation_seconds"], 0.0)
 
     def test_batched_selector_oversampling_keeps_batch_rank(self):
         rng = np.random.default_rng(52)
