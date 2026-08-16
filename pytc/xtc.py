@@ -1029,7 +1029,9 @@ class ISDFXTC(XTC, ISDFTC):
     # Fields are inherited from ISDFTC
 
     @classmethod
-    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384, fixed_pivots=None):
+    def from_xtc(cls, xtc_obj, n_rank=None, is_incore=False, save_path=None,
+                 ls_grid_batch_size=16384, fixed_pivots=None, batch_size=1,
+                 candidate_oversampling=2, n_topup=0):
         """Initialize ISDFXTC object from XTC object.
 
         Args:
@@ -1038,6 +1040,11 @@ class ISDFXTC(XTC, ISDFTC):
             is_incore: Whether to perform in-core decomposition
             save_path: Path to save ISDF kernels
             ls_grid_batch_size: Batch size for grid evaluation in linear solver in ISDF decomposition (default: 16384)
+            batch_size: Exact columns retained per blocked pivot round.  One
+                preserves exact greedy pivot selection.
+            candidate_oversampling: Candidate-pool multiplier for exact
+                within-pool re-pivoting.
+            n_topup: Final exact-greedy singleton pivots after blocked rounds.
         """
         from . import df
         from .utils import cache_state
@@ -1079,7 +1086,8 @@ class ISDFXTC(XTC, ISDFTC):
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             xtc_obj.phi, xtc_obj.grad_phi, n_rank, n_rank, weights=xtc_obj.weights,
             is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size,
-            fixed_pivots=fixed_pivots
+            fixed_pivots=fixed_pivots, batch_size=batch_size,
+            candidate_oversampling=candidate_oversampling, n_topup=n_topup,
         )
 
         # Persist xtc_obj's mo_coeff / mo_occ so subsequent runs that reuse
