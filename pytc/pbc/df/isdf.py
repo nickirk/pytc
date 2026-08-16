@@ -463,11 +463,33 @@ def pivoted_cholesky_batched_hermitian(
         existing = factor[:, :len(pivots)]
         correction = existing @ existing[index].conj() if pivots else 0.0
         projection_seconds = time.perf_counter() - projection_started
-        # Async on a jnp factor: the host read that pays for the line above is
-        # `np.asarray(vector)` in the factor-update block, so top-up's real
-        # projection cost is charged to `factor_update_seconds`. Zero here keeps
-        # the record shape uniform rather than implying it was measured.
-        materialisation_seconds = 0.0
+        # Force the read HERE so the split is exact rather than approximate.
+        #
+        # This is the opposite choice from the batched round above, and the
+        # reason they differ is overlap. There, syncing inside the window would
+        # destroy real overlap and change what is measured. Here there is no
+        # overlap to lose: the only thing between this point and the host read
+        # in the factor update is `vector`, which DEPENDS on `correction`, so
+        # nothing can proceed until it lands. Forcing it one line earlier moves
+        # where the seconds are recorded, not when the work happens.
+        #
+        # This corrects a claim I committed in e34476d and had NOT measured --
+        # that top-up's projection cost is charged to `factor_update_seconds`,
+        # recorded as a hardcoded 0.0. @Woke flagged it as unverified and he was
+        # right to: projects/task121/topup_accounting_probe.py, checksum-matched
+        # arms, measured the OPPOSITE split -- the majority already landed in
+        # `projection_seconds` (~70-80% across runs) and only the rest leaked
+        # onward. A large jnp column slice does not dispatch freely the way the
+        # batched gather does. The hardcoded zero was wrong in both directions:
+        # it claimed a leak that is mostly not there, and hid the part that is.
+        #
+        # Only the DIRECTION of that split transfers -- the probe runs on a
+        # loaded laptop at reduced shapes and its absolute times swung several
+        # fold between runs. Do not quote its magnitudes as cluster numbers.
+        materialisation_started = time.perf_counter()
+        if pivots:
+            correction = np.asarray(correction)
+        materialisation_seconds = time.perf_counter() - materialisation_started
         factor_update_started = time.perf_counter()
         vector = (column[:, 0] - correction) / np.sqrt(diag[index])
         if isinstance(factor, jnp.ndarray):
