@@ -47,6 +47,7 @@ class TestISDFDFStructure(unittest.TestCase):
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
         adapter = ISDFDF(
             cell, kpts, rank=4, block_size=100, selection_mode="bpc_streamed",
+            selection_metric="gamma",
             bpc_batch_size=8, bpc_min_separation=2.0,
             bpc_candidate_oversampling=4, bpc_n_topup=16,
         )
@@ -54,6 +55,7 @@ class TestISDFDFStructure(unittest.TestCase):
         with patch.object(coulomb, "build", return_value=sentinel) as mocked_build:
             self.assertIs(adapter.build(), sentinel)
         self.assertEqual(mocked_build.call_args.kwargs["selection_mode"], "bpc_streamed")
+        self.assertEqual(mocked_build.call_args.kwargs["selection_metric"], "gamma")
         self.assertEqual(mocked_build.call_args.kwargs["bpc_batch_size"], 8)
         self.assertEqual(mocked_build.call_args.kwargs["bpc_min_separation"], 2.0)
         self.assertEqual(mocked_build.call_args.kwargs["bpc_candidate_oversampling"], 4)

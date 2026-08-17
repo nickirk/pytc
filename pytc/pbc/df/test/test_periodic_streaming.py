@@ -115,6 +115,22 @@ class TestBuildPeriodicPivotOracle(unittest.TestCase):
         np.testing.assert_allclose(diag, np.diag(expected), atol=1e-10)
         np.testing.assert_allclose(np.asarray(col_eval(3)).real, expected[:, 3], atol=1e-10)
 
+    def test_gamma_subset_from_a_finite_mesh_matches_its_dense_metric(self):
+        cell = _make_cell()
+        full_kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        gamma = full_kpts[np.linalg.norm(full_kpts, axis=1) <= 1e-10]
+        self.assertEqual(gamma.shape, (1, 3), "fixture has no unique Gamma point")
+        grid_coords = cell.get_uniform_grids(cell.mesh)[:21]
+        diag, col_eval = build_periodic_pivot_oracle(
+            cell, gamma, grid_coords, block_size=7,
+        )
+        expected = _dense_reference_metric(cell, gamma, grid_coords)
+        np.testing.assert_allclose(diag, np.diag(expected), atol=1e-10)
+        for j in (0, 8, 20):
+            np.testing.assert_allclose(
+                np.asarray(col_eval(j)).real, expected[:, j], atol=1e-10,
+            )
+
     def test_pivoted_cholesky_hermitian_reconstructs_dense_reference(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 2], wrap_around=False)

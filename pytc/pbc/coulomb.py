@@ -134,6 +134,7 @@ FROZEN_BPC_POLICY = {
 # batch=16/oversampling=1/topup=0 values would ship a configuration nothing has validated
 # -- which is the failure the previous comment existed to prevent.
 DEFAULT_SELECTION_MODE = "bpc_auto"
+SELECTION_METRICS = ("full_k", "gamma")
 
 RETENTION_MODES = ("single", "pairwise", "svd_lstsq", "cholesky_jitter")
 
@@ -276,6 +277,7 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
 
 def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
                        provider_cls, provider_details, selection_mode=None,
+                       selection_metric="full_k",
                        fixed_pivots=None,
                        bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
                        bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
@@ -375,6 +377,11 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
     )
 
     requested_mode = selection_mode
+    if selection_metric not in SELECTION_METRICS:
+        raise ValueError(
+            f"selection_metric must be one of {SELECTION_METRICS}, got "
+            f"{selection_metric!r}."
+        )
     fixed_pivots_provided = fixed_pivots is not None
     if selection_mode == "fixed_pivots" and not fixed_pivots_provided:
         raise ValueError(
@@ -475,7 +482,10 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         if cached_ao_max_bytes is None
         else int(cached_ao_max_bytes)
     )
-    predicted_cache_bytes = predicted_cached_ao_bytes(n_grid, n_kpts, n_ao)
+    selection_n_kpts = 1 if selection_metric == "gamma" else int(n_kpts)
+    predicted_cache_bytes = predicted_cached_ao_bytes(
+        n_grid, selection_n_kpts, n_ao
+    )
     if storage_resolved == "auto":
         storage_resolved = (
             "cached" if predicted_cache_bytes <= cache_ceiling else "streamed"
@@ -505,6 +515,10 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         )
     provider_name = f"{provider_cls.__module__}.{provider_cls.__qualname__}"
 
+    reuse_ao_cache_for_eta_resolved = bool(
+        reuse_ao_cache_for_eta and selection_metric == "full_k"
+    )
+
     if p_block_rows is not None:
         eta_strategy = "panel_blocked"
         kernel_strategy = "panel_precomputed"
@@ -514,7 +528,7 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
     else:
         eta_strategy = (
             "resident_cached"
-            if reuse_ao_cache_for_eta and storage_resolved == "cached"
+            if reuse_ao_cache_for_eta_resolved and storage_resolved == "cached"
             else "resident_streamed"
         )
         kernel_strategy = "grid_blocked" if kern_blocking is not None else "dense"
@@ -526,6 +540,7 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         "rank": int(rank),
         "block_size": int(block_size),
         "selection_mode": requested_mode,
+        "selection_metric": selection_metric,
         "fixed_pivots": fixed_pivots_native,
         "bpc_batch_size": bpc_batch_size,
         "bpc_min_separation": bpc_min_separation,
@@ -550,9 +565,17 @@ def resolve_build_plan(*, n_grid, n_kpts, n_ao, rank, block_size,
         **requested_config,
         "selection_mode": selection_mode,
         "selection_mode_requested": requested_mode,
+        "selection_metric_n_kpts": selection_n_kpts,
         "selector": selector,
         "storage_requested": storage_requested,
         "storage": storage_resolved,
+        "reuse_ao_cache_for_eta": reuse_ao_cache_for_eta_resolved,
+        "reuse_ao_cache_for_eta_requested": bool(reuse_ao_cache_for_eta),
+        "reuse_ao_cache_for_eta_disabled_reason": (
+            "gamma_selection_cache_has_one_kpoint"
+            if reuse_ao_cache_for_eta and selection_metric == "gamma"
+            else None
+        ),
         "bpc_policy": bpc_policy_resolved,
         "bpc_batch_size": (
             None if bpc_policy_resolved is None
@@ -635,6 +658,7 @@ def _resolve_retention_mode(retention_mode, rtol, n_retained_pin=None):
 
 def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
           provider_cls=RawKernelProvider, selection_mode=None,
+          selection_metric="full_k",
           fixed_pivots=None, on_selection=None,
           bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
           bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
@@ -652,6 +676,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         kpts: (Nk,3) absolute k-points (canonicalized internally).
         rank: requested interpolation-point rank.
         block_size: grid points per streamed AO block.
+        selection_metric: ``"full_k"`` (current exact metric) or experimental
+            ``"gamma"``. The latter selects pivots from the unique Gamma-point
+            AO metric, then evaluates and fits all q channels on the full mesh.
+            It is opt-in until a finite-k energy gate establishes accuracy.
         on_selection: optional callable invoked immediately after pivot
             selection with ``(pivots, selection_provenance)``. Exists so a
             caller can persist pivots at the moment they are produced;
@@ -714,6 +742,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         provider_cls=type(provider),
         provider_details=provenance_fn(),
         selection_mode=selection_mode,
+        selection_metric=selection_metric,
         fixed_pivots=fixed_pivots,
         bpc_batch_size=bpc_batch_size,
         bpc_min_separation=bpc_min_separation,
@@ -737,6 +766,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     rank = resolved_plan["rank"]
     block_size = resolved_plan["block_size"]
     selection_mode = resolved_plan["selection_mode"]
+    selection_metric = resolved_plan["selection_metric"]
     selector = resolved_plan["selector"]
     storage = resolved_plan["storage"]
     fixed_pivots = resolved_plan["fixed_pivots"]
@@ -758,11 +788,28 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     if resolved_plan["storage_requested"] == "auto":
         cache_gate["auto_resolved_to"] = storage
 
+    if selection_metric == "gamma":
+        gamma_indices = np.flatnonzero(
+            np.linalg.norm(mesh_obj.canonical_kpts, axis=1) <= 1e-10
+        )
+        if gamma_indices.size != 1:
+            raise ValueError(
+                "selection_metric='gamma' requires exactly one Gamma point "
+                f"in the canonical k-mesh; found {gamma_indices.size}."
+            )
+        selection_kpt_indices = gamma_indices.astype(np.int64)
+    else:
+        selection_kpt_indices = np.arange(mesh_obj.n_kpts, dtype=np.int64)
+    selection_kpts = mesh_obj.canonical_kpts[selection_kpt_indices]
+
     ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
     selection_provenance = {
         "mode": selection_mode,
         "selector": selector,
         "storage": storage,
+        "metric_kpoint_policy": selection_metric,
+        "metric_kpoint_indices": selection_kpt_indices.tolist(),
+        "metric_n_kpts": int(selection_kpts.shape[0]),
         "candidate_rule": "all_grid_points_v1",
         "candidate_count": int(grid_coords.shape[0]),
         "candidate_identity": full_grid_candidate_identity(grid_coords.shape[0]),
@@ -798,15 +845,15 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         })
     elif selection_mode == "bpc_streamed":
         diag, col_batch_eval = build_periodic_batched_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            cell, selection_kpts, grid_coords, block_size, stats=ao_stats,
         )
     elif selection_mode == "bpc_cached_gemm":
         diag, col_batch_eval, cached_ao = build_cached_periodic_bpc_gemm_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            cell, selection_kpts, grid_coords, block_size, stats=ao_stats,
         )
     else:
         diag, col_eval = build_periodic_pivot_oracle(
-            cell, mesh_obj.canonical_kpts, grid_coords, block_size, stats=ao_stats,
+            cell, selection_kpts, grid_coords, block_size, stats=ao_stats,
         )
     if selection_mode == "fixed_pivots":
         pass
@@ -1387,11 +1434,12 @@ class ISDFDF:
 
     Args:
         kpts: (Nk,3) absolute k-points, e.g. cell.make_kpts(kmesh).
-        rank, block_size, rtol, retention_mode: forwarded to build().
+        rank, block_size, rtol, retention_mode, selection_metric: forwarded to
+            build().
     """
 
     def __init__(self, cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
-                 selection_mode=None, fixed_pivots=None,
+                 selection_mode=None, selection_metric="full_k", fixed_pivots=None,
                  bpc_batch_size=FROZEN_BPC_POLICY["bpc_batch_size"],
                  bpc_min_separation=FROZEN_BPC_POLICY["bpc_min_separation"],
                  bpc_candidate_oversampling=FROZEN_BPC_POLICY["bpc_candidate_oversampling"],
@@ -1413,6 +1461,7 @@ class ISDFDF:
         self.jitter_rcond = jitter_rcond
         self.cached_ao_max_bytes = cached_ao_max_bytes
         self.selection_mode = selection_mode
+        self.selection_metric = selection_metric
         self.fixed_pivots = None if fixed_pivots is None else np.asarray(fixed_pivots)
         self.bpc_batch_size = bpc_batch_size
         self.bpc_min_separation = bpc_min_separation
@@ -1456,6 +1505,7 @@ class ISDFDF:
                 solve_backend=self.solve_backend, jitter_rcond=self.jitter_rcond,
                 cached_ao_max_bytes=self.cached_ao_max_bytes,
                 selection_mode=self.selection_mode,
+                selection_metric=self.selection_metric,
                 fixed_pivots=self.fixed_pivots,
                 bpc_batch_size=self.bpc_batch_size,
                 bpc_min_separation=self.bpc_min_separation,

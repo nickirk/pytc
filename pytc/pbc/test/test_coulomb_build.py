@@ -251,6 +251,33 @@ class TestBuildPlan(unittest.TestCase):
                 )
                 self.assertEqual(record["resolved"]["storage"], expected_storage)
 
+    def test_gamma_metric_sizes_only_one_kpoint_and_disables_eta_cache_reuse(self):
+        full = self._resolve(
+            n_grid=10, n_kpts=8, n_ao=3,
+            selection_mode="bpc_cached_gemm",
+            selection_metric="full_k",
+        ).to_dict()
+        gamma = self._resolve(
+            n_grid=10, n_kpts=8, n_ao=3,
+            selection_mode="bpc_cached_gemm",
+            selection_metric="gamma",
+        ).to_dict()
+        self.assertEqual(
+            full["resolved"]["predicted_cached_ao_bytes"],
+            8 * gamma["resolved"]["predicted_cached_ao_bytes"],
+        )
+        self.assertEqual(gamma["resolved"]["selection_metric_n_kpts"], 1)
+        self.assertTrue(gamma["requested"]["reuse_ao_cache_for_eta"])
+        self.assertFalse(gamma["resolved"]["reuse_ao_cache_for_eta"])
+        self.assertEqual(
+            gamma["resolved"]["reuse_ao_cache_for_eta_disabled_reason"],
+            "gamma_selection_cache_has_one_kpoint",
+        )
+
+    def test_invalid_selection_metric_refuses_before_ao(self):
+        with self.assertRaisesRegex(ValueError, "selection_metric"):
+            self._resolve(selection_metric="q_dependent")
+
     def test_plan_is_deeply_immutable_and_returns_fresh_json_values(self):
         details = {"normalization": "unit_test", "nested": {"mesh": [1, 2, 3]}}
         plan = self._resolve(provider_details=details)
@@ -270,6 +297,46 @@ class TestBuildPlan(unittest.TestCase):
 
 
 class TestBuild(unittest.TestCase):
+    def test_gamma_selection_metric_uses_one_kpoint_then_returns_to_full_mesh(self):
+        """The production call path, not only provenance, must drop the Nk sum."""
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 2], wrap_around=False)
+        original = cell.pbc_eval_gto
+        selection_finished = False
+        seen_during_selection = []
+        seen_after_selection = []
+
+        def record_eval(*args, **kwargs):
+            target = (seen_after_selection if selection_finished
+                      else seen_during_selection)
+            target.append(len(kwargs["kpts"]))
+            return original(*args, **kwargs)
+
+        def mark_selection_done(_pivots, provenance):
+            nonlocal selection_finished
+            self.assertEqual(provenance["metric_kpoint_policy"], "gamma")
+            self.assertEqual(provenance["metric_n_kpts"], 1)
+            self.assertEqual(len(provenance["metric_kpoint_indices"]), 1)
+            selection_finished = True
+
+        with mock.patch.object(cell, "pbc_eval_gto", side_effect=record_eval):
+            result = coulomb.build(
+                cell, kpts, rank=3, block_size=9,
+                selection_mode="bpc_cached_gemm",
+                selection_metric="gamma",
+                on_selection=mark_selection_done,
+            )
+
+        self.assertTrue(seen_during_selection, "selection made no AO calls")
+        self.assertEqual(set(seen_during_selection), {1})
+        self.assertIn(len(kpts), seen_after_selection)
+        self.assertEqual(
+            result["build_plan"]["resolved"]["selection_metric"], "gamma"
+        )
+        self.assertFalse(
+            result["build_plan"]["resolved"]["reuse_ao_cache_for_eta"]
+        )
+
     def test_build_records_exact_provider_and_normalization_provenance(self):
         cell = _make_cell()
         kpts = cell.make_kpts([1, 1, 1], wrap_around=False)
@@ -313,6 +380,12 @@ class TestBuild(unittest.TestCase):
         )
         self.assertEqual(
             device["build_plan"]["requested"]["selection_mode"], None
+        )
+        self.assertEqual(
+            device["build_plan"]["requested"]["selection_metric"], "full_k"
+        )
+        self.assertEqual(
+            device["build_plan"]["resolved"]["selection_metric"], "full_k"
         )
         self.assertEqual(device["build_plan"]["requested"]["rank"], 3)
         self.assertEqual(device["build_plan"]["requested"]["block_size"], 9)
