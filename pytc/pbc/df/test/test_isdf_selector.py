@@ -540,50 +540,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestFullWidthProjectionIsNumericallyIdentical(unittest.TestCase):
-    """The task #127 A/B knob must change timing only, never the answer.
-
-    Numerical identity is the PREMISE of passing `rank` instead of the bucketed
-    width -- columns in [p0, rank) are exactly zero. If the pivots move, the
-    premise is false and any timing result from the A/B is meaningless. So this
-    is a gate on the experiment, not a nicety.
-    """
-
-    def _select(self, full_width):
-        from pytc.pbc.df import isdf as _isdf
-        rng = np.random.default_rng(77)
-        feature = rng.normal(size=(60, 20)) + 1j * rng.normal(size=(60, 20))
-        metric = feature @ feature.conj().T
-        original = _isdf._SELECTION_FULL_WIDTH
-        try:
-            _isdf._SELECTION_FULL_WIDTH = full_width
-            return pivoted_cholesky_batched_hermitian(
-                np.real(np.diag(metric)), lambda idx: metric[:, idx], rank=18,
-                mesh=(5, 4, 3), batch_size=4, n_topup=2, blocked_projection=True)
-        finally:
-            _isdf._SELECTION_FULL_WIDTH = original
-
-    def test_pivots_and_factor_are_identical_across_the_knob(self):
-        p_bucket, f_bucket, n_bucket, _ = self._select(False)
-        p_full, f_full, n_full, _ = self._select(True)
-        np.testing.assert_array_equal(p_bucket, p_full)
-        self.assertEqual(n_bucket, n_full)
-        np.testing.assert_allclose(np.asarray(f_bucket), np.asarray(f_full), atol=1e-10)
-
-    def test_the_knob_is_inert_when_off(self):
-        """A flag-off run must be the old code path, or the baseline arm moved."""
-        from pytc.pbc.df import isdf as _isdf
-        self.assertFalse(_isdf._SELECTION_FULL_WIDTH, "the knob must default OFF")
-        self.assertEqual(_isdf._bucketed_width(100, 10_000), 4096)
-        original = _isdf._SELECTION_FULL_WIDTH
-        try:
-            _isdf._SELECTION_FULL_WIDTH = True
-            self.assertEqual(_isdf._bucketed_width(100, 10_000), 10_000)
-        finally:
-            _isdf._SELECTION_FULL_WIDTH = original
-        self.assertEqual(_isdf._bucketed_width(100, 10_000), 4096)
-
-
 class TestGrowBufferIsNumericallyIdentical(unittest.TestCase):
     """Growing the factor must change allocation only, never the answer.
 
@@ -631,9 +587,9 @@ class TestGrowBufferIsNumericallyIdentical(unittest.TestCase):
         self.assertEqual(np.asarray(factor).shape[1], len(pivots))
         self.assertEqual(count, len(pivots))
 
-    def test_the_knob_defaults_off(self):
+    def test_growing_is_the_default(self):
         from pytc.pbc.df import isdf as _isdf
-        self.assertFalse(_isdf._SELECTION_GROW_BUFFER)
+        self.assertTrue(_isdf._SELECTION_GROW_BUFFER)
         self.assertEqual(_isdf._SELECTION_WIDTH_BUCKET, 4096,
                          "bucket not restored; a later test would run on the "
                          "wrong granularity")
