@@ -41,10 +41,14 @@ class TestISDFXTCPanelization(unittest.TestCase):
     def test_aux_recovered_kernels_preserve_h2_xtc_normal_order(self):
         """Exact auxiliary K recovery must leave the full H2 XTC view intact."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
-        direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
+        direct = self.isdf_xtc.isdf(
+            self.jparams, reuse_aux_kernels=False, **kwargs
+        )
         recovered = self.isdf_xtc.isdf(
             self.jparams, reuse_aux_kernels=True, **kwargs
         )
+        self.assertEqual(direct.kmat_kernel_mode, "direct")
+        self.assertEqual(recovered.kmat_kernel_mode, "aux-recovery")
 
         np.testing.assert_allclose(
             np.asarray(recovered.isdf_kernels["K1_kernel"]),
@@ -86,7 +90,9 @@ class TestISDFXTCPanelization(unittest.TestCase):
         """The production path streams HDF5 auxiliary panels and preserves XTC."""
         kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=127)
         with tempfile.TemporaryDirectory() as tmpdir:
-            direct = self.isdf_xtc.isdf(self.jparams, **kwargs)
+            direct = self.isdf_xtc.isdf(
+                self.jparams, reuse_aux_kernels=False, **kwargs
+            )
             store_path = os.path.join(tmpdir, "h2_aux_streamed.h5")
             # Match a genuine out-of-core ISDF object: xi lives only in the
             # persistent store and the object carries None for both fields.
@@ -105,6 +111,8 @@ class TestISDFXTCPanelization(unittest.TestCase):
                 reuse_aux_kernels=True,
                 **kwargs,
             )
+            self.assertEqual(direct.kmat_kernel_mode, "direct")
+            self.assertEqual(recovered.kmat_kernel_mode, "aux-recovery")
 
             np.testing.assert_allclose(
                 np.asarray(recovered.isdf_kernels["K1_kernel"]),
@@ -146,7 +154,12 @@ class TestISDFXTCPanelization(unittest.TestCase):
                 xi_grad=None,
                 save_path=store_path,
             )
-            direct = fixed_isdf.isdf(self.jparams, save_path=store_path, **kwargs)
+            direct = fixed_isdf.isdf(
+                self.jparams,
+                save_path=store_path,
+                reuse_aux_kernels=False,
+                **kwargs,
+            )
             direct_k1 = np.asarray(direct.isdf_kernels["K1_kernel"])
             direct_k3 = np.asarray(direct.isdf_kernels["K3_kernel"])
             with h5py.File(store_path, "r") as f:
@@ -154,6 +167,8 @@ class TestISDFXTCPanelization(unittest.TestCase):
             recovered = fixed_isdf.isdf(
                 self.jparams, save_path=store_path, reuse_aux_kernels=True, **kwargs
             )
+            self.assertEqual(direct.kmat_kernel_mode, "direct")
+            self.assertEqual(recovered.kmat_kernel_mode, "aux-recovery")
             np.testing.assert_allclose(
                 np.asarray(recovered.isdf_kernels["K1_kernel"]), direct_k1,
                 rtol=0, atol=2e-12,
