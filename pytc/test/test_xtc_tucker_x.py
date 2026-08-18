@@ -332,6 +332,7 @@ class TestRealFactorOnlyH2(unittest.TestCase):
 
         self.assertNotIn("X", direct.isdf_kernels)
         self.assertIn("X_tucker", direct.isdf_kernels)
+        self.assertEqual(direct.kmat_kernel_mode, "aux-recovery")
         metadata = direct.laux_build_metadata
         self.assertIsNotNone(metadata)
         self.assertEqual(metadata.mode, "interpolative-cur-v1")

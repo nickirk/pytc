@@ -235,6 +235,7 @@ class TestPhysicalH2ResidualHMatrix(unittest.TestCase):
                 self.params,
                 batch_size=16,
                 host_grid_block_size=64,
+                reuse_aux_kernels=False,
                 laux_hmatrix=self.exact_config,
             )
 

@@ -775,6 +775,8 @@ class ISDFTC(TC):
         isdf_kernels: Dictionary storing precomputed kernels (U1, U3)
         laux_build_metadata: Non-array provenance for a hierarchical L_aux
             build, excluded from the numeric pytree.
+        kmat_kernel_mode: Resolved K1/K3 construction route (``direct`` or
+            ``aux-recovery``), excluded from the numeric pytree.
     """
     xi_phi: jnp.ndarray = struct.field(default=None)
     xi_grad: jnp.ndarray = struct.field(default=None)
@@ -787,6 +789,7 @@ class ISDFTC(TC):
     laux_build_metadata: LauxBuildMetadata = struct.field(
         default=None, pytree_node=False
     )
+    kmat_kernel_mode: str = struct.field(default=None, pytree_node=False)
 
     def _get_fixed_rank_block_size(self):
         """Return a fixed rank_block_size that is safe for all orbital slices.
@@ -1860,7 +1863,7 @@ class ISDFTC(TC):
 	
 
     def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
-             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=False,
+             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=None,
              use_laux_fast_grad=False, use_laux_exact_split=False,
              laux_hmatrix=None):
         """Compute ISDF intermediates and store them.
@@ -1875,11 +1878,12 @@ class ISDFTC(TC):
             r2_tile_size: Optional r2-grid tile size for kernel assembly.
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
-            reuse_aux_kernels: Opt-in exact path that builds ``L_aux`` and
-                ``H_aux`` together, then recovers K1/K3 from one-grid
-                contractions.  The out-of-core implementation streams grid
-                and left-rank panels, retaining only the final K kernels in
-                host memory; it requires a persistent ``save_path`` for the
+            reuse_aux_kernels: Exact path that builds ``L_aux`` and ``H_aux``
+                together, then recovers K1/K3 from one-grid contractions.  By
+                default it is enabled for in-core calculations and out-of-core
+                calculations with a persistent output path.  Out-of-core
+                calculations without a path retain direct K1/K3 construction.
+                Passing ``True`` explicitly requires a persistent path for the
                 L_aux/H_aux datasets.
             use_laux_fast_grad: Opt into an algebraically equivalent,
                 Jastrow-provided fast derivative for the L_aux double-grid
@@ -1896,6 +1900,9 @@ class ISDFTC(TC):
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+        reuse_aux_kernels_defaulted = reuse_aux_kernels is None
+        if reuse_aux_kernels_defaulted:
+            reuse_aux_kernels = self.is_incore or bool(out_path)
         if laux_hmatrix is not None:
             from pytc.df.hmatrix import LauxHMatrixConfig
 
@@ -1921,9 +1928,14 @@ class ISDFTC(TC):
         )
         kernels = {}
         laux_build_metadata = None
-        # An opt-in auxiliary-reuse request must execute that path, not
-        # silently accept a pre-existing direct K1/K3 cache.
-        if out_path and os.path.exists(out_path) and not reuse_aux_kernels:
+        # An explicit auxiliary-reuse request must execute that path, not
+        # silently accept a pre-existing direct K1/K3 cache.  The default may
+        # accept an exact warm cache instead of rebuilding equivalent kernels.
+        if (
+            out_path
+            and os.path.exists(out_path)
+            and (not reuse_aux_kernels or reuse_aux_kernels_defaulted)
+        ):
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
@@ -1946,6 +1958,11 @@ class ISDFTC(TC):
                         kernels['K1_kernel'] = f['K1_kernel'][:]
                         logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
                         kernels['K3_kernel'] = f['K3_kernel'][:]
+                        cached_kmat_mode = f.attrs.get(
+                            "pytc_kmat_kernel_mode", "legacy-cache-unknown"
+                        )
+                        if isinstance(cached_kmat_mode, bytes):
+                            cached_kmat_mode = cached_kmat_mode.decode()
                         if self.is_incore:
                             logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
                             kernels['L_aux'] = f['L_aux'][:]
@@ -1958,6 +1975,7 @@ class ISDFTC(TC):
                         return self.replace(
                             isdf_kernels=kernels,
                             laux_build_metadata=None,
+                            kmat_kernel_mode=cached_kmat_mode,
                         )
                 
                 # If we are here, keys are missing. Close the file!
@@ -2107,6 +2125,9 @@ class ISDFTC(TC):
             isdf_kernels=kernels,
             save_path=out_path,
             laux_build_metadata=laux_build_metadata,
+            kmat_kernel_mode=(
+                "aux-recovery" if reuse_aux_kernels else "direct"
+            ),
         )
 
     def _accumulate_transpose_block(self, result_np, U1, U3, ranges_T,

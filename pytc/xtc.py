@@ -1134,7 +1134,7 @@ class ISDFXTC(XTC, ISDFTC):
         d_reduce_group_blocks=1,
         r2_tile_size=None,
         gpu_budget_bytes=None,
-        reuse_aux_kernels=False,
+        reuse_aux_kernels=None,
         use_laux_fast_grad=False,
         use_laux_exact_split=False,
         laux_hmatrix=None,
@@ -1154,10 +1154,10 @@ class ISDFXTC(XTC, ISDFTC):
             r2_tile_size: Optional r2-grid tile size for kernel assembly.
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
-            reuse_aux_kernels: Opt-in exact K1/K3 recovery from ``L_aux`` and
-                its squared-gradient companion.  The parent ISDF
-                implementation streams the out-of-core auxiliary contraction
-                when a persistent output path is provided.
+            reuse_aux_kernels: Exact K1/K3 recovery from ``L_aux`` and its
+                squared-gradient companion.  The parent enables it by default
+                whenever the in-core state or a persistent output path supports
+                the auxiliary contraction.
             use_laux_fast_grad: Opt into the Jastrow's L_aux-only fast
                 derivative path.  The parent validates this mode against any
                 reusable base cache.
@@ -1234,6 +1234,7 @@ class ISDFXTC(XTC, ISDFTC):
                             isdf_kernels=kernels,
                             save_path=out_path,
                             laux_build_metadata=isdf_tc.laux_build_metadata,
+                            kmat_kernel_mode=isdf_tc.kmat_kernel_mode,
                         )
                         keep_open = not self.is_incore
                         return result
@@ -1272,6 +1273,7 @@ class ISDFXTC(XTC, ISDFTC):
             isdf_kernels=kernels,
             save_path=out_path,
             laux_build_metadata=isdf_tc.laux_build_metadata,
+            kmat_kernel_mode=isdf_tc.kmat_kernel_mode,
         )
 
     def compute_delta_u_kernels(
@@ -1553,7 +1555,7 @@ class ISDFXTC(XTC, ISDFTC):
         d_reduce_group_blocks=1,
         r2_tile_size=None,
         gpu_budget_bytes=None,
-        reuse_aux_kernels=False,
+        reuse_aux_kernels=None,
         use_laux_fast_grad=False,
         use_laux_exact_split=False,
         laux_hmatrix=None,

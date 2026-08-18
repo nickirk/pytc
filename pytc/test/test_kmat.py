@@ -1,5 +1,6 @@
 """Tests for JAX implementation of kinetic matrix elements."""
 
+import inspect
 import unittest
 import tempfile
 import numpy as np
@@ -287,6 +288,69 @@ class TestKmatFromAuxParity(unittest.TestCase):
             rtol=0,
             atol=2e-12,
         )
+
+    def test_aux_recovery_is_the_public_default(self):
+        """TC, XTC, and factor-only builders must share the exact-reuse default."""
+        from pytc.tc import ISDFTC
+        from pytc.xtc import ISDFXTC
+
+        for method in (
+            ISDFTC.isdf,
+            ISDFXTC.isdf,
+            ISDFXTC.build_tucker_x_kernels_direct,
+        ):
+            with self.subTest(method=method.__qualname__):
+                self.assertIs(
+                    inspect.signature(method)
+                    .parameters["reuse_aux_kernels"]
+                    .default,
+                    None,
+                )
+
+        in_core = self.isdf.isdf(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=512,
+        )
+        self.assertEqual(in_core.kmat_kernel_mode, "aux-recovery")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/default-recovery.h5"
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
+                handle.create_dataset("xi_grad", data=np.asarray(self.isdf.xi_grad))
+            out_of_core = self.isdf.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=path,
+            ).isdf(
+                self.params,
+                save_path=path,
+                batch_size=32,
+                host_grid_block_size=512,
+            )
+            self.assertEqual(out_of_core.kmat_kernel_mode, "aux-recovery")
+            with h5py.File(path, "r") as handle:
+                self.assertEqual(
+                    handle.attrs["pytc_kmat_kernel_mode"], "aux-recovery"
+                )
+            warm = self.isdf.isdf(
+                self.params,
+                save_path=path,
+                batch_size=32,
+                host_grid_block_size=512,
+            )
+            self.assertEqual(warm.kmat_kernel_mode, "aux-recovery")
+
+        no_store = self.isdf.replace(is_incore=False, save_path=None).isdf(
+            self.params,
+            batch_size=32,
+            host_grid_block_size=self.isdf.grid_points.shape[0],
+        )
+        self.assertIn("K1_kernel", no_store.isdf_kernels)
+        self.assertIn("K3_kernel", no_store.isdf_kernels)
+        self.assertEqual(no_store.kmat_kernel_mode, "direct")
 
     def test_h2_streamed_aux_recovery_matches_direct_from_hdf5(self):
         """The out-of-core recovery must use HDF5 panels without a K-square GPU temporary."""
