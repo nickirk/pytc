@@ -12,7 +12,6 @@ import numpy as np
 from pyscf import gto, scf
 
 from pytc import xtc as xtc_mod
-from pytc.df import LauxHMatrixConfig
 from pytc.jastrow.rexp import REXP
 from pytc.solver import jax_xtc_ccsd
 
@@ -303,62 +302,6 @@ class TestRealFactorOnlyH2(unittest.TestCase):
                 self.assertNotIn("X", handle)
                 self.assertNotIn("X_rm", handle)
                 self.assertTrue({"K1_kernel", "K3_kernel", "L_aux"} <= set(handle))
-
-    def test_source_free_builder_composes_hmatrix_and_exposes_provenance(self):
-        mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
-            unit="Angstrom", verbose=0,
-        )
-        mf = scf.RHF(mol).run()
-        jparams = {"alpha": jnp.array([1.0])}
-        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
-        isdf = xtc_mod.ISDFXTC.from_xtc(
-            base, n_rank=max(8, 3 * base.n_orb), is_incore=True,
-        )
-        permissive = LauxHMatrixConfig(128, 0.05, 1e-2, 16, 16)
-        direct = isdf.build_tucker_x_kernels_direct(
-            jparams,
-            base.n_orb,
-            oversampling=2,
-            seed=37,
-            batch_size=64,
-            orb_block_size=2,
-            host_grid_block_size=512,
-            reuse_aux_kernels=True,
-            use_laux_fast_grad=True,
-            use_laux_exact_split=True,
-            laux_hmatrix=permissive,
-        )
-
-        self.assertNotIn("X", direct.isdf_kernels)
-        self.assertIn("X_tucker", direct.isdf_kernels)
-        self.assertEqual(direct.kmat_kernel_mode, "aux-recovery")
-        metadata = direct.laux_build_metadata
-        self.assertIsNotNone(metadata)
-        self.assertEqual(metadata.mode, "interpolative-cur-v1")
-        self.assertEqual(
-            metadata.config_fingerprint,
-            permissive.cache_tag + "-split-fast",
-        )
-        self.assertGreater(metadata.far_blocks, 0)
-        self.assertGreater(metadata.accepted_far_blocks, 0)
-        leaves = jax.tree_util.tree_leaves(direct)
-        self.assertFalse(any(leaf is metadata for leaf in leaves))
-
-        fallback_heavy = isdf.isdf(
-            jparams,
-            batch_size=64,
-            host_grid_block_size=512,
-            reuse_aux_kernels=True,
-            use_laux_fast_grad=True,
-            use_laux_exact_split=True,
-            laux_hmatrix=LauxHMatrixConfig(128, 0.05, 0.0, 16, 16),
-        )
-        fallback_metadata = fallback_heavy.laux_build_metadata
-        self.assertEqual(fallback_metadata.far_blocks, metadata.far_blocks)
-        self.assertGreater(
-            fallback_metadata.direct_fallbacks, metadata.direct_fallbacks
-        )
 
     def test_source_free_full_rank_factor_view_matches_dense_x(self):
         """The direct builder needs no materialized-X cache to recover full X."""

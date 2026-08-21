@@ -299,36 +299,6 @@ class NuclearCusp(Jastrow):
     def get_log_grads_r2(self, r1, r2, params):
         return self.get_log_grads_r1(r2, r1, params)
 
-    def laux_one_grid_gradient(self, r_batch, params):
-        """Return the exact one-grid cusp gradient used by split L_aux.
-
-        NuclearCusp is independent of the second electron coordinate.  The
-        polynomial coefficients depend only on the fixed Jastrow parameters,
-        so build them once and differentiate the one-grid inner expression.
-        """
-        clipped_params = self._clip_params(params)
-        poly_coeffs = self._precompute_poly_coeffs(clipped_params)
-        r2_reference = jnp.zeros(3, dtype=r_batch.dtype)
-
-        def one_gradient(r1):
-            def scalar_fn(x):
-                return self._compute_inner(
-                    x, r2_reference, clipped_params, poly_coeffs
-                ).reshape(-1)[0]
-            return jax.grad(scalar_fn)(r1)
-
-        return jax.vmap(one_gradient)(r_batch)
-
-    def grad_r_batch_laux_residual(self, r1_batch, r2_batch, params):
-        """The exact one-grid contribution leaves no cusp residual."""
-        return jnp.zeros(
-            (r1_batch.shape[0], r2_batch.shape[0], 3), dtype=r1_batch.dtype
-        )
-
-    def grad_r_batch_residual(self, r1_batch, r2_batch, params):
-        """The ordinary split path also has no cusp residual."""
-        return self.grad_r_batch_laux_residual(r1_batch, r2_batch, params)
-
     def eval_mo_at_r(self, nucleus_idx, r):
         """JAX-compatible cubic spline evaluation."""
         r_is_array = hasattr(r, 'shape') and r.ndim > 0

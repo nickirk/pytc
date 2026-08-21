@@ -1136,8 +1136,6 @@ class ISDFXTC(XTC, ISDFTC):
         gpu_budget_bytes=None,
         reuse_aux_kernels=None,
         use_laux_fast_grad=False,
-        use_laux_exact_split=False,
-        laux_hmatrix=None,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1161,11 +1159,6 @@ class ISDFXTC(XTC, ISDFTC):
             use_laux_fast_grad: Opt into the Jastrow's L_aux-only fast
                 derivative path.  The parent validates this mode against any
                 reusable base cache.
-            use_laux_exact_split: Opt into exact extraction of any
-                integration-coordinate-independent Jastrow gradient from
-                the L_aux/H_aux pair pass.
-            laux_hmatrix: Optional ``LauxHMatrixConfig`` forwarded to the
-                auxiliary construction.  The direct path remains the default.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
@@ -1177,13 +1170,9 @@ class ISDFXTC(XTC, ISDFTC):
                                r2_tile_size=r2_tile_size,
                                gpu_budget_bytes=gpu_budget_bytes,
                                reuse_aux_kernels=reuse_aux_kernels,
-                               use_laux_fast_grad=use_laux_fast_grad,
-                               use_laux_exact_split=use_laux_exact_split,
-                               laux_hmatrix=laux_hmatrix)
+                               use_laux_fast_grad=use_laux_fast_grad)
         kernels = isdf_tc.isdf_kernels
-        requested_laux_mode = _laux_gradient_mode(
-            use_laux_fast_grad, use_laux_exact_split, laux_hmatrix
-        )
+        requested_laux_mode = _laux_gradient_mode(use_laux_fast_grad)
         
         if out_path and os.path.exists(out_path):
             f = None
@@ -1233,7 +1222,6 @@ class ISDFXTC(XTC, ISDFTC):
                         result = self.replace(
                             isdf_kernels=kernels,
                             save_path=out_path,
-                            laux_build_metadata=isdf_tc.laux_build_metadata,
                             kmat_kernel_mode=isdf_tc.kmat_kernel_mode,
                         )
                         keep_open = not self.is_incore
@@ -1272,7 +1260,6 @@ class ISDFXTC(XTC, ISDFTC):
         return self.replace(
             isdf_kernels=kernels,
             save_path=out_path,
-            laux_build_metadata=isdf_tc.laux_build_metadata,
             kmat_kernel_mode=isdf_tc.kmat_kernel_mode,
         )
 
@@ -1557,8 +1544,6 @@ class ISDFXTC(XTC, ISDFTC):
         gpu_budget_bytes=None,
         reuse_aux_kernels=None,
         use_laux_fast_grad=False,
-        use_laux_exact_split=False,
-        laux_hmatrix=None,
     ):
         """Build a factor-only X view without materializing dense ``X``.
 
@@ -1572,7 +1557,6 @@ class ISDFXTC(XTC, ISDFTC):
         When ``save_path`` is supplied, the reusable base intermediates may be
         cached there by :class:`ISDFTC`; no dense exchange dataset is created.
         The accepted L_aux construction controls are forwarded unchanged.
-        ``laux_hmatrix`` is opt-in and currently requires an in-core object.
         """
         if save_path and os.path.exists(save_path):
             with h5py.File(save_path, 'r') as handle:
@@ -1592,8 +1576,6 @@ class ISDFXTC(XTC, ISDFTC):
             gpu_budget_bytes=gpu_budget_bytes,
             reuse_aux_kernels=reuse_aux_kernels,
             use_laux_fast_grad=use_laux_fast_grad,
-            use_laux_exact_split=use_laux_exact_split,
-            laux_hmatrix=laux_hmatrix,
         )
         kernels = dict(base.isdf_kernels)
         l_aux = kernels.pop("L_aux")

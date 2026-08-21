@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 from pyscf import gto, scf
 
-from pytc.df.hmatrix import LauxHMatrixConfig
 from pytc.jastrow.rexp import REXP
 from pytc.tc import ISDFTC
 from pytc.xtc import XTC, ISDFXTC
@@ -256,46 +255,6 @@ class TestISDFXTCPanelization(unittest.TestCase):
             self.assertFalse(opened_reads[0].id.valid)
         finally:
             os.remove(path)
-
-    def test_delta_u_cache_rejects_adjacent_float_laux_modes(self):
-        cached_config = LauxHMatrixConfig(8, 0.123456781, 1e-3, 4, 4)
-        requested_config = LauxHMatrixConfig(8, 0.123456782, 1e-3, 4, 4)
-        self.assertNotEqual(cached_config.cache_tag, requested_config.cache_tag)
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "stale_delta_u.h5")
-            with h5py.File(path, "w") as store:
-                store.create_dataset("D", data=np.full((1, 1), 7.0))
-                store.create_dataset("X", data=np.full((1, 1, 1), 7.0))
-                store.attrs["pytc_xtc_x_mode"] = "full"
-                store.attrs["pytc_xtc_laux_gradient_mode"] = (
-                    cached_config.cache_tag + "-direct"
-                )
-
-            rebuilt = {
-                "D": np.full((1, 1), 3.0),
-                "X": np.full((1, 1, 1), 5.0),
-            }
-            base = self.isdf_xtc.replace(isdf_kernels={})
-            with mock.patch.object(ISDFTC, "isdf", return_value=base), \
-                    mock.patch.object(
-                        ISDFXTC,
-                        "compute_delta_u_kernels",
-                        return_value=rebuilt,
-                    ) as compute:
-                result = self.isdf_xtc.isdf(
-                    self.jparams,
-                    save_path=path,
-                    reuse_aux_kernels=True,
-                    laux_hmatrix=requested_config,
-                )
-
-            compute.assert_called_once()
-            np.testing.assert_array_equal(result.isdf_kernels["D"], rebuilt["D"])
-            with h5py.File(path, "r") as store:
-                self.assertEqual(
-                    store.attrs["pytc_xtc_laux_gradient_mode"],
-                    requested_config.cache_tag + "-direct",
-                )
 
     def test_delta_u_tile_assembly_matches_public_api(self):
         kernels = self.isdf_xtc.compute_delta_u_kernels(

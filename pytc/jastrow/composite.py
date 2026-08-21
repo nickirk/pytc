@@ -75,39 +75,6 @@ class CompositeJastrow(Jastrow):
             )
         return grad_total
 
-    def grad_r_batch_laux_residual(self, r1_batch, r2_batch, params):
-        """Accumulate only the pair-dependent L_aux gradient pieces."""
-        grad_total = jnp.zeros(
-            (r1_batch.shape[0], r2_batch.shape[0], 3), dtype=r1_batch.dtype
-        )
-        for jastrow, jastrow_params in zip(self.jastrows, params):
-            grad_total += jastrow.grad_r_batch_laux_residual(
-                r1_batch, r2_batch, jastrow_params
-            )
-        return grad_total
-
-    def grad_r_batch_residual(self, r1_batch, r2_batch, params):
-        """Accumulate ordinary pair-gradient residuals for exact splitting."""
-        grad_total = jnp.zeros(
-            (r1_batch.shape[0], r2_batch.shape[0], 3), dtype=r1_batch.dtype
-        )
-        for jastrow, jastrow_params in zip(self.jastrows, params):
-            grad_total += jastrow.grad_r_batch_residual(
-                r1_batch, r2_batch, jastrow_params
-            )
-        return grad_total
-
-    def laux_one_grid_gradient(self, r_batch, params):
-        """Sum exact integration-coordinate-independent component gradients."""
-        grad_total = None
-        for jastrow, jastrow_params in zip(self.jastrows, params):
-            contribution = jastrow.laux_one_grid_gradient(r_batch, jastrow_params)
-            if contribution is not None:
-                grad_total = (
-                    contribution if grad_total is None else grad_total + contribution
-                )
-        return grad_total
-
     def grad_params(self, r1, r2, params):
         """Compute gradient of u w.r.t parameters.
         
