@@ -954,9 +954,7 @@ def _contract_K1_minus_K2_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s,
 
 
 def contract_K1_minus_K2_isdf_fused(phi_p, phi_q, phi_r, phi_s,
-                                    grad_phi_p, grad_phi_q, U1,
-                                    r_block_size=128,
-                                    mem_cap_elems=500_000_000):
+                                    grad_phi_p, grad_phi_q, U1):
     """Fused (K1 - K2) contraction with the ISDF rank contracted inside GEMMs.
 
     Step 1 forms T[p,q,l] by contracting the (p,q) orbital pair with phi
@@ -1105,9 +1103,7 @@ def _contract_K3_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s, U3):
     return _fused_step2_rblocked(T_K3, phi_r, phi_s, Np, Nq, Nr, Ns, n_rank)
 
 
-def contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3,
-                             r_block_size=128,
-                             mem_cap_elems=500_000_000):
+def contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3):
     """Fused K3 contraction with the ISDF rank contracted inside GEMMs.
 
     Same construction as ``contract_K1_minus_K2_isdf_fused``: Step 1

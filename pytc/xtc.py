@@ -1206,7 +1206,10 @@ class ISDFXTC(XTC, ISDFTC):
                         logger.info(f"  Loading D with shape: {f['D'].shape} on host RAM")
                         kernels['D'] = f['D'][:]
                         if self.is_incore:
-                            logger.debug("incore mode: Loading X with shape: {f['X'].shape} on host RAM")
+                            logger.debug(
+                                "incore mode: Loading X with shape: %s on host RAM",
+                                f['X'].shape,
+                            )
                             kernels['X'] = f['X'][:]
                         else:
                             # Keep the file open only when its datasets escape for
