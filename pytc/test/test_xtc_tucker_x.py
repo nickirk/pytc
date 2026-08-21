@@ -83,6 +83,9 @@ class _FakeTuckerRuntime:
     def _get_fixed_rank_block_size(self):
         return 2
 
+    def _get_isdf_device_cache(self, *_args, **_kwargs):
+        return None
+
     def _contract_delta_U_kernels(self, kernels, ranges):
         return xtc_mod.ISDFXTC._contract_delta_U_kernels(self, kernels, ranges)
 
