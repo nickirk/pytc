@@ -74,36 +74,12 @@ def _panel_blk_overrides():
         panel_blk = None
     return panel_blk, gpu_max_memory_mb
 
-# ----------------------------------------------------------------------
-# Per-(ISDFTC instance, device) cache of device-resident phi_isdf /
-# grad_phi_isdf / TC kernels / D so the per-tile dispatch path doesn't
-# re-upload them.
-#
-# The cache is process-wide (rather than per-instance) so that multiple
-# code paths sharing the same ISDFTC instance can both benefit from a
-# single upload.  Keys are ``(id(self), device_id)`` for fast lookup.
-#
-# Lifecycle
-# ------------------------
-# Without explicit cleanup the cache leaks both ways:
-#   1. Memory: an ISDFTC instance that is GC'd leaves its multi-GB
-#      device-resident phi/kernels / D entries permanently in the
-#      cache, so VRAM monotonically grows across runs in a long-lived
-#      process (notebook, REPL, sweep script).
-#   2. Correctness: ``id()`` is reused after object destruction, so a
-#      *new* ISDFTC that happens to receive a recycled id() would
-#      silently inherit the *old* instance's stale device buffers.
-#
-# Both are addressed by registering a ``weakref.finalize`` the first
-# time we cache anything for an instance: the finaliser drops every
-# ``(id(self), *)`` entry the moment ``self`` is GC'd, which both frees
-# VRAM and prevents id-reuse hits.  ``invalidate_isdf_device_cache``
-# remains available for callers that want explicit eviction without
-# relying on GC.
-# ----------------------------------------------------------------------
+# Device-resident operands are keyed by object identity and device.  The
+# finalizer is required because Python can reuse an object's id after GC;
+# retaining an old entry would leak VRAM and could return stale buffers.
 _ISDF_DEVICE_CACHE: dict = {}
 _ISDF_DEVICE_CACHE_LOCK = threading.Lock()
-_ISDF_DEVICE_CACHE_FINALISED: set = set()  # ids we've already attached a finaliser to
+_ISDF_DEVICE_CACHE_FINALISED: set = set()
 
 
 def _evict_isdf_device_cache_for_id(self_id):
@@ -115,60 +91,25 @@ def _evict_isdf_device_cache_for_id(self_id):
         _ISDF_DEVICE_CACHE_FINALISED.discard(self_id)
 
 
-def invalidate_isdf_device_cache(instance=None):
-    """Manually evict ISDFTC device-cache entries.
-
-    Without arguments, clears the entire cache (every instance, every
-    device).  With an ISDFTC instance, evicts only that instance's
-    entries — useful for releasing a known-stale set of buffers ahead
-    of GC.
-
-    Equivalent to the automatic ``weakref.finalize`` path, but
-    available for callers that want explicit lifecycle control.
-    """
-    if instance is None:
-        with _ISDF_DEVICE_CACHE_LOCK:
-            _ISDF_DEVICE_CACHE.clear()
-            _ISDF_DEVICE_CACHE_FINALISED.clear()
-    else:
-        _evict_isdf_device_cache_for_id(id(instance))
-
-
-_TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device/layout
-
-
 def _array_nbytes(arr):
-    """Return the byte size of an array-like object without copying."""
-    shape = getattr(arr, "shape", None)
-    dtype = getattr(arr, "dtype", None)
-    if shape is None or dtype is None:
-        arr_np = np.asarray(arr)
-        return int(arr_np.size * arr_np.dtype.itemsize)
-    return int(np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize)
+    return int(np.prod(arr.shape, dtype=np.int64) * np.dtype(arr.dtype).itemsize)
 
 
 def _get_local_device_free_bytes(device):
-    """Return free bytes for one local device when available."""
-    try:
-        stats = device.memory_stats()
-        pool_limit = int(stats["bytes_limit"])
-        in_use = int(stats.get("bytes_in_use", 0))
-        return max(pool_limit - in_use, 0)
-    except Exception:
-        return 1 << 60
+    """Return free bytes reported by one local device."""
+    stats = device.memory_stats()
+    if not stats or "bytes_limit" not in stats:
+        raise RuntimeError(
+            f"device {device!r} does not report a usable memory limit"
+        )
+    pool_limit = int(stats["bytes_limit"])
+    in_use = int(stats.get("bytes_in_use", 0))
+    return max(pool_limit - in_use, 0)
 
 
 def _cache_d_on_device(device, arr, *, fraction=0.35):
     """Whether a persistent device cache should keep ``arr`` resident."""
     return _array_nbytes(arr) <= int(_get_local_device_free_bytes(device) * fraction)
-
-
-def _cache_tc_kernels_on_device(device, u1, u3, *, fraction=0.30):
-    """Whether persistent TC kernels should be cached on one device.
-
-    Kept for API compatibility with call-sites that only want a bool.
-    """
-    return _choose_tc_kernel_strategy(device, u1, u3, fraction=fraction)[0]
 
 
 def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
@@ -853,23 +794,13 @@ class ISDFTC(TC):
                                include_grad=False,
                                include_delta_u=False,
                                include_tc=False):
-        """Return persistent ISDF operands resident on one device.
-
-        The first call for a given ``(self, device)`` materialises
-        ``phi_isdf`` (and optionally grad/TC/D) on ``device`` and stores
-        them in the process-wide ``_ISDF_DEVICE_CACHE``.  A
-        ``weakref.finalize`` is attached to ``self`` the first time we
-        cache anything for it, so the moment ``self`` is GC'd the
-        finaliser drops every ``(id(self), *)`` cache entry — releasing
-        the device-resident buffers and preventing a recycled ``id()``
-        from silently inheriting the old instance's cache.  See the
-        ``_ISDF_DEVICE_CACHE`` docstring at module top.
-        """
+        """Return persistent ISDF operands resident on one device."""
         if device is None:
             return None
 
         self_id = id(self)
         key = (self_id, getattr(device, "id", repr(device)))
+        uses_host_memory = getattr(device, "platform", None) == "cpu"
 
         with _ISDF_DEVICE_CACHE_LOCK:
             cache = _ISDF_DEVICE_CACHE.get(key)
@@ -878,8 +809,6 @@ class ISDFTC(TC):
                     "phi_isdf": jax.device_put(np.asarray(self.phi_isdf), device),
                 }
                 _ISDF_DEVICE_CACHE[key] = cache
-                # Register the finaliser exactly once per instance,
-                # not per (instance, device) pair.
                 if self_id not in _ISDF_DEVICE_CACHE_FINALISED:
                     _ISDF_DEVICE_CACHE_FINALISED.add(self_id)
                     weakref.finalize(
@@ -893,9 +822,12 @@ class ISDFTC(TC):
             need_u1 = "K1_kernel" in kernels and "K1_kernel" not in cache
             need_u3 = "K3_kernel" in kernels and "K3_kernel" not in cache
             if need_u1 or need_u3:
-                resident, panel_size = _choose_tc_kernel_strategy(
-                    device, kernels["K1_kernel"], kernels["K3_kernel"],
-                )
+                if uses_host_memory:
+                    resident, panel_size = True, None
+                else:
+                    resident, panel_size = _choose_tc_kernel_strategy(
+                        device, kernels["K1_kernel"], kernels["K3_kernel"],
+                    )
                 if resident:
                     logger.debug(
                         "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB, resident)",
@@ -920,7 +852,7 @@ class ISDFTC(TC):
                     cache["K_stream_panel"] = int(panel_size)
 
         if include_delta_u and kernels is not None and "D" in kernels and "D" not in cache:
-            if _cache_d_on_device(device, kernels["D"]):
+            if uses_host_memory or _cache_d_on_device(device, kernels["D"]):
                 logger.debug(
                     "Caching Delta U D kernel on device %s (%.2f GiB)",
                     getattr(device, "id", "host"),
@@ -1869,11 +1801,7 @@ class ISDFTC(TC):
         rbs = self._get_fixed_rank_block_size()
 
         chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
-        cache_getter = getattr(self, "_get_isdf_device_cache", None)
-        cache = (
-            cache_getter(device=device, include_grad=True)
-            if callable(cache_getter) else None
-        )
+        cache = self._get_isdf_device_cache(device=device, include_grad=True)
         phi_full = cache["phi_isdf"] if cache is not None else self.phi_isdf
         grad_full = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
         u1 = jax.device_put(U1, device) if device is not None else U1
@@ -1905,24 +1833,15 @@ class ISDFTC(TC):
     def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None,
                             panel_layout="pr"):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
-        global _TC_DIRECT_TILE_PROFILED
-        _device_key = getattr(device, "id", "host")
         panel_layout = _normalize_panel_layout(panel_layout)
-        _profile_key = (_device_key, panel_layout)
-        _profile = panel_size is not None and _profile_key not in _TC_DIRECT_TILE_PROFILED
-        if _profile:
-            _TC_DIRECT_TILE_PROFILED.add(_profile_key)
-            _t0 = time.perf_counter()
 
         U1 = kernels['K1_kernel']
         U3 = kernels['K3_kernel']
         slice_p, slice_q, slice_r, slice_s = ranges
 
         rbs = self._get_fixed_rank_block_size()
-        cache_getter = getattr(self, "_get_isdf_device_cache", None)
-        cache = (
-            cache_getter(kernels, device=device, include_grad=True, include_tc=True)
-            if callable(cache_getter) else None
+        cache = self._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_tc=True
         )
         # ``u1`` / ``u3`` may be device jax.Arrays (resident) OR host numpy
         # arrays (streaming); the downstream contract_* wrappers handle both.
@@ -1935,18 +1854,6 @@ class ISDFTC(TC):
             u1 = jax.device_put(U1, device) if device is not None else U1
         if u3 is None:
             u3 = jax.device_put(U3, device) if device is not None else U3
-
-        if _profile:
-            jax.block_until_ready((u1, u3))
-            _t_put = time.perf_counter()
-            logger.debug(
-                "_get_tc_direct_tile first-tile profile: K1+K3 device_put %.3fs "
-                "(K1=%.1fMB, K3=%.1fMB, device=%s)",
-                _t_put - _t0,
-                getattr(U1, 'nbytes', 0) / 1e6,
-                getattr(U3, 'nbytes', 0) / 1e6,
-                _device_key,
-            )
 
         device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
 
@@ -2027,18 +1934,8 @@ class ISDFTC(TC):
                     panel_size=k_panel)
 
             if panel_size is not None:
-                if _profile:
-                    jax.block_until_ready(k12)
-                    _t_k1 = time.perf_counter()
-                    logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
-                                 _t_k1 - _t_put)
                 k3 = kmat_jax.contract_K3_isdf_streaming(
                     phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
-                if _profile:
-                    jax.block_until_ready(k3)
-                    _t_k3 = time.perf_counter()
-                    logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
-                                 "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
                 result = 0.5 * (k12 + k3)
                 # If the slice_p==slice_q branch re-padded phi_p/phi_q to
                 # equalise them, slice axes 0/1 back to the caller-expected

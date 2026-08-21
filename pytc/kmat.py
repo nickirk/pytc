@@ -687,296 +687,6 @@ def contract_K1_minus_K2_isdf_jit(phi_p, phi_q, phi_r, phi_s,
     return result
 
 
-# Fused-kernel memory budget, module-level so it is a concrete Python constant
-# at jit trace time (kept off the jit static-arg path deliberately).  Governs
-# how the two rank-scaled intermediates are tiled; ~4 GB (fp64) each by default.
-_FUSED_MEM_CAP_ELEMS = 500_000_000
-# Upper cap on the Step-2 r-block width before the budget shrinks it further.
-_FUSED_R_BLOCK_CAP = 128
-# Upper cap on the Step-1 kb width (keeps the pair-product GEMM shapes sane
-# on small decks, where the budget alone would allow a full-width block).
-_FUSED_KB_CAP = 4096
-
-
-def _fused_kb_block(Np, Nq):
-    """Pick the Step-1 kb width so the (Np, Nq, kb) pair-product block stays
-    under ``_FUSED_MEM_CAP_ELEMS`` elements.  Clamps to [1, _FUSED_KB_CAP].
-
-    The (Np, Nq, N_fused) pair-product is rank-scaled and OOMs at large
-    decks (~239 GB at nvir=1179, N_fused=21467), so Step 1 sums it in kb
-    blocks along N_fused; small decks collapse to a single block.
-    """
-    return int(min(_FUSED_KB_CAP, max(1, _FUSED_MEM_CAP_ELEMS // max(1, Np * Nq))))
-
-
-def _family_l_block(Np, Nq, n_rank, budget=_FUSED_MEM_CAP_ELEMS):
-    """l-block width for family assembly: T_lb = (Np, Nq, lb) stays under
-    ``budget`` elements (~4 GB fp64 default).  This is what lets vvoo-class
-    families (Np=Nq=nvir) run without the full (Np,Nq,n_rank) intermediate
-    that OOM'd the fused path at the 1200 deck.
-    """
-    return int(min(n_rank, max(1, budget // max(1, Np * Nq))))
-
-
-def _family_step1_k3(phi_p, phi_q, U3_lb, kb):
-    """T[p,q,l'] = sum_k phi_p[p,k] U3[k,l'] phi_q[q,k] for one l-slice,
-    summed in kb blocks along N_fused so the (Np,Nq,kb) pair-product is
-    the largest intermediate (never the full (Np,Nq,N_fused))."""
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    lb = U3_lb.shape[1]
-    T = jnp.zeros((Np, Nq, lb), dtype=phi_p.dtype)
-    for k0 in range(0, U3_lb.shape[0], kb):
-        k1 = min(k0 + kb, U3_lb.shape[0])
-        M = phi_p[:, k0:k1][:, None, :] * phi_q[:, k0:k1][None, :, :]
-        T = T + jnp.matmul(M.reshape(Np * Nq, k1 - k0),
-                           U3_lb[k0:k1]).reshape(Np, Nq, lb)
-    return T
-
-
-def family_step1_combined(phi_p, phi_q, grad_phi_p, grad_phi_q, U1, U3):
-    """T_c[p,q,l] = (T_K1 - T_K2 + T_K3) built ONCE over a (p, q) domain.
-
-    The (K1-K2) and K3 step-1 intermediates share the (p, q) pair-product
-    pass, so one sweep of U1 and U3 (each read exactly once, in kb blocks
-    along N_fused) produces the combined rank tensor the per-tile step-2
-    contractions are served from.  Intended for block families whose tiles
-    share (p, q); the caller is responsible for only using it on domains
-    where the full T_c fits the device (the cache in ``pytc.tc`` enforces
-    this and falls back to the per-tile scan otherwise).
-    """
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    N_fused, n_rank = U1.shape[0], U1.shape[1]
-    kb = _fused_kb_block(Np, Nq)
-    blocks = []
-    for l0 in range(0, n_rank, _family_l_block(Np, Nq, n_rank)):
-        l1 = min(l0 + _family_l_block(Np, Nq, n_rank), n_rank)
-        T1 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
-        T2 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
-        T3 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
-        for k0 in range(0, N_fused, kb):
-            k1 = min(k0 + kb, N_fused)
-            pp = phi_p[:, k0:k1]
-            qq = phi_q[:, k0:k1]
-            M_plain = pp[:, None, :] * qq[None, :, :]            # (Np, Nq, kb)
-            u3k = U3[k0:k1, l0:l1]
-            T3 = T3 + jnp.matmul(M_plain.reshape(Np * Nq, k1 - k0), u3k
-                                 ).reshape(Np, Nq, l1 - l0)
-            for c in range(3):
-                uu = U1[k0:k1, l0:l1, c]
-                M1 = grad_phi_p[:, k0:k1, c][:, None, :] * qq[None, :, :]
-                M2 = pp[:, None, :] * grad_phi_q[:, k0:k1, c][None, :, :]
-                T1 = T1 + jnp.matmul(M1.reshape(Np * Nq, k1 - k0), uu
-                                     ).reshape(Np, Nq, l1 - l0)
-                T2 = T2 + jnp.matmul(M2.reshape(Np * Nq, k1 - k0), uu
-                                     ).reshape(Np, Nq, l1 - l0)
-        blocks.append(T1 - T2 + T3)
-    if len(blocks) == 1:
-        return blocks[0]
-    return jnp.concatenate(blocks, axis=2)
-
-
-def family_step2_tile(T_c, phi_r, phi_s):
-    """out[p,q,r,s] = sum_l T_c[p,q,l] phi_r[r,l] phi_s[s,l], in l-blocks so
-    the (Nr, Ns, lb) pair-product stays small."""
-    Np, Nq, n_rank = T_c.shape
-    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
-    lb = _family_l_block(Np, Nq, n_rank)
-    out = jnp.zeros((Np, Nq, Nr, Ns), dtype=T_c.dtype)
-    for l0 in range(0, n_rank, lb):
-        l1 = min(l0 + lb, n_rank)
-        C = (phi_r[:, l0:l1][:, None, :]
-             * phi_s[:, l0:l1][None, :, :])                     # (Nr, Ns, lb)
-        out = out + jnp.einsum('pql,rsl->pqrs', T_c[:, :, l0:l1], C)
-    return out
-
-
-def family_contract_K3_isdf(phi_p, phi_q, tile_rs, U3):
-    """K3 assembly for a block family whose tiles all share the (p, q) domain.
-
-    The rank intermediate T[p,q,l] is built ONCE — U3 is read exactly once,
-    in l-blocks budgeted by ``_family_l_block`` — and every tile's output is
-    contracted from the device-resident T blocks.  The per-tile path this
-    replaces re-reads the full U3 for every tile of the family (~57 tiles
-    per family at the 1200 deck, ~3.7 GB per read).
-
-    tile_rs: list of (phi_r_i, phi_s_i) for each tile in the family.
-    Returns the list of (Np, Nq, Nr_i, Ns_i) tile outputs.
-    """
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    N_fused, n_rank = U3.shape
-    lb = _family_l_block(Np, Nq, n_rank)
-    kb = _fused_kb_block(Np, Nq)
-    outs = [jnp.zeros((Np, Nq, r.shape[0], s.shape[0]), dtype=phi_p.dtype)
-            for r, s in tile_rs]
-    for l0 in range(0, n_rank, lb):
-        l1 = min(l0 + lb, n_rank)
-        U3_lb = U3[:, l0:l1]                                  # (N_fused, l)
-        T_lb = _family_step1_k3(phi_p, phi_q, U3_lb, kb)
-        for i, (phi_r_i, phi_s_i) in enumerate(tile_rs):
-            C_i = (phi_r_i[:, l0:l1][:, None, :]
-                   * phi_s_i[:, l0:l1][None, :, :])           # (Nr_i, Ns_i, l)
-            outs[i] = outs[i] + jnp.einsum('pql,rsl->pqrs', T_lb, C_i)
-    return outs
-
-
-def family_contract_K1_minus_K2_isdf(phi_p, phi_q, grad_phi_p, grad_phi_q,
-                                     tile_rs, U1):
-    """(K1 - K2) assembly for a block family whose tiles share (p, q).
-
-    Same one-read structure as ``family_contract_K3_isdf``: T_K1/T_K2 are
-    built once per l-block (three Cartesian components, U1 read once) and
-    all tiles are served from the device-resident T blocks.
-
-    tile_rs: list of (phi_r_i, phi_s_i).  Returns the list of tile outputs.
-    """
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    N_fused, n_rank = U1.shape[0], U1.shape[1]
-    lb = _family_l_block(Np, Nq, n_rank)
-    kb = _fused_kb_block(Np, Nq)
-    outs = [jnp.zeros((Np, Nq, r.shape[0], s.shape[0]), dtype=phi_p.dtype)
-            for r, s in tile_rs]
-    for l0 in range(0, n_rank, lb):
-        l1 = min(l0 + lb, n_rank)
-        U1_lb = U1[:, l0:l1, :]                               # (N_fused, l, 3)
-        T1 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
-        T2 = jnp.zeros((Np, Nq, l1 - l0), dtype=phi_p.dtype)
-        for c in range(3):
-            for k0 in range(0, N_fused, kb):
-                k1 = min(k0 + kb, N_fused)
-                uu = U1_lb[k0:k1, :, c]                       # (kb, l)
-                M1 = (grad_phi_p[:, k0:k1, c][:, None, :]
-                      * phi_q[:, k0:k1][None, :, :])          # (Np, Nq, kb)
-                M2 = (phi_p[:, k0:k1][:, None, :]
-                      * grad_phi_q[:, k0:k1, c][None, :, :])  # (Np, Nq, kb)
-                T1 = T1 + jnp.matmul(M1.reshape(Np * Nq, k1 - k0), uu
-                                     ).reshape(Np, Nq, l1 - l0)
-                T2 = T2 + jnp.matmul(M2.reshape(Np * Nq, k1 - k0), uu
-                                     ).reshape(Np, Nq, l1 - l0)
-        T_lb = T1 - T2
-        for i, (phi_r_i, phi_s_i) in enumerate(tile_rs):
-            C_i = (phi_r_i[:, l0:l1][:, None, :]
-                   * phi_s_i[:, l0:l1][None, :, :])           # (Nr_i, Ns_i, l)
-            outs[i] = outs[i] + jnp.einsum('pql,rsl->pqrs', T_lb, C_i)
-    return outs
-
-
-def _fused_r_block(Np, Nq, n_rank):
-    """Pick the Step-2 r-block width R so the (Np, Nq, R, n_rank) intermediate
-    stays under ``_FUSED_MEM_CAP_ELEMS`` elements.  Clamps to [1, _R_BLOCK_CAP].
-
-    Step 1 no longer needs tiling: it contracts the (p,q) orbital pair with phi
-    FIRST, forming only (Np, Nq, N_fused) -- ~n_rank/Nq times smaller than the
-    old (Np, N_fused, n_rank) W -- so the summed axis never materialises large.
-    """
-    cap = _FUSED_MEM_CAP_ELEMS
-    return int(min(int(_FUSED_R_BLOCK_CAP), max(1, cap // max(1, Np * Nq * n_rank))))
-
-
-def _fused_step2_rblocked(T, phi_r, phi_s, Np, Nq, Nr, Ns, n_rank):
-    """result[p,q,r,s] = sum_l T[p,q,l] phi_r[r,l] phi_s[s,l], in r-blocks via a
-    ROLLED ``jax.lax.fori_loop`` so only one (Np, Nq, R, n_rank) intermediate is
-    ever live -- XLA cannot rematerialise all r-blocks into one full-width op
-    (the failure mode that defeated the earlier Python-unrolled tiling).  The
-    4D output is written via disjoint in-place slice updates, never doubled.
-    ``phi_r`` is zero-padded up to a multiple of R and sliced back afterwards.
-    """
-    R = _fused_r_block(Np, Nq, n_rank)
-    n_rb = (Nr + R - 1) // R
-    Nr_pad = n_rb * R
-    phi_r_p = phi_r if Nr_pad == Nr else jnp.pad(phi_r, ((0, Nr_pad - Nr), (0, 0)))
-    phi_sT = phi_s.T                                          # (n_rank, Ns)
-    result = jnp.zeros((Np, Nq, Nr_pad, Ns), dtype=T.dtype)
-
-    def body(i, res):
-        r0 = i * R
-        phi_r_blk = jax.lax.dynamic_slice(phi_r_p, (r0, 0), (R, n_rank))   # (R, n_rank)
-        T_r = T[:, :, None, :] * phi_r_blk[None, None, :, :]               # (Np,Nq,R,n_rank)
-        block = jnp.matmul(T_r.reshape(Np * Nq * R, n_rank), phi_sT).reshape(Np, Nq, R, Ns)
-        return jax.lax.dynamic_update_slice(res, block, (0, 0, r0, 0))
-
-    result = jax.lax.fori_loop(0, n_rb, body, result)
-    if Nr_pad != Nr:
-        result = result[:, :, :Nr, :]
-    return result
-
-
-@jax.jit
-def _contract_K1_minus_K2_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s,
-                                          grad_phi_p, grad_phi_q, U1):
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
-    N_fused = U1.shape[0]
-    n_rank = U1.shape[1]
-
-    # --- Step 1: T_K1[p,q,l] = sum_{k,c} grad_phi_p[p,k,c] phi_q[q,k] U1[k,l,c]
-    #             T_K2[p,q,l] = sum_{k,c} phi_p[p,k] grad_phi_q[q,k,c] U1[k,l,c]
-    # Contract the (p,q) orbital pair with phi FIRST, but summed in kb blocks
-    # along N_fused inside a ROLLED fori_loop: the full (Np,Nq,N_fused)
-    # pair-product is rank-scaled and OOMs at large decks (~239 GB at
-    # nvir=1179, N_fused=21467), so only one (Np,Nq,kb) block is ever live
-    # and XLA cannot rematerialise the blocks into one full-width op.
-    # T_K2 is built directly in (p,q,l) order.
-    kb = _fused_kb_block(Np, Nq)
-    n_kb = (N_fused + kb - 1) // kb
-    Nf_pad = n_kb * kb
-    if Nf_pad != N_fused:
-        phi_p = jnp.pad(phi_p, ((0, 0), (0, Nf_pad - N_fused)))
-        phi_q = jnp.pad(phi_q, ((0, 0), (0, Nf_pad - N_fused)))
-        grad_phi_p = jnp.pad(grad_phi_p, ((0, 0), (0, Nf_pad - N_fused), (0, 0)))
-        grad_phi_q = jnp.pad(grad_phi_q, ((0, 0), (0, Nf_pad - N_fused), (0, 0)))
-        U1 = jnp.pad(U1, ((0, Nf_pad - N_fused), (0, 0), (0, 0)))
-
-    T_K1 = jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype)
-    T_K2 = jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype)
-    for c in range(3):
-        U1c = U1[:, :, c]                                     # (Nf_pad, n_rank)
-        gp_c = grad_phi_p[:, :, c]                            # (Np, Nf_pad)
-        gq_c = grad_phi_q[:, :, c]                            # (Nq, Nf_pad)
-
-        def step1_body(i, carry, U1c=U1c, gp_c=gp_c, gq_c=gq_c):
-            T1, T2 = carry
-            k0 = i * kb
-            pp = jax.lax.dynamic_slice(phi_p, (0, k0), (Np, kb))
-            qq = jax.lax.dynamic_slice(phi_q, (0, k0), (Nq, kb))
-            gp = jax.lax.dynamic_slice(gp_c, (0, k0), (Np, kb))
-            gq = jax.lax.dynamic_slice(gq_c, (0, k0), (Nq, kb))
-            uu = jax.lax.dynamic_slice(U1c, (k0, 0), (kb, n_rank))
-            M1 = gp[:, None, :] * qq[None, :, :]              # (Np, Nq, kb)
-            M2 = pp[:, None, :] * gq[None, :, :]              # (Np, Nq, kb)
-            T1 = T1 + jnp.matmul(M1.reshape(Np * Nq, kb), uu).reshape(Np, Nq, n_rank)
-            T2 = T2 + jnp.matmul(M2.reshape(Np * Nq, kb), uu).reshape(Np, Nq, n_rank)
-            return T1, T2
-
-        T_K1, T_K2 = jax.lax.fori_loop(0, n_kb, step1_body, (T_K1, T_K2))
-    T_combined = T_K1 - T_K2                                   # (Np, Nq, n_rank)
-
-    return _fused_step2_rblocked(T_combined, phi_r, phi_s, Np, Nq, Nr, Ns, n_rank)
-
-
-def contract_K1_minus_K2_isdf_fused(phi_p, phi_q, phi_r, phi_s,
-                                    grad_phi_p, grad_phi_q, U1):
-    """Fused (K1 - K2) contraction with the ISDF rank contracted inside GEMMs.
-
-    Step 1 forms T[p,q,l] by contracting the (p,q) orbital pair with phi
-    first, summed in kb blocks along N_fused inside a rolled fori_loop so
-    the (Np,Nq,N_fused) pair-product — itself rank-scaled, ~239 GB at
-    nvir=1179/N_fused=21467 — never exists in full.  Step 2 contracts T
-    against phi_r/phi_s in a rolled r-block fori_loop, writing disjoint
-    slices of the 4D output in place.
-
-    Memory note: the Step-1 T carry (Np, Nq, n_rank) is NOT budgeted — it
-    scales to ~239 GB at the 1200-orbital deck (nvir=1179, N_fused=21467)
-    and OOMs there, as measured on B200/H200.  Validated only up to
-    nvir~590.  If this path is ever needed at larger decks, the T carry
-    must additionally be blocked over the rank axis (nested lb/kb rolled
-    loops feeding the 4D accumulator block by block).
-    """
-    if isinstance(U1, np.ndarray):
-        U1 = jax.device_put(U1)
-    return _contract_K1_minus_K2_isdf_fused_impl(
-        phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1)
-
-
 @partial(jax.jit, static_argnums=(5,))
 def contract_K1_antisym_pq_isdf_jit(phi_p, phi_r, phi_s, grad_phi_p, U1,
                                      rank_block_size=128):
@@ -1034,8 +744,7 @@ def contract_K1_antisym_pq_isdf_jit(phi_p, phi_r, phi_s, grad_phi_p, U1,
 
 
 def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
-                               rank_block_size=None, gpu_max_memory_mb=None,
-                               fused=False):
+                               rank_block_size=None, gpu_max_memory_mb=None):
     """Compute (K1 - K2)[pqrs] in one pass, halving GPU peak vs separate calls.
 
     K2[pqrs] = K1[qprs] transposed, so the difference can be accumulated
@@ -1053,10 +762,6 @@ def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
     grad_phi_p = grad_phi_piv[slice_p]
     grad_phi_q = grad_phi_piv[slice_q]
 
-    if fused:
-        return contract_K1_minus_K2_isdf_fused(
-            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1)
-
     if rank_block_size is None:
         from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(
@@ -1066,62 +771,6 @@ def contract_K1_minus_K2_isdf(phi_piv, grad_phi_piv, U1, ranges=None,
     return contract_K1_minus_K2_isdf_jit(
         phi_p, phi_q, phi_r, phi_s,
         grad_phi_p, grad_phi_q, U1, rank_block_size)
-
-
-@jax.jit
-def _contract_K3_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s, U3):
-    Np, Nq = phi_p.shape[0], phi_q.shape[0]
-    Nr, Ns = phi_r.shape[0], phi_s.shape[0]
-    N_fused = U3.shape[0]
-    n_rank = U3.shape[1]
-
-    # --- Step 1: T_K3[p,q,l] = sum_k phi_p[p,k] U3[k,l] phi_q[q,k] ---
-    # Contract (p,q) with phi FIRST, summed in kb blocks along N_fused inside
-    # a ROLLED fori_loop: the full (Np, Nq, N_fused) pair-product is
-    # rank-scaled and OOMs at large decks (~239 GB at nvir=1179,
-    # N_fused=21467), so only one (Np,Nq,kb) block is ever live and XLA
-    # cannot rematerialise the blocks into one full-width op.
-    kb = _fused_kb_block(Np, Nq)
-    n_kb = (N_fused + kb - 1) // kb
-    Nf_pad = n_kb * kb
-    if Nf_pad != N_fused:
-        phi_p = jnp.pad(phi_p, ((0, 0), (0, Nf_pad - N_fused)))
-        phi_q = jnp.pad(phi_q, ((0, 0), (0, Nf_pad - N_fused)))
-        U3 = jnp.pad(U3, ((0, Nf_pad - N_fused), (0, 0)))
-
-    def step1_body(i, T):
-        k0 = i * kb
-        pp = jax.lax.dynamic_slice(phi_p, (0, k0), (Np, kb))
-        qq = jax.lax.dynamic_slice(phi_q, (0, k0), (Nq, kb))
-        uu = jax.lax.dynamic_slice(U3, (k0, 0), (kb, n_rank))
-        M = pp[:, None, :] * qq[None, :, :]                   # (Np, Nq, kb)
-        return T + jnp.matmul(M.reshape(Np * Nq, kb), uu).reshape(Np, Nq, n_rank)
-
-    T_K3 = jax.lax.fori_loop(0, n_kb, step1_body,
-                             jnp.zeros((Np, Nq, n_rank), dtype=phi_p.dtype))
-
-    return _fused_step2_rblocked(T_K3, phi_r, phi_s, Np, Nq, Nr, Ns, n_rank)
-
-
-def contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3):
-    """Fused K3 contraction with the ISDF rank contracted inside GEMMs.
-
-    Same construction as ``contract_K1_minus_K2_isdf_fused``: Step 1
-    contracts (p,q) with phi first, summed in kb blocks along N_fused
-    inside a rolled fori_loop so the (Np,Nq,N_fused) pair-product — itself
-    rank-scaled, ~239 GB at nvir=1179/N_fused=21467 — never exists in
-    full; Step 2 is the rolled r-block fori_loop.
-
-    Memory note: the Step-1 T carry (Np, Nq, n_rank) is NOT budgeted — it
-    scales to ~239 GB at the 1200-orbital deck (nvir=1179, N_fused=21467)
-    and OOMs there, as measured on B200.  Validated only up to nvir~590.
-    If this path is ever needed at larger decks, the T carry must
-    additionally be blocked over the rank axis (nested lb/kb rolled loops
-    feeding the 4D accumulator block by block).
-    """
-    if isinstance(U3, np.ndarray):
-        U3 = jax.device_put(U3)
-    return _contract_K3_isdf_fused_impl(phi_p, phi_q, phi_r, phi_s, U3)
 
 
 def contract_K3_isdf_jit(phi_p, phi_q, phi_r, phi_s, U3, rank_block_size=128):
@@ -1244,16 +893,11 @@ def contract_K1_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
 def contract_K1_minus_K2_isdf_streaming(phi_p, phi_q, phi_r, phi_s,
                                          grad_phi_p, grad_phi_q, U1,
                                          rank_block_size=128,
-                                         panel_size=None,
-                                         fused=False):
-    """Streaming-capable wrapper around :func:`contract_K1_minus_K2_isdf_jit` / fused.
+                                         panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K1_minus_K2_isdf_jit`.
 
     ``U1`` can be a device ``jax.Array`` or a host numpy ndarray.
     """
-    if fused:
-        return contract_K1_minus_K2_isdf_fused(
-            phi_p, phi_q, phi_r, phi_s, grad_phi_p, grad_phi_q, U1)
-
     n_fused = U1.shape[1]
     if panel_size is None or panel_size >= n_fused:
         if isinstance(U1, np.ndarray):
@@ -1307,16 +951,12 @@ def contract_K1_antisym_pq_isdf_streaming(phi_p, phi_r, phi_s, grad_phi_p, U1,
 
 def contract_K3_isdf_streaming(phi_p, phi_q, phi_r, phi_s, U3,
                                 rank_block_size=128,
-                                panel_size=None,
-                                fused=False):
-    """Streaming-capable wrapper around :func:`contract_K3_isdf_jit` / fused.
+                                panel_size=None):
+    """Streaming-capable wrapper around :func:`contract_K3_isdf_jit`.
 
     Same panel-on-axis-1 strategy as :func:`contract_K1_minus_K2_isdf`, but
     U3 is 2-D ``(n_fused, n_fused)`` with no ``c`` component axis.
     """
-    if fused:
-        return contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3)
-
     n_fused = U3.shape[1]
     if panel_size is None or panel_size >= n_fused:
         if isinstance(U3, np.ndarray):
@@ -1335,14 +975,13 @@ def contract_K3_isdf_streaming(phi_p, phi_q, phi_r, phi_s, U3,
 
 
 def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
-                     gpu_max_memory_mb=None, fused=False):
+                     gpu_max_memory_mb=None):
     """Contract K3 using ISDF decomposition.
     
     Args:
         rank_block_size: Override for the ISDF rank scan block size.
             If None, an adaptive size is computed.
         gpu_max_memory_mb: GPU memory budget for adaptive block sizing.
-        fused: If True, use the fused kernel (contracts rank dimension first).
     """
     if ranges is None:
         slice_p = slice_q = slice_r = slice_s = slice(None)
@@ -1354,9 +993,6 @@ def contract_K3_isdf(phi_piv, U3, ranges=None, rank_block_size=None,
     phi_r = phi_piv[slice_r]
     phi_s = phi_piv[slice_s]
     
-    if fused:
-        return contract_K3_isdf_fused(phi_p, phi_q, phi_r, phi_s, U3)
-
     if rank_block_size is None:
         from pytc.utils.gpu_memory import adaptive_rank_block_size
         rank_block_size = adaptive_rank_block_size(

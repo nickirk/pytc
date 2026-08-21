@@ -209,8 +209,6 @@ def issue_stage_stats_scope():
 # The cache holds at most two slices.
 # ---------------------------------------------------------------------------
 _X_HDF5_CACHE = OrderedDict()
-_DELTA_U_DIRECT_TILE_PROFILED = set()
-_ASSEMBLE_2B_TILE_PROFILED = set()
 # Keys added when the auto-shrink warning has been emitted for a device so
 # we log once per device per run, not once per tile on the CCSD hot path.
 _DELTA_U_AUTOSHRINK_WARNED = set()
@@ -316,13 +314,14 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank, *, include_d=Tru
 def _get_device_free_bytes(device=None):
     """Return currently free bytes for a specific local device when possible."""
     if device is not None:
-        try:
-            stats = device.memory_stats()
-            pool_limit = int(stats['bytes_limit'])
-            in_use = int(stats.get('bytes_in_use', 0))
-            return max(pool_limit - in_use, 0)
-        except Exception:
-            pass
+        stats = device.memory_stats()
+        if not stats or "bytes_limit" not in stats:
+            raise RuntimeError(
+                f"device {device!r} does not report a usable memory limit"
+            )
+        pool_limit = int(stats['bytes_limit'])
+        in_use = int(stats.get('bytes_in_use', 0))
+        return max(pool_limit - in_use, 0)
 
     from pytc.utils.gpu_memory import _get_gpu_free_bytes
     return _get_gpu_free_bytes()
@@ -2828,25 +2827,14 @@ class ISDFXTC(XTC, ISDFTC):
     def _get_delta_u_direct_tile(self, kernels, ranges, device=None, panel_size=None,
                                  panel_layout="pr"):
         """Compute one unsymmetrized Delta U tile from prepared kernel panels."""
-        global _DELTA_U_DIRECT_TILE_PROFILED
         D = kernels['D']
         tucker_x = _get_tucker_x_factors(kernels)
         X = None if tucker_x is not None else kernels['X']
         slice_p, slice_q, slice_r, slice_s = ranges
         device_key = getattr(device, "id", "host")
         panel_layout = _normalize_panel_layout(panel_layout)
-        profile_key = (device_key, panel_layout)
-        profile = panel_size is not None and profile_key not in _DELTA_U_DIRECT_TILE_PROFILED
-        if profile:
-            _DELTA_U_DIRECT_TILE_PROFILED.add(profile_key)
-            t0 = time.perf_counter()
-
-        cache_getter = getattr(self, "_get_isdf_device_cache", None)
-        cache = (
-            cache_getter(
-                kernels, device=device, include_grad=False, include_delta_u=True
-            )
-            if callable(cache_getter) else None
+        cache = self._get_isdf_device_cache(
+            kernels, device=device, include_grad=False, include_delta_u=True
         )
         phi_src = cache["phi_isdf"] if cache is not None else self.phi_isdf
         D_resident = cache.get("D") if cache is not None else None
@@ -2947,29 +2935,11 @@ class ISDFXTC(XTC, ISDFTC):
                 else contextlib.nullcontext()
             )
             with device_ctx:
-                result = _contract_delta_u_tucker_direct_tile_jit(
+                return _contract_delta_u_tucker_direct_tile_jit(
                     D, z_device, phi_p, phi_q, phi_r, phi_s, u_r, u_s,
                 )
-                if profile:
-                    jax.block_until_ready(result)
-                    logger.debug(
-                        "_get_delta_u_direct_tile Tucker first-tile profile: "
-                        "total %.3fs (device=%s, factors=%d)",
-                        time.perf_counter() - t0, device_key, z.shape[0],
-                    )
-                return result
 
         X_sliced = _read_X_slice(X, slice_r, slice_s)
-        if profile:
-            t_read = time.perf_counter()
-            logger.debug(
-                "_get_delta_u_direct_tile first-tile profile: X read %.3fs "
-                "(device=%s, X=%.1fMB, tile=(%d,%d,%d,%d))",
-                t_read - t0,
-                device_key,
-                getattr(X_sliced, "nbytes", 0) / 1e6,
-                Np, Nq_eff, Nr, Ns_eff,
-            )
         if panel_size is not None:
             phi_p = _pad_axis(phi_p, 0, Np) if Np != p_len else jnp.asarray(phi_p)
             phi_q = _pad_axis(phi_q, 0, Nq_eff) if Nq_eff != Nq else jnp.asarray(phi_q)
@@ -3018,36 +2988,15 @@ class ISDFXTC(XTC, ISDFTC):
         else:
             D = jnp.asarray(D)
             X_sliced = jnp.asarray(X_sliced)
-        if profile:
-            jax.block_until_ready((D, X_sliced, phi_p, phi_q, phi_r, phi_s))
-            t_put = time.perf_counter()
-            logger.debug(
-                "_get_delta_u_direct_tile first-tile profile: operands ready %.3fs "
-                "(device=%s, D_cached=%s)",
-                t_put - t_read,
-                device_key,
-                D_resident is not None,
-            )
         device_ctx = (
             jax.default_device(device)
             if device is not None
             else contextlib.nullcontext()
         )
         with device_ctx:
-            result = _contract_delta_u_direct_tile_jit(
+            return _contract_delta_u_direct_tile_jit(
                 D, X_sliced, phi_p, phi_q, phi_r, phi_s,
             )
-            if profile:
-                jax.block_until_ready(result)
-                t_kernel = time.perf_counter()
-                logger.debug(
-                    "_get_delta_u_direct_tile first-tile profile: kernel %.3fs, total %.3fs "
-                    "(device=%s)",
-                    t_kernel - t_put,
-                    t_kernel - t0,
-                    device_key,
-                )
-            return result
 
     def _assemble_delta_u_tile(self, kernels, ranges, device=None, panel_size=None,
                                panel_layout="pr"):
@@ -3073,11 +3022,9 @@ class ISDFXTC(XTC, ISDFTC):
             # add it to the estimate when it's NOT resident — otherwise the
             # double-count can over-shrink panel_size or falsely trigger the
             # genuine-OOM guard on later tiles.
-            _cache_getter = getattr(self, "_get_isdf_device_cache", None)
-            _cache = (
-                _cache_getter(kernels, device=device,
-                              include_grad=False, include_delta_u=True)
-                if callable(_cache_getter) else None
+            _cache = self._get_isdf_device_cache(
+                kernels, device=device,
+                include_grad=False, include_delta_u=True
             )
             _D_resident = _cache.get("D") if _cache is not None else None
             free_bytes = _get_device_free_bytes(device)
@@ -3184,15 +3131,8 @@ class ISDFXTC(XTC, ISDFTC):
     def _assemble_2b_tile(self, jastrow_params, kernels, ranges, device=None,
                           panel_size=None, panel_layout="pr"):
         """Assemble a finished ISDF-XTC 2-body tile from TC and Delta U parts."""
-        global _ASSEMBLE_2B_TILE_PROFILED
-        del jastrow_params  # Reserved for future per-tile kernel refresh logic.
-        device_key = getattr(device, "id", "host")
+        del jastrow_params
         panel_layout = _normalize_panel_layout(panel_layout)
-        profile_key = (device_key, panel_layout)
-        profile = panel_size is not None and profile_key not in _ASSEMBLE_2B_TILE_PROFILED
-        if profile:
-            _ASSEMBLE_2B_TILE_PROFILED.add(profile_key)
-            t0 = time.perf_counter()
         # Per-tile stage timing (only active when a pipeline has opened an
         # ``issue_stage_stats_scope`` — see the comment near the top of
         # this file).  We measure pure Python-return time here, *without*
@@ -3209,14 +3149,6 @@ class ISDFXTC(XTC, ISDFTC):
         if _stage_timing:
             _t_stage_tc1 = time.perf_counter()
             _accum_issue_stage("tc_assemble_s", _t_stage_tc1 - _t_stage_tc0)
-        if profile:
-            jax.block_until_ready(tc_tile)
-            t_tc = time.perf_counter()
-            logger.debug(
-                "_assemble_2b_tile first-tile profile: TC assemble %.3fs (device=%s)",
-                t_tc - t0,
-                device_key,
-            )
         if _stage_timing:
             _t_stage_du0 = time.perf_counter()
         delta_u_tile = self._assemble_delta_u_tile(
@@ -3225,15 +3157,6 @@ class ISDFXTC(XTC, ISDFTC):
         if _stage_timing:
             _t_stage_du1 = time.perf_counter()
             _accum_issue_stage("delta_u_assemble_s", _t_stage_du1 - _t_stage_du0)
-        if profile:
-            jax.block_until_ready(delta_u_tile)
-            t_du = time.perf_counter()
-            logger.debug(
-                "_assemble_2b_tile first-tile profile: delta_U assemble %.3fs (device=%s)",
-                t_du - t_tc,
-                device_key,
-            )
-
         if panel_size is not None:
             if _stage_timing:
                 _t_stage_sum0 = time.perf_counter()
@@ -3242,16 +3165,6 @@ class ISDFXTC(XTC, ISDFTC):
                 _t_stage_sum1 = time.perf_counter()
                 _accum_issue_stage("final_sum_s", _t_stage_sum1 - _t_stage_sum0)
                 _accum_issue_stage("n_tiles", 1)
-            if profile:
-                jax.block_until_ready(result)
-                t_sum = time.perf_counter()
-                logger.debug(
-                    "_assemble_2b_tile first-tile profile: final sum %.3fs, total %.3fs "
-                    "(device=%s)",
-                    t_sum - t_du,
-                    t_sum - t0,
-                    device_key,
-                )
             return result
 
         tc_tile = np.array(tc_tile)
