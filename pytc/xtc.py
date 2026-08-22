@@ -314,6 +314,13 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank, *, include_d=Tru
 def _get_device_free_bytes(device=None):
     """Return currently free bytes for a specific local device when possible."""
     if device is not None:
+        if getattr(device, "platform", None) == "cpu":
+            import psutil
+            available = int(psutil.virtual_memory().available)
+            if available <= 0:
+                raise RuntimeError("host does not report usable available memory")
+            return available
+
         stats = device.memory_stats()
         if not stats or "bytes_limit" not in stats:
             raise RuntimeError(

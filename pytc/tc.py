@@ -97,6 +97,13 @@ def _array_nbytes(arr):
 
 def _get_local_device_free_bytes(device):
     """Return free bytes reported by one local device."""
+    if getattr(device, "platform", None) == "cpu":
+        import psutil
+        available = int(psutil.virtual_memory().available)
+        if available <= 0:
+            raise RuntimeError("host does not report usable available memory")
+        return available
+
     stats = device.memory_stats()
     if not stats or "bytes_limit" not in stats:
         raise RuntimeError(
