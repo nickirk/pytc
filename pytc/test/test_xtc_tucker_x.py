@@ -283,6 +283,53 @@ class TestTuckerXSolverViews(unittest.TestCase):
 class TestRealFactorOnlyH2(unittest.TestCase):
     """Exercise the actual ISDF, ERI, and CCSD paths with no dense-X key."""
 
+    def test_isdf_n_factor_dispatches_to_factor_only_builder(self):
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",
+            unit="Angstrom", verbose=0,
+        )
+        mf = scf.RHF(mol).run()
+        jparams = {"alpha": jnp.array([1.0])}
+        base = xtc_mod.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
+        isdf = xtc_mod.ISDFXTC.from_xtc(
+            base, n_rank=max(8, 3 * base.n_orb), is_incore=True,
+        )
+        sentinel = object()
+        with mock.patch.object(
+            xtc_mod.ISDFXTC,
+            "build_tucker_x_kernels_direct",
+            autospec=True,
+            return_value=sentinel,
+        ) as builder:
+            actual = isdf.isdf(
+                jparams,
+                n_factor=1,
+                batch_size=64,
+                orb_block_size=2,
+                host_grid_block_size=512,
+                d_reduce_group_blocks=3,
+                r2_tile_size=5,
+                gpu_budget_bytes=1234,
+                reuse_aux_kernels=False,
+                use_laux_fast_grad=True,
+            )
+
+        self.assertIs(actual, sentinel)
+        builder.assert_called_once_with(
+            isdf,
+            jparams,
+            1,
+            batch_size=64,
+            orb_block_size=2,
+            host_grid_block_size=512,
+            save_path=None,
+            d_reduce_group_blocks=3,
+            r2_tile_size=5,
+            gpu_budget_bytes=1234,
+            reuse_aux_kernels=False,
+            use_laux_fast_grad=True,
+        )
+
     def test_source_free_builder_cache_never_writes_dense_x(self):
         mol = gto.M(
             atom="H 0 0 0; H 0 0 0.74", basis="sto-3g",

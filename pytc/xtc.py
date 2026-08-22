@@ -1142,6 +1142,7 @@ class ISDFXTC(XTC, ISDFTC):
         gpu_budget_bytes=None,
         reuse_aux_kernels=None,
         use_laux_fast_grad=False,
+        n_factor=None,
     ):
         """Compute ISDF intermediates and store them.
         
@@ -1165,11 +1166,35 @@ class ISDFXTC(XTC, ISDFTC):
             use_laux_fast_grad: Opt into the Jastrow's L_aux-only fast
                 derivative path.  The parent validates this mode against any
                 reusable base cache.
+            n_factor: Opt into the factor-only orbital Tucker representation
+                of X with rank M = ``n_factor``.  The returned object contains
+                ``X_tucker = {"U", "Z"}`` and does not materialize dense X.
+                Leave as ``None`` (the default) for the full-X build.
         """
         logger.info("Computing ISDF intermediates (XTC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
+
+        if n_factor is not None:
+            logger.info(
+                "  Using opt-in rank-M orbital Tucker X (M=%s); "
+                "dense X will not be built",
+                n_factor,
+            )
+            return self.build_tucker_x_kernels_direct(
+                jastrow_params,
+                n_factor,
+                batch_size=batch_size,
+                orb_block_size=orb_block_size,
+                host_grid_block_size=host_grid_block_size,
+                save_path=out_path,
+                d_reduce_group_blocks=d_reduce_group_blocks,
+                r2_tile_size=r2_tile_size,
+                gpu_budget_bytes=gpu_budget_bytes,
+                reuse_aux_kernels=reuse_aux_kernels,
+                use_laux_fast_grad=use_laux_fast_grad,
+            )
         
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
