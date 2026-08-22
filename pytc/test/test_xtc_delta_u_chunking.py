@@ -23,6 +23,10 @@ class _FakeISDF:
     def _get_fixed_rank_block_size(self):
         return 2
 
+    def _get_isdf_device_cache(self, kernels, device=None,
+                               include_grad=False, include_delta_u=False):
+        return None
+
     _get_delta_u_direct_tile = xtc_mod.ISDFXTC._get_delta_u_direct_tile
 
 
@@ -80,7 +84,6 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
         fake._get_delta_u_direct_tile = types.MethodType(
             xtc_mod.ISDFXTC._get_delta_u_direct_tile, fake
         )
-        fake._get_isdf_device_cache = None
         return fake
 
     def _make_kernels(self, nmo, n_rank):
