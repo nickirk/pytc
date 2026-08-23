@@ -72,6 +72,16 @@ class FactorizedStateExecutionTest(unittest.TestCase):
             del fake.isdf_kernels[drop_kernel]
         return isdf_xtc_ccsd.RCCSD(self.mf, fake, None, on_the_fly_vvvv=True)
 
+    def _make_tucker_cc(self, n_factor=4):
+        fake = _fake_xtc_obj(self.nmo, self.rank)
+        del fake.isdf_kernels["X"]
+        rng = np.random.default_rng(20260823)
+        fake.isdf_kernels["X_tucker"] = {
+            "U": rng.standard_normal((self.nmo, n_factor)),
+            "Z": rng.standard_normal((n_factor, n_factor, self.rank)),
+        }
+        return isdf_xtc_ccsd.RCCSD(self.mf, fake, None, on_the_fly_vvvv=True)
+
     def test_state_builds_and_caches(self):
         cc = self._make_cc()
         state1 = cc._factorized_state()
@@ -108,6 +118,40 @@ class FactorizedStateExecutionTest(unittest.TestCase):
                 x_rm, self.nocc, self.nmo - self.nocc, self.rank),
             "rank_major")
 
+    def test_state_accepts_factor_only_tucker_x(self):
+        cc = self._make_tucker_cc()
+        _, _, _, x_state = cc._factorized_state()
+        nvir = self.nmo - self.nocc
+        self.assertIsInstance(x_state, isdf_xtc_ccsd._TuckerXFactors)
+        self.assertEqual(x_state.u.shape, (nvir, 4))
+        self.assertEqual(x_state.z.shape, (4, 4, self.rank))
+        self.assertNotIn("X", cc.xtc_obj.isdf_kernels)
+
+    def test_state_prefers_tucker_x_when_both_stores_are_valid(self):
+        cc = self._make_cc()
+        dense_x = cc.xtc_obj.isdf_kernels["X"]
+        rng = np.random.default_rng(20260824)
+        cc.xtc_obj.isdf_kernels["X_tucker"] = {
+            "U": rng.standard_normal((self.nmo, 4)),
+            "Z": rng.standard_normal((4, 4, self.rank)),
+        }
+
+        _, _, _, x_state = cc._factorized_state()
+
+        self.assertIsInstance(x_state, isdf_xtc_ccsd._TuckerXFactors)
+        self.assertIs(cc.xtc_obj.isdf_kernels["X"], dense_x)
+
+    def test_malformed_tucker_x_does_not_fall_back_to_valid_dense_x(self):
+        cc = self._make_cc()
+        self.assertIn("X", cc.xtc_obj.isdf_kernels)
+        cc.xtc_obj.isdf_kernels["X_tucker"] = {
+            "U": np.zeros((self.nmo, 4)),
+            "Z": np.zeros((4, 4, self.rank - 1)),
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "rank disagrees"):
+            cc._factorized_state()
+
     def test_hook_executes_streamed_contraction(self):
         # Execute the hook end-to-end on the synthetic case: the streamed
         # factor-direct terms plus the JAX sandwich must produce a finite,
@@ -115,6 +159,18 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         cc = self._make_cc()
         nvir = self.nmo - self.nocc
         rng = np.random.default_rng(7)
+        t2_raw = rng.standard_normal((self.nocc, self.nocc, nvir, nvir))
+        t2 = 0.5 * (t2_raw + t2_raw.transpose(1, 0, 3, 2))
+        eris = types.SimpleNamespace(vvvv=None)
+        t2new = np.zeros_like(t2)
+        cc._contract_vvvv_t2(cc, t2, eris, t2new)
+        self.assertTrue(np.all(np.isfinite(t2new)))
+        self.assertGreater(np.linalg.norm(t2new), 0.0)
+
+    def test_hook_executes_tucker_factor_direct_contraction(self):
+        cc = self._make_tucker_cc()
+        nvir = self.nmo - self.nocc
+        rng = np.random.default_rng(11)
         t2_raw = rng.standard_normal((self.nocc, self.nocc, nvir, nvir))
         t2 = 0.5 * (t2_raw + t2_raw.transpose(1, 0, 3, 2))
         eris = types.SimpleNamespace(vvvv=None)
@@ -133,7 +189,6 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         eris = types.SimpleNamespace(vvvv=np.zeros((1, 1, 1, 1)))
         with self.assertRaisesRegex(RuntimeError, "materialized VVVV"):
             cc._contract_vvvv_t2(cc, None, eris, None)
-
 
 class PreloadSuppressionTest(unittest.TestCase):
     """The whole-X host preload fires on the materialized parent but is

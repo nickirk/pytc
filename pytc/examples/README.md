@@ -13,9 +13,10 @@ self-check.
 | `03_dense_xtc_ccsd.py` | Exact (dense, non-ISDF) transcorrelated CCSD | The transcorrelated (xTC) Hamiltonian and CCSD integration |
 | `04_isdf_xtc_ccsd.py` | ISDF-approximated xTC-CCSD, vs. 03's dense reference | Interpolative Separable Density Fitting (ISDF) |
 | `05_make_fno_xtc_ccsd.py` | FNO (MP2 natural orbital) virtual-space truncation scan, via ISDF | Frozen/truncated natural orbitals (FNO) |
+| `06_rank_m_x_factor_direct_ccsd.py` | Opt-in rank-M orbital X and direct T2-U-Z ISDF xTC-CCSD | Rank-M X approximation / factor-direct CCSD |
 
-A sixth example -- a deterministic, non-stochastic alternative to `01` -- is
-deferred. It relied on a Jastrow optimizer that was found to be broken on
+A future example -- a deterministic, non-stochastic alternative to `01` --
+is deferred. It relied on a Jastrow optimizer that was found to be broken on
 `main` (a downstream host-array materialization severs its JAX gradient path)
 and has been removed from `main` pending a fix; see the tracked bug (task #49).
 The example will be added once the optimizer is reintroduced.
@@ -54,7 +55,7 @@ instead. Measured wall times:
 - `01` writes `h2o_phase_b_hist.h5` (not committed to git -- see
   `.gitignore`). `02` reads it and prints the Polyak-Ruppert-averaged
   parameters (not consumed elsewhere -- see the split above).
-- `03`-`05` are each fully standalone (hardcoded `JASTROW_PARAMS`, no shared
+- `03`-`06` are each fully standalone (hardcoded `JASTROW_PARAMS`, no shared
   state, no ordering dependency).
 
 ## Production script analogues

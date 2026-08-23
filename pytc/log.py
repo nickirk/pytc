@@ -8,7 +8,6 @@ This module provides centralized logging functionality including:
 
 import logging
 import subprocess
-from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -42,24 +41,9 @@ def get_git_commit(repo_path: Optional[Path] = None) -> str:
 
 
 def get_pytc_version() -> str:
-    """Get the pytc version from pyproject.toml.
-
-    Returns:
-        The pytc version string, or 'unknown' if not available.
-    """
-    try:
-        from importlib.metadata import version
-        return version('pytc-qc')
-    except PackageNotFoundError:
-        pass
-
-    pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
-    if pyproject_path.exists():
-        import tomllib
-        with open(pyproject_path, 'rb') as f:
-            data = tomllib.load(f)
-            return data.get('project', {}).get('version', 'unknown')
-    return 'unknown'
+    """Return the package version resolved once by :mod:`pytc`."""
+    from . import __version__
+    return __version__
 
 
 def get_dependency_versions() -> Dict[str, str]:

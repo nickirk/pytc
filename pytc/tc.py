@@ -18,6 +18,7 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 from .utils import sharding_core
+from .utils.gpu_memory import array_nbytes, get_local_device_free_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -69,36 +70,12 @@ def _panel_blk_overrides():
         panel_blk = None
     return panel_blk, gpu_max_memory_mb
 
-# ----------------------------------------------------------------------
-# Per-(ISDFTC instance, device) cache of device-resident phi_isdf /
-# grad_phi_isdf / TC kernels / D so the per-tile dispatch path doesn't
-# re-upload them.
-#
-# The cache is process-wide (rather than per-instance) so that multiple
-# code paths sharing the same ISDFTC instance can both benefit from a
-# single upload.  Keys are ``(id(self), device_id)`` for fast lookup.
-#
-# Lifecycle
-# ------------------------
-# Without explicit cleanup the cache leaks both ways:
-#   1. Memory: an ISDFTC instance that is GC'd leaves its multi-GB
-#      device-resident phi/kernels / D entries permanently in the
-#      cache, so VRAM monotonically grows across runs in a long-lived
-#      process (notebook, REPL, sweep script).
-#   2. Correctness: ``id()`` is reused after object destruction, so a
-#      *new* ISDFTC that happens to receive a recycled id() would
-#      silently inherit the *old* instance's stale device buffers.
-#
-# Both are addressed by registering a ``weakref.finalize`` the first
-# time we cache anything for an instance: the finaliser drops every
-# ``(id(self), *)`` entry the moment ``self`` is GC'd, which both frees
-# VRAM and prevents id-reuse hits.  ``invalidate_isdf_device_cache``
-# remains available for callers that want explicit eviction without
-# relying on GC.
-# ----------------------------------------------------------------------
+# Device-resident operands are keyed by object identity and device.  The
+# finalizer is required because Python can reuse an object's id after GC;
+# retaining an old entry would leak VRAM and could return stale buffers.
 _ISDF_DEVICE_CACHE: dict = {}
 _ISDF_DEVICE_CACHE_LOCK = threading.Lock()
-_ISDF_DEVICE_CACHE_FINALISED: set = set()  # ids we've already attached a finaliser to
+_ISDF_DEVICE_CACHE_FINALISED: set = set()
 
 
 def _evict_isdf_device_cache_for_id(self_id):
@@ -110,60 +87,9 @@ def _evict_isdf_device_cache_for_id(self_id):
         _ISDF_DEVICE_CACHE_FINALISED.discard(self_id)
 
 
-def invalidate_isdf_device_cache(instance=None):
-    """Manually evict ISDFTC device-cache entries.
-
-    Without arguments, clears the entire cache (every instance, every
-    device).  With an ISDFTC instance, evicts only that instance's
-    entries — useful for releasing a known-stale set of buffers ahead
-    of GC.
-
-    Equivalent to the automatic ``weakref.finalize`` path, but
-    available for callers that want explicit lifecycle control.
-    """
-    if instance is None:
-        with _ISDF_DEVICE_CACHE_LOCK:
-            _ISDF_DEVICE_CACHE.clear()
-            _ISDF_DEVICE_CACHE_FINALISED.clear()
-    else:
-        _evict_isdf_device_cache_for_id(id(instance))
-
-
-_TC_DIRECT_TILE_PROFILED: set = set()  # log first tile's phase breakdown once per device/layout
-
-
-def _array_nbytes(arr):
-    """Return the byte size of an array-like object without copying."""
-    shape = getattr(arr, "shape", None)
-    dtype = getattr(arr, "dtype", None)
-    if shape is None or dtype is None:
-        arr_np = np.asarray(arr)
-        return int(arr_np.size * arr_np.dtype.itemsize)
-    return int(np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize)
-
-
-def _get_local_device_free_bytes(device):
-    """Return free bytes for one local device when available."""
-    try:
-        stats = device.memory_stats()
-        pool_limit = int(stats["bytes_limit"])
-        in_use = int(stats.get("bytes_in_use", 0))
-        return max(pool_limit - in_use, 0)
-    except Exception:
-        return 1 << 60
-
-
 def _cache_d_on_device(device, arr, *, fraction=0.35):
     """Whether a persistent device cache should keep ``arr`` resident."""
-    return _array_nbytes(arr) <= int(_get_local_device_free_bytes(device) * fraction)
-
-
-def _cache_tc_kernels_on_device(device, u1, u3, *, fraction=0.30):
-    """Whether persistent TC kernels should be cached on one device.
-
-    Kept for API compatibility with call-sites that only want a bool.
-    """
-    return _choose_tc_kernel_strategy(device, u1, u3, fraction=fraction)[0]
+    return array_nbytes(arr) <= int(get_local_device_free_bytes(device) * fraction)
 
 
 def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
@@ -183,8 +109,8 @@ def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
     transients (K1_transient / scratch / D / phi), which matches the scratch
     profile observed empirically on A100-80G at n_fused ~25k.
     """
-    total = _array_nbytes(u1) + _array_nbytes(u3)
-    free_bytes = _get_local_device_free_bytes(device)
+    total = array_nbytes(u1) + array_nbytes(u3)
+    free_bytes = get_local_device_free_bytes(device)
     if total <= int(free_bytes * fraction):
         return True, None
 
@@ -745,6 +671,8 @@ class ISDFTC(TC):
         phi: ISDF basis for density (Nb, N_fused)
         grad_phi: ISDF basis for gradients (Nb, N_fused, 3)
         isdf_kernels: Dictionary storing precomputed kernels (U1, U3)
+        kmat_kernel_mode: Resolved K1/K3 construction route (``direct`` or
+            ``aux-recovery``), excluded from the numeric pytree.
     """
     xi_phi: jnp.ndarray = struct.field(default=None)
     xi_grad: jnp.ndarray = struct.field(default=None)
@@ -754,6 +682,7 @@ class ISDFTC(TC):
     isdf_kernels: dict = struct.field(default=None, pytree_node=True)
     is_incore: bool = struct.field(default=False, pytree_node=False)
     save_path: str = struct.field(default=None, pytree_node=False)
+    kmat_kernel_mode: str = struct.field(default=None, pytree_node=False)
 
     def _get_fixed_rank_block_size(self):
         """Return a fixed rank_block_size that is safe for all orbital slices.
@@ -845,23 +774,13 @@ class ISDFTC(TC):
                                include_grad=False,
                                include_delta_u=False,
                                include_tc=False):
-        """Return persistent ISDF operands resident on one device.
-
-        The first call for a given ``(self, device)`` materialises
-        ``phi_isdf`` (and optionally grad/TC/D) on ``device`` and stores
-        them in the process-wide ``_ISDF_DEVICE_CACHE``.  A
-        ``weakref.finalize`` is attached to ``self`` the first time we
-        cache anything for it, so the moment ``self`` is GC'd the
-        finaliser drops every ``(id(self), *)`` cache entry — releasing
-        the device-resident buffers and preventing a recycled ``id()``
-        from silently inheriting the old instance's cache.  See the
-        ``_ISDF_DEVICE_CACHE`` docstring at module top.
-        """
+        """Return persistent ISDF operands resident on one device."""
         if device is None:
             return None
 
         self_id = id(self)
         key = (self_id, getattr(device, "id", repr(device)))
+        uses_host_memory = getattr(device, "platform", None) == "cpu"
 
         with _ISDF_DEVICE_CACHE_LOCK:
             cache = _ISDF_DEVICE_CACHE.get(key)
@@ -870,8 +789,6 @@ class ISDFTC(TC):
                     "phi_isdf": jax.device_put(np.asarray(self.phi_isdf), device),
                 }
                 _ISDF_DEVICE_CACHE[key] = cache
-                # Register the finaliser exactly once per instance,
-                # not per (instance, device) pair.
                 if self_id not in _ISDF_DEVICE_CACHE_FINALISED:
                     _ISDF_DEVICE_CACHE_FINALISED.add(self_id)
                     weakref.finalize(
@@ -885,15 +802,18 @@ class ISDFTC(TC):
             need_u1 = "K1_kernel" in kernels and "K1_kernel" not in cache
             need_u3 = "K3_kernel" in kernels and "K3_kernel" not in cache
             if need_u1 or need_u3:
-                resident, panel_size = _choose_tc_kernel_strategy(
-                    device, kernels["K1_kernel"], kernels["K3_kernel"],
-                )
+                if uses_host_memory:
+                    resident, panel_size = True, None
+                else:
+                    resident, panel_size = _choose_tc_kernel_strategy(
+                        device, kernels["K1_kernel"], kernels["K3_kernel"],
+                    )
                 if resident:
                     logger.debug(
                         "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB, resident)",
                         getattr(device, "id", "host"),
-                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
-                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
                     )
                     cache["K1_kernel"] = jax.device_put(np.asarray(kernels["K1_kernel"]), device)
                     cache["K3_kernel"] = jax.device_put(np.asarray(kernels["K3_kernel"]), device)
@@ -903,8 +823,8 @@ class ISDFTC(TC):
                         "Streaming TC kernels from host on device %s "
                         "(K1=%.2f GiB, K3=%.2f GiB, panel_size=%d)",
                         getattr(device, "id", "host"),
-                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
-                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
                         panel_size,
                     )
                     cache["K1_kernel"] = np.asarray(kernels["K1_kernel"])
@@ -912,11 +832,11 @@ class ISDFTC(TC):
                     cache["K_stream_panel"] = int(panel_size)
 
         if include_delta_u and kernels is not None and "D" in kernels and "D" not in cache:
-            if _cache_d_on_device(device, kernels["D"]):
+            if uses_host_memory or _cache_d_on_device(device, kernels["D"]):
                 logger.debug(
                     "Caching Delta U D kernel on device %s (%.2f GiB)",
                     getattr(device, "id", "host"),
-                    _array_nbytes(kernels["D"]) / (1024.0 ** 3),
+                    array_nbytes(kernels["D"]) / (1024.0 ** 3),
                 )
                 cache["D"] = jax.device_put(np.asarray(kernels["D"]), device)
             else:
@@ -925,7 +845,18 @@ class ISDFTC(TC):
         return cache
 
     @classmethod
-    def from_tc(cls, tc_obj, n_rank=None, is_incore=False, save_path=None, ls_grid_batch_size=16384):
+    def from_tc(
+        cls,
+        tc_obj,
+        n_rank=None,
+        is_incore=False,
+        save_path=None,
+        ls_grid_batch_size=16384,
+        fixed_pivots=None,
+        batch_size=1,
+        candidate_oversampling=2,
+        n_topup=0,
+    ):
         """Initialize ISDFTC object from TC object.
         
         Args:
@@ -934,6 +865,12 @@ class ISDFTC(TC):
             is_incore: Whether to perform in-core decomposition
             save_path: Path to save ISDF kernels
             ls_grid_batch_size: Batch size for grid decomposition in isdf_decompose
+            fixed_pivots: Optional fixed pivot sequence.
+            batch_size: Exact columns retained per blocked pivot round. One
+                preserves exact greedy pivot selection.
+            candidate_oversampling: Candidate-pool multiplier for exact
+                within-pool re-pivoting.
+            n_topup: Final exact-greedy singleton pivots after blocked rounds.
             
         Returns:
             ISDFTC: Initialized ISDFTC object
@@ -946,7 +883,10 @@ class ISDFTC(TC):
         logger.info("ISDFTC.from_tc: building ISDF decomposition")
         phi_isdf, xi_phi, grad_phi_isdf, xi_grad, pivots, actual_save_path = df.isdf_decompose(
             tc_obj.phi, tc_obj.grad_phi, n_rank, n_rank, weights=tc_obj.weights,
-            is_incore=is_incore, save_path=save_path, grid_batch_size=ls_grid_batch_size
+            is_incore=is_incore, save_path=save_path,
+            grid_batch_size=ls_grid_batch_size, fixed_pivots=fixed_pivots,
+            batch_size=batch_size,
+            candidate_oversampling=candidate_oversampling, n_topup=n_topup,
         )
         
         return cls(
@@ -1369,8 +1309,17 @@ class ISDFTC(TC):
         return {'K1_kernel': jnp.asarray(K1_kernel),
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
-    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None, host_grid_block_size=None):
-        """Compute L_aux (G) for the full grid with grid-blocking to save host RAM."""
+    def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
+                       host_grid_block_size=None, include_h_aux=False):
+        """Compute L_aux, and optionally its exact squared-gradient companion.
+
+        When ``include_h_aux`` is true this also forms
+        ``H_aux[a,g] = sum_h xi_phi[a,h] w_h |grad u(g,h)|^2`` in the same
+        double-grid pass.  ``H_aux`` lets the K3 ISDF kernel be recovered by
+        one-grid contraction; paired with ``L_aux`` it likewise recovers K1.
+        The default is deliberately unchanged for existing callers.
+
+        """
         n_devices = jax.local_device_count()
         devices = jax.local_devices()
         n_grid = self.grid_points.shape[0]
@@ -1380,13 +1329,19 @@ class ISDFTC(TC):
             host_grid_block_size = n_grid
             
         L_aux_out = None
+        H_aux_out = None
         f_out = None
         if save_path:
             f_out = h5py.File(save_path, 'a')
             if 'L_aux' in f_out: del f_out['L_aux']
             L_aux_out = f_out.create_dataset('L_aux', (n_rank, n_grid, 3), dtype='f8')
+            if include_h_aux:
+                if 'H_aux' in f_out: del f_out['H_aux']
+                H_aux_out = f_out.create_dataset('H_aux', (n_rank, n_grid), dtype='f8')
         else:
             L_aux_out = np.zeros((n_rank, n_grid, 3))
+            if include_h_aux:
+                H_aux_out = np.zeros((n_rank, n_grid))
             
         xi_phi_ds = None
         f_xi = None
@@ -1403,14 +1358,22 @@ class ISDFTC(TC):
             
         def compute_block_on_device(grid_eval_shard, jastrow_params, grid_int, weights_int, xi_phi_int):
             def scan_body(carry, i):
+                if include_h_aux:
+                    l_aux_carry, h_aux_carry = carry
                 r_eval = grid_eval_shard
                 g_batch = jax.lax.dynamic_slice(grid_int, (i * batch_size, 0), (batch_size, 3))
                 w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
                 xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
                 
-                u_grad = self.jastrow_factor.grad_r_batch(r_eval, g_batch, jastrow_params)
+                u_grad = self.jastrow_factor.grad_r_batch(
+                    r_eval, g_batch, jastrow_params
+                )
                 xi_weighted = xi_batch * w_batch[None, :]
                 update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
+                if include_h_aux:
+                    grad_sq = jnp.sum(u_grad**2, axis=-1)
+                    h_update = jnp.einsum('ab,ib->ai', xi_weighted, grad_sq)
+                    return (l_aux_carry + update, h_aux_carry + h_update), None
                 return carry + update, None
 
             n_int = grid_int.shape[0]
@@ -1422,18 +1385,34 @@ class ISDFTC(TC):
                 weights_int = jnp.pad(weights_int, (0, pad_int))
                 xi_phi_int = jnp.pad(xi_phi_int, ((0, 0), (0, pad_int)))
                 
-            init_val = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
-            res, _ = jax.lax.scan(scan_body, init_val, jnp.arange(n_batches))
-            return res
+            l_aux_init = jnp.zeros((n_rank, grid_eval_shard.shape[0], 3))
+            if include_h_aux:
+                h_aux_init = jnp.zeros((n_rank, grid_eval_shard.shape[0]))
+                (l_aux_res, h_aux_res), _ = jax.lax.scan(
+                    scan_body, (l_aux_init, h_aux_init), jnp.arange(n_batches)
+                )
+                return l_aux_res, h_aux_res
+            l_aux_res, _ = jax.lax.scan(scan_body, l_aux_init, jnp.arange(n_batches))
+            return l_aux_res
 
-        @shard_map(
-            mesh=mesh,
-            in_specs=(P('devices', None), P(), P(), P(), P()),
-            out_specs=P(None, 'devices', None),
-            check_vma=False,
-        )
-        def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
-            return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+        if include_h_aux:
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P('devices', None), P(), P(), P(), P()),
+                out_specs=(P(None, 'devices', None), P(None, 'devices')),
+                check_vma=False,
+            )
+            def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+                return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
+        else:
+            @shard_map(
+                mesh=mesh,
+                in_specs=(P('devices', None), P(), P(), P(), P()),
+                out_specs=P(None, 'devices', None),
+                check_vma=False,
+            )
+            def sharded_compute(grid_eval_shard, params, grid_int, weights_int, xi_phi_int):
+                return compute_block_on_device(grid_eval_shard, params, grid_int, weights_int, xi_phi_int)
 
         try:
             for r0 in range(0, n_grid, host_grid_block_size):
@@ -1451,6 +1430,7 @@ class ISDFTC(TC):
                 sharded_grid_eval = jax.device_put(grid_eval_block, eval_sharding)
                 
                 res_rep_accum = None
+                h_aux_rep_accum = None
                 
                 # Also controlled by host_grid_block_size to limit peak memory of inputs
                 from pytc.utils.prefetch import async_read, await_read, safe_hdf5_read
@@ -1484,6 +1464,9 @@ class ISDFTC(TC):
                         sharded_grid_eval, params_rep, grid_int_chunk, weights_int_chunk, xi_phi_chunk
                     )
 
+                    if include_h_aux:
+                        res_partial, h_partial = res_partial
+
                     # While shard_map runs, prefetch next integration block.
                     next_g0 = g0 + host_grid_block_size
                     if next_g0 < n_grid:
@@ -1491,15 +1474,27 @@ class ISDFTC(TC):
                     
                     if res_rep_accum is None:
                         res_rep_accum = res_partial
+                        if include_h_aux:
+                            h_aux_rep_accum = h_partial
                     else:
                         res_rep_accum += res_partial
+                        if include_h_aux:
+                            h_aux_rep_accum += h_partial
                     
                     del grid_int_chunk, weights_int_chunk, xi_phi_chunk, res_partial
+                    if include_h_aux:
+                        del h_partial
                 
                 res_block = res_rep_accum[:, :n_eval, :]
                 L_aux_out[:, r0:r1, :] = np.asarray(res_block)
+                if include_h_aux:
+                    h_aux_block = h_aux_rep_accum[:, :n_eval]
+                    H_aux_out[:, r0:r1] = np.asarray(h_aux_block)
+                    del h_aux_block
                 
                 del sharded_grid_eval, res_rep_accum, res_block
+                if include_h_aux:
+                    del h_aux_rep_accum
                 gc.collect()
                 
         finally:
@@ -1511,11 +1506,14 @@ class ISDFTC(TC):
             if f_out and not isinstance(L_aux_out, h5py.Dataset):
                 f_out.close()
             
+        if include_h_aux:
+            return L_aux_out, H_aux_out
         return L_aux_out
 	
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
-             r2_tile_size=None, gpu_budget_bytes=None):
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000,
+             host_grid_block_size=None, r2_tile_size=None,
+             gpu_budget_bytes=None, reuse_aux_kernels=None):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1528,14 +1526,35 @@ class ISDFTC(TC):
             r2_tile_size: Optional r2-grid tile size for kernel assembly.
             gpu_budget_bytes: Optional device-memory budget in bytes for kernel
                 assembly.
+            reuse_aux_kernels: Exact path that builds ``L_aux`` and ``H_aux``
+                together, then recovers K1/K3 from one-grid contractions.  By
+                default it is enabled for in-core calculations and out-of-core
+                calculations with a persistent output path.  Out-of-core
+                calculations without a path retain direct K1/K3 construction.
+                Passing ``True`` explicitly requires a persistent path for the
+                L_aux/H_aux datasets.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
         
         out_path = save_path if save_path else self.save_path
-        
+        reuse_aux_kernels_defaulted = reuse_aux_kernels is None
+        if reuse_aux_kernels_defaulted:
+            reuse_aux_kernels = self.is_incore or bool(out_path)
+        if reuse_aux_kernels and not self.is_incore and not out_path:
+            raise ValueError(
+                "out-of-core reuse_aux_kernels requires save_path so L_aux "
+                "and H_aux can be streamed rather than materialized"
+            )
         kernels = {}
-        if out_path and os.path.exists(out_path):
+        # An explicit auxiliary-reuse request must execute that path, not
+        # silently accept a pre-existing direct K1/K3 cache.  The default may
+        # accept an exact warm cache instead of rebuilding equivalent kernels.
+        if (
+            out_path
+            and os.path.exists(out_path)
+            and (not reuse_aux_kernels or reuse_aux_kernels_defaulted)
+        ):
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
@@ -1544,33 +1563,126 @@ class ISDFTC(TC):
                     kernels['K1_kernel'] = f['K1_kernel'][:]
                     logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
                     kernels['K3_kernel'] = f['K3_kernel'][:]
+                    cached_kmat_mode = f.attrs.get(
+                        "pytc_kmat_kernel_mode", "legacy-cache-unknown"
+                    )
+                    if isinstance(cached_kmat_mode, bytes):
+                        cached_kmat_mode = cached_kmat_mode.decode()
                     if self.is_incore:
                         logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
                         kernels['L_aux'] = f['L_aux'][:]
                         f.close()
                     else:
                         logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
-                        kernels['L_aux'] = f['L_aux'] 
+                        kernels['L_aux'] = f['L_aux']
 
                     logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
-                    return self.replace(isdf_kernels=kernels)
+                    return self.replace(
+                        isdf_kernels=kernels,
+                        kmat_kernel_mode=cached_kmat_mode,
+                    )
                 
                 # If we are here, keys are missing. Close the file!
-                f.close()
+                if f is not None:
+                    f.close()
             except (IOError, KeyError) as e:
                 logger.warning(f"  Error reading kernels from {out_path}: {e}. Recomputing...")
 
-        logger.info("  Computing K1 and K3 kernels...")
-        
-        kernels = self.compute_kmat_kernels(jastrow_params, batch_size,
-                                            host_grid_block_size=host_grid_block_size,
-                                            r2_tile_size=r2_tile_size,
-                                            gpu_budget_bytes=gpu_budget_bytes)
+        if reuse_aux_kernels:
+            logger.info("  Computing L_aux and H_aux for exact K1/K3 recovery...")
+            aux_build_start = time.perf_counter()
+            aux_result = self._compute_L_aux(
+                jastrow_params,
+                batch_size,
+                save_path=out_path if not self.is_incore else None,
+                host_grid_block_size=host_grid_block_size,
+                include_h_aux=True,
+            )
+            L_aux, H_aux = aux_result
+            logger.info(
+                "  L_aux/H_aux construction completed in %.4f s",
+                time.perf_counter() - aux_build_start,
+            )
+            recovery_start = time.perf_counter()
+            if self.is_incore:
+                kernels = kmat_jax.calc_kmat_kernels_from_aux(
+                    self.xi_phi, self.xi_grad, self.weights, L_aux, H_aux
+                )
+            else:
+                # The grid panel follows the L_aux construction panel; rows
+                # of the left K rank are deliberately small so no full R^2
+                # temporary is ever materialized on a GPU.
+                stream_grid_block = host_grid_block_size or min(
+                    self.grid_points.shape[0], 4096
+                )
+                stream_rank_block = min(self.phi_isdf.shape[1], 128)
+                logger.info(
+                    "  Recovering K1/K3 from streamed L_aux/H_aux "
+                    "(grid_block=%d, rank_block=%d)...",
+                    stream_grid_block,
+                    stream_rank_block,
+                )
+                # A genuine out-of-core ISDF object intentionally carries
+                # ``None`` for xi_phi/xi_grad.  Reuse the already-open
+                # L_aux HDF5 file instead of reloading either collocation
+                # tensor into host memory.
+                xi_source_file = L_aux.file
+                xi_phi_source = (
+                    self.xi_phi if self.xi_phi is not None
+                    else xi_source_file['xi_phi']
+                )
+                xi_grad_source = (
+                    self.xi_grad if self.xi_grad is not None
+                    else xi_source_file['xi_grad']
+                )
+                kernels = kmat_jax.calc_kmat_kernels_from_aux_streamed(
+                    xi_phi_source,
+                    xi_grad_source,
+                    self.weights,
+                    L_aux,
+                    H_aux,
+                    grid_block_size=stream_grid_block,
+                    rank_block_size=stream_rank_block,
+                )
+                # H_aux is a transient companion to L_aux, not a cache
+                # format change.  Drop it immediately after exact K3
+                # recovery rather than retaining an extra R-by-G dataset.
+                if isinstance(H_aux, h5py.Dataset):
+                    h_aux_file = H_aux.file
+                    del h_aux_file['H_aux']
+                    h_aux_file.flush()
+            logger.info(
+                "  K1/K3 auxiliary recovery completed in %.4f s",
+                time.perf_counter() - recovery_start,
+            )
+        else:
+            logger.info("  Computing K1 and K3 kernels...")
+            direct_k_start = time.perf_counter()
+            kernels = self.compute_kmat_kernels(
+                jastrow_params,
+                batch_size,
+                host_grid_block_size=host_grid_block_size,
+                r2_tile_size=r2_tile_size,
+                gpu_budget_bytes=gpu_budget_bytes,
+            )
+            logger.info(
+                "  K1/K3 direct construction completed in %.4f s",
+                time.perf_counter() - direct_k_start,
+            )
+            logger.info("  Computing L_aux...")
+            laux_start = time.perf_counter()
+            L_aux = self._compute_L_aux(
+                jastrow_params,
+                batch_size,
+                save_path=out_path if not self.is_incore else None,
+                host_grid_block_size=host_grid_block_size,
+            )
+            logger.info(
+                "  L_aux construction completed in %.4f s",
+                time.perf_counter() - laux_start,
+            )
         logger.info(f"   K1 kernel on device size: {kernels['K1_kernel'].size * 8 / 1024**3:.2f} GB")
         logger.info(f"   K3 kernel on device size: {kernels['K3_kernel'].size * 8 / 1024**3:.2f} GB")
-        
-        logger.info("  Computing L_aux...")
-        L_aux = self._compute_L_aux(jastrow_params, batch_size, save_path=out_path if not self.is_incore else None, host_grid_block_size=host_grid_block_size)
         
         # Move L_aux to CPU RAM to avoid GPU OOM (it can be very large)
         # If it's an HDF5 dataset, we keep it as is.
@@ -1587,6 +1699,12 @@ class ISDFTC(TC):
         
         if out_path and not self.is_incore:
             with h5py.File(out_path, 'a') as f:
+                # This provenance is deliberately on the base cache because
+                # timing cards must not mistake a direct K cache for an
+                # auxiliary-recovered one (or vice versa) after a restart.
+                f.attrs['pytc_kmat_kernel_mode'] = (
+                    'aux-recovery' if reuse_aux_kernels else 'direct'
+                )
                 for k, v in kernels.items():
                     if k == 'L_aux': continue
                     if k in f: del f[k]
@@ -1597,7 +1715,13 @@ class ISDFTC(TC):
                 
         logger.info(f"ISDF intermediates computed in {time.perf_counter() - start_time:.4f} s")
         
-        return self.replace(isdf_kernels=kernels, save_path=out_path)
+        return self.replace(
+            isdf_kernels=kernels,
+            save_path=out_path,
+            kmat_kernel_mode=(
+                "aux-recovery" if reuse_aux_kernels else "direct"
+            ),
+        )
 
     def _accumulate_transpose_block(self, result_np, U1, U3, ranges_T,
                                     scale, n_sub=2, device=None):
@@ -1626,11 +1750,7 @@ class ISDFTC(TC):
         rbs = self._get_fixed_rank_block_size()
 
         chunk_size = max(1, (r_len + n_sub - 1) // n_sub)
-        cache_getter = getattr(self, "_get_isdf_device_cache", None)
-        cache = (
-            cache_getter(device=device, include_grad=True)
-            if callable(cache_getter) else None
-        )
+        cache = self._get_isdf_device_cache(device=device, include_grad=True)
         phi_full = cache["phi_isdf"] if cache is not None else self.phi_isdf
         grad_full = cache["grad_phi_isdf"] if cache is not None else self.grad_phi_isdf
         u1 = jax.device_put(U1, device) if device is not None else U1
@@ -1662,24 +1782,15 @@ class ISDFTC(TC):
     def _get_tc_direct_tile(self, kernels, ranges, device=None, panel_size=None,
                             panel_layout="pr"):
         """Compute the unsymmetrized direct TC tile 0.5*(K1-K2+K3)."""
-        global _TC_DIRECT_TILE_PROFILED
-        _device_key = getattr(device, "id", "host")
         panel_layout = _normalize_panel_layout(panel_layout)
-        _profile_key = (_device_key, panel_layout)
-        _profile = panel_size is not None and _profile_key not in _TC_DIRECT_TILE_PROFILED
-        if _profile:
-            _TC_DIRECT_TILE_PROFILED.add(_profile_key)
-            _t0 = time.perf_counter()
 
         U1 = kernels['K1_kernel']
         U3 = kernels['K3_kernel']
         slice_p, slice_q, slice_r, slice_s = ranges
 
         rbs = self._get_fixed_rank_block_size()
-        cache_getter = getattr(self, "_get_isdf_device_cache", None)
-        cache = (
-            cache_getter(kernels, device=device, include_grad=True, include_tc=True)
-            if callable(cache_getter) else None
+        cache = self._get_isdf_device_cache(
+            kernels, device=device, include_grad=True, include_tc=True
         )
         # ``u1`` / ``u3`` may be device jax.Arrays (resident) OR host numpy
         # arrays (streaming); the downstream contract_* wrappers handle both.
@@ -1692,18 +1803,6 @@ class ISDFTC(TC):
             u1 = jax.device_put(U1, device) if device is not None else U1
         if u3 is None:
             u3 = jax.device_put(U3, device) if device is not None else U3
-
-        if _profile:
-            jax.block_until_ready((u1, u3))
-            _t_put = time.perf_counter()
-            logger.debug(
-                "_get_tc_direct_tile first-tile profile: K1+K3 device_put %.3fs "
-                "(K1=%.1fMB, K3=%.1fMB, device=%s)",
-                _t_put - _t0,
-                getattr(U1, 'nbytes', 0) / 1e6,
-                getattr(U3, 'nbytes', 0) / 1e6,
-                _device_key,
-            )
 
         device_ctx = jax.default_device(device) if device is not None else contextlib.nullcontext()
 
@@ -1784,18 +1883,8 @@ class ISDFTC(TC):
                     panel_size=k_panel)
 
             if panel_size is not None:
-                if _profile:
-                    jax.block_until_ready(k12)
-                    _t_k1 = time.perf_counter()
-                    logger.debug("_get_tc_direct_tile first-tile profile: K1 compute %.3fs",
-                                 _t_k1 - _t_put)
                 k3 = kmat_jax.contract_K3_isdf_streaming(
                     phi_p, phi_q, phi_r, phi_s, u3, rbs, panel_size=k_panel)
-                if _profile:
-                    jax.block_until_ready(k3)
-                    _t_k3 = time.perf_counter()
-                    logger.debug("_get_tc_direct_tile first-tile profile: K3 compute %.3fs, "
-                                 "total tile %.3fs", _t_k3 - _t_k1, _t_k3 - _t0)
                 result = 0.5 * (k12 + k3)
                 # If the slice_p==slice_q branch re-padded phi_p/phi_q to
                 # equalise them, slice axes 0/1 back to the caller-expected

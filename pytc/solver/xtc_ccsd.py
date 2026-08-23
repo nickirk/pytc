@@ -32,6 +32,75 @@ from pytc import xtc as xtc_mod
 
 logger = logging.getLogger(__name__)
 
+
+def eris_reference_energy(eris):
+    """Return the reference energy represented by a CCSD ERI container.
+
+    ``RCCSD`` receives a Fock matrix (the reference-normal-ordered one-body
+    coefficient) together with un-normal-ordered two-electron integrals.  The
+    scalar ``e_core`` is the compensating constant which makes this expression
+    the requested reference energy.  Keeping this small calculation outside
+    :meth:`RCCSD.get_e_hf` makes it possible to construct and validate a
+    reference-normal-ordered ERI view without rebuilding the ERIs.
+    """
+    nocc = eris.nocc
+    fock = np.asarray(eris.fock)
+    energy = 2 * np.einsum('ii->', fock[:nocc, :nocc])
+    if hasattr(eris, 'oooo'):
+        oooo = np.asarray(eris.oooo)
+        energy -= 2 * np.einsum('iijj->', oooo)
+        energy += np.einsum('ijji->', oooo)
+    energy += getattr(eris, 'e_core', 0)
+    return energy.real
+
+
+def resolve_vvvv_disk_block_size(nocc, nvir, cc, *, kind, n_fused=None):
+    """Resolve a bounded first-axis block for disk-backed VVVV I/O.
+
+    The host slab written by the AO2MO path is
+    ``(block, nvir, nvir, nvir)``.  It is a different resource from the
+    symmetric on-the-fly GPU tile, so an unconstrained compute estimate can
+    choose a single multi-GiB HDF5 write.  The RCCSD VVVV panel override is a
+    hard cap for both the writer and the disk-reader contractions.
+    """
+    auto, _ = estimate_blksize(
+        nocc, nvir, kind,
+        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
+        host_max_memory_mb=getattr(cc, 'max_memory', None),
+        n_fused=n_fused,
+    )
+    p_block = getattr(cc, 'vvvv_p_block_size', None)
+    r_block = getattr(cc, 'vvvv_r_block_size', None)
+    if p_block is not None and r_block is not None and int(p_block) != int(r_block):
+        raise ValueError(
+            "Disk-backed VVVV requires equal vvvv_p_block_size and "
+            "vvvv_r_block_size"
+        )
+    configured = p_block if p_block is not None else r_block
+    block = int(configured) if configured is not None else int(auto)
+    if block < 1:
+        raise ValueError("Disk-backed VVVV block size must be positive")
+    return min(block, nvir)
+
+
+def _record_vvvv_write_receipt(eris, *, nvir, p_blksize, r_blksize):
+    """Record the panel layout resolved by the writer that filled ``vvvv``.
+
+    The consumer gate must inspect this receipt rather than recomputing a
+    second panel layout: it is written from the exact values used by the loop
+    that owns every HDF5 assignment.
+    """
+    receipt = {
+        'nvir': int(nvir),
+        'p_blksize': int(p_blksize),
+        'r_blksize': int(r_blksize),
+        'n_p_blocks': (int(nvir) + int(p_blksize) - 1) // int(p_blksize),
+        'n_r_blocks': (int(nvir) + int(r_blksize) - 1) // int(r_blksize),
+    }
+    eris.vvvv_write_receipt = receipt
+    return receipt
+
+
 class RCCSD(rccsd.RCCSD):
     """Restricted CCSD with ISDF-XTC integrals."""
     def __init__(self, mf, xtc_obj=None, jastrow_params=None, **kwargs):
@@ -86,19 +155,7 @@ class RCCSD(rccsd.RCCSD):
             if getattr(self, 'e_hf', None) is not None:
                 return self.e_hf
             return self._scf.e_tot
-        
-        no = self.nocc
-        fock = eris.fock
-        # E_hf = 2*sum_i F_ii - 2*sum_ij (ii|jj) + sum_ij (ij|ji) + E_core
-        e_hf = 2*np.einsum('ii->', fock[:no,:no])
-        if hasattr(eris, 'oooo'):
-            oooo = np.asarray(eris.oooo)
-            e_hf -= 2*np.einsum('iijj ->', oooo)
-            e_hf += np.einsum('ijji ->', oooo)
-        
-        e_hf += getattr(eris, 'e_core', 0)
-        
-        return e_hf.real
+        return eris_reference_energy(eris)
 
     def _finalize(self):
         if self.converged:
@@ -475,10 +532,9 @@ def _contract_vvvv_t2(cc, t2, eris, out=None):
             nocc = cc.nocc
             nvir = cc.nmo - nocc
 
-            mem_host = cc.max_memory * 1e6
-            # Block size: each block loads (blk, nvir, nvir, nvir) floats
-            blksize = max(4, int(mem_host / (nvir * nvir * nvir * 8)))
-            blksize = min(nvir, blksize)
+            blksize = resolve_vvvv_disk_block_size(
+                nocc, nvir, cc, kind='vvvv'
+            )
 
             from pytc.utils.prefetch import PrefetchIterator, hdf5_slice_loader
             chunks = [(p0, min(p0 + blksize, nvir))
@@ -1479,11 +1535,13 @@ def _compute_vvvv_block_df(eris, xtc_obj, jastrow_params, L_vv_full, nocc, nvir,
         include_accumulators=False,
     )
     panel_size = p_blksize
+    receipt = _record_vvvv_write_receipt(
+        eris, nvir=nvir, p_blksize=p_blksize, r_blksize=r_blksize
+    )
     logger.info(
         "    Writing VVVV to disk (p_blksize=%d, r_blksize=%d, n_p_blocks=%d, n_r_blocks=%d)",
         p_blksize, r_blksize,
-        (nvir + p_blksize - 1) // p_blksize,
-        (nvir + r_blksize - 1) // r_blksize,
+        receipt['n_p_blocks'], receipt['n_r_blocks'],
     )
 
     # If X is an HDF5 dataset, preload it into RAM to avoid 15k+ per-tile
@@ -1647,14 +1705,14 @@ def _compute_vvvv_block_ao2mo(eris, xtc_obj, jastrow_params, mol, mo_coeff, nocc
     if hasattr(xtc_obj, 'phi_isdf') and xtc_obj.phi_isdf is not None:
         _n_fused = xtc_obj.phi_isdf.shape[1]
 
-    blksize, _ = estimate_blksize(
-        nocc, nvir, 'vvvv',
-        gpu_max_memory_mb=getattr(cc, 'gpu_max_memory', None),
-        host_max_memory_mb=getattr(cc, 'max_memory', None),
-        n_fused=_n_fused)
-    blksize = max(4, blksize)
+    blksize = resolve_vvvv_disk_block_size(
+        nocc, nvir, cc, kind='vvvv', n_fused=_n_fused
+    )
+    receipt = _record_vvvv_write_receipt(
+        eris, nvir=nvir, p_blksize=blksize, r_blksize=blksize
+    )
     logger.info(f"    Writing VVVV to disk (blksize={blksize}, "
-                f"n_blocks={(nvir+blksize-1)//blksize})")
+                f"n_blocks={receipt['n_p_blocks']})")
 
     from pytc.utils.prefetch import async_read, await_read
     ds = eris.vvvv

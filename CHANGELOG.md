@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-21
+
+### Added
+
+- Deterministic blocked pivot selection for molecular ISDF.
+- Capability-aware exact auxiliary recovery of the K1 and K3 kernels,
+  including streamed out-of-core construction and cache provenance.
+- An opt-in rank-M orbital Tucker representation for the X kernel, including
+  direct T2-U-Z contraction in the factorized ISDF xTC-CCSD solver without
+  reconstructing dense X or a virtual four-index tile.
+- An opt-in persistent XLA compilation cache.
+
+### Changed
+
+- Accelerator-memory probes now fail closed when the available capacity cannot
+  be measured reliably.
+- Disk-backed X panels remain bounded during the JAX CCSD direct-tile path.
+
+### Fixed
+
+- Delta-U dispatch-time memory sizing no longer double-counts an already
+  resident D kernel.
+- Rank-major X-store conversion retains the source layout and adds a validated
+  provenance-stamped twin for legacy compatibility.
+
+### Validation
+
+- On H10/R=1.6/cc-pVTZ/grid2 on one V100, using one fixed ISDF base, exact
+  auxiliary recovery reduced K1/K3 construction from 324.90 s to 89.62 s
+  (3.63x) and total ISDF-intermediate construction from 922.96 s to 714.25 s
+  (1.29x), with K1/K3 relative errors below 1.2e-15 and normal-order
+  identities agreeing within 2.4e-16.
+- On H10/cc-pVTZ/grid2 on one A100 (batch size 32), blocked pivot selection
+  was 9.515x faster in the relaxed-energy run; the full-X total energy changed
+  by +0.000267 mHa.
+- On the same H10 gate, the opt-in M=80 orbital-X approximation changed the
+  exact-pivot total energy by -0.844607 mHa; combining blocked selection with
+  M=80 changed it by -0.852088 mHa. Transfer beyond H10 and a matched
+  rank-M construction speedup have not been established.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added

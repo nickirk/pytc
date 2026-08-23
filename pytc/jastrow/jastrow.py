@@ -76,7 +76,7 @@ class Jastrow:
             return self.grad_r(r1, r2, params)
         
         return jax.vmap(grad_fn, in_axes=(0, None))(r1_batch, r2_batch)
-    
+
     def laplacian_r(self, r1, r2, params):
         """Compute Laplacian of u w.r.t r1 coordinates.
         

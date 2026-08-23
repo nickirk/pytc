@@ -28,6 +28,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
         )
         mf = scf.RHF(mol)
         mf.kernel()
+        cls.mf = mf
 
         jastrow = REXP()
         cls.jparams = {"alpha": jnp.array([1.0])}
@@ -35,6 +36,152 @@ class TestISDFXTCPanelization(unittest.TestCase):
         xtc = XTC.from_pyscf(mf, jastrow, grid_lvl=0)
         n_rank = max(8, 3 * xtc.n_orb)
         cls.isdf_xtc = ISDFXTC.from_xtc(xtc, n_rank=n_rank, is_incore=True)
+
+    def test_aux_recovered_kernels_preserve_h2_xtc_normal_order(self):
+        """Exact auxiliary K recovery must leave the full H2 XTC view intact."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
+        direct = self.isdf_xtc.isdf(
+            self.jparams, reuse_aux_kernels=False, **kwargs
+        )
+        recovered = self.isdf_xtc.isdf(
+            self.jparams, reuse_aux_kernels=True, **kwargs
+        )
+        self.assertEqual(direct.kmat_kernel_mode, "direct")
+        self.assertEqual(recovered.kmat_kernel_mode, "aux-recovery")
+
+        np.testing.assert_allclose(
+            np.asarray(recovered.isdf_kernels["K1_kernel"]),
+            np.asarray(direct.isdf_kernels["K1_kernel"]),
+            rtol=0,
+            atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered.isdf_kernels["K3_kernel"]),
+            np.asarray(direct.isdf_kernels["K3_kernel"]),
+            rtol=0,
+            atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered.get_2b(self.jparams)),
+            np.asarray(direct.get_2b(self.jparams)),
+            rtol=0,
+            atol=2e-12,
+        )
+
+        direct_h = direct.get_delta_h(self.jparams)
+        recovered_h = recovered.get_delta_h(self.jparams)
+        np.testing.assert_allclose(
+            np.asarray(recovered_h), np.asarray(direct_h), rtol=0, atol=2e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(recovered.get_delta_U(self.jparams)),
+            np.asarray(direct.get_delta_U(self.jparams)),
+            rtol=0,
+            atol=2e-12,
+        )
+        self.assertAlmostEqual(
+            float(recovered.get_const(self.jparams, delta_h=recovered_h)),
+            float(direct.get_const(self.jparams, delta_h=direct_h)),
+            places=12,
+        )
+
+    def test_aux_reuse_streams_out_of_core_xtc_normal_order(self):
+        """The production path streams HDF5 auxiliary panels and preserves XTC."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=127)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            direct = self.isdf_xtc.isdf(
+                self.jparams, reuse_aux_kernels=False, **kwargs
+            )
+            store_path = os.path.join(tmpdir, "h2_aux_streamed.h5")
+            # Match a genuine out-of-core ISDF object: xi lives only in the
+            # persistent store and the object carries None for both fields.
+            with h5py.File(store_path, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf_xtc.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf_xtc.xi_grad))
+            out_of_core = self.isdf_xtc.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=store_path,
+            )
+            recovered = out_of_core.isdf(
+                self.jparams,
+                save_path=store_path,
+                reuse_aux_kernels=True,
+                **kwargs,
+            )
+            self.assertEqual(direct.kmat_kernel_mode, "direct")
+            self.assertEqual(recovered.kmat_kernel_mode, "aux-recovery")
+
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K1_kernel"]),
+                np.asarray(direct.isdf_kernels["K1_kernel"]),
+                rtol=0,
+                atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K3_kernel"]),
+                np.asarray(direct.isdf_kernels["K3_kernel"]),
+                rtol=0,
+                atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.get_delta_U(self.jparams)),
+                np.asarray(direct.get_delta_U(self.jparams)),
+                rtol=0,
+                atol=2e-12,
+            )
+            with h5py.File(store_path, "r") as f:
+                self.assertIn("L_aux", f)
+                self.assertNotIn("H_aux", f)
+                self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
+
+    def test_aux_reuse_preserves_a_fixed_out_of_core_isdf_basis(self):
+        """A direct cache can be rebuilt with auxiliary K recovery in one gauge."""
+        kwargs = dict(batch_size=64, orb_block_size=2, host_grid_block_size=512)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = os.path.join(tmpdir, "h2_fixed_isdf.h5")
+            with h5py.File(store_path, "w") as f:
+                f.create_dataset("xi_phi", data=np.asarray(self.isdf_xtc.xi_phi))
+                f.create_dataset("xi_grad", data=np.asarray(self.isdf_xtc.xi_grad))
+                f.create_dataset("pivots", data=np.asarray(self.isdf_xtc.pivots))
+                f.create_dataset("phi_isdf", data=np.asarray(self.isdf_xtc.phi_isdf))
+                f.create_dataset("grad_phi_isdf", data=np.asarray(self.isdf_xtc.grad_phi_isdf))
+            fixed_isdf = self.isdf_xtc.replace(
+                is_incore=False,
+                xi_phi=None,
+                xi_grad=None,
+                save_path=store_path,
+            )
+            direct = fixed_isdf.isdf(
+                self.jparams,
+                save_path=store_path,
+                reuse_aux_kernels=False,
+                **kwargs,
+            )
+            direct_k1 = np.asarray(direct.isdf_kernels["K1_kernel"])
+            direct_k3 = np.asarray(direct.isdf_kernels["K3_kernel"])
+            with h5py.File(store_path, "r") as f:
+                direct_l_aux = f["L_aux"][:]
+            recovered = fixed_isdf.isdf(
+                self.jparams, save_path=store_path, reuse_aux_kernels=True, **kwargs
+            )
+            self.assertEqual(direct.kmat_kernel_mode, "direct")
+            self.assertEqual(recovered.kmat_kernel_mode, "aux-recovery")
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K1_kernel"]), direct_k1,
+                rtol=0, atol=2e-12,
+            )
+            np.testing.assert_allclose(
+                np.asarray(recovered.isdf_kernels["K3_kernel"]), direct_k3,
+                rtol=0, atol=2e-12,
+            )
+            with h5py.File(store_path, "r") as f:
+                np.testing.assert_allclose(
+                    f["L_aux"][:], direct_l_aux, rtol=0, atol=2e-12,
+                )
+                self.assertEqual(f.attrs["pytc_kmat_kernel_mode"], "aux-recovery")
+                self.assertNotIn("H_aux", f)
 
     def test_x_s_panel_blocks_matches_baseline(self):
         batch_size = 64
@@ -164,7 +311,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
             "_contract_delta_U_kernels",
             side_effect=AssertionError("direct tile should not route through chunk scheduler"),
         ):
-            with mock.patch("pytc.xtc._get_device_free_bytes", return_value=1):
+            with mock.patch("pytc.xtc.get_local_device_free_bytes", return_value=1):
                 with self.assertRaises(RuntimeError):
                     self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges)
 

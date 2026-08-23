@@ -12,6 +12,17 @@ import h5py
 import uuid
 import gc
 
+from jax.tree_util import Partial as JaxPartial
+
+from .pivots import (
+    grad_columns,
+    grad_diagonal,
+    phi_columns,
+    phi_diagonal,
+    pivoted_cholesky_streaming,
+    validate_pivot_controls,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,103 +124,36 @@ def solve_normal_equations_batch_prepared(chol: jnp.ndarray, lower: bool,
     return jsp_linalg.cho_solve((chol, lower), atb)
 
 
-@partial(jax.jit, static_argnames=('n_rank',))
 def _pivoted_cholesky_phi(phi_weighted, n_rank, shift):
-    """Specialized pivoted Cholesky for phi decomposition."""
-    n_grid = phi_weighted.shape[1]
-
-    # Deterministic tie-break ramp for argmax (GPU/CPU pivot selection).
-    # GPU tree-reduction in sum(phi**2,axis=0) produces diag_err values differing
-    # ~eps·V (≈1e-16) device-to-device, flipping near-tie argmax results. Adding
-    # a ramp = 1e-12 * arange(n_grid) * max(|diag_err|) overrides reduction noise
-    # (~4 orders above eps, ~4 orders below typical candidate gaps) so the
-    # highest index wins ties deterministically on both devices.
-    diag_err = jnp.sum(phi_weighted**2, axis=0)**2 + shift
-    diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
-
-    # Storage for L factor (N_grid, n_rank)
-    L = jnp.zeros((n_grid, n_rank))
-    pivots = jnp.zeros(n_rank, dtype=int)
-
-    def body_fn(step, state):
-        diag_err, L, pivots = state
-        pivot = jnp.argmax(diag_err)
-        pivots = pivots.at[step].set(pivot)
-        pivot_val = diag_err[pivot]
-
-        dot = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
-        S_col = dot**2
-        S_col = S_col.at[pivot].add(shift)
-
-        dot_prod = jnp.dot(L, L[pivot])
-        is_small = pivot_val < 1e-12
-        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
-        inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
-
-        l_col = (S_col - dot_prod) * inv_sqrt_pivot
-        l_col = jnp.where(is_small, 0.0, l_col)
-        L = L.at[:, step].set(l_col)
-        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
-
-        return diag_err, L, pivots
-
-    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
-    return final_pivots
+    """Historical exact-greedy density selector (batch-size-one contract)."""
+    return pivoted_cholesky_streaming(
+        phi_diagonal(phi_weighted),
+        JaxPartial(phi_columns, phi_weighted),
+        shift,
+        n_rank=n_rank,
+        batch_size=1,
+        candidate_oversampling=1,
+        n_topup=0,
+    )
 
 
-@partial(jax.jit, static_argnames=('n_rank',))
 def _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank, shift):
-    """Specialized pivoted Cholesky for gradient decomposition."""
-    n_grid = phi_weighted.shape[1]
-
-    A_diag = jnp.sum(phi_weighted**2, axis=0)
-    B_diag = jnp.sum(jnp.sum(grad_phi_weighted**2, axis=2), axis=0)
-    diag_err = A_diag * B_diag + shift
-    # Same deterministic tie-break ramp as _pivoted_cholesky_phi (see comment there).
-    diag_err = diag_err + 1e-12 * jnp.arange(n_grid, dtype=diag_err.dtype) * jnp.max(jnp.abs(diag_err))
-
-    # Storage for L factor (N_grid, n_rank)
-    L = jnp.zeros((n_grid, n_rank))
-    pivots = jnp.zeros(n_rank, dtype=int)
-
-    def body_fn(step, state):
-        diag_err, L, pivots = state
-        pivot = jnp.argmax(diag_err)
-        pivots = pivots.at[step].set(pivot)
-        pivot_val = diag_err[pivot]
-
-        A_col = jnp.dot(phi_weighted.T, phi_weighted[:, pivot])
-        B_col = jnp.zeros(n_grid)
-        for c in range(3):
-            B_col += jnp.dot(grad_phi_weighted[:, :, c].T, grad_phi_weighted[:, pivot, c])
-        S_col = A_col * B_col
-        S_col = S_col.at[pivot].add(shift)
-
-        dot_prod = jnp.dot(L, L[pivot])
-        is_small = pivot_val < 1e-12
-        safe_pivot = jnp.where(is_small, 1.0, pivot_val)
-        inv_sqrt_pivot = jax.lax.rsqrt(safe_pivot)
-
-        l_col = (S_col - dot_prod) * inv_sqrt_pivot
-        l_col = jnp.where(is_small, 0.0, l_col)
-        L = L.at[:, step].set(l_col)
-        diag_err = jnp.maximum(diag_err - l_col**2, 0.0)
-        diag_err = jnp.where(is_small, diag_err.at[pivot].set(0.0), diag_err)
-
-        return diag_err, L, pivots
-
-    _, _, final_pivots = jax.lax.fori_loop(0, n_rank, body_fn, (diag_err, L, pivots))
-    return final_pivots
-
-
-
-
+    """Historical exact-greedy gradient selector (batch-size-one contract)."""
+    return pivoted_cholesky_streaming(
+        grad_diagonal(phi_weighted, grad_phi_weighted),
+        JaxPartial(grad_columns, phi_weighted, grad_phi_weighted),
+        shift,
+        n_rank=n_rank,
+        batch_size=1,
+        candidate_oversampling=1,
+        n_topup=0,
+    )
 
 
 def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
                    grid_batch_size=4096, rcond=1e-14,
-                   is_incore=False, save_path=None, fixed_pivots=None):
+                   is_incore=False, save_path=None, fixed_pivots=None,
+                   batch_size=1, candidate_oversampling=2, n_topup=0):
     """Perform ISDF decomposition of orbitals and their gradients.
 
     Memory-efficient implementation using pivoted Cholesky and normal-equation
@@ -225,6 +169,12 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         grid_batch_size: Number of grid points to process in each batch
         rcond: Scales the Tikhonov jitter in prepare_normal_equations_solver
                (default 1e-14).
+        batch_size: Exact columns retained per blocked pivot round.  The
+                    default of one reproduces the historical greedy selector.
+        candidate_oversampling: Size multiplier for the stale-diagonal pool
+                    that is exactly re-pivoted before each blocked update.
+        n_topup: Number of final pivots selected by exact greedy singleton
+                 updates after the blocked rounds.
 
     Returns:
         phi_piv: (N_orb, N_fused)
@@ -233,10 +183,33 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
         xi_grad: (N_fused, N_grid, 3)
         pivots: (N_fused,)
     """
+    n_grid = int(phi.shape[1])
+    validate_pivot_controls(
+        n_grid, n_rank_phi, batch_size, candidate_oversampling, n_topup
+    )
+    validate_pivot_controls(
+        n_grid, n_rank_grad, batch_size, candidate_oversampling, n_topup
+    )
+
     if save_path is not None and os.path.exists(save_path) and fixed_pivots is None:
         try:
             with h5py.File(save_path, 'r') as f:
                 if all(k in f for k in ['xi_phi', 'xi_grad', 'pivots', 'phi_isdf', 'grad_phi_isdf']):
+                    requested_controls = (
+                        int(batch_size),
+                        int(candidate_oversampling),
+                        int(n_topup),
+                    )
+                    cached_controls = (
+                        int(f.attrs.get('isdf_pivot_batch_size', 1)),
+                        int(f.attrs.get('isdf_pivot_candidate_oversampling', 2)),
+                        int(f.attrs.get('isdf_pivot_n_topup', 0)),
+                    )
+                    if cached_controls != requested_controls:
+                        raise ValueError(
+                            "cached ISDF pivot controls %s do not match requested %s"
+                            % (cached_controls, requested_controls)
+                        )
                     logger.info(f"Loading ISDF decomposition from {save_path}")
                     pivots = jnp.array(f['pivots'][:])
                     phi_piv = jnp.array(f['phi_isdf'][:])
@@ -278,7 +251,15 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     diag_phi = orb_sq**2
     shift_phi = 1e-12 * jnp.max(jnp.abs(diag_phi))
 
-    pivots_phi = _pivoted_cholesky_phi(phi_weighted, n_rank_phi, shift_phi)
+    pivots_phi = pivoted_cholesky_streaming(
+        diag_phi,
+        JaxPartial(phi_columns, phi_weighted),
+        shift_phi,
+        n_rank=n_rank_phi,
+        batch_size=batch_size,
+        candidate_oversampling=candidate_oversampling,
+        n_topup=n_topup,
+    )
     t1 = time.perf_counter()
     logger.debug(f"Phi decomposition completed in {t1 - t0:.4f} s")
 
@@ -292,7 +273,15 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
     diag_grad = A_diag * B_diag
     shift_grad = 1e-12 * jnp.max(jnp.abs(diag_grad))
 
-    pivots_grad = _pivoted_cholesky_grad(phi_weighted, grad_phi_weighted, n_rank_grad, shift_grad)
+    pivots_grad = pivoted_cholesky_streaming(
+        diag_grad,
+        JaxPartial(grad_columns, phi_weighted, grad_phi_weighted),
+        shift_grad,
+        n_rank=n_rank_grad,
+        batch_size=batch_size,
+        candidate_oversampling=candidate_oversampling,
+        n_topup=n_topup,
+    )
     t1 = time.perf_counter()
     logger.debug(f"Grad decomposition completed in {t1 - t0:.4f} s")
 
@@ -378,6 +367,9 @@ def isdf_decompose(phi, grad_phi, n_rank_phi, n_rank_grad, weights=None,
 
         h5_file = h5py.File(save_path, 'a')
         logger.info(f"  Processing {n_batches} batches of size {grid_batch_size} (HDF5: {save_path})")
+        h5_file.attrs['isdf_pivot_batch_size'] = int(batch_size)
+        h5_file.attrs['isdf_pivot_candidate_oversampling'] = int(candidate_oversampling)
+        h5_file.attrs['isdf_pivot_n_topup'] = int(n_topup)
 
         for name, shape in [('xi_phi', (n_fused, n_grid)), ('xi_grad', (n_fused, n_grid, 3))]:
             if name in h5_file: del h5_file[name]
