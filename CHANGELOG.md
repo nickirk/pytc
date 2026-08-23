@@ -30,10 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Validation
 
-- On H10, exact auxiliary recovery reduced K1/K3 construction from 324.90 s
-  to 89.62 s (3.63x) and total ISDF-intermediate construction from 922.96 s
-  to 714.25 s (1.29x), with K1/K3 relative errors below 1.2e-15 and
-  normal-order identities agreeing within 2.4e-16.
+- On H10/R=1.6/cc-pVTZ/grid2 on one V100, using one fixed ISDF base, exact
+  auxiliary recovery reduced K1/K3 construction from 324.90 s to 89.62 s
+  (3.63x) and total ISDF-intermediate construction from 922.96 s to 714.25 s
+  (1.29x), with K1/K3 relative errors below 1.2e-15 and normal-order
+  identities agreeing within 2.4e-16.
 - On H10/cc-pVTZ/grid2 on one A100 (batch size 32), blocked pivot selection
   was 9.515x faster in the relaxed-energy run; the full-X total energy changed
   by +0.000267 mHa.
