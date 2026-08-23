@@ -127,6 +127,31 @@ class FactorizedStateExecutionTest(unittest.TestCase):
         self.assertEqual(x_state.z.shape, (4, 4, self.rank))
         self.assertNotIn("X", cc.xtc_obj.isdf_kernels)
 
+    def test_state_prefers_tucker_x_when_both_stores_are_valid(self):
+        cc = self._make_cc()
+        dense_x = cc.xtc_obj.isdf_kernels["X"]
+        rng = np.random.default_rng(20260824)
+        cc.xtc_obj.isdf_kernels["X_tucker"] = {
+            "U": rng.standard_normal((self.nmo, 4)),
+            "Z": rng.standard_normal((4, 4, self.rank)),
+        }
+
+        _, _, _, x_state = cc._factorized_state()
+
+        self.assertIsInstance(x_state, isdf_xtc_ccsd._TuckerXFactors)
+        self.assertIs(cc.xtc_obj.isdf_kernels["X"], dense_x)
+
+    def test_malformed_tucker_x_does_not_fall_back_to_valid_dense_x(self):
+        cc = self._make_cc()
+        self.assertIn("X", cc.xtc_obj.isdf_kernels)
+        cc.xtc_obj.isdf_kernels["X_tucker"] = {
+            "U": np.zeros((self.nmo, 4)),
+            "Z": np.zeros((4, 4, self.rank - 1)),
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "rank disagrees"):
+            cc._factorized_state()
+
     def test_hook_executes_streamed_contraction(self):
         # Execute the hook end-to-end on the synthetic case: the streamed
         # factor-direct terms plus the JAX sandwich must produce a finite,
