@@ -397,10 +397,10 @@ class TestKmatFromAuxParity(unittest.TestCase):
         """Fresh direct and recovered caches must remain distinguishable."""
         with tempfile.TemporaryDirectory() as directory:
             cases = (
-                ("direct", "direct", "direct", False),
-                ("aux-recovery", "aux-recovery", "direct", True),
+                ("direct", "direct", False),
+                ("aux-recovery", "aux-recovery", True),
             )
-            for mode, kmat_mode, laux_mode, reuse_aux_kernels in cases:
+            for mode, kmat_mode, reuse_aux_kernels in cases:
                 path = f"{directory}/{mode}.h5"
                 with h5py.File(path, "w") as handle:
                     handle.create_dataset("xi_phi", data=np.asarray(self.isdf.xi_phi))
@@ -420,60 +420,7 @@ class TestKmatFromAuxParity(unittest.TestCase):
                 self.assertIn("K1_kernel", out_of_core.isdf_kernels)
                 with h5py.File(path, "r") as handle:
                     self.assertEqual(handle.attrs["pytc_kmat_kernel_mode"], kmat_mode)
-                    self.assertEqual(handle.attrs["pytc_laux_gradient_mode"], laux_mode)
                     self.assertNotIn("H_aux", handle)
-
-
-class TestLauxAnalyticalBoysHandy(unittest.TestCase):
-    """The L_aux-only analytic B-H derivative must retain physical parity."""
-
-    @classmethod
-    def setUpClass(cls):
-        from pyscf import gto, scf
-        from pytc.tc import TC, ISDFTC
-
-        mol = gto.M(
-            atom="H 0 0 0; H 0 0 0.74",
-            basis="sto-3g",
-            unit="Angstrom",
-            verbose=0,
-        )
-        mf = scf.RHF(mol).run()
-        ncusp = NuclearCusp.create(mol, n_radial=128)
-        boys_handy = BoysHandy.create(mol)
-        cls.params = [ncusp.init_params(), boys_handy.init_params()]
-        jastrow = CompositeJastrow.create([ncusp, boys_handy])
-        base = TC.from_pyscf(mf, jastrow, grid_lvl=0)
-        cls.isdf = ISDFTC.from_tc(
-            base, n_rank=max(8, 3 * base.n_orb), is_incore=True
-        )
-
-    def test_fast_bh_derivative_preserves_laux_and_two_body(self):
-        block = 512
-        direct = self.isdf.isdf(
-            self.params,
-            batch_size=32,
-            host_grid_block_size=block,
-            reuse_aux_kernels=True,
-        )
-        fast = self.isdf.isdf(
-            self.params,
-            batch_size=32,
-            host_grid_block_size=block,
-            reuse_aux_kernels=True,
-            use_laux_fast_grad=True,
-        )
-        for key in ("K1_kernel", "K3_kernel", "L_aux"):
-            np.testing.assert_allclose(
-                np.asarray(fast.isdf_kernels[key]),
-                np.asarray(direct.isdf_kernels[key]),
-                rtol=0, atol=2e-12,
-            )
-
-        np.testing.assert_allclose(
-            np.asarray(fast.get_2b(self.params)),
-            np.asarray(direct.get_2b(self.params)), rtol=0, atol=2e-12
-        )
 
 
 class TestStreamingContractionParity(unittest.TestCase):

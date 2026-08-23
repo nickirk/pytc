@@ -222,7 +222,7 @@ class TestTuckerXSolverViews(unittest.TestCase):
 
     def test_direct_tile_factor_view_matches_dense_x(self):
         ranges = (slice(0, 3), slice(2, 5), slice(1, 4), slice(0, 2))
-        with mock.patch.object(xtc_mod, "_get_device_free_bytes", return_value=2**40):
+        with mock.patch.object(xtc_mod, "get_local_device_free_bytes", return_value=2**40):
             expected = xtc_mod.ISDFXTC._get_delta_u_direct_tile(
                 self.runtime, self.dense, ranges,
             )
@@ -234,7 +234,7 @@ class TestTuckerXSolverViews(unittest.TestCase):
 
     def test_padded_direct_tile_factor_view_matches_dense_x(self):
         ranges = (slice(0, 3), slice(2, 5), slice(1, 4), slice(0, 2))
-        with mock.patch.object(xtc_mod, "_get_device_free_bytes", return_value=2**40):
+        with mock.patch.object(xtc_mod, "get_local_device_free_bytes", return_value=2**40):
             expected = xtc_mod.ISDFXTC._get_delta_u_direct_tile(
                 self.runtime, self.dense, ranges, panel_size=4,
             )
@@ -311,7 +311,6 @@ class TestRealFactorOnlyH2(unittest.TestCase):
                 r2_tile_size=5,
                 gpu_budget_bytes=1234,
                 reuse_aux_kernels=False,
-                use_laux_fast_grad=True,
             )
 
         self.assertIs(actual, sentinel)
@@ -327,7 +326,6 @@ class TestRealFactorOnlyH2(unittest.TestCase):
             r2_tile_size=5,
             gpu_budget_bytes=1234,
             reuse_aux_kernels=False,
-            use_laux_fast_grad=True,
         )
 
     def test_source_free_builder_cache_never_writes_dense_x(self):

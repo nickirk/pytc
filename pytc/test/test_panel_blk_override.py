@@ -12,7 +12,7 @@ from unittest import mock
 import numpy as np
 
 import pytc.tc as tc
-import pytc.xtc as xtc
+from pytc.utils import gpu_memory
 from pytc.utils.gpu_memory import adaptive_rank_block_size
 
 
@@ -61,22 +61,19 @@ class TestDeviceMemoryBudget(unittest.TestCase):
 
     def test_free_bytes_uses_reported_limit_and_usage(self):
         device = self._Device({"bytes_limit": 1000, "bytes_in_use": 250})
-        self.assertEqual(tc._get_local_device_free_bytes(device), 750)
+        self.assertEqual(gpu_memory.get_local_device_free_bytes(device), 750)
 
     def test_cpu_uses_measured_host_available_memory(self):
         device = self._Device(None)
         device.platform = "cpu"
         virtual_memory = mock.Mock(available=123456)
         with mock.patch("psutil.virtual_memory", return_value=virtual_memory):
-            self.assertEqual(tc._get_local_device_free_bytes(device), 123456)
-            self.assertEqual(xtc._get_device_free_bytes(device), 123456)
+            self.assertEqual(gpu_memory.get_local_device_free_bytes(device), 123456)
 
     def test_missing_memory_limit_fails_instead_of_assuming_space(self):
         device = self._Device(None)
         with self.assertRaisesRegex(RuntimeError, "does not report"):
-            tc._get_local_device_free_bytes(device)
-        with self.assertRaisesRegex(RuntimeError, "does not report"):
-            xtc._get_device_free_bytes(device)
+            gpu_memory.get_local_device_free_bytes(device)
         with self.assertRaisesRegex(RuntimeError, "does not report"):
             tc._choose_tc_kernel_strategy(
                 device, np.zeros((2, 2, 3)), np.zeros((2, 2))

@@ -18,6 +18,7 @@ from flax import struct
 from pyscf import dft
 from . import kmat as kmat_jax
 from .utils import sharding_core
+from .utils.gpu_memory import array_nbytes, get_local_device_free_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,6 @@ logger = logging.getLogger(__name__)
 # during CCSD iterations.  This eliminates JIT recompilation from
 # changing static_argnums values across ovvv / vovv / vvvv phases.
 _FIXED_RBS_CACHE: dict = {}
-
-
-def _laux_gradient_mode(use_fast):
-    """Return the cache fingerprint for one L_aux construction mode."""
-    return "fast" if use_fast else "direct"
 
 
 def _panel_blk_overrides():
@@ -91,32 +87,9 @@ def _evict_isdf_device_cache_for_id(self_id):
         _ISDF_DEVICE_CACHE_FINALISED.discard(self_id)
 
 
-def _array_nbytes(arr):
-    return int(np.prod(arr.shape, dtype=np.int64) * np.dtype(arr.dtype).itemsize)
-
-
-def _get_local_device_free_bytes(device):
-    """Return free bytes reported by one local device."""
-    if getattr(device, "platform", None) == "cpu":
-        import psutil
-        available = int(psutil.virtual_memory().available)
-        if available <= 0:
-            raise RuntimeError("host does not report usable available memory")
-        return available
-
-    stats = device.memory_stats()
-    if not stats or "bytes_limit" not in stats:
-        raise RuntimeError(
-            f"device {device!r} does not report a usable memory limit"
-        )
-    pool_limit = int(stats["bytes_limit"])
-    in_use = int(stats.get("bytes_in_use", 0))
-    return max(pool_limit - in_use, 0)
-
-
 def _cache_d_on_device(device, arr, *, fraction=0.35):
     """Whether a persistent device cache should keep ``arr`` resident."""
-    return _array_nbytes(arr) <= int(_get_local_device_free_bytes(device) * fraction)
+    return array_nbytes(arr) <= int(get_local_device_free_bytes(device) * fraction)
 
 
 def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
@@ -136,8 +109,8 @@ def _choose_tc_kernel_strategy(device, u1, u3, *, fraction=0.15):
     transients (K1_transient / scratch / D / phi), which matches the scratch
     profile observed empirically on A100-80G at n_fused ~25k.
     """
-    total = _array_nbytes(u1) + _array_nbytes(u3)
-    free_bytes = _get_local_device_free_bytes(device)
+    total = array_nbytes(u1) + array_nbytes(u3)
+    free_bytes = get_local_device_free_bytes(device)
     if total <= int(free_bytes * fraction):
         return True, None
 
@@ -839,8 +812,8 @@ class ISDFTC(TC):
                     logger.debug(
                         "Caching TC kernels on device %s (K1=%.2f GiB, K3=%.2f GiB, resident)",
                         getattr(device, "id", "host"),
-                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
-                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
                     )
                     cache["K1_kernel"] = jax.device_put(np.asarray(kernels["K1_kernel"]), device)
                     cache["K3_kernel"] = jax.device_put(np.asarray(kernels["K3_kernel"]), device)
@@ -850,8 +823,8 @@ class ISDFTC(TC):
                         "Streaming TC kernels from host on device %s "
                         "(K1=%.2f GiB, K3=%.2f GiB, panel_size=%d)",
                         getattr(device, "id", "host"),
-                        _array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
-                        _array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K1_kernel"]) / (1024.0 ** 3),
+                        array_nbytes(kernels["K3_kernel"]) / (1024.0 ** 3),
                         panel_size,
                     )
                     cache["K1_kernel"] = np.asarray(kernels["K1_kernel"])
@@ -863,7 +836,7 @@ class ISDFTC(TC):
                 logger.debug(
                     "Caching Delta U D kernel on device %s (%.2f GiB)",
                     getattr(device, "id", "host"),
-                    _array_nbytes(kernels["D"]) / (1024.0 ** 3),
+                    array_nbytes(kernels["D"]) / (1024.0 ** 3),
                 )
                 cache["D"] = jax.device_put(np.asarray(kernels["D"]), device)
             else:
@@ -1337,8 +1310,7 @@ class ISDFTC(TC):
                 'K3_kernel': jnp.asarray(K3_kernel)}
 
     def _compute_L_aux(self, jastrow_params, batch_size=1024, save_path=None,
-                       host_grid_block_size=None, include_h_aux=False,
-                       use_laux_fast_grad=False):
+                       host_grid_block_size=None, include_h_aux=False):
         """Compute L_aux, and optionally its exact squared-gradient companion.
 
         When ``include_h_aux`` is true this also forms
@@ -1346,10 +1318,6 @@ class ISDFTC(TC):
         double-grid pass.  ``H_aux`` lets the K3 ISDF kernel be recovered by
         one-grid contraction; paired with ``L_aux`` it likewise recovers K1.
         The default is deliberately unchanged for existing callers.
-
-        ``use_laux_fast_grad`` selects a Jastrow-provided derivative fast path
-        for this construction only.  It is opt-in so existing caches and all
-        non-L_aux derivative callers retain the ordinary implementation.
 
         """
         n_devices = jax.local_device_count()
@@ -1397,14 +1365,9 @@ class ISDFTC(TC):
                 w_batch = jax.lax.dynamic_slice(weights_int, (i * batch_size,), (batch_size,))
                 xi_batch = jax.lax.dynamic_slice(xi_phi_int, (0, i * batch_size), (n_rank, batch_size))
                 
-                if use_laux_fast_grad:
-                    u_grad = self.jastrow_factor.grad_r_batch_laux(
-                        r_eval, g_batch, jastrow_params
-                    )
-                else:
-                    u_grad = self.jastrow_factor.grad_r_batch(
-                        r_eval, g_batch, jastrow_params
-                    )
+                u_grad = self.jastrow_factor.grad_r_batch(
+                    r_eval, g_batch, jastrow_params
+                )
                 xi_weighted = xi_batch * w_batch[None, :]
                 update = jnp.einsum('ab,ibk->aik', xi_weighted, u_grad)
                 if include_h_aux:
@@ -1548,9 +1511,9 @@ class ISDFTC(TC):
         return L_aux_out
 	
 
-    def isdf(self, jastrow_params, save_path=None, batch_size=1000, host_grid_block_size=None,
-             r2_tile_size=None, gpu_budget_bytes=None, reuse_aux_kernels=None,
-             use_laux_fast_grad=False):
+    def isdf(self, jastrow_params, save_path=None, batch_size=1000,
+             host_grid_block_size=None, r2_tile_size=None,
+             gpu_budget_bytes=None, reuse_aux_kernels=None):
         """Compute ISDF intermediates and store them.
         
         Computes K1_kernel, K3_kernel, and L_aux.
@@ -1570,9 +1533,6 @@ class ISDFTC(TC):
                 calculations without a path retain direct K1/K3 construction.
                 Passing ``True`` explicitly requires a persistent path for the
                 L_aux/H_aux datasets.
-            use_laux_fast_grad: Opt into an algebraically equivalent,
-                Jastrow-provided fast derivative for the L_aux double-grid
-                contraction.  The choice is persisted on out-of-core caches.
         """
         logger.info("Computing ISDF intermediates (TC)...")
         start_time = time.perf_counter()
@@ -1586,7 +1546,6 @@ class ISDFTC(TC):
                 "out-of-core reuse_aux_kernels requires save_path so L_aux "
                 "and H_aux can be streamed rather than materialized"
             )
-        laux_gradient_mode = _laux_gradient_mode(use_laux_fast_grad)
         kernels = {}
         # An explicit auxiliary-reuse request must execute that path, not
         # silently accept a pre-existing direct K1/K3 cache.  The default may
@@ -1599,43 +1558,29 @@ class ISDFTC(TC):
             try:
                 f = h5py.File(out_path, 'r')
                 if 'K1_kernel' in f and 'K3_kernel' in f and 'L_aux' in f:
-                    cached_laux_mode = f.attrs.get(
-                        "pytc_laux_gradient_mode", "direct"
+                    logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
+                    logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
+                    kernels['K1_kernel'] = f['K1_kernel'][:]
+                    logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
+                    kernels['K3_kernel'] = f['K3_kernel'][:]
+                    cached_kmat_mode = f.attrs.get(
+                        "pytc_kmat_kernel_mode", "legacy-cache-unknown"
                     )
-                    if isinstance(cached_laux_mode, bytes):
-                        cached_laux_mode = cached_laux_mode.decode()
-                    if cached_laux_mode != laux_gradient_mode:
-                        logger.info(
-                            "  L_aux cache gradient mode is %s, but this run "
-                            "requests %s; recomputing base intermediates.",
-                            cached_laux_mode, laux_gradient_mode,
-                        )
+                    if isinstance(cached_kmat_mode, bytes):
+                        cached_kmat_mode = cached_kmat_mode.decode()
+                    if self.is_incore:
+                        logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
+                        kernels['L_aux'] = f['L_aux'][:]
                         f.close()
-                        f = None
                     else:
-                        logger.info(f"  Found existing K1, K3, and L_aux in {out_path}. Reading from file...")
-                        logger.info(f"  Loading K1 with shape: {f['K1_kernel'].shape} on host RAM.")
-                        kernels['K1_kernel'] = f['K1_kernel'][:]
-                        logger.info(f"  Loading K3 with shape: {f['K3_kernel'].shape} on host RAM")
-                        kernels['K3_kernel'] = f['K3_kernel'][:]
-                        cached_kmat_mode = f.attrs.get(
-                            "pytc_kmat_kernel_mode", "legacy-cache-unknown"
-                        )
-                        if isinstance(cached_kmat_mode, bytes):
-                            cached_kmat_mode = cached_kmat_mode.decode()
-                        if self.is_incore:
-                            logger.debug(f"incore mode: Loading L_aux with shape: {f['L_aux'].shape} on host RAM")
-                            kernels['L_aux'] = f['L_aux'][:]
-                            f.close()
-                        else:
-                            logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
-                            kernels['L_aux'] = f['L_aux']
+                        logger.debug(f"out-of-core mode: Streaming L_aux with shape: {f['L_aux'].shape} from {out_path}")
+                        kernels['L_aux'] = f['L_aux']
 
-                        logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
-                        return self.replace(
-                            isdf_kernels=kernels,
-                            kmat_kernel_mode=cached_kmat_mode,
-                        )
+                    logger.info(f"ISDF intermediates loaded from file in {time.perf_counter() - start_time:.4f} s")
+                    return self.replace(
+                        isdf_kernels=kernels,
+                        kmat_kernel_mode=cached_kmat_mode,
+                    )
                 
                 # If we are here, keys are missing. Close the file!
                 if f is not None:
@@ -1652,7 +1597,6 @@ class ISDFTC(TC):
                 save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
                 include_h_aux=True,
-                use_laux_fast_grad=use_laux_fast_grad,
             )
             L_aux, H_aux = aux_result
             logger.info(
@@ -1732,7 +1676,6 @@ class ISDFTC(TC):
                 batch_size,
                 save_path=out_path if not self.is_incore else None,
                 host_grid_block_size=host_grid_block_size,
-                use_laux_fast_grad=use_laux_fast_grad,
             )
             logger.info(
                 "  L_aux construction completed in %.4f s",
@@ -1762,7 +1705,6 @@ class ISDFTC(TC):
                 f.attrs['pytc_kmat_kernel_mode'] = (
                     'aux-recovery' if reuse_aux_kernels else 'direct'
                 )
-                f.attrs['pytc_laux_gradient_mode'] = laux_gradient_mode
                 for k, v in kernels.items():
                     if k == 'L_aux': continue
                     if k in f: del f[k]

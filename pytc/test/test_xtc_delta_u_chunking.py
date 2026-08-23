@@ -117,7 +117,7 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
 
         # Stub a large-enough free budget so isdf_tile_peak_bytes(3, ...) fits
         large_free = 10 * 1024 ** 3  # 10 GiB — easily fits a tiny tile
-        with mock.patch("pytc.xtc._get_device_free_bytes", return_value=large_free):
+        with mock.patch("pytc.xtc.get_local_device_free_bytes", return_value=large_free):
             with mock.patch("pytc.utils.gpu_memory._get_gpu_free_bytes",
                             return_value=large_free):
                 # Should not raise: safe_ps >= max(q_len=3, r_len=3) = 3
@@ -141,7 +141,7 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
         )
         # Stub tiny free memory so no tile fits.
         tiny_free = 1  # 1 byte — nothing will fit
-        with mock.patch("pytc.xtc._get_device_free_bytes", return_value=tiny_free):
+        with mock.patch("pytc.xtc.get_local_device_free_bytes", return_value=tiny_free):
             with self.assertRaises(RuntimeError) as ctx:
                 fake._assemble_delta_u_tile(
                     kernels, ranges, device=None,
@@ -152,7 +152,7 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
         fh.close()
 
     def test_resident_d_not_double_counted_in_shrink_guard(self):
-        # When D is already resident in the device cache, _get_device_free_bytes
+        # When D is already resident in the device cache, the free-memory probe
         # has already excluded D's bytes from the free total.  The pre-dispatch
         # shrink guard must use include_d=False — otherwise it double-counts D
         # and can over-shrink panel_size or falsely trip the genuine-OOM guard.
@@ -185,7 +185,7 @@ class TestDeltaUAutoshrinkGuard(unittest.TestCase):
         large_free = 10 * 1024 ** 3
         with mock.patch("pytc.xtc._isdf_tile_peak_bytes",
                         side_effect=recording_tile_peak):
-            with mock.patch("pytc.xtc._get_device_free_bytes",
+            with mock.patch("pytc.xtc.get_local_device_free_bytes",
                             return_value=large_free):
                 with mock.patch("pytc.utils.gpu_memory._get_gpu_free_bytes",
                                 return_value=large_free):

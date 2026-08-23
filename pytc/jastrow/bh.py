@@ -237,69 +237,6 @@ class BoysHandy(Jastrow):
     def _compute(self, r1, r2, params):
         return self._compute_forward(r1, r2, params)
 
-    def _as_laux_analytical(self):
-        """Return the same B-H expansion with its analytic derivative view.
-
-        ``BoysHandy`` remains the generic-autodiff public implementation.
-        This transient view is used only by the opt-in L_aux derivative path,
-        whose equivalence is tested against the generic implementation.  The
-        local import avoids the B-H/BHA definition cycle.
-        """
-        from .bha import BoysHandyAnalytical
-
-        if isinstance(self, BoysHandyAnalytical):
-            return self
-
-        max_nuclei = max(
-            (group.shape[0] for group in self.nuclei_by_type), default=0
-        )
-        padded_groups = []
-        masks = []
-        for group in self.nuclei_by_type:
-            pad_n = max_nuclei - group.shape[0]
-            padded_groups.append(jnp.pad(group, ((0, pad_n), (0, 0))))
-            masks.append(
-                jnp.concatenate((
-                    jnp.ones(group.shape[0], dtype=bool),
-                    jnp.zeros(pad_n, dtype=bool),
-                ))
-            )
-        if padded_groups:
-            padded_nuclei = jnp.stack(padded_groups, axis=0)
-            nuclei_mask = jnp.stack(masks, axis=0)
-        else:
-            padded_nuclei = jnp.zeros((0, 0, 3))
-            nuclei_mask = jnp.zeros((0, 0), dtype=bool)
-
-        return BoysHandyAnalytical(
-            nuclear_pos=self.nuclear_pos,
-            nuclear_charges=self.nuclear_charges,
-            atom_type_map=self.atom_type_map,
-            unique_charges=self.unique_charges,
-            _term_m=self._term_m,
-            _term_n=self._term_n,
-            _term_o=self._term_o,
-            _delta_factor=self._delta_factor,
-            _cusp_mask=self._cusp_mask,
-            nelectron=self.nelectron,
-            natom=self.natom,
-            n_types=self.n_types,
-            n_terms=self.n_terms,
-            max_degree=self.max_degree,
-            epsilon=self.epsilon,
-            terms_per_atom_type=self.terms_per_atom_type,
-            nuclei_by_type=self.nuclei_by_type,
-            name=self.name,
-            padded_nuclei_by_type=padded_nuclei,
-            nuclei_mask_by_type=nuclei_mask,
-        )
-
-    def grad_r_batch_laux(self, r1_batch, r2_batch, params):
-        """Use the analytic B-H derivative only for the opt-in L_aux path."""
-        return self._as_laux_analytical().grad_r_batch(
-            r1_batch, r2_batch, params
-        )
-
     def flatten_params(self, params):
         return jnp.concatenate([
             params['b_raw'].ravel(),

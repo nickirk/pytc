@@ -18,7 +18,6 @@ from collections import OrderedDict
 from .tc import (
     TC,
     ISDFTC,
-    _laux_gradient_mode,
     _normalize_panel_layout,
     _transpose_panel_layout,
     _pad_axis,
@@ -26,6 +25,7 @@ from .tc import (
 )
 from .utils.tile_memory import isdf_tile_peak_bytes as _isdf_tile_peak_bytes
 from .utils.tile_memory import find_max_blksize as _find_max_blksize
+from .utils.gpu_memory import get_local_device_free_bytes
 from . import tc_helper
 from . import kmat as kmat_jax
 from .utils import sharding_core
@@ -309,29 +309,6 @@ def _estimate_delta_u_direct_tile_bytes(Np, Nq, Nr, Ns, N_rank, *, include_d=Tru
         "out": out_size_bytes,
         "total": total,
     }
-
-
-def _get_device_free_bytes(device=None):
-    """Return currently free bytes for a specific local device when possible."""
-    if device is not None:
-        if getattr(device, "platform", None) == "cpu":
-            import psutil
-            available = int(psutil.virtual_memory().available)
-            if available <= 0:
-                raise RuntimeError("host does not report usable available memory")
-            return available
-
-        stats = device.memory_stats()
-        if not stats or "bytes_limit" not in stats:
-            raise RuntimeError(
-                f"device {device!r} does not report a usable memory limit"
-            )
-        pool_limit = int(stats['bytes_limit'])
-        in_use = int(stats.get('bytes_in_use', 0))
-        return max(pool_limit - in_use, 0)
-
-    from pytc.utils.gpu_memory import _get_gpu_free_bytes
-    return _get_gpu_free_bytes()
 
 
 def compute_2b_tile(xtc_obj, jastrow_params, ranges, device=None, panel_size=None,
@@ -1141,7 +1118,6 @@ class ISDFXTC(XTC, ISDFTC):
         r2_tile_size=None,
         gpu_budget_bytes=None,
         reuse_aux_kernels=None,
-        use_laux_fast_grad=False,
         n_factor=None,
     ):
         """Compute ISDF intermediates and store them.
@@ -1163,9 +1139,6 @@ class ISDFXTC(XTC, ISDFTC):
                 squared-gradient companion.  The parent enables it by default
                 whenever the in-core state or a persistent output path supports
                 the auxiliary contraction.
-            use_laux_fast_grad: Opt into the Jastrow's L_aux-only fast
-                derivative path.  The parent validates this mode against any
-                reusable base cache.
             n_factor: Opt into the factor-only orbital Tucker representation
                 of X with rank M = ``n_factor``.  The returned object contains
                 ``X_tucker = {"U", "Z"}`` and does not materialize dense X.
@@ -1193,17 +1166,14 @@ class ISDFXTC(XTC, ISDFTC):
                 r2_tile_size=r2_tile_size,
                 gpu_budget_bytes=gpu_budget_bytes,
                 reuse_aux_kernels=reuse_aux_kernels,
-                use_laux_fast_grad=use_laux_fast_grad,
             )
         
         isdf_tc = super().isdf(jastrow_params, save_path=out_path, batch_size=batch_size,
                                host_grid_block_size=host_grid_block_size,
                                r2_tile_size=r2_tile_size,
                                gpu_budget_bytes=gpu_budget_bytes,
-                               reuse_aux_kernels=reuse_aux_kernels,
-                               use_laux_fast_grad=use_laux_fast_grad)
+                               reuse_aux_kernels=reuse_aux_kernels)
         kernels = isdf_tc.isdf_kernels
-        requested_laux_mode = _laux_gradient_mode(use_laux_fast_grad)
         
         if out_path and os.path.exists(out_path):
             f = None
@@ -1214,23 +1184,11 @@ class ISDFXTC(XTC, ISDFTC):
                     cached_x_mode = f.attrs.get("pytc_xtc_x_mode", "full")
                     if isinstance(cached_x_mode, bytes):
                         cached_x_mode = cached_x_mode.decode()
-                    cached_laux_mode = f.attrs.get(
-                        "pytc_xtc_laux_gradient_mode", "direct"
-                    )
-                    if isinstance(cached_laux_mode, bytes):
-                        cached_laux_mode = cached_laux_mode.decode()
                     if cached_x_mode != "full":
                         logger.info(
                             "  Delta-U cache X mode is %s, not full; "
                             "recomputing D/X kernels.",
                             cached_x_mode,
-                        )
-                    elif cached_laux_mode != requested_laux_mode:
-                        logger.info(
-                            "  Delta-U cache L_aux mode is %s, but this run "
-                            "requests %s; recomputing D/X kernels.",
-                            cached_laux_mode,
-                            requested_laux_mode,
                         )
                     else:
                         logger.info(f"  Found existing D and X in {out_path}. Reading from file...")
@@ -1284,7 +1242,6 @@ class ISDFXTC(XTC, ISDFTC):
         
         if out_path:
             with h5py.File(out_path, 'a') as f:
-                f.attrs['pytc_xtc_laux_gradient_mode'] = requested_laux_mode
                 if 'phi_isdf' not in f: f.create_dataset('phi_isdf', data=np.array(self.phi_isdf))
                 if 'grad_phi_isdf' not in f: f.create_dataset('grad_phi_isdf', data=np.array(self.grad_phi_isdf))
                 if 'pivots' not in f: f.create_dataset('pivots', data=np.array(self.pivots))
@@ -1577,7 +1534,6 @@ class ISDFXTC(XTC, ISDFTC):
         r2_tile_size=None,
         gpu_budget_bytes=None,
         reuse_aux_kernels=None,
-        use_laux_fast_grad=False,
     ):
         """Build a factor-only X view without materializing dense ``X``.
 
@@ -1609,7 +1565,6 @@ class ISDFXTC(XTC, ISDFTC):
             r2_tile_size=r2_tile_size,
             gpu_budget_bytes=gpu_budget_bytes,
             reuse_aux_kernels=reuse_aux_kernels,
-            use_laux_fast_grad=use_laux_fast_grad,
         )
         kernels = dict(base.isdf_kernels)
         l_aux = kernels.pop("L_aux")
@@ -2898,7 +2853,7 @@ class ISDFXTC(XTC, ISDFTC):
         # ~43 % head-room for XLA workspace / BFC fragmentation on top of
         # the estimate (which already counts D, X_sliced, C_pq × 2, C_rs,
         # and 2 × out).
-        threshold_bytes = int(_get_device_free_bytes(device) * 0.7)
+        threshold_bytes = int(get_local_device_free_bytes(device) * 0.7)
         if total_needed_bytes >= threshold_bytes:
             raise RuntimeError(
                 "Delta U direct tile exceeds available device memory: "
@@ -3059,7 +3014,7 @@ class ISDFXTC(XTC, ISDFTC):
                 include_grad=False, include_delta_u=True
             )
             _D_resident = _cache.get("D") if _cache is not None else None
-            free_bytes = _get_device_free_bytes(device)
+            free_bytes = get_local_device_free_bytes(device)
             threshold_bytes = int(free_bytes * 0.7)
 
             def _tile_bytes(ps, _incl_d=(_D_resident is None)):

@@ -311,7 +311,7 @@ class TestISDFXTCPanelization(unittest.TestCase):
             "_contract_delta_U_kernels",
             side_effect=AssertionError("direct tile should not route through chunk scheduler"),
         ):
-            with mock.patch("pytc.xtc._get_device_free_bytes", return_value=1):
+            with mock.patch("pytc.xtc.get_local_device_free_bytes", return_value=1):
                 with self.assertRaises(RuntimeError):
                     self.isdf_xtc._get_delta_u_direct_tile(kernels, ranges)
 

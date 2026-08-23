@@ -63,6 +63,37 @@ from pytc.utils.tile_memory import isdf_tile_peak_bytes, find_max_blksize  # noq
 logger = logging.getLogger(__name__)
 
 
+def array_nbytes(arr):
+    """Return the byte size of an array-like object without copying it."""
+    return int(np.prod(arr.shape, dtype=np.int64) * np.dtype(arr.dtype).itemsize)
+
+
+def get_local_device_free_bytes(device=None):
+    """Return currently free bytes for one local device.
+
+    With no explicit device, use the existing most-constrained-device probe.
+    CPU devices report available host RAM; accelerators must expose an XLA
+    memory-pool limit so callers fail closed instead of assuming capacity.
+    """
+    if device is None:
+        return _get_gpu_free_bytes()
+    if getattr(device, "platform", None) == "cpu":
+        import psutil
+        available = int(psutil.virtual_memory().available)
+        if available <= 0:
+            raise RuntimeError("host does not report usable available memory")
+        return available
+
+    stats = device.memory_stats()
+    if not stats or "bytes_limit" not in stats:
+        raise RuntimeError(
+            f"device {device!r} does not report a usable memory limit"
+        )
+    pool_limit = int(stats["bytes_limit"])
+    in_use = int(stats.get("bytes_in_use", 0))
+    return max(pool_limit - in_use, 0)
+
+
 # ---------------------------------------------------------------------------
 # Per-tile absolute size ceiling (asymmetric-tile phases only)
 # ---------------------------------------------------------------------------
