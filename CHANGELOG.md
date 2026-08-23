@@ -12,7 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deterministic blocked pivot selection for molecular ISDF.
 - Capability-aware exact auxiliary recovery of the K1 and K3 kernels,
   including streamed out-of-core construction and cache provenance.
-- An opt-in rank-M orbital Tucker representation for the X kernel.
+- An opt-in rank-M orbital Tucker representation for the X kernel, including
+  direct T2-U-Z contraction in the factorized ISDF xTC-CCSD solver without
+  reconstructing dense X or a virtual four-index tile.
 - An opt-in persistent XLA compilation cache.
 
 ### Changed

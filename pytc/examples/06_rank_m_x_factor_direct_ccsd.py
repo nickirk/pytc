@@ -3,9 +3,9 @@
 This small H4/STO-3G calculation demonstrates the API rather than a
 production accuracy benchmark.  Passing ``n_factor=M`` to ``ISDFXTC.isdf``
 replaces dense ``X[r,s,c]`` with the orbital Tucker factors
-``X_tucker = {U[r,a], Z[a,b,c]}``, where ``a,b < M``.  The standard JAX CCSD
-solver then consumes those factors through its on-the-fly direct-tile path;
-dense X and the full VVVV tensor are never materialized.
+``X_tucker = {U[r,a], Z[a,b,c]}``, where ``a,b < M``.  The dedicated
+factor-direct ISDF CCSD solver contracts T2 directly with U/Z; dense X, a
+four-virtual tile, and the full VVVV tensor are never materialized.
 
 Rank-M X remains opt-in.  Its current numerical validation is limited to the
 H10/M=80 study reported for PyTC 0.2.1, so choose M and validate energies for
@@ -21,7 +21,7 @@ from pyscf import gto, scf
 
 from pytc import xtc
 from pytc.jastrow import REXP
-from pytc.solver import jax_xtc_ccsd
+from pytc.solver import isdf_xtc_ccsd
 
 
 JASTROW_PARAMS = {"alpha": np.array([0.4])}
@@ -35,7 +35,9 @@ def main():
         unit="Angstrom",
         verbose=0,
     )
-    mf = scf.RHF(mol).run()
+    # The factor-direct solver combines ISDF xTC terms with the ordinary
+    # Coulomb contribution through the density-fitting factors.
+    mf = scf.RHF(mol).density_fit().run()
     assert mf.converged
 
     xtc_obj = xtc.XTC.from_pyscf(mf, REXP(), grid_lvl=0)
@@ -61,9 +63,10 @@ def main():
     assert z.shape == (N_FACTOR, N_FACTOR, isdf_xtc.phi_isdf.shape[1])
     print(f"factor-only X: U{u.shape}, Z{z.shape}; dense X absent")
 
-    # ao2mo() uses ISDFXTC's factor-direct tiles.  on_the_fly_vvvv=True
-    # prevents construction of the full four-virtual integral tensor.
-    mycc = jax_xtc_ccsd.RCCSD(
+    # This is the dedicated factor-direct solver, not jax_xtc_ccsd.RCCSD's
+    # bounded-tile path.  Its VVVV hook contracts T2 directly with K1/K2/K3,
+    # D, and the rank-M U/Z factors without constructing a four-virtual tile.
+    mycc = isdf_xtc_ccsd.RCCSD(
         mf,
         isdf_xtc,
         JASTROW_PARAMS,
@@ -77,7 +80,7 @@ def main():
 
     assert mycc.converged
     print(f"rank-{N_FACTOR} X factor-direct xTC-CCSD E_corr: {e_corr:.10f}")
-    print("OK: factor-only ISDF build and direct-tile CCSD both completed.")
+    print("OK: factor-only ISDF build and direct T2-U-Z CCSD completed.")
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@
 The :class:`RCCSD` class inherits the CCSD machinery of
 :mod:`pytc.solver.jax_xtc_ccsd` and replaces only the VVVV--T2 leg through
 that module's instance hook.  The rest of this module is the factor-direct
-contraction machinery it dispatches to: the X factor is never materialized
-in full -- it stays on its host/HDF5 backing and is streamed one rank panel
-at a time (three residency tiers: device lift / host-resident / store
-stream), which is what makes large systems fittable on one GPU.
+contraction machinery it dispatches to.  Full X stays on its host/HDF5
+backing and is streamed one rank panel at a time (three residency tiers:
+device lift / host-resident / store stream).  Opt-in rank-M X instead keeps
+its separated U/Z orbital factors through the T2 contraction.  Neither path
+materializes a virtual four-index tile.
 
 The raw ERI-like tile order in PyTC is ``(a, c, b, d)``; the public
 functions contract that tile directly with a dense RCCSD ``t2`` in
@@ -38,6 +39,14 @@ from pytc.utils.prefetch import async_read, await_read
 _logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _TuckerXFactors:
+    """Virtual-orbital Tucker factors for the factor-direct X branches."""
+
+    u: np.ndarray
+    z: np.ndarray
+
+
 
 
 class RCCSD(jax_xtc_ccsd.RCCSD):
@@ -62,8 +71,10 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         base = self.xtc_obj
         nocc = self.nocc
         kernels = base.isdf_kernels
-        required = ("K1_kernel", "K3_kernel", "D", "X")
+        required = ("K1_kernel", "K3_kernel", "D")
         missing = [name for name in required if name not in kernels]
+        if "X_tucker" not in kernels and "X" not in kernels:
+            missing.append("X or X_tucker")
         if missing:
             raise RuntimeError(f"ISDF kernels missing for factorized RCCSD: {missing}")
         tc = {
@@ -73,13 +84,33 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
             "u3": np.asarray(kernels["K3_kernel"], dtype=np.float64),
             "d": np.asarray(kernels["D"], dtype=np.float64),
         }
-        # X stays on its backing (a NumPy array or an HDF5 dataset): the
-        # contraction streams it one rank panel at a time, so the full block
-        # is never materialized on host or device.  Device X peak is one
-        # panel.  When
-        # the store carries a rank-major twin (X_rm, panel-contiguous
-        # reads), the contraction uses it; legacy consumers keep X.
-        x_backing = kernels.get("X_rm", kernels["X"])
+        if "X_tucker" in kernels:
+            factors = kernels["X_tucker"]
+            if not isinstance(factors, Mapping) or not {"U", "Z"} <= set(factors):
+                raise RuntimeError("X_tucker must contain U and Z")
+            u = np.asarray(factors["U"], dtype=np.float64)
+            z = np.asarray(factors["Z"], dtype=np.float64)
+            if u.ndim != 2 or u.shape[0] != base.phi_isdf.shape[0]:
+                raise RuntimeError(
+                    "X_tucker U must have shape (nmo, M); "
+                    f"got {u.shape}, nmo={base.phi_isdf.shape[0]}"
+                )
+            if z.ndim != 3 or z.shape[:2] != (u.shape[1], u.shape[1]):
+                raise RuntimeError(
+                    "X_tucker Z must have shape (M, M, rank); "
+                    f"got U={u.shape}, Z={z.shape}"
+                )
+            if z.shape[2] != base.phi_isdf.shape[1]:
+                raise RuntimeError(
+                    "X_tucker rank disagrees with phi_isdf: "
+                    f"Z={z.shape}, phi_isdf={base.phi_isdf.shape}"
+                )
+            x_state = _TuckerXFactors(u=u[nocc:], z=z)
+        else:
+            # Full X stays on its backing (a NumPy array or an HDF5 dataset):
+            # the contraction streams it one rank panel at a time.  When the
+            # store carries a rank-major twin, use its panel-contiguous reads.
+            x_state = kernels.get("X_rm", kernels["X"])
         with_df = getattr(self, "with_df", None) or self._scf.with_df
         b = thc.extract_vv_df_factor(
             with_df, self.mo_coeff, nocc)
@@ -87,7 +118,7 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
         fit = fit_lsthc_jax(
             tc["p"], b, rcond=self.factorized_rcond,
             virtual_panel=min(self.factorized_virtual_panel, nvir))
-        state = (tc, b, fit, x_backing)
+        state = (tc, b, fit, x_state)
         self._isdf_factorized_state = state
         return state
 
@@ -98,14 +129,21 @@ class RCCSD(jax_xtc_ccsd.RCCSD):
             raise RuntimeError(
                 "factorized RCCSD refuses a materialized VVVV store; select "
                 "jax_xtc_ccsd.RCCSD for the legacy materialized route")
-        tc, b, fit, x_backing = self._factorized_state()
+        tc, b, fit, x_state = self._factorized_state()
         rank_panel = min(self.factorized_rank_panel, fit.p_virtual.shape[1])
         aux_panel = min(self.factorized_aux_panel, b.shape[2])
         with _tile_timers.term("fd_isdf_terms") as _tt:
-            terms = contract_terms_t2_auto(
-                t2_jax, **tc, x_backing=x_backing, nocc=self.nocc,
-                occupied_pair_batch_size=min(8, self.nocc * self.nocc),
-                rank_panel_size=rank_panel)
+            if isinstance(x_state, _TuckerXFactors):
+                _tile_timers.incr("fd_x_tucker_direct")
+                terms = contract_terms_t2_tucker(
+                    t2_jax, **tc, u=x_state.u, z=x_state.z,
+                    occupied_pair_batch_size=min(8, self.nocc * self.nocc),
+                    rank_panel_size=rank_panel)
+            else:
+                terms = contract_terms_t2_auto(
+                    t2_jax, **tc, x_backing=x_state, nocc=self.nocc,
+                    occupied_pair_batch_size=min(8, self.nocc * self.nocc),
+                    rank_panel_size=rank_panel)
             final = terms["final"]
             # Only "final" is consumed below; the other term tensors are
             # diagnostics and are dropped before the sandwich.
@@ -766,6 +804,227 @@ def compiled_partial_x_right_memory(
 
     return _compiled_partial_x_memory(
         _contract_x_right_t2_jit, t2, right_out, right_inner, x,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+
+
+def _validate_tucker_x(
+    t2: Array,
+    out_factor: Array,
+    inner_factor: Array,
+    u: Array,
+    z: Array,
+) -> None:
+    """Validate ``X[p,q,m] = U[p,a] Z[a,b,m] U[q,b]`` factors."""
+
+    nvir = _validate_x_factors(t2, out_factor, inner_factor)
+    if u.ndim != 2 or u.shape[0] != nvir:
+        raise ValueError(
+            "Tucker X U must have shape (nvir, M); "
+            f"got {u.shape}, nvir={nvir}"
+        )
+    expected = (u.shape[1], u.shape[1], out_factor.shape[1])
+    if z.shape != expected:
+        raise ValueError(
+            "Tucker X Z must have shape (M, M, rank); "
+            f"got {z.shape}, expected {expected}"
+        )
+
+
+@partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
+def _contract_tucker_x_left_t2_jit(
+    t2: Array,
+    left_out: Array,
+    left_inner: Array,
+    u: Array,
+    z: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> Array:
+    """Contract ``P[a,m]P[c,m]U[b,x]Z[x,y,m]U[d,y]`` with T2."""
+
+    nocc_i, nocc_j, nvir, _ = t2.shape
+    rank = left_out.shape[1]
+    n_pairs = nocc_i * nocc_j
+    n_pair_blocks = (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size
+    n_rank_blocks = (rank + rank_panel_size - 1) // rank_panel_size
+    padded_pairs = n_pair_blocks * occupied_pair_batch_size
+    padded_rank = n_rank_blocks * rank_panel_size
+    t2_pairs = jnp.pad(
+        t2.reshape(n_pairs, nvir, nvir),
+        ((0, padded_pairs - n_pairs), (0, 0), (0, 0)),
+    )
+    inner_padded = jnp.pad(left_inner, ((0, 0), (0, padded_rank - rank)))
+    out_padded = jnp.pad(left_out, ((0, 0), (0, padded_rank - rank)))
+    z_padded = jnp.pad(z, ((0, 0), (0, 0), (0, padded_rank - rank)))
+    result = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2.dtype)
+
+    def pair_body(pair_block, result_acc):
+        pair0 = pair_block * occupied_pair_batch_size
+        tau_block = jax.lax.dynamic_slice(
+            t2_pairs, (pair0, 0, 0),
+            (occupied_pair_batch_size, nvir, nvir),
+        )
+
+        def rank_body(rank_block, out_acc):
+            rank0 = rank_block * rank_panel_size
+            inner_panel = jax.lax.dynamic_slice(
+                inner_padded, (0, rank0), (nvir, rank_panel_size),
+            )
+            out_panel = jax.lax.dynamic_slice(
+                out_padded, (0, rank0), (nvir, rank_panel_size),
+            )
+            z_panel = jax.lax.dynamic_slice(
+                z_padded, (0, 0, rank0),
+                (z.shape[0], z.shape[1], rank_panel_size),
+            )
+            # S[n,d,m] = sum_c T2[n,c,d] P[c,m]
+            s = jnp.einsum("ncd,cm->ndm", tau_block, inner_panel)
+            # T[n,m,y] = sum_d S[n,d,m] U[d,y]
+            t = jnp.einsum("ndm,dy->nmy", s, u)
+            # Y[n,m,x] = sum_y T[n,m,y] Z[x,y,m]
+            y = jnp.einsum("nmy,xym->nmx", t, z_panel)
+            return out_acc + jnp.einsum(
+                "am,nmx,bx->nab", out_panel, y, u,
+            )
+
+        out_block = jax.lax.fori_loop(
+            0, n_rank_blocks, rank_body,
+            jnp.zeros((occupied_pair_batch_size, nvir, nvir), dtype=t2.dtype),
+        )
+        return jax.lax.dynamic_update_slice(result_acc, out_block, (pair0, 0, 0))
+
+    result = jax.lax.fori_loop(0, n_pair_blocks, pair_body, result)
+    return result[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
+
+
+@partial(jax.jit, static_argnames=("occupied_pair_batch_size", "rank_panel_size"))
+def _contract_tucker_x_right_t2_jit(
+    t2: Array,
+    right_out: Array,
+    right_inner: Array,
+    u: Array,
+    z: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> Array:
+    """Contract ``U[a,x]Z[x,y,m]U[c,y]P[b,m]P[d,m]`` with T2."""
+
+    nocc_i, nocc_j, nvir, _ = t2.shape
+    rank = right_out.shape[1]
+    n_pairs = nocc_i * nocc_j
+    n_pair_blocks = (n_pairs + occupied_pair_batch_size - 1) // occupied_pair_batch_size
+    n_rank_blocks = (rank + rank_panel_size - 1) // rank_panel_size
+    padded_pairs = n_pair_blocks * occupied_pair_batch_size
+    padded_rank = n_rank_blocks * rank_panel_size
+    t2_pairs = jnp.pad(
+        t2.reshape(n_pairs, nvir, nvir),
+        ((0, padded_pairs - n_pairs), (0, 0), (0, 0)),
+    )
+    inner_padded = jnp.pad(right_inner, ((0, 0), (0, padded_rank - rank)))
+    out_padded = jnp.pad(right_out, ((0, 0), (0, padded_rank - rank)))
+    z_padded = jnp.pad(z, ((0, 0), (0, 0), (0, padded_rank - rank)))
+    result = jnp.zeros((padded_pairs, nvir, nvir), dtype=t2.dtype)
+
+    def pair_body(pair_block, result_acc):
+        pair0 = pair_block * occupied_pair_batch_size
+        tau_block = jax.lax.dynamic_slice(
+            t2_pairs, (pair0, 0, 0),
+            (occupied_pair_batch_size, nvir, nvir),
+        )
+
+        def rank_body(rank_block, out_acc):
+            rank0 = rank_block * rank_panel_size
+            inner_panel = jax.lax.dynamic_slice(
+                inner_padded, (0, rank0), (nvir, rank_panel_size),
+            )
+            out_panel = jax.lax.dynamic_slice(
+                out_padded, (0, rank0), (nvir, rank_panel_size),
+            )
+            z_panel = jax.lax.dynamic_slice(
+                z_padded, (0, 0, rank0),
+                (z.shape[0], z.shape[1], rank_panel_size),
+            )
+            # S[n,c,m] = sum_d T2[n,c,d] P[d,m]
+            s = jnp.einsum("ncd,dm->ncm", tau_block, inner_panel)
+            # T[n,m,y] = sum_c S[n,c,m] U[c,y]
+            t = jnp.einsum("ncm,cy->nmy", s, u)
+            # Y[n,m,x] = sum_y T[n,m,y] Z[x,y,m]
+            y = jnp.einsum("nmy,xym->nmx", t, z_panel)
+            return out_acc + jnp.einsum(
+                "ax,nmx,bm->nab", u, y, out_panel,
+            )
+
+        out_block = jax.lax.fori_loop(
+            0, n_rank_blocks, rank_body,
+            jnp.zeros((occupied_pair_batch_size, nvir, nvir), dtype=t2.dtype),
+        )
+        return jax.lax.dynamic_update_slice(result_acc, out_block, (pair0, 0, 0))
+
+    result = jax.lax.fori_loop(0, n_pair_blocks, pair_body, result)
+    return result[:n_pairs].reshape(nocc_i, nocc_j, nvir, nvir)
+
+
+def _contract_tucker_x(
+    kernel,
+    t2: Array,
+    out_factor: Array,
+    inner_factor: Array,
+    u: Array,
+    z: Array,
+    *,
+    occupied_pair_batch_size: int,
+    rank_panel_size: int,
+) -> Array:
+    if occupied_pair_batch_size < 1 or rank_panel_size < 1:
+        raise ValueError("occupied_pair_batch_size and rank_panel_size must be positive")
+    arrays = tuple(map(jnp.asarray, (t2, out_factor, inner_factor, u, z)))
+    _validate_tucker_x(*arrays)
+    return kernel(
+        *arrays,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+
+
+def contract_tucker_x_left_t2(
+    t2: Array,
+    left_out: Array,
+    left_inner: Array,
+    u: Array,
+    z: Array,
+    *,
+    occupied_pair_batch_size: int = 8,
+    rank_panel_size: int = 128,
+) -> Array:
+    """Factor-direct left X term; neither dense X nor a V⁴ tile is formed."""
+
+    return _contract_tucker_x(
+        _contract_tucker_x_left_t2_jit,
+        t2, left_out, left_inner, u, z,
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+
+
+def contract_tucker_x_right_t2(
+    t2: Array,
+    right_out: Array,
+    right_inner: Array,
+    u: Array,
+    z: Array,
+    *,
+    occupied_pair_batch_size: int = 8,
+    rank_panel_size: int = 128,
+) -> Array:
+    """Factor-direct pair X term; neither dense X nor a V⁴ tile is formed."""
+
+    return _contract_tucker_x(
+        _contract_tucker_x_right_t2_jit,
+        t2, right_out, right_inner, u, z,
         occupied_pair_batch_size=occupied_pair_batch_size,
         rank_panel_size=rank_panel_size,
     )
@@ -1591,6 +1850,53 @@ def contract_terms_t2_xstream(
         "x_direct": x_direct,
         "x_pair": x_pair,
     })
+
+
+def contract_terms_t2_tucker(
+    t2: Array,
+    p: Array,
+    grad_p: Array,
+    u1: Array,
+    u3: Array,
+    d: Array,
+    u: Array,
+    z: Array,
+    *,
+    occupied_pair_batch_size: int = 8,
+    rank_panel_size: int = 128,
+) -> Mapping[str, Array]:
+    """Factor-direct VVVV--T2 terms with rank-M Tucker X.
+
+    K1/K2/K3/D use the established factor-direct kernels.  The two X terms
+    consume ``U`` and ``Z`` directly and never reconstruct either dense X or
+    a virtual four-index tile.
+    """
+
+    p, grad_p, u1, u3, d, u, z = _validate_term_factors(
+        p, grad_p, u1, u3, d, u, z,
+    )
+    _validate_tucker_x(t2, p, p, u, z)
+    kw = dict(
+        occupied_pair_batch_size=occupied_pair_batch_size,
+        rank_panel_size=rank_panel_size,
+    )
+    terms = {
+        "k1_direct": _contract_k1_direct_t2_jit(t2, p, grad_p, u1, **kw),
+        "k1_pair": _contract_k1_pair_t2_jit(t2, p, grad_p, u1, **kw),
+        "k2_direct": _contract_k2_direct_t2_jit(t2, p, grad_p, u1, **kw),
+        "k2_pair": _contract_k2_pair_t2_jit(t2, p, grad_p, u1, **kw),
+        "k3_direct": contract_full_thc_t2(t2, p, p, u3, p, p, **kw),
+        "k3_pair": contract_full_thc_pair_swapped_t2(
+            t2, p, p, u3, p, p, **kw,
+        ),
+        "d_direct": contract_full_thc_t2(t2, p, p, d, p, p, **kw),
+        "d_pair": contract_full_thc_pair_swapped_t2(
+            t2, p, p, d, p, p, **kw,
+        ),
+        "x_direct": contract_tucker_x_left_t2(t2, p, p, u, z, **kw),
+        "x_pair": contract_tucker_x_right_t2(t2, p, p, u, z, **kw),
+    }
+    return _assemble_terms(terms)
 
 
 def contract_terms_t2(

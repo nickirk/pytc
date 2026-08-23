@@ -263,6 +263,72 @@ class TestFactorDirectRandomFP64(unittest.TestCase):
                 self.assertNotIn(v4_shape, _jaxpr_output_shapes(closed.jaxpr))
 
 
+class TestTuckerXFactorDirect(unittest.TestCase):
+    """Rank-M X contracts directly with T2 without reconstructing X or V⁴."""
+
+    def setUp(self):
+        self.data = _random_inputs(nocc=2, nvir=5, rank=7)
+        keys = jax.random.split(jax.random.key(271828), 2)
+        self.u = jax.random.normal(keys[0], (5, 3), dtype=jnp.float64)
+        self.z = jax.random.normal(keys[1], (3, 3, 7), dtype=jnp.float64)
+        self.x = jnp.einsum("va,abm,wb->vwm", self.u, self.z, self.u)
+        self.kw = dict(occupied_pair_batch_size=2, rank_panel_size=3)
+
+    def test_left_and_right_match_reconstructed_x_reference(self):
+        calls = (
+            (
+                isdf_xtc_ccsd.contract_tucker_x_left_t2,
+                isdf_xtc_ccsd.contract_x_left_t2,
+            ),
+            (
+                isdf_xtc_ccsd.contract_tucker_x_right_t2,
+                isdf_xtc_ccsd.contract_x_right_t2,
+            ),
+        )
+        for actual_fn, reference_fn in calls:
+            with self.subTest(side=actual_fn.__name__):
+                actual = actual_fn(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.u, self.z, **self.kw,
+                )
+                reference = reference_fn(
+                    self.data["t2"], self.data["p"], self.data["p"],
+                    self.x, **self.kw,
+                )
+                self.assertLessEqual(_relative_l2(actual, reference), 1e-12)
+
+    def test_complete_term_map_matches_reconstructed_x_reference(self):
+        actual = isdf_xtc_ccsd.contract_terms_t2_tucker(
+            self.data["t2"], self.data["p"], self.data["grad_p"],
+            self.data["u1"], self.data["u3"], self.data["d"],
+            self.u, self.z, **self.kw,
+        )
+        reference = isdf_xtc_ccsd.contract_terms_t2(
+            **{**self.data, "x": self.x}, **self.kw,
+        )
+        self.assertEqual(set(actual), set(reference))
+        for name in reference:
+            with self.subTest(term=name):
+                self.assertLessEqual(
+                    _relative_l2(actual[name], reference[name]), 1e-12,
+                )
+
+    def test_staged_x_kernels_never_create_a_virtual_four_index_tile(self):
+        v4_shape = (5, 5, 5, 5)
+        calls = (
+            lambda t2: isdf_xtc_ccsd.contract_tucker_x_left_t2(
+                t2, self.data["p"], self.data["p"], self.u, self.z, **self.kw,
+            ),
+            lambda t2: isdf_xtc_ccsd.contract_tucker_x_right_t2(
+                t2, self.data["p"], self.data["p"], self.u, self.z, **self.kw,
+            ),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                closed = jax.make_jaxpr(call)(self.data["t2"])
+                self.assertNotIn(v4_shape, _jaxpr_output_shapes(closed.jaxpr))
+
+
 @unittest.skipUnless(
     os.environ.get("PYTC_RUN_FACTOR_DIRECT_H10") == "1",
     "set PYTC_RUN_FACTOR_DIRECT_H10=1 to run the physical H10 gate",
