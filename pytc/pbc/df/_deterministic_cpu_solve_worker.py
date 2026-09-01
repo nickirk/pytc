@@ -10,6 +10,15 @@ import os
 import sys
 
 
+_PROTOCOL = os.fdopen(
+    int(os.environ["PYTC_DETERMINISTIC_PROTOCOL_FD"]),
+    "w",
+    encoding="utf-8",
+    buffering=1,
+    closefd=False,
+)
+
+
 def _attach_shared_memory(name):
     from multiprocessing import shared_memory
 
@@ -25,8 +34,8 @@ def _attach_shared_memory(name):
 
 
 def _emit(payload):
-    sys.stdout.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
-    sys.stdout.flush()
+    _PROTOCOL.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
+    _PROTOCOL.flush()
 
 
 def main(metadata_path):

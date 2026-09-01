@@ -1768,9 +1768,9 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
     return jnp.stack(coul_kpt, axis=0), jnp.stack(kern_kpt, axis=0), infos, n_pipeline_calls
 
 
-def _read_deterministic_worker_message(proc, *, stderr_path):
+def _read_deterministic_worker_message(proc, protocol_stream, *, stderr_path):
     """Read one JSON protocol message or report a fail-closed worker error."""
-    line = proc.stdout.readline()
+    line = protocol_stream.readline()
     if line:
         try:
             message = json.loads(line)
@@ -1840,6 +1840,8 @@ def build_coul_kpt_deterministic_cpu(
     q_nbytes = int(np.prod(q_shape, dtype=np.int64)) * np.dtype(np.complex128).itemsize
     shared = []
     proc = None
+    protocol_stream = None
+    protocol_read_fd = None
 
     def _new_shared():
         block = shared_memory.SharedMemory(create=True, size=q_nbytes)
@@ -1890,18 +1892,28 @@ def build_coul_kpt_deterministic_cpu(
                 "XLA_FLAGS": "--xla_cpu_multi_thread_eigen=false "
                              "intra_op_parallelism_threads=1",
             })
+            protocol_read_fd, protocol_write_fd = os.pipe()
+            env["PYTC_DETERMINISTIC_PROTOCOL_FD"] = str(protocol_write_fd)
             with open(stderr_path, "w", encoding="utf-8") as stderr_handle:
-                proc = subprocess.Popen(
-                    [sys.executable, "-c", bootstrap, worker_path, metadata_path],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_handle,
-                    text=True,
-                    bufsize=1,
-                    env=env,
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-c", bootstrap, worker_path, metadata_path],
+                        stdin=subprocess.PIPE,
+                        stdout=stderr_handle,
+                        stderr=stderr_handle,
+                        text=True,
+                        bufsize=1,
+                        env=env,
+                        pass_fds=(protocol_write_fd,),
+                    )
+                finally:
+                    os.close(protocol_write_fd)
+                protocol_stream = os.fdopen(
+                    protocol_read_fd, "r", encoding="utf-8", buffering=1
                 )
+                protocol_read_fd = None
                 ready = _read_deterministic_worker_message(
-                    proc, stderr_path=stderr_path
+                    proc, protocol_stream, stderr_path=stderr_path
                 )
                 if ready.get("event") != "ready" or ready.get("affinity_count") != 1:
                     raise RuntimeError(
@@ -1941,7 +1953,7 @@ def build_coul_kpt_deterministic_cpu(
                     proc.stdin.write(json.dumps(command, allow_nan=False) + "\n")
                     proc.stdin.flush()
                     result = _read_deterministic_worker_message(
-                        proc, stderr_path=stderr_path
+                        proc, protocol_stream, stderr_path=stderr_path
                     )
                     if result.get("event") != "result" or result.get("q") != q:
                         raise RuntimeError(
@@ -1966,7 +1978,7 @@ def build_coul_kpt_deterministic_cpu(
                 proc.stdin.write('{"event":"stop"}\n')
                 proc.stdin.flush()
                 stopped = _read_deterministic_worker_message(
-                    proc, stderr_path=stderr_path
+                    proc, protocol_stream, stderr_path=stderr_path
                 )
                 if stopped.get("event") != "stopped":
                     raise RuntimeError(
@@ -1995,6 +2007,10 @@ def build_coul_kpt_deterministic_cpu(
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+        if protocol_stream is not None:
+            protocol_stream.close()
+        elif protocol_read_fd is not None:
+            os.close(protocol_read_fd)
         for block in shared:
             block.close()
             try:
