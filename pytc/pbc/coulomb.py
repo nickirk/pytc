@@ -25,6 +25,7 @@ from pytc.pbc.df.isdf import (
     build_periodic_batched_pivot_oracle,
     build_coul_kpt_deterministic_cpu,
     build_coul_kpt_device,
+    build_coul_q_shard_device,
     build_coul_kpt_host,
     build_periodic_pivot_oracle,
     build_pi_eta,
@@ -1104,6 +1105,153 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             "n_selected": n_selected,
             "ao_calls_through_eta": selector_ao_calls + ao_stats["pbc_eval_calls"],
             "ao_grid_points_through_eta": selector_ao_grid_points + ao_stats["grid_points"],
+        },
+    }
+
+
+def build_q_shard_from_inpv(
+    cell,
+    mesh_obj,
+    inpv_kpt,
+    q_indices,
+    *,
+    block_size,
+    p_block_rows,
+    rtol=None,
+    retention_mode=None,
+    provider_cls=RawKernelProvider,
+    n_retained_pin=None,
+    jitter_rcond=None,
+):
+    """Build and solve one bounded q shard from persisted interpolation values.
+
+    Pivot selection is intentionally outside this function.  A large-mesh
+    driver selects/checkpoints pivots and ``inpv_kpt`` once, then calls this
+    function for disjoint q shards without repeating selection or gathering
+    all-q Pi/kern/coul arrays on one node.
+    """
+    retention_mode = _resolve_retention_mode(retention_mode, rtol, n_retained_pin)
+    validate_option_compatibility(
+        p_block_rows=p_block_rows,
+        solve_backend="device",
+        jitter_rcond=jitter_rcond,
+        retention_mode=retention_mode,
+        rtol=rtol,
+        n_retained_pin=n_retained_pin,
+        provider_cls=provider_cls,
+    )
+    if isinstance(block_size, bool) or not isinstance(block_size, (int, np.integer)):
+        raise ValueError("block_size must be a positive integer.")
+    if isinstance(p_block_rows, bool) or not isinstance(
+        p_block_rows, (int, np.integer)
+    ):
+        raise ValueError("p_block_rows must be a positive integer.")
+    block_size = int(block_size)
+    p_block_rows = int(p_block_rows)
+    if block_size <= 0 or p_block_rows <= 0:
+        raise ValueError("block_size and p_block_rows must be positive.")
+
+    inpv_kpt = np.asarray(inpv_kpt, dtype=np.complex128)
+    if inpv_kpt.ndim != 3 or inpv_kpt.shape[0] != mesh_obj.n_kpts:
+        raise ValueError(
+            f"inpv_kpt must have shape ({mesh_obj.n_kpts},Nip,Nao), got "
+            f"{inpv_kpt.shape}."
+        )
+    if inpv_kpt.shape[2] != cell.nao_nr():
+        raise ValueError(
+            f"inpv_kpt Nao={inpv_kpt.shape[2]} does not match cell.nao="
+            f"{cell.nao_nr()}."
+        )
+    ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
+
+    q_indices = np.asarray(q_indices)
+    if q_indices.ndim != 1 or not np.issubdtype(q_indices.dtype, np.integer):
+        raise ValueError("q_indices must be a 1-D integer array.")
+    q_indices = q_indices.astype(np.int64, copy=False)
+    if q_indices.size == 0 or np.unique(q_indices).size != q_indices.size:
+        raise ValueError("q_indices must be nonempty and unique.")
+    if np.any(q_indices < 0) or np.any(q_indices >= mesh_obj.n_kpts):
+        raise ValueError(f"q_indices must lie in [0,{mesh_obj.n_kpts}).")
+
+    grid_coords = cell.get_uniform_grids(cell.mesh)
+    provider = provider_cls(
+        cell=cell,
+        canonical_kpts=mesh_obj.canonical_kpts,
+        grid_mesh=cell.mesh,
+    )
+    provenance_fn = getattr(provider, "provenance", None)
+    if provenance_fn is None:
+        raise ValueError(
+            f"provider {type(provider).__module__}.{type(provider).__qualname__} "
+            "must expose provenance()."
+        )
+    provider_provenance = _jsonable(
+        provenance_fn(), path="kernel_provider"
+    )
+
+    ao_stats = {"pbc_eval_calls": 0, "grid_points": 0}
+    sweeps = []
+
+    def _ao_block_factory():
+        first = not sweeps
+        sweeps.append(1)
+        return (
+            block
+            for _, _, block in stream_ao_blocks(
+                cell,
+                mesh_obj.canonical_kpts,
+                grid_coords,
+                block_size,
+                stats=ao_stats if first else None,
+            )
+        )
+
+    neg = np.asarray(mesh_obj.neg, dtype=np.int64)
+    Pi, kern = build_pi_kern_p_blocked(
+        inpv_kpt,
+        _ao_block_factory,
+        mesh_obj.phase,
+        mesh_obj.neg,
+        provider,
+        grid_coords,
+        panel_rows=p_block_rows,
+        self_paired=lambda q: int(neg[q]) == int(q),
+        mesh=mesh_obj,
+        q_indices=q_indices,
+    )
+    coul, kern, solve_infos = build_coul_q_shard_device(
+        provider,
+        Pi,
+        grid_coords,
+        mesh_obj,
+        q_indices,
+        kern=kern,
+        rtol=rtol,
+        retention_mode=retention_mode,
+        n_retained_pin=n_retained_pin,
+        jitter_rcond=jitter_rcond,
+    )
+    return {
+        "q_indices": np.array(q_indices, copy=True),
+        "coul_kpt": coul,
+        "kern_kpt": kern,
+        "solve_infos": solve_infos,
+        "n_pipeline_calls": int(q_indices.size),
+        "ao_tr_residual": ao_tr_residual,
+        "ao_stats": dict(ao_stats),
+        "kernel_provider": provider_provenance,
+        "shard_provenance": {
+            "schema_version": 1,
+            "n_kpts": int(mesh_obj.n_kpts),
+            "q_indices": q_indices.tolist(),
+            "q_block_size": int(q_indices.size),
+            "block_size": block_size,
+            "p_block_rows": p_block_rows,
+            "retention_mode": retention_mode,
+            "rtol": rtol,
+            "n_retained_pin": _jsonable(n_retained_pin),
+            "jitter_rcond": jitter_rcond,
+            "transform": "mapped_fft_selected_q_v1",
         },
     }
 

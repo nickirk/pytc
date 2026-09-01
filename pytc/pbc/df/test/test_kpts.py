@@ -16,15 +16,20 @@ from pytc.pbc.df.kpts import (
     canonicalize_kpts,
     check_time_reversal_residual,
     kpt_to_spc,
+    kpt_to_spc_fft,
     pair_convolve,
+    pair_convolve_fft_device,
+    pair_convolve_q_device,
     spc_to_kpt,
+    spc_to_kpt_fft,
 )
 
 
 def _make_cell(a_diag=(2.0, 2.0, 2.0)):
     cell = Cell()
     cell.atom = "He 1.0 1.0 1.0"
-    cell.a = np.diag(a_diag)
+    lattice = np.asarray(a_diag, dtype=np.float64)
+    cell.a = lattice if lattice.shape == (3, 3) else np.diag(lattice)
     cell.unit = "A"
     cell.verbose = 0
     cell.basis = "gth-dzvp"
@@ -165,6 +170,17 @@ class TestCanonicalizeKpts(unittest.TestCase):
         self.assertEqual(mesh.kmesh, (2, 3, 4))
         self.assertEqual(mesh.n_kpts, 24)
 
+    def test_fft_layout_is_bijective_on_anisotropic_mesh(self):
+        cell = _make_cell(a_diag=(2.0, 2.5, 3.0))
+        mesh = canonicalize_kpts(
+            cell, cell.make_kpts([2, 3, 4], wrap_around=False)
+        )
+        for indices in (mesh.fft_k_indices, mesh.fft_r_indices):
+            flat = np.ravel_multi_index(indices.T, mesh.kmesh)
+            np.testing.assert_array_equal(np.sort(flat), np.arange(mesh.n_kpts))
+        self.assertFalse(mesh.fft_k_indices.flags.writeable)
+        self.assertFalse(mesh.fft_r_indices.flags.writeable)
+
     def test_rejects_incomplete_mesh(self):
         cell = _make_cell()
         kpts = cell.make_kpts([2, 2, 2], wrap_around=False)
@@ -188,6 +204,8 @@ class TestKptsMeshValidation(unittest.TestCase):
             kpts=mesh.kpts, kmesh=mesh.kmesh, n_kpts=mesh.n_kpts,
             canonical_kpts=mesh.canonical_kpts, permutation=mesh.permutation,
             neg=mesh.neg, ktol=mesh.ktol, phase=mesh.phase,
+            fft_k_indices=mesh.fft_k_indices,
+            fft_r_indices=mesh.fft_r_indices,
         )
 
     def test_valid_construction_round_trips(self):
@@ -219,6 +237,22 @@ class TestKptsMeshValidation(unittest.TestCase):
     def test_rejects_bad_ktol(self):
         kwargs = self._valid_kwargs()
         kwargs["ktol"] = -1e-8
+        with self.assertRaises(ValueError):
+            KptsMesh(**kwargs)
+
+    def test_rejects_non_bijective_fft_layout(self):
+        kwargs = self._valid_kwargs()
+        bad = kwargs["fft_k_indices"].copy()
+        bad[1] = bad[0]
+        kwargs["fft_k_indices"] = bad
+        with self.assertRaises(ValueError):
+            KptsMesh(**kwargs)
+
+    def test_rejects_phase_that_disagrees_with_fft_layout(self):
+        kwargs = self._valid_kwargs()
+        bad = kwargs["phase"].copy()
+        bad[0, 0] += 1e-3
+        kwargs["phase"] = bad
         with self.assertRaises(ValueError):
             KptsMesh(**kwargs)
 
@@ -360,6 +394,46 @@ class TestKptToSpcSpcToKpt(unittest.TestCase):
         with self.assertRaises(ValueError):
             spc_to_kpt(m, phase3)
 
+    def test_mapped_fft_matches_dense_phase_on_nontrivial_meshes(self):
+        cell = _make_cell(a_diag=(2.0, 2.5, 3.0))
+        rng = np.random.default_rng(64)
+        for kmesh in ([1, 1, 3], [2, 2, 2], [2, 3, 4]):
+            with self.subTest(kmesh=kmesh):
+                mesh = canonicalize_kpts(
+                    cell, cell.make_kpts(kmesh, wrap_around=False)
+                )
+                spc = rng.normal(size=(mesh.n_kpts, 3, 5))
+                kpt = spc_to_kpt(spc, mesh.phase)
+                np.testing.assert_allclose(
+                    kpt_to_spc_fft(kpt, mesh),
+                    kpt_to_spc(kpt, mesh.phase),
+                    rtol=0.0,
+                    atol=2e-14,
+                )
+                np.testing.assert_allclose(
+                    spc_to_kpt_fft(spc, mesh),
+                    spc_to_kpt(spc, mesh.phase),
+                    rtol=0.0,
+                    atol=2e-14,
+                )
+
+    def test_mapped_fft_matches_dense_phase_on_skew_lattice(self):
+        cell = _make_cell(
+            np.array([[2.0, 0.1, 0.0], [0.2, 2.4, 0.1], [0.0, 0.3, 2.8]])
+        )
+        mesh = canonicalize_kpts(
+            cell, cell.make_kpts([2, 3, 2], wrap_around=False)
+        )
+        rng = np.random.default_rng(65)
+        spc = rng.normal(size=(mesh.n_kpts, 2, 7))
+        kpt = spc_to_kpt(spc, mesh.phase)
+        np.testing.assert_allclose(
+            kpt_to_spc_fft(kpt, mesh),
+            kpt_to_spc(kpt, mesh.phase),
+            rtol=0.0,
+            atol=2e-14,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -403,6 +477,40 @@ class TestPairConvolveDevice(unittest.TestCase):
             pair_convolve_device(X[0], Y, phase)
         with self.assertRaises(ValueError):
             pair_convolve_device(X, Y, phase[:, :3])
+
+    def test_mapped_fft_and_selected_q_match_dense_oracle(self):
+        cell = _make_cell(a_diag=(2.0, 2.5, 3.0))
+        rng = np.random.default_rng(4)
+        for kmesh in ([1, 1, 3], [2, 2, 2], [2, 3, 4]):
+            with self.subTest(kmesh=kmesh):
+                mesh = canonicalize_kpts(
+                    cell, cell.make_kpts(kmesh, wrap_around=False)
+                )
+                X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (3, 5))
+                Y = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (4, 5))
+                dense = pair_convolve(X, Y, mesh.phase)
+                mapped = pair_convolve_fft_device(X, Y, mesh)
+                np.testing.assert_allclose(mapped, dense, rtol=0.0, atol=2e-12)
+
+                q_indices = np.array(
+                    [mesh.n_kpts - 1, 0, mesh.n_kpts // 2], dtype=np.int64
+                )
+                selected = pair_convolve_q_device(X, Y, mesh, q_indices)
+                np.testing.assert_allclose(
+                    selected, dense[q_indices], rtol=0.0, atol=2e-12
+                )
+
+    def test_selected_q_rejects_bad_indices(self):
+        cell = _make_cell()
+        mesh = canonicalize_kpts(
+            cell, cell.make_kpts([2, 2, 2], wrap_around=False)
+        )
+        rng = np.random.default_rng(5)
+        X = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (3, 5))
+        Y = _tr_symmetric_fixture(rng, mesh.n_kpts, mesh.neg, (4, 5))
+        for bad in ([], [mesh.n_kpts], [-1], [0.5]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                pair_convolve_q_device(X, Y, mesh, np.asarray(bad))
 
 
 class TestKTransformTiling(unittest.TestCase):

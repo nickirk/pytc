@@ -19,6 +19,7 @@ import weakref
 from pytc.pbc.df.isdf import (
     RawKernelProvider,
     build_coul_kpt_device,
+    build_coul_q_shard_device,
     p_blocked_peak_bytes,
     apply_raw_kernel_and_solve,
     build_pi_eta,
@@ -428,6 +429,24 @@ class TestPBlockedStorageContract(unittest.TestCase):
         self.assertGreater(floor, 300e9)
         self.assertGreater(narrow["total"], floor)
 
+    def test_byte_model_q_shard_reduces_only_q_indexed_terms(self):
+        shape = dict(
+            n_kpts=64,
+            n_ip=1040,
+            n_grid=274625,
+            panel_rows=130,
+            ao_block_cols=512,
+            n_ao=104,
+        )
+        full = p_blocked_peak_bytes(**shape)
+        shard = p_blocked_peak_bytes(**shape, q_block_size=8)
+        for term in ("eta_panels", "Pi", "kern", "grid_phases"):
+            self.assertEqual(full[term], 8 * shard[term], term)
+        for term in ("per_q_temporaries", "one_ao_block"):
+            self.assertEqual(full[term], shard[term], term)
+        with self.assertRaises(ValueError):
+            p_blocked_peak_bytes(**shape, q_block_size=65)
+
     def test_streamed_eta_rejects_a_grid_width_mismatch(self):
         cell, mesh_obj, grids, X, chunks, provider = self._fixture()
         with self.assertRaises(ValueError):
@@ -489,6 +508,61 @@ class TestPBlockedProviderAndSelfPaired(unittest.TestCase):
                 self.assertEqual(np.max(np.abs(kern[q].imag)), 0.0, f"kern q={q}")
                 self.assertEqual(np.max(np.abs(Pi[q].imag)), 0.0, f"Pi q={q}")
 
+    def test_q_shard_matches_selected_rows_of_full_builder(self):
+        cell, mesh_obj, grids, X, ao, provider = self._setup((3, 1, 1))
+        neg = np.asarray(mesh_obj.neg)
+        sp = lambda q: int(neg[q]) == q
+        full_pi, full_kern = build_pi_kern_p_blocked(
+            X,
+            lambda: [ao],
+            mesh_obj.phase,
+            mesh_obj.neg,
+            provider,
+            grids,
+            panel_rows=2,
+            self_paired=sp,
+        )
+        q_indices = np.array([2, 0], dtype=np.int64)
+        shard_pi, shard_kern = build_pi_kern_p_blocked(
+            X,
+            lambda: [ao],
+            mesh_obj.phase,
+            mesh_obj.neg,
+            provider,
+            grids,
+            panel_rows=2,
+            self_paired=sp,
+            mesh=mesh_obj,
+            q_indices=q_indices,
+        )
+        self.assertEqual(shard_pi.shape[0], q_indices.size)
+        self.assertEqual(shard_kern.shape[0], q_indices.size)
+        np.testing.assert_allclose(
+            shard_pi, full_pi[q_indices], rtol=0.0, atol=2e-12
+        )
+        np.testing.assert_allclose(
+            shard_kern, full_kern[q_indices], rtol=0.0, atol=2e-12
+        )
+
+    def test_q_shard_requires_mesh_and_unique_in_range_indices(self):
+        cell, mesh_obj, grids, X, ao, provider = self._setup((3, 1, 1))
+        common = dict(
+            X=X,
+            ao_block_factory=lambda: [ao],
+            phase=mesh_obj.phase,
+            neg=mesh_obj.neg,
+            provider=provider,
+            grid_coords=grids,
+            panel_rows=2,
+        )
+        with self.assertRaises(ValueError):
+            build_pi_kern_p_blocked(**common, q_indices=[0])
+        for bad in ([], [0, 0], [-1], [mesh_obj.n_kpts], [0.5]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                build_pi_kern_p_blocked(
+                    **common, mesh=mesh_obj, q_indices=np.asarray(bad)
+                )
+
     def test_mirror_is_skipped_when_the_provider_makes_no_such_claim(self):
         cell, mesh_obj, grids, X, ao, provider = self._setup((2, 1, 1), n_ip=6)
 
@@ -542,6 +616,86 @@ class TestPBlockedThroughTheSolve(unittest.TestCase):
                                    rtol=0, atol=1e-12)
         np.testing.assert_allclose(np.asarray(kern_pb), np.asarray(kern_eta),
                                    rtol=0, atol=1e-12)
+
+    def test_q_shard_build_and_solve_matches_selected_full_rows(self):
+        cell = _make_cell()
+        rng = np.random.default_rng(32)
+        mesh_obj = canonicalize_kpts(
+            cell, cell.make_kpts([3, 1, 1], wrap_around=False)
+        )
+        grids = cell.get_uniform_grids(cell.mesh)
+        X = _tr_symmetric_fixture(
+            rng, mesh_obj.n_kpts, mesh_obj.neg, (4, cell.nao)
+        )
+        ao = _tr_symmetric_fixture(
+            rng,
+            mesh_obj.n_kpts,
+            mesh_obj.neg,
+            (grids.shape[0], cell.nao),
+        )
+        provider = RawKernelProvider(
+            cell=cell,
+            canonical_kpts=mesh_obj.canonical_kpts,
+            grid_mesh=cell.mesh,
+        )
+        neg = np.asarray(mesh_obj.neg)
+        sp = lambda q: int(neg[q]) == q
+
+        full_pi, full_kern = build_pi_kern_p_blocked(
+            X,
+            lambda: [ao],
+            mesh_obj.phase,
+            mesh_obj.neg,
+            provider,
+            grids,
+            panel_rows=2,
+            self_paired=sp,
+        )
+        full_coul, _, _, _ = build_coul_kpt_device(
+            provider,
+            full_pi,
+            None,
+            grids,
+            mesh_obj,
+            rtol=1e-6,
+            kern=full_kern,
+        )
+
+        q_indices = np.array([2, 0], dtype=np.int64)
+        shard_pi, shard_kern = build_pi_kern_p_blocked(
+            X,
+            lambda: [ao],
+            mesh_obj.phase,
+            mesh_obj.neg,
+            provider,
+            grids,
+            panel_rows=2,
+            self_paired=sp,
+            mesh=mesh_obj,
+            q_indices=q_indices,
+        )
+        shard_coul, solved_kern, infos = build_coul_q_shard_device(
+            provider,
+            shard_pi,
+            grids,
+            mesh_obj,
+            q_indices,
+            kern=shard_kern,
+            rtol=1e-6,
+        )
+        self.assertEqual(len(infos), q_indices.size)
+        np.testing.assert_allclose(
+            np.asarray(shard_coul),
+            np.asarray(full_coul)[q_indices],
+            rtol=0.0,
+            atol=2e-10,
+        )
+        np.testing.assert_allclose(
+            np.asarray(solved_kern),
+            full_kern[q_indices],
+            rtol=0.0,
+            atol=2e-12,
+        )
 
     def test_kern_shape_is_validated_when_eta_is_absent(self):
         cell = _make_cell()

@@ -70,6 +70,31 @@ def _match_fractional_points(query, reference, ktol):
     return permutation
 
 
+def _mesh_grid_indices(fractional, kmesh, ktol, *, label):
+    """Map fractional mesh coordinates to integer FFT-grid coordinates.
+
+    The input order is deliberately preserved.  The returned row ``i`` is the
+    three-dimensional FFT-grid coordinate of input row ``i``; callers can
+    therefore reorder between PySCF's canonical enumeration and NumPy/JAX's
+    C-order FFT layout without assuming that the two enumerations coincide.
+    """
+    fractional = _fold_fractional(np.asarray(fractional, dtype=np.float64), ktol)
+    kmesh_arr = np.asarray(kmesh, dtype=np.int64)
+    scaled = fractional * kmesh_arr[None, :]
+    nearest = np.rint(scaled)
+    residual = np.max(np.abs(scaled - nearest)) if scaled.size else 0.0
+    if residual > max(float(ktol) * int(np.max(kmesh_arr)) * 10.0, 1e-9):
+        raise ValueError(
+            f"{label} do not lie on the inferred FFT grid (max integer-coordinate "
+            f"residual {residual:.3e})."
+        )
+    indices = np.mod(nearest.astype(np.int64), kmesh_arr[None, :])
+    flat = np.ravel_multi_index(indices.T, tuple(int(x) for x in kmesh_arr))
+    if sorted(flat.tolist()) != list(range(int(np.prod(kmesh_arr)))):
+        raise ValueError(f"{label} do not form a bijection on the inferred FFT grid.")
+    return indices
+
+
 @dataclasses.dataclass(frozen=True)
 class KptsMesh:
     """A canonicalized k-point mesh.
@@ -82,6 +107,10 @@ class KptsMesh:
     phase: (n_kpts, n_kpts) complex128 unitary k<->supercell-image matrix,
         phase[R,k] = exp(i R.canonical_kpts[k]) / sqrt(n_kpts), with R from
         k2gamma.translation_vectors_for_kmesh(cell, kmesh, wrap_around=False).
+    fft_k_indices / fft_r_indices: integer triples mapping canonical k and R
+        rows, respectively, to C-order FFT-grid coordinates.  They are optional
+        only for backwards-compatible manual construction; canonicalize_kpts
+        always supplies them.
     """
     kpts: object
     kmesh: tuple
@@ -91,6 +120,8 @@ class KptsMesh:
     neg: object
     ktol: float
     phase: object
+    fft_k_indices: object = None
+    fft_r_indices: object = None
 
     def __post_init__(self):
         kpts = np.asarray(self.kpts, dtype=np.float64)
@@ -147,15 +178,64 @@ class KptsMesh:
             raise ValueError(f"phase must have shape ({n_kpts},{n_kpts}), got {phase.shape}.")
         if not np.all(np.isfinite(phase)):
             raise ValueError("phase must be finite.")
-        unitary_residual = float(
-            np.linalg.norm(phase.conj().T @ phase - np.eye(n_kpts))
-        )
-        if unitary_residual > max(self.ktol * 1e4, 1e-8):
+        fft_k_indices = self.fft_k_indices
+        fft_r_indices = self.fft_r_indices
+        if (fft_k_indices is None) != (fft_r_indices is None):
             raise ValueError(
-                f"phase is not unitary (||phase^dagger @ phase - I||={unitary_residual:.3e}) -- "
-                f"this indicates canonical_kpts/R vectors do not form a valid Fourier-conjugate "
-                f"pair for this mesh."
+                "fft_k_indices and fft_r_indices must either both be supplied or both be None."
             )
+        if fft_k_indices is None:
+            # Backwards-compatible validation for callers that manually build a
+            # KptsMesh.  canonicalize_kpts always supplies an analytic FFT layout
+            # and therefore avoids this O(Nk^3) Gram matrix at large meshes.
+            unitary_residual = float(
+                np.linalg.norm(phase.conj().T @ phase - np.eye(n_kpts))
+            )
+            if unitary_residual > max(self.ktol * 1e4, 1e-8):
+                raise ValueError(
+                    f"phase is not unitary (||phase^dagger @ phase - I||="
+                    f"{unitary_residual:.3e}) -- this indicates canonical_kpts/R "
+                    f"vectors do not form a valid Fourier-conjugate pair for this mesh."
+                )
+        else:
+            fft_k_indices = np.asarray(fft_k_indices)
+            fft_r_indices = np.asarray(fft_r_indices)
+            for name, indices in (
+                ("fft_k_indices", fft_k_indices),
+                ("fft_r_indices", fft_r_indices),
+            ):
+                if indices.shape != (n_kpts, 3) or not np.issubdtype(
+                    indices.dtype, np.integer
+                ):
+                    raise ValueError(
+                        f"{name} must be an integer array with shape ({n_kpts},3)."
+                    )
+                if np.any(indices < 0) or np.any(indices >= np.asarray(kmesh)[None, :]):
+                    raise ValueError(f"{name} contains coordinates outside kmesh={kmesh}.")
+                flat_indices = np.ravel_multi_index(indices.T, kmesh)
+                if sorted(flat_indices.tolist()) != list(range(n_kpts)):
+                    raise ValueError(f"{name} must be a bijection on the FFT grid.")
+
+            # Certify the supplied phase against the analytic DFT layout in
+            # bounded row tiles.  This is O(Nk^2), rather than the old O(Nk^3)
+            # phase^H phase check that is itself prohibitive at k12^3.
+            kfrac = fft_k_indices / np.asarray(kmesh, dtype=np.float64)[None, :]
+            phase_tol = max(self.ktol * 100.0, 1e-10)
+            max_phase_error = 0.0
+            for start in range(0, n_kpts, 64):
+                stop = min(start + 64, n_kpts)
+                expected = np.exp(
+                    2j * np.pi * (fft_r_indices[start:stop] @ kfrac.T)
+                ) / np.sqrt(n_kpts)
+                max_phase_error = max(
+                    max_phase_error,
+                    float(np.max(np.abs(phase[start:stop] - expected))),
+                )
+            if max_phase_error > phase_tol:
+                raise ValueError(
+                    f"phase disagrees with the supplied FFT layout (max_abs="
+                    f"{max_phase_error:.3e}, tol={phase_tol:.3e})."
+                )
 
         object.__setattr__(self, "kpts", _readonly_copy(kpts))
         object.__setattr__(self, "canonical_kpts", _readonly_copy(canonical_kpts))
@@ -165,6 +245,13 @@ class KptsMesh:
         object.__setattr__(self, "n_kpts", n_kpts)
         object.__setattr__(self, "ktol", float(self.ktol))
         object.__setattr__(self, "phase", _readonly_copy(phase))
+        if fft_k_indices is not None:
+            object.__setattr__(
+                self, "fft_k_indices", _readonly_copy(fft_k_indices.astype(np.int64))
+            )
+            object.__setattr__(
+                self, "fft_r_indices", _readonly_copy(fft_r_indices.astype(np.int64))
+            )
 
     def _normalize_k_axis(self, values, axis):
         values = np.asarray(values)
@@ -264,9 +351,22 @@ def canonicalize_kpts(cell, kpts, *, ktol=_DEFAULT_KTOL):
     R_vec_abs = k2gamma.translation_vectors_for_kmesh(cell, list(kmesh), wrap_around=False)
     phase = np.exp(1j * (R_vec_abs @ canonical_kpts.T)) / np.sqrt(n_kpts)
 
+    fft_k_indices = _mesh_grid_indices(
+        folded_canonical, kmesh, ktol, label="canonical k-points"
+    )
+    lattice_vectors = np.asarray(cell.lattice_vectors(), dtype=np.float64)
+    r_fractional = np.linalg.solve(lattice_vectors.T, R_vec_abs.T).T
+    fft_r_indices = _mesh_grid_indices(
+        r_fractional / np.asarray(kmesh, dtype=np.float64)[None, :],
+        kmesh,
+        ktol,
+        label="supercell translations",
+    )
+
     return KptsMesh(
         kpts=kpts_np, kmesh=kmesh, n_kpts=n_kpts, canonical_kpts=canonical_kpts,
         permutation=permutation, neg=neg, ktol=float(ktol), phase=phase,
+        fft_k_indices=fft_k_indices, fft_r_indices=fft_r_indices,
     )
 
 
@@ -417,6 +517,189 @@ def spc_to_kpt(m_spc, phase):
         stop = min(start + _SPC_TILE_COLS, n_cols)
         out[:, start:stop] = phase_h @ flat[:, start:stop]
     return out.reshape((n_k,) + trailing_shape)
+
+
+def _fft_layout(mesh):
+    """Return validated flat canonical->FFT mappings for one KptsMesh."""
+    if not isinstance(mesh, KptsMesh):
+        raise TypeError(f"mesh must be a KptsMesh, got {type(mesh).__name__}.")
+    if mesh.fft_k_indices is None or mesh.fft_r_indices is None:
+        raise ValueError(
+            "mesh has no FFT layout; construct it with canonicalize_kpts."
+        )
+    k_flat = np.ravel_multi_index(np.asarray(mesh.fft_k_indices).T, mesh.kmesh)
+    r_flat = np.ravel_multi_index(np.asarray(mesh.fft_r_indices).T, mesh.kmesh)
+    return k_flat.astype(np.int64), r_flat.astype(np.int64)
+
+
+def kpt_to_spc_fft(m_kpt, mesh, *, imag_tol=1e-10):
+    """Mapped unitary k->supercell transform using a three-dimensional FFT.
+
+    This is algebraically the same transform as ``kpt_to_spc(m, mesh.phase)``.
+    The explicit maps prevent a silent dependency on PySCF's flat enumeration.
+    """
+    m_kpt = np.asarray(m_kpt)
+    if m_kpt.ndim < 1 or m_kpt.shape[0] != mesh.n_kpts:
+        raise ValueError(
+            f"m_kpt axis 0 must have length {mesh.n_kpts}, got {m_kpt.shape}."
+        )
+    k_flat, r_flat = _fft_layout(mesh)
+    trailing_shape = m_kpt.shape[1:]
+    flat = m_kpt.reshape(mesh.n_kpts, -1)
+    grid_flat = np.empty_like(flat, dtype=np.complex128)
+    grid_flat[k_flat] = flat
+    grid = grid_flat.reshape(mesh.kmesh + (flat.shape[1],))
+    spc_grid = np.fft.ifftn(grid, axes=(0, 1, 2)) * np.sqrt(mesh.n_kpts)
+    spc = spc_grid.reshape(mesh.n_kpts, -1)[r_flat]
+
+    norm_total = float(np.linalg.norm(spc))
+    norm_imag = float(np.linalg.norm(spc.imag))
+    imag_ratio = norm_imag / norm_total if norm_total > 0.0 else norm_imag
+    if imag_ratio > float(imag_tol):
+        raise ValueError(
+            f"kpt_to_spc_fft: ||Im(m_spc)||/||m_spc||={imag_ratio:.3e} "
+            f"exceeds imag_tol={imag_tol:.1e}."
+        )
+    return np.ascontiguousarray(spc.real.reshape((mesh.n_kpts,) + trailing_shape))
+
+
+def spc_to_kpt_fft(m_spc, mesh):
+    """Mapped inverse of ``kpt_to_spc_fft`` for every canonical q."""
+    m_spc = np.asarray(m_spc)
+    if m_spc.ndim < 1 or m_spc.shape[0] != mesh.n_kpts:
+        raise ValueError(
+            f"m_spc axis 0 must have length {mesh.n_kpts}, got {m_spc.shape}."
+        )
+    k_flat, r_flat = _fft_layout(mesh)
+    trailing_shape = m_spc.shape[1:]
+    flat = m_spc.reshape(mesh.n_kpts, -1)
+    grid_flat = np.empty_like(flat, dtype=np.complex128)
+    grid_flat[r_flat] = flat
+    grid = grid_flat.reshape(mesh.kmesh + (flat.shape[1],))
+    k_grid = np.fft.fftn(grid, axes=(0, 1, 2)) / np.sqrt(mesh.n_kpts)
+    canonical = k_grid.reshape(mesh.n_kpts, -1)[k_flat]
+    return np.ascontiguousarray(
+        canonical.reshape((mesh.n_kpts,) + trailing_shape), dtype=np.complex128
+    )
+
+
+def _selected_phase_h(mesh, q_indices):
+    """Selected rows of phase^H, generated without materialising full phase."""
+    q_indices = np.asarray(q_indices)
+    if q_indices.ndim != 1 or not np.issubdtype(q_indices.dtype, np.integer):
+        raise ValueError("q_indices must be a 1-D integer array.")
+    q_indices = q_indices.astype(np.int64, copy=False)
+    if q_indices.size == 0:
+        raise ValueError("q_indices must be nonempty.")
+    if np.any(q_indices < 0) or np.any(q_indices >= mesh.n_kpts):
+        raise ValueError(f"q_indices must lie in [0,{mesh.n_kpts}).")
+    r = np.asarray(mesh.fft_r_indices, dtype=np.float64)
+    q = np.asarray(mesh.fft_k_indices, dtype=np.float64)[q_indices]
+    frac_q = q / np.asarray(mesh.kmesh, dtype=np.float64)[None, :]
+    return np.exp(-2j * np.pi * (frac_q @ r.T)) / np.sqrt(mesh.n_kpts)
+
+
+@partial(jax.jit, static_argnames=("kmesh",))
+def _pair_convolve_fft_full_core(X, Y, k_flat, r_flat, kmesh):
+    T = jnp.einsum("kpa,kfa->kpf", X, jnp.conj(Y))
+    trailing = T.shape[1:]
+    flat = T.reshape(T.shape[0], -1)
+    grid_flat = jnp.zeros_like(flat).at[k_flat].set(flat)
+    grid = grid_flat.reshape(tuple(kmesh) + (flat.shape[1],))
+    spc_grid = jnp.fft.ifftn(grid, axes=(0, 1, 2)) * jnp.sqrt(T.shape[0])
+    spc = spc_grid.reshape(T.shape[0], -1)[r_flat].reshape(T.shape)
+    denom = jnp.linalg.norm(spc)
+    imag_ratio = jnp.linalg.norm(spc.imag) / jnp.where(denom > 0, denom, 1.0)
+    Z_R = spc.real * spc.real
+
+    z_flat = Z_R.reshape(T.shape[0], -1)
+    r_grid_flat = jnp.zeros_like(z_flat).at[r_flat].set(z_flat)
+    r_grid = r_grid_flat.reshape(tuple(kmesh) + (z_flat.shape[1],))
+    q_grid = jnp.fft.fftn(r_grid, axes=(0, 1, 2)) / jnp.sqrt(T.shape[0])
+    Z = q_grid.reshape(T.shape[0], -1)[k_flat].reshape(T.shape)
+    return Z.astype(jnp.complex128), imag_ratio
+
+
+@partial(jax.jit, static_argnames=("kmesh",))
+def _pair_convolve_fft_q_core(X, Y, k_flat, r_flat, phase_h_rows, kmesh):
+    T = jnp.einsum("kpa,kfa->kpf", X, jnp.conj(Y))
+    flat = T.reshape(T.shape[0], -1)
+    grid_flat = jnp.zeros_like(flat).at[k_flat].set(flat)
+    grid = grid_flat.reshape(tuple(kmesh) + (flat.shape[1],))
+    spc_grid = jnp.fft.ifftn(grid, axes=(0, 1, 2)) * jnp.sqrt(T.shape[0])
+    spc = spc_grid.reshape(T.shape[0], -1)[r_flat].reshape(T.shape)
+    denom = jnp.linalg.norm(spc)
+    imag_ratio = jnp.linalg.norm(spc.imag) / jnp.where(denom > 0, denom, 1.0)
+    Z_R = spc.real * spc.real
+    Z = phase_h_rows @ Z_R.reshape(T.shape[0], -1)
+    return Z.reshape((phase_h_rows.shape[0],) + T.shape[1:]).astype(
+        jnp.complex128
+    ), imag_ratio
+
+
+def _validate_pair_convolve_fft_inputs(X, Y, mesh):
+    X = jnp.asarray(X, dtype=jnp.complex128)
+    Y = jnp.asarray(Y, dtype=jnp.complex128)
+    if X.dtype != jnp.complex128 or Y.dtype != jnp.complex128:
+        raise ValueError(
+            "pair_convolve_fft_device requires jax_enable_x64=True; inputs "
+            "resolved to a lower precision."
+        )
+    if X.ndim != 3 or Y.ndim != 3:
+        raise ValueError("X and Y must be 3-D (Nk, ., Nao).")
+    if X.shape[0] != mesh.n_kpts or Y.shape[0] != mesh.n_kpts:
+        raise ValueError(
+            f"X/Y axis 0 must match n_kpts={mesh.n_kpts}; got "
+            f"{X.shape[0]} and {Y.shape[0]}."
+        )
+    if X.shape[2] != Y.shape[2]:
+        raise ValueError(f"X and Y must share Nao; got {X.shape[2]} and {Y.shape[2]}.")
+    if X.shape[1] == 0 or Y.shape[1] == 0:
+        raise ValueError("X and Y must have at least one row.")
+    k_flat, r_flat = _fft_layout(mesh)
+    return X, Y, jnp.asarray(k_flat), jnp.asarray(r_flat)
+
+
+def pair_convolve_fft_device(X, Y, mesh, *, imag_tol=1e-10):
+    """All-q pair convolution using mapped 3-D FFTs in both directions."""
+    X, Y, k_flat, r_flat = _validate_pair_convolve_fft_inputs(X, Y, mesh)
+    Z, imag_ratio = _pair_convolve_fft_full_core(
+        X, Y, k_flat, r_flat, mesh.kmesh
+    )
+    ratio = float(imag_ratio)
+    if ratio > float(imag_tol):
+        raise ValueError(
+            f"pair_convolve_fft_device: imaginary ratio {ratio:.3e} exceeds "
+            f"imag_tol={imag_tol:.1e}."
+        )
+    return np.asarray(Z)
+
+
+def pair_convolve_q_device(X, Y, mesh, q_indices, *, imag_tol=1e-10):
+    """Selected-q pair convolution with a mapped FFT forward transform.
+
+    Only the requested inverse-transform rows are formed, so the returned
+    leading dimension and the final transform cost are bounded by ``Bq`` rather
+    than ``Nk``.  The forward transform still couples every k point, as required
+    by the convolution theorem.
+    """
+    X, Y, k_flat, r_flat = _validate_pair_convolve_fft_inputs(X, Y, mesh)
+    phase_h_rows = _selected_phase_h(mesh, q_indices)
+    Z, imag_ratio = _pair_convolve_fft_q_core(
+        X,
+        Y,
+        k_flat,
+        r_flat,
+        jnp.asarray(phase_h_rows, dtype=jnp.complex128),
+        mesh.kmesh,
+    )
+    ratio = float(imag_ratio)
+    if ratio > float(imag_tol):
+        raise ValueError(
+            f"pair_convolve_q_device: imaginary ratio {ratio:.3e} exceeds "
+            f"imag_tol={imag_tol:.1e}."
+        )
+    return np.asarray(Z)
 
 
 @partial(jax.jit, static_argnames=("imag_tol",))

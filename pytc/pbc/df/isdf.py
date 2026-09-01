@@ -1768,6 +1768,66 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
     return jnp.stack(coul_kpt, axis=0), jnp.stack(kern_kpt, axis=0), infos, n_pipeline_calls
 
 
+def build_coul_q_shard_device(
+    provider,
+    Pi,
+    grid_coords,
+    mesh_obj,
+    q_indices,
+    *,
+    kern,
+    rtol=None,
+    retained_solve_residual_gate=1e-10,
+    retention_mode="single",
+    n_retained_pin=None,
+    jitter_rcond=None,
+):
+    """Solve one bounded physical-q shard without allocating all-q arrays.
+
+    ``Pi`` and ``kern`` have leading dimension ``Bq`` in the exact order of
+    ``q_indices``.  Every requested q is solved independently; no partner row is
+    materialised outside the shard.  A later shard/reduction layer may choose
+    one representative per {q,-q} pair, but this primitive keeps the artifact
+    contract explicit and order-preserving.
+    """
+    q_indices = _normalize_q_indices(q_indices, mesh_obj.n_kpts)
+    Pi = np.asarray(Pi)
+    kern = np.asarray(kern)
+    n_q = int(q_indices.size)
+    if Pi.ndim != 3 or Pi.shape[0] != n_q:
+        raise ValueError(f"Pi must have shape (Bq,Nip,Nip) with Bq={n_q}.")
+    if kern.shape != Pi.shape:
+        raise ValueError(f"kern must have the same shape as Pi; got {kern.shape} and {Pi.shape}.")
+
+    pin_per_q = _normalize_n_retained_pin(n_retained_pin, n_q)
+    canonical_kpts = np.asarray(mesh_obj.canonical_kpts, dtype=np.float64)
+    phase_shard = precompute_phase_all_q(grid_coords, canonical_kpts[q_indices])
+    neg = np.asarray(mesh_obj.neg, dtype=np.int64)
+
+    coul = []
+    kern_out = []
+    infos = []
+    for local_q, q in enumerate(q_indices):
+        W_q, kern_q, info_q = apply_kernel_and_solve_device(
+            provider,
+            int(q),
+            Pi[local_q],
+            None,
+            kern_q=kern[local_q],
+            phase_q=phase_shard[local_q],
+            rtol=rtol,
+            retained_solve_residual_gate=retained_solve_residual_gate,
+            jitter_rcond=jitter_rcond,
+            self_paired=(int(neg[q]) == int(q)),
+            retention_mode=retention_mode,
+            n_retained_pin=None if pin_per_q is None else pin_per_q[local_q],
+        )
+        coul.append(W_q)
+        kern_out.append(kern_q)
+        infos.append(info_q)
+    return jnp.stack(coul, axis=0), jnp.stack(kern_out, axis=0), infos
+
+
 def _read_deterministic_worker_message(proc, protocol_stream, *, stderr_path):
     """Read one JSON protocol message or report a fail-closed worker error."""
     line = protocol_stream.readline()
@@ -2470,7 +2530,7 @@ def stage_eta_recompute_tile(X, ao_block_source, phase, neg, q_slice=None):
 
 
 def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
-                         ao_block_cols, n_ao):
+                         ao_block_cols, n_ao, q_block_size=None):
     """Honest peak-byte model for build_pi_kern_p_blocked.
 
     Counts every resident term, not just the panels -- the omission that made an
@@ -2490,13 +2550,18 @@ def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
     staging path -- rather than treating this as a bound.
     """
     c16 = 16
-    panels = 2 * int(n_kpts) * int(panel_rows) * int(n_grid) * c16
-    square = int(n_kpts) * int(n_ip) * int(n_ip) * c16
+    n_q = int(n_kpts) if q_block_size is None else int(q_block_size)
+    if n_q <= 0 or n_q > int(n_kpts):
+        raise ValueError(
+            f"q_block_size must lie in [1,{int(n_kpts)}], got {q_block_size}."
+        )
+    panels = 2 * n_q * int(panel_rows) * int(n_grid) * c16
+    square = n_q * int(n_ip) * int(n_ip) * c16
     terms = {
         "eta_panels": panels,
         "Pi": square,
         "kern": square,
-        "grid_phases": int(n_kpts) * int(n_grid) * c16,
+        "grid_phases": n_q * int(n_grid) * c16,
         # lq_i, lq_j and rq_j for one q at a time.
         "per_q_temporaries": 3 * int(panel_rows) * int(n_grid) * c16,
         "one_ao_block": int(n_kpts) * int(ao_block_cols) * int(n_ao) * c16,
@@ -2505,8 +2570,40 @@ def p_blocked_peak_bytes(n_kpts, n_ip, n_grid, panel_rows, *,
     return terms
 
 
+def _normalize_q_indices(q_indices, n_kpts):
+    if q_indices is None:
+        return None
+    q_indices = np.asarray(q_indices)
+    if q_indices.ndim != 1 or not np.issubdtype(q_indices.dtype, np.integer):
+        raise ValueError("q_indices must be a 1-D integer array.")
+    q_indices = q_indices.astype(np.int64, copy=False)
+    if q_indices.size == 0:
+        raise ValueError("q_indices must be nonempty.")
+    if np.any(q_indices < 0) or np.any(q_indices >= int(n_kpts)):
+        raise ValueError(f"q_indices must lie in [0,{int(n_kpts)}).")
+    if np.unique(q_indices).size != q_indices.size:
+        raise ValueError("q_indices must not contain duplicates.")
+    return q_indices
+
+
+def _pair_convolve_physical(X, Y, phase, neg, *, imag_tol, mesh, q_indices):
+    """Convolve and return physical-q order, optionally for one q shard."""
+    if q_indices is None:
+        return _pair_convolve()(X, Y, phase, imag_tol=imag_tol)[neg]
+    if mesh is None:
+        raise ValueError("mesh is required when q_indices selects a bounded shard.")
+    from pytc.pbc.df.kpts import pair_convolve_q_device
+
+    # Algorithm 1 returns the opposite q convention from Pi/eta.  Request the
+    # corresponding raw rows directly instead of forming every q and applying
+    # the full neg permutation afterward.
+    raw_q = np.asarray(neg, dtype=np.int64)[q_indices]
+    return pair_convolve_q_device(X, Y, mesh, raw_q, imag_tol=imag_tol)
+
+
 def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
-                       imag_tol=1e-10, on_block=None):
+                       imag_tol=1e-10, on_block=None, mesh=None,
+                       q_indices=None):
     """eta for a slab of pivot rows, holding one AO block at a time.
 
     ``build_pi_eta`` cannot be reused here: it does ``list(ao_blocks)`` to learn
@@ -2521,15 +2618,24 @@ def _eta_rows_streamed(X_rows, ao_blocks, phase, neg, n_grid, *,
     """
     X_rows = np.asarray(X_rows)
     n_kpts, n_rows = int(X_rows.shape[0]), int(X_rows.shape[1])
-    pair_convolve = _pair_convolve()
-    eta = np.empty((n_kpts, n_rows, int(n_grid)), dtype=np.complex128)
+    q_indices = _normalize_q_indices(q_indices, n_kpts)
+    n_q = n_kpts if q_indices is None else int(q_indices.size)
+    eta = np.empty((n_q, n_rows, int(n_grid)), dtype=np.complex128)
     col = 0
     index = 0
     # NOT enumerate(): CPython reuses its result tuple, which keeps the previously
     # yielded block alive for one extra iteration. That retention is invisible to
     # any equivalence test and defeats the point of streaming.
     for block in ao_blocks:
-        Z = pair_convolve(X_rows, np.asarray(block), phase, imag_tol=imag_tol)[neg]
+        Z = _pair_convolve_physical(
+            X_rows,
+            np.asarray(block),
+            phase,
+            neg,
+            imag_tol=imag_tol,
+            mesh=mesh,
+            q_indices=q_indices,
+        )
         width = int(Z.shape[2])
         if col + width > int(n_grid):
             raise ValueError(
@@ -2609,8 +2715,15 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                             grid_coords, *,
                             panel_rows, imag_tol=1e-10,
                             self_paired=None,
-                            on_block=None, on_panel=None):
-    """kern for every q without holding a full eta.
+                            on_block=None, on_panel=None,
+                            mesh=None, q_indices=None):
+    """Build panel-blocked Pi/kern, optionally for a bounded physical-q shard.
+
+    With ``q_indices=None`` this returns every q exactly as before.  Supplying
+    ``mesh`` and unique ``q_indices`` returns only those physical-q rows, in the
+    requested order; the mapped FFT forward transform still couples every k,
+    while the inverse transform, eta panels, Pi, kern, and grid phases scale
+    with ``Bq`` rather than ``Nk``.
 
     AO blocks are streamed one at a time via ``_eta_rows_streamed``; the residency
     is asserted by test, not assumed.
@@ -2670,11 +2783,24 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         raise ValueError(f"panel_rows must be an integer, got {type(panel_rows)}.")
     if int(panel_rows) <= 0:
         raise ValueError(f"panel_rows must be positive, got {panel_rows}.")
-    pair_convolve = _pair_convolve()
+    neg = np.asarray(neg, dtype=np.int64)
+    if neg.shape != (n_kpts,):
+        raise ValueError(f"neg must have shape ({n_kpts},), got {neg.shape}.")
+    q_indices = _normalize_q_indices(q_indices, n_kpts)
+    physical_q = np.arange(n_kpts, dtype=np.int64) if q_indices is None else q_indices
+    n_q = int(physical_q.size)
 
     # Pi needs no AO stream -- it is X against itself -- so it is built once and
     # never regenerated, whatever the panel schedule does.
-    Pi = pair_convolve(X, X, phase, imag_tol=imag_tol)[neg]
+    Pi = _pair_convolve_physical(
+        X,
+        X,
+        phase,
+        neg,
+        imag_tol=imag_tol,
+        mesh=mesh,
+        q_indices=q_indices,
+    )
 
     # The mirror needs kern Hermitian, which needs the provider self-adjoint at
     # fixed q. Linearity and the q/-q dagger law do not imply it, so it is opt-in
@@ -2702,21 +2828,25 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
     pairs_done = 0
 
     def _eta_panel(p0, p1):
-        """eta rows [p0:p1) for every q, one AO block resident at a time."""
+        """eta rows [p0:p1) for this q set, one AO block at a time."""
         return _eta_rows_streamed(
             X[:, p0:p1, :], ao_block_factory(), phase, neg, n_grid_total,
             imag_tol=imag_tol,
-            on_block=on_block)
+            on_block=on_block, mesh=mesh, q_indices=q_indices)
 
     grid_coords = np.asarray(grid_coords, dtype=np.float64)
     q_kpts = np.asarray(provider.canonical_kpts, dtype=np.float64)
+    if q_kpts.shape[0] != n_kpts:
+        raise ValueError(
+            f"provider has {q_kpts.shape[0]} canonical k-points, expected {n_kpts}."
+        )
     # Known up front, so eta slabs preallocate and the AO stream is never listed.
     n_grid_total = int(grid_coords.shape[0])
     # Precomputed once: the contraction scales by 1/sqrt(n_grid), and passing
     # it in keeps _panel_block's signature free of a traced-vs-static split.
     inv_sqrt_grid = 1.0 / np.sqrt(n_grid_total)
-    gphases = np.exp(-1j * (grid_coords @ q_kpts.T)).T          # (Nk, Ng)
-    kern = np.zeros((n_kpts, n_ip, n_ip), dtype=np.complex128)
+    gphases = np.exp(-1j * (grid_coords @ q_kpts[physical_q].T)).T  # (Bq, Ng)
+    kern = np.zeros((n_q, n_ip, n_ip), dtype=np.complex128)
     # After the fixed setup above, so elapsed is loop work and not an allocation
     # term amortised over a growing denominator.
     loop_started = time.perf_counter()
@@ -2741,31 +2871,31 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
                 eta_j_host = _eta_panel(j0, j1)
                 eta_j = jnp.asarray(eta_j_host, dtype=jnp.complex128)
                 del eta_j_host
-            for q in range(n_kpts):
+            for local_q, q in enumerate(physical_q):
                 # gphase multiplies along the shared grid axis, so
                 #   (eta_i*g) @ conj(apply(eta_j*g)).T
                 # = eta_i @ (conj(apply(eta_j*g)) * g).T
                 # exactly, and the left factor needs no separate array.
-                gphase = gphases[q]
+                gphase = gphases[local_q]
                 # jnp, not np: the contraction below runs on device, so the
                 # operands are staged once here instead of a panel-sized array
                 # crossing the boundary per pair (task #116).
                 # Device slices of already-device panels: no host transfer.
-                eta_iq = eta_i[q]
-                eta_jq = eta_iq if j == i else eta_j[q]
+                eta_iq = eta_i[local_q]
+                eta_jq = eta_iq if j == i else eta_j[local_q]
                 rq_j = _right_factor(provider, q, eta_jq, gphase)
                 block = np.asarray(_panel_block(eta_iq, rq_j, inv_sqrt_grid))
-                kern[q, i0:i1, j0:j1] = block
+                kern[local_q, i0:i1, j0:j1] = block
                 if j != i and not mirror:
                     # No self-adjointness guarantee: compute the transposed panel
                     # instead of mirroring it. Correct for any provider, at twice
                     # the off-diagonal work.
                     rq_i = _right_factor(provider, q, eta_iq, gphase)
-                    kern[q, j0:j1, i0:i1] = np.asarray(
+                    kern[local_q, j0:j1, i0:i1] = np.asarray(
                         _panel_block(eta_jq, rq_i, inv_sqrt_grid))
                     del rq_i
                 elif j != i:
-                    kern[q, j0:j1, i0:i1] = np.conj(block).T
+                    kern[local_q, j0:j1, i0:i1] = np.conj(block).T
                 del rq_j
                 # Do not let the final q slices extend into the next panel pair.
                 del eta_iq, eta_jq, block
@@ -2793,8 +2923,8 @@ def build_pi_kern_p_blocked(X, ao_block_factory, phase, neg, provider,
         # (isdf.py:675 and :712). Projecting only kern would hand the solve a
         # complex Pi it would have made real.
         Pi = np.array(Pi, dtype=np.complex128, copy=True)
-        for q in range(n_kpts):
+        for local_q, q in enumerate(physical_q):
             if self_paired(q):
-                Pi[q] = Pi[q].real.astype(np.complex128)
-                kern[q] = kern[q].real.astype(np.complex128)
+                Pi[local_q] = Pi[local_q].real.astype(np.complex128)
+                kern[local_q] = kern[local_q].real.astype(np.complex128)
     return Pi, kern

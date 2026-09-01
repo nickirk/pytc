@@ -1051,3 +1051,55 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
         many = coulomb.build(cell, kpts, p_block_rows=1, **common)
         np.testing.assert_allclose(np.asarray(many["coul_kpt"]),
                                    np.asarray(one["coul_kpt"]), rtol=0, atol=1e-10)
+
+    def test_q_shard_from_persisted_inpv_matches_full_build(self):
+        """A physical q shard must be directly indexable from the full result.
+
+        This exercises the public restart boundary: pivot selection and the
+        interpolation values are produced once, while a worker receives only
+        persisted ``inpv_kpt`` plus its requested physical q indices.
+        """
+        self.assertTrue(jax.config.jax_enable_x64)
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 3], wrap_around=False)
+        common = dict(
+            rank=4,
+            block_size=9,
+            p_block_rows=2,
+            selection_mode="fixed_pivots",
+            fixed_pivots=np.arange(4, dtype=np.int64),
+            retention_mode="single",
+            n_retained_pin=2,
+        )
+        full = coulomb.build(cell, kpts, **common)
+        q_indices = np.asarray([2, 0], dtype=np.int64)
+        shard = coulomb.build_q_shard_from_inpv(
+            cell,
+            full["mesh_obj"],
+            full["inpv_kpt"],
+            q_indices,
+            block_size=common["block_size"],
+            p_block_rows=common["p_block_rows"],
+            retention_mode=common["retention_mode"],
+            n_retained_pin=common["n_retained_pin"],
+        )
+
+        np.testing.assert_array_equal(shard["q_indices"], q_indices)
+        np.testing.assert_allclose(
+            np.asarray(shard["kern_kpt"]),
+            np.asarray(full["kern_kpt"])[q_indices],
+            rtol=0,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(shard["coul_kpt"]),
+            np.asarray(full["coul_kpt"])[q_indices],
+            rtol=0,
+            atol=1e-10,
+        )
+        self.assertEqual(
+            shard["shard_provenance"]["transform"],
+            "mapped_fft_selected_q_v1",
+        )
+        self.assertEqual(shard["n_pipeline_calls"], len(q_indices))
+        self.assertGreater(shard["ao_stats"]["pbc_eval_calls"], 0)
