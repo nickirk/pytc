@@ -36,7 +36,13 @@ from pytc.pbc.df.isdf import (
     pivoted_cholesky_batched_hermitian,
     stream_ao_blocks,
 )
-from pytc.pbc.df.kpts import canonicalize_kpts, check_time_reversal_residual, kpt_to_spc, spc_to_kpt
+from pytc.pbc.df.kpts import (
+    canonicalize_kpts,
+    check_time_reversal_residual,
+    kpt_to_spc,
+    spc_to_kpt,
+)
+from pytc.pbc.df.q_shards import fingerprint_inpv, fingerprint_kpts_mesh
 from pytc.pbc.fft_mesh import describe_fft_mesh
 
 logger = logging.getLogger(__name__)
@@ -683,7 +689,8 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
           reuse_ao_cache_for_eta=True,
           stage_eta_root=None, stage_eta_block=4096, kern_blocking=None,
           n_retained_pin=None, p_block_rows=None,
-          solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None):
+          solve_backend="device", jitter_rcond=None, cached_ao_max_bytes=None,
+          q_indices=None):
     """Build the periodic FFT-ISDF interpolation-point factor and solved
     kernel for one (cell, k-mesh) system, wiring S1-S4 end to end.
 
@@ -724,6 +731,10 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             values differ in the last bits. Measured
             3.41x on selection at rank 15660; see
             docs/isdf-periodic/artifacts/task95 in the staging repo.
+        q_indices: optional one-dimensional set of physical-q rows. This is a
+            large-mesh restart boundary: selection runs once, but Pi/kernel and
+            sandwich solves are built only for these rows. It currently
+            requires panel blocking and the device solve backend.
 
     Returns:
         dict: mesh_obj (KptsMesh), inpv_kpt (Nk,Nip,Nao) complex128,
@@ -807,6 +818,24 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     }
     if resolved_plan["storage_requested"] == "auto":
         cache_gate["auto_resolved_to"] = storage
+
+    if q_indices is not None:
+        q_indices = np.asarray(q_indices)
+        if q_indices.ndim != 1 or not np.issubdtype(q_indices.dtype, np.integer):
+            raise ValueError("q_indices must be a 1-D integer array.")
+        q_indices = q_indices.astype(np.int64, copy=False)
+        if q_indices.size == 0 or np.unique(q_indices).size != q_indices.size:
+            raise ValueError("q_indices must be nonempty and unique.")
+        if np.any(q_indices < 0) or np.any(q_indices >= mesh_obj.n_kpts):
+            raise ValueError(f"q_indices must lie in [0,{mesh_obj.n_kpts}).")
+        if p_block_rows is None or solve_backend != "device":
+            raise ValueError(
+                "q_indices requires p_block_rows and solve_backend='device'."
+            )
+        if stage_eta_root is not None or kern_blocking is not None:
+            raise ValueError(
+                "q_indices is incompatible with stage_eta_root and kern_blocking."
+            )
 
     if selection_metric == "gamma":
         gamma_indices = np.flatnonzero(
@@ -960,6 +989,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
     ao_stats["pbc_eval_calls"] += 1
     ao_stats["grid_points"] += int(pivots.size)
     ao_tr_residual = check_time_reversal_residual(inpv_kpt, mesh_obj.neg)
+    source_fingerprint = fingerprint_inpv(inpv_kpt) if q_indices is not None else None
 
     if not reuse_ao_cache_for_eta and cached_ao is not None:
         # Free the AO cache -- and the selector closure that also holds it -- so
@@ -1033,6 +1063,8 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
                 provider,
                 grid_coords, panel_rows=int(p_block_rows),
                         self_paired=lambda q: int(neg_arr[q]) == q,
+                        mesh=mesh_obj,
+                        q_indices=q_indices,
             )
         elif stage_eta_root is not None:
             staged_path = os.path.join(
@@ -1051,7 +1083,21 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
                 inpv_kpt, ao_blocks_for_eta, mesh_obj.phase, mesh_obj.neg,
 )
 
-        if solve_backend == "host":
+        if q_indices is not None:
+            coul_kpt, kern_kpt, solve_infos = build_coul_q_shard_device(
+                provider,
+                Pi,
+                grid_coords,
+                mesh_obj,
+                q_indices,
+                kern=kern_p_blocked,
+                rtol=rtol,
+                retention_mode=retention_mode,
+                n_retained_pin=n_retained_pin,
+                jitter_rcond=jitter_rcond,
+            )
+            n_pipeline_calls = int(q_indices.size)
+        elif solve_backend == "host":
             # Reference path. Exists so an accuracy question can be settled without
             # first porting a solver to the device path; refuses the device-only
             # levers rather than silently ignoring them, since a lever that is
@@ -1087,7 +1133,7 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             except FileNotFoundError:
                 pass
 
-    return {
+    result = {
         "mesh_obj": mesh_obj,
         "inpv_kpt": inpv_kpt,
         "coul_kpt": coul_kpt,
@@ -1107,6 +1153,24 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
             "ao_grid_points_through_eta": selector_ao_grid_points + ao_stats["grid_points"],
         },
     }
+    if q_indices is not None:
+        result["q_indices"] = np.array(q_indices, copy=True)
+        result["shard_provenance"] = {
+            "schema_version": 1,
+            "source_fingerprint": source_fingerprint,
+            "mesh_fingerprint": fingerprint_kpts_mesh(mesh_obj),
+            "n_kpts": int(mesh_obj.n_kpts),
+            "q_indices": q_indices.tolist(),
+            "q_block_size": int(q_indices.size),
+            "block_size": block_size,
+            "p_block_rows": p_block_rows,
+            "retention_mode": retention_mode,
+            "rtol": rtol,
+            "n_retained_pin": _jsonable(n_retained_pin),
+            "jitter_rcond": jitter_rcond,
+            "transform": "mapped_fft_selected_q_v1",
+        }
+    return result
 
 
 def build_q_shard_from_inpv(
@@ -1117,6 +1181,7 @@ def build_q_shard_from_inpv(
     *,
     block_size,
     p_block_rows,
+    source_fingerprint,
     rtol=None,
     retention_mode=None,
     provider_cls=RawKernelProvider,
@@ -1128,7 +1193,8 @@ def build_q_shard_from_inpv(
     Pivot selection is intentionally outside this function.  A large-mesh
     driver selects/checkpoints pivots and ``inpv_kpt`` once, then calls this
     function for disjoint q shards without repeating selection or gathering
-    all-q Pi/kern/coul arrays on one node.
+    all-q Pi/kern/coul arrays on one node. ``source_fingerprint`` binds every
+    shard to that one persisted interpolation-value artifact.
     """
     retention_mode = _resolve_retention_mode(retention_mode, rtol, n_retained_pin)
     validate_option_compatibility(
@@ -1150,6 +1216,8 @@ def build_q_shard_from_inpv(
     p_block_rows = int(p_block_rows)
     if block_size <= 0 or p_block_rows <= 0:
         raise ValueError("block_size and p_block_rows must be positive.")
+    if not isinstance(source_fingerprint, str) or not source_fingerprint:
+        raise ValueError("source_fingerprint must be a nonempty string.")
 
     inpv_kpt = np.asarray(inpv_kpt, dtype=np.complex128)
     if inpv_kpt.ndim != 3 or inpv_kpt.shape[0] != mesh_obj.n_kpts:
@@ -1242,6 +1310,8 @@ def build_q_shard_from_inpv(
         "kernel_provider": provider_provenance,
         "shard_provenance": {
             "schema_version": 1,
+            "source_fingerprint": source_fingerprint,
+            "mesh_fingerprint": fingerprint_kpts_mesh(mesh_obj),
             "n_kpts": int(mesh_obj.n_kpts),
             "q_indices": q_indices.tolist(),
             "q_block_size": int(q_indices.size),

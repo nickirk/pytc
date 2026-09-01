@@ -25,6 +25,7 @@ from pytc.pbc.df.isdf import (
     stream_ao_blocks,
 )
 from pytc.pbc.df.kpts import canonicalize_kpts
+from pytc.pbc.df.q_shards import fingerprint_inpv
 
 
 def _make_cell():
@@ -1080,9 +1081,11 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
             q_indices,
             block_size=common["block_size"],
             p_block_rows=common["p_block_rows"],
+            source_fingerprint="unit-test-inpv",
             retention_mode=common["retention_mode"],
             n_retained_pin=common["n_retained_pin"],
         )
+        direct = coulomb.build(cell, kpts, q_indices=q_indices, **common)
 
         np.testing.assert_array_equal(shard["q_indices"], q_indices)
         np.testing.assert_allclose(
@@ -1096,6 +1099,24 @@ class TestPanelBlockedBuildPath(unittest.TestCase):
             np.asarray(full["coul_kpt"])[q_indices],
             rtol=0,
             atol=1e-10,
+        )
+        np.testing.assert_array_equal(direct["q_indices"], q_indices)
+        np.testing.assert_allclose(
+            np.asarray(direct["kern_kpt"]),
+            np.asarray(full["kern_kpt"])[q_indices],
+            rtol=0,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(direct["coul_kpt"]),
+            np.asarray(full["coul_kpt"])[q_indices],
+            rtol=0,
+            atol=1e-10,
+        )
+        np.testing.assert_array_equal(direct["inpv_kpt"], full["inpv_kpt"])
+        self.assertEqual(
+            direct["shard_provenance"]["source_fingerprint"],
+            fingerprint_inpv(direct["inpv_kpt"]),
         )
         self.assertEqual(
             shard["shard_provenance"]["transform"],
