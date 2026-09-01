@@ -83,7 +83,7 @@ class TestBuildPlan(unittest.TestCase):
         """Exhaust the independent route switches without doing AO work."""
         custom_provider = type("_CustomProvider", (RawKernelProvider,), {})
         values = itertools.product(
-            ("device", "host"),
+            ("device", "host", "deterministic_cpu"),
             (False, True),  # panel blocking
             (False, True),  # eta staging
             (False, True),  # kernel blocking
@@ -108,6 +108,10 @@ class TestBuildPlan(unittest.TestCase):
                 legal &= not (panel and staged)
                 legal &= not (backend == "host" and (panel or kern_blocked))
                 legal &= not (backend == "host" and custom)
+                legal &= not (
+                    backend == "deterministic_cpu"
+                    and (not panel or retention != "single")
+                )
                 if retention == "cholesky_jitter":
                     # Runs on both backends now: the jitted path takes a fixed
                     # jitter instead of the host loop's escalation.
@@ -157,7 +161,7 @@ class TestBuildPlan(unittest.TestCase):
                 # the plan boundary, before an expensive build can complete.
                 json.dumps(plan.to_dict())
                 checked += 1
-        self.assertEqual(checked, 2560)
+        self.assertEqual(checked, 3840)
 
     def test_retained_rank_pin_is_normalized_and_validated_pre_ao(self):
         for pin, expected in (
@@ -173,6 +177,43 @@ class TestBuildPlan(unittest.TestCase):
             with self.subTest(invalid_pin=repr(pin)):
                 with self.assertRaises(ValueError):
                     self._resolve(n_retained_pin=pin)
+
+    def test_full_build_routes_panel_kernel_to_deterministic_cpu_backend(self):
+        cell = _make_cell()
+        kpts = cell.make_kpts([1, 1, 1], wrap_around=False)
+
+        def fake_deterministic(Pi, kern, grid_coords, mesh_obj, **kwargs):
+            self.assertEqual(Pi.shape, kern.shape)
+            self.assertEqual(Pi.shape[0], mesh_obj.n_kpts)
+            self.assertGreater(grid_coords.shape[0], 0)
+            self.assertEqual(kwargs["retention_mode"], "single")
+            zeros = np.zeros_like(Pi)
+            infos = [{"execution_backend": "test-double"}] * mesh_obj.n_kpts
+            return zeros, kern, infos, 1
+
+        with mock.patch.object(
+            coulomb,
+            "build_coul_kpt_deterministic_cpu",
+            side_effect=fake_deterministic,
+        ) as isolated_solve:
+            built = coulomb.build(
+                cell,
+                kpts,
+                rank=3,
+                block_size=11,
+                p_block_rows=2,
+                solve_backend="deterministic_cpu",
+                retention_mode="single",
+                selection_mode="streamed",
+            )
+        isolated_solve.assert_called_once()
+        self.assertEqual(
+            built["build_plan"]["resolved"]["solve_backend"],
+            "deterministic_cpu",
+        )
+        self.assertEqual(
+            built["solve_infos"][0]["execution_backend"], "test-double"
+        )
 
     def test_invalid_retention_routes_refuse_before_mesh_or_ao(self):
         cell = _make_cell()

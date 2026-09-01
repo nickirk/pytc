@@ -23,6 +23,7 @@ from pytc.pbc.df.isdf import (
     RawKernelProvider,
     build_cached_periodic_bpc_gemm_oracle,
     build_periodic_batched_pivot_oracle,
+    build_coul_kpt_deterministic_cpu,
     build_coul_kpt_device,
     build_coul_kpt_host,
     build_periodic_pivot_oracle,
@@ -165,9 +166,10 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
     ONE function called from both sites rather than duplicated: a second copy of a
     refusal rule drifts, and then the two disagree about what is legal.
     """
-    if solve_backend not in ("device", "host"):
+    if solve_backend not in ("device", "host", "deterministic_cpu"):
         raise ValueError(
-            f"solve_backend must be 'device' or 'host', got {solve_backend!r}. "
+            "solve_backend must be 'device', 'host', or 'deterministic_cpu', "
+            f"got {solve_backend!r}. "
             f"'host' is a reference path for accuracy work, not a performance path."
         )
     if retention_mode not in RETENTION_MODES:
@@ -202,6 +204,18 @@ def validate_option_compatibility(*, p_block_rows=None, kern_blocking=None,
                     f"solve_backend='host' does not implement {name}; it is a "
                     f"reference path, not a performance path."
                 )
+    if solve_backend == "deterministic_cpu":
+        if p_block_rows is None:
+            raise ValueError(
+                "solve_backend='deterministic_cpu' currently requires "
+                "p_block_rows so the kernel is precomputed before the isolated "
+                "one-CPU solve."
+            )
+        if retention_mode != "single":
+            raise ValueError(
+                "solve_backend='deterministic_cpu' is validated only for "
+                "retention_mode='single'."
+            )
     elif jitter_rcond is not None and retention_mode != "cholesky_jitter":
         raise ValueError(
             f"jitter_rcond applies only to retention_mode='cholesky_jitter', got "
@@ -697,6 +711,11 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
         n_retained_pin: optional int K or length-Nk sequence, forwarded
             per-q to the S4 solve (fixed effective rank; mutually
             exclusive with rtol).
+        solve_backend: ``"device"`` (default), ``"host"`` reference, or
+            ``"deterministic_cpu"``. The deterministic CPU route requires
+            ``p_block_rows`` and ``retention_mode="single"``; it keeps the
+            parallel selector/Pi/kernel stages but performs only the sandwich
+            solves in a fresh subprocess affined to one CPU.
         bpc_blocked_projection: apply the BPC projection once per round as
             level-3 BLAS instead of once per pivot. Selects the same pivots
             (test_isdf_selector.py, test_blocked_projection_matches_
@@ -1040,6 +1059,15 @@ def build(cell, kpts, *, rank, block_size, rtol=None, retention_mode=None,
                 cell, Pi, eta, grid_coords, mesh_obj, rtol=rtol,
                 retention_mode=retention_mode, jitter_rcond=jitter_rcond,
                 n_retained_pin=n_retained_pin,
+            )
+        elif solve_backend == "deterministic_cpu":
+            coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = (
+                build_coul_kpt_deterministic_cpu(
+                    Pi, kern_p_blocked, grid_coords, mesh_obj, rtol=rtol,
+                    retention_mode=retention_mode,
+                    n_retained_pin=n_retained_pin,
+                    jitter_rcond=jitter_rcond,
+                )
             )
         else:
             coul_kpt, kern_kpt, solve_infos, n_pipeline_calls = build_coul_kpt_device(

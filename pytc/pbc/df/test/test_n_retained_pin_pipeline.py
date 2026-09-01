@@ -4,6 +4,7 @@ NumPy oracle, and a pin set to each q's rtol-selected count reproduces
 the rtol pipeline run exactly (the mechanism the pinned-comparison
 regression relies on)."""
 
+import os
 import unittest
 
 import jax
@@ -15,6 +16,7 @@ from pytc.pbc.df.isdf import (
     RawKernelProvider,
     apply_kernel_and_solve_device,
     apply_raw_kernel_and_solve,
+    build_coul_kpt_deterministic_cpu,
     build_coul_kpt_device,
     build_pi_eta,
 )
@@ -68,6 +70,40 @@ def _setup(kmesh=(1, 1, 3), seed=96, n_ip=3):
 
 
 class TestPinnedPipeline(unittest.TestCase):
+    @unittest.skipUnless(
+        hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"),
+        "deterministic CPU solve requires Linux CPU-affinity APIs",
+    )
+    def test_deterministic_cpu_worker_is_bitwise_repeatable_and_receipted(self):
+        _, mesh_obj, grids, Pi, eta, provider = _setup()
+        coul_device, kern, _, calls = build_coul_kpt_device(
+            provider, Pi, eta, grids, mesh_obj, rtol=1e-8,
+        )
+        first = build_coul_kpt_deterministic_cpu(
+            Pi, kern, grids, mesh_obj, rtol=1e-8,
+        )
+        second = build_coul_kpt_deterministic_cpu(
+            Pi, kern, grids, mesh_obj, rtol=1e-8,
+        )
+        coul_first, kern_first, infos_first, calls_first = first
+        coul_second, kern_second, infos_second, calls_second = second
+
+        self.assertEqual(calls_first, calls)
+        self.assertEqual(calls_second, calls)
+        np.testing.assert_array_equal(np.asarray(coul_first), np.asarray(coul_second))
+        np.testing.assert_array_equal(np.asarray(kern_first), np.asarray(kern_second))
+        np.testing.assert_allclose(
+            np.asarray(coul_first), np.asarray(coul_device), atol=1e-10, rtol=1e-10,
+        )
+        for info_first, info_second in zip(infos_first, infos_second):
+            self.assertEqual(info_first["worker_affinity_count"], 1)
+            self.assertEqual(info_second["worker_affinity_count"], 1)
+            self.assertEqual(
+                info_first["execution_backend"],
+                "deterministic_cpu_subprocess",
+            )
+            self.assertEqual(info_first["n_retained"], info_second["n_retained"])
+
     def test_pinned_fused_path_matches_numpy_oracle_per_q(self):
         cell, mesh_obj, grids, Pi, eta, provider = _setup()
         for q in range(mesh_obj.n_kpts):

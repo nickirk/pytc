@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 import time
 from functools import partial
 
@@ -1762,6 +1766,243 @@ def build_coul_kpt_device(provider, Pi, eta, grid_coords, mesh_obj, *, rtol=None
             done[nq] = True
 
     return jnp.stack(coul_kpt, axis=0), jnp.stack(kern_kpt, axis=0), infos, n_pipeline_calls
+
+
+def _read_deterministic_worker_message(proc, *, stderr_path):
+    """Read one JSON protocol message or report a fail-closed worker error."""
+    line = proc.stdout.readline()
+    if line:
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "deterministic CPU solve worker emitted a non-JSON protocol line: "
+                f"{line[:200]!r}"
+            ) from exc
+        if message.get("event") == "error":
+            raise RuntimeError(
+                "deterministic CPU solve worker failed: "
+                f"{message.get('error', 'unknown worker error')}"
+            )
+        return message
+
+    returncode = proc.poll()
+    try:
+        with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
+            stderr_tail = handle.read()[-2000:]
+    except OSError:
+        stderr_tail = "<worker stderr unavailable>"
+    raise RuntimeError(
+        "deterministic CPU solve worker exited without a protocol message "
+        f"(returncode={returncode}); stderr tail: {stderr_tail}"
+    )
+
+
+def build_coul_kpt_deterministic_cpu(
+    Pi, kern, grid_coords, mesh_obj, *, rtol=None,
+    retained_solve_residual_gate=1e-10, retention_mode="single",
+    n_retained_pin=None, jitter_rcond=None,
+):
+    """Solve precomputed periodic kernels in a fresh one-CPU subprocess.
+
+    This is the deterministic boundary for CPU builds whose surrounding AO,
+    selector, Pi, eta, and kernel construction should retain their wider CPU
+    allocation.  The child narrows its CPU affinity before importing JAX, then
+    reuses :func:`apply_kernel_and_solve_device` so dtype, retention, residual,
+    self-pair, and normalization behavior cannot drift from the device path.
+
+    Only one q-sized Pi/kernel/output buffer is shared at a time.  Consequently
+    the boundary adds O(Nip**2), not O(Nk*Nip**2), peak storage.
+    """
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        raise RuntimeError(
+            "solve_backend='deterministic_cpu' requires Linux CPU-affinity APIs."
+        )
+
+    from multiprocessing import shared_memory
+
+    n_kpts = int(mesh_obj.n_kpts)
+    Pi = np.asarray(Pi, dtype=np.complex128)
+    kern = np.asarray(kern, dtype=np.complex128)
+    if Pi.ndim != 3 or Pi.shape[0] != n_kpts or Pi.shape[1] != Pi.shape[2]:
+        raise ValueError(
+            f"Pi must have shape ({n_kpts}, Nip, Nip), got {Pi.shape}."
+        )
+    if kern.shape != Pi.shape:
+        raise ValueError(f"kern must match Pi shape {Pi.shape}, got {kern.shape}.")
+    n_grid = int(np.asarray(grid_coords).shape[0])
+    if n_grid <= 0:
+        raise ValueError("grid_coords must contain at least one grid point.")
+
+    pin_per_q = _normalize_n_retained_pin(n_retained_pin, n_kpts)
+    n_ip = int(Pi.shape[1])
+    q_shape = (n_ip, n_ip)
+    q_nbytes = int(np.prod(q_shape, dtype=np.int64)) * np.dtype(np.complex128).itemsize
+    shared = []
+    proc = None
+
+    def _new_shared():
+        block = shared_memory.SharedMemory(create=True, size=q_nbytes)
+        shared.append(block)
+        return block
+
+    try:
+        pi_shm = _new_shared()
+        kern_shm = _new_shared()
+        out_shm = _new_shared()
+        pi_buf = np.ndarray(q_shape, dtype=np.complex128, buffer=pi_shm.buf)
+        kern_buf = np.ndarray(q_shape, dtype=np.complex128, buffer=kern_shm.buf)
+        out_buf = np.ndarray(q_shape, dtype=np.complex128, buffer=out_shm.buf)
+
+        with tempfile.TemporaryDirectory(prefix="pytc-deterministic-solve-") as tmpdir:
+            metadata_path = os.path.join(tmpdir, "shared.json")
+            stderr_path = os.path.join(tmpdir, "worker.stderr")
+            with open(metadata_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "shape": list(q_shape),
+                    "dtype": np.dtype(np.complex128).str,
+                    "n_grid": n_grid,
+                    "pi_shm": pi_shm.name,
+                    "kern_shm": kern_shm.name,
+                    "out_shm": out_shm.name,
+                }, handle, sort_keys=True)
+
+            worker_path = os.path.join(
+                os.path.dirname(__file__), "_deterministic_cpu_solve_worker.py"
+            )
+            bootstrap = (
+                "import os,runpy,sys; "
+                "cpus=sorted(os.sched_getaffinity(0)); "
+                "os.sched_setaffinity(0,{cpus[0]}); "
+                "sys.argv=sys.argv[1:]; "
+                "runpy.run_path(sys.argv[0],run_name='__main__')"
+            )
+            env = os.environ.copy()
+            env.update({
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "NUMEXPR_NUM_THREADS": "1",
+                "VECLIB_MAXIMUM_THREADS": "1",
+                "BLIS_NUM_THREADS": "1",
+                "JAX_PLATFORMS": "cpu",
+                "JAX_ENABLE_X64": "true",
+                "XLA_FLAGS": "--xla_cpu_multi_thread_eigen=false "
+                             "intra_op_parallelism_threads=1",
+            })
+            with open(stderr_path, "w", encoding="utf-8") as stderr_handle:
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", bootstrap, worker_path, metadata_path],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_handle,
+                    text=True,
+                    bufsize=1,
+                    env=env,
+                )
+                ready = _read_deterministic_worker_message(
+                    proc, stderr_path=stderr_path
+                )
+                if ready.get("event") != "ready" or ready.get("affinity_count") != 1:
+                    raise RuntimeError(
+                        "deterministic CPU solve worker did not prove a one-CPU "
+                        f"boundary: {ready!r}"
+                    )
+
+                neg = np.asarray(mesh_obj.neg)
+                coul_kpt = [None] * n_kpts
+                kern_kpt = [None] * n_kpts
+                infos = [None] * n_kpts
+                done = [False] * n_kpts
+                n_pipeline_calls = 0
+
+                for q in range(n_kpts):
+                    if done[q]:
+                        continue
+                    nq = int(neg[q])
+                    pi_buf[...] = Pi[q]
+                    kern_buf[...] = kern[q]
+                    command = {
+                        "event": "solve",
+                        "q": q,
+                        "self_paired": nq == q,
+                        "rtol": None if rtol is None else float(rtol),
+                        "retained_solve_residual_gate": float(
+                            retained_solve_residual_gate
+                        ),
+                        "retention_mode": retention_mode,
+                        "n_retained_pin": (
+                            None if pin_per_q is None else int(pin_per_q[q])
+                        ),
+                        "jitter_rcond": (
+                            None if jitter_rcond is None else float(jitter_rcond)
+                        ),
+                    }
+                    proc.stdin.write(json.dumps(command, allow_nan=False) + "\n")
+                    proc.stdin.flush()
+                    result = _read_deterministic_worker_message(
+                        proc, stderr_path=stderr_path
+                    )
+                    if result.get("event") != "result" or result.get("q") != q:
+                        raise RuntimeError(
+                            "deterministic CPU solve worker returned an unexpected "
+                            f"protocol message for q={q}: {result!r}"
+                        )
+                    W_q = np.array(out_buf, copy=True)
+                    kern_q = np.array(kern_buf, copy=True)
+                    info_q = result["info"]
+                    coul_kpt[q] = W_q
+                    kern_kpt[q] = kern_q
+                    infos[q] = info_q
+                    done[q] = True
+                    n_pipeline_calls += 1
+
+                    if nq != q and not done[nq]:
+                        coul_kpt[nq] = np.conj(W_q)
+                        kern_kpt[nq] = np.conj(kern_q)
+                        infos[nq] = info_q
+                        done[nq] = True
+
+                proc.stdin.write('{"event":"stop"}\n')
+                proc.stdin.flush()
+                stopped = _read_deterministic_worker_message(
+                    proc, stderr_path=stderr_path
+                )
+                if stopped.get("event") != "stopped":
+                    raise RuntimeError(
+                        "deterministic CPU solve worker did not acknowledge stop: "
+                        f"{stopped!r}"
+                    )
+                proc.stdin.close()
+                if proc.wait(timeout=30) != 0:
+                    raise RuntimeError(
+                        "deterministic CPU solve worker exited nonzero after stop."
+                    )
+
+        return (
+            jnp.asarray(np.stack(coul_kpt, axis=0)),
+            jnp.asarray(np.stack(kern_kpt, axis=0)),
+            infos,
+            n_pipeline_calls,
+        )
+    finally:
+        if proc is not None and proc.poll() is None:
+            if proc.stdin is not None and not proc.stdin.closed:
+                proc.stdin.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        for block in shared:
+            block.close()
+            try:
+                block.unlink()
+            except FileNotFoundError:
+                # Python <3.13 child resource tracking may already have unlinked
+                # an attached block while unwinding a worker failure.
+                pass
 
 
 def build_coul_kpt_host(cell, Pi, eta, grid_coords, mesh_obj, *, rtol=None,
